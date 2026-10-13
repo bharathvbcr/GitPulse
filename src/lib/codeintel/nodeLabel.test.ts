@@ -41,6 +41,19 @@ describe("nodeLabel", () => {
     });
   });
 
+  it("reads the member ids DevMap gives class fields and object-literal members", () => {
+    // Since DevMap 0.2.4's TypeScript lane, `paperService = { fetchOne() {} }`
+    // is `store.ts::paperService.fetchOne` and a class field arrow is
+    // `Store.ts::Store.load`: the same `file::Owner.member` shape as a method.
+    expect(nodeLabel("src/lib/store.ts::paperService.fetchOne")).toEqual({
+      symbol: "paperService.fetchOne",
+      file: "store.ts",
+      path: "src/lib/store.ts",
+    });
+    expect(nodeLabelText("src/Store.ts::Store.load")).toBe("Store.load · Store.ts");
+    expect(nodeFilePath("src/lib/store.ts::paperService.fetchOne")).toBe("src/lib/store.ts");
+  });
+
   it("does not mistake a bare namespace prefix for a file", () => {
     const label = nodeLabel("SelectionReader::readSelection");
     expect(label.symbol).toBe("SelectionReader::readSelection");

@@ -562,9 +562,12 @@ impl DiscoverySkipReason {
         match self {
             // NonSource: README, build cache, default index excludes.
             // Oversized: past the 1 MiB ceiling. Charging every fixture /
-            // vendored grammar as coverage loss left repositories permanently
-            // `partial`; extraction can never succeed on these bytes, so they
-            // are an ordinary skip — not a hole in the graph.
+            // vendored grammar as a *refusal* left repositories permanently
+            // `partial`, so it is not one — but it is not silent either. It is
+            // its own coverage category ([`Self::over_limit`]): always listed,
+            // and charged to the dead-code pass only where the file could have
+            // held calls. Folding it back into "an ordinary skip" is how a
+            // 1.7 MB generated caller vanished with `status` reporting fresh.
             DiscoverySkipReason::NonSource | DiscoverySkipReason::Oversized { .. } => false,
             DiscoverySkipReason::NonUtf8Path | DiscoverySkipReason::Unreadable { .. } => true,
             // A refusal, not an ordinary pass-over: unlike a symlink to a file
@@ -576,13 +579,45 @@ impl DiscoverySkipReason {
         }
     }
 
+    /// The size verdict, when this skip is the source ceiling.
+    ///
+    /// The third class beside "ordinary skip" and "refusal": a file this
+    /// indexer was pointed at and will not read *by policy*. Not a refusal —
+    /// see [`Self::is_refusal`] — and never retried, because no retry shrinks a
+    /// file; but every surface lists it, because the graph is missing whatever
+    /// it declared or called.
+    pub fn over_limit(&self) -> Option<(u64, u64)> {
+        match self {
+            DiscoverySkipReason::Oversized { bytes, limit } => Some((*bytes, *limit)),
+            _ => None,
+        }
+    }
+
+    /// Read `(bytes, limit)` back out of an `Oversized` verdict's own
+    /// [`Display`] wording.
+    ///
+    /// The store keeps a coverage row as `(path, reason)` text, and a status
+    /// surface owes its reader the two numbers as numbers. This is the inverse
+    /// of the `Display` arm above, kept beside it so the two cannot drift;
+    /// `the_oversized_wording_round_trips` pins it. `None` for any other text,
+    /// which a caller reports as "not stated" rather than as zero.
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub fn parse_over_limit(reason: &str) -> Option<(u64, u64)> {
+        let (bytes, rest) = reason.split_once(" bytes exceeds the ")?;
+        let (limit, _) = rest.split_once(" byte source ceiling")?;
+        Some((bytes.parse().ok()?, limit.parse().ok()?))
+    }
+
     /// Does this refusal say the path is not the repository's at all?
     ///
     /// The distinction decides what happens to rows a previous generation
-    /// wrote for the path. `Oversized` and `Unreadable` are about *this
-    /// attempt*: the file may shrink, or regain `+r`, and until it does its
-    /// last good extraction is the best description of it the graph has, so the
-    /// rows are kept. `EscapesRoot` is about the path itself — the bytes belong
+    /// wrote for the path. `Unreadable` is about *this attempt*: the file may
+    /// regain `+r`, and until it does its last good extraction is the best
+    /// description of it the graph has, so the rows are kept. (`Oversized` is
+    /// not a refusal at all: its rows are dropped, by the build and the drain
+    /// alike, because a cold build of the same tree writes none — see
+    /// [`Self::over_limit`].) `EscapesRoot` is about the path itself — the bytes belong
     /// to somebody else's directory — and a `devmap build` writes no rows for
     /// it, so a drain that kept them would leave the graph claiming symbols the
     /// build path had already stopped claiming, which is the disagreement
@@ -604,6 +639,19 @@ impl DiscoveryReport {
     pub fn refused_count(&self) -> usize {
         self.refusals().count()
     }
+
+    /// Source files skipped for exceeding the size ceiling, with
+    /// `(bytes, limit)`, in discovery order.
+    ///
+    /// Not among [`Self::refusals`] — see [`DiscoverySkipReason::over_limit`]
+    /// for why it is a category of its own.
+    pub fn over_limit(&self) -> impl Iterator<Item = (&String, u64, u64)> {
+        self.skipped_paths.iter().filter_map(|(path, reason)| {
+            reason
+                .over_limit()
+                .map(|(bytes, limit)| (path, bytes, limit))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +659,13 @@ pub enum ParseOutcome {
     Clean,
     Partial {
         error_ranges: Vec<TextRange>,
+        /// The subset of `error_ranges` of nonzero width whose bytes hold no
+        /// identifier character — a stray `}` or `>()`. Such a region cannot
+        /// have consumed a declaration or a callee, since both need a name.
+        /// A region this list does not name is treated as able to hide one,
+        /// so a producer that cannot tell leaves it out.
+        #[serde(default)]
+        nameless_ranges: Vec<TextRange>,
     },
     Failed {
         reason: String,
@@ -886,6 +941,15 @@ impl ExtractedImport {
             .map(|name| (name.clone(), name.clone()))
             .collect()
     }
+}
+
+/// A lambda body and the expression its implicit `this` is. See
+/// [`Extraction::scope_receivers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeReceiver {
+    pub body_start: usize,
+    pub body_end: usize,
+    pub receiver: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1261,6 +1325,21 @@ pub enum WiringKind {
     /// property of the language, and putting a second path-shaped rule beside
     /// the table is how the two come to disagree about `.tf`.
     DirectoryUnit,
+    /// A manifest proving that the package or module rooted at its directory
+    /// has no consumer outside the corpus.
+    ///
+    /// Emitted on the manifest itself — a `package.json` that publishes no
+    /// entry point (no `exports`, `main`, `module`, `types`, `typings`,
+    /// `browser` or `bin`), or a Gradle build script applying
+    /// `com.android.application` — and read by liveness for every source file
+    /// whose nearest manifest of that kind is this one. An export in such a
+    /// package proves nothing about callers outside the corpus, so an uncalled
+    /// one is an `exported_unreferenced` candidate at the unconfirmed tier.
+    ///
+    /// Not a liveness exemption of any kind, for the file or its symbols: it
+    /// is a fact about who *can* call, which only ever widens what is
+    /// examined.
+    ModulePrivateScope,
 }
 
 /// Whether a file can be the subject of a liveness verdict at all, and if not,
@@ -1452,6 +1531,19 @@ pub struct Extraction {
     /// so G20 stars and package-level import edges survive reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_package: Option<String>,
+    /// Kotlin/Java `package` header. Two files with the same clause share one
+    /// unqualified namespace — across source sets too, which is why a test in
+    /// `src/test` reaches a `src/main` class with no import. Kept on the
+    /// extraction (not derived from the path) because a package need not match
+    /// its directory, and a durable reload strips `source_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jvm_package: Option<String>,
+    /// Kotlin lambdas whose implicit `this` is a written expression:
+    /// `editor.apply { .. }`, `x.run { .. }`, `with(x) { .. }`. A bare call
+    /// inside one is first a member of that receiver, and only then a function
+    /// in scope — which the call alone cannot say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_receivers: Vec<ScopeReceiver>,
     /// Whether a Go file carries a build constraint — a `//go:build` or
     /// `// +build` directive, or an implicit `_GOOS`/`_GOARCH` filename suffix.
     /// Always false for non-Go files.
@@ -1491,6 +1583,12 @@ pub struct Extraction {
     /// answer: this file declares no such name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_member_names: Option<Vec<String>>,
+    /// Go declarations, local scopes and call receivers as structured facts, the
+    /// input the resolver's Go type evaluator reads. `None` for a non-Go file or
+    /// an extraction cached before it existed — the evaluator then abstains
+    /// rather than read absence as "no declarations".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_facts: Option<crate::gofacts::GoFacts>,
     /// `(qualified scope, local name)` for every value a callable binds itself:
     /// parameters, `let`/`:=`/`=` targets, loop variables, `with … as` handles.
     ///
@@ -1508,6 +1606,38 @@ pub struct Extraction {
     /// payload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_locals: Vec<(String, String)>,
+    /// The name of every inline `mod name { … }` block a Rust file declares, at
+    /// any nesting. Sorted and deduplicated; empty for every other language.
+    ///
+    /// The extractor files an inline module's items under the file's own
+    /// namespace, so `fast_impl::gated()` written beside `mod fast_impl { pub fn
+    /// gated() }` names a function this file declares — but nothing in the
+    /// symbol table says `fast_impl` is a module of *this file* rather than a
+    /// crate or a sibling file, and binding a path by its last segment alone
+    /// would hand `tokio::spawn()` to any local `spawn`. This is the fact that
+    /// tells the two apart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_inline_modules: Vec<String>,
+    /// `(type, target)` for every `impl Deref for type { type Target = target; }`
+    /// a Rust file declares, both reduced to their bare names. Sorted and
+    /// deduplicated; empty for every other language.
+    ///
+    /// A method call the receiver's own type does not declare is looked up on
+    /// the type it dereferences to — `guard.inner()` through `Deref<Target =
+    /// Inner>` — and the symbol table has no record that `Guard` derefs at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_deref_targets: Vec<(String, String)>,
+    /// Calls Rust makes without writing one: `a + b` is `a.add(b)`, `t[i]` is
+    /// `t.index(i)`, `let g = Guard::new();` runs `Guard::drop` at the end of
+    /// the scope, `let m: Meters = x.into();` calls `Meters::from`. Empty for
+    /// every other language.
+    ///
+    /// Kept apart from `calls` because they are candidates, not statements: an
+    /// `a + b` on integers is the overwhelmingly common case and names no
+    /// symbol, so a candidate that binds to nothing is dropped rather than
+    /// recorded as an unresolved call. One that binds is a real edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_implicit_calls: Vec<ExtractedCall>,
     /// Locally bound names at exact call/reference start offsets. Unlike graph
     /// caller identities, these distinguish unnamed callbacks and captures.
     /// Sorted and deduplicated; persists after source text is stripped.
@@ -1560,6 +1690,16 @@ pub struct LocalBinding {
 }
 
 impl Extraction {
+    /// The implicit-`this` expression of the innermost scope-function lambda
+    /// containing `byte`, if any.
+    pub fn scope_receiver_at(&self, byte: usize) -> Option<&str> {
+        self.scope_receivers
+            .iter()
+            .filter(|scope| scope.body_start <= byte && byte < scope.body_end)
+            .min_by_key(|scope| scope.body_end - scope.body_start)
+            .map(|scope| scope.receiver.as_str())
+    }
+
     pub fn local_binding_at(&self, start_byte: usize, name: &str) -> Option<&LocalBinding> {
         self.local_bindings
             .binary_search_by(|binding| {
@@ -1735,6 +1875,12 @@ impl Extraction {
         capabilities_of(&self.language, &self.engine)
     }
 
+    /// The language this file's declarations and calls are written in. See
+    /// [`code_language_of`].
+    pub fn code_language(&self) -> &str {
+        code_language_of(&self.language, &self.engine)
+    }
+
     /// Whether a grammar read this file and no call extractor exists for its
     /// language — every symbol in it is uncalled and calls nothing *by
     /// construction*. See [`is_call_blind`].
@@ -1776,6 +1922,11 @@ impl Extraction {
                     ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                 )
         });
+        // Every durable copy — the extraction cache and the generation's
+        // payload — passes through here, so a secret file's values are
+        // withheld at rest even when this extraction came from a cache row
+        // older than the rule.
+        crate::secret::withhold_secret_values(&mut durable);
         durable
     }
 }
@@ -1788,11 +1939,25 @@ pub fn capabilities_of(
     language: &str,
     engine: &ExtractionEngine,
 ) -> crate::languages::Capabilities {
+    crate::languages::capabilities_for_language(code_language_of(language, engine))
+}
+
+/// The language the code in a file read by `engine` under `language` is
+/// written in: the kernel's for a notebook, `language` for everything else.
+///
+/// `language` names the container, and for an `.ipynb` the container is not
+/// the code. The capability question was the first to learn that (R10); the
+/// coverage join kept asking the container. It keyed its per-language hole and
+/// coverage counts by `language`, so a Python-kernel notebook that failed to
+/// parse was charged to `"notebook"`, and `language_can_reference("notebook",
+/// "python")` is false — a notebook has no family and no call extractor of its
+/// own. The hole it left could hide a caller of any Python symbol it called and
+/// capped none of them. One owner for "which language is this code", so the
+/// next site that needs the answer cannot read the container by mistake.
+pub fn code_language_of<'a>(language: &'a str, engine: &'a ExtractionEngine) -> &'a str {
     match engine {
-        ExtractionEngine::Notebook { kernel_language } => {
-            crate::languages::capabilities_for_language(kernel_language)
-        }
-        _ => crate::languages::capabilities_for_language(language),
+        ExtractionEngine::Notebook { kernel_language } => kernel_language,
+        _ => language,
     }
 }
 
@@ -1833,6 +1998,35 @@ pub fn is_call_blind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored wording of an over-limit verdict yields its numbers back.
+    ///
+    /// `status` reports `bytes` and `limit` from a row that holds only the
+    /// `Display` text, so a change to that text that the parser missed would
+    /// turn every listed size into "not stated" without failing anything else.
+    #[test]
+    fn the_oversized_wording_round_trips() {
+        let reason = DiscoverySkipReason::Oversized {
+            bytes: 1_708_958,
+            limit: 1_048_576,
+        };
+        assert_eq!(
+            DiscoverySkipReason::parse_over_limit(&reason.to_string()),
+            Some((1_708_958, 1_048_576))
+        );
+        assert_eq!(reason.over_limit(), Some((1_708_958, 1_048_576)));
+        assert_eq!(
+            DiscoverySkipReason::parse_over_limit(
+                &DiscoverySkipReason::Unreadable {
+                    reason: "1 bytes exceeds the 2 byte source ceiling".into()
+                }
+                .to_string()
+            ),
+            None,
+            "only the verdict's own wording parses, not a reason that quotes it"
+        );
+        assert_eq!(DiscoverySkipReason::NonSource.over_limit(), None);
+    }
 
     /// Confidence survives the SQLite round-trip exactly.
     ///

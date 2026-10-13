@@ -217,7 +217,11 @@ fn declared_type_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
 /// Returns `None` when this node is not a type declaration in this language,
 /// which is the overwhelmingly common case — this runs on every node of every
 /// walk, so the miss has to be one `match` on a `&str`.
-fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Node<'a>)>> {
+fn heritage_clauses<'a>(
+    node: Node<'a>,
+    source: &str,
+    lang: &str,
+) -> Option<Vec<(Relation, Node<'a>)>> {
     let container = node.kind();
     let interesting = matches!(
         (lang, container),
@@ -234,7 +238,7 @@ fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Nod
                 "class_declaration" | "struct_declaration" | "interface_declaration"
             )
             | ("cpp" | "cuda", "class_specifier" | "struct_specifier")
-            | ("ruby", "class")
+            | ("ruby", "class" | "module")
             | ("php", "class_declaration" | "interface_declaration")
             | ("swift", "class_declaration" | "protocol_declaration")
             | ("kotlin", "class_declaration" | "object_declaration")
@@ -287,10 +291,47 @@ fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Nod
     if lang == "rust" {
         collect_rust_impl(node, &mut clauses);
     }
+    if lang == "ruby" {
+        collect_ruby_mixins(node, source, &mut clauses);
+    }
     if lang == "objc" {
         collect_objc_heritage(node, &mut clauses);
     }
     Some(clauses)
+}
+
+/// `include Reader` / `prepend Reader` in a class or module body: the module is
+/// in the declarer's ancestor chain, so a bare send the declarer makes can reach
+/// the module's methods. `extend` puts the module on the *singleton* and is not
+/// an instance ancestor, so it is not a supertype here.
+///
+/// Only a receiverless send of constants directly in the body: `include` inside
+/// a method, a conditional or a block is a runtime decision this does not claim.
+fn collect_ruby_mixins<'a>(node: Node<'a>, source: &str, clauses: &mut Vec<(Relation, Node<'a>)>) {
+    let Some(body) = node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "body_statement");
+        found
+    }) else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for statement in body.named_children(&mut cursor) {
+        if statement.kind() != "call" || statement.child_by_field_name("receiver").is_some() {
+            continue;
+        }
+        let is_mixin = statement
+            .child_by_field_name("method")
+            .is_some_and(|method| matches!(text(method, source), "include" | "prepend"));
+        if !is_mixin {
+            continue;
+        }
+        if let Some(arguments) = statement.child_by_field_name("arguments") {
+            clauses.push((Relation::Implements, arguments));
+        }
+    }
 }
 
 /// TypeScript separates the two clauses; JavaScript has only the base.
@@ -361,7 +402,7 @@ pub(crate) fn push_heritage_references(
     file_symbol_name: &str,
     references: &mut Vec<ExtractedReference>,
 ) {
-    let Some(clauses) = heritage_clauses(node, lang) else {
+    let Some(clauses) = heritage_clauses(node, source, lang) else {
         return;
     };
     if clauses.is_empty() {

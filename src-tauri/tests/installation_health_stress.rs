@@ -18,6 +18,11 @@
 //! sharing that gate measures the suite instead.
 #![cfg(unix)]
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::engine::git_cli::capture_command;
 use std::time::Duration;
 

@@ -25,7 +25,7 @@ vi.mock("../desktop/nativeShell", () => ({ resolveGitRoot: (...args: unknown[]) 
 const focusTerminalSession = vi.fn();
 vi.mock("../terminal/sessionFocus", () => ({ focusTerminalSession: (...args: unknown[]) => focusTerminalSession(...args) }));
 
-const { openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showAttemptTerminal, showTaskTerminal, startTaskTerminal, trustAttemptCheckout } = await import("./taskTerminal");
+const { ATTEMPT_HOST_STEP_MS, openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showAttemptTerminal, showTaskTerminal, startTaskTerminal, trustAttemptCheckout } = await import("./taskTerminal");
 const { consumeTaskTerminalRequest, taskTerminalRequests } = await import("../terminal/taskLaunches");
 const { terminalSessions } = await import("../terminal/sessionRegistry");
 
@@ -110,6 +110,56 @@ describe("startTaskTerminal", () => {
     expect(await first).toEqual({ kind: "waiting", reason: "checkout", checkout: "/work/a" });
     expect(await second).toEqual({ kind: "started" });
     expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["a", "b"]);
+  });
+
+  describe("never waits on the host without a bound", () => {
+    // The start used to await the root walk, the family lookup and the open
+    // with no limit; one host call that never answered held the launch — and
+    // the sheet that made it — for good.
+    afterEach(() => { vi.useRealTimers(); });
+    const never = () => new Promise<never>(() => {});
+
+    it("reports an open that never answers as waiting, and keeps the request", async () => {
+      vi.useFakeTimers();
+      openRepo.mockImplementationOnce(never);
+      const outcome = startTaskTerminal(run("h", "/work/h"));
+      await vi.advanceTimersByTimeAsync(ATTEMPT_HOST_STEP_MS);
+      expect(await outcome).toEqual({ kind: "waiting", reason: "checkout", checkout: "/work/h" });
+      // The checkout opening later still starts it.
+      expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["h"]);
+    });
+
+    it("opens the checkout itself when its family never answers", async () => {
+      vi.useFakeTimers();
+      familyOf.mockImplementationOnce(never);
+      openRepo.mockResolvedValueOnce(true);
+      const outcome = startTaskTerminal(run("f", "/work/f"));
+      await vi.advanceTimersByTimeAsync(ATTEMPT_HOST_STEP_MS);
+      expect(await outcome).toEqual({ kind: "started" });
+      expect(openRepo).toHaveBeenCalledWith("/work/f", expect.anything());
+    });
+
+    it("fails, queueing nothing, when the checkout walk never answers", async () => {
+      vi.useFakeTimers();
+      resolveGitRoot.mockImplementationOnce(never);
+      const outcome = startTaskTerminal(run("w", "/work/w"));
+      const settled = expect(outcome).rejects.toThrow(/\/work\/w/);
+      await vi.advanceTimersByTimeAsync(ATTEMPT_HOST_STEP_MS);
+      await settled;
+      expect(get(taskTerminalRequests)).toEqual([]);
+      expect(openRepo).not.toHaveBeenCalled();
+    });
+
+    it("absorbs an open that fails after the bound instead of leaving it unhandled", async () => {
+      vi.useFakeTimers();
+      let fail: (cause: Error) => void = () => {};
+      openRepo.mockImplementationOnce(() => new Promise<boolean>((_, reject) => { fail = reject; }));
+      const outcome = startTaskTerminal(run("l", "/work/l"));
+      await vi.advanceTimersByTimeAsync(ATTEMPT_HOST_STEP_MS);
+      expect(await outcome).toEqual({ kind: "waiting", reason: "checkout", checkout: "/work/l" });
+      fail(new Error("late"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
   });
 
   it("propagates a failed open rather than reporting a start", async () => {

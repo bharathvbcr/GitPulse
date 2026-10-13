@@ -16,23 +16,40 @@
 //! Ordinary source-tree staleness on a repository that already has its
 //! artifacts stays incremental.
 //!
-//! ## Echo / failure cooldown
+//! ## Duty cycle: every build sets a wait
 //!
-//! A `repo_changed` tick that rebuilds and learns the index was already warm
-//! (`unchanged: true`) — or that the build failed — used to reopen a 1 Hz
-//! loop whenever the build itself wrote under a watched path the noise gate
-//! missed. Per-repo exponential cooldown (1s → 2s → … capped at 60s) answers
-//! further `repo_changed` ticks with [`LiveRefreshDecision::SkipCooldown`]
-//! until the wait elapses.
+//! Every live build that runs sets a per-repository wait, and watcher ticks
+//! inside it are answered [`LiveRefreshDecision::SkipCooldown`] without
+//! probing anything; the frontend holds its next ask until the wait ends, so
+//! every edit inside it is folded into one build.
+//!
+//! * A productive build rests `max(30 s, 2 x its duration)`, capped at 10 min
+//!   ([`rest_after_build`]). It used to *clear* the wait instead, so an agent
+//!   editing continuously kept a build running back to back.
+//! * An `unchanged: true` echo or a failed build waits at least that long, and
+//!   longer on a streak (1 s → 2 s → … capped at 60 s, under the same floor):
+//!   both used to reopen a 1 Hz loop whenever the build wrote under a watched
+//!   path the noise gate missed.
+//! * A build that ran past [`cli::BUILD_DEADLINE`] pauses automatic indexing
+//!   for at least 10 min, doubling on a streak, and the outcome says the index
+//!   is too slow ([`LiveRefreshOutcome::index_too_slow`]).
 //!
 //! Activation (`repo_changed: false`) still reads status so a payload-obsolete
-//! index can `--manifest` rebuild even while the wait is active. An
-//! `unchanged: true` echo's wait *does* block activation incremental rebuilds:
-//! the last build already proved the tree current, and treating focus as a
-//! new stale signal restarted a 1 Hz status+build loop. Failed-build waits
-//! still allow activation retry. Explicit `devmap build` / `refresh` commands
-//! still call [`clear_live_echo_cooldown`] so the next watcher tick is not
-//! stranded behind a stale wait.
+//! index can `--manifest` rebuild, and a missing artifact can be restored,
+//! even while a wait is active. An echo's or a rest's wait *does* block
+//! activation incremental rebuilds: the last build already indexed the tree,
+//! and treating focus as a new stale signal restarted a status+build loop.
+//! Failed-build waits still allow activation retry; a too-slow pause does not.
+//! Explicit `devmap build` / `refresh` commands call
+//! [`clear_live_echo_cooldown`], which drops every wait for the repository.
+//!
+//! ## Off the IPC path
+//!
+//! [`start_refresh`] — what the command calls — runs an authorized build on a
+//! background thread and answers [`LiveRefreshDecision::Started`]; the next
+//! ask collects the outcome. One live build runs at a time across every
+//! repository ([`LiveBuildSlot`]), the bound the frontend's single queue slot
+//! used to provide by awaiting each build.
 //!
 //! ## Store lifetime
 //!
@@ -110,6 +127,11 @@ pub enum LiveRefreshDecision {
     /// seconds, and reporting it as unavailable let the frontend settle a
     /// repository that was never looked at.
     SkipDeferred,
+    /// A build was authorized and started on a background thread; the IPC
+    /// call did not wait for it. Its outcome — a [`Self::Refresh`] carrying the
+    /// build — is handed to the next ask for this repository, and until then
+    /// every ask answers [`Self::SkipBuilding`] without probing anything.
+    Started,
 }
 
 impl LiveRefreshDecision {
@@ -131,34 +153,73 @@ const OBSOLETE_PAYLOAD_REASON: &str = "stored extraction payload is obsolete";
 
 const COOLDOWN_CAP_SECS: u64 = 60;
 
+/// Shortest rest after any live build, however quick.
+pub(crate) const LIVE_REST_FLOOR: Duration = Duration::from_secs(30);
+
+/// Longest rest a build's own duration can earn ("~10 min" in the audit).
+pub(crate) const LIVE_REST_CAP: Duration = Duration::from_secs(10 * 60);
+
+/// Rest after a live build that ran past [`cli::BUILD_DEADLINE`].
+pub(crate) const TOO_SLOW_REST: Duration = Duration::from_secs(10 * 60);
+
+/// Ceiling for consecutive timed-out builds, which double [`TOO_SLOW_REST`].
+pub(crate) const TOO_SLOW_REST_CAP: Duration = Duration::from_secs(60 * 60);
+
+/// What the last live build for a repository meant for the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitKind {
+    /// The build did its job. Watcher ticks wait out the rest, and every edit
+    /// inside it is folded into the one build that follows. Activation still
+    /// reads status, so a fresh store reports fresh and a missing artifact or
+    /// obsolete payload still heals; only an incremental rebuild waits.
+    Rest,
+    /// `unchanged: true`: the build proved the tree already current. Activation
+    /// must not spawn another incremental rebuild while this holds;
+    /// payload-obsolete and missing artifacts still bypass it.
+    Echo,
+    /// The build failed. Activation may retry.
+    Failure,
+    /// The build ran past its deadline. Nothing automatic runs until the wait
+    /// elapses — retrying at the failure cadence is what kept a 15-minute
+    /// child running back to back — and the Map strip says why.
+    TooSlow,
+}
+
 #[derive(Debug, Clone)]
-struct EchoCooldown {
+struct LiveWait {
     until: Instant,
     /// Consecutive echo/failure builds that raised the wait (0 before first).
     streak: u32,
-    /// Last raise was `unchanged: true` (not a failed build). Activation
-    /// must not spawn another incremental rebuild while this wait holds;
-    /// payload-obsolete still bypasses it after a status peek.
-    unchanged_echo: bool,
+    /// Consecutive timed-out builds (0 for the first).
+    too_slow_streak: u32,
+    kind: WaitKind,
 }
 
-fn echo_cooldowns() -> &'static Mutex<HashMap<String, EchoCooldown>> {
-    static MAP: OnceLock<Mutex<HashMap<String, EchoCooldown>>> = OnceLock::new();
+fn live_waits() -> &'static Mutex<HashMap<String, LiveWait>> {
+    static MAP: OnceLock<Mutex<HashMap<String, LiveWait>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Drop the echo/failure cooldown for `repo_path` (explicit build/refresh).
+/// The waits map, recovered from poisoning: a panic elsewhere must not turn
+/// the governor off, which is what answering "no wait" would do.
+fn lock_live_waits() -> std::sync::MutexGuard<'static, HashMap<String, LiveWait>> {
+    live_waits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop every live-build wait for `repo_path` (explicit build/refresh).
+///
+/// The user asking for a build is the one signal that outranks the governor,
+/// including a "too slow" pause: they have chosen to spend the time.
 pub fn clear_live_echo_cooldown(repo_path: &str) {
-    if let Ok(mut map) = echo_cooldowns().lock() {
-        map.remove(repo_path);
-    }
+    lock_live_waits().remove(repo_path);
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn clear_all_live_echo_cooldowns() {
-    if let Ok(mut map) = echo_cooldowns().lock() {
-        map.clear();
-    }
+    lock_live_waits().clear();
+    lock_finished_builds().clear();
 }
 
 /// Next cooldown length after `streak` consecutive echo/failure builds.
@@ -169,35 +230,121 @@ pub(crate) fn cooldown_secs_for_streak(streak: u32) -> u64 {
     (1u64 << shift).min(COOLDOWN_CAP_SECS)
 }
 
-fn cooldown_state(repo_path: &str, now: Instant) -> Option<(Duration, bool)> {
-    let map = echo_cooldowns().lock().ok()?;
+/// Rest after a live build that took `elapsed`: `max(30 s, 2 x elapsed)`,
+/// capped at [`LIVE_REST_CAP`]. A build that cost a minute of CPU earns two
+/// minutes of quiet, so the index spends at most a third of the wall clock
+/// building however fast an agent edits.
+pub(crate) fn rest_after_build(elapsed: Duration) -> Duration {
+    elapsed
+        .saturating_mul(2)
+        .clamp(LIVE_REST_FLOOR, LIVE_REST_CAP)
+}
+
+/// Rest after the `streak`-th consecutive timed-out build (0 for the first):
+/// 10 min, doubling, capped at an hour.
+pub(crate) fn too_slow_rest(streak: u32) -> Duration {
+    TOO_SLOW_REST
+        .saturating_mul(1u32 << streak.min(3))
+        .min(TOO_SLOW_REST_CAP)
+}
+
+fn live_wait(repo_path: &str, now: Instant) -> Option<(Duration, WaitKind)> {
+    let map = lock_live_waits();
     let entry = map.get(repo_path)?;
     if entry.until <= now {
         return None;
     }
-    Some((
-        entry.until.saturating_duration_since(now),
-        entry.unchanged_echo,
-    ))
+    Some((entry.until.saturating_duration_since(now), entry.kind))
 }
 
-fn raise_echo_cooldown(repo_path: &str, now: Instant, unchanged_echo: bool) {
-    let Ok(mut map) = echo_cooldowns().lock() else {
-        return;
+/// Record what a live build that finished at `finished` after `elapsed`
+/// means for the next one, and return the wait it set.
+fn raise_live_wait(
+    repo_path: &str,
+    finished: Instant,
+    elapsed: Duration,
+    kind: WaitKind,
+) -> Duration {
+    let mut map = lock_live_waits();
+    let previous = map.get(repo_path);
+    let streak = match (kind, previous) {
+        (WaitKind::Echo | WaitKind::Failure, Some(prev))
+            if matches!(prev.kind, WaitKind::Echo | WaitKind::Failure) =>
+        {
+            prev.streak.saturating_add(1)
+        }
+        _ => 0,
     };
-    let streak = map
-        .get(repo_path)
-        .map(|e| e.streak.saturating_add(1))
-        .unwrap_or(0);
-    let secs = cooldown_secs_for_streak(streak);
+    let too_slow_streak = match (kind, previous) {
+        (WaitKind::TooSlow, Some(prev)) if prev.kind == WaitKind::TooSlow => {
+            prev.too_slow_streak.saturating_add(1)
+        }
+        _ => 0,
+    };
+    let wait = match kind {
+        WaitKind::Rest => rest_after_build(elapsed),
+        WaitKind::Echo | WaitKind::Failure => {
+            rest_after_build(elapsed).max(Duration::from_secs(cooldown_secs_for_streak(streak)))
+        }
+        WaitKind::TooSlow => too_slow_rest(too_slow_streak),
+    };
     map.insert(
         repo_path.to_string(),
-        EchoCooldown {
-            until: now + Duration::from_secs(secs),
+        LiveWait {
+            until: finished + wait,
             streak,
-            unchanged_echo,
+            too_slow_streak,
+            kind,
         },
     );
+    wait
+}
+
+/// Outcomes of builds [`start_refresh`] ran on a background thread, waiting to
+/// be handed to the next ask for that repository. At most one per repository.
+fn finished_builds() -> &'static Mutex<HashMap<String, LiveRefreshOutcome>> {
+    static MAP: OnceLock<Mutex<HashMap<String, LiveRefreshOutcome>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_finished_builds() -> std::sync::MutexGuard<'static, HashMap<String, LiveRefreshOutcome>> {
+    finished_builds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The one live build allowed to run at a time, across every repository.
+///
+/// The frontend used to provide this by awaiting each build inside its single
+/// queue slot. Once a build no longer holds the IPC call, nothing else would
+/// stop every tab restored at launch from starting its own child at once.
+fn live_build_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+struct LiveBuildSlot;
+
+impl LiveBuildSlot {
+    /// Claim the slot for `repo_path`, or name the repository holding it.
+    fn claim(repo_path: &str) -> Result<Self, String> {
+        let mut slot = live_build_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(holder) = slot.as_ref() {
+            return Err(holder.clone());
+        }
+        *slot = Some(repo_path.to_string());
+        Ok(Self)
+    }
+}
+
+impl Drop for LiveBuildSlot {
+    fn drop(&mut self) {
+        *live_build_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// Facts for a probe the spawn gate refused to start: nothing was learned
@@ -223,6 +370,7 @@ fn skip_deferred_outcome(facts: LiveRefreshFacts, reason: String) -> LiveRefresh
         reason: Some(reason),
         cooldown_remaining_ms: None,
         artifacts_restored: false,
+        index_too_slow: false,
     }
 }
 
@@ -240,8 +388,22 @@ fn decision_for_spawn_error(error: &str, wanted: LiveRefreshDecision) -> LiveRef
     }
 }
 
-fn skip_cooldown_outcome(remaining: Duration) -> LiveRefreshOutcome {
-    let ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// The Map strip's sentence for a repository whose live build timed out.
+fn too_slow_reason(remaining: Duration) -> String {
+    format!(
+        "Index too slow: the last automatic build ran past its {}-minute limit, so automatic \
+         indexing is paused for {} min. Press Build to index now.",
+        cli::BUILD_DEADLINE.as_secs() / 60,
+        remaining.as_secs().div_ceil(60)
+    )
+}
+
+fn skip_cooldown_outcome(remaining: Duration, kind: WaitKind) -> LiveRefreshOutcome {
+    let ms = duration_ms(remaining);
     LiveRefreshOutcome {
         decision: LiveRefreshDecision::SkipCooldown,
         facts: LiveRefreshFactsDto {
@@ -254,16 +416,19 @@ fn skip_cooldown_outcome(remaining: Duration) -> LiveRefreshOutcome {
             daemon_pending: None,
         },
         build: None,
-        reason: Some(format!(
-            "live index cooldown active; retry in {ms}ms (unchanged or failed builds)"
-        )),
+        reason: Some(match kind {
+            WaitKind::Rest => format!(
+                "live index resting after a build; edits since are folded into one build in {ms}ms"
+            ),
+            WaitKind::Echo | WaitKind::Failure => {
+                format!("live index cooldown active; retry in {ms}ms (unchanged or failed builds)")
+            }
+            WaitKind::TooSlow => too_slow_reason(remaining),
+        }),
         cooldown_remaining_ms: Some(ms),
         artifacts_restored: false,
+        index_too_slow: kind == WaitKind::TooSlow,
     }
-}
-
-fn note_productive_build(repo_path: &str) {
-    clear_live_echo_cooldown(repo_path);
 }
 
 /// True when a finished build should raise the echo cooldown.
@@ -390,9 +555,20 @@ pub struct LiveRefreshOutcome {
     /// Present only when a build was started.
     pub build: Option<BuildOutcome>,
     pub reason: Option<String>,
-    /// Remaining echo/failure backoff when `decision` is [`SkipCooldown`].
+    /// How long this repository's live index now waits before the next
+    /// automatic build: the remaining wait when `decision` is
+    /// [`SkipCooldown`], and the rest a finished build just set when it is
+    /// [`Refresh`]. A watcher tick inside the wait is answered without a build,
+    /// so the frontend holds its next ask until the wait ends and folds every
+    /// edit in between into that one ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
+    /// The last live build ran past its deadline and automatic indexing is
+    /// paused for at least [`TOO_SLOW_REST`]. Set on that build's outcome and on
+    /// every [`SkipCooldown`] answered during the pause, so the Map strip can
+    /// say the index is too slow rather than "queued".
+    #[serde(default)]
+    pub index_too_slow: bool,
     /// This build wrote consumer artifacts that were absent before it ran.
     ///
     /// Needed because such a build reports `unchanged: true` whenever the
@@ -473,18 +649,73 @@ pub fn freshness_from_cli_status(status: &CliStatus) -> (bool, bool, bool) {
     (true, is_fresh, !schema_outdated)
 }
 
-/// Decide and optionally run an incremental build after a repo change.
+/// How [`live_refresh`] runs a build it has authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveBuildRun {
+    /// On the calling thread: the outcome carries the build.
+    Inline,
+    /// On a background thread: the call answers
+    /// [`LiveRefreshDecision::Started`] and the next ask for the repository
+    /// collects the outcome.
+    Detached,
+}
+
+/// Decide and optionally run a build after a repo change, waiting for it.
 ///
 /// `repo_changed` is the watcher half of the stale signal: a settled write
 /// means the working tree may diverge from the indexed hashes even when the
 /// store still reports `is_fresh: true` (no daemon pending queue). Folded
-/// into effective freshness before the gate runs. Watcher ticks (`true`) are
-/// blocked by echo/failure cooldown. Activation (`false`) still peeks status:
-/// an `unchanged` echo's wait blocks another incremental rebuild, but a
-/// payload-obsolete index bypasses it so `--manifest` can restamp analyzer
-/// identity. An `unchanged` or failed live build is not a productive restamp
-/// and must not clear the wait.
+/// into effective freshness before the gate runs.
+///
+/// Every finished live build sets a wait (see [`WaitKind`]). Watcher ticks
+/// (`true`) inside any wait are answered [`LiveRefreshDecision::SkipCooldown`]
+/// without probing anything. Activation (`false`) still peeks status: an
+/// `unchanged` echo's wait or a productive build's rest blocks another
+/// incremental rebuild, but a payload-obsolete index or a missing artifact
+/// bypasses it so `--manifest` can restamp analyzer identity or restore the
+/// map. A timed-out build's pause blocks activation too.
 pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome {
+    live_refresh(
+        repo_path,
+        repo_changed,
+        Instant::now(),
+        LiveBuildRun::Inline,
+    )
+}
+
+/// [`maybe_refresh`] for the IPC command: the same gate and the same waits,
+/// but an authorized build runs on a background thread and this returns
+/// [`LiveRefreshDecision::Started`] as soon as the child's writer slot is held.
+///
+/// The command used to hold a blocking-pool thread, and the frontend's IPC
+/// call, for as long as the child ran — up to [`cli::BUILD_DEADLINE`]. What
+/// still runs inline is the status probe, bounded by [`cli::STATUS_DEADLINE`].
+pub fn start_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome {
+    live_refresh(
+        repo_path,
+        repo_changed,
+        Instant::now(),
+        LiveBuildRun::Detached,
+    )
+}
+
+pub(crate) fn live_refresh(
+    repo_path: &str,
+    repo_changed: bool,
+    now: Instant,
+    run: LiveBuildRun,
+) -> LiveRefreshOutcome {
+    // A build an earlier ask started has finished: its outcome is the answer,
+    // whatever this ask was for. It is stored before the writer slot is
+    // released, so no ask can find the repository idle with it still pending.
+    let collected = lock_finished_builds().remove(repo_path);
+    if let Some(mut finished) = collected {
+        // What is left of the wait it set, not the whole of it: the outcome
+        // may have waited for this ask.
+        finished.cooldown_remaining_ms =
+            live_wait(repo_path, now).map(|(remaining, _)| duration_ms(remaining));
+        return finished;
+    }
     let already_building = is_build_in_flight(repo_path);
     if already_building {
         // Busy retries must not launch status children against the active
@@ -504,14 +735,16 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
             reason: Some("a devmap build is already running for this repo".into()),
             cooldown_remaining_ms: None,
             artifacts_restored: false,
+            index_too_slow: false,
         };
     }
 
-    let now = Instant::now();
-    let cooldown = cooldown_state(repo_path, now);
-    if repo_changed {
-        if let Some((remaining, _)) = cooldown {
-            return skip_cooldown_outcome(remaining);
+    let wait = live_wait(repo_path, now);
+    if let Some((remaining, kind)) = wait {
+        // A watcher tick inside any wait is folded into the build at its end;
+        // a timed-out build's pause holds against activation as well.
+        if repo_changed || kind == WaitKind::TooSlow {
+            return skip_cooldown_outcome(remaining, kind);
         }
     }
 
@@ -535,15 +768,13 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
         Vec::new()
     };
     let artifacts_missing = !missing.is_empty();
-    if !repo_changed {
-        if let Some((remaining, unchanged_echo)) = cooldown {
-            // A build that only rewrote artifacts reports the store
-            // `unchanged`, so it raises this wait every time. Letting the wait
-            // then block the next activation is what made a missing
-            // `repo_map.json` unrecoverable without a manual build.
-            if unchanged_echo && !needs_manifest && !artifacts_missing {
-                return skip_cooldown_outcome(remaining);
-            }
+    if let Some((remaining, WaitKind::Echo)) = wait {
+        // A build that only rewrote artifacts reports the store
+        // `unchanged`, so it raises this wait every time. Letting the wait
+        // then block the next activation is what made a missing
+        // `repo_map.json` unrecoverable without a manual build.
+        if !needs_manifest && !artifacts_missing {
+            return skip_cooldown_outcome(remaining, WaitKind::Echo);
         }
     }
     // Watcher dirty forces stale; status alone can also be stale (daemon).
@@ -606,99 +837,193 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                 ),
                 LiveRefreshDecision::SkipCooldown => unreachable!(),
                 LiveRefreshDecision::SkipDeferred => unreachable!(),
+                LiveRefreshDecision::Started => unreachable!(),
                 LiveRefreshDecision::Refresh => unreachable!(),
             }),
             cooldown_remaining_ms: None,
             artifacts_restored: false,
+            index_too_slow: false,
         };
     }
-    let spawned = match live_rebuild_kind(cli.status.as_ref(), artifacts_missing) {
-        LiveRebuildKind::Manifest => cli::build(repo_path),
-        LiveRebuildKind::Incremental => cli::refresh(repo_path),
-    };
-    match spawned {
-        Ok(build) => {
-            // Only a *successful* build can be credited with the artifacts,
-            // and only ones that were actually absent beforehand count.
-            let artifacts_restored =
-                artifacts_missing && build.ok && missing_artifacts(repo_path).is_empty();
-            if artifacts_restored {
-                // Productive even when the store echoed `unchanged`.
-                note_productive_build(repo_path);
-            } else if artifacts_missing {
-                // This build ran *because* artifacts were absent and they are
-                // absent still. Whatever the store said about itself, the build
-                // did not do the thing it was spawned to do, so it backs off on
-                // the failure flavour rather than the benign-echo one — an
-                // `unchanged: true` here describes the database, not the files
-                // beside it that were the reason to run at all.
-                raise_echo_cooldown(repo_path, Instant::now(), false);
-            } else if build_is_echo_or_failure(&build) {
-                raise_echo_cooldown(
-                    repo_path,
-                    Instant::now(),
-                    build.ok
-                        && build
-                            .report
-                            .as_ref()
-                            .and_then(|report| report.get("unchanged"))
-                            .and_then(Value::as_bool)
-                            == Some(true),
-                );
-            } else if build.ok {
-                note_productive_build(repo_path);
-            }
-            LiveRefreshOutcome {
-                decision,
-                facts: facts.into(),
-                reason: if build.ok {
-                    None
-                } else {
-                    Some(
-                        build
-                            .stderr
-                            .trim()
-                            .to_string()
-                            .if_empty_then(|| "devmap refresh failed".into()),
-                    )
-                },
-                build: Some(build),
-                cooldown_remaining_ms: None,
-                artifacts_restored,
-            }
+    let rebuild = live_rebuild_kind(cli.status.as_ref(), artifacts_missing);
+    // Activation inside a productive build's rest. Checked after the gate, so
+    // a fresh store still answers `SkipFresh` and a missing artifact or an
+    // obsolete payload still heals; what waits is an incremental rebuild of a
+    // tree a build indexed moments ago, which is what an activation that
+    // follows a watcher tick would otherwise start on every focus change.
+    if let Some((remaining, WaitKind::Rest)) = wait {
+        if rebuild == LiveRebuildKind::Incremental {
+            return skip_cooldown_outcome(remaining, WaitKind::Rest);
         }
-        Err(e) => {
-            let decision = decision_for_spawn_error(&e, decision);
-            if decision == LiveRefreshDecision::SkipDeferred {
-                // Status answered, then the build itself was shed. Not a
-                // failed build: no cooldown; keep what status did establish.
-                return skip_deferred_outcome(facts, e);
-            }
-            LiveRefreshOutcome {
-                decision,
-                facts: LiveRefreshFactsDto {
-                    already_building: decision == LiveRefreshDecision::SkipBuilding,
-                    ..facts.into()
-                },
+    }
+    let slot = match LiveBuildSlot::claim(repo_path) {
+        Ok(slot) => slot,
+        Err(holder) => {
+            return LiveRefreshOutcome {
+                decision: LiveRefreshDecision::SkipBuilding,
+                facts: facts.into(),
                 build: None,
-                reason: Some(e),
+                reason: Some(format!(
+                    "the live index is building {holder}; one automatic build runs at a time"
+                )),
                 cooldown_remaining_ms: None,
                 artifacts_restored: false,
+                index_too_slow: false,
+            };
+        }
+    };
+    let settle = LiveSettle {
+        repo_path: repo_path.to_string(),
+        decision,
+        facts,
+        artifacts_missing,
+        started: now,
+    };
+    let prepared = match cli::prepare(repo_path, rebuild == LiveRebuildKind::Manifest) {
+        Ok(prepared) => prepared,
+        Err(error) => return settle.record(Err(error), Duration::ZERO),
+    };
+    let build_clock = Instant::now();
+    match run {
+        LiveBuildRun::Inline => {
+            let outcome =
+                prepared.run_then(|spawned| settle.record(spawned, build_clock.elapsed()));
+            drop(slot);
+            outcome
+        }
+        LiveBuildRun::Detached => {
+            let thread_settle = settle.clone();
+            let started = std::thread::Builder::new()
+                .name("devmap-live-build".into())
+                .spawn(move || {
+                    crate::engine::git_cli::with_background_processes(|| {
+                        prepared.run_then(|spawned| {
+                            let outcome = thread_settle.record(spawned, build_clock.elapsed());
+                            lock_finished_builds().insert(thread_settle.repo_path.clone(), outcome);
+                            // Free for the next repository the moment the
+                            // outcome is collectable, not when this thread
+                            // finishes unwinding.
+                            drop(slot);
+                        })
+                    });
+                });
+            match started {
+                Ok(_) => LiveRefreshOutcome {
+                    decision: LiveRefreshDecision::Started,
+                    facts: facts.into(),
+                    build: None,
+                    reason: Some(
+                        "devmap build started in the background; the next ask collects its outcome"
+                            .into(),
+                    ),
+                    cooldown_remaining_ms: None,
+                    artifacts_restored: false,
+                    index_too_slow: false,
+                },
+                // The closure, and with it the writer slot and the live slot,
+                // was dropped with the failed spawn.
+                Err(error) => settle.record(
+                    Err(format!(
+                        "could not start the live index build thread: {error}"
+                    )),
+                    Duration::ZERO,
+                ),
             }
         }
     }
 }
 
-trait IfEmpty {
-    fn if_empty_then(self, f: impl FnOnce() -> String) -> String;
+/// What a live build was authorized as, carried to wherever it finishes.
+#[derive(Debug, Clone)]
+struct LiveSettle {
+    repo_path: String,
+    decision: LiveRefreshDecision,
+    facts: LiveRefreshFacts,
+    artifacts_missing: bool,
+    /// When the ask that authorized the build was made (the governor's clock).
+    started: Instant,
 }
 
-impl IfEmpty for String {
-    fn if_empty_then(self, f: impl FnOnce() -> String) -> String {
-        if self.is_empty() {
-            f()
+impl LiveSettle {
+    /// Turn what the build did into its outcome, and set the wait it earns.
+    ///
+    /// Every build that ran sets one: a productive build's rest is no longer
+    /// cleared, which is what let an agent editing continuously keep a build
+    /// running back to back.
+    fn record(
+        &self,
+        spawned: Result<BuildOutcome, String>,
+        elapsed: Duration,
+    ) -> LiveRefreshOutcome {
+        let finished = self.started + elapsed;
+        let build = match spawned {
+            Ok(build) => build,
+            Err(error) => {
+                let decision = decision_for_spawn_error(&error, self.decision);
+                if decision == LiveRefreshDecision::SkipDeferred {
+                    // Status answered, then the build itself was shed. Not a
+                    // failed build: no wait; keep what status did establish.
+                    return skip_deferred_outcome(self.facts, error);
+                }
+                // A build that could not run at all retries on every tick
+                // unless it waits like a failed one. A writer-slot race is
+                // somebody else's build, not a failure of this one.
+                let wait = (decision != LiveRefreshDecision::SkipBuilding).then(|| {
+                    raise_live_wait(&self.repo_path, finished, elapsed, WaitKind::Failure)
+                });
+                return LiveRefreshOutcome {
+                    decision,
+                    facts: LiveRefreshFactsDto {
+                        already_building: decision == LiveRefreshDecision::SkipBuilding,
+                        ..self.facts.into()
+                    },
+                    build: None,
+                    reason: Some(error),
+                    cooldown_remaining_ms: wait.map(duration_ms),
+                    artifacts_restored: false,
+                    index_too_slow: false,
+                };
+            }
+        };
+        // Only a *successful* build can be credited with the artifacts, and
+        // only ones that were actually absent beforehand count.
+        let artifacts_restored =
+            self.artifacts_missing && build.ok && missing_artifacts(&self.repo_path).is_empty();
+        let kind = if build.timed_out {
+            WaitKind::TooSlow
+        } else if artifacts_restored {
+            // Productive even when the store echoed `unchanged`.
+            WaitKind::Rest
+        } else if self.artifacts_missing || !build.ok {
+            // A build that ran *because* artifacts were absent and left them
+            // absent did not do the thing it was spawned to do, so it backs
+            // off on the failure flavour rather than the benign-echo one — an
+            // `unchanged: true` here describes the database, not the files
+            // beside it that were the reason to run at all.
+            WaitKind::Failure
+        } else if build_is_echo_or_failure(&build) {
+            WaitKind::Echo
         } else {
-            self
+            WaitKind::Rest
+        };
+        let wait = raise_live_wait(&self.repo_path, finished, elapsed, kind);
+        let failure = (!build.ok).then(|| {
+            super::cli::failure_detail(&build.stdout, &build.stderr, "devmap refresh failed".into())
+        });
+        LiveRefreshOutcome {
+            decision: self.decision,
+            facts: self.facts.into(),
+            reason: match (kind, failure) {
+                (WaitKind::TooSlow, Some(detail)) => {
+                    Some(format!("{} ({detail})", too_slow_reason(wait)))
+                }
+                (WaitKind::TooSlow, None) => Some(too_slow_reason(wait)),
+                (_, failure) => failure,
+            },
+            build: Some(build),
+            cooldown_remaining_ms: Some(duration_ms(wait)),
+            artifacts_restored,
+            index_too_slow: kind == WaitKind::TooSlow,
         }
     }
 }
@@ -706,6 +1031,7 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
     use serde_json::json;
 
@@ -1246,6 +1572,445 @@ exit 2
             LiveRefreshDecision::SkipCooldown,
             "activation must not reset watcher-echo cooldown"
         );
+    }
+
+    /// A trusted fixture repository with stub artifacts and a stub `devmap`
+    /// whose body is `script`; the binding is returned so the caller can state
+    /// the status the probe answers.
+    #[cfg(unix)]
+    fn stub_repository(script: &str) -> (tempfile::TempDir, cli::TestBinaryBinding) {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo.path())
+            .output_locked()
+            .expect("git init");
+        assert!(output.status.success());
+        crate::test_support::trust_repo(repo.path());
+        write_stub_artifacts(repo.path());
+        let bin = repo.path().join("devmap");
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        (repo, bound)
+    }
+
+    /// Lets a stub build that waits for a `release` file finish, and waits
+    /// (bounded) for the live slot it holds to come free. A failed assertion
+    /// must not leave a background build holding the slot for every test that
+    /// runs after it.
+    #[cfg(unix)]
+    struct ReleaseStub(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for ReleaseStub {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), "");
+            let deadline = Instant::now() + Duration::from_secs(35);
+            while live_build_slot()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// The duty cycle under an agent edit storm: one settled write per second
+    /// for ten minutes, every build productive (`unchanged: false`) and the
+    /// store reporting stale throughout, because the agent keeps editing.
+    ///
+    /// A productive build used to *clear* the cooldown, so every tick built:
+    /// 600 builds in ten minutes, back to back. The clock is injected so the
+    /// ten minutes cost what twenty stub builds cost, not ten minutes.
+    #[test]
+    #[cfg(unix)]
+    fn productive_edit_storm_builds_at_most_once_per_rest_window() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  printf '%s\n' '{"ok":true,"unchanged":false}'
+  exit 0
+fi
+echo unexpected: "$*" >&2
+exit 2
+"#,
+        );
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
+        let path = repo.path().to_string_lossy().into_owned();
+        let start = Instant::now();
+        let mut built_at: Vec<u64> = Vec::new();
+        for second in 0..600u64 {
+            let outcome = live_refresh(
+                &path,
+                true,
+                start + Duration::from_secs(second),
+                LiveBuildRun::Inline,
+            );
+            match outcome.decision {
+                LiveRefreshDecision::Refresh => {
+                    assert!(
+                        outcome.build.as_ref().is_some_and(|build| build.ok),
+                        "{outcome:?}"
+                    );
+                    built_at.push(second);
+                }
+                LiveRefreshDecision::SkipCooldown => {}
+                other => panic!("unexpected decision during the edit storm: {other:?}"),
+            }
+        }
+        // `max(30 s, 2 x build)`: the stub builds in milliseconds, so the
+        // floor governs. Every gap is measured, not only the count.
+        for pair in built_at.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= 30,
+                "two builds {}s apart inside one rest window: {built_at:?}",
+                pair[1] - pair[0]
+            );
+        }
+        assert!(
+            built_at.len() <= 20,
+            "a 10-minute storm spawned {} builds: {built_at:?}",
+            built_at.len()
+        );
+        assert!(
+            !built_at.is_empty(),
+            "the storm must still be indexed, not starved"
+        );
+    }
+
+    #[test]
+    fn rest_is_twice_the_build_floored_at_30s_and_capped_at_10min() {
+        assert_eq!(rest_after_build(Duration::ZERO), LIVE_REST_FLOOR);
+        assert_eq!(rest_after_build(Duration::from_secs(14)), LIVE_REST_FLOOR);
+        assert_eq!(
+            rest_after_build(Duration::from_secs(53)),
+            Duration::from_secs(106),
+            "the audit's average build earns twice its own length"
+        );
+        assert_eq!(
+            rest_after_build(Duration::from_secs(821)),
+            LIVE_REST_CAP,
+            "the audit's slowest build is capped"
+        );
+        assert_eq!(rest_after_build(Duration::MAX), LIVE_REST_CAP);
+    }
+
+    #[test]
+    fn a_timed_out_build_pauses_at_least_ten_minutes_and_doubles_to_an_hour() {
+        assert_eq!(too_slow_rest(0), Duration::from_secs(10 * 60));
+        assert_eq!(too_slow_rest(1), Duration::from_secs(20 * 60));
+        assert_eq!(too_slow_rest(2), Duration::from_secs(40 * 60));
+        assert_eq!(too_slow_rest(3), TOO_SLOW_REST_CAP);
+        assert_eq!(too_slow_rest(u32::MAX), TOO_SLOW_REST_CAP);
+    }
+
+    /// A timed-out build used to get the 1-60 s failure cadence and then run
+    /// again — a 15-minute child, back to back. Now nothing automatic runs for
+    /// ten minutes, activation included, and the outcome says why in words
+    /// the Map strip shows.
+    #[test]
+    #[cfg(unix)]
+    fn a_timed_out_build_pauses_automatic_indexing_and_says_the_index_is_too_slow() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  printf '%s\n' '{"ok":true,"unchanged":false}'
+  exit 0
+fi
+echo unexpected: "$*" >&2
+exit 2
+"#,
+        );
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
+        let path = repo.path().to_string_lossy().into_owned();
+        let start = Instant::now();
+        let settle = LiveSettle {
+            repo_path: path.clone(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: start,
+        };
+        // The outcome `PreparedBuild::run_then` hands over when the child
+        // outlives `BUILD_DEADLINE`; the deadline itself is not waited out.
+        let timed_out = BuildOutcome {
+            ok: false,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: "devmap timed out after 900s".into(),
+            timed_out: true,
+            report: None,
+        };
+        let outcome = settle.record(Ok(timed_out.clone()), cli::BUILD_DEADLINE);
+        assert!(outcome.index_too_slow, "{outcome:?}");
+        assert_eq!(outcome.cooldown_remaining_ms, Some(10 * 60 * 1_000));
+        let reason = outcome.reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Index too slow"), "{reason}");
+        assert!(reason.contains("timed out after 900s"), "{reason}");
+
+        let finished = start + cli::BUILD_DEADLINE;
+        for (after, repo_changed) in [(1u64, true), (1, false), (599, true), (599, false)] {
+            let answer = live_refresh(
+                &path,
+                repo_changed,
+                finished + Duration::from_secs(after),
+                LiveBuildRun::Inline,
+            );
+            assert_eq!(
+                answer.decision,
+                LiveRefreshDecision::SkipCooldown,
+                "{after}s after a timeout, repo_changed={repo_changed}"
+            );
+            assert!(answer.index_too_slow, "{answer:?}");
+            assert!(answer.build.is_none());
+        }
+        // Ten minutes on, the next attempt is allowed.
+        let retry = live_refresh(
+            &path,
+            false,
+            finished + Duration::from_secs(601),
+            LiveBuildRun::Inline,
+        );
+        assert_eq!(retry.decision, LiveRefreshDecision::Refresh, "{retry:?}");
+        assert!(!retry.index_too_slow);
+        // That retry built productively, so the timeout streak is over: the
+        // next timeout starts again at ten minutes.
+        let after_success = settle.record(Ok(timed_out.clone()), cli::BUILD_DEADLINE);
+        assert_eq!(after_success.cooldown_remaining_ms, Some(10 * 60 * 1_000));
+        // A second *consecutive* timeout doubles the pause.
+        let again = settle.record(Ok(timed_out), cli::BUILD_DEADLINE);
+        assert_eq!(again.cooldown_remaining_ms, Some(20 * 60 * 1_000));
+
+        // The user pressing Build outranks the pause.
+        clear_live_echo_cooldown(&path);
+        assert_eq!(live_wait(&path, finished).map(|(_, kind)| kind), None);
+    }
+
+    /// A build that could not run at all — here a binary whose stdout is not
+    /// JSON — used to answer `Refresh` with no wait, so every watcher tick
+    /// spawned it again.
+    #[test]
+    #[cfg(unix)]
+    fn a_build_that_cannot_run_waits_like_a_failed_one() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  echo not json
+  exit 0
+fi
+exit 2
+"#,
+        );
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
+        let path = repo.path().to_string_lossy().into_owned();
+        let first = maybe_refresh(&path, true);
+        assert_eq!(first.decision, LiveRefreshDecision::Refresh);
+        assert!(first.build.is_none(), "{first:?}");
+        assert!(first.cooldown_remaining_ms.is_some_and(|ms| ms > 0));
+        assert_eq!(
+            maybe_refresh(&path, true).decision,
+            LiveRefreshDecision::SkipCooldown
+        );
+    }
+
+    /// The command never waits on the child: it answers `started` once the
+    /// writer slot is held, every ask while the child runs is a probe-free
+    /// `skip_building`, and the next ask after it exits collects the outcome
+    /// together with the rest it set.
+    #[test]
+    #[cfg(unix)]
+    fn start_refresh_answers_before_the_build_and_the_next_ask_collects_it() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  i=0; while [ ! -f release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+  printf '%s\n' '{"ok":true,"unchanged":false}'
+  exit 0
+fi
+exit 2
+"#,
+        );
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
+        let path = repo.path().to_string_lossy().into_owned();
+        let _release = ReleaseStub(repo.path().to_path_buf());
+
+        let asked = Instant::now();
+        let started = start_refresh(&path, true);
+        assert_eq!(
+            started.decision,
+            LiveRefreshDecision::Started,
+            "{started:?}"
+        );
+        assert!(started.build.is_none());
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "the command waited {:?} on a build that has not finished",
+            asked.elapsed()
+        );
+        assert!(
+            is_build_in_flight(&path),
+            "the writer slot is held on return"
+        );
+
+        let busy = start_refresh(&path, true);
+        assert_eq!(busy.decision, LiveRefreshDecision::SkipBuilding);
+
+        std::fs::write(repo.path().join("release"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let collected = loop {
+            let answer = start_refresh(&path, true);
+            if answer.decision != LiveRefreshDecision::SkipBuilding {
+                break answer;
+            }
+            assert!(Instant::now() < deadline, "the build never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            collected.decision,
+            LiveRefreshDecision::Refresh,
+            "{collected:?}"
+        );
+        assert!(collected.build.as_ref().is_some_and(|build| build.ok));
+        // What is left of the 30 s floor the build set, measured at collection.
+        assert!(
+            collected
+                .cooldown_remaining_ms
+                .is_some_and(|ms| ms > 20_000 && ms <= duration_ms(LIVE_REST_FLOOR)),
+            "{collected:?}"
+        );
+        // Collected once; the rest it set now answers the next tick.
+        let next = start_refresh(&path, true);
+        assert_eq!(next.decision, LiveRefreshDecision::SkipCooldown, "{next:?}");
+    }
+
+    /// One automatic build at a time across every repository: the frontend
+    /// used to provide this by awaiting each build in its single queue slot.
+    #[test]
+    #[cfg(unix)]
+    fn one_live_build_runs_at_a_time_across_repositories() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> argv.log
+if [ "$1" = "build" ]; then
+  i=0; while [ ! -f release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+  printf '%s\n' '{"ok":true,"unchanged":false}'
+  exit 0
+fi
+exit 2
+"#;
+        let (first, bound) = stub_repository(script);
+        let _release_first = ReleaseStub(first.path().to_path_buf());
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
+        // The second repository is served by the same bound stub binary.
+        let second = tempfile::TempDir::new().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(second.path())
+            .output_locked()
+            .expect("git init")
+            .status
+            .success());
+        crate::test_support::trust_repo(second.path());
+        write_stub_artifacts(second.path());
+        let first_path = first.path().to_string_lossy().into_owned();
+        let second_path = second.path().to_string_lossy().into_owned();
+
+        assert_eq!(
+            start_refresh(&first_path, true).decision,
+            LiveRefreshDecision::Started
+        );
+        let refused = start_refresh(&second_path, true);
+        assert_eq!(
+            refused.decision,
+            LiveRefreshDecision::SkipBuilding,
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("one automatic build runs at a time")),
+            "{refused:?}"
+        );
+        // The daemon probe may ask the stub for paths; a build it may not run.
+        let second_log =
+            std::fs::read_to_string(second.path().join("argv.log")).unwrap_or_default();
+        assert!(
+            !second_log.lines().any(|line| line.starts_with("build")),
+            "the second repository built while the first was building:\n{second_log}"
+        );
+
+        std::fs::write(first.path().join("release"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while start_refresh(&first_path, true).decision == LiveRefreshDecision::SkipBuilding {
+            assert!(Instant::now() < deadline, "the first build never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(second.path().join("release"), "").unwrap();
+        let after = maybe_refresh(&second_path, true);
+        assert_eq!(after.decision, LiveRefreshDecision::Refresh, "{after:?}");
     }
 
     #[test]

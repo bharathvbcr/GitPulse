@@ -123,6 +123,51 @@ describe("IPC and event payloads are named, not inlined", () => {
   });
 });
 
+/**
+ * Wire-shaped type names declared in more than one source file.
+ *
+ * The component check above cannot see two `.ts` modules that each declare the
+ * same payload: both are "in a module", yet structural typing lets either copy
+ * drift from Rust without failing anything. Keys are type names, values the
+ * files declaring them.
+ */
+function duplicateWireTypes(sources: ReadonlyMap<string, string>): Map<string, string[]> {
+  const declaredIn = new Map<string, string[]>();
+  for (const [file, source] of sources) {
+    for (const name of new Set(wireShapedTypesIn(source))) {
+      declaredIn.set(name, [...(declaredIn.get(name) ?? []), file]);
+    }
+  }
+  return new Map([...declaredIn].filter(([, files]) => files.length > 1));
+}
+
+describe("a wire type has one declaring module", () => {
+  it("detects the same payload declared in two modules", () => {
+    const sources = new Map([
+      ["a.ts", "export interface Dup {\n  commit_id: string;\n}\n"],
+      ["b.ts", "interface Dup {\n  commit_id: string;\n}\n"],
+      ["c.ts", "export interface Solo {\n  commit_id: string;\n}\n"],
+      ["d.ts", "export interface Plain {\n  commitId: string;\n}\nexport interface Plain2 {\n  commitId: string;\n}\n"],
+      ["e.ts", "export interface Plain {\n  commitId: string;\n}\n"],
+    ]);
+    expect([...duplicateWireTypes(sources)]).toEqual([["Dup", ["a.ts", "b.ts"]]]);
+  });
+
+  it("has no wire-shaped type declared in two frontend files", () => {
+    const sources = new Map(
+      frontendFiles(COMPONENT_ROOT).map((file) => [
+        path.relative(COMPONENT_ROOT, file),
+        readFileSync(file, "utf8"),
+      ]),
+    );
+    expect(sources.size).toBeGreaterThan(100);
+    expect(
+      Object.fromEntries(duplicateWireTypes(sources)),
+      "declare the payload once in a types module and import it everywhere else",
+    ).toEqual({});
+  });
+});
+
 describe("wire types live in modules, not components", () => {
   const components = svelteFiles(COMPONENT_ROOT);
 

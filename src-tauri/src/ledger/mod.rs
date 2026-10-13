@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS events (
   detail_json    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_repo_ts  ON events(repo_path, ts_utc);
+CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
+    WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_binding  ON events(worktree_path, ts_utc)
@@ -147,6 +149,41 @@ CREATE TABLE IF NOT EXISTS fleet_languages (
 
 /// This build's event schema version, written into every row.
 pub const SCHEMA_VERSION: i64 = 1;
+
+/// The writer generation stamped into the ledger (`PRAGMA user_version`).
+///
+/// Distinct from [`SCHEMA_VERSION`], which versions one event row: this
+/// versions the *rules writers follow*, such as which cursors a `session.*`
+/// row must move. A build that predates a rule writes rows the newer rules
+/// treat as new (a 1.3.1 daemon appended transcript rows without moving 1.4.0's
+/// `transcript_cursors`, and the app then re-ingested those bytes as
+/// duplicates). Bump this whenever a rule like that changes; every build that
+/// knows about the stamp refuses a ledger stamped newer than itself, and a
+/// build older than the stamp's introduction is stopped by the daemon lock and
+/// the version check in Health instead.
+pub const WRITER_VERSION: i64 = 1;
+
+/// Refuses a ledger a newer writer has stamped, and stamps one a writer of
+/// this generation is now using. Never lowers the stamp.
+fn check_writer_version(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
+    let stamped: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+    if stamped > WRITER_VERSION {
+        return Err(LedgerError::new(
+            "writer_too_old",
+            format!(
+                "{} was written by a newer GitPulse (writer generation {stamped}; this build is {WRITER_VERSION}). Update GitPulse, or restart the old gitpulsed, before writing to it.",
+                db_path.display()
+            ),
+        ));
+    }
+    if stamped < WRITER_VERSION {
+        conn.pragma_update(None, "user_version", WRITER_VERSION)
+            .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+    }
+    Ok(())
+}
 
 /// Who acted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +381,24 @@ fn announce(repo_path: &str, cursor: i64) {
     }
 }
 
+/// One segment of an event action name: lowercase ASCII letters and digits,
+/// every other character folded to `_`.
+///
+/// The single owner of what an action segment may contain, shared by command
+/// lines ([`action_for_argv`]) and the reflog replay, so a verb from either
+/// source is spelled the same way in the ledger.
+pub(crate) fn action_segment(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Derives an event action name from a command line.
 ///
 /// `git commit` becomes `git.commit`; anything else becomes `command.run`, so a
@@ -352,16 +407,7 @@ fn announce(repo_path: &str, cursor: i64) {
 pub fn action_for_argv(argv: &[&str]) -> String {
     match (argv.first(), argv.get(1)) {
         (Some(&"git"), Some(sub)) => {
-            let clean: String = sub
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() {
-                        c.to_ascii_lowercase()
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
+            let clean = action_segment(sub);
             if clean.is_empty() || !clean.starts_with(|c: char| c.is_ascii_lowercase()) {
                 "command.run".to_string()
             } else {
@@ -372,11 +418,45 @@ pub fn action_for_argv(argv: &[&str]) -> String {
     }
 }
 
-type Registry = Mutex<HashMap<PathBuf, Result<Mutex<Connection>, LedgerError>>>;
+/// One repository's connection, behind its own lock.
+///
+/// The slot stays empty until an open succeeds: a failed open is returned to
+/// its caller and retried by the next one, so one transient `SQLITE_BUSY` or
+/// permission race cannot disable the ledger for the process lifetime.
+#[derive(Default)]
+pub(crate) struct Slot {
+    conn: Mutex<Option<Live>>,
+}
+
+/// An open connection and the identity of the file it was opened on.
+struct Live {
+    conn: Connection,
+    file: Option<FileId>,
+}
+
+/// Device and inode of the database file: enough to notice that
+/// `.devcouncil/` was deleted and recreated underneath an open connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId(u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| FileId(meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<FileId> {
+    None
+}
+
+type Registry = Mutex<HashMap<PathBuf, std::sync::Arc<Slot>>>;
 type DroppedRegistry = Mutex<HashMap<PathBuf, u64>>;
 
 /// One connection per repository, opened once.
-fn registry() -> &'static Registry {
+pub(crate) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -714,6 +794,8 @@ pub(crate) fn read_checked_state_file(
 }
 
 fn open(db_path: &Path) -> Result<Connection, LedgerError> {
+    #[cfg(test)]
+    tests::LEDGER_WRITE_OPENS.with(|opens| opens.set(opens.get() + 1));
     let dir = db_path.parent().ok_or_else(|| {
         LedgerError::new(
             "state_path_invalid",
@@ -759,11 +841,64 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
         .map_err(|e| LedgerError::new("pragma_failed", format!("journal_mode: {e}")))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| LedgerError::new("pragma_failed", format!("synchronous: {e}")))?;
+    // Before the schema batch: a refused writer must not alter anything.
+    check_writer_version(&conn, db_path)?;
     conn.execute_batch(SCHEMA)
         .map_err(|e| LedgerError::new("schema_failed", e.to_string()))?;
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
     Ok(conn)
+}
+
+/// Opens an existing ledger read-only, or `Ok(None)` when there is none.
+///
+/// The read half of [`open`], for a process that must not create, secure or
+/// migrate the database: no directory or file is created, nothing is
+/// chmodded, and a read-only connection cannot run the WAL pragmas or the
+/// schema DDL. The same no-symlink, inside-the-repository validation runs
+/// before and after the open, by metadata only — never by opening and closing
+/// a descriptor, which would drop this process's SQLite locks (see [`open`]).
+fn open_readonly(db_path: &Path) -> Result<Option<Connection>, LedgerError> {
+    let dir = db_path.parent().ok_or_else(|| {
+        LedgerError::new(
+            "state_path_invalid",
+            format!("ledger path has no parent: {}", db_path.display()),
+        )
+    })?;
+    let repo = dir.parent().ok_or_else(|| {
+        LedgerError::new(
+            "state_path_invalid",
+            format!(
+                "ledger state directory has no repository: {}",
+                dir.display()
+            ),
+        )
+    })?;
+    if checked_state_file_metadata(db_path, Some(repo))?.is_none() {
+        return Ok(None);
+    }
+    validate_ledger_files(db_path, repo)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| LedgerError::new("open_failed", format!("{}: {e}", db_path.display())))?;
+    checked_state_directory(dir, Some(repo), false)?;
+    validate_ledger_files(db_path, repo)?;
+    Ok(Some(conn))
+}
+
+/// Whether a read-only connection's database has `table`. A creator that died
+/// between creating the file and its schema leaves a database with none, and
+/// a read-only reader cannot add them; such a ledger holds no rows.
+fn has_table(conn: &Connection, table: &str) -> Result<bool, LedgerError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .map_err(|e| LedgerError::new("query_failed", e.to_string()))
 }
 
 #[cfg(unix)]
@@ -868,37 +1003,99 @@ fn secure_ledger_files(_db_path: &Path, _repo: &Path) -> Result<(), LedgerError>
 
 /// Runs `f` against this repo's connection.
 ///
-/// The open is attempted once per repository and the result — success *or*
-/// failure — is cached. Retrying a failed open on every append would turn a
-/// read-only checkout into a syscall storm on the mutation path.
+/// The registry lock covers only the map lookup; the open, the schema DDL and
+/// `f` run under the repository's own slot lock, so one busy or slow ledger
+/// stalls that repository alone. Cross-process writers are serialised by
+/// SQLite (WAL plus the busy timeout set in [`open`]), which is also what the
+/// schema's monotonic cursor rests on: it is per database, so no lock shared
+/// between repositories ever protected it.
+///
+/// An open that fails is not remembered. A connection whose database file was
+/// deleted or replaced is dropped and reopened, rather than appending to an
+/// unlinked inode while [`status`] reports `recording`.
 fn with_conn<T>(
     repo_path: &str,
     f: impl FnOnce(&Connection) -> Result<T, LedgerError>,
 ) -> Result<T, LedgerError> {
     let db_path = ledger_path(repo_path);
-    let mut reg = registry()
+    let slot = {
+        let mut reg = registry().lock().map_err(|_| {
+            LedgerError::new("registry_poisoned", "ledger registry mutex was poisoned")
+        })?;
+        std::sync::Arc::clone(reg.entry(db_path.clone()).or_default())
+    };
+    let mut guard = slot
+        .conn
         .lock()
-        .map_err(|_| LedgerError::new("registry_poisoned", "ledger registry mutex was poisoned"))?;
+        .map_err(|_| LedgerError::new("conn_poisoned", "ledger connection mutex was poisoned"))?;
 
-    let entry = reg
-        .entry(db_path.clone())
-        .or_insert_with(|| open(&db_path).map(Mutex::new));
-
-    match entry {
-        Err(e) => Err(e.clone()),
-        // The registry lock is still held, so this reference is already
-        // exclusive: `get_mut` reaches the connection without a second lock,
-        // and cannot deadlock the way a nested `lock()` could.
-        //
-        // Holding the registry across `f` is deliberate rather than incidental.
-        // It is what makes "one writer" true across every repository at once,
-        // which is the property the schema's monotonic cursor rests on. Appends
-        // cost tens of microseconds, so the contention this creates is far
-        // cheaper than the coordination it replaces.
-        Ok(lock) => f(lock.get_mut().map_err(|_| {
-            LedgerError::new("conn_poisoned", "ledger connection mutex was poisoned")
-        })?),
+    if guard
+        .as_ref()
+        .is_some_and(|live| live.file.is_some() && file_id(&db_path) != live.file)
+    {
+        *guard = None;
     }
+    if guard.is_none() {
+        let conn = open(&db_path)?;
+        *guard = Some(Live {
+            conn,
+            file: file_id(&db_path),
+        });
+    }
+    match guard.as_ref() {
+        Some(live) => f(&live.conn),
+        None => Err(LedgerError::new("open_failed", "ledger connection missing")),
+    }
+}
+
+/// Begins a write transaction that takes the write lock up front.
+///
+/// A deferred transaction that reads first and writes later must upgrade its
+/// lock mid-flight, and SQLite fails that upgrade with `SQLITE_BUSY` at once
+/// when another process wrote in between — the busy timeout does not apply.
+/// `IMMEDIATE` waits for the lock at `BEGIN`, where the timeout does. Every
+/// multi-statement writer goes through here.
+fn write_tx(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
+/// How a read reaches the database.
+#[derive(Clone, Copy)]
+enum Access {
+    /// The shared writable connection: creates and migrates on first use.
+    Writable,
+    /// A fresh `SQLITE_OPEN_READ_ONLY` connection: never creates, migrates,
+    /// chmods or checkpoints, so a read-only tool cannot change the ledger.
+    ReadOnly,
+}
+
+fn with_access<T>(
+    repo_path: &str,
+    access: Access,
+    f: impl FnOnce(&Connection) -> Result<T, LedgerError>,
+) -> Result<T, LedgerError> {
+    match access {
+        Access::Writable => with_conn(repo_path, f),
+        Access::ReadOnly => {
+            let conn = open_readonly_initialised(&ledger_path(repo_path))?;
+            f(&conn)
+        }
+    }
+}
+
+/// [`open_readonly`] for a reader that needs a ledger to read: a missing
+/// file or a database with no schema yet is reported, never read as empty.
+fn open_readonly_initialised(db_path: &Path) -> Result<Connection, LedgerError> {
+    let not_initialised = |message: &str| LedgerError::new("not_initialised", message);
+    let conn = open_readonly(db_path)?.ok_or_else(|| {
+        not_initialised("no ledger in this repository yet; nothing has been recorded")
+    })?;
+    if !has_table(&conn, "events")? {
+        return Err(not_initialised(
+            "the ledger file has no schema yet; nothing has been recorded",
+        ));
+    }
+    Ok(conn)
 }
 
 /// Appends one event and returns its cursor id.
@@ -946,6 +1143,23 @@ struct Prepared {
     detail: Option<String>,
 }
 
+/// `contracts/event.schema.json`'s action pattern,
+/// `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`: two or more dot-separated words,
+/// each starting with a lowercase letter.
+fn valid_action(action: &str) -> bool {
+    let mut words = 0;
+    for word in action.split('.') {
+        let mut chars = word.chars();
+        let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !ok {
+            return false;
+        }
+        words += 1;
+    }
+    words >= 2
+}
+
 fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
     if draft.repo_path.is_empty() {
         return Err(LedgerError::new(
@@ -957,6 +1171,13 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         return Err(LedgerError::new(
             "no_action",
             "an event must name an action",
+        ));
+    }
+
+    if !valid_action(&draft.action) {
+        return Err(LedgerError::new(
+            "invalid_action",
+            "an action must be a dotted lowercase name such as git.commit",
         ));
     }
 
@@ -1146,9 +1367,7 @@ pub(crate) fn advance_transcripts(
         let failed = |e: rusqlite::Error| LedgerError::new("insert_failed", e.to_string());
         // IMMEDIATE takes the write lock before the offset is read, so a
         // second process cannot move it between the check and the write.
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(failed)?;
+        let tx = write_tx(conn).map_err(failed)?;
         let mut recorded = 0i64;
         let mut newest = None;
         for (advance, events) in advances.iter().zip(&prepared) {
@@ -1214,7 +1433,7 @@ pub(crate) fn forget_transcripts(
     let worktree = transcript_key(Path::new(worktree_path));
     with_conn(repo_path, |conn| {
         let failed = |e: rusqlite::Error| LedgerError::new("forget_failed", e.to_string());
-        let tx = conn.unchecked_transaction().map_err(failed)?;
+        let tx = write_tx(conn).map_err(failed)?;
         for key in file_keys {
             tx.execute(
                 "DELETE FROM transcript_cursors WHERE worktree_key = ?1 AND file_key = ?2",
@@ -1249,7 +1468,7 @@ pub fn record(draft: Draft) -> Option<i64> {
 /// asks for what followed, and the answer is the same whether it has been
 /// listening for an hour or has just opened the app.
 pub fn tail(repo_path: &str, cursor: i64, limit: u32) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, false)
+    read_after(repo_path, cursor, limit, false, Access::Writable)
 }
 
 /// The newest `limit` events after `cursor`, oldest first.
@@ -1265,8 +1484,14 @@ pub fn tail_newest(
     cursor: i64,
     limit: u32,
 ) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, true)
+    read_after(repo_path, cursor, limit, true, Access::Writable)
 }
+
+/// Any row attributed to a repository other than the two spellings `?1 <= ?2`.
+/// See [`latest_binding`] for why this is range probes rather than `NOT IN`.
+const FOREIGN_ROW_SQL: &str = "SELECT 1 FROM events
+     WHERE repo_path < ?1 OR (repo_path > ?1 AND repo_path < ?2) OR repo_path > ?2
+     LIMIT 1";
 
 /// The newest bind or unbind recorded for a worktree under either spelling of
 /// its path: `Some(Some(task))` for a binding, `Some(None)` for an unbind (or
@@ -1287,35 +1512,111 @@ fn latest_binding(
 ) -> Result<Option<Option<String>>, LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+    with_conn(repo_path, |conn| {
+        query_latest_binding(conn, repo_path, worktree, stored_worktree)
+    })
+}
+
+/// [`latest_binding`] over a read-only connection that is opened, queried and
+/// dropped, never cached.
+///
+/// For the agent hook, a fresh process on every Bash call and every edit: the
+/// creating path cost it a directory and file chmod, WAL and synchronous
+/// pragmas and the whole schema DDL on each call, against a ledger the app is
+/// writing. `Ok(None)` when there is no ledger, or one that never received its
+/// schema — neither can hold a binding.
+pub(crate) fn latest_binding_readonly(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    #[cfg(test)]
+    tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+    let Some(conn) = open_readonly(&ledger_path(repo_path))? else {
+        return Ok(None);
+    };
+    if !has_table(&conn, "events")? {
+        return Ok(None);
+    }
+    query_latest_binding(&conn, repo_path, worktree, stored_worktree)
+}
+
+/// The one binding query behind [`latest_binding`] and
+/// [`latest_binding_readonly`].
+fn query_latest_binding(
+    conn: &Connection,
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
-    with_conn(repo_path, |conn| {
-        let foreign = conn
-            .query_row(
-                "SELECT 1 FROM events WHERE repo_path NOT IN (?1, ?2) LIMIT 1",
-                params![canonical_repo_path, stored_repo_path],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
-        if foreign.is_some() {
-            return Err(LedgerError::new(
-                "repository_mismatch",
-                "the ledger contains an event attributed to a different repository",
-            ));
-        }
+    // `NOT IN` cannot seek, and in the normal case — no foreign row — `LIMIT 1`
+    // never stops it early, so it scanned all of `idx_events_repo_ts` on every
+    // gated mutation and every hook process. Three range probes around the two
+    // spellings ask the same question with index seeks. `repo_path` is
+    // `TEXT NOT NULL` under BINARY collation, so `<`/`>` partition it exactly.
+    let (lo, hi) = if canonical_repo_path <= stored_repo_path {
+        (&canonical_repo_path, &stored_repo_path)
+    } else {
+        (&stored_repo_path, &canonical_repo_path)
+    };
+    let foreign = conn
+        .query_row(FOREIGN_ROW_SQL, params![lo, hi], |row| row.get::<_, i64>(0))
+        .optional()
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+    if foreign.is_some() {
+        return Err(LedgerError::new(
+            "repository_mismatch",
+            "the ledger contains an event attributed to a different repository",
+        ));
+    }
+    conn.query_row(
+        "SELECT action, task_id FROM events
+         WHERE action IN ('worktree.bind', 'worktree.unbind')
+           AND worktree_path IN (?1, ?2)
+         ORDER BY ts_utc DESC, ulid DESC
+         LIMIT 1",
+        params![worktree, stored_worktree],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+    .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
+}
+
+/// A binding's `(ts_utc, ulid)` precedence key and the task it names, if any.
+pub(crate) type NewestBinding = ((String, String), Option<String>);
+
+/// The newest bind or unbind for a worktree in one *legacy sibling* ledger,
+/// with its `(ts_utc, ulid)` precedence key, read through a read-only
+/// connection. For resolving a binding while the family's own ledger does not
+/// exist yet, so the answer can still be enforced without creating or
+/// migrating that ledger from a read.
+pub(crate) fn newest_binding_readonly(
+    sibling_repo: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<NewestBinding>, LedgerError> {
+    with_access(sibling_repo, Access::ReadOnly, |conn| {
         conn.query_row(
-            "SELECT action, task_id FROM events
+            "SELECT ts_utc, ulid, action, task_id FROM events
              WHERE action IN ('worktree.bind', 'worktree.unbind')
                AND worktree_path IN (?1, ?2)
              ORDER BY ts_utc DESC, ulid DESC
              LIMIT 1",
             params![worktree, stored_worktree],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                let action: String = row.get(2)?;
+                let task: Option<String> = row.get(3)?;
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    task.filter(|_| action == bindings::BIND),
+                ))
+            },
         )
         .optional()
         .map_err(|e| LedgerError::new("query_failed", e.to_string()))
-        .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
     })
 }
 
@@ -1324,6 +1625,7 @@ fn read_after(
     cursor: i64,
     limit: u32,
     newest: bool,
+    access: Access,
 ) -> Result<Vec<LedgerEvent>, LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
@@ -1333,7 +1635,7 @@ fn read_after(
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     let order = if newest { "DESC" } else { "ASC" };
-    with_conn(repo_path, |conn| {
+    with_access(repo_path, access, |conn| {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, ulid, ts_utc, schema_version, repo_path, worktree_path,
@@ -1534,8 +1836,7 @@ fn import_legacy_page(
 ) -> Result<(usize, Option<i64>), LedgerError> {
     let source_label = redact::text(source_label);
     with_conn(anchor, |conn| {
-        let transaction = conn
-            .unchecked_transaction()
+        let transaction = write_tx(conn)
             .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
         let mut imported = 0usize;
         let mut newest_cursor = None;
@@ -1736,6 +2037,198 @@ pub(crate) fn consolidate_worktree_ledgers(
     Ok(imported_total)
 }
 
+/// The `object` of every `reflog.*` event recorded for one checkout, in the
+/// form it is stored (redacted), for the reflog catch-up's "already recorded"
+/// test.
+///
+/// One query on the partial index `idx_events_reflog` in place of paging the whole ledger
+/// through [`tail`]. A read error is an error: the caller must not read "could
+/// not find out" as "nothing is recorded" and write the history a second time.
+/// Callers compare against [`redact::text`] of an identity, never the raw one,
+/// because the raw spelling is not what is stored.
+pub(crate) fn recorded_reflog_objects(
+    repo_path: &str,
+    worktree_path: &str,
+    is_anchor: bool,
+) -> Result<std::collections::HashSet<String>, LedgerError> {
+    let raw = worktree_path.to_string();
+    let stored = redact::text(worktree_path);
+    with_conn(repo_path, |conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT object FROM events
+                 WHERE action LIKE 'reflog.%' AND object IS NOT NULL
+                   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
+            )
+            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
+        let rows = stmt
+            .query_map(params![raw, stored, is_anchor], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| LedgerError::new("row_failed", e.to_string()))
+    })
+}
+
+/// Events kept by [`prune_events`] whatever their age: the newest ones, so
+/// the cursor never moves backwards or repeats an id.
+pub const RETAIN_NEWEST_EVENTS: i64 = 10_000;
+/// The age past which [`prune_events`] may delete an event.
+pub const RETAIN_EVENT_DAYS: u32 = 365;
+/// Rows one prune deletes, so it holds the write lock for a bounded time.
+const PRUNE_BATCH: i64 = 5_000;
+
+/// Deletes events older than `older_than_days`, never the newest
+/// `keep_newest`, and never a worktree bind or unbind (they are what a
+/// worktree's task scope is enforced from, however old). One bounded batch per
+/// call; returns how many were deleted, so a caller loops until it is 0.
+///
+/// Catch-up ([`prune_expired`]) runs it on the default policy; a host may
+/// still call it with its own. Keeping the newest rows means the highest
+/// cursor survives, so ids are never reused.
+pub fn prune_events(
+    repo_path: &str,
+    older_than_days: u32,
+    keep_newest: i64,
+) -> Result<usize, LedgerError> {
+    let keep_newest = keep_newest.max(1);
+    let age_ms = u64::from(older_than_days).saturating_mul(86_400_000);
+    let cutoff = ids::iso8601_utc(ids::now_millis().saturating_sub(age_ms));
+    with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("prune_failed", e.to_string());
+        let tx = write_tx(conn).map_err(failed)?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM events WHERE id IN (
+                     SELECT id FROM events
+                     WHERE ts_utc < ?1
+                       AND action NOT IN ('worktree.bind', 'worktree.unbind')
+                       AND id <= (SELECT COALESCE(MAX(id), 0) FROM events) - ?2
+                     ORDER BY id LIMIT ?3)",
+                params![cutoff, keep_newest, PRUNE_BATCH],
+            )
+            .map_err(failed)?;
+        tx.commit().map_err(failed)?;
+        Ok(deleted)
+    })
+}
+
+/// Batches one maintenance pass may run, so a ledger that fell far behind is
+/// brought back over several passes instead of one long write-lock hold.
+pub const PRUNE_MAX_BATCHES: usize = 20;
+
+/// What one [`prune_expired`] pass did. `error` is empty when it ran clean;
+/// a pass that could not prune must not read the same as one with nothing to
+/// prune.
+#[derive(Debug, Clone, Default)]
+pub struct PruneReport {
+    pub deleted: usize,
+    pub error: String,
+}
+
+/// The default retention policy ([`RETAIN_EVENT_DAYS`], [`RETAIN_NEWEST_EVENTS`])
+/// applied in bounded batches: at most [`PRUNE_MAX_BATCHES`] of [`PRUNE_BATCH`]
+/// rows, and no batch starts once `deadline` has passed.
+pub fn prune_expired(repo_path: &str, deadline: Option<std::time::Instant>) -> PruneReport {
+    prune_with_policy(repo_path, RETAIN_EVENT_DAYS, RETAIN_NEWEST_EVENTS, deadline)
+}
+
+fn prune_with_policy(
+    repo_path: &str,
+    older_than_days: u32,
+    keep_newest: i64,
+    deadline: Option<std::time::Instant>,
+) -> PruneReport {
+    let mut report = PruneReport::default();
+    for _ in 0..PRUNE_MAX_BATCHES {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        match prune_events(repo_path, older_than_days, keep_newest) {
+            Ok(0) => break,
+            Ok(n) => report.deleted += n,
+            Err(error) => {
+                log::error!(target: "ledger", "event retention failed for {repo_path}: {error}");
+                report.error = format!("ledger retention failed: {error}");
+                break;
+            }
+        }
+    }
+    report
+}
+
+/// The first sibling ledger holding rows [`consolidate_worktree_ledgers`] has
+/// not imported into `anchor`, found without importing them.
+///
+/// The read-only twin of consolidation's steady-state check, for a lookup
+/// that must fail closed on unmigrated history rather than run the migration:
+/// a legacy sibling may hold the binding event that decides the answer.
+/// Sources persist after import, so existence proves nothing; a source is
+/// consolidated when it is empty or the anchor's marker for it has reached its
+/// newest row — exactly where a completed import leaves the marker. A source
+/// that shrank below its marker was replaced, and consolidation re-reads it,
+/// so it counts as unimported until then.
+pub(crate) fn unconsolidated_legacy_ledger(
+    anchor: &str,
+    members: &[PathBuf],
+) -> Result<Option<PathBuf>, LedgerError> {
+    let anchor_path = std::fs::canonicalize(anchor).map_err(|error| {
+        LedgerError::new(
+            "legacy_anchor_invalid",
+            format!("could not resolve family ledger anchor: {error}"),
+        )
+    })?;
+    let mut anchor_conn: Option<Option<Connection>> = None;
+    for source in members {
+        if source == &anchor_path {
+            continue;
+        }
+        let source_db = ledger_path(&source.to_string_lossy());
+        let Some(source_conn) = open_readonly(&source_db)? else {
+            continue;
+        };
+        let source_max: i64 = if has_table(&source_conn, "events")? {
+            source_conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| {
+                    LedgerError::new(
+                        "legacy_read_failed",
+                        format!("could not read {}: {error}", source_db.display()),
+                    )
+                })?
+        } else {
+            0
+        };
+        if source_max == 0 {
+            continue;
+        }
+        if anchor_conn.is_none() {
+            anchor_conn = Some(open_readonly(&ledger_path(anchor))?);
+        }
+        let marker = match anchor_conn.as_ref().and_then(Option::as_ref) {
+            Some(conn) if has_table(conn, "ledger_family_imports")? => {
+                let key = family_source_key(&anchor_path, &source.to_string_lossy())?;
+                conn.query_row(
+                    "SELECT source_cursor FROM ledger_family_imports WHERE source_key = ?1",
+                    params![key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?
+                .unwrap_or(0)
+            }
+            _ => 0,
+        };
+        if marker != source_max {
+            return Ok(Some(source.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// The highest cursor in this repo's ledger, or 0 when it is empty.
 ///
 /// Phase 3's reflog catch-up starts here: everything git recorded after this
@@ -1769,15 +2262,29 @@ pub fn is_initialised(repo_path: &str) -> bool {
 /// and "there is no ledger yet" is a distinct, reported state rather than one
 /// conjured into existence so the answer can be "recording".
 pub fn status_readonly(repo_path: &str) -> LedgerStatus {
-    if is_initialised(repo_path) {
-        return status(repo_path);
-    }
+    let path = ledger_path(repo_path);
+    let (recording, error, error_code) = if !is_initialised(repo_path) {
+        (
+            false,
+            "no ledger in this repository yet; nothing has been recorded".to_string(),
+            "not_initialised".to_string(),
+        )
+    } else {
+        match open_readonly_initialised(&path) {
+            Ok(_) => (true, String::new(), String::new()),
+            Err(e) => (false, e.message, e.code.to_string()),
+        }
+    };
     LedgerStatus {
-        recording: false,
-        path: ledger_path(repo_path).display().to_string(),
-        dropped: 0,
-        error: "no ledger in this repository yet; nothing has been recorded".to_string(),
-        error_code: "not_initialised".to_string(),
+        recording,
+        path: path.display().to_string(),
+        dropped: if recording {
+            dropped_appends(repo_path)
+        } else {
+            0
+        },
+        error,
+        error_code,
     }
 }
 
@@ -1793,7 +2300,7 @@ pub fn tail_readonly(
     if !is_initialised(repo_path) {
         return Ok(None);
     }
-    tail(repo_path, cursor, limit).map(Some)
+    read_after(repo_path, cursor, limit, false, Access::ReadOnly).map(Some)
 }
 
 pub fn status(repo_path: &str) -> LedgerStatus {
@@ -2126,7 +2633,12 @@ pub fn save_fleet_metrics(repo_path: &str, input: &FleetMetricsInput) -> Result<
     let coverage_at = input.coverage_pct.map(|_| now.clone());
     let loc_language = input.loc_language.as_deref().map(redact::text);
     with_conn(repo_path, |conn| {
-        conn.execute(
+        // One transaction for the metrics row, the language rows and the
+        // day's history: a failure part-way leaves none of them, rather than a
+        // fresh scalar row beside last scan's languages.
+        let tx = write_tx(conn)
+            .map_err(|e| LedgerError::new("fleet_metrics_tx_failed", e.to_string()))?;
+        tx.execute(
             r#"
             INSERT INTO fleet_metrics (
                 repo_path, loc, loc_language, loc_truncated, loc_at,
@@ -2191,9 +2703,10 @@ pub fn save_fleet_metrics(repo_path: &str, input: &FleetMetricsInput) -> Result<
             ],
         )
         .map_err(|e| LedgerError::new("insert_fleet_metrics_failed", e.to_string()))?;
-        write_fleet_languages(conn, &repo_identity, input.languages.as_deref())?;
-        write_fleet_history(conn, &repo_identity, &utc_day(&now), input)?;
-        Ok(())
+        write_fleet_languages(&tx, &repo_identity, input.languages.as_deref())?;
+        write_fleet_history(&tx, &repo_identity, &utc_day(&now), input)?;
+        tx.commit()
+            .map_err(|e| LedgerError::new("fleet_metrics_commit_failed", e.to_string()))
     })
 }
 
@@ -2259,18 +2772,15 @@ fn write_fleet_languages(
     let Some(languages) = languages else {
         return Ok(());
     };
-    // Delete-then-insert inside one transaction, so a failure part-way cannot
-    // leave a repository with half of one scan and half of the last.
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| LedgerError::new("fleet_languages_tx_failed", e.to_string()))?;
-    tx.execute(
+    // Delete-then-insert inside the caller's transaction, so a failure part-way
+    // cannot leave a repository with half of one scan and half of the last.
+    conn.execute(
         "DELETE FROM fleet_languages WHERE repo_path = ?1",
         params![repo_identity],
     )
     .map_err(|e| LedgerError::new("delete_fleet_languages_failed", e.to_string()))?;
     for stat in languages.iter().take(MAX_FLEET_LANGUAGES) {
-        tx.execute(
+        conn.execute(
             r#"
             INSERT INTO fleet_languages
                 (repo_path, language, color_hex, category, code_lines, file_count, percentage)
@@ -2294,8 +2804,6 @@ fn write_fleet_languages(
         )
         .map_err(|e| LedgerError::new("insert_fleet_languages_failed", e.to_string()))?;
     }
-    tx.commit()
-        .map_err(|e| LedgerError::new("fleet_languages_commit_failed", e.to_string()))?;
     Ok(())
 }
 
@@ -2508,6 +3016,9 @@ fn read_fleet_languages(
 #[cfg(test)]
 mod contract_tests;
 
+#[cfg(test)]
+mod reliability_tests;
+
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
@@ -2516,17 +3027,34 @@ pub(crate) mod tests_support {
         super::registry().lock().unwrap().clear();
         super::dropped_registry().lock().unwrap().clear();
     }
+
+    /// Read-write ledger opens this thread has made so far.
+    pub fn write_opens() -> usize {
+        super::tests::LEDGER_WRITE_OPENS.with(std::cell::Cell::get)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn action_segments_fold_to_lowercase_ascii_tokens() {
+        assert_eq!(action_segment("Cherry-Pick"), "cherry_pick");
+        assert_eq!(action_segment("é!"), "__");
+        assert_eq!(action_for_argv(&["git", "Cherry-Pick"]), "git.cherry_pick");
+        assert_eq!(action_for_argv(&["git", "9lives"]), "command.run");
+    }
+
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     thread_local! {
         /// Ledger queries this thread has issued through [`read_after`] or
         /// [`latest_binding`]; a test reads it to count what a lookup costs.
         pub(super) static LEDGER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Read-write opens ([`open`]) this thread has made: each one is the
+        /// chmod pass, the WAL pragmas and the schema DDL.
+        pub(super) static LEDGER_WRITE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// The env var that turns [`shm_lock_probe_child`] from a no-op into the
@@ -2679,6 +3207,15 @@ mod tests {
         let empty = tail_readonly(&repo, 0, 10).expect("reads");
         assert_eq!(empty.as_deref(), Some(&[][..]));
         assert!(is_initialised(&repo));
+    }
+
+    /// The one way a redaction test reports a leak: it names the field and
+    /// which secret, never the secret and never the haystack it was found in,
+    /// because a failing assert's message goes to the CI log.
+    fn assert_secret_free(haystack: &str, secrets: &[&str], what: &str) {
+        for (index, secret) in secrets.iter().enumerate() {
+            assert!(!haystack.contains(secret), "secret #{index} reached {what}");
+        }
     }
 
     fn temp_repo() -> tempfile::TempDir {
@@ -3255,6 +3792,46 @@ mod tests {
         assert!(found.health_complete);
     }
 
+    /// The defect: the ledger had no version stamp, so an older writer was
+    /// never refused. A fresh ledger is stamped; a ledger stamped by a newer
+    /// writer is refused without being altered; an unstamped (pre-stamp)
+    /// ledger is adopted and stamped.
+    #[test]
+    fn a_ledger_stamped_by_a_newer_writer_is_refused_unaltered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let db = ledger_path(&repo);
+        let version = |db: &Path| -> i64 {
+            Connection::open(db)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        drop(open(&db).expect("a fresh ledger opens"));
+        assert_eq!(version(&db), WRITER_VERSION, "a fresh ledger is stamped");
+
+        // A pre-stamp ledger (stamp 0) is adopted.
+        Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
+        drop(open(&db).expect("an unstamped ledger is adopted"));
+        assert_eq!(version(&db), WRITER_VERSION);
+
+        // A newer writer's ledger is refused, and left exactly as found.
+        Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", WRITER_VERSION + 1)
+            .unwrap();
+        let error = open(&db).expect_err("an older writer must be refused");
+        assert_eq!(error.code, "writer_too_old", "{error:?}");
+        assert_eq!(
+            version(&db),
+            WRITER_VERSION + 1,
+            "a refused writer changed the stamp"
+        );
+    }
+
     #[test]
     fn a_ledger_without_the_table_reads_as_never_scanned() {
         let dir = temp_repo();
@@ -3384,23 +3961,21 @@ mod tests {
             }
         }
         let raw = String::from_utf8_lossy(&bytes);
-        assert!(
-            !raw.contains(key),
-            "the credential reached the database in full"
-        );
+        assert_secret_free(&raw, &[key], "the database");
 
         let events = tail(repo, 0, 10).expect("tail");
         assert!(events[0].argv_json.as_ref().unwrap().contains("ghp_"));
-        assert!(!events[0].argv_json.as_ref().unwrap().contains(key));
+        assert_secret_free(
+            events[0].argv_json.as_ref().unwrap(),
+            &[key],
+            "the argv field",
+        );
         let event_json = serde_json::to_string(&events[0]).expect("serialize event");
         assert!(
             event_json.contains("ghp_"),
             "credential shape stays identifiable"
         );
-        assert!(
-            !event_json.contains(key),
-            "a credential survived in a non-argv ledger field: {event_json}"
-        );
+        assert_secret_free(&event_json, &[key], "a ledger field read back");
     }
 
     #[test]
@@ -3437,14 +4012,14 @@ mod tests {
             }
         }
         let raw = String::from_utf8_lossy(&bytes);
-        for secret in [auth, cookie, password, cli_password, private_key] {
-            assert!(!raw.contains(secret), "contextual secret reached disk");
-        }
+        let secrets = [auth, cookie, password, cli_password, private_key];
+        assert_secret_free(&raw, &secrets, "disk");
 
         let event = tail(repo, 0, 10).expect("tail").pop().expect("event");
         assert!(event.object.as_deref().unwrap().contains("<redacted>"));
         for json in [event.argv_json, event.verdict_json, event.detail_json] {
             let json = json.expect("serialized field");
+            assert_secret_free(&json, &secrets, "a ledger field read back");
             serde_json::from_str::<serde_json::Value>(&json).unwrap_or_else(|error| {
                 panic!("redaction corrupted serialized JSON: {error}: {json}")
             });
@@ -3457,12 +4032,32 @@ mod tests {
 
     #[test]
     fn redaction_failure_messages_do_not_echo_the_secret() {
-        let src = include_str!("mod.rs");
-        let forbidden = String::from("reached disk: {") + "secret}";
+        let secret = "opaque-leaked-secret-value";
+        let haystack = format!(r#"{{"field":"{secret}","other":"x"}}"#);
+
+        // Drive the failure path itself and read everything it emits: the
+        // panic payload is what the test runner prints into the log.
+        let caught = std::panic::catch_unwind(|| {
+            assert_secret_free(&haystack, &[secret], "disk");
+        })
+        .expect_err("a leaked secret must fail the assertion");
+        let emitted = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("the failure carries a message");
+
         assert!(
-            !src.contains(&forbidden),
-            "a failing assert must not write the secret into the log"
+            emitted.contains("disk"),
+            "the failure must still say where the leak was: {emitted}"
         );
+        assert!(
+            !emitted.contains(secret) && !emitted.contains(&haystack),
+            "the failure message echoed the secret or the text holding it"
+        );
+
+        // Control: a clean haystack does not trip it.
+        assert_secret_free("nothing here", &[secret], "disk");
     }
 
     #[cfg(unix)]

@@ -105,6 +105,9 @@ describe("merge and discard", () => {
       return null;
     });
     const dirty = await discardAttemptWorktree(run());
+    // The dirty count is all these actions read: the listing asks for it and
+    // nothing deeper (no diff stats, divergence or routes per worktree).
+    expect(calls.find(([c]) => c === "cmd_list_worktrees")?.[1]).toEqual({ repoPath: "/work/repo", depth: "dirty" });
     expect(calls.find(([c]) => c === "cmd_remove_worktree")?.[1]).toEqual({ repoPath: "/work/repo", targetPath: WT, force: true });
     expect(calls.find(([c]) => c === "cmd_delete_branch")?.[1]).toEqual({ repoPath: "/work/repo", branchName: "gitpulse/fix-e42-wt0attem", force: false });
     expect(dirty?.message).toMatch(/was kept: the branch is not fully merged/);

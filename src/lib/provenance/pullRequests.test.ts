@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prFreshness, prRevisionCandidates, prRevisions, wasResolved } from "./pullRequests";
+import { prFreshness, prHeadFreshness, prRevisionCandidates, prRevisions, wasResolved } from "./pullRequests";
 import { freshnessBadge } from "./badge";
 import type { ProvenanceFreshness } from "./types";
 
@@ -113,5 +113,17 @@ describe("wasResolved", () => {
     expect(wasResolved(unresolved("origin/main"))).toBe(false);
     expect(wasResolved(unresolved("a".repeat(39)))).toBe(false);
     expect(wasResolved(unresolved("A".repeat(40)))).toBe(false);
+  });
+});
+
+describe("fork pull requests", () => {
+  it("asks about no revision for a fork head and shows no freshness for it", () => {
+    const fork = { head_ref: "main", is_cross_repository: true };
+    expect(prRevisions([fork])).toEqual([]);
+    const byRevision = { "origin/main": resolved(SHA_A) };
+    expect(prHeadFreshness(byRevision, fork)).toBeNull();
+    expect(prHeadFreshness(byRevision, { head_ref: "main", is_cross_repository: false })).toEqual(
+      resolved(SHA_A),
+    );
   });
 });

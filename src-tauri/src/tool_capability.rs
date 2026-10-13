@@ -7,8 +7,10 @@
 
 use crate::tool_install::ExternalTool;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -96,9 +98,132 @@ pub fn resolve_cached(
     }
 }
 
+/// What a binary on disk looked like when it was probed: replacing or
+/// upgrading it changes one of these, which is what ends the cached answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Probe answers for CLI binaries (`gh --version`, an agent's `--version` and
+/// `--help`), keyed by the resolved binary path and stamped with its size and
+/// mtime.
+///
+/// These probes ran before every GitHub call — including the live run poll —
+/// and before every agent launch, each a process spawn for an answer that
+/// changes only when the binary does. Only answers the caller marks cacheable
+/// are kept: a probe that was shed under load, or that started and failed,
+/// may succeed a moment later and must be asked again. A program that does not
+/// resolve to a regular file is never cached either, so a tool installed after
+/// a miss is seen at once.
+pub(crate) struct BinaryProbeCache<T> {
+    entries: OnceLock<Mutex<HashMap<PathBuf, (BinaryStamp, T)>>>,
+}
+
+/// More distinct binaries than a machine has; past it the cache starts over
+/// rather than growing with every path ever probed.
+const MAX_PROBED_BINARIES: usize = 16;
+
+impl<T: Clone> BinaryProbeCache<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: OnceLock::new(),
+        }
+    }
+
+    /// Forgets every answer, so a test that forces a probe to fail is not
+    /// served an earlier test's cached success.
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        if let Some(entries) = self.entries.get() {
+            entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    /// The cached answer for `program` if the binary is unchanged, else
+    /// `probe()`'s. `probe` returns the answer and whether it may be kept.
+    pub(crate) fn get_or_probe(&self, program: &str, probe: impl FnOnce() -> (T, bool)) -> T {
+        let path = PathBuf::from(program);
+        let stamp = path
+            .is_absolute()
+            .then(|| std::fs::metadata(&path).ok())
+            .flatten()
+            .filter(std::fs::Metadata::is_file)
+            .map(|meta| BinaryStamp {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+            });
+        let Some(stamp) = stamp else {
+            return probe().0;
+        };
+        let entries = self.entries.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some((seen, answer)) = entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+        {
+            if *seen == stamp {
+                return answer.clone();
+            }
+        }
+        // Not under the lock: a probe is a process spawn.
+        let (answer, cacheable) = probe();
+        if cacheable {
+            let mut map = entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.len() >= MAX_PROBED_BINARIES && !map.contains_key(&path) {
+                map.clear();
+            }
+            map.insert(path, (stamp, answer.clone()));
+        }
+        answer
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_is_kept_until_the_binary_changes_and_only_when_cacheable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tool");
+        std::fs::write(&bin, "v1").unwrap();
+        let program = bin.to_str().unwrap();
+        let cache: BinaryProbeCache<u32> = BinaryProbeCache::new();
+        let mut probes = 0u32;
+        let mut ask = |cacheable: bool| {
+            cache.get_or_probe(program, || {
+                probes += 1;
+                (probes, cacheable)
+            })
+        };
+        // Not cacheable (a probe shed under load): asked again every time.
+        assert_eq!((ask(false), ask(false)), (1, 2));
+        assert_eq!(
+            (ask(true), ask(true), ask(true)),
+            (3, 3, 3),
+            "kept once cacheable"
+        );
+        // A different binary at the same path is a different answer.
+        std::fs::write(&bin, "version two").unwrap();
+        assert_eq!(ask(true), 4);
+        // A bare name that resolves to no file is never cached.
+        let miss: BinaryProbeCache<u32> = BinaryProbeCache::new();
+        assert_eq!(
+            miss.get_or_probe("definitely-not-installed", || (1, true)),
+            1
+        );
+        assert_eq!(
+            miss.get_or_probe("definitely-not-installed", || (2, true)),
+            2
+        );
+    }
 
     #[test]
     fn caches_negative_answer() {

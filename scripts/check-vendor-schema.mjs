@@ -52,7 +52,7 @@ export function readVendoredSchema() {
   return Number(match[1]);
 }
 
-function readCliSchema() {
+export function readCliSchema() {
   // Prefer `devmap doctor --json` (binary-declared expected_schema_version).
   // Fall back to `--version` prose only when doctor is absent (older installs).
   const doctor = spawnSync("devmap", ["doctor", "--json"], {

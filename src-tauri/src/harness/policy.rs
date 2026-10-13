@@ -22,9 +22,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::protocol::{RawDecision, OP_POLICY_CHECK_COMMAND, OP_POLICY_CHECK_FILE};
-use super::sidecar::{self, HarnessError, DEFAULT_CALL_TIMEOUT};
+use super::sidecar::{self, HarnessError, Lane, DEFAULT_CALL_TIMEOUT};
 
 const POLICY_TIMEOUT: Duration = DEFAULT_CALL_TIMEOUT;
+
+/// How long the app waits on its hook-lane sidecar for one verdict. A hook
+/// gives the app well under a second (`hooks::GATE_APP_DEADLINE`) and falls
+/// back to its own per-call path after that, so this only has to outlast a
+/// cold start of the child, not a slow verdict.
+const HOOK_LANE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The harness rules that refuse a command line because the gate could not read
 /// it rather than because of what it read. See
@@ -114,7 +120,7 @@ pub struct PolicyVerdict {
 }
 
 impl PolicyVerdict {
-    fn from_decision(target: &str, d: RawDecision) -> Self {
+    pub(crate) fn from_decision(target: &str, d: RawDecision) -> Self {
         // The shared classification, in the contract's evaluation order. A
         // decision satisfies several of these at once — a granted decision is
         // also an allow — and the earlier branch is the more honest reading.
@@ -224,9 +230,9 @@ impl PolicyVerdict {
     /// line, not because it read it and found something wrong.
     ///
     /// Whether the checkout is bound to a task is the caller's to supply (see
-    /// `harness::ScopedVerdict`): `task_id` cannot answer it, because the
-    /// harness stamps every command decision with its `host-scope` placeholder
-    /// whether or not a scope was sent.
+    /// `harness::ScopedVerdict`): `task_id` cannot answer it, because a command
+    /// decision may carry the harness's `host-scope` placeholder whether or not
+    /// a scope was sent.
     ///
     /// Each rule in [`UNREADABLE_CONSTRUCT_RULES`] is a statement about the
     /// gate's own reach: a `cd` moves where relative paths land, a heredoc body
@@ -345,6 +351,23 @@ pub fn check_command_allowing(
     scope: Option<&HostScope>,
     allowed: &[String],
 ) -> PolicyVerdict {
+    check_command_on(Lane::Shared, root, command, scope, allowed)
+}
+
+/// [`check_command_allowing`] asked of `lane`'s sidecar. The hook lane has a
+/// shorter ceiling than [`POLICY_TIMEOUT`]: its caller is a hook with a
+/// deadline of its own, and a verdict that outlasts it is of no use to anyone.
+pub(crate) fn check_command_on(
+    lane: Lane,
+    root: &str,
+    command: &str,
+    scope: Option<&HostScope>,
+    allowed: &[String],
+) -> PolicyVerdict {
+    let timeout = match lane {
+        Lane::Shared => POLICY_TIMEOUT,
+        Lane::Hook => HOOK_LANE_TIMEOUT,
+    };
     let mut params = serde_json::json!({ "command": command, "root": root });
     if let Some(scope) = scope {
         params["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
@@ -353,7 +376,7 @@ pub fn check_command_allowing(
         params["allowed_commands"] =
             serde_json::to_value(allowed).unwrap_or(serde_json::Value::Null);
     }
-    match sidecar::call_policy::<RawDecision>(OP_POLICY_CHECK_COMMAND, params, POLICY_TIMEOUT) {
+    match sidecar::call_policy_on::<RawDecision>(lane, OP_POLICY_CHECK_COMMAND, params, timeout) {
         Ok(d) => PolicyVerdict::from_decision(command, d),
         Err(e) => PolicyVerdict::unchecked(command, &e),
     }
@@ -387,7 +410,9 @@ pub fn render_command(argv: &[&str]) -> String {
         .join(" ")
 }
 
-fn shell_quote(arg: &str) -> String {
+/// `arg` as one POSIX shell word: bare when every character is safe, else
+/// single-quoted with an embedded `'` written `'\''`.
+pub fn shell_quote(arg: &str) -> String {
     let safe = !arg.is_empty()
         && arg.chars().all(|c| {
             c.is_ascii_alphanumeric()

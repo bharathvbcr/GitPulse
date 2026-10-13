@@ -56,7 +56,7 @@ const STARTING = "starting";
 const RUNNING = "running";
 
 function phaseOf(record: TerminalSessionRecord): Pick<AttemptSession, "phase" | "label"> {
-  if (isAdoptedSession(record)) return { phase: "adopted", label: "Running · not shown since the window reloaded" };
+  if (isAdoptedSession(record)) return { phase: "adopted", label: "Running · not shown in any tab" };
   if (record.status === STARTING) return { phase: "starting", label: "Starting…" };
   if (record.status === RUNNING) return { phase: "running", label: "Running in this window" };
   // A live record whose status is neither is carrying a message: a pending
@@ -166,7 +166,7 @@ export function agentGlance(session: AttemptSession, activity: SessionActivity |
   if (attention) {
     // An adopted session is the one the reader cannot see, so what it asked
     // matters most there; the line keeps saying why it is not on screen.
-    const where = session.phase === "adopted" ? " · not shown since the window reloaded" : "";
+    const where = session.phase === "adopted" ? " · not shown in any tab" : "";
     return { tone: attention.kind, headline: `${attention.label} · ${shortSpan(now - attention.at)} ago${where}`, detail: attention.detail, title };
   }
   if (session.phase === "adopted") return { tone: "adopted", headline: session.label, detail: null, title };

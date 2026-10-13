@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseCodeintelResponse, parseCodeintelStatus } from "./types";
+import { buildFailureReason, parseCodeintelResponse, parseCodeintelStatus } from "./types";
+import type { DevmapBuildOutcome } from "./types";
 
 describe("parseCodeintelResponse", () => {
   it("throws on null, arrays, and non-objects", () => {
@@ -215,5 +216,29 @@ describe("parseCodeintelStatus", () => {
       parseCodeintelStatus({ available: true, db_path: "/x", freshness_reason: null })
         .freshness_reason,
     ).toBeNull();
+  });
+});
+
+describe("buildFailureReason", () => {
+  const failed = (overrides: Partial<DevmapBuildOutcome>): DevmapBuildOutcome => ({
+    ok: false,
+    binary: "/bin/devmap",
+    lookup: "path_search",
+    stdout: "",
+    stderr: "",
+    timed_out: false,
+    ...overrides,
+  });
+
+  it("reads a --json refusal from the envelope on stdout, where stderr is empty", () => {
+    const outcome = failed({ report: { error: "store at /w/.devcouncil is not a devmap store" } });
+    expect(buildFailureReason(outcome, "the build failed")).toBe("store at /w/.devcouncil is not a devmap store");
+  });
+
+  it("falls back to stderr, then to the caller's sentence", () => {
+    expect(buildFailureReason(failed({ stderr: " locked by pid 41\n" }), "x")).toBe("locked by pid 41");
+    for (const report of [undefined, null, "text", [], { error: "" }, { error: 7 }, { files: 3 }]) {
+      expect(buildFailureReason(failed({ report }), "the build failed"), String(report)).toBe("the build failed");
+    }
   });
 });

@@ -38,14 +38,12 @@ describe("TaskDuePicker", () => {
     expect(markup).not.toContain('role="listbox"');
   });
 
-  it("can be cleared, which the native control it replaces could not be", () => {
-    expect(source).toContain('data-testid="task-due-clear"');
-    expect(source).toContain("onChange(null)");
-    // Nothing to clear is a disabled button, not a button that writes null
-    // over null and marks the draft dirty.
-    expect(source).toContain("disabled={value === null}");
-  });
-
+  // Rendered in harness/tasksChecks.js: a typed date goes through quick add's
+  // grammar and round-trips; Clear removes it, saves as none and is disabled
+  // after; the calendar opens on the due month and forgets browsing once
+  // closed; Escape closes the picker and leaves the sheet open. That last
+  // check does not discriminate the stopped propagation below (removing it
+  // still passed there), so the contract stays.
   it("distinguishes today from the chosen day", () => {
     // Outline means "you are here", fill means "this is chosen". Painting both
     // the same way makes the grid ambiguous on the day a task is due.
@@ -73,13 +71,6 @@ describe("TaskDuePicker", () => {
     expect(source).toContain('use:portal={"body"}');
     expect(source).toContain("clampMenuPosition");
     expect(source).toContain("LAYERS.MENU");
-  });
-
-  it("opens on the month the task is due in, not the month last browsed", () => {
-    expect(source).toContain("browsed = $state<{ year: number; month: number } | null>(null)");
-    expect(source).toContain("const view = $derived(browsed ?? viewFor(value, now()))");
-    // Closing forgets the browsing, so the next open follows the value again.
-    expect(source).toMatch(/function close\([\s\S]*?browsed = null;/);
   });
 
   it("takes its clock by injection so a test can pin the calendar", () => {

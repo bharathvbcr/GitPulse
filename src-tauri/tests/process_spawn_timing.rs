@@ -5,6 +5,11 @@
 //! admission gate while the bare comparison bypasses it, so colocating this
 //! measurement made unrelated gate contention affect only one side.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::engine::git_cli::capture_command;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::process::{Command, Stdio};

@@ -6,12 +6,12 @@ GitPulse is a high-performance native desktop client for Git, repository managem
 
 ## Four views, one workspace
 
-GitPulse has 4 application views. Each view keeps related sections together.
+GitPulse has 4 application views with 18 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
-| **[Code](#2-code-code)** | Browse files, inspect authorship, explore structure | Explorer · Blame · Map |
+| **[Code](#2-code-code)** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
@@ -19,15 +19,15 @@ GitPulse has 4 application views. Each view keeps related sections together.
 - **Graph, Diff and Suspects** share the selected commit (`selectedCommitId` in `graphStore`), so switching lenses never loses the commit or regression window you are reviewing.
 - **Explorer and Blame** share the selected file (`selectedFilePath` in `repoStore`), so jumping from syntax editing to line authorship keeps your active file.
 - **Overview** embeds the branch stack hierarchy directly as a collapsible card, linking stacked branches to active worktrees and pull requests.
-- **[Fleet](#53-fleet--the-whole-workspace-at-once-cmdshiftf)** compares repositories across the workspace, evaluating uncommitted churn, sync state, and health.
-- **[Tasks](#54-global--saved-workspace-tasks)** opens global and saved-workspace Kanban and list boards across repositories.
+- **[Fleet](#53-fleet--the-whole-workspace-at-once-cmdshiftf)** compares repositories across the workspace (scaling to 1,000 repositories with 24 active watches), evaluating uncommitted churn, sync state, and health.
+- **[Tasks](#54-global--saved-workspace-tasks)** opens global and saved-workspace Kanban and list boards across repositories with swimlanes and WIP limits.
 - The **[Terminal dock](#51-terminal--a-dock-not-a-view-ctrl)** stays available beneath whichever view is on screen, preserving PTY output across view switches.
 
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The Four Views (Header Tabs)"]
         Work["<b>Work</b> (<code>work</code> · <code>F10</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
-        Code["<b>Code</b> (<code>code</code> · <code>⌘1</code>)<br/>Explorer · Blame · Map — file selection & repo code map"]
+        Code["<b>Code</b> (<code>code</code> · <code>⌘1</code>)<br/>Explorer · Blame · Search · Map — file selection, text search & repo code map"]
         History["<b>History</b> (<code>history</code> · <code>⌘2</code>)<br/>Graph · Diff · Reflog · Suspects — four commit history lenses"]
         Insights["<b>Insights</b> (<code>insights</code> · <code>⌘3</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five diagnostic scans"]
     end
@@ -127,7 +127,8 @@ flowchart TD
     subgraph CodeViewSections["Code View (⌘1 / Ctrl+1)"]
         Explorer["<b>Explorer</b> (⌥1)<br/>File tree, virtualized editor, Markdown/Media/Hex previews, commit composer"]
         Blame["<b>Blame</b> (⌥2)<br/>Per-line authorship, commit blocks, age timeline & rail, coverage gutter"]
-        Map["<b>Map</b> (⌥3)<br/>DevMap repo map, code/doc graph, Markdown search, cross-repo links"]
+        SearchSec["<b>Search</b> (⌥3)<br/>Repository-wide git grep, working tree/revision search, honest cancellation"]
+        Map["<b>Map</b> (⌥4)<br/>DevMap repo map, code/doc graph, Markdown search, cross-repo links"]
     end
 ```
 
@@ -139,7 +140,7 @@ flowchart TD
 - **Inline Text Editor**: Instant toggle between syntax viewing and in-memory text editing with `⌘S` save shortcuts and dirty-state indicators.
 - **Responsive Header Controls & Scroll Cues**: Toolbars feature horizontal auto-scrolling with `ScrollCue` visual markers and boundary-aware tooltip placement (`placeTooltipBubble`).
 - **Specialized Preview Modes**:
-  - **Markdown / MarkDev**: MarkDev's own HTML renderer, outline navigation, frontmatter, task lists, tables, callout blocks, footnotes, math shown as source, repository-confined pictures, links that open in the OS or the explorer, and backlink exploration.
+  - **Markdown / MarkDev**: MarkDev's own HTML renderer, outline navigation, frontmatter, task lists, tables, callout blocks, footnotes, math unsupported (shown as its LaTeX source), repository-confined pictures, links that open in the OS or the explorer, and backlink exploration.
   - **Media & Images**: High-resolution image preview with dimensions, aspect ratios, and format inspection.
   - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters.
 - **Live Pulse Dashboard & Commit Composer**: Working-tree churn overview, instant staging buttons, and structured commit drafting (type, scope, subject). Features on-device Apple Intelligence fallback on macOS for phrasing suggestions, and pre-commit blast radius markers via `devmap preview`.
@@ -154,7 +155,14 @@ flowchart TD
 - **Coverage Gutter**: Per-line test coverage hit counts displayed alongside authorship gutters, with explicit *Coverage unavailable* indicators if coverage data is missing.
 - **Direct Commit Navigation**: Single click on any commit hash navigates straight to that commit's diff in History.
 
-### 2.3 Map (DevMap Code Intelligence)
+### 2.3 Search
+- **Repository-Wide Text Search**: High-speed text search across the working tree or an explicit Git revision powered by `git grep`.
+- **Honest Inclusion Boundaries**: Searches tracked and untracked files while strictly respecting `.gitignore` exclusions.
+- **Honest Status**: Capped, cut, timed-out, or cancelled searches explicitly declare their partial status rather than masquerading as complete results.
+- **Search Controls**: Case-sensitivity (`Aa`), regular expressions (`.*`), path-pattern scoping, and previous/next match jumping.
+- **Navigation & Shortcuts**: Reached via `⌥3` in Code, `⌘⇧F` / `Ctrl+Shift+F`, the command palette (`Open Search — find text across the repository`), or the View menu. Selecting a match opens the target file in Explorer at the exact matched line.
+
+### 2.4 Map (DevMap Code Intelligence)
 - **Repo Map Navigator**: Reads the resolved `repo_map.json` (`.devmap/repo_map.json` or `.devcouncil/repo_map.json`), exposing subsystems, entry points, critical files, and role-file counts.
 - **Interactive Code & Doc Graph Canvas**: Visual canvas mapping symbols, dependencies, and documentation relationships. Includes filters to hide notes and Markdown nodes.
 - **Repo Docs Vault**: Indexes all Git-tracked Markdown files (`git ls-files`). Features full-text search, broken link reports, and document backlinks.
@@ -253,7 +261,7 @@ flowchart TD
 ### 4.5 Storage
 - **Git Internals Audit**: Breaks down disk usage across packfiles, loose objects, reflogs, Git LFS assets, and submodules.
 - **Build & Cache Auditor**: Identifies unignored build directories (`target/`, `node_modules/`, `.venv/`, `dist/`).
-- **Repo Hygiene & Build Cleaner**: Configurable cleanup policies for stale build output across Rust, Node, Go, Python, and JVM projects, with preview dry-runs and safe restoration.
+- **Repo Hygiene & Build Cleaner**: Configurable cleanup policies for stale build output across Rust, Node, Go, Python, and JVM projects, with preview dry-runs. Cleaning deletes: nothing is restored afterwards, so read the preview first.
 
 ---
 

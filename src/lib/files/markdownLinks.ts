@@ -128,12 +128,57 @@ function closest(target: EventTarget | null, selector: string): Element | null {
   return typeof candidate?.closest === "function" ? candidate.closest(selector) : null;
 }
 
+/** Withheld pictures: the renderer leaves `src="#"` and the address as data. */
+const WITHHELD_IMAGE = "img[data-withheld-src]";
+
+/**
+ * Repository Markdown is untrusted, and a remote picture is a request the
+ * reader never made (a beacon with their IP). The renderer withholds them;
+ * a click is the reader asking for this one. Only network addresses load.
+ */
+function loadWithheldImage(image: Element): void {
+  const address = withheldAddress(image.getAttribute("data-withheld-src") ?? "");
+  if (!address) return;
+  image.setAttribute("referrerpolicy", "no-referrer");
+  image.setAttribute("src", address);
+  image.removeAttribute("data-withheld-src");
+  image.removeAttribute("role");
+  image.removeAttribute("tabindex");
+}
+
+/**
+ * The address a withheld picture may load from, or null. Only https reaches
+ * the network. A scheme-relative address would resolve against the app's own
+ * scheme, so it is read as https; plain http is not loaded, as the renderer
+ * never lets an http picture through either.
+ */
+function withheldAddress(raw: string): string | null {
+  const trimmed = raw.trim();
+  const address = trimmed.startsWith("//") ? `https:${trimmed}` : trimmed;
+  return /^https:\/\/[^/]/i.test(address) ? address : null;
+}
+
+/** Enter or Space on a withheld picture loads it, as a click does. */
+export function handleMarkdownKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const withheld = closest(event.target, WITHHELD_IMAGE);
+  if (!withheld) return;
+  event.preventDefault();
+  loadWithheldImage(withheld);
+}
+
 /**
  * Handles a click (or middle click) inside rendered Markdown. Every link is
  * claimed — the webview never follows one — and resolved by
  * {@link resolveMarkdownLink}.
  */
 export function handleMarkdownClick(event: MouseEvent, context: MarkdownClickContext): void {
+  const withheld = closest(event.target, WITHHELD_IMAGE);
+  if (withheld) {
+    event.preventDefault();
+    loadWithheldImage(withheld);
+    return;
+  }
   const copyButton = closest(event.target, `.${COPY_CLASS}`);
   if (copyButton) {
     event.preventDefault();
@@ -185,6 +230,36 @@ async function copyCode(button: Element, context: MarkdownClickContext): Promise
   }, COPY_RESET_MS);
 }
 
+/** Prefix of a footnote definition's id: heading slugs never contain a colon. */
+const FOOTNOTE_ID_PREFIX = "fn:";
+
+/**
+ * Gives footnote definitions an id no heading can have. The renderer writes
+ * a definition's id as its raw label while headings get slugs from one table
+ * the footnotes bypass, so `[^note]` beside a heading "Note" produced two
+ * elements with id `note` and a footnote link that jumped to the heading.
+ * Links to a definition are rewritten with it. Idempotent: a definition
+ * already namespaced (or already prefixed for the document) is left alone.
+ */
+function namespaceFootnotes(root: ParentNode): void {
+  const renamed = new Set<string>();
+  for (const definition of root.querySelectorAll(".footnote-definition[id]")) {
+    if (definition.id.startsWith(MARKDOWN_ID_PREFIX) || definition.id.startsWith(FOOTNOTE_ID_PREFIX)) continue;
+    renamed.add(definition.id);
+    definition.id = `${FOOTNOTE_ID_PREFIX}${definition.id}`;
+  }
+  if (renamed.size === 0) return;
+  for (const anchor of root.querySelectorAll('a[href^="#"]')) {
+    let target: string;
+    try {
+      target = decodeURIComponent((anchor.getAttribute("href") ?? "").slice(1));
+    } catch {
+      continue;
+    }
+    if (renamed.has(target)) anchor.setAttribute("href", `#${encodeURIComponent(FOOTNOTE_ID_PREFIX + target)}`);
+  }
+}
+
 /**
  * Prepares rendered Markdown HTML for the app's document, before it is
  * inserted — so an unprefixed id never exists there, not even for a frame:
@@ -204,6 +279,7 @@ export function prepareRenderedMarkdown(html: string, note: MarkdownNote | null,
   template.innerHTML = html;
   const root = template.content;
   const owner = root.ownerDocument;
+  namespaceFootnotes(root);
   for (const element of root.querySelectorAll("[id]")) {
     if (!element.id.startsWith(MARKDOWN_ID_PREFIX)) element.id = `${MARKDOWN_ID_PREFIX}${element.id}`;
   }
@@ -223,8 +299,19 @@ export function prepareRenderedMarkdown(html: string, note: MarkdownNote | null,
     frame.append(button, block);
   }
   for (const picture of root.querySelectorAll("img")) {
-    const src = picture.getAttribute("src") ?? "";
-    if (/^(?:data:image\/|https:)/i.test(src)) continue;
+    const held = picture.getAttribute("data-withheld-src");
+    const heldAddress = held === null ? null : withheldAddress(held);
+    if (heldAddress) {
+      // A remote picture the renderer withheld stays in place as a control:
+      // the reader loads it by clicking it (or Enter/Space).
+      picture.classList.add("gp-md-withheld-picture");
+      picture.setAttribute("role", "button");
+      picture.setAttribute("tabindex", "0");
+      picture.setAttribute("title", `Remote picture not loaded: ${heldAddress}. Click to load it.`);
+      continue;
+    }
+    const src = held ?? picture.getAttribute("src") ?? "";
+    if (held === null && /^(?:data:image\/|https:)/i.test(src)) continue;
     // The renderer leaves a picture it did not embed with its source path.
     // In the webview that path resolves against the APP's origin — a broken
     // icon at best, one of GitPulse's own assets at worst — so it is replaced

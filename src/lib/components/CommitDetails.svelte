@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "../ipc/invoke";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -77,7 +78,6 @@
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
   let currentCommitId = $derived($repoStore.selectedCommitId || $graphStore.selectedCommit?.id || null);
   let explainGuard: AsyncGuard | null = null;
-  const explainTarget = { repo: null as string | null, id: null as string | null };
 
   let copiedSha = $state(false);
   let copiedMessage = $state(false);
@@ -131,18 +131,18 @@
     return () => explainGuard?.cancel();
   });
 
+  // A new commit or repository outdates an explanation still being written.
   $effect(() => {
-    const id = currentCommitId;
-    const repo = $repoStore.currentPath;
-    if (explainTarget.repo === repo && explainTarget.id === id) return;
-    explainTarget.repo = repo;
-    explainTarget.id = id;
-    explainGuard?.cancel();
-    isExplaining = false;
+    void currentCommitId;
+    void $currentRepoPath;
+    untrack(() => {
+      explainGuard?.cancel();
+      isExplaining = false;
+    });
   });
 
   $effect(() => {
-    const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
+    const id = currentCommitId;
     if (!id) {
       details = null;
       return;
@@ -169,9 +169,12 @@
    *  never leave an earlier commit's provenance on a later one. */
   let provenanceToken = 0;
 
+  // Keyed by value on the repository and the commit, so a store publish that
+  // changed neither keeps the badge and any fetch in flight. Only a new
+  // target blanks it and outdates the previous request.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
+    const repo = $currentRepoPath;
+    const id = currentCommitId;
     const mine = ++provenanceToken;
     provenance = null;
     if (!repo || !id) return;

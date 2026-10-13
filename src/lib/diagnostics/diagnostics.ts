@@ -4,6 +4,7 @@ import { browserStorage, type StorageLike } from "../repos/persist";
 import { escapeRegExp } from "../text/lineSearch";
 import { isProductDisabledMessage } from "../health/githubAlerts";
 import { isDeferredUnderLoad } from "../async/deferral";
+import { createDeferredWrite, flushOnPageHide, type DeferredWriteTimers } from "../async/deferredWrite";
 
 /**
  * Central capture of everything that goes wrong while the app runs: uncaught
@@ -669,6 +670,8 @@ export interface DiagnosticsStore {
   readonly health: Readable<DiagnosticsHealth>;
   /** Retry explicitly after unavailable/quota-limited storage; never loop per error. */
   retryPersistence(): void;
+  /** Writes a pending save now; the page-hide handler and tests call it. */
+  flush(): void;
   error(source: string, detail: unknown): void;
   warn(source: string, detail: unknown): void;
   clear(): void;
@@ -1074,7 +1077,18 @@ function loadPersisted(storage: StorageLike | null, development: boolean): {
   return { entries, nextId, rewritten, restorationError: invalid > 0 ? `${invalid} invalid saved diagnostic entries could not be restored.` : null };
 }
 
-export function createDiagnostics(deps: { storage?: StorageLike | null; now?: () => number; development?: boolean; buildId?: string } = {}): DiagnosticsStore {
+/**
+ * How long a recorded entry may wait before the log is saved. Every console
+ * warning, console error and unhandled rejection is recorded, and each save
+ * serializes the whole ring (up to {@link MAX_DIAGNOSTIC_ENTRIES} entries,
+ * about a megabyte) and writes it synchronously — once per event, an error
+ * storm spent its time in JSON.stringify and localStorage. Entries recorded
+ * inside one window share one save; the page-hide flush covers the window
+ * the app is closed in.
+ */
+export const DIAGNOSTIC_PERSIST_DELAY_MS = 500;
+
+export function createDiagnostics(deps: { storage?: StorageLike | null; now?: () => number; development?: boolean; buildId?: string; timers?: DeferredWriteTimers } = {}): DiagnosticsStore {
   const buildId = redactDiagnosticText(deps.buildId ?? APP_BUILD_ID).slice(0, 96);
   // `undefined` means "pick the browser storage"; explicit null disables it.
   const storage = deps.storage !== undefined ? deps.storage : browserStorage();
@@ -1110,6 +1124,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
   }
 
   if (restored.rewritten) persist();
+  const pendingSave = createDeferredWrite(() => persist(), DIAGNOSTIC_PERSIST_DELAY_MS, deps.timers);
 
   function record(requested: DiagnosticSeverity, source: string, detail: unknown) {
     const safeSource = clampMessage(redactDiagnosticText(source));
@@ -1154,7 +1169,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
         ...entries.slice(1),
       ];
       store.set(entries);
-      persist();
+      pendingSave.schedule();
       return;
     }
     if (nextId >= Number.MAX_SAFE_INTEGER - 1) {
@@ -1171,16 +1186,22 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       entries = entries.slice(0, MAX_DIAGNOSTIC_ENTRIES);
     }
     store.set(entries);
-    persist();
+    pendingSave.schedule();
   }
 
   return {
     subscribe: store.subscribe,
     health: { subscribe: health.subscribe },
-    retryPersistence: () => persist(true),
+    retryPersistence: () => {
+      pendingSave.cancel();
+      persist(true);
+    },
+    flush: () => pendingSave.flush(),
     error: (source, detail) => record("error", source, detail),
     warn: (source, detail) => record("warning", source, detail),
     clear: () => {
+      // The key is removed below; a save still pending would only put it back.
+      pendingSave.cancel();
       entries = [];
       nextId = 0;
       headKey = null;
@@ -1202,6 +1223,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
 
 /** App-wide singleton; safe to import from stores and components alike. */
 export const diagnostics: DiagnosticsStore = createDiagnostics();
+flushOnPageHide(() => diagnostics.flush());
 
 /**
  * Render entries as a plain-text report for pasting into an issue or handing

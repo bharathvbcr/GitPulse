@@ -687,6 +687,8 @@ it("reloads terminal preferences and rejects corrupt stored values", async () =>
     const first = (await import("../interfaceStore")).interfaceStore;
     expect(get(first)).toMatchObject({ terminalFontSize:20, terminalLauncher:"manvi" });
     first.setTerminalFontSize(18); first.setTerminalLauncher("codex");
+    // Saves are deferred; leaving the page flushes them, as this does.
+    first.flush();
     vi.resetModules();
     expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({ terminalFontSize:18, terminalLauncher:"codex" });
     storage.setItem("gitpulse_interface_prefs", JSON.stringify({terminalFontSize:"large", terminalLauncher:"unknown"}));
@@ -823,6 +825,8 @@ describe("tasks board view preferences", () => {
       first.setTaskDensity("compact");
       first.toggleTaskColumn("done");
       first.setTaskCardFields(["owner", "due"]);
+      // Saves are deferred; leaving the page flushes them, as this does.
+      first.flush();
       vi.resetModules();
       expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({
         taskLayout: "list",

@@ -376,10 +376,28 @@ export async function isPortFree(port, diagnostics = []) {
   /** @type {string[]} */
   const v6 = [];
   if (!(await tryListen(port, "::1", v6))) {
+    // A host without IPv6 (an IPv4-only container, IPv6 disabled) refuses
+    // `::1` with EAFNOSUPPORT or EADDRNOTAVAIL for every port. Nothing can
+    // hold a loopback that does not exist, so that is not "busy" — read as
+    // busy, every port in every range was, and the dev server could not start.
+    if (lacksIpv6Loopback(v6)) return true;
     diagnostics.push(...v6);
     return false;
   }
   return true;
+}
+
+/**
+ * True when `tryListen`'s diagnostics for `::1` say the host has no IPv6
+ * loopback at all, rather than that something holds the port.
+ *
+ * @param {string[]} diagnostics
+ */
+export function lacksIpv6Loopback(diagnostics) {
+  return (
+    diagnostics.length > 0 &&
+    diagnostics.every((line) => / (EAFNOSUPPORT|EADDRNOTAVAIL)$/.test(line))
+  );
 }
 
 /**

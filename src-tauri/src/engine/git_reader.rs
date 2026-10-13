@@ -2,11 +2,12 @@ use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
 use crate::engine::git_cli::{
-    self, git, git_text, git_text_capped, git_text_shared, sandbox_join, sandbox_join_canonical,
-    sandbox_join_entry, validate_repo, Incomplete,
+    self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
+    sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::ref_cache::{self, FileIdentity};
+use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
@@ -317,6 +318,19 @@ pub struct RepoLanguageStat {
 /// report says so instead of presenting a capped sample as complete coverage.
 pub const LANG_STATS_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Candidates one language scan reads at most; see
+/// [`LanguageDetector::prioritize_for_stats`].
+const LANG_STATS_MAX_FILES: usize = 10_000;
+
+/// Largest file the language scan reads whole.
+const LANG_MAX_FILE_BYTES: u64 = 1_048_576;
+
+/// Threads one language scan reads with, the caller's own included. File
+/// reads spawn no child, so this pool is the whole of the scan's parallelism
+/// and is bounded here rather than borrowed from rayon's global pool, which
+/// the insights and dead-branch scans share.
+const LANG_SCAN_WORKERS: usize = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageStatsReport {
     pub stats: Vec<RepoLanguageStat>,
@@ -528,6 +542,7 @@ impl GitReader {
             base: default_base,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         let mut format = String::from(BRANCH_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
@@ -581,7 +596,7 @@ impl GitReader {
             }
             let is_current = parts[0].trim() == "*";
             let refname = parts[1];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let tip = parts[2].to_string();
@@ -591,7 +606,8 @@ impl GitReader {
             let is_remote = refname.starts_with("refs/remotes/");
             let (name, remote_name) = if is_remote {
                 let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
+                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                    .map(|(owner, _)| owner.to_string());
                 (rest.to_string(), remote)
             } else {
                 (refname.trim_start_matches("refs/heads/").to_string(), None)
@@ -671,6 +687,7 @@ impl GitReader {
             base: probed_default,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         // Cheap listing only: refnames and tips, no history walks here.
         // Refnames and object ids cannot contain NULs, so %00 fields stay
@@ -694,13 +711,14 @@ impl GitReader {
                 continue;
             }
             let refname = parts[0];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let is_remote = refname.starts_with("refs/remotes/");
             let (name, remote_name) = if is_remote {
                 let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
+                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                    .map(|(owner, _)| owner.to_string());
                 (rest.to_string(), remote)
             } else {
                 (refname.trim_start_matches("refs/heads/").to_string(), None)
@@ -834,10 +852,8 @@ impl GitReader {
         scope: RefScope,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = Self::page_count_limit(max_count).to_string();
-        let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
-        let count_arg = format!("-n{}", count);
-        let skip_arg = format!("--skip={}", skipped);
+        let count = Self::page_count_limit(max_count);
+        let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
         // History reads Git objects, not today's filesystem. A historical
         // file may now be a dangling link or live below a replaced directory.
         // Lexical confinement and a literal pathspec bound the object query.
@@ -848,6 +864,49 @@ impl GitReader {
             }
             None => None,
         };
+        let chunk = history_chunk_size();
+        let mut commits = if count <= chunk {
+            Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
+        } else {
+            // A long window is read as aligned chunks, each kept on its own.
+            // One 100k-commit answer exceeded the cache's per-entry cap and
+            // was never kept, so every "load more" walked and parsed the whole
+            // window again; chunks stay under the cap, and growing the window
+            // reads only the chunks it has not seen. (Git still skips past
+            // the earlier commits for a new chunk: `--skip` has to walk them.)
+            let end = skipped.saturating_add(count);
+            let mut start = skipped - skipped % chunk;
+            let mut commits = Vec::with_capacity(count);
+            while start < end {
+                let rows =
+                    Self::history_chunk(&repo, start, chunk, revision, spec.as_deref(), scope)?;
+                let ended = rows.len() < chunk;
+                let from = skipped.saturating_sub(start).min(rows.len());
+                let to = (end - start).min(rows.len());
+                commits.extend(rows.into_iter().skip(from).take(to - from));
+                if ended {
+                    break;
+                }
+                start += chunk;
+            }
+            commits
+        };
+        mark_shallow_boundary(&repo, &mut commits)?;
+        Ok(commits)
+    }
+
+    /// One `git log` page: `count` commits after `skip`, parsed. Each distinct
+    /// (skip, count) is its own kept answer in [`ref_cache`].
+    fn history_chunk(
+        repo: &Path,
+        skip: usize,
+        count: usize,
+        revision: Option<&str>,
+        spec: Option<&str>,
+        scope: RefScope,
+    ) -> Result<Vec<RawCommitNode>, String> {
+        let count_arg = format!("-n{count}");
+        let skip_arg = format!("--skip={skip}");
         let mut args: Vec<&str> = Vec::new();
         if spec.is_some() {
             // Path bytes reach us raw rather than octal-escaped, matching the
@@ -881,7 +940,7 @@ impl GitReader {
             // decides the set for both sides; see crate::graph::ref_scope.
             args.extend_from_slice(crate::graph::history_rev_args(scope));
         }
-        if let Some(spec) = spec.as_deref() {
+        if let Some(spec) = spec {
             args.push("--");
             args.push(spec);
         }
@@ -896,7 +955,7 @@ impl GitReader {
         } else {
             &crate::graph::ref_scope::NAMED_REF_PATTERNS
         };
-        let stdout = ref_cache::git_text(&repo, namespaces, &args)?;
+        let stdout = ref_cache::git_text(repo, namespaces, &args)?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -1084,6 +1143,7 @@ impl GitReader {
                 }
             }
 
+            warnings.extend(undecodable_path_warning(&path));
             statuses.push(FileStatus {
                 path,
                 old_path,
@@ -1451,7 +1511,17 @@ impl GitReader {
     ) -> Result<CommitDetails, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let args = ["show", "--numstat", "-z", COMMIT_SHOW_FORMAT, commit_id];
+        let args = [
+            "show",
+            "--numstat",
+            "-z",
+            // `%ad`/`%cd` follow `log.date`; pin git's default rendering
+            // so a developer's `relative` or `human` does not stale the
+            // dates the panel shows.
+            "--date=default",
+            COMMIT_SHOW_FORMAT,
+            commit_id,
+        ];
         let (stdout, cut) = if is_full_oid(commit_id) {
             ref_cache::git_text_capped(&repo, &[], &args, cap)?
         } else {
@@ -1581,20 +1651,7 @@ impl GitReader {
     /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
     /// that did not happen and is an error, never reported as detached.
     pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
-        let repo = validate_repo(repo_path)?;
-        let run = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        match run.status_code {
-            0 => {
-                let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
-                validate_ref_name(&name)?;
-                Ok(Some(name))
-            }
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read the current branch (git exited {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )),
-        }
+        head_branch(&validate_repo(repo_path)?)
     }
 
     /// Reads what a reset of HEAD's branch to `target` would take off it.
@@ -1680,97 +1737,103 @@ impl GitReader {
         })
     }
 
+    /// Language statistics for the working tree, bounded by
+    /// [`LANG_STATS_DEADLINE`].
+    ///
+    /// Callers asking about one repository while its scan runs share that
+    /// scan: the metric strip, the fleet view and a watcher-driven refresh
+    /// routinely ask at once, and each used to start its own read of the
+    /// whole tree. The key carries the admission class so a reactive caller
+    /// never inherits a refusal that only a background leader could get.
     pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {
-        Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+        type Flights = crate::singleflight::SingleFlight<
+            (std::path::PathBuf, git_cli::Admission),
+            Result<LanguageStatsReport, String>,
+        >;
+        static FLIGHTS: OnceLock<Flights> = OnceLock::new();
+        let repo = validate_repo(repo_path)?;
+        let key = (
+            repo.canonicalize().unwrap_or(repo),
+            git_cli::current_admission(),
+        );
+        FLIGHTS.get_or_init(Flights::default).run(key, || {
+            Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+        })
     }
 
     /// Like [`Self::get_repo_language_stats`] with an explicit budget;
     /// `None` means unbounded (tests).
+    ///
+    /// Each file's result is remembered against its identity (see
+    /// [`lang_cache`]), so a rescan reads only the files that changed since
+    /// the last one; the rest cost one `lstat` each. What does need reading is
+    /// read by up to [`LANG_SCAN_WORKERS`] threads.
     pub fn get_repo_language_stats_bounded(
         repo_path: &str,
         deadline: Option<Duration>,
     ) -> Result<LanguageStatsReport, String> {
         let started = Instant::now();
-        let expired = || match deadline {
-            Some(d) => started.elapsed() >= d,
-            None => false,
-        };
         let repo = validate_repo(repo_path)?;
-        let stdout = git_text(
-            &repo,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-        )?;
-
-        let mut candidates = Vec::new();
-        // Git can list one conflicted path in multiple index stages. Preserve
-        // its exact filename bytes for disk access; normalization is only for
-        // language classification, never for opening the file.
-        for rel_path in parse_ls_files_entries(&stdout) {
-            if rel_path.is_empty() || LanguageDetector::is_ignored_source_path(&rel_path) {
-                continue;
-            }
-            let lang_info = LanguageDetector::detect_from_path(&rel_path);
-            if !LanguageDetector::should_count_for_stats(&rel_path, &lang_info) {
-                continue;
-            }
-            candidates.push((rel_path, lang_info));
-        }
+        #[cfg(test)]
+        lang_probe::note_scan(&repo);
+        let candidates = language_candidates(&repo)?;
         let candidate_files = candidates.len();
-        let selected = LanguageDetector::prioritize_for_stats(candidates, 10_000);
-        let selected_len = selected.len();
+        let selected = LanguageDetector::prioritize_for_stats(candidates, LANG_STATS_MAX_FILES);
+
+        let cache_key = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        let mut previous = lang_cache::take(&cache_key);
+        let outcomes = scan_language_files(&repo, &selected, &previous, started, deadline);
 
         let mut lang_counts: HashMap<&'static str, (usize, usize, &'static str, &'static str)> =
             HashMap::new();
         let mut total_lines = 0usize;
         let mut scanned_files = 0usize;
         let mut deadline_hit = false;
-        let mut incomplete = selected_len < candidate_files;
+        let mut incomplete = selected.len() < candidate_files;
+        let mut remembered = lang_cache::RepoMap::with_capacity(selected.len());
 
-        for (rel_path, path_info) in selected {
-            if expired() {
-                deadline_hit = true;
-                break;
-            }
-            // Resolve through symlinks so a tracked file that is really a link
-            // pointing outside the repo is refused instead of read.
-            let full_path = match git_cli::sandbox_join_canonical(&repo, &rel_path) {
-                Ok(path) => path,
-                Err(_) => {
-                    incomplete = true;
-                    record_lang(&mut lang_counts, path_info, 0);
+        for ((rel_path, path_info), outcome) in selected.into_iter().zip(outcomes) {
+            let tally = match outcome {
+                None => {
+                    deadline_hit = true;
                     continue;
                 }
-            };
-            let bytes = match read_working_tree_file(&full_path, 1_048_576) {
-                Ok(bytes) => bytes,
-                Err(_) => {
+                Some(ScanOutcome::Remembered(tally)) => {
+                    if let Some(entry) = previous.remove(&rel_path) {
+                        remembered.insert(rel_path, entry);
+                    }
+                    tally
+                }
+                Some(ScanOutcome::Read { tally, remember }) => {
+                    previous.remove(&rel_path);
+                    if let Some(entry) = remember {
+                        remembered.insert(rel_path, entry);
+                    }
+                    tally
+                }
+                Some(ScanOutcome::Unreadable) => {
+                    previous.remove(&rel_path);
                     incomplete = true;
                     record_lang(&mut lang_counts, path_info, 0);
                     continue;
                 }
             };
             scanned_files += 1;
-            if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
-                continue;
+            if let FileTally::Counted { lang, code_lines } = tally {
+                record_lang(&mut lang_counts, lang, code_lines);
+                total_lines += code_lines;
             }
-            let lang_info = LanguageDetector::detect_from_bytes(&rel_path, &bytes);
-            if !LanguageDetector::should_count_for_stats(&rel_path, &lang_info) {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&bytes);
-            // Language-aware: block comments, docstrings and string literals
-            // all change what counts as code, and this sum IS the repository's
-            // headline LOC number.
-            let loc = LocCounter::count_for_language(&content, lang_info.name);
-            record_lang(&mut lang_counts, lang_info, loc.code_lines);
-            total_lines += loc.code_lines;
         }
+        // A finished pass saw every selected file, so what it did not see is
+        // gone (deleted, ignored, past the cap) and is not kept. A pass the
+        // deadline cut short keeps what it never reached, which is what lets
+        // the next pass get further instead of starting over.
+        if deadline_hit {
+            for (rel_path, entry) in previous {
+                remembered.entry(rel_path).or_insert(entry);
+            }
+        }
+        lang_cache::put(cache_key, remembered);
 
         let mut stats: Vec<RepoLanguageStat> = lang_counts
             .into_iter()
@@ -1839,12 +1902,7 @@ impl GitReader {
             match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
                 Ok(out) => out,
                 Err(e) => {
-                    let msg = e.to_lowercase();
-                    if msg.contains("does not have any commits")
-                        || msg.contains("bad default revision 'head'")
-                        || msg.contains("fatal: your current branch")
-                        || msg.contains("fatal: needed a single revision")
-                    {
+                    if is_unborn_head_error(&e) {
                         return Ok(PulseReport {
                             commits: Vec::new(),
                             top_files_by_churn: Vec::new(),
@@ -1899,6 +1957,16 @@ impl GitReader {
         repo_path: &str,
         max_files: Option<usize>,
     ) -> Result<KnowledgeReport, String> {
+        Self::knowledge_report_with(repo_path, max_files, budget::MAX_BLAME_BYTES)
+    }
+
+    /// [`Self::knowledge_report`] with the per-file blame budget injected, so a
+    /// test can cut a blame short without a 16 MiB fixture.
+    fn knowledge_report_with(
+        repo_path: &str,
+        max_files: Option<usize>,
+        blame_cap: usize,
+    ) -> Result<KnowledgeReport, String> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         let has_mailmap = repo.join(".mailmap").is_file();
@@ -1908,12 +1976,7 @@ impl GitReader {
         let stdout = match git_text(&repo, &["ls-files", "-z", "--cached"]) {
             Ok(out) => out,
             Err(e) => {
-                let msg = e.to_lowercase();
-                if msg.contains("does not have any commits")
-                    || msg.contains("bad default revision 'head'")
-                    || msg.contains("fatal: your current branch")
-                    || msg.contains("fatal: needed a single revision")
-                {
+                if is_unborn_head_error(&e) {
                     return Ok(KnowledgeReport {
                         scanned_files: 0,
                         candidate_files: 0,
@@ -1982,6 +2045,9 @@ impl GitReader {
         let mut age_dist = CodeAgeDistribution::default();
         let mut orphaned_files: Vec<OrphanedFile> = Vec::new();
         let mut scanned_files = 0;
+        // A blame cut off at its byte cap or its deadline is a prefix of the
+        // file, so every count built from it is a lower bound.
+        let mut blame_cut_short = false;
         let mut scanned_lines = 0;
 
         for file_path in selected_files {
@@ -1996,8 +2062,11 @@ impl GitReader {
             args.push("--");
             args.push(&file_path);
 
-            let stdout = match git_text_capped(&repo, &args, budget::MAX_BLAME_BYTES) {
-                Ok((out, _)) => out,
+            let stdout = match git_text_capped(&repo, &args, blame_cap) {
+                Ok((out, incomplete)) => {
+                    blame_cut_short |= incomplete.is_some();
+                    out
+                }
                 Err(_) => continue,
             };
 
@@ -2112,7 +2181,7 @@ impl GitReader {
             orphaned_files,
             age_distribution: age_dist,
             half_life_days,
-            truncated: truncated || scanned_files < candidate_files,
+            truncated: truncated || blame_cut_short || scanned_files < candidate_files,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }
@@ -2135,6 +2204,7 @@ impl GitReader {
         max_scan_commits: usize,
     ) -> Result<DoraReport, String> {
         let repo = validate_repo(repo_path)?;
+        let started = Instant::now();
         let window = window_days.unwrap_or(90).clamp(7, 365);
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2153,12 +2223,7 @@ impl GitReader {
         ) {
             Ok(out) => out,
             Err(e) => {
-                let msg = e.to_lowercase();
-                if msg.contains("does not have any commits")
-                    || msg.contains("bad default revision 'head'")
-                    || msg.contains("fatal: your current branch")
-                    || msg.contains("fatal: needed a single revision")
-                {
+                if is_unborn_head_error(&e) {
                     return Ok(DoraReport {
                         deploy_frequency_per_week: 0.0,
                         deploy_rating: "Low".to_string(),
@@ -2219,33 +2284,49 @@ impl GitReader {
 
         let mut lead_times_hours: Vec<f64> = Vec::new();
         if !release_tags.is_empty() {
-            let commit_stdout =
-                git_text(&repo, &["log", "-n", "30", "--format=%H%x00%ct"]).unwrap_or_default();
-
-            for line in commit_stdout.lines() {
-                let parts: Vec<&str> = line.split('\0').collect();
-                if parts.len() >= 2 {
-                    let commit_sha = parts[0];
-                    let commit_ts: i64 = parts[1].parse().unwrap_or(0);
-
-                    if let Ok(desc) =
-                        git_text(&repo, &["describe", "--tags", "--contains", commit_sha])
+            let commit_stdout = dora_git(
+                &repo,
+                started,
+                &["log", "-n", "30", "--format=%H%x00%ct"],
+                "the recent-commit read",
+            )?;
+            let commits: Vec<(&str, i64)> = commit_stdout
+                .lines()
+                .filter_map(|line| {
+                    let (sha, ts) = line.split_once('\0')?;
+                    Some((sha, ts.parse().unwrap_or(0)))
+                })
+                .collect();
+            if !commits.is_empty() {
+                // One `name-rev` for all of them: this was one `describe
+                // --contains` process per commit, thirty in a row. It prints
+                // one line per argument, in order; `undefined` marks a commit
+                // no tag contains.
+                let mut args = vec!["name-rev", "--tags", "--name-only"];
+                args.extend(commits.iter().map(|(sha, _)| *sha));
+                let names = dora_git(&repo, started, &args, "the tag lookup")?;
+                let names: Vec<&str> = names.lines().collect();
+                if names.len() != commits.len() {
+                    return Err(format!(
+                        "DORA tag lookup answered {} lines for {} commits",
+                        names.len(),
+                        commits.len()
+                    ));
+                }
+                for ((_, commit_ts), name) in commits.iter().zip(names) {
+                    let tag_ref = name
+                        .trim()
+                        .trim_start_matches("tags/")
+                        .split('~')
+                        .next()
+                        .unwrap_or("")
+                        .split('^')
+                        .next()
+                        .unwrap_or("");
+                    if let Some((_, _, tag_ts)) = release_tags.iter().find(|(t, _, _)| t == tag_ref)
                     {
-                        let tag_ref = desc
-                            .trim()
-                            .split('~')
-                            .next()
-                            .unwrap_or("")
-                            .split('^')
-                            .next()
-                            .unwrap_or("");
-                        if let Some((_, _, tag_ts)) =
-                            release_tags.iter().find(|(t, _, _)| t == tag_ref)
-                        {
-                            if *tag_ts >= commit_ts {
-                                let diff_hours = ((*tag_ts - commit_ts) as f64) / 3600.0;
-                                lead_times_hours.push(diff_hours);
-                            }
+                        if *tag_ts >= *commit_ts {
+                            lead_times_hours.push(((*tag_ts - *commit_ts) as f64) / 3600.0);
                         }
                     }
                 }
@@ -2273,11 +2354,12 @@ impl GitReader {
 
         let since_arg = format!("--since={window}.days");
         let scan_limit = max_scan_commits.to_string();
-        let log_stdout = git_text(
+        let log_stdout = dora_git(
             &repo,
+            started,
             &["log", "-n", &scan_limit, &since_arg, "--format=%s%x00%ct"],
-        )
-        .unwrap_or_default();
+            "the commit scan",
+        )?;
 
         let mut total_commits = 0usize;
         let mut revert_or_fix_commits = 0usize;
@@ -2362,6 +2444,41 @@ impl GitReader {
             is_mttr_approximation: true,
             window_days: window,
         })
+    }
+}
+
+/// True when git's error says the repository has no commit to read yet: an
+/// empty history, which is an answer, not a failed read.
+fn is_unborn_head_error(error: &str) -> bool {
+    let msg = error.to_lowercase();
+    msg.contains("does not have any commits")
+        || msg.contains("bad default revision 'head'")
+        || msg.contains("fatal: your current branch")
+        || msg.contains("fatal: needed a single revision")
+}
+
+/// Wall-clock budget for one DORA report across all of its git reads.
+const DORA_DEADLINE: Duration = Duration::from_secs(60);
+
+/// One git read of the DORA report, bounded by what is left of
+/// [`DORA_DEADLINE`]. A failed or out-of-time read is an error naming the
+/// step: the report used to swallow it (`unwrap_or_default`), so an empty
+/// answer from a read that never ran looked like a repository with no
+/// commits and published a 0% failure rate and no lead time.
+fn dora_git(repo: &Path, started: Instant, args: &[&str], step: &str) -> Result<String, String> {
+    let left = DORA_DEADLINE
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            format!(
+                "DORA report ran out of its {}s budget before {step}",
+                DORA_DEADLINE.as_secs()
+            )
+        })?;
+    match git_text_with_timeout(repo, args, left) {
+        Ok(text) => Ok(text),
+        Err(error) if is_unborn_head_error(&error) => Ok(String::new()),
+        Err(error) => Err(format!("DORA {step} failed: {error}")),
     }
 }
 
@@ -2595,30 +2712,44 @@ pub(crate) fn parse_pulse_stream(
 ///
 /// Priority: `checkout.defaultRemote`, the current branch's configured
 /// upstream remote, a lone configured remote, else "origin".
+#[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
+    default_remote_reads(repo).0
+}
+
+/// [`resolve_default_remote`] plus the reason, when a read it depends on
+/// produced no answer (config, the current branch, the remote list). The name
+/// is then a guess built from "not set"; a caller guarding a destructive
+/// action refuses on the reason instead of trusting the guess.
+fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
+    let mut unread: Option<String> = None;
     // One read of the effective config answers what used to be two
-    // `config --get` processes and, usually, `git remote` too. A failed read
-    // is "not set", as each failed `--get` was; the spawn gate's failure
-    // counter is what marks the answer unclean (see `default_base`).
-    let config = config_snapshot(repo).unwrap_or_default();
+    // `config --get` processes and, usually, `git remote` too.
+    let config = match config_snapshot(repo) {
+        Ok(config) => config,
+        Err(error) => {
+            unread = Some(error);
+            HashMap::new()
+        }
+    };
     if let Some(configured) = config.get("checkout.defaultremote") {
         let trimmed = configured.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return (trimmed.to_string(), unread);
         }
     }
-    if let Ok(branch) = ref_cache::git_text(
-        repo,
-        &["refs/heads"],
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    ) {
-        let branch = branch.trim();
-        if !branch.is_empty() {
-            if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
-                let trimmed = upstream.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
+    let branch = match head_branch_cached(repo) {
+        Ok(branch) => branch,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
+            let trimmed = upstream.trim();
+            if !trimmed.is_empty() {
+                return (trimmed.to_string(), unread);
             }
         }
     }
@@ -2633,15 +2764,18 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(error) => {
+                unread.get_or_insert(error);
+                Vec::new()
+            }
         }
     } else {
         configured
     };
     if let [only] = names.as_slice() {
-        return only.clone();
+        return (only.clone(), unread);
     }
-    "origin".to_string()
+    ("origin".to_string(), unread)
 }
 
 /// The effective config as `git config --list -z` prints it, last value of a
@@ -2678,6 +2812,26 @@ fn configured_remotes(config: &HashMap<String, String>) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// True for a remote's own HEAD pointer, `refs/remotes/<remote>/HEAD`, which
+/// names the branch the remote considers default rather than being one. Only
+/// that exact shape: a branch *called* `release/HEAD` (`refs/remotes/origin/
+/// release/HEAD`, or a local `refs/heads/release/HEAD`) is a real branch and
+/// was hidden by an "ends in /HEAD" test.
+pub(crate) fn is_remote_head(remote_names: &[String], refname: &str) -> bool {
+    refname
+        .strip_prefix("refs/remotes/")
+        .and_then(|rest| remotes::split_tracking_ref(remote_names, rest))
+        .is_some_and(|(_, branch)| branch == "HEAD")
+}
+
+/// Names of the remotes configured for `repo`, for attributing remote-tracking
+/// refs through [`remotes::split_tracking_ref`].
+pub(crate) fn configured_remote_names(repo: &Path) -> Vec<String> {
+    config_snapshot(repo)
+        .map(|config| configured_remotes(&config))
+        .unwrap_or_default()
 }
 
 /// Whether the repository still has pre-config remote definitions, which
@@ -2782,25 +2936,12 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
             }
         }
     }
-    // The lookups below read a failed spawn as "not set". Under load that is
-    // a refusal, not an answer, so a value computed while any of them failed
+    // The lookups read a failed spawn as "not set". Under load that is a
+    // refusal, not an answer, so a value computed while any of them failed
     // is marked unclean: shared with the callers already queued behind it,
     // never served to one that arrives later.
-    let failures_before = git_cli::process_failures();
-    let remote = resolve_default_remote(repo);
-    let head_ref = remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-    let clean = git_cli::process_failures() == failures_before;
-    let value = DefaultBase {
-        remote,
-        remote_head,
-        base,
-        incomplete: (!clean).then(|| {
-            git_cli::last_process_failure()
-                .unwrap_or_else(|| "a default-branch lookup produced no answer".into())
-        }),
-    };
+    let value = compute_default_base(repo);
+    let clean = value.incomplete.is_none();
     if let Some(stamp) = stamp {
         let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
         if memo.len() >= MAX_MEMOIZED_REPOS && !memo.contains_key(repo) {
@@ -2817,6 +2958,39 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         );
     }
     value
+}
+
+/// The uncached default-base lookup behind [`default_base`]. A read that gave
+/// no answer (a refused spawn, a deadline, an unreadable ref) sets
+/// `incomplete`; it never reads as "no remote HEAD". Callers that guard a
+/// destructive action use this directly, so a memoized answer from before the
+/// read started failing cannot stand in for the state they are acting on.
+pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+    let failures_before = git_cli::process_failures();
+    let (remote, mut unread) = default_remote_reads(repo);
+    let head_ref = remote_head_ref(&remote);
+    let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
+        Ok(target) => target,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
+    let incomplete = if git_cli::process_failures() != failures_before {
+        Some(
+            git_cli::last_process_failure()
+                .unwrap_or_else(|| "a default-branch lookup produced no answer".into()),
+        )
+    } else {
+        unread
+    };
+    DefaultBase {
+        remote,
+        remote_head,
+        base,
+        incomplete,
+    }
 }
 
 #[derive(Clone)]
@@ -2911,6 +3085,70 @@ fn pick_default_branch(local_names: &[String], remote_head: Option<&str>, remote
 /// commit.
 const TAG_LIST_FORMAT: &str =
     "%(refname:short)%00%(objectname)%00%(contents:subject)%00%(*objectname)";
+
+/// Where the symbolic ref `refname` points, as the full ref name.
+///
+/// `--quiet` makes exit 1 git's answer "this is not a symbolic ref" (a
+/// detached HEAD, an absent `origin/HEAD`): `Ok(None)`. Any other failure is a
+/// read that did not happen (a refused spawn, a deadline, an unreadable ref
+/// file) and is an `Err`, never "not set": callers that guard a destructive
+/// action on the answer must not take an unreadable ref for an absent one.
+pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<String>, String> {
+    let run = git_cli::git_captured(repo, &["symbolic-ref", "--quiet", refname])?;
+    match run.status_code {
+        0 => {
+            let target = String::from_utf8_lossy(&run.stdout).trim().to_string();
+            Ok((!target.is_empty()).then_some(target))
+        }
+        1 => Ok(None),
+        code => Err(format!(
+            "Could not read {refname} (git exited {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )),
+    }
+}
+
+/// The local branch HEAD is on, as its short name; `None` when detached.
+///
+/// Asks for the full ref and strips `refs/heads/` itself: `--short` shortens
+/// to the shortest *unambiguous* name, which is `heads/main` when a tag is
+/// also called `main`. The canonical owner of the question: a failed read is
+/// an `Err` (see [`symbolic_ref_target`]) and never "detached".
+pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
+    let branch = head_branch_name(repo)?;
+    if let Some(name) = &branch {
+        validate_ref_name(name)?;
+    }
+    Ok(branch)
+}
+
+/// [`head_branch`] without the argv-safety check on the name, for readers that
+/// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
+/// the writers would refuse to name in a command, `fix(ui)` among them, is
+/// still the one HEAD is on.
+fn head_branch_name(repo: &Path) -> Result<Option<String>, String> {
+    symbolic_ref_target(repo, "HEAD")?
+        .map(|target| branch_of_head_target(&target))
+        .transpose()
+}
+
+/// [`head_branch_name`] answered through the ref cache, for the readers that
+/// ask on every refresh. The cached read cannot tell a detached HEAD (exit 1,
+/// an answer) from a refusal, so a failed cached read is asked again, uncached,
+/// and that one decides.
+pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, String> {
+    match ref_cache::git_text(repo, &["refs/heads"], &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok(target) => branch_of_head_target(target.trim()).map(Some),
+        Err(_) => head_branch_name(repo),
+    }
+}
+
+fn branch_of_head_target(target: &str) -> Result<String, String> {
+    target
+        .strip_prefix("refs/heads/")
+        .map(str::to_string)
+        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))
+}
 
 /// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
 const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
@@ -3143,7 +3381,10 @@ fn compute_eligible_churn(
 /// Ahead/behind of every branch and remote-tracking tip against `base_oid`,
 /// keyed by tip oid, from one `for-each-ref`. `None` when git cannot answer
 /// (the atom needs 2.42), which leaves each tip to its own walk.
-fn tip_counts_against(repo: &Path, base_oid: &str) -> Option<HashMap<String, (usize, usize)>> {
+pub(crate) fn tip_counts_against(
+    repo: &Path,
+    base_oid: &str,
+) -> Option<HashMap<String, (usize, usize)>> {
     validate_oid(base_oid).ok()?;
     let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
     let text = ref_cache::git_text(
@@ -3498,6 +3739,91 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err("Git object size did not match cat-file".into());
     }
     Ok(bytes)
+}
+
+/// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
+const HISTORY_CHUNK: usize = 5_000;
+
+#[cfg(not(test))]
+fn history_chunk_size() -> usize {
+    HISTORY_CHUNK
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn history_chunk_size() -> usize {
+    CHUNK_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(HISTORY_CHUNK)
+}
+
+/// Runs `body` with a small history chunk, so a test can cross chunk
+/// boundaries without a 5,000-commit fixture.
+#[cfg(test)]
+pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHUNK_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    body()
+}
+
+/// The warning a status row carries when its path cannot be trusted to name
+/// the file on disk. Git paths are bytes; the IPC carries UTF-8, so a Linux
+/// path that is not valid UTF-8 arrives with U+FFFD in place of each bad byte
+/// and any action sent back for it would name a file that does not exist. The
+/// row says so instead of looking like any other file.
+pub(crate) fn undecodable_path_warning(path: &str) -> Option<String> {
+    path.contains('\u{FFFD}').then(|| {
+        "This path is not valid UTF-8, so it is shown with replacement characters and \
+         actions sent for it will not find the file. Use git on the command line for it."
+            .to_string()
+    })
+}
+
+/// Commits whose parents exist in the real history but not in this clone, from
+/// the `shallow` file in the common git directory. Git prints no parents for
+/// them (`%P` is empty), which the lane solver reads as a root; a root is a
+/// commit that has no parents, not one whose parents were cut off.
+///
+/// `Ok(empty)` only when there is no such file. A file that exists and cannot
+/// be read fails the page: its commits would be drawn as roots.
+fn shallow_commits(repo: &Path) -> Result<HashSet<String>, String> {
+    let (_private, common) = crate::repository_trust::git_directories(repo)?;
+    match std::fs::read_to_string(common.join("shallow")) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(error) => Err(format!("Could not read the shallow boundary: {error}")),
+    }
+}
+
+/// Gives each shallow-boundary commit the unknown parent it is missing, so it
+/// is drawn as a stub rather than as the root of the history.
+fn mark_shallow_boundary(repo: &Path, commits: &mut [RawCommitNode]) -> Result<(), String> {
+    if !commits.iter().any(|commit| commit.parent_ids.is_empty()) {
+        return Ok(());
+    }
+    let shallow = shallow_commits(repo)?;
+    for commit in commits.iter_mut() {
+        if commit.parent_ids.is_empty() && shallow.contains(&commit.id) {
+            commit
+                .parent_ids
+                .push(crate::graph::UNKNOWN_PARENT.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one `\x01`-separated history record laid out by
@@ -4444,6 +4770,568 @@ fn record_lang(
     entry.1 += 1;
 }
 
+/// The files a language scan counts: tracked and untracked-not-ignored, minus
+/// vendored, generated and non-text kinds.
+///
+/// Vendored and generated are decided by the path's `linguist-vendored` and
+/// `linguist-generated` attributes where the repository sets them, and by the
+/// built-in directory and file-name rules where it does not, as Linguist does.
+/// Git can list one conflicted path in several index stages; the listing is
+/// deduplicated, and each path keeps its exact bytes for disk access, since
+/// normalization is only for classification.
+fn language_candidates(repo: &Path) -> Result<Vec<(String, LanguageInfo)>, String> {
+    let stdout = git_text(
+        repo,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    let paths = parse_ls_files_entries(&stdout);
+    let attrs = linguist_attributes(repo, &paths)?;
+    let mut candidates = Vec::with_capacity(paths.len());
+    for rel_path in paths {
+        let path_attrs = attrs.get(&rel_path).copied().unwrap_or_default();
+        let lang_info = LanguageDetector::detect_from_path(&rel_path);
+        if LanguageDetector::should_count_for_stats_with(&rel_path, &lang_info, path_attrs) {
+            candidates.push((rel_path, lang_info));
+        }
+    }
+    Ok(candidates)
+}
+
+/// Every path's Linguist attributes from one `git check-attr --stdin` run;
+/// paths with neither attribute specified are left out.
+///
+/// A failure here fails the scan rather than counting without the
+/// attributes: a total that silently includes trees the repository marked as
+/// vendored is a wrong number presented as a right one.
+fn linguist_attributes(
+    repo: &Path,
+    paths: &[String],
+) -> Result<HashMap<String, crate::analyzer::LinguistAttrs>, String> {
+    let mut attrs: HashMap<String, crate::analyzer::LinguistAttrs> = HashMap::new();
+    if paths.is_empty() {
+        return Ok(attrs);
+    }
+    let mut input = Vec::with_capacity(paths.iter().map(|p| p.len() + 1).sum());
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let output = git_cli::git_with_stdin(
+        repo,
+        &[
+            "check-attr",
+            "-z",
+            "--stdin",
+            "linguist-vendored",
+            "linguist-generated",
+        ],
+        &input,
+    )?;
+    // `-z` output is `<path> NUL <attribute> NUL <value> NUL`, per attribute.
+    let mut fields = output.split(|&b| b == 0);
+    while let (Some(path), Some(attribute), Some(value)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let Some(value) =
+            crate::analyzer::LinguistAttrs::parse_value(&String::from_utf8_lossy(value))
+        else {
+            continue;
+        };
+        let entry = attrs
+            .entry(String::from_utf8_lossy(path).into_owned())
+            .or_default();
+        match attribute {
+            b"linguist-vendored" => entry.vendored = Some(value),
+            b"linguist-generated" => entry.generated = Some(value),
+            _ => {}
+        }
+    }
+    Ok(attrs)
+}
+
+/// What one scanned file adds to the language report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTally {
+    /// Read, and not counted: binary, or classified out of the statistics.
+    Skipped,
+    Counted {
+        lang: LanguageInfo,
+        code_lines: usize,
+    },
+}
+
+/// One candidate's fate in a scan.
+enum ScanOutcome {
+    /// Unchanged since the last scan; its remembered tally, unread.
+    Remembered(FileTally),
+    /// Read now. `remember` is set when the file has been still long enough
+    /// that a later change must change its identity.
+    Read {
+        tally: FileTally,
+        remember: Option<lang_cache::Entry>,
+    },
+    /// Could not be read safely: escapes the repository, vanished, is not a
+    /// regular file, or is text past the size cap. The report is incomplete.
+    Unreadable,
+}
+
+/// A file's identity for the language cache: what a write must change.
+///
+/// The ctime is what makes this hold against tools that restore an mtime
+/// (`cp -p`, `rsync -t`, `touch -r`): no user-level call can set it, and any
+/// write, chmod or rename moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanIdentity {
+    len: u64,
+    inode: u64,
+    modified: Option<SystemTime>,
+    changed: Option<SystemTime>,
+}
+
+impl ScanIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (inode, changed) = {
+            use std::os::unix::fs::MetadataExt;
+            let changed = u64::try_from(meta.ctime())
+                .ok()
+                .and_then(|secs| u32::try_from(meta.ctime_nsec()).ok().map(|ns| (secs, ns)))
+                .map(|(secs, ns)| UNIX_EPOCH + Duration::new(secs, ns));
+            (meta.ino(), changed)
+        };
+        // Windows exposes no inode or change time through `std`; size and
+        // mtime still move on every ordinary write.
+        #[cfg(not(unix))]
+        let (inode, changed) = (0, None);
+        Self {
+            len: meta.len(),
+            inode,
+            modified: meta.modified().ok(),
+            changed,
+        }
+    }
+
+    /// The later of the mtime and the ctime; `None` when the mtime is
+    /// unknown, which never lets the file be remembered.
+    fn newest(&self) -> Option<SystemTime> {
+        let modified = self.modified?;
+        Some(
+            self.changed
+                .map_or(modified, |changed| changed.max(modified)),
+        )
+    }
+}
+
+/// Resolves each directory a scan reads from once, through
+/// [`sandbox_join_canonical`], instead of re-resolving every component of
+/// every file's path: one `lstat` + `realpath` per directory per scan, not
+/// per file. A file is then opened as `<resolved dir>/<name>` with
+/// `O_NOFOLLOW`, so the only component left unresolved cannot be a link.
+struct ScanSandbox<'a> {
+    repo: &'a Path,
+    dirs: Mutex<HashMap<String, Option<std::sync::Arc<Path>>>>,
+}
+
+impl<'a> ScanSandbox<'a> {
+    fn new(repo: &'a Path) -> Self {
+        Self {
+            repo,
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `rel_dir` resolved inside the repository, or `None` when it escapes
+    /// it through a link or cannot be resolved. `""` is the root.
+    fn dir(&self, rel_dir: &str) -> Option<std::sync::Arc<Path>> {
+        if let Some(known) = self
+            .dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(rel_dir)
+        {
+            return known.clone();
+        }
+        // Resolved outside the lock: two workers may both resolve one
+        // directory, and they reach the same answer.
+        let resolved = if rel_dir.is_empty() {
+            self.repo.canonicalize().ok()
+        } else {
+            sandbox_join_canonical(self.repo, rel_dir).ok()
+        }
+        .map(std::sync::Arc::<Path>::from);
+        self.dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(rel_dir.to_string(), resolved.clone());
+        resolved
+    }
+}
+
+/// Scans `selected` on up to [`LANG_SCAN_WORKERS`] threads. The result is in
+/// `selected`'s order; `None` marks a file the deadline stopped the scan
+/// before reaching.
+fn scan_language_files(
+    repo: &Path,
+    selected: &[(String, LanguageInfo)],
+    previous: &lang_cache::RepoMap,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> Vec<Option<ScanOutcome>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let sandbox = ScanSandbox::new(repo);
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut done = Vec::new();
+        while !deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some((rel_path, path_info)) = selected.get(index) else {
+                break;
+            };
+            done.push((index, scan_one(&sandbox, rel_path, *path_info, previous)));
+        }
+        done
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(LANG_SCAN_WORKERS)
+        .min(selected.len());
+    let batches: Vec<Vec<(usize, ScanOutcome)>> = std::thread::scope(|scope| {
+        // The caller is one of the workers. A helper the host refuses to
+        // start only means fewer of them: the shared counter hands its share
+        // to the threads that did start.
+        let helpers: Vec<_> = (1..workers)
+            .filter_map(|_| {
+                std::thread::Builder::new()
+                    .name("gitpulse-lang-scan".into())
+                    .spawn_scoped(scope, work)
+                    .ok()
+            })
+            .collect();
+        let mut batches = vec![work()];
+        for helper in helpers {
+            batches.push(
+                helper
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        batches
+    });
+    let mut outcomes: Vec<Option<ScanOutcome>> = std::iter::repeat_with(|| None)
+        .take(selected.len())
+        .collect();
+    for (index, outcome) in batches.into_iter().flatten() {
+        outcomes[index] = Some(outcome);
+    }
+    outcomes
+}
+
+/// One candidate: answered from `previous` when its identity is unchanged,
+/// read otherwise.
+fn scan_one(
+    sandbox: &ScanSandbox<'_>,
+    rel_path: &str,
+    path_info: LanguageInfo,
+    previous: &lang_cache::RepoMap,
+) -> ScanOutcome {
+    // Lexical validation (absolute, `..`, NUL) is owned by sandbox_join.
+    if sandbox_join(sandbox.repo, rel_path).is_err() {
+        return ScanOutcome::Unreadable;
+    }
+    let (rel_dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+    let Some(dir) = sandbox.dir(rel_dir) else {
+        return ScanOutcome::Unreadable;
+    };
+    let path = dir.join(name);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return ScanOutcome::Unreadable;
+    };
+    if meta.file_type().is_symlink() {
+        // A link resolves whole, and one that leaves the repository is
+        // refused. It is never remembered: its target can change while the
+        // link itself does not.
+        let Ok(target) = sandbox_join_canonical(sandbox.repo, rel_path) else {
+            return ScanOutcome::Unreadable;
+        };
+        let Ok(target_meta) = std::fs::symlink_metadata(&target) else {
+            return ScanOutcome::Unreadable;
+        };
+        if !target_meta.is_file() {
+            return ScanOutcome::Unreadable;
+        }
+        #[cfg(test)]
+        lang_probe::note_read(sandbox.repo);
+        return match tally_file(&target, target_meta.len(), rel_path, path_info) {
+            Some(tally) => ScanOutcome::Read {
+                tally,
+                remember: None,
+            },
+            None => ScanOutcome::Unreadable,
+        };
+    }
+    // Checked before opening: a FIFO, socket or device is never opened.
+    if !meta.is_file() {
+        return ScanOutcome::Unreadable;
+    }
+    let identity = ScanIdentity::of(&meta);
+    if let Some(entry) = previous.get(rel_path) {
+        if entry.identity == identity && entry.path_info == path_info {
+            return ScanOutcome::Remembered(entry.tally);
+        }
+    }
+    #[cfg(test)]
+    lang_probe::note_read(sandbox.repo);
+    match tally_file(&path, meta.len(), rel_path, path_info) {
+        Some(tally) => ScanOutcome::Read {
+            tally,
+            remember: lang_cache::settled(&identity).then_some(lang_cache::Entry {
+                identity,
+                path_info,
+                tally,
+            }),
+        },
+        None => ScanOutcome::Unreadable,
+    }
+}
+
+/// Reads and classifies one regular file `len` bytes long. `None` when it
+/// cannot be read, or is text past [`LANG_MAX_FILE_BYTES`] and so cannot be
+/// counted.
+///
+/// A file past the cap is read only as far as [`LanguageDetector::looks_binary`]
+/// looks: a binary one is skipped exactly as a whole read would skip it.
+fn tally_file(path: &Path, len: u64, rel_path: &str, path_info: LanguageInfo) -> Option<FileTally> {
+    let oversized = len > LANG_MAX_FILE_BYTES;
+    let limit = if oversized {
+        LanguageDetector::BINARY_PROBE_BYTES as u64
+    } else {
+        LANG_MAX_FILE_BYTES + 1
+    };
+    let bytes = read_file_prefix(path, limit, len).ok()?;
+    if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
+        return Some(FileTally::Skipped);
+    }
+    // Grown past the cap since it was measured, or past it all along.
+    if oversized || bytes.len() as u64 > LANG_MAX_FILE_BYTES {
+        return None;
+    }
+    let lang_info = LanguageDetector::detect_from_bytes(rel_path, &bytes);
+    // The path rules already admitted this file; only its kind, which the
+    // bytes can change (a PNG named `.txt`), is left to decide.
+    if !LanguageDetector::is_countable_kind(&lang_info) {
+        return Some(FileTally::Skipped);
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    // Language-aware: block comments, docstrings and string literals all
+    // change what counts as code, and this sum IS the repository's headline
+    // LOC number.
+    let loc = LocCounter::count_for_language(&content, lang_info.name);
+    Some(FileTally::Counted {
+        lang: lang_info,
+        code_lines: loc.code_lines,
+    })
+}
+
+/// Up to `limit` bytes of the regular file at `path`, which measured `len`
+/// bytes. Opened without following a final link and without blocking (a FIFO
+/// swapped in after the caller's `lstat` cannot hang the read), and refused
+/// unless the open handle is a regular file. The buffer is sized from `len`
+/// so an unchanged file takes one read and one end-of-file read: `open`,
+/// `fstat`, two `read`s and `close`.
+fn read_file_prefix(path: &Path, limit: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let first = usize::try_from(len.saturating_add(1))
+        .unwrap_or(usize::MAX)
+        .clamp(1, limit.max(1));
+    let mut bytes = vec![0u8; first];
+    let mut filled = 0;
+    loop {
+        if filled == bytes.len() {
+            if bytes.len() >= limit {
+                break;
+            }
+            bytes.resize(bytes.len().saturating_mul(2).min(limit), 0);
+        }
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+/// Per-file results of the language scan, so a rescan reads only what
+/// changed.
+///
+/// Keyed by path and checked against [`ScanIdentity`] rather than keyed by
+/// blob id: an identity answers for tracked, modified and untracked files
+/// alike from one `lstat`, where a blob id needs git to vouch, per scan, that
+/// the working-tree file still matches the index, and a content-keyed entry
+/// poisoned by a write racing the read would be served to every worktree.
+///
+/// Bounded twice over: a repository's map holds at most the files one scan
+/// can select (it is pruned to them after every complete pass, and refused
+/// whole if it ever outgrows twice that), and at most `MAX_REPOS`
+/// repositories are remembered, the least recently scanned going first.
+/// Nothing here is a source of truth: a miss is always recomputed from the
+/// file.
+mod lang_cache {
+    use super::{
+        FileTally, HashMap, LanguageInfo, Mutex, OnceLock, PoisonError, ScanIdentity,
+        LANG_STATS_MAX_FILES,
+    };
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    pub(super) const MAX_REPOS: usize = 8;
+    const MAX_FILES_PER_REPO: usize = 2 * LANG_STATS_MAX_FILES;
+    /// A file changed this recently is not remembered: a second write inside
+    /// one timestamp tick (a second on HFS+, two on FAT) would leave its
+    /// identity unchanged. Git applies the same "racily clean" rule to its
+    /// own index.
+    pub(super) const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+    #[derive(Clone, Debug)]
+    pub(super) struct Entry {
+        pub identity: ScanIdentity,
+        /// The path-based classification the tally was computed under.
+        pub path_info: LanguageInfo,
+        pub tally: FileTally,
+    }
+
+    pub(super) type RepoMap = HashMap<String, Entry>;
+
+    #[derive(Default)]
+    struct Store {
+        /// Least recently scanned first.
+        order: Vec<PathBuf>,
+        repos: HashMap<PathBuf, RepoMap>,
+    }
+
+    fn store() -> &'static Mutex<Store> {
+        static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Store::default()))
+    }
+
+    /// Whether `identity` is old enough that a later write must change it.
+    pub(super) fn settled(identity: &ScanIdentity) -> bool {
+        identity.newest().is_some_and(|newest| {
+            SystemTime::now()
+                .duration_since(newest)
+                .is_ok_and(|age| age >= RACY_WINDOW)
+        })
+    }
+
+    /// Takes `repo`'s map out of the store so the scan holds no lock while it
+    /// reads files. A concurrent scan of the same repository starts empty.
+    pub(super) fn take(repo: &PathBuf) -> RepoMap {
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| key != repo);
+        store.repos.remove(repo).unwrap_or_default()
+    }
+
+    pub(super) fn put(repo: PathBuf, map: RepoMap) {
+        if map.is_empty() || map.len() > MAX_FILES_PER_REPO {
+            return;
+        }
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| *key != repo);
+        store.order.push(repo.clone());
+        store.repos.insert(repo, map);
+        while store.order.len() > MAX_REPOS {
+            let oldest = store.order.remove(0);
+            store.repos.remove(&oldest);
+        }
+    }
+
+    /// Forgets one repository, as a restart would.
+    #[cfg(test)]
+    pub(super) fn forget(repo: &std::path::Path) {
+        let key = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+        take(&key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_repos() -> usize {
+        store()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .repos
+            .len()
+    }
+}
+
+/// What the language scan did, per repository, for the tests that count it.
+/// Keyed by repository rather than by thread because the scan reads on worker
+/// threads and the test harness runs tests side by side in one process.
+#[cfg(test)]
+mod lang_probe {
+    use super::{HashMap, Mutex, Path, PoisonError};
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct Counts {
+        scans: usize,
+        reads: usize,
+    }
+
+    static COUNTS: Mutex<Option<HashMap<PathBuf, Counts>>> = Mutex::new(None);
+
+    fn key(repo: &Path) -> PathBuf {
+        repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())
+    }
+
+    fn with(repo: &Path, f: impl FnOnce(&mut Counts)) {
+        let mut guard = COUNTS.lock().unwrap_or_else(PoisonError::into_inner);
+        f(guard
+            .get_or_insert_with(HashMap::new)
+            .entry(key(repo))
+            .or_default());
+    }
+
+    pub(super) fn note_scan(repo: &Path) {
+        with(repo, |c| c.scans += 1);
+    }
+
+    pub(super) fn note_read(repo: &Path) {
+        with(repo, |c| c.reads += 1);
+    }
+
+    /// Scans started on `repo` so far.
+    pub(super) fn scans_of(repo: &Path) -> usize {
+        let mut n = 0;
+        with(repo, |c| n = c.scans);
+        n
+    }
+
+    /// Files the scan has opened and read in `repo` so far.
+    pub(super) fn reads_of(repo: &Path) -> usize {
+        let mut n = 0;
+        with(repo, |c| n = c.reads);
+        n
+    }
+}
+
 fn mime_from_path(path: &str) -> String {
     match Path::new(path)
         .extension()
@@ -4579,6 +5467,378 @@ mod tests {
         assert!(report.truncated, "a scan that read nothing is truncated");
     }
 
+    /// Longer than the window inside which a just-changed file is not
+    /// remembered, so a fixture written before it is eligible for the cache.
+    const SETTLE: Duration = Duration::from_millis(2_200);
+
+    fn run_git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    /// A repository of `files` source files in nested directories, a few
+    /// untracked, binary and markdown ones among them.
+    fn churn_repo(dir: &std::path::Path, files: usize) {
+        init_stats_repo(dir);
+        for i in 0..files {
+            let (name, body) = match i % 5 {
+                0 => (
+                    format!("f{i}.py"),
+                    format!("# c\ndef f{i}():\n    return {i}\n"),
+                ),
+                1 => (format!("f{i}.md"), format!("# title {i}\n\ntext\n")),
+                2 => (format!("f{i}.bin"), "\u{0}\u{1}\u{2}".repeat(10)),
+                _ => (
+                    format!("f{i}.rs"),
+                    format!("/* b */\nfn f{i}() {{\n    let x = {i};\n}}\n"),
+                ),
+            };
+            let path = churn_path(dir, &name, i);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        run_git_in(dir, &["add", "."]);
+        // Untracked, and so counted by the scan's `--others`.
+        std::fs::write(dir.join("untracked.rs"), "fn u() {}\n").unwrap();
+    }
+
+    fn churn_path(dir: &std::path::Path, name: &str, i: usize) -> std::path::PathBuf {
+        dir.join(format!("pkg{}", i % 40))
+            .join(format!("mod{}", i % 7))
+            .join(name)
+    }
+
+    fn churn_rs(dir: &std::path::Path, i: usize) -> std::path::PathBuf {
+        assert!(i % 5 >= 3, "index {i} is not a .rs file in the fixture");
+        churn_path(dir, &format!("f{i}.rs"), i)
+    }
+
+    /// A rescan reads only the files that changed: none for an unchanged
+    /// tree, exactly the edited one after a one-file edit. The old scan read
+    /// every candidate on every call.
+    #[test]
+    fn language_stats_rescan_reads_only_what_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 3000);
+        std::thread::sleep(SETTLE);
+        let root = dir.path();
+        let repo = root.to_str().unwrap();
+
+        let before = lang_probe::reads_of(root);
+        let first = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            first.candidate_files,
+            "a cold scan reads every candidate"
+        );
+        assert!(!first.truncated);
+
+        let before = lang_probe::reads_of(root);
+        let second = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            0,
+            "an unchanged tree must not be read again"
+        );
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+
+        std::fs::write(churn_rs(root, 3), "fn changed() {}\nfn again() {}\n").unwrap();
+        std::thread::sleep(SETTLE);
+        let before = lang_probe::reads_of(root);
+        let third = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            1,
+            "a one-file edit reads that file and nothing else"
+        );
+        assert_ne!(
+            serde_json::to_string(&second).unwrap(),
+            serde_json::to_string(&third).unwrap(),
+            "the edit is reflected"
+        );
+    }
+
+    /// Callers arriving while a scan runs share it instead of each starting
+    /// their own read of the whole tree.
+    #[test]
+    fn concurrent_language_stats_calls_share_one_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 3000);
+        let root = dir.path().to_path_buf();
+        let started = lang_probe::scans_of(&root);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (barrier, root) = (barrier.clone(), root.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    GitReader::get_repo_language_stats(root.to_str().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let reports: Vec<String> = handles
+            .into_iter()
+            .map(|h| serde_json::to_string(&h.join().unwrap()).unwrap())
+            .collect();
+        let scans = lang_probe::scans_of(&root) - started;
+        assert!(reports.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(scans <= 2, "8 simultaneous callers started {scans} scans");
+    }
+
+    /// Vendored trees count for nothing, whether a directory name or a
+    /// `.gitattributes` rule says so; `linguist-generated` is honoured; and an
+    /// explicit `-linguist-vendored` brings a tree back.
+    #[test]
+    fn vendored_trees_and_linguist_attributes_contribute_no_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root); // app.rs: 1 line
+        let files = [
+            ("vendored/dep/src/lib.rs", "fn v() {}\n".repeat(50)),
+            ("third_party/zlib/inflate.c", "int x;\n".repeat(50)),
+            (
+                "src-tauri/framework/tao/src/lib.rs",
+                "fn t() {}\n".repeat(50),
+            ),
+            ("deps/big/lib.rs", "fn d() {}\n".repeat(50)),
+            ("src/schema.rs", "fn g() {}\n".repeat(50)),
+            ("vendor/ours/keep.rs", "fn k() {}\nfn k2() {}\n".to_string()),
+            ("crates/framework/src/lib.rs", "fn f() {}\n".to_string()),
+        ];
+        for (path, body) in &files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        std::fs::write(
+            root.join(".gitattributes"),
+            "src-tauri/framework/** linguist-vendored\n\
+             deps/** linguist-vendored\n\
+             src/schema.rs linguist-generated\n\
+             vendor/ours/** -linguist-vendored\n",
+        )
+        .unwrap();
+        run_git_in(root, &["add", "."]);
+        let report =
+            GitReader::get_repo_language_stats_bounded(root.to_str().unwrap(), None).unwrap();
+        let rust: usize = report
+            .stats
+            .iter()
+            .filter(|s| s.language == "Rust")
+            .map(|s| s.code_lines)
+            .sum();
+        assert_eq!(
+            rust,
+            1 + 2 + 1,
+            "app.rs, vendor/ours/keep.rs, crates/framework"
+        );
+        assert!(
+            report.stats.iter().all(|s| s.language != "C"),
+            "third_party/ is vendored: {:?}",
+            report.stats
+        );
+        assert!(!report.truncated);
+    }
+
+    /// The scan with nothing remembered: what every call used to be.
+    fn fresh_language_stats(repo: &std::path::Path) -> String {
+        lang_cache::forget(repo);
+        let report = GitReader::get_repo_language_stats_bounded(repo.to_str().unwrap(), None)
+            .expect("fresh");
+        serde_json::to_string(&report).unwrap()
+    }
+
+    fn warm_language_stats(repo: &std::path::Path) -> String {
+        let report =
+            GitReader::get_repo_language_stats_bounded(repo.to_str().unwrap(), None).expect("warm");
+        serde_json::to_string(&report).unwrap()
+    }
+
+    /// The remembered answer must be the fresh answer after every kind of
+    /// churn: edits that change size, deletions, additions of tracked and
+    /// untracked files, a source file turned binary, a regular file replaced
+    /// by a symlink out of the repository, a rename, and a same-size rewrite
+    /// that puts the old mtime back.
+    #[test]
+    fn language_stats_rescan_equals_a_fresh_scan_under_churn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 400);
+        let root = dir.path();
+        std::thread::sleep(SETTLE);
+        assert_eq!(warm_language_stats(root), fresh_language_stats(root));
+        assert_eq!(warm_language_stats(root), fresh_language_stats(root));
+
+        let step = |label: &str, mutate: &dyn Fn()| {
+            warm_language_stats(root);
+            mutate();
+            std::thread::sleep(SETTLE);
+            assert_eq!(
+                warm_language_stats(root),
+                fresh_language_stats(root),
+                "{label}"
+            );
+            // And the next warm pass off the rebuilt cache agrees too.
+            assert_eq!(
+                warm_language_stats(root),
+                fresh_language_stats(root),
+                "{label} (again)"
+            );
+        };
+        step("grow a file", &|| {
+            std::fs::write(churn_rs(root, 3), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        });
+        step("shrink a file", &|| {
+            std::fs::write(churn_rs(root, 8), "").unwrap()
+        });
+        step("delete a file", &|| {
+            std::fs::remove_file(churn_rs(root, 13)).unwrap()
+        });
+        step("add untracked files", &|| {
+            std::fs::write(root.join("new1.rs"), "fn n1() {}\n").unwrap();
+            std::fs::write(root.join("new2.py"), "x = 1\ny = 2\n").unwrap();
+        });
+        step("turn a source file binary", &|| {
+            std::fs::write(churn_rs(root, 18), vec![0u8; 64]).unwrap();
+        });
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("o.rs"), "fn outside() {}\n".repeat(50)).unwrap();
+        #[cfg(unix)]
+        step("replace a file with an outside symlink", &|| {
+            let target = churn_rs(root, 23);
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("o.rs"), &target).unwrap();
+        });
+        step("rename a file", &|| {
+            std::fs::rename(churn_rs(root, 28), root.join("renamed.rs")).unwrap();
+        });
+        step("same-size rewrite with the old mtime put back", &|| {
+            let path = churn_rs(root, 33);
+            let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let body = std::fs::read_to_string(&path).unwrap();
+            // A comment line becomes a code line, in the same number of bytes.
+            let same_size = body.replacen("/* b */", "fn b();", 1);
+            assert_ne!(same_size, body);
+            assert_eq!(same_size.len(), body.len());
+            std::fs::write(&path, same_size).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        });
+    }
+
+    /// A file written inside the racy window is never remembered, so a second
+    /// write in the same clock tick cannot be served stale.
+    #[test]
+    fn language_stats_do_not_remember_a_file_written_just_now() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_stats_repo(dir.path());
+        let root = dir.path();
+        let repo = root.to_str().unwrap();
+        let file = root.join("app.rs");
+        let (mut last_lines, mut reads) = (0, 0);
+        for round in 1..=3usize {
+            std::fs::write(&file, "fn x() {}\n".repeat(round)).unwrap();
+            let before = lang_probe::reads_of(root);
+            let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+            reads += lang_probe::reads_of(root) - before;
+            last_lines = report.stats[0].code_lines;
+        }
+        assert_eq!(last_lines, 3, "the newest write is what is counted");
+        assert_eq!(reads, 3, "a just-written file is read on every pass");
+    }
+
+    /// The remembered repositories are bounded and the oldest goes first.
+    #[test]
+    fn language_stats_cache_remembers_a_bounded_number_of_repositories() {
+        let meta = std::fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let entry = || {
+            let mut map = HashMap::new();
+            map.insert(
+                "a.rs".to_string(),
+                lang_cache::Entry {
+                    identity: ScanIdentity::of(&meta),
+                    path_info: LanguageDetector::detect_from_path("a.rs"),
+                    tally: FileTally::Skipped,
+                },
+            );
+            map
+        };
+        let keys: Vec<std::path::PathBuf> = (0..lang_cache::MAX_REPOS + 4)
+            .map(|i| std::path::PathBuf::from(format!("/bounded-cache-probe/{i}")))
+            .collect();
+        for key in &keys {
+            lang_cache::put(key.clone(), entry());
+        }
+        assert!(lang_cache::tracked_repos() <= lang_cache::MAX_REPOS);
+        assert!(
+            lang_cache::take(&keys[0]).is_empty(),
+            "the least recently scanned repository is forgotten first"
+        );
+    }
+
+    /// Directories are resolved once per scan rather than per file, and that
+    /// must not open a way out: a tracked file whose directory has been
+    /// replaced by a link out of the repository is refused, not read.
+    #[cfg(unix)]
+    #[test]
+    fn language_stats_refuse_a_directory_linked_out_of_the_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root);
+        std::fs::create_dir(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/inner.py"), "x = 1\n").unwrap();
+        run_git_in(root, &["add", "."]);
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("inner.py"), "y = 2\n".repeat(40)).unwrap();
+        std::fs::remove_dir_all(root.join("pkg")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("pkg")).unwrap();
+        let report =
+            GitReader::get_repo_language_stats_bounded(root.to_str().unwrap(), None).unwrap();
+        assert!(
+            report
+                .stats
+                .iter()
+                .filter(|s| s.language == "Python")
+                .all(|s| s.code_lines == 0),
+            "{report:?}"
+        );
+        assert!(report.truncated, "a refused candidate is a hole");
+    }
+
+    /// A file over the read cap whose first bytes are binary is not source:
+    /// a full read would have skipped it on the same 8 KiB sniff, so it is
+    /// skipped, not reported as a hole in the scan. This repository's
+    /// `src-tauri/icons/icon.icns` (1.3 MB, an extension no table names) made
+    /// every scan of it report `truncated`. Oversized text is still a hole.
+    #[test]
+    fn an_oversized_binary_is_skipped_but_oversized_text_truncates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root);
+        let mut icon = b"icns\0\0\0\x01".to_vec();
+        icon.resize(1_300_000, 7);
+        std::fs::write(root.join("icon.icns"), icon).unwrap();
+        run_git_in(root, &["add", "."]);
+        let repo = root.to_str().unwrap();
+        let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert!(!report.truncated, "{report:?}");
+        assert_eq!(report.scanned_files, report.candidate_files);
+
+        std::fs::write(root.join("huge.txt"), "line\n".repeat(300_000)).unwrap();
+        let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert!(report.truncated, "uncounted text is a hole: {report:?}");
+    }
+
     #[test]
     fn language_stats_report_is_complete_on_a_small_repo() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4593,6 +5853,76 @@ mod tests {
         assert_eq!(report.candidate_files, 1);
         assert_eq!(report.stats.len(), 1);
         assert_eq!(report.stats[0].language, "Rust");
+    }
+
+    /// `PROFILE_REPO=<repo> cargo test --lib language_stats_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: prints timings over PROFILE_REPO"]
+    fn language_stats_profile() {
+        // A relative PROFILE_REPO is taken from the checkout root, not from
+        // the `src-tauri` directory cargo runs the test in.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(std::env::var("PROFILE_REPO").expect("PROFILE_REPO"))
+            .canonicalize()
+            .expect("PROFILE_REPO exists");
+        let root = root.to_str().expect("UTF-8 path").to_string();
+        crate::test_support::trust_repo(Path::new(&root));
+        let (mut cold, mut warm) = (u128::MAX, u128::MAX);
+        let (mut cold_max, mut warm_max) = (0, 0);
+        for round in 0..5 {
+            // Cold: nothing remembered, as after a restart.
+            lang_cache::forget(Path::new(&root));
+            let reads = lang_probe::reads_of(Path::new(&root));
+            let t = Instant::now();
+            let a = GitReader::get_repo_language_stats(&root).expect("cold");
+            let ms = t.elapsed().as_millis();
+            (cold, cold_max) = (cold.min(ms), cold_max.max(ms));
+            let cold_reads = lang_probe::reads_of(Path::new(&root)) - reads;
+            let reads = lang_probe::reads_of(Path::new(&root));
+            let t = Instant::now();
+            let b = GitReader::get_repo_language_stats(&root).expect("warm");
+            let ms = t.elapsed().as_millis();
+            (warm, warm_max) = (warm.min(ms), warm_max.max(ms));
+            let warm_reads = lang_probe::reads_of(Path::new(&root)) - reads;
+            eprintln!(
+                "round {round}: truncated {}/{} scanned {}/{} candidates {} reads {cold_reads}/{warm_reads}",
+                a.truncated, b.truncated, a.scanned_files, b.scanned_files, a.candidate_files
+            );
+            assert!(!a.truncated && !b.truncated, "{a:?}");
+            assert_eq!(a.scanned_files, a.candidate_files);
+        }
+        eprintln!(
+            "language stats over {root}: cold min {cold} ms (max {cold_max}), warm min {warm} ms (max {warm_max})"
+        );
+    }
+
+    /// No file under this repository's `src-tauri/vendored/` or
+    /// `src-tauri/framework/` is a candidate: the first by its directory
+    /// name, the second by `.gitattributes`.
+    #[test]
+    fn this_repository_counts_no_vendored_or_framework_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("checkout root")
+            .canonicalize()
+            .unwrap();
+        crate::test_support::trust_repo(&root);
+        let candidates = language_candidates(&root).expect("candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|(path, _)| path.starts_with("src-tauri/src/")),
+            "the listing is this repository's"
+        );
+        let leaked: Vec<&String> = candidates
+            .iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                path.starts_with("src-tauri/vendored/") || path.starts_with("src-tauri/framework/")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "{} leaked: {leaked:?}", leaked.len());
     }
 
     #[test]
@@ -5415,18 +6745,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
         let repo = dir.path().canonicalize().unwrap();
-        let uncached = |repo: &Path| {
-            let remote = resolve_default_remote(repo);
-            let head_ref = remote_head_ref(&remote);
-            let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-            let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-            DefaultBase {
-                remote,
-                remote_head,
-                base,
-                incomplete: None,
-            }
-        };
+        let uncached = compute_default_base;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {
@@ -6703,6 +8022,10 @@ mod tests {
         assert_eq!(literal_pathspec("0:foo.py"), ":(literal)0:foo.py");
     }
 
+    /// Kept as a stated source contract: the failure is Windows-only (a Git for
+    /// Windows index refuses `0:foo.py`), so no test on another host can
+    /// observe it. The fixtures that must not be reintroduced are the two
+    /// `read-tree` call shapes below.
     #[test]
     fn tests_do_not_seed_drive_shaped_names_through_read_tree() {
         let src = include_str!("git_reader.rs");
@@ -6713,8 +8036,6 @@ mod tests {
             "read-tree cannot install 0:foo.py into a Git for Windows index; use mktree for the commit and git_output if the refusal itself is the assertion"
         );
         assert!(!src.contains(&forbidden_path));
-        assert!(src.contains("commit_index_union_mktree"));
-        assert!(src.contains("index_can_store_path"));
     }
 
     #[test]
@@ -7661,6 +8982,119 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(report.age_distribution.total_lines, report.scanned_lines);
     }
 
+    /// A blame cut off at its byte budget is a prefix of the file. The report
+    /// built from it used to count as a full scan, with `truncated` false.
+    #[test]
+    fn a_blame_cut_at_its_cap_marks_the_ownership_report_truncated() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let body: String = (0..200)
+            .map(|n| format!("let value_{n} = {n};\n"))
+            .collect();
+        std::fs::write(dir.path().join("code.rs"), body).unwrap();
+        git_in(dir.path(), &["add", "code.rs"]);
+        git_in(dir.path(), &["commit", "-m", "feat: many lines"]);
+
+        let whole = GitReader::knowledge_report(path, Some(10)).expect("whole");
+        assert!(!whole.truncated, "the control must be a whole scan");
+
+        let cut = GitReader::knowledge_report_with(path, Some(10), 8192).expect("cut");
+        assert!(
+            cut.truncated,
+            "a blame cut at its cap reported as a whole scan: {cut:?}"
+        );
+    }
+
+    /// A path git printed as bytes that are not UTF-8 reaches us as U+FFFD.
+    /// (The filesystem here may refuse such a name, so the replacement
+    /// character stands in for what the decoder would have produced.)
+    #[test]
+    fn a_path_with_replacement_characters_carries_a_warning() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("bad\u{FFFD}name.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("fine.txt"), "x").unwrap();
+
+        let statuses = GitReader::get_status(path).expect("status");
+        let bad = statuses
+            .iter()
+            .find(|s| s.path.contains('\u{FFFD}'))
+            .expect("row");
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("not valid UTF-8")),
+            "{:?}",
+            bad.warnings
+        );
+        let fine = statuses.iter().find(|s| s.path == "fine.txt").expect("row");
+        assert!(fine.warnings.is_empty(), "{:?}", fine.warnings);
+    }
+
+    /// Growing the window reads only the chunks it has not seen, and the
+    /// result is the window a single walk would have produced.
+    #[test]
+    fn growing_the_history_window_reads_only_the_new_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..40 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let log_skips = |since: usize| -> Vec<String> {
+            git_cli::spawn_log::spawns_in(&repo)[since..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .filter_map(|argv| argv.iter().find(|a| a.starts_with("--skip=")).cloned())
+                .collect()
+        };
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 30);
+
+        let (first, second, before, middle) = with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                let first =
+                    GitReader::read_commit_history_paged(path, 0, 20, None, None, RefScope::Named)
+                        .unwrap();
+                let before = git_cli::spawn_log::spawns_in(&repo).len();
+                let second =
+                    GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+                        .unwrap();
+                let middle = git_cli::spawn_log::spawns_in(&repo).len();
+                (first, second, before, middle)
+            })
+        });
+        assert_eq!(ids(&first), ids(&whole[..20]));
+        assert_eq!(
+            ids(&second),
+            ids(&whole),
+            "chunked read differs from one walk"
+        );
+        assert_eq!(
+            log_skips(before),
+            vec!["--skip=20".to_string()],
+            "the larger window re-read chunks it already held (spawns {before}..{middle})"
+        );
+        // A page that starts mid-chunk is still exact.
+        let mid = with_history_chunk(10, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let direct = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(ids(&mid), ids(&direct));
+        assert_eq!(mid.len(), 18);
+    }
+
     #[test]
     fn dora_report_computes_release_metrics_from_tags() {
         let dir = init_repo_with_remotes(&[], "main");
@@ -7720,6 +9154,44 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             "an empty history was not cut short; the empty sample is the signal"
         );
         assert_eq!(report.commit_scan_window_commits, None);
+    }
+
+    /// Lead time asked git once per commit (30 `describe --contains` spawns).
+    /// It must be one `name-rev` for the whole batch, and still find the tag.
+    #[test]
+    fn dora_lead_time_is_one_process_not_one_per_commit() {
+        let dir = repo_with_commits(12);
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
+        let path = dir.path().to_str().unwrap();
+
+        let (report, labels) =
+            git_cli::spawn_labels_during(|| GitReader::dora_report(path, Some(90)));
+        let report = report.expect("report");
+        let count = |label: &str| labels.iter().filter(|l| l.as_str() == label).count();
+        assert_eq!(count("git name-rev"), 1, "{labels:?}");
+        assert_eq!(count("git describe"), 0, "{labels:?}");
+        assert!(
+            labels.len() <= 6,
+            "a DORA report is a handful of spawns, not one per commit: {labels:?}"
+        );
+        assert!(
+            report.median_lead_time_hours >= 0.0 && report.lead_time_rating != "None",
+            "the tag was found: {report:?}"
+        );
+    }
+
+    /// A failed commit read is not an empty history: it used to publish 0%
+    /// change failures and no lead time as if measured.
+    #[test]
+    fn dora_reports_a_failed_git_read_instead_of_an_empty_answer() {
+        let dir = repo_with_commits(3);
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
+        let path = dir.path().to_str().unwrap();
+        let error = git_cli::with_forced_spawn_failure_of("--format=%s%x00%ct", || {
+            GitReader::dora_report(path, Some(90))
+        })
+        .expect_err("a failed commit scan must fail the report");
+        assert!(error.contains("commit scan"), "{error}");
     }
 
     /// Seeds `count` commits whose subjects alternate so the scan has both
@@ -8130,7 +9602,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
     /// (metadata, then numstat), each waiting on the spawn gate.
     #[test]
     fn commit_details_first_load_spawns_one_git_process() {
-        ref_cache::without_racy_window(|| {
+        ref_cache::eager(|| {
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
             let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
@@ -8154,7 +9626,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         // The answer must stay in the process-wide table between the two
         // calls; the test that fills that table's byte budget evicts it.
         let _held = ref_cache::retention();
-        ref_cache::without_racy_window(|| {
+        ref_cache::eager(|| {
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
             let first = GitReader::get_commit_details(&path, &head).expect("first");
@@ -8172,7 +9644,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
     /// as objects arrive), so it is never a cache key: it is read each time.
     #[test]
     fn an_abbreviated_commit_id_is_not_cached() {
-        ref_cache::without_racy_window(|| {
+        ref_cache::eager(|| {
             let (_dir, repo, head) = repo_with_commit_of(2);
             let path = repo.to_string_lossy().into_owned();
             let short = &head[..12];
@@ -8274,7 +9746,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
     /// invented, and the cut answer is not kept.
     #[test]
     fn oversized_numstat_is_flagged_and_never_cached() {
-        ref_cache::without_racy_window(|| {
+        ref_cache::eager(|| {
             let (_dir, repo, head) = repo_with_commit_of(200);
             let path = repo.to_string_lossy().into_owned();
             let cap = 2048;

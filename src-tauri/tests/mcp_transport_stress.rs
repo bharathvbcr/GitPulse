@@ -15,6 +15,11 @@
 //! JSON-RPC message per line**, **every request carrying an id is answered
 //! exactly once**, and **no input kills the server**.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -414,25 +419,52 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
         .as_bytes(),
     );
     server.write(request(json!("fast"), "tools/list", json!({})).as_bytes());
+    // Both requests are in the pipe. Freeze the server for longer than the slow
+    // call's whole budget, the way a loaded host does, so the order asserted
+    // below is the server's and not the scheduler's.
+    stall(&server.child, Duration::from_millis(700));
 
-    let started = Instant::now();
-    let mut first = String::new();
-    reader.read_line(&mut first).expect("a first response");
-    let elapsed = started.elapsed();
-    let first: Value = serde_json::from_str(first.trim()).expect("JSON");
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a response");
+        lines.push(serde_json::from_str::<Value>(line.trim()).expect("JSON"));
+    }
 
     drop(server.stdin.take());
     let _ = server.child.wait();
 
+    // Order, not wall-clock: a serialized loop answers `slow` first whatever the
+    // host's speed, and an absolute bound on the fast answer is what flaked
+    // under CPU contention (510 ms against a typical 26 ms).
     assert_eq!(
-        first["id"],
+        lines[0]["id"],
         json!("fast"),
-        "the fast request did not overtake the slow one: {first}"
+        "the fast request did not overtake the slow one: {lines:?}"
     );
-    assert!(
-        elapsed < Duration::from_millis(400),
-        "the fast answer waited {elapsed:?} — the loop is still serialized"
+    assert_eq!(
+        lines[1]["id"],
+        json!("slow"),
+        "the slow request was not answered after the fast one: {lines:?}"
     );
+}
+
+/// Freeze `child` for `duration` (SIGSTOP/SIGCONT). Elsewhere it only waits, so
+/// the test still holds its order assertion without the injected stall.
+fn stall(child: &Child, duration: Duration) {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(child.id()).expect("pid fits");
+        // SAFETY: signalling a child this test spawned and still owns.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "SIGSTOP");
+        std::thread::sleep(duration);
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0, "SIGCONT");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        std::thread::sleep(duration);
+    }
 }
 
 #[test]

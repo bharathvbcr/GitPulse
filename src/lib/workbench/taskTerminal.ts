@@ -40,14 +40,22 @@ import {
 import { handOverDetachedRun, isAdoptedSession } from "../terminal/detachedSessions";
 import { focusTerminalSession } from "../terminal/sessionFocus";
 import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
-import { explainError, findConversation, launchManagedRun, type TaskRun } from "./client";
+import { explainError, findConversation, launchManagedRun, WorkbenchError, type TaskRun } from "./client";
 import { resolveGitRoot } from "../desktop/nativeShell";
 import { identityKey, isCaseInsensitiveFs, normalizeRepoPath } from "../repos/paths";
 import { relativeStartDir } from "../terminal/tabs";
 import { formatError } from "../ui/formatError";
 import { PROVIDER_LABELS } from "./vocabulary";
 import { defaultHandoff, type HandoffSettings } from "./taskHandoff";
-import { bounded } from "./taskActions";
+import { bounded, TASK_ACTION_TIMEOUT_MS } from "./taskActions";
+import { fallbackOnDeadline, withDeadline } from "../async/deadline";
+
+/**
+ * The longest one host step of an attempt's start is waited for: the root
+ * walk, the family lookup, the open. None was bounded, so a host call that
+ * never answered held the launch, and the sheet that made it, for good.
+ */
+export const ATTEMPT_HOST_STEP_MS = TASK_ACTION_TIMEOUT_MS;
 
 /**
  * `opened`: on screen now. `started`: its checkout is open and the terminal
@@ -91,7 +99,9 @@ export async function startTaskTerminal(run: RunRef): Promise<AttemptStart> {
   const refused = openRefusal(place.root);
   if (refused) return { kind: "failed", checkout: place.root, reason: refused };
   queueAttempt(run, place);
-  const opened = await repoStore.openRepo(place.root, backgroundOpen());
+  // Queued already, so an open still in progress at the bound is "waiting
+  // for the checkout" — true, and the request starts when the tab opens.
+  const opened = await withDeadline(repoStore.openRepo(place.root, backgroundOpen()), ATTEMPT_HOST_STEP_MS).catch(fallbackOnDeadline(false));
   return afterOpen(run, place.root, opened, "started");
 }
 
@@ -174,7 +184,8 @@ interface Placement {
  */
 async function hostFor(place: Placement): Promise<Placement> {
   if (tabFor(place.root) || get(repoStore).currentPath === null) return place;
-  const family = await repoStore.familyOf(place.root);
+  // Only a better host for the terminal: without an answer, the checkout's own tab.
+  const family = await withDeadline(repoStore.familyOf(place.root), ATTEMPT_HOST_STEP_MS).catch(fallbackOnDeadline(null));
   if (!family) return place;
   const host = hostTabFor({ repoPath: place.root, family }, openTabs(), { caseInsensitive: isCaseInsensitiveFs() });
   return host ? { ...place, family, host: host.path } : place;
@@ -198,8 +209,11 @@ async function hostFor(place: Placement): Promise<Placement> {
 async function checkoutFor(cwd: string): Promise<Placement> {
   let root: string;
   try {
-    root = await resolveGitRoot(cwd);
+    root = await bounded(resolveGitRoot(cwd), ATTEMPT_HOST_STEP_MS);
   } catch (cause) {
+    if (cause instanceof WorkbenchError && cause.code === "transport_error") {
+      throw new Error(`Finding the Git checkout that contains ${cwd} did not finish in time, so its terminal did not start. Start it again from this task's Agents.`);
+    }
     throw new Error(`No Git checkout contains ${cwd}, so its terminal cannot start. ${formatError(cause)}`);
   }
   const options = { caseInsensitive: isCaseInsensitiveFs() };

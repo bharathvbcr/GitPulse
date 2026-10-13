@@ -16,12 +16,12 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views. Each view keeps related sections together.
+GitPulse has 4 application views with 18 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
-| **[Code](#2-code-code)** | Browse files, inspect authorship, explore structure | Explorer · Blame · Map |
+| **[Code](#2-code-code)** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 17 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 18 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -51,7 +51,7 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map — file selection plus the code/docs map"]
+        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Search · Map — file selection, text search and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
     end
@@ -210,25 +210,28 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 Work → Tasks shows tasks linked to the active repository. The **Tasks** button
 beside Fleet opens global and saved-workspace scopes over the same records.
 
-- **Organize**: Board/list layouts, full-text search, priority/type/owner/label/due
-  filters, multi-selection, context menus and drag or keyboard status moves.
-- **Know the scope**: Facets and Select all use loaded cards; column counts and
-  **Load more** reveal additional results. Due soon means the next seven days.
+- **Organize**: Board/list layouts with swimlanes (grouped by owner or first label),
+  saved views, column WIP limits, full-text search with structured query filters
+  (`is:bug`, `priority:high`, `status:open`, `repo:name`, `owner:`, `label:`, `severity:`, `due:` with `-` negation),
+  quick filter chips, multi-selection, context menus, and drag or keyboard moves.
+- **Checklists & Task Links**: Task checklists with individual completion states, and
+  relational links between tasks (parent, blocks, related, duplicate of) edited in the task sheet
+  and surfaced in agent handoff briefs.
+- **Know the scope**: Facets and Select all operate on loaded cards; column counts and
+  **Load more** reveal additional results. Due soon means the next seven days. Missing checkouts
+  are flagged before action.
 - **Edit and review**: Notes can seed a draft. Manvi proposes title/description
   changes against a saved revision; field locks and explicit acceptance apply.
-  Quick Enhance exposes details that compact cards omit.
+  Quick Enhance exposes details that compact cards omit. **Merge…** on the board's selection
+  bar combines duplicate tasks safely.
 - **Hand off**: Copy a saved task brief or an explicitly labeled unsaved draft for
-  an agent. Task run controls prepare a saved revision before launch.
-- **Archive**: **Archive** on a card's menu and on the selection bar files work
-  away; it is disabled, and says so, for a task already archived. A dock beside
-  the Inbox holds the scope's archived tasks with its own search and **Load
-  more**, and states the rule it runs on — a task is archived when it reaches
-  Done. Restore returns a selection to any other status through the same
-  confirmation as any bulk change. The panel reports what it has loaded against
-  the server's total, says whether the Done column is still on the board, and
-  does not report an archive it has not read as an empty one.
-- **Delete**: Confirm removal from every board. Partial results retain failures
-  and skipped items; the screen cannot restore the deleted task ID.
+  an agent. Terminal handoffs feature per-launch model selection (model, effort, advisor).
+- **Archive & Deleted Recovery**: Independent archived flag (dc-store schema 11) files work
+  away while preserving completion dates. The Archive dock lists most recently completed first,
+  with search and **Restore**. The dedicated **Deleted** view allows restoring deleted tasks
+  by ID, checked against the deletion revision.
+- **Delete**: Confirmed removal from every board. Partial results retain failures
+  and skipped items.
 
 See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the workflow, shortcuts,
 copy limits and the distinction between terminal handoffs and managed runs.
@@ -237,11 +240,12 @@ copy limits and the distinction between terminal handoffs and managed runs.
 
 ## 2. Code (`code`)
 
-Three sections under one view. Explorer and Blame are two lenses on one **file**
-(`selectedFilePath` survives the switch). Map is the structural navigator over
-the DevMap repo map, the code/doc graph, and repository markdown — not a third
-reading of the same open file. Sections switch from the segmented control
-(`⌥1` / `⌥2` / `⌥3` while Code is active) or by name in the command palette.
+Four sections under one view. Explorer and Blame are two lenses on one **file**
+(`selectedFilePath` survives the switch). Search scans file contents across the
+working tree or revisions. Map is the structural navigator over the DevMap repo
+map, the code/doc graph, and repository markdown — not a fourth reading of the
+same open file. Sections switch from the segmented control
+(`⌥1` / `⌥2` / `⌥3` / `⌥4` while Code is active) or by name in the command palette.
 
 ### 2.1 Explorer
 
@@ -276,7 +280,15 @@ reading of the same open file. Sections switch from the segmented control
 - **Commit Navigation**: One-click navigation from any blamed line directly to its full commit diff and history details.
 - **Uncommitted Lines Named**: Worktree-only lines carry an all-zero OID and render as `uncommitted` rather than as a link to a commit that does not exist.
 
-### 2.3 Map
+### 2.3 Search
+
+- **Repository-Wide Text Search**: Searches file contents across the working tree or an explicit Git revision via `git grep`.
+- **Honest Inclusion Boundaries**: Searches tracked and untracked files while strictly respecting `.gitignore` exclusions.
+- **Honest Outcome Reporting**: A search that is cancelled, timed out, capped, or truncated explicitly declares its partial status and reason, rather than presenting a partial match count as complete.
+- **Search Controls**: Case-sensitive (`Aa`), regular expressions (`.*`), and path-pattern scopes with previous/next match navigation.
+- **Navigation & Shortcuts**: Reached via `⌥3` while in Code view, `⌘⇧F` / `Ctrl+Shift+F`, the command palette (`Open Search — find text across the repository`), or the View menu. Selecting a match opens the target file in Explorer at the exact matched line.
+
+### 2.4 Map
 
 DevCouncil's `devmap` module. GitPulse takes this component without requiring the rest of the DevCouncil suite, and updates it independently of the Manvi wrap.
 

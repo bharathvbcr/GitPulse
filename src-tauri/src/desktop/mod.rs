@@ -1,15 +1,26 @@
 pub mod actions;
+pub mod confirm;
+pub mod exit;
+#[cfg(target_os = "macos")]
+pub mod instance;
+#[cfg(target_os = "macos")]
+pub mod launch;
+#[cfg(any(target_os = "macos", test))]
+pub mod launch_agent;
 mod menu;
 pub mod popover;
 pub mod shell;
 pub mod state;
+#[cfg(target_os = "macos")]
+pub mod terminate;
 mod tray;
+#[cfg(target_os = "macos")]
+pub mod webcrash;
 
 pub use state::MenuState;
 pub use tray::build_tray_menu;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -30,7 +41,7 @@ pub struct DesktopState {
     recents: Mutex<Vec<String>>,
     menu_state: Mutex<MenuState>,
     pending_open: Mutex<Option<String>>,
-    exit_guard_ready: AtomicBool,
+    exit: exit::ExitGate,
     tray_glyph: Mutex<Option<GlyphVariant>>,
 }
 
@@ -39,19 +50,6 @@ pub struct NativeEvent {
     pub id: String,
     pub path: Option<String>,
     pub repo_path: Option<String>,
-}
-
-fn should_guard_exit(frontend_ready: bool, programmatic_exit: bool) -> bool {
-    frontend_ready && !programmatic_exit
-}
-
-fn request_exit_confirmation<R: Runtime>(app: &AppHandle<R>) {
-    if let Err(error) = reveal_main(app) {
-        log::warn!(target: "desktop", "Could not reveal quit confirmation: {error}");
-    }
-    if let Err(error) = app.emit(EXIT_REQUESTED_EVENT, ()) {
-        log::warn!(target: "desktop", "exit-request emit failed: {error}");
-    }
 }
 
 pub fn install_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -80,13 +78,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 return;
             }
             "quit" => {
-                if app
-                    .state::<DesktopState>()
-                    .exit_guard_ready
-                    .load(Ordering::Acquire)
-                {
-                    request_exit_confirmation(app);
-                } else {
+                if exit::begin(app, exit::Origin::Internal) == exit::Begin::Proceed {
                     app.exit(0);
                 }
                 return;
@@ -185,12 +177,7 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
             Err(error) => log::warn!(target: "desktop", "Could not hide main window: {error}"),
         }
     }
-    let ready = app
-        .state::<DesktopState>()
-        .exit_guard_ready
-        .load(Ordering::Acquire);
-    if ready {
-        request_exit_confirmation(app);
+    if exit::begin(app, exit::Origin::Internal) != exit::Begin::Proceed {
         true
     } else {
         // Before the listener is installed, nobody can answer a quit request.
@@ -198,6 +185,86 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
         #[cfg(target_os = "macos")]
         app.exit(0);
         false
+    }
+}
+
+/// Whether a webview may navigate to `url`: the app's own origin only.
+///
+/// The app is a single page that opens external links through the opener
+/// plugin, so no legitimate flow leaves its origin. Anything else (a link
+/// that slipped past the opener, a redirect, injected markup) would load
+/// remote content into a webview that holds the IPC bridge. `tauri://` is the
+/// macOS/Linux scheme, `tauri.localhost` Windows's, and the Vite dev server is
+/// admitted in debug builds only.
+pub fn navigation_allowed(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => {
+            url.host_str() == Some("tauri.localhost")
+                || (cfg!(debug_assertions)
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+                    && url.port() == Some(5173))
+        }
+        "about" => url.as_str() == "about:blank",
+        _ => false,
+    }
+}
+
+/// Registers [`navigation_allowed`] for every webview the app creates, the
+/// configured main window included, which has no builder to hang it on.
+pub fn navigation_guard<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("navigation-guard")
+        .on_navigation(|webview, url| {
+            let allowed = navigation_allowed(url);
+            if !allowed {
+                log::warn!(
+                    target: "desktop",
+                    "blocked {} navigation to {}://{}",
+                    webview.label(),
+                    url.scheme(),
+                    url.host_str().unwrap_or("")
+                );
+            }
+            allowed
+        })
+        .build()
+}
+
+/// A reload replaces the page that acknowledged terminal output and the one
+/// that confirms quits, while the processes it started keep running here.
+/// Both are let go before the new page's script runs.
+pub fn handle_page_load<R: Runtime>(
+    webview: &tauri::Webview<R>,
+    payload: &tauri::webview::PageLoadPayload<'_>,
+) {
+    if webview.label() != "main"
+        || !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+    {
+        return;
+    }
+    exit::disarm(webview.app_handle(), "the main window's page is reloading");
+    let sessions = webview.state::<crate::terminal::TerminalSessions>();
+    let detached = crate::terminal::detach_all(&sessions);
+    if detached > 0 {
+        log::info!(target: "terminal", "page reloaded; {detached} terminal session(s) detached and still running");
+    }
+}
+
+impl DesktopState {
+    /// The quit gate, for checks that must see whether quits are confirmed.
+    pub fn exit_gate(&self) -> &exit::ExitGate {
+        &self.exit
+    }
+}
+
+/// `AppHandle::exit` supplies a code: that exit was already approved and is
+/// never asked about again. Only a code-less request (the last window closing)
+/// goes to the frontend.
+fn route_exit_requested<R: Runtime>(app: &AppHandle<R>, code: Option<i32>) -> exit::Begin {
+    if code.is_some() {
+        exit::Begin::Proceed
+    } else {
+        exit::begin(app, exit::Origin::Internal)
     }
 }
 
@@ -235,13 +302,8 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
         // `sidecar::shutdown` gives up after ~1.2s rather than stalling
         // exit behind an in-flight request.
         RunEvent::ExitRequested { code, api, .. } => {
-            let ready = app
-                .state::<DesktopState>()
-                .exit_guard_ready
-                .load(Ordering::Acquire);
-            if should_guard_exit(ready, code.is_some()) {
+            if route_exit_requested(app, *code) != exit::Begin::Proceed {
                 api.prevent_exit();
-                request_exit_confirmation(app);
             } else {
                 if let Some(workbench) = app.try_state::<crate::workbench::WorkbenchState>() {
                     workbench.shutdown();
@@ -250,6 +312,10 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
             }
         }
         RunEvent::Exit => {
+            // First: a launch from here on must wait for this process to be
+            // gone and take over, not hand its request to one that is leaving.
+            #[cfg(target_os = "macos")]
+            launch::shutdown();
             if let Some(workbench) = app.try_state::<crate::workbench::WorkbenchState>() {
                 workbench.shutdown();
             }
@@ -301,16 +367,69 @@ pub fn repository_arg(argv: &[String]) -> Option<&str> {
 /// window is not optional — without it a user who opened a repository from the
 /// file manager sees nothing happen at all, because the window that answered is
 /// behind whatever they were looking at.
-pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, argv: &[String]) {
+///
+/// `cwd` is the second launch's directory, not ours: `gitpulse .` typed in a
+/// terminal names the repository the terminal is in.
+#[cfg(not(target_os = "macos"))]
+pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, argv: &[String], cwd: &str) {
     match second_launch(argv) {
         // Reveals the window itself, after queuing the repository.
-        SecondLaunch::Open(path) => queue_and_emit_open(app, Path::new(path)),
+        SecondLaunch::Open(path) => queue_and_emit_open(app, &launch_path(path, Path::new(cwd))),
         SecondLaunch::Reveal => {
             if let Err(error) = reveal_main(app) {
                 log::warn!(target: "desktop", "Could not reveal GitPulse for a second launch: {error}");
             }
         }
         SecondLaunch::Ignore => {}
+    }
+}
+
+/// A path from another process's command line, made absolute against that
+/// process's working directory. One that is already absolute is untouched; an
+/// empty `cwd` (the launch could not read its own) leaves it as given.
+pub fn launch_path(path: &str, cwd: &Path) -> std::path::PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() || cwd.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// What a launch handed over through [`instance`] asks of this one. Runs on
+/// the main thread: revealing changes the Dock policy, which AppKit only
+/// accepts there.
+#[cfg(target_os = "macos")]
+pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
+    let handle = app.clone();
+    let scheduled = app.run_on_main_thread(move || match request {
+        instance::Request::Open { paths } => {
+            for path in paths {
+                queue_and_emit_open(&handle, Path::new(&path));
+            }
+        }
+        instance::Request::Reveal => {
+            if let Err(error) = reveal_main(&handle) {
+                log::warn!(target: "desktop", "Could not reveal GitPulse for another launch: {error}");
+            }
+        }
+        // Answered on its own connection by the gate attached to the mailbox;
+        // it never reaches the sink, and there is nothing here for the window.
+        instance::Request::GateCommand { .. } => {}
+        instance::Request::Notification { id, snooze } => {
+            if let Err(error) = crate::workbench::notifications::forward(&handle, id, snooze) {
+                log::warn!(target: "desktop", "A banner response from another launch was not delivered: {error}");
+                // The click still asked for GitPulse. Snooze asked for nothing.
+                if !snooze {
+                    if let Err(error) = reveal_main(&handle) {
+                        log::warn!(target: "desktop", "Could not reveal GitPulse for a banner: {error}");
+                    }
+                }
+            }
+        }
+    });
+    if let Err(error) = scheduled {
+        log::error!(target: "desktop", "A request from another launch was dropped: {error}");
     }
 }
 
@@ -532,11 +651,7 @@ pub fn set_recent_menu<R: Runtime>(app: &AppHandle<R>, paths: Vec<String>) -> Re
     app.set_menu(menu).map_err(|e| e.to_string())?;
     {
         let state = app.state::<DesktopState>();
-        let mut recents = state
-            .recents
-            .lock()
-            .map_err(|e| format!("Recent-repo lock poisoned: {e}"))?;
-        *recents = capped.clone();
+        *crate::supervisor::lock_or_recover(&state.recents) = capped.clone();
     }
     Ok(())
 }
@@ -572,19 +687,52 @@ pub fn cmd_resolve_git_root(path: String) -> Result<String, String> {
 /// Arms close protection only after the frontend listener is installed.
 #[tauri::command(async)]
 pub fn cmd_set_exit_guard_ready(state: State<DesktopState>) {
-    state.exit_guard_ready.store(true, Ordering::Release);
+    state.exit.arm();
 }
 
-/// Completes a frontend-approved exit. `AppHandle::exit` supplies a code, so
-/// the run-event guard can distinguish this from an OS/user quit request.
+/// Completes a frontend-approved exit (see `exit::approve`).
 #[tauri::command(async)]
 pub fn cmd_exit_app(app: AppHandle) {
-    app.exit(0);
+    exit::approve(&app);
+}
+
+/// The frontend acknowledges a quit request, or cancels it.
+#[tauri::command(async)]
+pub fn cmd_exit_request_answer(app: AppHandle, answer: exit::ExitAnswer) {
+    exit::answer(&app, answer);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_is_limited_to_the_app_origin() {
+        let allow = |u: &str| navigation_allowed(&tauri::Url::parse(u).unwrap());
+        assert!(allow("tauri://localhost/index.html"));
+        assert!(allow("http://tauri.localhost/status.html"));
+        assert!(allow("https://tauri.localhost/"));
+        assert!(allow("about:blank"));
+        for hostile in [
+            "https://example.com/",
+            "http://evil.test/tauri.localhost",
+            "https://tauri.localhost.evil.test/",
+            "http://localhost:5173/",
+            "tauri://evil/",
+            "file:///etc/passwd",
+            "data:text/html,<script>1</script>",
+            "javascript:alert(1)",
+            "blob:https://tauri.localhost/x",
+            "about:srcdoc",
+        ] {
+            // The dev server is admitted in debug builds, which is how tests run.
+            if hostile == "http://localhost:5173/" {
+                assert_eq!(allow(hostile), cfg!(debug_assertions));
+                continue;
+            }
+            assert!(!allow(hostile), "{hostile} must be refused");
+        }
+    }
 
     #[test]
     fn dismissing_status_does_not_request_app_exit_but_main_close_does() {
@@ -622,6 +770,54 @@ mod tests {
             1,
             "main-window quit protection must remain active"
         );
+        // Settled before its deadline: the mock runtime cannot exit.
+        exit::answer(app.handle(), exit::ExitAnswer::Cancel);
+    }
+
+    #[test]
+    fn a_quit_is_handed_to_the_frontend_once_and_only_while_it_listens() {
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let confirmations = Arc::new(Mutex::new(0));
+        let received = Arc::clone(&confirmations);
+        app.listen(EXIT_REQUESTED_EVENT, move |_| {
+            *received.lock().unwrap() += 1;
+        });
+        let handle = app.handle();
+        let state = app.state::<DesktopState>();
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::Proceed,
+            "before the frontend listens, nobody could answer a held quit"
+        );
+        assert_eq!(*confirmations.lock().unwrap(), 0);
+
+        cmd_set_exit_guard_ready(app.state::<DesktopState>());
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::Deferred
+        );
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::AlreadyPending,
+            "a repeated quit must not stack a second confirmation"
+        );
+        assert_eq!(*confirmations.lock().unwrap(), 1);
+        exit::answer(handle, exit::ExitAnswer::Seen);
+        exit::answer(handle, exit::ExitAnswer::Cancel);
+        assert!(state.exit.take().is_none(), "a cancelled quit is settled");
+
+        // A reload or crash takes the listener away: quits go straight through.
+        exit::disarm(handle, "test reload");
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::Proceed
+        );
+        assert_eq!(*confirmations.lock().unwrap(), 1);
     }
 
     #[test]
@@ -659,6 +855,25 @@ mod tests {
         assert_eq!(repository_arg(&argv(&["--"])), None);
         // argv[0] is never the request, however much it looks like a path.
         assert_eq!(repository_arg(&["/opt/gitpulse".into()]), None);
+    }
+
+    /// `gitpulse .` from a terminal names the terminal's repository. The
+    /// running instance has its own working directory, which is not the one
+    /// the request was made in.
+    #[test]
+    fn a_launch_path_is_resolved_where_the_launch_was_made() {
+        let cwd = std::env::temp_dir();
+        assert_eq!(launch_path(".", &cwd), cwd.join("."));
+        assert_eq!(launch_path("sub/repo", &cwd), cwd.join("sub/repo"));
+        let absolute = cwd.join("elsewhere");
+        let absolute = absolute.to_str().unwrap();
+        assert_eq!(
+            launch_path(absolute, Path::new("/ignored")),
+            Path::new(absolute)
+        );
+        // A launch that could not read its own directory sends none; the path
+        // is left as given rather than anchored somewhere arbitrary.
+        assert_eq!(launch_path("rel", Path::new("")), Path::new("rel"));
     }
 
     #[test]
@@ -704,10 +919,21 @@ mod tests {
 
     #[test]
     fn exit_guard_only_intercepts_user_requests_after_frontend_is_ready() {
-        assert!(!should_guard_exit(false, false));
-        assert!(!should_guard_exit(false, true));
-        assert!(should_guard_exit(true, false));
-        assert!(!should_guard_exit(true, true));
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let handle = app.handle();
+        assert_eq!(route_exit_requested(handle, None), exit::Begin::Proceed);
+        assert_eq!(route_exit_requested(handle, Some(0)), exit::Begin::Proceed);
+        cmd_set_exit_guard_ready(app.state::<DesktopState>());
+        assert_eq!(
+            route_exit_requested(handle, Some(0)),
+            exit::Begin::Proceed,
+            "an approved exit must never be asked about again"
+        );
+        assert_eq!(route_exit_requested(handle, None), exit::Begin::Deferred);
+        exit::answer(handle, exit::ExitAnswer::Cancel);
     }
 
     #[test]

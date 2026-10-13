@@ -356,15 +356,77 @@ pub(crate) fn install(app: &tauri::AppHandle) {
     }
     let app = app.clone();
     let failure = status.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("workbench-notifications".into())
-        .spawn(move || run(host, app, receiver, status))
+    if let Err(error) =
+        crate::supervisor::spawn_once("workbench-notifications", "task notifications", move || {
+            run(host, app, receiver, status)
+        })
     {
         if let Ok(mut current) = failure.lock() {
             current.available = false;
             current.error = Some(error.to_string());
         }
     }
+}
+
+/// A banner response that macOS delivered to another launch of GitPulse,
+/// which handed it here (`desktop::instance`) instead of starting a second app.
+///
+/// It joins the same queue the delegate in this process feeds, so it gets the
+/// same identity checks and the same open-or-snooze handling as a click this
+/// process received itself.
+#[cfg(target_os = "macos")]
+pub(crate) fn forward(app: &tauri::AppHandle, native: String, snooze: bool) -> Result<(), String> {
+    enqueue_response(&app.state::<WorkbenchState>(), native, snooze)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn enqueue_response(host: &WorkbenchState, native: String, snooze: bool) -> Result<(), String> {
+    let coordinator = host
+        .0
+        .notifications
+        .get()
+        .ok_or("native notifications are not installed in this process")?;
+    let event = if snooze {
+        Event::Snooze(native)
+    } else {
+        Event::Activate(native)
+    };
+    coordinator
+        .sender
+        .try_send(event)
+        .map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "the notification queue is full".to_owned(),
+            mpsc::TrySendError::Disconnected(_) => "the notification worker has stopped".to_owned(),
+        })
+}
+
+/// Banner responses delivered to a launch that is only passing a request on
+/// to the GitPulse already running. See [`responses`].
+#[cfg(target_os = "macos")]
+pub(crate) struct ResponseTap(mpsc::Receiver<Event>);
+
+#[cfg(target_os = "macos")]
+impl ResponseTap {
+    /// The first response, as `(native identifier, snooze)`.
+    pub(crate) fn try_take(&self) -> Option<(String, bool)> {
+        loop {
+            match self.0.try_recv().ok()? {
+                Event::Activate(native) => return Some((native, false)),
+                Event::Snooze(native) => return Some((native, true)),
+                Event::Wake => continue,
+            }
+        }
+    }
+}
+
+/// Installs this process's notification delegate only to catch the response
+/// macOS launched it to deliver. Main thread, before AppKit finishes launching.
+#[cfg(target_os = "macos")]
+pub(crate) fn responses() -> Result<ResponseTap, String> {
+    let (sender, receiver) = mpsc::sync_channel(4);
+    platform::install(sender, Arc::new(Mutex::new(Status::default())))
+        .map(|()| ResponseTap(receiver))
+        .map_err(|error| error.message)
 }
 
 fn run(
@@ -627,6 +689,36 @@ mod tests {
             Event::Activate("gitpulse.0123456789abcdef0123456789abcdef.event-1".into()),
             Event::Activate(native) if notice_id(&native) == Some("event-1")
         ));
+    }
+    /// A banner response another launch handed over joins the same queue the
+    /// delegate feeds, as the same event — so it gets the same identity checks
+    /// and the same open-or-snooze handling — and every way it cannot be
+    /// queued is an error the caller can act on, never a silent drop.
+    #[test]
+    fn a_handed_over_banner_response_joins_the_delegates_queue() {
+        let host = WorkbenchState(Arc::new(super::super::Inner::default()));
+        assert!(
+            enqueue_response(&host, "n".into(), false).is_err(),
+            "no worker"
+        );
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let coordinator = Coordinator {
+            sender,
+            status: Arc::new(Mutex::new(Status::default())),
+        };
+        assert!(host.0.notifications.set(coordinator).is_ok());
+        enqueue_response(&host, "open-me".into(), false).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Event::Activate(n)) if n == "open-me"));
+        enqueue_response(&host, "later".into(), true).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Event::Snooze(n)) if n == "later"));
+
+        enqueue_response(&host, "fills".into(), false).unwrap();
+        let full = enqueue_response(&host, "overflows".into(), false).unwrap_err();
+        assert!(full.contains("full"), "{full}");
+        drop(receiver);
+        let stopped = enqueue_response(&host, "nobody".into(), false).unwrap_err();
+        assert!(stopped.contains("stopped"), "{stopped}");
     }
     #[test]
     fn native_id_cannot_be_a_path_command_or_another_namespace() {
@@ -923,9 +1015,17 @@ mod tests {
     fn every_managed_callback_kind_produces_a_bannerable_notice() {
         let root = tempfile::tempdir().unwrap();
         let host = profile_host(root.path());
+        // The store refuses a relative directory, and `/checkout` has no drive
+        // letter, so on Windows it is not absolute.
+        let checkout = if cfg!(windows) {
+            r"C:\checkout"
+        } else {
+            "/checkout"
+        };
+        let checkout_git = format!("{checkout}/.git");
         call(&host,"repositories.put",json!({"id":"m","request_id":"m","expected_revision":0,"name":"m","identity_key":"local:/checkout/.git"})).unwrap();
         call(&host,"items.put",json!({"id":"t","request_id":"t","expected_revision":0,"title":"private","repository_ids":["m"],"primary_repository_id":"m"})).unwrap();
-        call(&host,"runs.prepare",json!({"id":"run","request_id":"prepare","expected_revision":0,"kind":"managed","task_id":"t","source_revision":1,"repository_id":"m","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"/checkout","git_dir":"/checkout/.git","git_common_dir":"/checkout/.git","head_oid":"0123456789abcdef0123456789abcdef01234567","head_ref":"refs/heads/main","max_active_runs":1})).unwrap();
+        call(&host,"runs.prepare",json!({"id":"run","request_id":"prepare","expected_revision":0,"kind":"managed","task_id":"t","source_revision":1,"repository_id":"m","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":checkout,"git_dir":checkout_git,"git_common_dir":checkout_git,"head_oid":"0123456789abcdef0123456789abcdef01234567","head_ref":"refs/heads/main","max_active_runs":1})).unwrap();
         call(&host,"runs.claim",json!({"id":"run","request_id":"claim","expected_revision":1,"owner_id":"owner","session_id":"session","kind":"managed"})).unwrap();
         let pid = std::process::id();
         let birth = super::super::process_birth::read(pid).unwrap();

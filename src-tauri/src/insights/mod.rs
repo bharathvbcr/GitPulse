@@ -6,7 +6,7 @@
 //! nothing. Nothing here mutates a repository.
 
 mod entity_collision;
-mod live_sessions;
+pub(crate) mod live_sessions;
 
 pub use entity_collision::{
     classify_overlapping_path, classify_party_symbols, parse_old_side_ranges,
@@ -371,11 +371,25 @@ pub struct McpInfo {
     pub binary_found: bool,
     pub binary_path: String,
     pub binary_error: String,
+    /// The bare `gitpulse-mcp` the plugin manifest names resolves on `PATH`.
+    pub binary_on_path: bool,
+    /// `gitpulse-hook`, resolved the same way as the server above.
+    pub hook_found: bool,
+    pub hook_path: String,
+    pub hook_error: String,
+    pub hook_on_path: bool,
     pub plugin_found: bool,
     pub plugin_path: String,
     pub plugin_error: String,
     pub plugin_manifest_json: String,
+    /// The portable manifest, naming `gitpulse-mcp` bare.
     pub plugin_mcp_json: String,
+    /// The MCP manifest to install: `command` is the resolved absolute path.
+    /// Empty when the server was not found.
+    pub mcp_config_json: String,
+    /// The hooks manifest to install: absolute path, deciding hooks refusing
+    /// when the binary is missing. Empty when the hook binary was not found.
+    pub hooks_config_json: String,
     pub tools: Vec<McpToolInfo>,
 }
 
@@ -791,17 +805,10 @@ fn snapshot_observed(
     };
 
     let changes = match GitReader::get_status(repo_path) {
-        Ok(files) => {
-            let truncated = files.len() > MAX_ACTIVE_FILES;
-            let kept = if truncated {
-                &files[..MAX_ACTIVE_FILES]
-            } else {
-                &files
-            };
-            let mut facet = changes_from_status(kept, truncated);
-            facet.files = files.len() as u32;
-            facet
-        }
+        // The facet carries counts, not rows, and the whole status is already
+        // in memory: count every file. Counting only the first
+        // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
+        Ok(files) => changes_from_status(&files, false),
         Err(error) => empty_changes(error),
     };
 
@@ -1084,11 +1091,23 @@ fn fleet_commit_stats(
     // One over the cap, so "we stopped early" is observable rather than
     // indistinguishable from a repository that happens to have exactly the cap.
     let limit = (MAX_FLEET_COMMITS + 1).to_string();
+    // Only commits inside the window count toward the cap. Without a date
+    // bound the cap was spent on history older than the window, so a
+    // repository with more than the cap in total read as truncated even when
+    // every commit of the window had been seen; with it, `truncated` means the
+    // window itself hit the cap. `--since-as-filter` (git 2.37) rather than
+    // `--since`: plain `--since` stops walking at the first old commit, so one
+    // commit with a skewed clock at the tip hid everything behind it.
+    let since = format!(
+        "--since-as-filter={}",
+        anchor_epoch.saturating_sub(i64::from(window_days) * BUCKET_SECONDS)
+    );
     let text = match git_text(
         repo,
         &[
             "log",
             "--no-show-signature",
+            &since,
             "-n",
             &limit,
             "--format=%ct%x1f%ae",
@@ -1517,21 +1536,28 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
 ///
 /// The porcelain path scan stays bounded and cheap. Symbol classification runs
 /// afterwards on the first overlapping path only — see
-/// [`entity_collision::enrich_first_item`].
+/// [`entity_collision::enrich_item`].
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
-    collision_risk_observed(repo_path, &live_sessions::observe())
+    collision_risk_observed(repo_path, &live_sessions::observe(), None)
+}
+
+/// [`collision_risk`] whose symbol verdict is computed for `path`, the file
+/// being edited, instead of the first overlapping row.
+pub fn collision_risk_for_path(repo_path: &str, path: &str) -> CollisionRisk {
+    collision_risk_observed(repo_path, &live_sessions::observe(), Some(path))
 }
 
 /// [`collision_risk`] over a live-session observation the caller made.
 fn collision_risk_observed(
     repo_path: &str,
     observation: &live_sessions::Observation,
+    focus: Option<&str>,
 ) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
-        Ok(list) => entity_collision::enrich_first_item(collision_from_list(
-            &list,
-            &live_in(observation, &list),
-        )),
+        Ok(list) => entity_collision::enrich_item(
+            collision_from_list(&list, &live_in(observation, &list)),
+            focus,
+        ),
         Err(error) => empty_collisions(error),
     }
 }
@@ -1550,16 +1576,6 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
     }
 }
 
-/// Resolves the worktree an insights read is about, and proves it belongs to
-/// `repo_path`.
-///
-/// Without this, `worktree_path` was taken on trust: a path naming a totally
-/// unrelated repository came back stamped with `repo_path`'s identity, so the
-/// answer described one repository while claiming to describe another. The
-/// ledger route has always authenticated this pair; these read tools now use
-/// the same gate. The returned path is the canonical one git registered, so
-/// later comparisons against the worktree listing are not defeated by
-/// symlinks or a trailing slash.
 /// Do two path strings name the same directory?
 ///
 /// A literal comparison is not enough on macOS, where every temporary directory
@@ -1572,8 +1588,9 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
 /// Canonicalization is attempted on both sides and the literal comparison is
 /// the fallback, because a worktree that was removed between the listing and
 /// this call cannot be canonicalized and must still compare equal to itself.
-fn same_path(left: &str, right: &str) -> bool {
-    if Path::new(left) == Path::new(right) {
+pub(crate) fn same_path(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bool {
+    let (left, right) = (left.as_ref(), right.as_ref());
+    if left == right {
         return true;
     }
     match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
@@ -1582,6 +1599,16 @@ fn same_path(left: &str, right: &str) -> bool {
     }
 }
 
+/// Resolves the worktree an insights read is about, and proves it belongs to
+/// `repo_path`.
+///
+/// Without this, `worktree_path` was taken on trust: a path naming a totally
+/// unrelated repository came back stamped with `repo_path`'s identity, so the
+/// answer described one repository while claiming to describe another. The
+/// ledger route has always authenticated this pair; these read tools now use
+/// the same gate. The returned path is the canonical one git registered, so
+/// later comparisons against the worktree listing are not defeated by
+/// symlinks or a trailing slash.
 fn resolve_target(repo_path: &str, worktree_path: Option<&str>) -> Result<String, String> {
     let Some(requested) = worktree_path else {
         // No worktree named: the repository itself is the target, and there is
@@ -1621,7 +1648,9 @@ fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChange
             let total = files.len() as u32;
             let truncated = files.len() > cap;
             let kept: Vec<FileStatus> = files.iter().take(cap).cloned().collect();
-            let counts = count_statuses(&kept);
+            // Totals describe the whole worktree, like `total`; only the row
+            // list is capped. Counting the rows kept understated them.
+            let counts = count_statuses(&files);
             ActiveChanges {
                 repo_path: repo_path.to_string(),
                 worktree_path: target.to_string(),
@@ -1813,60 +1842,179 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
     }
 }
 
-fn looks_like_mcp_binary(name: &str) -> bool {
-    let stem = name.strip_suffix(".exe").unwrap_or(name);
-    stem == "gitpulse-mcp" || stem.starts_with("gitpulse-mcp-")
+/// Where one of the app's bundled executables is, and whether a bare name
+/// would reach it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BinaryStatus {
+    found: bool,
+    path: String,
+    error: String,
+    /// The bare command name resolves on `PATH`. The plugin's own manifests
+    /// name it bare, so with an empty `PATH` they cannot start it even when
+    /// `found`.
+    on_path: bool,
 }
 
-fn resolve_mcp_binary() -> (bool, String, String) {
-    if let Ok(explicit) = std::env::var("GITPULSE_MCP_PATH") {
-        let path = Path::new(&explicit);
-        if path.is_file() {
-            return (true, explicit, String::new());
+/// `gitpulse-mcp`, or the target-triple build Tauri names it (`gitpulse-mcp-<triple>`).
+fn looks_like_binary(name: &str, stem: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    name == stem
+        || name
+            .strip_prefix(stem)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// Whether `stem` is an executable file in one of the directories of `path_var`.
+/// `None` and an empty value find nothing.
+fn on_path_in(stem: &str, path_var: Option<std::ffi::OsString>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        !dir.as_os_str().is_empty()
+            && [stem.to_string(), format!("{stem}.exe")]
+                .iter()
+                .any(|name| dir.join(name).is_file())
+    })
+}
+
+/// Resolves one bundled executable: an explicit `env_var` override, else this
+/// process itself or a file beside it (the app bundle's `Contents/MacOS`).
+fn resolve_bundled_binary(env_var: &str, stem: &str) -> BinaryStatus {
+    let on_path = on_path_in(stem, std::env::var_os("PATH"));
+    let missing = |error: String| BinaryStatus {
+        error,
+        on_path,
+        ..BinaryStatus::default()
+    };
+    let found = |path: String| BinaryStatus {
+        found: true,
+        path,
+        error: String::new(),
+        on_path,
+    };
+    if let Ok(explicit) = std::env::var(env_var) {
+        if Path::new(&explicit).is_file() {
+            return found(explicit);
         }
-        return (
-            false,
-            explicit,
-            "GITPULSE_MCP_PATH does not point at a file".into(),
-        );
+        return BinaryStatus {
+            path: explicit,
+            ..missing(format!("{env_var} does not point at a file"))
+        };
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(e) => {
-            return (
-                false,
-                String::new(),
-                format!("could not resolve this process path: {e}"),
-            )
-        }
+        Err(e) => return missing(format!("could not resolve this process path: {e}")),
     };
-    if looks_like_mcp_binary(exe.file_name().and_then(|n| n.to_str()).unwrap_or_default())
-        && exe.is_file()
+    if looks_like_binary(
+        exe.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        stem,
+    ) && exe.is_file()
     {
-        return (true, exe.to_string_lossy().into_owned(), String::new());
+        return found(exe.to_string_lossy().into_owned());
     }
     let Some(dir) = exe.parent() else {
-        return (
-            false,
-            String::new(),
-            "gitpulse-mcp is not next to this process".into(),
-        );
+        return missing(format!("{stem} is not next to this process"));
     };
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path.is_file() && looks_like_mcp_binary(name) {
-                return (true, path.to_string_lossy().into_owned(), String::new());
+            if path.is_file() && looks_like_binary(name, stem) {
+                return found(path.to_string_lossy().into_owned());
             }
         }
     }
-    (
-        false,
-        String::new(),
-        "gitpulse-mcp is not next to this app. Build it with `cargo build --bin gitpulse-mcp --manifest-path src-tauri/Cargo.toml`, or set GITPULSE_MCP_PATH."
-            .into(),
-    )
+    missing(format!(
+        "{stem} is not next to this app. Build it with `cargo build --bin {stem} --manifest-path src-tauri/Cargo.toml`, or set {env_var}."
+    ))
+}
+
+/// Single-quotes `text` for a POSIX shell.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The plugin's MCP manifest with `gitpulse` started by `binary`'s absolute
+/// path. A bare `gitpulse-mcp` only works when something put it on `PATH`, and
+/// a released app does not.
+fn mcp_config_with(template: &str, binary: &str) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(template).map_err(|e| format!("the MCP manifest is not JSON: {e}"))?;
+    let server = value
+        .pointer_mut("/mcpServers/gitpulse")
+        .and_then(|s| s.as_object_mut())
+        .ok_or("the MCP manifest has no gitpulse server")?;
+    server.insert(
+        "command".into(),
+        serde_json::Value::String(binary.to_string()),
+    );
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+/// The plugin's hooks manifest with every `gitpulse-hook` spelled as the
+/// absolute path of `binary`.
+///
+/// The hooks that decide something (`collision-guard`, `command-gate`) also
+/// refuse when the binary is missing: a host treats a hook that cannot start as
+/// a non-blocking error and runs the call anyway, so the bare command left the
+/// gate silently off. Exit status 2 is the host's "block", with the reason on
+/// stderr. `session-brief` cannot block anything, so it tells the session
+/// instead. Reports (`notify`) stay as they are: losing one loses a
+/// notification, never a decision. On Windows there is no `sh` to wrap with, so
+/// every command is the quoted path alone.
+fn hooks_config_with(template: &str, binary: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(template)
+        .map_err(|e| format!("the hooks manifest is not JSON: {e}"))?;
+    let events = value
+        .get_mut("hooks")
+        .and_then(|h| h.as_object_mut())
+        .ok_or("the hooks manifest has no hooks")?;
+    let quoted = sh_quote(binary);
+    for groups in events.values_mut() {
+        for group in groups.as_array_mut().into_iter().flatten() {
+            for handler in group
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+                .into_iter()
+                .flatten()
+            {
+                let Some(command) = handler.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                let Some(args) = command.strip_prefix("gitpulse-hook ") else {
+                    return Err(format!("unexpected hook command: {command}"));
+                };
+                let wrapped = if cfg!(windows) {
+                    format!("\"{binary}\" {args}")
+                } else {
+                    match args.split_whitespace().next() {
+                        Some("collision-guard" | "command-gate") => format!(
+                            "[ -x {quoted} ] || {{ echo {} >&2; exit 2; }}; exec {quoted} {args}",
+                            sh_quote(&format!(
+                                "GitPulse blocked this call: its safety hook {binary} cannot run. Reinstall GitPulse or set the hook path in Settings."
+                            ))
+                        ),
+                        Some("session-brief") => format!(
+                            "[ -x {quoted} ] || {{ printf '%s' {}; exit 0; }}; exec {quoted} {args}",
+                            sh_quote(&serde_json::json!({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "SessionStart",
+                                    "additionalContext": format!(
+                                        "WARNING: GitPulse's safety hooks cannot run ({binary} is missing), so the collision guard and command gate are OFF in this session."
+                                    )
+                                }
+                            })
+                            .to_string())
+                        ),
+                        _ => format!("{quoted} {args}"),
+                    }
+                };
+                handler["command"] = serde_json::Value::String(wrapped);
+            }
+        }
+    }
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
 }
 
 fn is_native_plugin_root(path: &Path) -> bool {
@@ -1919,30 +2067,54 @@ fn resolve_plugin_root() -> (bool, String, String) {
 /// manifests, and the tool catalog. Never claims a binary is present when the
 /// file could not be found.
 pub fn mcp_info() -> McpInfo {
-    let (binary_found, binary_path, binary_error) = resolve_mcp_binary();
+    let mcp = resolve_bundled_binary("GITPULSE_MCP_PATH", "gitpulse-mcp");
+    let hook = resolve_bundled_binary("GITPULSE_HOOK_PATH", "gitpulse-hook");
     let (plugin_found, plugin_path, plugin_error) = resolve_plugin_root();
-    let (plugin_manifest_json, plugin_mcp_json) = if plugin_found {
-        let root = Path::new(&plugin_path);
-        let manifest =
-            std::fs::read_to_string(root.join(".codex-plugin/plugin.json")).unwrap_or_default();
-        let mcp = std::fs::read_to_string(root.join(".mcp.json")).unwrap_or_default();
-        (manifest, mcp)
-    } else {
-        (String::new(), String::new())
-    };
+    let (plugin_manifest_json, plugin_mcp_json, mcp_config_json, hooks_config_json) =
+        if plugin_found {
+            let root = Path::new(&plugin_path);
+            let manifest =
+                std::fs::read_to_string(root.join(".codex-plugin/plugin.json")).unwrap_or_default();
+            let mcp_template = std::fs::read_to_string(root.join(".mcp.json")).unwrap_or_default();
+            let hooks_template =
+                std::fs::read_to_string(root.join("hooks/hooks.json")).unwrap_or_default();
+            // What Settings copies is the command that will run, so it is built
+            // from the path just resolved. Nothing is offered for a binary that
+            // was not found: a copy naming a bare command is the bug.
+            let mcp_config = if mcp.found {
+                mcp_config_with(&mcp_template, &mcp.path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let hooks_config = if hook.found {
+                hooks_config_with(&hooks_template, &hook.path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (manifest, mcp_template, mcp_config, hooks_config)
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
     McpInfo {
         protocol_version: crate::mcp::PROTOCOL_VERSION.to_string(),
         server_name: crate::mcp::SERVER_NAME.to_string(),
         server_version: crate::mcp::server_version().to_string(),
         read_only: true,
-        binary_found,
-        binary_path,
-        binary_error,
+        binary_found: mcp.found,
+        binary_path: mcp.path,
+        binary_error: mcp.error,
+        binary_on_path: mcp.on_path,
+        hook_found: hook.found,
+        hook_path: hook.path,
+        hook_error: hook.error,
+        hook_on_path: hook.on_path,
         plugin_found,
         plugin_path,
         plugin_error,
         plugin_manifest_json,
         plugin_mcp_json,
+        mcp_config_json,
+        hooks_config_json,
         tools: crate::mcp::tool_catalog(),
     }
 }
@@ -1954,6 +2126,25 @@ mod tests {
     use std::fs;
 
     use crate::test_support::git_in;
+
+    #[test]
+    fn same_path_takes_strings_and_paths_and_sees_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        assert!(same_path(real.to_str().unwrap(), &real));
+        assert!(!same_path(&real, dir.path()));
+        // A removed directory cannot be canonicalised and compares literally.
+        let gone = dir.path().join("gone");
+        assert!(same_path(&gone, &gone));
+        assert!(!same_path(&gone, &real));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(same_path(&link, &real));
+        }
+    }
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1985,34 +2176,6 @@ mod tests {
         }
     }
 
-    /// One builder per fact. Two hand-written `WorktreeSummary` literals and a
-    /// third agent-kind scan in the collision path each had to be kept in step
-    /// by hand; a new field, or a change to how a path is labelled, landed in
-    /// one and not the others.
-    #[test]
-    fn worktree_rows_and_agent_labels_each_have_one_builder() {
-        let source = include_str!("mod.rs");
-        let production = &source[..source
-            .find("#[cfg(test)]\nmod tests")
-            .expect("test module marker")];
-        // A struct literal opens on a line of its own; signatures returning
-        // the type and the definition do not.
-        assert_eq!(
-            production
-                .lines()
-                .filter(|line| line.trim() == "WorktreeSummary {")
-                .count(),
-            1,
-            "summarise_worktree is the only WorktreeSummary literal"
-        );
-        assert_eq!(
-            production.matches("agent_layout(").count(),
-            1,
-            "agent_labels is the one scan"
-        );
-        assert!(!production.contains("agent_kind(&"));
-    }
-
     /// The snapshot row and the change-context row for an unlisted checkout
     /// come from one builder. Pinned to the bytes the two separate builders
     /// produced before they converged, so the convergence changed no output.
@@ -2037,8 +2200,10 @@ mod tests {
 
     /// A running process registered as one Claude Code session in `cwd`.
     /// Killed when dropped, so a failing assertion leaves nothing behind.
+    #[cfg(unix)]
     struct SimulatedSession(std::process::Child);
 
+    #[cfg(unix)]
     impl Drop for SimulatedSession {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -2046,6 +2211,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn simulate_session(registry: &Path, cwd: &Path) -> SimulatedSession {
         let child = std::process::Command::new("sleep")
             .arg("60")
@@ -2094,7 +2260,7 @@ mod tests {
         let claude = observation.iter().find(|k| k.kind == "claude").unwrap();
         assert_eq!(claude.live.len(), 2, "both stand-ins are alive: {claude:?}");
 
-        let risk = collision_risk_observed(repo, &observation);
+        let risk = collision_risk_observed(repo, &observation, None);
         assert!(risk.ok, "{risk:?}");
         assert_eq!(risk.overlapping_files, 0, "one worktree overlaps nothing");
         assert_eq!(risk.shared_worktree_files, 1, "{risk:?}");
@@ -2152,7 +2318,7 @@ mod tests {
             &crate::workbench::process_birth::running_since,
         );
 
-        let risk = collision_risk_observed(repo, &observation);
+        let risk = collision_risk_observed(repo, &observation, None);
         assert!(risk.ok, "{risk:?}");
         assert!(risk.shared_worktrees.is_empty(), "{risk:?}");
         assert_eq!(risk.shared_worktree_files, 0);
@@ -2199,7 +2365,11 @@ mod tests {
         assert!(!snap.changes.ok);
         assert!(!snap.collisions.ok);
         assert_eq!(snap.collisions.overlapping_files, 0);
-        assert!(!snap.collisions.items.is_empty() || snap.collisions.items.is_empty());
+        assert!(
+            snap.collisions.items.is_empty(),
+            "a collision scan that failed must not invent overlaps: {:?}",
+            snap.collisions.items
+        );
         // Zero overlapping files plus ok:false is "we did not look", not clean.
         assert!(!snap.worktrees.ok && snap.collisions.overlapping_files == 0);
     }
@@ -2317,6 +2487,31 @@ mod tests {
         assert!(!changes.error.is_empty());
         assert!(changes.files.is_empty());
         assert_eq!(changes.total, 0);
+    }
+
+    /// 250 untracked files, a cap of 200 on rows: the totals cover all 250.
+    /// They were rolled from the first 200 and read as exact.
+    #[test]
+    fn change_totals_cover_every_file_not_the_capped_list() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        for i in 0..250 {
+            fs::write(main.path().join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        let snap = snapshot(repo);
+        assert!(snap.changes.ok, "{:?}", snap.changes);
+        assert_eq!(snap.changes.files, 250);
+        assert_eq!(snap.changes.untracked, 250, "{:?}", snap.changes);
+        assert!(!snap.changes.truncated, "{:?}", snap.changes);
+
+        let listed = active_changes(repo, None, Some(10));
+        assert_eq!(listed.files.len(), 10);
+        assert_eq!(listed.total, 250);
+        assert!(listed.truncated, "the row list is capped");
+        assert_eq!(
+            listed.untracked, 250,
+            "totals are not the capped rows: {listed:?}"
+        );
     }
 
     /// Commits an empty change stamped at an exact instant.
@@ -2545,6 +2740,53 @@ mod tests {
             "every in-window commit is counted, whatever order the dates arrive in"
         );
         assert_eq!(stats.active_days, 4);
+    }
+
+    /// More history than the cap, all of it older than the window except three
+    /// commits: the window was fully covered, so nothing is a floor.
+    #[test]
+    fn a_long_history_older_than_the_window_is_not_truncated() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        let old_total = MAX_FLEET_COMMITS + 50;
+        let mut stream = String::new();
+        for i in 0..old_total + 3 {
+            let stamp = if i < old_total {
+                anchor - 400 * 86_400 + i as i64
+            } else {
+                anchor - 100 * (1 + (i - old_total) as i64)
+            };
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{}\ncommitter A <a@example.com> {stamp} +0000\ndata 2\nc\n",
+                i + 1
+            ));
+            if i > 0 {
+                stream.push_str(&format!("from :{i}\n"));
+            }
+            stream.push('\n');
+        }
+        let file = dir.path().join("stream");
+        fs::File::create(&file)
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        let status = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(dir.path())
+            .stdin(fs::File::open(&file).unwrap())
+            .status_locked()
+            .expect("spawn git fast-import");
+        assert!(status.success());
+
+        let stats =
+            fleet_commit_stats(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS).expect("probe runs");
+        assert_eq!(stats.commits, 3);
+        assert!(
+            !stats.truncated,
+            "the window held 3 commits; history past the window must not spend the cap"
+        );
     }
 
     #[test]
@@ -3330,6 +3572,171 @@ mod tests {
         assert!(info.read_only);
         assert_eq!(info.protocol_version, crate::mcp::PROTOCOL_VERSION);
         assert!(!info.tools.is_empty());
+    }
+
+    fn plugin_hooks_template() -> String {
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
+        )
+        .expect("the plugin ships a hooks manifest")
+    }
+
+    /// The commands of the generated hooks manifest, keyed by the subcommand
+    /// they run.
+    fn generated_commands(binary: &str) -> Vec<(String, String)> {
+        let json = hooks_config_with(&plugin_hooks_template(), binary).expect("rewritten");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut found = Vec::new();
+        for groups in value["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    let command = handler["command"].as_str().unwrap().to_string();
+                    let sub = command.rsplit(' ').next().unwrap_or_default().to_string();
+                    found.push((sub, command));
+                }
+            }
+        }
+        found
+    }
+
+    /// A released app has nothing on `PATH`, so the manifest it hands out must
+    /// name the binary by path. The shipped one names it bare.
+    #[test]
+    fn the_generated_hooks_and_mcp_manifests_name_the_binary_by_absolute_path() {
+        let commands =
+            generated_commands("/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook");
+        assert!(!commands.is_empty());
+        for (_, command) in &commands {
+            assert!(
+                command.contains("/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook"),
+                "{command}"
+            );
+            assert!(!command.starts_with("gitpulse-hook "), "{command}");
+        }
+        let mcp = mcp_config_with(
+            r#"{"mcpServers":{"gitpulse":{"type":"stdio","command":"gitpulse-mcp"}}}"#,
+            "/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+        )
+        .unwrap();
+        assert!(
+            mcp.contains("\"command\": \"/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp\""),
+            "{mcp}"
+        );
+        assert!(mcp_config_with("{}", "/x").is_err());
+        assert!(hooks_config_with(
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"other x"}]}]}}"#,
+            "/x"
+        )
+        .is_err());
+    }
+
+    /// A hook that cannot launch must not read as a hook that allowed the
+    /// call. Run for real: with the binary missing, the deciding hooks exit 2
+    /// (the host's "block") with the reason on stderr, session start says the
+    /// hooks are off, and a present binary is simply run.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_hook_binary_refuses_deciding_hooks_and_warns_at_session_start() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gitpulse hook's dir/gitpulse-hook");
+        let run = |command: &str| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output_locked()
+                .expect("sh runs")
+        };
+        let commands = generated_commands(missing.to_str().unwrap());
+        for (sub, command) in &commands {
+            let out = run(command);
+            match sub.as_str() {
+                "collision-guard" | "command-gate" => {
+                    assert_eq!(out.status.code(), Some(2), "{sub}: {command}");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(stderr.contains("blocked this call"), "{sub}: {stderr}");
+                }
+                "session-brief" => {
+                    assert_eq!(out.status.code(), Some(0), "{sub}");
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let value: serde_json::Value =
+                        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+                    assert!(
+                        value["hookSpecificOutput"]["additionalContext"]
+                            .as_str()
+                            .unwrap()
+                            .contains("OFF"),
+                        "{stdout}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(commands.iter().any(|(sub, _)| sub == "command-gate"));
+        assert!(commands.iter().any(|(sub, _)| sub == "session-brief"));
+
+        // Present: the wrapper hands control to the binary with its arguments.
+        std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        std::fs::write(&missing, "#!/bin/sh\necho \"ran $*\"\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (sub, command) in generated_commands(missing.to_str().unwrap()) {
+            let out = run(&command);
+            assert_eq!(out.status.code(), Some(0), "{sub}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).starts_with("ran "),
+                "{sub}"
+            );
+        }
+    }
+
+    /// The bare command a plugin manifest names reaches nothing with an empty
+    /// `PATH`; Settings says so instead of reporting the binary as fine.
+    #[test]
+    fn a_bare_command_is_not_reachable_on_an_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "gitpulse-hook.exe"
+        } else {
+            "gitpulse-hook"
+        };
+        fs::write(dir.path().join(name), "").unwrap();
+        assert!(on_path_in(
+            "gitpulse-hook",
+            Some(dir.path().as_os_str().to_owned())
+        ));
+        assert!(!on_path_in(
+            "gitpulse-hook",
+            Some(std::ffi::OsString::new())
+        ));
+        assert!(!on_path_in("gitpulse-hook", None));
+        assert!(!on_path_in(
+            "gitpulse-mcp",
+            Some(dir.path().as_os_str().to_owned())
+        ));
+        assert!(looks_like_binary(
+            "gitpulse-hook-aarch64-apple-darwin",
+            "gitpulse-hook"
+        ));
+        assert!(looks_like_binary("gitpulse-hook.exe", "gitpulse-hook"));
+        assert!(!looks_like_binary("gitpulse-hookah", "gitpulse-hook"));
+    }
+
+    /// With the hook binary unresolved nothing is offered to copy: a manifest
+    /// naming a binary that is not there is the failure being fixed.
+    #[test]
+    fn mcp_info_offers_no_hooks_manifest_for_a_hook_binary_it_did_not_find() {
+        let serial = crate::harness::sidecar::test_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+        let info = mcp_info();
+        assert!(!info.hook_found);
+        assert!(
+            info.hook_error.contains("GITPULSE_HOOK_PATH"),
+            "{}",
+            info.hook_error
+        );
+        assert!(info.hooks_config_json.is_empty());
     }
 
     #[test]

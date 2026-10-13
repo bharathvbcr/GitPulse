@@ -90,10 +90,10 @@ describe("CodeStackViewer load correctness", () => {
     // instance block by its closing tag.
     const effectStart = source.indexOf("$effect(() => {\n    const repo");
     const effect = source.slice(effectStart, source.lastIndexOf("</script>"));
-    expect(effect).toContain("$repoStore.currentPath");
-    expect(effect).toContain("$repoStore.generation");
-    // Memo guard: unrelated store emissions must not refetch.
-    expect(effect).toContain("generation === prevGeneration) return;");
+    expect(effect).toContain("const repo = $currentRepoPath;");
+    expect(effect).toContain("void generation;");
+    // Both keys compare by value, so unrelated store emissions do not refetch.
+    expect(source).toContain("const generation = $derived($repoStore.generation);");
   });
 
   it("shows a loading state instead of a false empty state on first fetch", () => {

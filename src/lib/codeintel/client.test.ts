@@ -296,7 +296,7 @@ describe("codeintel client", () => {
       name: "b",
     });
 
-    vi.mocked(invoke).mockResolvedValueOnce({ links: [], count: 0, repos_considered: 1 });
+    vi.mocked(invoke).mockResolvedValueOnce({ links: [], coverage_gaps: [], count: 0, repos_considered: 1 });
     await getWorkspaceLinkCandidates("/a");
     expect(invoke).toHaveBeenCalledWith("cmd_workspace_link_candidates", {
       registryRoot: "/a",

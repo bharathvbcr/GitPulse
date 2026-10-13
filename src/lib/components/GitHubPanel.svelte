@@ -20,7 +20,8 @@
 <script lang="ts">
   import { keyedList } from "../ui/eachKeys";
   import { SvelteSet } from "svelte/reactivity";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "../ipc/invoke";
@@ -49,7 +50,7 @@
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import FirebasePanel from "./FirebasePanel.svelte";
   import { freshnessStore } from "../provenance/store";
-  import { prFreshness, prRevisions } from "../provenance/pullRequests";
+  import { prHeadFreshness, prRevisions } from "../provenance/pullRequests";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { harnessStore, verdictLabel, type Guarded } from "../stores/harnessStore";
   import type {
@@ -95,7 +96,7 @@
   import { runTimelineRows } from "../github/runLifecycle";
   import { anyInFlight, failuresSince } from "../delivery/transitions";
   import { createLivePoll, type LiveState } from "../delivery/livePoll";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import type { GitHubRunsReport } from "../github/types";
 
   const macos = isMacOS();
@@ -263,7 +264,7 @@
   let clockTick = $state(Date.now());
   // Visibility-aware: a ticker whose only job is to re-render a relative
   // stamp must not wake the renderer behind other windows.
-  $effect(() => createVisibleInterval(() => (clockTick = Date.now()), 30_000));
+  $effect(() => createAdaptiveTimer(() => (clockTick = Date.now()), 30_000));
   const fetchedAgo = $derived(
     fetchedAt === null ? "" : relativeAge(new Date(fetchedAt).toISOString(), clockTick),
   );
@@ -315,7 +316,7 @@
    */
   let livePoll: ReturnType<typeof createLivePoll> | null = null;
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     liveRuns = null;
     failureNotice = null;
     liveState = { kind: "idle", reason: "" };
@@ -357,7 +358,7 @@
     // this one fires every second, and `liveState` stays "live" while the
     // window is hidden — the poll's own timer stops, but this ticker would
     // not have.
-    return createVisibleInterval(() => (timelineNow = Date.now()), 1_000);
+    return createAdaptiveTimer(() => (timelineNow = Date.now()), 1_000);
   });
 
   function clearPrFilter() {
@@ -471,72 +472,75 @@
    *
    * Each head is asked about under both `origin/<ref>` and `<ref>`; a head
    * that resolves under neither reads as *unknown*, never as unverified.
+   *
+   * The effect reads values compared by value, never `$repoStore` itself, so
+   * a store emission that changed neither the repository nor its default
+   * branch — a status poll, a diff selection — is not another batch.
    */
   const defaultBranchName = $derived(
     $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
   );
 
+  const freshness = freshnessStore.consumer("pull-requests");
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const prs = ctx?.pull_requests ?? [];
     const base = defaultBranchName;
     if (!repo || prs.length === 0) return;
-    void freshnessStore.load(repo, prRevisions(prs), base);
+    void freshness.load(repo, prRevisions(prs), base);
   });
 
-  // Reload context + workflows only when the real dependencies change (repo,
-  // checked-out branch for the dispatch-ref default). Every status-poll /
-  // stats-drain emission re-runs this effect otherwise, blanking ctx
-  // mid-flight, clearing checkout spinners, and clobbering the dispatchRef
-  // input the user may be editing.
-  let prevRepo: string | null = null;
-  let prevBranch: string | null = null;
+  // Reload context + workflows only when the real dependencies change: the
+  // repository, and the checked-out branch for the dispatch-ref default. Both
+  // compare by value, so a status poll or stats drain neither re-runs this
+  // nor — through the teardown below — cancels a load already in flight,
+  // which used to leave the spinner on with no load left to clear it.
+  const checkedOutBranch = $derived($repoStore.currentBranch);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const branch = $repoStore.currentBranch;
-    if (repo === prevRepo && branch === prevBranch) return;
-    prevRepo = repo;
-    prevBranch = branch;
-    // Hydrate last-known data synchronously so a revisit renders instantly;
-    // the fetches below then refresh it in place.
-    ctx = ctxCache.get(repo ?? "") ?? null;
-    workflows = workflowsCache.get(repo ?? "") ?? null;
-    // A hydrated context is from whenever it was fetched, not from now; the
-    // refetch below stamps it. Narrowing does not survive a repository or
-    // branch switch either — rows missing for a reason that scrolled away
-    // with the previous repository is worse than showing all of them.
-    fetchedAt = null;
-    clearPrFilter();
-    issueQuery = "";
-    runsThisBranch = false;
-    latestReleaseOnly = true;
-    workflowsExpanded = false;
-    runsExpanded = false;
-    ciReportOpen = true;
-    checkingOut.clear();
-    ciReport = null;
-    ciError = null;
-    ciRunning = false;
-    actionNotice = null;
-    actionError = null;
-    // Dispatch ref is repo-scoped: default to the checked-out branch.
-    dispatchRef = $repoStore.currentBranch ?? "";
-    if (!repo) {
-      inflight?.cancel();
-      workflowsInflight?.cancel();
-      ciInflight?.cancel();
-      loading = false;
-      workflowsLoading = false;
-      return;
-    }
-    void loadFor(repo);
-    void loadWorkflowsFor(repo);
-    const startedCtx = inflight;
-    const startedWf = workflowsInflight;
-    return () => {
-      if (inflight === startedCtx) startedCtx?.cancel();
-      if (workflowsInflight === startedWf) startedWf?.cancel();
-    };
+    const repo = $currentRepoPath;
+    const branch = checkedOutBranch;
+    return untrack(() => {
+      // Hydrate last-known data synchronously so a revisit renders instantly;
+      // the fetches below then refresh it in place.
+      ctx = ctxCache.get(repo ?? "") ?? null;
+      workflows = workflowsCache.get(repo ?? "") ?? null;
+      // A hydrated context is from whenever it was fetched, not from now; the
+      // refetch below stamps it. Narrowing does not survive a repository or
+      // branch switch either — rows missing for a reason that scrolled away
+      // with the previous repository is worse than showing all of them.
+      fetchedAt = null;
+      clearPrFilter();
+      issueQuery = "";
+      runsThisBranch = false;
+      latestReleaseOnly = true;
+      workflowsExpanded = false;
+      runsExpanded = false;
+      ciReportOpen = true;
+      checkingOut.clear();
+      ciReport = null;
+      ciError = null;
+      ciRunning = false;
+      actionNotice = null;
+      actionError = null;
+      // Dispatch ref is repo-scoped: default to the checked-out branch.
+      dispatchRef = branch ?? "";
+      if (!repo) {
+        inflight?.cancel();
+        workflowsInflight?.cancel();
+        ciInflight?.cancel();
+        loading = false;
+        workflowsLoading = false;
+        return undefined;
+      }
+      void loadFor(repo);
+      void loadWorkflowsFor(repo);
+      const startedCtx = inflight;
+      const startedWf = workflowsInflight;
+      return () => {
+        if (inflight === startedCtx) startedCtx?.cancel();
+        if (workflowsInflight === startedWf) startedWf?.cancel();
+      };
+    });
   });
 
   // Both shades on every verdict. A single `-400` is tuned for the dark theme
@@ -1029,7 +1033,7 @@
                       <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                         <GitPullRequest size={14} class="text-accent shrink-0" />
                         <span class="truncate">#{pr.number} {pr.title}</span>
-                        <FreshnessBadge freshness={prFreshness($freshnessStore.byRevision, pr.head_ref)} />
+                        <FreshnessBadge freshness={prHeadFreshness($freshnessStore.byRevision, pr)} />
                         {#if pr.is_draft}
                           <span class="gp-pill">draft</span>
                         {/if}

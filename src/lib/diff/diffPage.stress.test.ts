@@ -21,6 +21,7 @@ import { composeLineSpans } from "./highlight";
 import { findMatches, hasUnboundedNesting, matchLabel } from "../text/lineSearch";
 import { detectLanguageFromPath } from "../files/syntaxHighlight";
 import type { RailEntry } from "./fileRail";
+import { wallClockBudget } from "../testing/wallClock";
 
 /** Nested-quantifier search patterns, kept out of this file so CodeQL does not treat them as a regex. */
 function nestedQuantifierSearchPatterns(): string[] {
@@ -489,7 +490,7 @@ describe("search cannot hang or over-report", () => {
     for (const pattern of ["a*", "\\b", "(?:)", "^", "$", "x?", "(|)", "\\B", "[^]*", "(?=l)"]) {
       const started = Date.now();
       const result = findMatches(lines, pattern, { regex: true });
-      expect(Date.now() - started, pattern).toBeLessThan(2_000);
+      expect(Date.now() - started, pattern).toBeLessThan(wallClockBudget(2_000));
       expect(result.matches.length, pattern).toBeLessThanOrEqual(5_000);
     }
   });
@@ -504,7 +505,7 @@ describe("search cannot hang or over-report", () => {
     for (const pattern of patterns) {
       const started = Date.now();
       const result = findMatches(["a".repeat(64) + "b"], pattern, { regex: true });
-      expect(Date.now() - started, pattern).toBeLessThan(1_000);
+      expect(Date.now() - started, pattern).toBeLessThan(wallClockBudget(1_000));
       expect(result.invalid, pattern).toBe(true);
       expect(result.reason, pattern).toBe("unbounded");
       expect(matchLabel(result, 0)).toBe("pattern may not terminate");
@@ -536,7 +537,7 @@ describe("search cannot hang or over-report", () => {
     expect(result.matches.length).toBeLessThan(2_000_000);
     // Generous, because the deadline is only checked every 256 lines and the
     // claim is boundedness rather than precision.
-    expect(elapsed).toBeLessThan(5_000);
+    expect(elapsed).toBeLessThan(wallClockBudget(5_000));
   }, STRESS_TIMEOUT_MS);
 
   it("reports a cap as a floor rather than as a total", () => {
@@ -775,7 +776,7 @@ describe("the unbounded-nesting guard flags the right shapes", () => {
       if (!matcher) continue;
       const started = performance.now();
       matcher.test("a".repeat(30) + "!");
-      expect(performance.now() - started, pattern).toBeLessThan(100);
+      expect(performance.now() - started, pattern).toBeLessThan(wallClockBudget(100));
     }
   });
 });

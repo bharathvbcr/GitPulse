@@ -39,6 +39,14 @@
  *     never `matches`. A comparison that could not run must not read like one
  *     that ran and found nothing.
  *
+ * Bare `--check` fails on upstream drift alone, and that is deliberate: it
+ * answers "is this tree exactly what upstream would vendor now?", which is the
+ * question after `bun run vendor` (`bun run vendor:check`). It is not a gate.
+ * Upstream commits land independently of GitPulse, so a gate that failed on
+ * drift would turn red with no change here and teach everyone to ignore it.
+ * The gate is `--check --allow-drift` (`bun run check:vendor-edits`), run by
+ * CI and `ci:local` alike: a local edit fails it, drift is still printed.
+ *
  * Exit codes: 0 vendored / no drift · 1 drift or a local edit · 2 the run
  * could not complete.
  */
@@ -108,6 +116,10 @@ export function sources(env = process.env, from = REPO) {
         // took it as a hard dependency upstream after that, so a re-vendor
         // without it fails to resolve rather than building a stale tree.
         "dc-proc",
+        // Python fnmatch semantics and the secret-path table. `devmap-extract`
+        // took it as a hard dependency upstream (it withholds secret paths from
+        // the code graph), so a re-vendor without it fails to resolve.
+        "dc-glob",
         // The credential table the ledger redacts with — the same one
         // dc-verify's secret gate blocks on, so the two cannot disagree about
         // what a secret is. GitPulse vendored all of dc-verify for this until
@@ -133,8 +145,8 @@ export function sources(env = process.env, from = REPO) {
         "devmap-resolve",
         "devmap-store",
       ],
-      crateDir: (/** @type {string} */ name) => path.join("rust", name),
-      contracts: path.join("backend", "contracts"),
+      crateDir: (/** @type {string} */ name) => path.posix.join("rust", name),
+      contracts: path.posix.join("backend", "contracts"),
     },
     {
       // MarkDev's module crates: the parse model, the HTML renderer the
@@ -145,7 +157,7 @@ export function sources(env = process.env, from = REPO) {
       root: env.GITPULSE_MARKDEV_ROOT ?? findSibling("MarkDev", from),
       workspace: "core",
       crates: ["markdev-md", "markdev-highlight", "markdev-html", "markdev-vault"],
-      crateDir: (/** @type {string} */ name) => path.join("core", "crates", name),
+      crateDir: (/** @type {string} */ name) => path.posix.join("core", "crates", name),
     },
   ];
 }
@@ -164,7 +176,7 @@ export function sources(env = process.env, from = REPO) {
  * @param {string} from
  * @returns {string}
  */
-function findSibling(name, from = REPO) {
+export function findSibling(name, from = REPO) {
   let dir = from;
   for (let i = 0; i < 8; i++) {
     const candidate = path.join(dir, name);
@@ -598,6 +610,24 @@ export function contractFiles(dir) {
 }
 
 /**
+ * Contracts Manvi owns, copied here by hand from Manvi's `contracts/`.
+ * DevCouncil's directory never carries them, so the vendor refresh must neither
+ * delete them nor report them as local edits; `scripts/serve-ops-contract.test.ts`
+ * holds this copy to Manvi's instead.
+ */
+export const MANVI_OWNED_CONTRACTS = new Set(["serve.ops.schema.json"]);
+
+/**
+ * The vendored contract files, without the ones Manvi owns.
+ * @param {string} dir
+ */
+function vendoredContractFiles(dir) {
+  const files = contractFiles(dir);
+  if (files === null) return null;
+  return Object.fromEntries(Object.entries(files).filter(([name]) => !MANVI_OWNED_CONTRACTS.has(name)));
+}
+
+/**
  * Record and copy DevCouncil's contracts into CONTRACTS_DIR.
  *
  * Runs after the crate tree is installed, and writes each file through a
@@ -636,7 +666,7 @@ function installContracts(from, contracts) {
     cpSync(path.join(from, name), temp);
     renameSync(temp, path.join(CONTRACTS_DIR, name));
   }
-  for (const name of Object.keys(contractFiles(CONTRACTS_DIR) ?? {})) {
+  for (const name of Object.keys(vendoredContractFiles(CONTRACTS_DIR) ?? {})) {
     if (!(name in contracts.files)) rmSync(path.join(CONTRACTS_DIR, name));
   }
 }
@@ -972,7 +1002,7 @@ export function check(env = process.env) {
  */
 function checkContracts(manifest, bySource) {
   const recorded = manifest.contracts;
-  const local = contractFiles(CONTRACTS_DIR);
+  const local = vendoredContractFiles(CONTRACTS_DIR);
   if (!recorded && local === null) return null;
   /** @type {CrateCheck} */
   const result = { name: "contracts", edited: [], upstream: "unavailable", drifted: [], reason: "" };

@@ -28,7 +28,10 @@
 //!
 //! Every read is bounded: a config over [`MAX_CONFIG_BYTES`] is skipped, an
 //! `extends` / `references` chain stops at [`MAX_CHAIN_DEPTH`], a cycle stops at
-//! the first repeat, and no path may leave the collect root.
+//! the first repeat, and no path may leave the collect root — lexically, by
+//! `join`, and on disk, because every read goes through
+//! `gomod::read_manifest` and so `safe_fs::read_repo_source`, which refuses a
+//! canonical target outside the root (a linked ancestor directory included).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -204,9 +207,15 @@ struct RawConfig {
     references: Vec<String>,
 }
 
-fn parse_raw(rel_path: &str, source: &str) -> Option<RawConfig> {
-    let value: Value = serde_json::from_str(&strip_jsonc(source)).ok()?;
-    let object = value.as_object()?;
+/// Parse one config, or say why it could not be: a config this pass read and
+/// could not parse takes its `paths` with it exactly as an unreadable one does,
+/// and was dropped without a record.
+fn parse_raw(rel_path: &str, source: &str) -> Result<RawConfig, String> {
+    let value: Value = serde_json::from_str(&strip_jsonc(source))
+        .map_err(|error| format!("could not be parsed as JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "could not be parsed: the top level is not a JSON object".to_string())?;
     let dir = parent_dir(rel_path).to_string();
     let extends = match object.get("extends") {
         Some(Value::String(one)) => vec![one.clone()],
@@ -254,7 +263,7 @@ fn parse_raw(rel_path: &str, source: &str) -> Option<RawConfig> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(RawConfig {
+    Ok(RawConfig {
         extends,
         base_url,
         paths,
@@ -262,10 +271,38 @@ fn parse_raw(rel_path: &str, source: &str) -> Option<RawConfig> {
     })
 }
 
+/// Whether a lookup error means nothing is at the path, rather than that the
+/// path could not be looked at.
+///
+/// Only these two. A permission error, a symlink loop or an I/O error says
+/// nothing about whether a config is there, and reading one as "no config" is
+/// how an unreadable `extends` target came to look exactly like a config that
+/// declares no `paths`.
+pub(crate) fn is_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// The governing projects, and what reading the configs behind them cost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TsConfigs {
+    pub projects: Vec<TsProject>,
+    /// Every config this pass looked at, found or named through `extends` /
+    /// `references`, repo-relative.
+    pub examined: BTreeSet<String>,
+    /// The configs among `examined` that exist and could not be read, by
+    /// path, with the error that stopped the read.
+    pub unreadable: BTreeMap<String, String>,
+}
+
 /// Reads configs by repo-relative path, bounded and memoised.
 struct Reader<'a> {
     root: &'a Path,
     cache: BTreeMap<String, Option<RawConfig>>,
+    examined: BTreeSet<String>,
+    unreadable: BTreeMap<String, String>,
 }
 
 impl Reader<'_> {
@@ -273,12 +310,29 @@ impl Reader<'_> {
         if let Some(cached) = self.cache.get(rel_path) {
             return cached.clone();
         }
-        let path = self.root.join(rel_path);
-        let raw = std::fs::metadata(&path)
-            .ok()
-            .filter(|meta| meta.is_file() && meta.len() <= MAX_CONFIG_BYTES)
-            .and_then(|_| std::fs::read_to_string(&path).ok())
-            .and_then(|source| parse_raw(rel_path, &source));
+        let source = match crate::gomod::read_manifest(self.root, rel_path, MAX_CONFIG_BYTES) {
+            crate::gomod::ManifestRead::Read(source) => {
+                self.examined.insert(rel_path.to_string());
+                Some(source)
+            }
+            // Absent, or a directory or an oversized file passed over the way
+            // discovery passes over the same shape: not a hand-written project
+            // config, and not a hole.
+            crate::gomod::ManifestRead::Absent | crate::gomod::ManifestRead::Skipped => None,
+            crate::gomod::ManifestRead::Refused(reason) => {
+                self.examined.insert(rel_path.to_string());
+                self.unreadable.insert(rel_path.to_string(), reason);
+                None
+            }
+        };
+        let raw = match source.map(|source| parse_raw(rel_path, &source)) {
+            Some(Ok(raw)) => Some(raw),
+            Some(Err(reason)) => {
+                self.unreadable.insert(rel_path.to_string(), reason);
+                None
+            }
+            None => None,
+        };
         self.cache.insert(rel_path.to_string(), raw.clone());
         raw
     }
@@ -317,8 +371,22 @@ impl Reader<'_> {
                 .flatten()
                 .collect()
         };
+        // A candidate that cannot be looked at is the one `extends` names as
+        // far as this pass can tell: handing it to `read` is what records it,
+        // where skipping to the next candidate would drop it without a word.
+        //
+        // A dangling link reads as `NotFound` through `metadata`, which
+        // follows it, and is not absent: the link is there and names nothing,
+        // which discovery refuses rather than passing over. Asking the link
+        // itself keeps it a candidate, and `read` records why it could not be
+        // read.
         candidates.into_iter().find(|candidate| {
-            std::fs::metadata(self.root.join(candidate)).is_ok_and(|meta| meta.is_file())
+            let path = self.root.join(candidate);
+            match std::fs::metadata(&path) {
+                Ok(meta) => meta.is_file(),
+                Err(error) if is_absent(&error) => std::fs::symlink_metadata(&path).is_ok(),
+                Err(_) => true,
+            }
         })
     }
 
@@ -412,11 +480,15 @@ impl Reader<'_> {
 ///
 /// `found` holds repo-relative paths whose names pass [`is_ts_config_name`].
 /// Configs reached only through `extends` / `references` are read from disk
-/// under `root` as needed, within the same bounds.
-pub fn build_ts_projects(root: &Path, found: &[String]) -> Vec<TsProject> {
+/// under `root` as needed, within the same bounds — which is how this pass
+/// comes to read configs discovery never sees, under `node_modules/` above
+/// all, and why it reports the ones it could not read itself.
+pub fn build_ts_projects(root: &Path, found: &[String]) -> TsConfigs {
     let mut reader = Reader {
         root,
         cache: BTreeMap::new(),
+        examined: BTreeSet::new(),
+        unreadable: BTreeMap::new(),
     };
     let mut projects = Vec::new();
     for rel_path in found.iter().filter(|path| governs_its_directory(path)) {
@@ -454,7 +526,11 @@ pub fn build_ts_projects(root: &Path, found: &[String]) -> Vec<TsProject> {
             .then_with(|| right.dir.len().cmp(&left.dir.len()))
             .then_with(|| left.dir.cmp(&right.dir))
     });
-    projects
+    TsConfigs {
+        projects,
+        examined: reader.examined,
+        unreadable: reader.unreadable,
+    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ Resolve this checkout with `devmap paths --json`, then check `devmap status --js
 Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. Always pass `repo_path` (the absolute repository path) on every `devmap_*` and `gitpulse_codeintel_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one `devmap mcp` process across tabs. Discover the actual tool names and schemas; a host need not expose every CLI capability.
 
 1. Reproduce the symptom with a bounded command or existing test and record the actual failure.
-2. Use `devmap search <name> --json` and `devmap explore <name> --json` to locate suspect symbols and callers. For literal error text that is not a symbol, search the source.
+2. Use `devmap search <name> --json` and `devmap explore <name> --json` to locate suspect symbols and callers. When the symptom names a behaviour rather than a symbol, `devmap ask --evidence "<behaviour>" --json` returns the likely code with its source and the tests that reach it. For literal error text that is not a symbol, search the source.
 3. Use `devmap trace <entry> <suspect> --json` when the call chain is the question. Confirm execution through call sites, logs, or instrumentation.
 4. Challenge the diagnosis, then add a regression that fails before the fix.
 5. Run `devmap impact <target> --json` before editing and `devmap affected <target> --json` for candidate tests; include the repository's required checks.

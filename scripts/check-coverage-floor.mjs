@@ -22,7 +22,7 @@ const INTEGER = /^\d+$/;
 /** @typedef {{ startLine: number, sourceFile: string | null, dataLines: Map<number, { line: number, count: number }>, branches: Array<{ taken: number }>, lineFound: number | null, lineHit: number | null, branchFound: number | null, branchHit: number | null, functionFound: number | null, functionHit: number | null }} RawRecord */
 /** @typedef {{ sourceFile: string, lines: CoverageMetric, branches: CoverageMetric | null }} CoverageRecord */
 /** @typedef {{ records: CoverageRecord[], totals: { lines: CoverageMetric, branches: CoverageMetric | null }, branchRecords: number }} ParsedLcov */
-/** @typedef {{ root: string, frontendPath: string | null, rustPath: string | null, frontendLines: number, frontendBranches: number, rustLines: number, help: boolean, json: boolean }} CliOptions */
+/** @typedef {{ root: string, frontendPath: string | null, rustPath: string | null, frontendLines: number, frontendBranches: number, rustLines: number, rustBranches: number | null, help: boolean, json: boolean }} CliOptions */
 /** @typedef {{ ok: true, invalid: false, parsed: ParsedLcov } | { ok: false, invalid: true, error: string }} CheckedReport */
 
 export const DEFAULT_THRESHOLDS = Object.freeze({
@@ -173,13 +173,11 @@ function finishRecord(record, reportName, sourceFiles) {
     }
     const branchFound = record.branchFound;
     const branchHit = record.branchHit;
-    if (branchFound !== record.branches.length) {
-      throw new Error(
-        `${location}: BRF ${branchFound} does not match ${record.branches.length} BRDA records`,
-      );
-    }
-    // Same reasoning as LH above: the summary is authoritative, the per-branch
-    // records are detail a producer may compute differently.
+    // Neither BRF nor BRH is cross-checked against the BRDA records. Same
+    // reasoning as LH above: the summary is authoritative, the per-branch
+    // records are detail a producer may compute differently — `cargo llvm-cov
+    // --branch` wrote BRF 107 beside 108 BRDA lines and BRF 532 beside 516, in
+    // 11 of 193 records of one report.
     if (branchHit > branchFound) {
       throw new Error(`${location}: BRH cannot exceed BRF`);
     }
@@ -401,6 +399,9 @@ function parseArgs(argv) {
     frontendLines: DEFAULT_THRESHOLDS.frontend.lines,
     frontendBranches: DEFAULT_THRESHOLDS.frontend.branches,
     rustLines: DEFAULT_THRESHOLDS.rust.lines,
+    // No default: Rust branch coverage needs a nightly `--branch` run, and a
+    // floor nobody measured is not a floor. Reported always, enforced on request.
+    rustBranches: null,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -436,6 +437,9 @@ function parseArgs(argv) {
       case "--rust-lines":
         options.rustLines = parseThreshold(value, flag);
         break;
+      case "--rust-branches":
+        options.rustBranches = parseThreshold(value, flag);
+        break;
       default:
         throw new Error(`unknown option ${flag}`);
     }
@@ -452,6 +456,7 @@ function printHelp() {
   console.log("  --frontend-lines <percent>   frontend line floor (default: 90)");
   console.log("  --frontend-branches <percent> frontend branch floor (default: 85)");
   console.log("  --rust-lines <percent>       Rust line floor (default: 80)");
+  console.log("  --rust-branches <percent>    Rust branch floor (default: none; branch coverage is reported when the LCOV has it)");
   console.log("  --json                       emit the result as JSON instead of the text report");
 }
 
@@ -486,7 +491,9 @@ export function main(argv = process.argv.slice(2)) {
     {
       label: "Rust",
       path: config.rustPath ?? path.join(config.root, "lcov.info"),
-      thresholds: { lines: config.rustLines },
+      thresholds: config.rustBranches === null
+        ? { lines: config.rustLines }
+        : { lines: config.rustLines, branches: config.rustBranches },
     },
   ];
   let invalid = false;
@@ -521,6 +528,27 @@ export function main(argv = process.argv.slice(2)) {
       if (!config.json) {
         console.log(
           `${report.label} ${metricName} ${metric ? formatMetric(metric) : "unavailable"} (required >= ${threshold.toFixed(2)}%)`,
+        );
+      }
+    }
+    // A metric with no floor is still reported, and says it is not gated, so a
+    // report that carries no branch data cannot read as one that passed it.
+    // Zero branches found is no data, not 0%: a report with BRF:0 everywhere
+    // is a build that did not measure branches.
+    const reportedBranches =
+      checked.parsed.totals.branches && checked.parsed.totals.branches.found > 0
+        ? checked.parsed.totals.branches
+        : null;
+    if (report.thresholds.branches === undefined && report.label === "Rust") {
+      metrics.branches = {
+        found: reportedBranches ? reportedBranches.found : null,
+        hit: reportedBranches ? reportedBranches.hit : null,
+        percent: reportedBranches ? percentage(reportedBranches) : null,
+        required: null,
+      };
+      if (!config.json) {
+        console.log(
+          `${report.label} branches ${reportedBranches ? formatMetric(reportedBranches) : "unavailable (the LCOV carries no branch data)"} (not gated)`,
         );
       }
     }

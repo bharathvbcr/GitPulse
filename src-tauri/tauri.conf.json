@@ -70,7 +70,8 @@
       "icons/icon.ico"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "High-performance native Git desktop client",
+    "shortDescription": "Fast, local-first Git desktop client and code intelligence workspace",
+    "longDescription": "GitPulse is a high-performance native desktop Git client, code intelligence engine, and task workspace built with Rust (Tauri 2) and Svelte 5.",
     "resources": {
       "../plugins/gitpulse/": "plugin/"
     },

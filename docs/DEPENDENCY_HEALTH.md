@@ -19,6 +19,19 @@ this personal repository, so the file is in-tree and the attachment is a GitHub
 Settings step; until it is attached, the framework alerts are dismissed as
 false positives / used-in-tests so they do not return on an unchanged tree.
 
+**Manual, GitHub Settings only (BLOCKED for an agent):** default setup also
+analyses `python`, which this repository does not contain (run 37875237672).
+Under Settings > Code security > CodeQL analysis, deselect Python so the
+languages are `actions`, `javascript-typescript` and `rust`, and attach the
+config file above. Neither can be done from a commit: a CodeQL advanced-setup
+workflow would conflict with default setup, and the repository properties API
+404s here. Until a person does it, treat the config as unattached.
+
+`vendor:check` (the upstream-drift half of `scripts/vendor-crates.mjs`) is not
+a CI gate: no upstream checkout exists on a runner, and drift is a refresh
+signal, never a failure (see that script's `# Drift` header). The local-edit
+half, `check:vendor-edits`, runs in `ci.yml` on every push.
+
 | Alert | Resolution |
 | --- | --- |
 | [js/incomplete-sanitization](https://github.com/bharathvbcr/GitPulse/security/code-scanning/26) in `ignoreRule` | The gitignore sanitizer now escapes `\` as well as `!*?[]# ` (CodeQL: "This does not escape backslash characters in the input."). Copy-ignore still refuses paths that contain `\` as an ambiguous shape. |

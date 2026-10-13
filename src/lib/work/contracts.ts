@@ -49,7 +49,7 @@ export function validateWorkResponse(command: string, value: unknown): void {
         const v = record(value); flag(v.available); nullableText(v.error);
         list(v.leases, entry => {
           const l = fields(entry, ["task_id", "owner", "status"]);
-          nullableText(l.agent); nullableText(l.expires_at);
+          nullableText(l.agent); nullableText(l.expires_at); nullableText(l.expiry_error);
         });
         break;
       }

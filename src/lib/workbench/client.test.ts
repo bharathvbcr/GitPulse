@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { page, taskCard, task, taskDraft, taskWrite, scopeParams } from "./client";
+import { enhancement, enhancementKind, enhancementSummary, page, storedRefinement, taskCard, task, taskDraft, taskWrite, scopeParams, taskSuggestions } from "./client";
 
 const full = { id: "t1", revision: 2, updated_at: 1, title: "Preserve task evidence", description: "exact error: E42", acceptance_criteria: ["Round-trip evidence"], kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null, labels: ["regression"], repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 10 };
 describe("workbench boundary", () => {
@@ -32,6 +32,23 @@ describe("workbench boundary", () => {
       expect(() => task({ ...full, locked_fields })).toThrow("invalid response");
     }
   });
+  it("decodes the acceptance_criteria lock schema 12 added, so a locked task still loads", () => {
+    const loaded = task({ ...full, locked_fields: ["title", "acceptance_criteria"] });
+    expect(loaded.locked_fields).toEqual(["title", "acceptance_criteria"]);
+    expect(taskWrite(full.id, full.revision, taskDraft(loaded))).toHaveProperty("locked_fields", ["title", "acceptance_criteria"]);
+  });
+  it("tells refinement proposals from text ones, and never reads one as the other", () => {
+    const stored = { id: "e1", revision: 2, updated_at: 1, kind: "refine", state: "ready", task_id: "t1", source_revision: 2, fields: ["acceptance_criteria", "split_into"], provider: "p", model: "m", automatic: false, created_at: 1, expires_at: 2,
+      proposed: { acceptance_criteria: ["a"], split_into: [{ title: "T", description: "D" }], duplicate_of: [] } };
+    expect(enhancementKind(stored)).toBe("refine");
+    expect(enhancementKind({ ...stored, kind: undefined })).toBe("text");
+    expect(() => enhancementKind({ ...stored, kind: "other" })).toThrow("invalid response");
+    expect(() => enhancementSummary(stored)).toThrow("invalid response");
+    expect(() => enhancement({ ...stored, source: full })).toThrow("invalid response");
+    expect(storedRefinement(stored).proposed.split_into).toEqual([{ title: "T", description: "D" }]);
+    expect(storedRefinement({ ...stored, state: "accepted", accepted_fields: ["split_into"], created_item_ids: ["ft-a"], applied_task_revision: 3 })).toMatchObject({ created_item_ids: ["ft-a"], applied_task_revision: 3 });
+    for (const bad of [{ fields: ["title"] }, { fields: [] }, { created_item_ids: [1] }, { kind: "text" }]) expect(() => storedRefinement({ ...stored, ...bad })).toThrow("invalid response");
+  });
   it("round-trips pasted logs and treats a missing field as absent rather than invalid", () => {
     expect(task(full).logs).toBeUndefined();
     const dumped = "error: E42\n    at src/main.rs:12";
@@ -41,5 +58,41 @@ describe("workbench boundary", () => {
     expect(taskWrite(full.id, full.revision, taskDraft(task(full)))).not.toHaveProperty("logs");
     expect(() => task({ ...full, logs: 12 })).toThrow("invalid response");
     expect(() => task({ ...full, logs: "a\0b" })).toThrow("invalid response");
+  });
+});
+
+describe("task suggestions", () => {
+  const reply = {
+    ok: true, generated_at: 5, candidates: 2,
+    suggestions: [{ rank: 1, id: "t1", title: "Fix it", status: "ready", priority: 0, score: 110, reason: "urgent priority", signals: [{ name: "priority", points: 100, detail: "urgent priority" }] }],
+    blocked: [{ id: "t2", title: "Held", blocked_by: ["t1"] }],
+    excluded: { in_progress: 1, review: 0, duplicate: 0, blocked: 1, filtered: 0 },
+    board: { scanned: 4, complete: true, unhydrated: 0 }, verification: { checked: 1, unchecked: 0, failed: 0 },
+  };
+  it("reads a well-formed answer whole", () => {
+    expect(taskSuggestions(reply).suggestions[0]).toMatchObject({ id: "t1", rank: 1, priority: 0, reason: "urgent priority" });
+    expect(taskSuggestions(reply).board.complete).toBe(true);
+  });
+  it("reads a task with no signals from both Manvi builds: [] and the old null", () => {
+    for (const signals of [[], null]) {
+      const got = taskSuggestions({ ...reply, suggestions: [{ ...reply.suggestions[0], score: 0, signals }] });
+      expect(got.suggestions[0].signals).toEqual([]);
+    }
+  });
+  it("reads the unread count when Manvi sends it and takes 0 from a build that does not", () => {
+    expect(taskSuggestions(reply).excluded.unread).toBe(0);
+    expect(taskSuggestions({ ...reply, excluded: { ...reply.excluded, unread: 7 } }).excluded.unread).toBe(7);
+    for (const unread of [-1, "3", null, 1.5]) expect(() => taskSuggestions({ ...reply, excluded: { ...reply.excluded, unread } })).toThrow("invalid response");
+  });
+  it("still refuses signals that are neither an array nor null", () => {
+    for (const signals of ["x", {}, 3, undefined]) expect(() => taskSuggestions({ ...reply, suggestions: [{ ...reply.suggestions[0], signals }] })).toThrow("invalid response");
+  });
+  it("refuses a malformed or failed answer instead of showing part of it", () => {
+    const bad: unknown[] = [
+      { ...reply, ok: false }, { ...reply, suggestions: null }, { ...reply, board: { ...reply.board, complete: "yes" } },
+      { ...reply, suggestions: [{ ...reply.suggestions[0], priority: 9 }] }, { ...reply, suggestions: [{ ...reply.suggestions[0], status: "doing" }] },
+      { ...reply, suggestions: Array(21).fill(reply.suggestions[0]) }, { ...reply, excluded: { ...reply.excluded, blocked: -1 } }, null, [],
+    ];
+    for (const value of bad) expect(() => taskSuggestions(value)).toThrow("invalid response");
   });
 });

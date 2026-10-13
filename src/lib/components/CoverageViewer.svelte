@@ -22,8 +22,9 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
+  import { runManviAction } from "../terminal/manviAction";
   import {
     Percent,
     RefreshCw,
@@ -73,9 +74,9 @@
   } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
-  import { copyText } from "../desktop/clipboard";
+  import { copyText, createCopyFlash } from "../desktop/clipboard";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { buildRunnablePlanSteps, tokenizeCommand } from "../terminal/tokenize";
+  import { buildRunnablePlanSteps, tokenizeCommand, type RunnablePlanStep } from "../terminal/tokenize";
   import {
     formatRunDetail,
     formatRunSummary,
@@ -84,6 +85,7 @@
   } from "../terminal/runResult";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
   import CoverageAgentPrompt from "./CoverageAgentPrompt.svelte";
   import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanReasons, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -92,7 +94,8 @@
   let isScanning = $state(false);
   let scanError = $state<string | null>(null);
   let selectedPath = $state<string | null>(null);
-  let sourceLines: string[] = $state([]);
+  // Raw: the whole file's lines, replaced wholesale on each load.
+  let sourceLines: string[] = $state.raw([]);
   let hitMap: Map<number, number> = $state(new Map());
   let fileError = $state<string | null>(null);
   let contentError = $state<string | null>(null);
@@ -115,6 +118,7 @@
   let activeMissed = $state<number | null>(null);
   let selectedScope = $state(false);
   let coverageRoot = $state<HTMLDivElement>();
+  let languageStrip = $state<HTMLDivElement>();
   const visibleFiles = $derived.by(() => filterCoverageFiles(report?.files ?? [], fileQuery, languageFilter, coverageFilter, fileSort));
   const filterLanguages = $derived.by(() => [...new Set(report?.files.map(file => file.language) ?? [])].sort());
   const selectedFile = $derived.by(() => report?.files.find(file => file.path.toLowerCase() === selectedPath?.toLowerCase()));
@@ -155,7 +159,7 @@
     jumpMissed(event.key === "ArrowDown" ? 1 : -1);
   }
   let reportCopied = $state(false);
-  let reportCopyTimer: number | null = null;
+  const reportFlash = createCopyFlash((value) => (reportCopied = value));
 
   function beginScan(): AsyncGuard {
     scanInflight?.cancel();
@@ -286,27 +290,13 @@
       // A copy can settle after a repo switch. The clipboard write already
       // happened, but stale success feedback must not leak into the new repo.
       if ($repoStore.currentPath !== repo || report !== current) return;
-      reportCopied = true;
-      if (reportCopyTimer !== null) window.clearTimeout(reportCopyTimer);
-      reportCopyTimer = window.setTimeout(() => {
-        reportCopyTimer = null;
-        reportCopied = false;
-      }, 1500);
+      reportFlash.flash();
     }
   }
 
   // ---------------------------------------------------------------------------
   // MANVI: local-model analysis of the coverage report
   // ---------------------------------------------------------------------------
-
-  interface RunnableStep {
-    id: string;
-    number: number | null;
-    text: string;
-    command: string | null;
-    argv: string[] | null;
-    error?: string;
-  }
 
   /**
    * `no_data` is the outcome that used to be reported as `passed`: the command
@@ -378,13 +368,13 @@
       .map((status) => ({ command: status.label, limitation: status.recovery!.limitation })),
   );
   let runningMissing = $state(false);
-  let aiCopyTimer: number | null = null;
+  const aiFlash = createCopyFlash((value) => (generationCopied = value));
   let copiedScriptKey = $state<string | null>(null);
   let copiedScriptTimer: number | null = null;
   let copiedAllFailed = $state(false);
   let copiedAllTimer: number | null = null;
   let scanErrorCopied = $state(false);
-  let scanErrorCopyTimer: number | null = null;
+  const scanErrorFlash = createCopyFlash((value) => (scanErrorCopied = value));
   let copiedStepId = $state<string | null>(null);
   let copiedStepTimer: number | null = null;
   let issueSubmitting = $state(false);
@@ -485,7 +475,7 @@
       })),
   );
 
-  let aiSteps = $derived.by<RunnableStep[]>(() => {
+  let aiSteps = $derived.by<RunnablePlanStep[]>(() => {
     if (!aiGeneration?.text) return [];
     return buildRunnablePlanSteps(aiGeneration.text);
   });
@@ -506,16 +496,8 @@
     generating = false;
     aiGeneration = null;
     aiError = null;
-    reportCopied = false;
-    if (reportCopyTimer !== null) {
-      window.clearTimeout(reportCopyTimer);
-      reportCopyTimer = null;
-    }
-    generationCopied = false;
-    if (aiCopyTimer !== null) {
-      window.clearTimeout(aiCopyTimer);
-      aiCopyTimer = null;
-    }
+    reportFlash.reset();
+    aiFlash.reset();
     copiedScriptKey = null;
     if (copiedScriptTimer !== null) {
       window.clearTimeout(copiedScriptTimer);
@@ -526,11 +508,7 @@
       window.clearTimeout(copiedAllTimer);
       copiedAllTimer = null;
     }
-    scanErrorCopied = false;
-    if (scanErrorCopyTimer !== null) {
-      window.clearTimeout(scanErrorCopyTimer);
-      scanErrorCopyTimer = null;
-    }
+    scanErrorFlash.reset();
     copiedStepId = null;
     if (copiedStepTimer !== null) {
       window.clearTimeout(copiedStepTimer);
@@ -655,11 +633,7 @@
 
   async function copyGeneration() {
     if (!aiGeneration?.text) return;
-    if (await copyText(aiGeneration.text)) {
-      generationCopied = true;
-      if (aiCopyTimer !== null) window.clearTimeout(aiCopyTimer);
-      aiCopyTimer = window.setTimeout(() => (generationCopied = false), 1500);
-    }
+    await aiFlash.copy(aiGeneration.text);
   }
 
   async function copyFailedScript(key: string, status: ScriptStatus) {
@@ -705,17 +679,10 @@
       repoPath: $repoStore.currentPath,
       scanError,
     });
-    if (await copyText(text)) {
-      scanErrorCopied = true;
-      if (scanErrorCopyTimer !== null) window.clearTimeout(scanErrorCopyTimer);
-      scanErrorCopyTimer = window.setTimeout(() => {
-        scanErrorCopyTimer = null;
-        scanErrorCopied = false;
-      }, 1500);
-    }
+    await scanErrorFlash.copy(text);
   }
 
-  async function copyStepOutput(step: RunnableStep, res: { detail?: string }) {
+  async function copyStepOutput(step: RunnablePlanStep, res: { detail?: string }) {
     let text = `$ ${step.command ?? step.text}\n`;
     if (res.detail) text += `${res.detail}\n`;
     if (await copyText(text.trim())) {
@@ -738,13 +705,13 @@
    * The `finally` clears it — only while the row is still this invocation's,
    * never a newer run's, and never a row in a repository switched to since.
    */
-  async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
+  async function runStep(step: RunnablePlanStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath || issueSubmitting) return false;
     const runId = ++nextRunId;
     stepResults[step.id] = { running: true, runId };
     try {
-      return await runStepOnce(step, repoPath, guard, runId);
+      return await runStepOnce(step, step.argv, repoPath, guard, runId);
     } finally {
       const row = stepResults[step.id];
       if (row?.runId === runId && row.running) stepResults[step.id] = { running: false };
@@ -752,31 +719,23 @@
   }
 
   async function runStepOnce(
-    step: RunnableStep,
+    step: RunnablePlanStep,
+    argv: string[],
     repoPath: string,
     guard: AsyncGuard,
     runId: number,
   ): Promise<boolean> {
     let passed = false;
-    let commandCompleted = false;
     const actionLabel = step.command ?? step.text;
     try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
+      const res = await runManviAction({
         repoPath,
-        args: step.argv,
+        argv,
         actionKind: "coverage",
-        // Long enough for a cold install/build/test cycle; the backend clamps to [1s, 30min].
-        timeoutSecs: 900,
-      });
-      commandCompleted = true;
-      passed = runPassed(res);
-      harnessStore.recordAction({
-        repoPath,
-        kind: "coverage-step",
+        journalKind: "coverage-step",
         label: actionLabel,
-        ok: passed,
-        verdict: res.policy ?? null,
       });
+      passed = runPassed(res);
       if (!guard.isLive()) return false;
 
       const detail = formatRunDetail(res);
@@ -798,14 +757,6 @@
       }
     } catch (err: unknown) {
       passed = false;
-      if (!commandCompleted) {
-        harnessStore.recordAction({
-          repoPath,
-          kind: "coverage-step",
-          label: actionLabel,
-          ok: false,
-        });
-      }
       if (!guard.isLive()) return false;
       const detail = reportPanelError("coverage", err);
       stepResults[step.id] = {
@@ -944,30 +895,13 @@
     repoPath: string,
     actionLabel: string,
   ): Promise<TerminalRunResult> {
-    try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
-        repoPath,
-        args: argv,
-        actionKind: "coverage_generator",
-        timeoutSecs: 900,
-      });
-      harnessStore.recordAction({
-        repoPath,
-        kind: "coverage-script",
-        label: actionLabel,
-        ok: runPassed(res),
-        verdict: res.policy ?? null,
-      });
-      return res;
-    } catch (err: unknown) {
-      harnessStore.recordAction({
-        repoPath,
-        kind: "coverage-script",
-        label: actionLabel,
-        ok: false,
-      });
-      throw err;
-    }
+    return runManviAction({
+      repoPath,
+      argv,
+      actionKind: "coverage_generator",
+      journalKind: "coverage-script",
+      label: actionLabel,
+    });
   }
 
   async function runCoverageScript(
@@ -1273,23 +1207,20 @@
       scanInflight?.cancel();
       generationInflight?.cancel();
       opsInflight?.cancel();
-      if (reportCopyTimer !== null) window.clearTimeout(reportCopyTimer);
-      if (aiCopyTimer !== null) window.clearTimeout(aiCopyTimer);
+      reportFlash.dispose();
+      aiFlash.dispose();
       if (copiedScriptTimer !== null) window.clearTimeout(copiedScriptTimer);
       if (copiedAllTimer !== null) window.clearTimeout(copiedAllTimer);
-      if (scanErrorCopyTimer !== null) window.clearTimeout(scanErrorCopyTimer);
+      scanErrorFlash.dispose();
       if (copiedStepTimer !== null) window.clearTimeout(copiedStepTimer);
     };
   });
 
-  // Memoized on the actual dependency: every status-poll / stats-drain
-  // emission re-runs the effect (project() hands out fresh objects), and an
-  // unguarded rerun would clobber the locally selected coverage file.
-  let prevSyncedSelection: string | null = null;
+  // Keyed on the selection by value: a status-poll or stats-drain publish
+  // re-running this would clobber the locally selected coverage file.
+  const storeSelection = $derived($repoStore.selectedFilePath);
   $effect(() => {
-    const selected = $repoStore.selectedFilePath;
-    if (selected === prevSyncedSelection) return;
-    prevSyncedSelection = selected;
+    const selected = storeSelection;
     if (selected) {
       untrack(() => { selectedPath = selected; });
     }
@@ -1323,12 +1254,11 @@
     void runMissingCoverage();
   }
 
-  // Repo-scoped scan lifecycle: depend on the scalar path, not every store
+  // Repo-scoped scan lifecycle: depend on the repository key, not every store
   // emission. An early return after effect cleanup would lose the subscription
   // on selection/poll updates. Initialization reads must not add dependencies.
-  const coverageRepo = $derived($repoStore.currentPath);
   $effect(() => {
-    const repo = coverageRepo;
+    const repo = $currentRepoPath;
     return untrack(() => {
       clearFileFilters();
       fileSort = "missed";
@@ -1348,7 +1278,7 @@
       // would discard the selection that effect just restored and make the sync
       // dead code; scan() still validates membership (case-insensitively) when
       // the report lands.
-      selectedPath = untrack(() => $repoStore.selectedFilePath);
+      selectedPath = storeSelection;
       fileError = null;
       contentError = null;
       sourceLines = [];
@@ -1390,11 +1320,11 @@
 
   // Keep a pending detail load alive across unrelated store publications.
   // Only its repository, selected path or measurement version owns cleanup.
-  const coverageDetailKey = $derived(`${coverageRepo ?? "\u0000"}\u0000${selectedPath ?? "\u0000"}\u0000${reportVersion}`);
+  const coverageDetailKey = $derived(`${$currentRepoPath ?? "\u0000"}\u0000${selectedPath ?? "\u0000"}\u0000${reportVersion}`);
   $effect(() => {
     void coverageDetailKey;
     return untrack(() => {
-      const repo = coverageRepo;
+      const repo = $currentRepoPath;
       const path = selectedPath;
       if (!repo || !path) {
         // The load this replaces was cancelled, and a cancelled load never
@@ -1809,7 +1739,10 @@
   {/if}
 
   {#if report && report.languages.length > 0}
-    <div class="px-4 py-2 border-b border-border/40 gp-section-edge bg-surface/20 flex items-center gap-3 overflow-x-auto gp-edge-fade-end font-sans">
+    <!-- The shared cue, not a fade class on the strip itself: a fade utility
+         on the scroller painted its gradient across the whole bar. -->
+    <div class="relative border-b border-border/40 gp-section-edge bg-surface/20">
+    <div bind:this={languageStrip} class="px-4 py-2 flex items-center gap-3 overflow-x-auto font-sans">
       <span class="text-[10px] uppercase tracking-wider text-textMuted/60 shrink-0">by language</span>
       <!-- Fixed track width, not `min-w-36`. The bar length encodes the
            percentage, so a track that grows with the label made 98.2% Rust and
@@ -1833,6 +1766,8 @@
           </div>
         </div>
       {/each}
+    </div>
+    <ScrollCue target={languageStrip} axis="x" />
     </div>
   {/if}
 

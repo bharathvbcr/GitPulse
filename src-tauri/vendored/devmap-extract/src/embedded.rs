@@ -852,7 +852,7 @@ pub(crate) fn merge_embedded_scripts(
 
         match &inner.parse_outcome {
             ParseOutcome::Clean => {}
-            ParseOutcome::Partial { error_ranges } => {
+            ParseOutcome::Partial { error_ranges, .. } => {
                 for range in error_ranges {
                     unparsed.push(TextRange {
                         start_byte: region.content.start_byte.saturating_add(range.start_byte),
@@ -993,11 +993,13 @@ pub(crate) fn fold_unparsed_ranges(outcome: &mut ParseOutcome, mut unparsed: Vec
     unparsed.dedup();
     match outcome {
         ParseOutcome::Clean => {
+            // Unread bytes are never nameless: nothing looked at them.
             *outcome = ParseOutcome::Partial {
                 error_ranges: unparsed,
+                nameless_ranges: Vec::new(),
             }
         }
-        ParseOutcome::Partial { error_ranges } => {
+        ParseOutcome::Partial { error_ranges, .. } => {
             error_ranges.extend(unparsed);
             error_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
             error_ranges.dedup();
@@ -1304,21 +1306,25 @@ mod tests {
         assert_eq!(
             outcome,
             ParseOutcome::Partial {
-                error_ranges: vec![range(1, 2), range(9, 4)]
+                error_ranges: vec![range(1, 2), range(9, 4)],
+                nameless_ranges: vec![],
             },
             "ranges are sorted so two builds of one file emit the same payload"
         );
 
         let mut outcome = ParseOutcome::Partial {
             error_ranges: vec![range(1, 2)],
+            nameless_ranges: vec![range(1, 2)],
         };
         fold_unparsed_ranges(&mut outcome, vec![range(1, 2), range(5, 6)]);
         assert_eq!(
             outcome,
             ParseOutcome::Partial {
-                error_ranges: vec![range(1, 2), range(5, 6)]
+                error_ranges: vec![range(1, 2), range(5, 6)],
+                nameless_ranges: vec![range(1, 2)],
             },
-            "the grammar's own error ranges are kept and duplicates collapse"
+            "the grammar's own error ranges, and which of them are nameless, are kept; \
+             duplicates collapse"
         );
 
         let mut outcome = ParseOutcome::Failed {

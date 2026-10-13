@@ -268,6 +268,30 @@ const MONTHS = [
   "Dec",
 ];
 
+/**
+ * Whether two blame answers draw the same page. A background revalidation that
+ * returns identical lines must not reassign the list, or the reader loses
+ * scroll position and filters to a re-render that changed nothing.
+ */
+export function areBlameLinesEqual(a: readonly BlameLine[], b: readonly BlameLine[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const la = a[i];
+    const lb = b[i];
+    if (
+      la.line_no !== lb.line_no ||
+      la.commit_id !== lb.commit_id ||
+      la.timestamp !== lb.timestamp ||
+      la.author_name !== lb.author_name ||
+      la.content !== lb.content
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** True for a worktree-only line, which has no commit and so no commit date. */
 export function isUncommittedLine(line: BlameLine): boolean {
   return ZERO_OID_RE.test(line.commit_id ?? "");

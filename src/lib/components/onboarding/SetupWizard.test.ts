@@ -21,3 +21,22 @@ describe("SetupWizard DevCouncil install", () => {
     expect(source).not.toContain("cmd_manvi_run_action");
   });
 });
+
+describe("SetupWizard dialog accessibility", () => {
+  it("traps focus, closes on Escape, and restores focus through the shared action", () => {
+    expect(source).toContain('import { trapFocus } from "../../ui/focusTrap"');
+    expect(source).toMatch(/aria-modal="true"[\s\S]*?use:trapFocus/);
+    expect(source).toContain('event.key !== "Escape"');
+    expect(source).toContain("isImeComposition(event)");
+    expect(source).toContain("onkeydown={onDialogKeydown}");
+  });
+
+  it("keeps the dialog role on the card, not the scrim", () => {
+    expect(source).toMatch(/<div\s+class="gp-scrim[^>]*role="presentation"/);
+    expect(source.match(/role="dialog"/g)).toHaveLength(1);
+  });
+
+  it("cannot Install before the selected tool's ladder has loaded", () => {
+    expect(source).toContain("disabled={!$ladder ||");
+  });
+});

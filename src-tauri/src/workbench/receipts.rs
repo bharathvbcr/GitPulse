@@ -192,16 +192,6 @@ pub(super) fn apply(
     Ok(written)
 }
 
-/// Whether `id` is safe to use as a file name: the run-id charset `release`
-/// already enforces.
-fn valid_run_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 fn journal_dir(state: &WorkbenchState) -> Result<PathBuf, WorkbenchError> {
     let profile = state.profile_path()?;
     let parent = profile
@@ -214,7 +204,7 @@ fn journal_dir(state: &WorkbenchState) -> Result<PathBuf, WorkbenchError> {
 /// file, rename, synced directory. One file per run; a later observation of
 /// the same run replaces an earlier one, because it contains it.
 pub(super) fn journal(state: &WorkbenchState, observed: &Observed) -> Result<(), String> {
-    if !valid_run_id(&observed.run_id) {
+    if !super::is_record_id(&observed.run_id) {
         return Err(format!(
             "run id {:?} cannot name a receipt",
             observed.run_id
@@ -252,7 +242,7 @@ pub(super) fn journal(state: &WorkbenchState, observed: &Observed) -> Result<(),
 
 /// Removes a run's journaled observation once the store holds it.
 pub(super) fn retire(state: &WorkbenchState, run_id: &str) {
-    if !valid_run_id(run_id) {
+    if !super::is_record_id(run_id) {
         return;
     }
     let Ok(dir) = journal_dir(state) else {
@@ -301,7 +291,7 @@ pub(super) fn replay(state: &WorkbenchState, only: Option<&str>) -> usize {
         let Some(run_id) = name
             .to_str()
             .and_then(|n| n.strip_suffix(".json"))
-            .filter(|id| valid_run_id(id))
+            .filter(|id| super::is_record_id(id))
         else {
             continue;
         };

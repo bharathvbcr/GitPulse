@@ -111,6 +111,34 @@ describe("check:workflows", () => {
     }
   });
 
+  it("measures Rust branch coverage, on a pinned nightly because the flag is unstable", () => {
+    const coverage = readFileSync(
+      fileURLToPath(new URL("../.github/workflows/coverage.yml", import.meta.url)),
+      "utf8",
+    );
+    for (const line of coverage.split("\n").filter((line) => line.includes("cargo llvm-cov") && line.includes("--manifest-path"))) {
+      expect(line).toContain("--branch");
+    }
+    expect(coverage).toMatch(/toolchain:\s*nightly-\d{4}-\d{2}-\d{2}/);
+  });
+
+  it("keeps the serial gate and also runs the suite in parallel, in its own workflow", () => {
+    const read = (name: string) =>
+      readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
+    // The gate stays serial: the previous test asserts every ci.yml line does.
+    expect(read("ci.yml")).toContain("--test-threads=1");
+    const parallel = read("test-parallel.yml");
+    const lines = parallel.split("\n").filter((line) => line.includes("cargo test --manifest-path"));
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line).toContain("--test-threads=8");
+      expect(line).not.toContain("--test-threads=1");
+    }
+    // Often enough to catch a parallel-only flake the day it lands, not at release.
+    expect(parallel).toMatch(/^\s*push:\s*\n\s*branches:\s*\[main\]/m);
+    expect(parallel).toMatch(/^\s*schedule:/m);
+  });
+
   it("scopes rust-cache to the runner image so native artifacts are not reused across MSVC upgrades", () => {
     for (const name of ["ci.yml", "coverage.yml", "release.yml"]) {
       const source = readFileSync(

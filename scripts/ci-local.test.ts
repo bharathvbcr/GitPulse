@@ -96,6 +96,20 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     expect(skipReason(webkit!, "linux")).toMatch(/needs darwin/);
   });
 
+  it("gates vendored crates on local edits, never on upstream drift alone", () => {
+    // Bare `--check` fails whenever DevCouncil commits, with no change here,
+    // so it is the post-refresh question, not a gate. CI and this runner both
+    // run the edit check, through the same script so they cannot diverge.
+    const scripts = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+      .scripts as Record<string, string>;
+    expect(scripts["check:vendor-edits"]).toBe("node scripts/vendor-crates.mjs --check --allow-drift");
+    expect(scripts["vendor:check"]).toBe("node scripts/vendor-crates.mjs --check");
+    expect(workflow("ci.yml")).toContain("bun run check:vendor-edits");
+    const gate = GATES.find((g) => g.id === "vendor-edits");
+    expect(gate && commandLine(gate)).toBe("bun run check:vendor-edits");
+    expect(gate?.local).toBeUndefined();
+  });
+
   it("passes the flags that stop one failing test binary hiding the rest", () => {
     // ci.yml spells out why: without --no-fail-fast cargo stops at the first
     // failing test binary, so the rest never run and the job reports one

@@ -15,6 +15,7 @@ use crate::engine::git_cli::{
     capture_command, git_text_partial, is_sandbox_symlink_escape, sandbox_join,
     sandbox_join_canonical, validate_repo,
 };
+use crate::fs_entry::BoundedRead;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -115,6 +116,7 @@ pub enum CoverageFormat {
     Istanbul,
     Jacoco,
     Clover,
+    SimpleCov,
     CoveragePyDb,
 }
 
@@ -127,6 +129,7 @@ impl CoverageFormat {
             Self::Istanbul => "istanbul",
             Self::Jacoco => "jacoco",
             Self::Clover => "clover",
+            Self::SimpleCov => "simplecov",
             Self::CoveragePyDb => "coverage_py_db",
         }
     }
@@ -192,6 +195,33 @@ pub struct CoverageArtifact {
     pub skipped: bool,
     pub skip_reason: Option<String>,
     pub totals: CoverageTotals,
+    /// Files whose hits were dropped because the source changed after this
+    /// report was written (the data describes code that no longer exists).
+    #[serde(default)]
+    pub stale_files: usize,
+    /// Reported files that match no file in the repository and were left out
+    /// of every total rather than counted under a made-up path.
+    #[serde(default)]
+    pub unresolved_files: usize,
+    /// Hit lines past the end of their source file, dropped.
+    #[serde(default)]
+    pub lines_past_eof: usize,
+}
+
+impl CoverageArtifact {
+    fn skipped(cand: &Candidate, reason: String) -> Self {
+        Self {
+            path: cand.rel.clone(),
+            format: cand.format.as_str().to_string(),
+            family: cand.family.clone(),
+            skipped: true,
+            skip_reason: Some(reason),
+            totals: CoverageTotals::default(),
+            stale_files: 0,
+            unresolved_files: 0,
+            lines_past_eof: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -369,37 +399,33 @@ fn limits_tag(limits: &ScanLimits) -> u64 {
 /// canonical target must stay inside the repository. That prevents a FIFO from
 /// blocking and prevents a symlink candidate from fingerprinting outside data.
 fn content_probe(repo: &Path, path: &Path, max_bytes: u64) -> u64 {
-    use std::io::Read;
     let Ok(canon) = path.canonicalize() else {
         return 0;
     };
     if !canon.starts_with(repo) {
         return 0;
     }
-    let Ok(meta) = std::fs::metadata(&canon) else {
+    let Ok(bytes) = read_capped(&canon, max_bytes) else {
         return 0;
     };
-    if !meta.is_file() || meta.len() > max_bytes {
-        return 0;
-    }
-    let Ok(mut file) = std::fs::File::open(canon) else {
-        return 0;
-    };
-    let mut buf = [0u8; 64 * 1024];
     let mut hash: u64 = 0x8422_2325_cbf2_9ce4;
-    loop {
-        let Ok(read) = file.read(&mut buf) else {
-            return 0;
-        };
-        if read == 0 {
-            break;
-        }
-        for byte in &buf[..read] {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
+    for byte in &bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
+}
+
+/// The bytes of a regular file of at most `cap` bytes.
+///
+/// The one bounded-read path for every file the coverage scan takes from the
+/// repository. The cap holds for the bytes actually read — not only for the
+/// size `metadata` reported before the read, which a file that grows between
+/// the check and the read defeats — and the open is non-blocking and never
+/// follows a symlink, so a FIFO or a swapped-in link cannot park or redirect
+/// the scan. Every caller passes an already canonical in-repository path.
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedRead> {
+    crate::fs_entry::read_bounded_nofollow(path, usize::try_from(cap).unwrap_or(usize::MAX))
 }
 
 /// ASCII-case-insensitive map lookup fallback for `file_coverage`.
@@ -502,8 +528,19 @@ impl CoverageScanner {
         let mut truncated = detected.listing_partial;
         let mut limit_notices: Vec<CoverageScanLimit> = Vec::new();
         let candidates = {
-            let mut c = collect_candidates(&families, &detected.cargo_dirs, &detected.go_mod_dirs);
-            if extend_directory_candidates(&repo, &families, &detected.cargo_dirs, &mut c) {
+            let mut c = collect_candidates(
+                &families,
+                &detected.cargo_dirs,
+                &detected.go_mod_dirs,
+                &detected.jvm_dirs,
+            );
+            if extend_directory_candidates(
+                &repo,
+                &families,
+                &detected.cargo_dirs,
+                &detected.jvm_dirs,
+                &mut c,
+            ) {
                 // A probed directory dropped an artifact-shaped entry beyond
                 // the MAX_DIR_ENTRIES window; readdir order is arbitrary, so
                 // real artifacts may have been left unseen.
@@ -605,28 +642,14 @@ impl CoverageScanner {
             match read_artifact(&repo, &cand.rel, limits.max_artifact_bytes) {
                 ArtifactRead::Missing => continue,
                 ArtifactRead::Skipped { reason } => {
-                    artifacts.push(CoverageArtifact {
-                        path: cand.rel,
-                        format: cand.format.as_str().to_string(),
-                        family: cand.family,
-                        skipped: true,
-                        skip_reason: Some(reason),
-                        totals: CoverageTotals::default(),
-                    });
+                    artifacts.push(CoverageArtifact::skipped(&cand, reason));
                 }
                 ArtifactRead::Text(text) => {
                     if cand.format == CoverageFormat::CoveragePyDb {
-                        artifacts.push(CoverageArtifact {
-                            path: cand.rel,
-                            format: cand.format.as_str().to_string(),
-                            family: cand.family,
-                            skipped: true,
-                            skip_reason: Some(
-                                "binary .coverage database; export coverage.xml or lcov.info"
-                                    .into(),
-                            ),
-                            totals: CoverageTotals::default(),
-                        });
+                        artifacts.push(CoverageArtifact::skipped(
+                            &cand,
+                            "binary .coverage database; export coverage.xml or lcov.info".into(),
+                        ));
                         continue;
                     }
                     #[cfg(test)]
@@ -640,6 +663,7 @@ impl CoverageScanner {
                         cand.format,
                         &text,
                         &repo,
+                        module_dir_of(&cand.rel),
                         &mut artifact_budget,
                         &mut go_expansion_capped,
                     ) {
@@ -647,21 +671,34 @@ impl CoverageScanner {
                             if artifact_budget.dropped() {
                                 truncated = true;
                             }
+                            let unresolved_files = take_unresolved_count();
+                            // Hits for code that has since changed describe
+                            // nothing: drop files edited after the report was
+                            // written, and lines past the end of what is on
+                            // disk, before they can be merged by max.
+                            let (map, stale_files, lines_past_eof) =
+                                drop_stale_and_out_of_range(&repo, &cand.rel, map);
                             // A parse that yields no records is not "0%
                             // covered" data — it's an artifact we understood
                             // but found nothing usable in (empty file,
                             // totals-only JSON, foreign schema). Say so.
                             if map.is_empty() {
-                                artifacts.push(CoverageArtifact {
-                                    path: cand.rel,
-                                    format: cand.format.as_str().to_string(),
-                                    family: cand.family,
-                                    skipped: true,
-                                    skip_reason: Some(
-                                        "parsed but contained no coverage records".into(),
-                                    ),
-                                    totals: CoverageTotals::default(),
-                                });
+                                let reason = if stale_files > 0 {
+                                    format!(
+                                        "every covered file changed after this report was written ({stale_files}); regenerate coverage"
+                                    )
+                                } else if unresolved_files > 0 {
+                                    format!(
+                                        "none of the {unresolved_files} reported files match a file in this repository"
+                                    )
+                                } else {
+                                    "parsed but contained no coverage records".into()
+                                };
+                                let mut row = CoverageArtifact::skipped(&cand, reason);
+                                row.stale_files = stale_files;
+                                row.unresolved_files = unresolved_files;
+                                row.lines_past_eof = lines_past_eof;
+                                artifacts.push(row);
                                 continue;
                             }
                             // Totals describe what the artifact contained at
@@ -677,6 +714,9 @@ impl CoverageScanner {
                                 skipped: false,
                                 skip_reason: None,
                                 totals,
+                                stale_files,
+                                unresolved_files,
+                                lines_past_eof,
                             });
                             if exhausted {
                                 truncated = true;
@@ -684,14 +724,7 @@ impl CoverageScanner {
                             }
                         }
                         Err(reason) => {
-                            artifacts.push(CoverageArtifact {
-                                path: cand.rel,
-                                format: cand.format.as_str().to_string(),
-                                family: cand.family,
-                                skipped: true,
-                                skip_reason: Some(reason),
-                                totals: CoverageTotals::default(),
-                            });
+                            artifacts.push(CoverageArtifact::skipped(&cand, reason));
                         }
                     }
                 }
@@ -904,8 +937,9 @@ fn specs_for(family: &str) -> &'static [(&'static str, CoverageFormat)] {
             ("cobertura.xml", CoverageFormat::Cobertura),
         ],
         "native" => &[
-            // The file GitPulse's own generate step writes, first so a fresh
-            // run is preferred over a stale hand-made one.
+            // The file GitPulse's own generate step writes. Order carries no
+            // freshness: every report is merged, and files edited after a
+            // report was written lose that report's hits.
             (NATIVE_COVERAGE_LCOV, CoverageFormat::Lcov),
             ("lcov.info", CoverageFormat::Lcov),
             ("coverage.info", CoverageFormat::Lcov),
@@ -933,7 +967,9 @@ fn specs_for(family: &str) -> &'static [(&'static str, CoverageFormat)] {
             ("build/logs/clover.xml", CoverageFormat::Clover),
         ],
         "ruby" => &[
-            ("coverage/coverage.json", CoverageFormat::Istanbul),
+            // SimpleCov's own resultset, then the JSON formatter's output.
+            ("coverage/.resultset.json", CoverageFormat::SimpleCov),
+            ("coverage/coverage.json", CoverageFormat::SimpleCov),
             ("coverage/lcov.info", CoverageFormat::Lcov),
             ("coverage.xml", CoverageFormat::Cobertura),
         ],
@@ -1148,16 +1184,11 @@ fn read_go_work_modules(repo: &Path) -> Option<(Vec<String>, bool)> {
         Ok(path) => path,
         Err(_) => return Some((Vec::new(), true)),
     };
-    let meta = match std::fs::metadata(&path) {
-        Ok(meta) => meta,
-        Err(_) => return Some((Vec::new(), true)),
-    };
-    if !meta.is_file() || meta.len() > MAX_GO_WORK_BYTES {
+    let Some(text) = read_capped(&path, MAX_GO_WORK_BYTES)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
         return Some((Vec::new(), true));
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => return Some((Vec::new(), true)),
     };
     Some(parse_go_work_use(&text))
 }
@@ -1278,12 +1309,8 @@ fn manifest_is_file(repo: &Path, rel: &str) -> bool {
 
 fn read_root_package_json(repo: &Path) -> Option<serde_json::Value> {
     let path = sandbox_join_canonical(repo, "package.json").ok()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_PACKAGE_JSON_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&text).ok()
+    let bytes = read_capped(&path, MAX_PACKAGE_JSON_BYTES).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn package_has_dep(pkg: &serde_json::Value, name: &str) -> bool {
@@ -1528,26 +1555,13 @@ fn resolve_manifest_rel(base: &str, rel: &str) -> Option<String> {
 }
 
 fn read_cargo_manifest_shape(repo: &Path, dir: &str) -> Option<CargoManifestShape> {
-    use std::io::Read as _;
     let rel = if dir.is_empty() {
         "Cargo.toml".to_string()
     } else {
         format!("{dir}/Cargo.toml")
     };
     let path = sandbox_join_canonical(repo, &rel).ok()?;
-    // Regular files only: opening a FIFO would block the scan.
-    if !std::fs::metadata(&path).ok()?.is_file() {
-        return None;
-    }
-    let mut text = String::new();
-    std::fs::File::open(&path)
-        .ok()?
-        .take(MAX_CARGO_MANIFEST_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    if text.len() as u64 > MAX_CARGO_MANIFEST_BYTES {
-        return None;
-    }
+    let text = String::from_utf8(read_capped(&path, MAX_CARGO_MANIFEST_BYTES).ok()?).ok()?;
     Some(parse_cargo_manifest_shape(&text))
 }
 
@@ -2693,6 +2707,9 @@ struct FamilyScan {
     families: BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: Vec<String>,
     go_mod_dirs: Vec<String>,
+    /// Non-root directories holding a Maven or Gradle build file: the modules
+    /// whose own `target/site/jacoco` or `build/reports/jacoco` is probed.
+    jvm_dirs: Vec<String>,
     go_work_at_root: bool,
     package_swift_dirs: Vec<String>,
     has_python_tests: bool,
@@ -2724,6 +2741,7 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     let mut families: BTreeMap<String, CoverageFamilyStatus> = BTreeMap::new();
     let mut cargo_dirs: Vec<String> = Vec::new();
     let mut go_mod_dirs: Vec<String> = Vec::new();
+    let mut jvm_dirs: Vec<String> = Vec::new();
     let mut go_work_at_root = false;
     let mut package_swift_dirs: Vec<String> = Vec::new();
     let mut has_python_tests = false;
@@ -2752,6 +2770,17 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
             let dir = rel_parent_dir(&rel);
             if !go_mod_dirs.contains(&dir) {
                 go_mod_dirs.push(dir);
+            }
+        } else if matches!(name, "pom.xml" | "build.gradle" | "build.gradle.kts") {
+            let dir = rel_parent_dir(&rel);
+            if !dir.is_empty() && !coverage_third_party_dir(&dir) && !jvm_dirs.contains(&dir) {
+                if jvm_dirs.len() >= MAX_JVM_MODULES {
+                    // Modules past the bound are never probed; say so rather
+                    // than present the modules read as the whole build.
+                    listing_partial = true;
+                } else {
+                    jvm_dirs.push(dir);
+                }
             }
         } else if name == "go.work" && rel_parent_dir(&rel).is_empty() {
             go_work_at_root = true;
@@ -2821,11 +2850,13 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     }
     cargo_dirs.sort();
     go_mod_dirs.sort();
+    jvm_dirs.sort();
     package_swift_dirs.sort();
     Ok(FamilyScan {
         families,
         cargo_dirs,
         go_mod_dirs,
+        jvm_dirs,
         go_work_at_root,
         package_swift_dirs,
         has_python_tests,
@@ -2839,6 +2870,7 @@ fn collect_candidates(
     families: &BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: &[String],
     go_mod_dirs: &[String],
+    jvm_dirs: &[String],
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
     // One candidate per artifact PATH: several families can list the same
@@ -2887,7 +2919,49 @@ fn collect_candidates(
             }
         }
     }
+    // Multi-module Maven/Gradle builds write each module's report under that
+    // module, never at the root; the root specs above miss all of them.
+    if families.contains_key("jvm") {
+        for dir in jvm_dirs {
+            for (tail, format) in nested_jvm_specs() {
+                let rel = format!("{dir}/{tail}");
+                if seen.insert(rel.clone()) {
+                    out.push(Candidate {
+                        rel,
+                        format: *format,
+                        family: "jvm".to_string(),
+                    });
+                }
+            }
+        }
+    }
     out
+}
+
+/// Cap on Maven/Gradle module directories probed for their own reports. A
+/// monorepo with hundreds of build files must not turn a scan into hundreds of
+/// stats; hitting it marks the scan capped.
+const MAX_JVM_MODULES: usize = 128;
+
+/// Report locations relative to a non-root Maven or Gradle module directory.
+fn nested_jvm_specs() -> &'static [(&'static str, CoverageFormat)] {
+    &[
+        ("target/site/jacoco/jacoco.xml", CoverageFormat::Jacoco),
+        (
+            "build/reports/jacoco/test/jacocoTestReport.xml",
+            CoverageFormat::Jacoco,
+        ),
+        ("build/reports/jacoco/jacoco.xml", CoverageFormat::Jacoco),
+    ]
+}
+
+/// Report directories probed relative to a non-root Maven or Gradle module.
+fn nested_jvm_dirs() -> &'static [&'static str] {
+    &[
+        "target/site/jacoco",
+        "build/reports/jacoco",
+        "build/reports/jacoco/test",
+    ]
 }
 
 /// Artifact locations relative to a non-root Go module directory.
@@ -2937,6 +3011,7 @@ fn extend_directory_candidates(
     repo: &Path,
     families: &BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: &[String],
+    jvm_dirs: &[String],
     out: &mut Vec<Candidate>,
 ) -> bool {
     let mut seen: BTreeSet<String> = out.iter().map(|c| c.rel.clone()).collect();
@@ -2991,6 +3066,13 @@ fn extend_directory_candidates(
             scan_dir(&format!("{dir}/{tail}"), "rust", &mut seen, out);
         }
     }
+    if families.contains_key("jvm") {
+        for dir in jvm_dirs {
+            for tail in nested_jvm_dirs() {
+                scan_dir(&format!("{dir}/{tail}"), "jvm", &mut seen, out);
+            }
+        }
+    }
     was_truncated
 }
 
@@ -3012,6 +3094,8 @@ fn format_from_filename(name: &str) -> Option<CoverageFormat> {
         } else {
             Some(CoverageFormat::Cobertura)
         }
+    } else if lower == ".resultset.json" {
+        Some(CoverageFormat::SimpleCov)
     } else if lower.ends_with(".json") && lower.contains("coverage") {
         // Totals-only summaries (`coverage-summary.json` from vitest's
         // json-summary reporter) carry no per-line records; parsing them as
@@ -3047,33 +3131,11 @@ fn read_artifact(repo: &Path, rel: &str, max_bytes: u64) -> ArtifactRead {
             reason: "artifact path escaped the repository".into(),
         };
     }
-    let meta = match std::fs::metadata(&canon) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            return ArtifactRead::Skipped {
-                reason: "permission denied".into(),
-            };
-        }
-        Err(_) => return ArtifactRead::Missing,
-    };
-    // Regular files only. FIFOs, sockets, and device nodes pass size checks
-    // (len() is 0 for a FIFO) and would block `fs::read` forever on open
-    // with no writer, pinning a scan thread.
-    if !meta.is_file() {
-        return ArtifactRead::Skipped {
-            reason: "not a regular file".into(),
-        };
-    }
-    if meta.len() > max_bytes {
-        return ArtifactRead::Skipped {
-            reason: format!("artifact exceeds {} byte limit ({})", max_bytes, meta.len()),
-        };
-    }
-    // Residual TOCTOU: the path can be swapped (e.g. re-pointed at a symlink
-    // outside the repo) between canonicalize and read, same as the documented
-    // write-path residual in git_cli.rs. Read-only exposure; attacker already
-    // needs local repo-write access.
-    match std::fs::read(&canon) {
+    // Regular files only, at or below the byte limit. FIFOs, sockets, and
+    // device nodes pass size checks (len() is 0 for a FIFO) and would block a
+    // plain read forever with no writer, pinning a scan thread; the bounded
+    // reader never blocks on them and holds the cap on the bytes it reads.
+    match read_capped(&canon, max_bytes) {
         Ok(bytes) => {
             if bytes.contains(&0) {
                 ArtifactRead::Skipped {
@@ -3083,10 +3145,18 @@ fn read_artifact(repo: &Path, rel: &str, max_bytes: u64) -> ArtifactRead {
                 ArtifactRead::Text(String::from_utf8_lossy(&bytes).into_owned())
             }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => ArtifactRead::Skipped {
-            reason: "permission denied".into(),
+        Err(BoundedRead::NotRegular) => ArtifactRead::Skipped {
+            reason: "not a regular file".into(),
         },
-        Err(_) => ArtifactRead::Missing,
+        Err(BoundedRead::TooLarge | BoundedRead::Grew) => ArtifactRead::Skipped {
+            reason: format!("artifact exceeds {max_bytes} byte limit"),
+        },
+        Err(BoundedRead::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            ArtifactRead::Skipped {
+                reason: "permission denied".into(),
+            }
+        }
+        Err(BoundedRead::Io(_)) => ArtifactRead::Missing,
     }
 }
 
@@ -3094,16 +3164,19 @@ fn parse_artifact(
     format: CoverageFormat,
     text: &str,
     repo: &Path,
+    module_dir: &str,
     budget: &mut EntryBudget,
     go_expansion_capped: &mut bool,
 ) -> Result<HashMap<String, BTreeMap<usize, u64>>, String> {
-    clear_existence_memo();
+    begin_resolution(module_dir);
     let text = text.trim_start_matches('\u{feff}');
     match format {
         CoverageFormat::Lcov => Ok(parse_lcov(text, repo, budget)),
         CoverageFormat::Cobertura => Ok(parse_cobertura(text, repo, budget)),
         CoverageFormat::GoCover => Ok(parse_go_cover(text, repo, budget, go_expansion_capped)),
-        CoverageFormat::Istanbul => parse_istanbul(text, repo, budget),
+        CoverageFormat::Istanbul | CoverageFormat::SimpleCov => {
+            parse_json_coverage(text, repo, budget)
+        }
         CoverageFormat::Jacoco => Ok(parse_jacoco(text, repo, budget)),
         CoverageFormat::Clover => Ok(parse_clover(text, repo, budget)),
         CoverageFormat::CoveragePyDb => Err("binary coverage.py database".into()),
@@ -3176,7 +3249,9 @@ fn parse_cobertura(
     let mut lines = BTreeMap::new();
     for piece in strip_xml_comments(text).split('<') {
         let trimmed = piece.trim();
-        if strip_tag(trimmed, "class").is_some() || strip_tag(trimmed, "file").is_some() {
+        if let Some(root) = trimmed.strip_prefix("source>") {
+            add_source_root(repo, root);
+        } else if strip_tag(trimmed, "class").is_some() || strip_tag(trimmed, "file").is_some() {
             if let Some(path) = current.take() {
                 merge_file(&mut out, path, std::mem::take(&mut lines), budget);
             }
@@ -3301,13 +3376,81 @@ fn parse_go_cover(
     out
 }
 
-fn parse_istanbul(
+/// JSON coverage is two unrelated shapes behind one file name: Istanbul's
+/// per-file statement maps, and SimpleCov's `{"coverage": {file: {"lines":
+/// [...]}}}` (the JSON formatter) or `{suite: {"coverage": ...}}` (the
+/// `.resultset.json`). The content, not the file name, says which.
+fn parse_json_coverage(
     text: &str,
     repo: &Path,
     budget: &mut EntryBudget,
 ) -> Result<HashMap<String, BTreeMap<usize, u64>>, String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    match simplecov_suites(&value) {
+        Some(suites) => Ok(parse_simplecov(&suites, repo, budget)),
+        None => parse_istanbul_value(&value, repo, budget),
+    }
+}
+
+/// The `coverage` objects of a SimpleCov document, or `None` when this is not
+/// one. An Istanbul file entry never has a top-level `coverage` object whose
+/// values carry `lines`.
+fn simplecov_suites(
+    value: &serde_json::Value,
+) -> Option<Vec<&serde_json::Map<String, serde_json::Value>>> {
+    let root = value.as_object()?;
+    let is_files = |m: &serde_json::Map<String, serde_json::Value>| {
+        m.values()
+            .any(|file| file.get("lines").is_some_and(|l| l.is_array()) || file.is_array())
+    };
+    if let Some(files) = root.get("coverage").and_then(|c| c.as_object()) {
+        return is_files(files).then(|| vec![files]);
+    }
+    let suites: Vec<_> = root
+        .values()
+        .filter_map(|suite| suite.get("coverage").and_then(|c| c.as_object()))
+        .filter(|files| is_files(files))
+        .collect();
+    (!suites.is_empty()).then_some(suites)
+}
+
+/// SimpleCov line arrays: index `i` is line `i + 1`; `null` is a line that is
+/// not code, a number is its hit count. Suites merge by max, like every other
+/// artifact.
+fn parse_simplecov(
+    suites: &[&serde_json::Map<String, serde_json::Value>],
+    repo: &Path,
+    budget: &mut EntryBudget,
+) -> HashMap<String, BTreeMap<usize, u64>> {
+    let mut out = HashMap::new();
+    for files in suites {
+        for (reported, file) in *files {
+            let Some(path) = relativize_or_suffix(repo, reported) else {
+                continue;
+            };
+            let lines = file
+                .get("lines")
+                .and_then(|l| l.as_array())
+                .or_else(|| file.as_array());
+            let Some(lines) = lines else { continue };
+            let mut record = BTreeMap::new();
+            for (index, hits) in lines.iter().enumerate() {
+                if let Some(hits) = hits.as_u64() {
+                    record_hit_unbudgeted(&mut record, index + 1, hits);
+                }
+            }
+            merge_file(&mut out, path, record, budget);
+        }
+    }
+    out
+}
+
+fn parse_istanbul_value(
+    value: &serde_json::Value,
+    repo: &Path,
+    budget: &mut EntryBudget,
+) -> Result<HashMap<String, BTreeMap<usize, u64>>, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "istanbul root must be an object".to_string())?;
@@ -3781,46 +3924,222 @@ fn relativize(repo: &Path, reported: &str) -> Option<String> {
     }
 }
 
-// Existence-check memo shared by one artifact parse. `relativize_or_suffix`
-// stats the filesystem per candidate path; a hostile 8 MB artifact full of
-// deep paths would otherwise issue millions of stats. Cleared at the start
-// of every artifact parse so results stay correct as files appear/disappear.
+/// Per-parse path resolution state, thread-local because the six parsers are
+/// plain functions over one artifact at a time. Reset by [`begin_resolution`]
+/// at the start of every artifact parse so results stay correct as files
+/// appear and disappear.
+///
+/// The existence memo exists because `relativize_or_suffix` stats the
+/// filesystem per candidate path; a hostile 8 MB artifact full of deep paths
+/// would otherwise issue millions of stats. It is also capped: past
+/// [`MAX_EXISTENCE_PROBES`] distinct probes nothing further resolves.
+#[derive(Default)]
+struct Resolution {
+    memo: HashMap<String, bool>,
+    /// Directory (repo-relative, empty for the root) the report belongs to:
+    /// the module that wrote it, against which its relative paths resolve.
+    module_dir: String,
+    /// Cobertura `<source>` roots, repo-relative.
+    sources: Vec<String>,
+    /// Reported files that matched nothing in the repository.
+    unresolved: usize,
+}
+
+const MAX_EXISTENCE_PROBES: usize = 200_000;
+/// Cobertura `<source>` roots honoured per report.
+const MAX_SOURCE_ROOTS: usize = 4;
+
 thread_local! {
-    static EXISTENCE_MEMO: std::cell::RefCell<HashMap<String, bool>> =
-        std::cell::RefCell::new(HashMap::new());
+    static RESOLUTION: std::cell::RefCell<Resolution> =
+        std::cell::RefCell::new(Resolution::default());
+}
+
+fn begin_resolution(module_dir: &str) {
+    RESOLUTION.with(|r| {
+        *r.borrow_mut() = Resolution {
+            module_dir: module_dir.to_string(),
+            ..Resolution::default()
+        };
+    });
+}
+
+fn take_unresolved_count() -> usize {
+    RESOLUTION.with(|r| std::mem::take(&mut r.borrow_mut().unresolved))
 }
 
 fn path_exists_cached(repo: &Path, rel: &str) -> bool {
     let key = format!("{}\0{}", repo.display(), rel);
-    EXISTENCE_MEMO.with(|memo| {
-        *memo.borrow_mut().entry(key).or_insert_with(|| {
-            sandbox_join_canonical(repo, rel)
-                .map(|path| path.is_file())
-                .unwrap_or(false)
-        })
+    RESOLUTION.with(|r| {
+        let mut r = r.borrow_mut();
+        if let Some(known) = r.memo.get(&key) {
+            return *known;
+        }
+        if r.memo.len() >= MAX_EXISTENCE_PROBES {
+            return false;
+        }
+        let exists = sandbox_join_canonical(repo, rel)
+            .map(|path| path.is_file())
+            .unwrap_or(false);
+        r.memo.insert(key, exists);
+        exists
     })
 }
 
-fn clear_existence_memo() {
-    EXISTENCE_MEMO.with(|memo| memo.borrow_mut().clear());
+/// Directories a coverage tool writes into, below the module that ran it.
+const ARTIFACT_DIR_SEGMENTS: &[&str] = &[
+    "coverage",
+    "htmlcov",
+    "target",
+    "llvm-cov",
+    "llvm-cov-target",
+    "tarpaulin",
+    "site",
+    "jacoco",
+    "reports",
+    "build",
+    "test",
+    "logs",
+    "TestResults",
+    ".build",
+];
+
+/// The module directory a report at `artifact_rel` belongs to: its directory
+/// with the trailing tool-output segments (`target/llvm-cov`, `coverage`, …)
+/// removed. `crates/x/target/llvm-cov/lcov.info` is module `crates/x`.
+fn module_dir_of(artifact_rel: &str) -> &str {
+    let mut dir = artifact_rel.rsplit_once('/').map_or("", |(d, _)| d);
+    loop {
+        match dir.rsplit_once('/') {
+            Some((parent, last)) if ARTIFACT_DIR_SEGMENTS.contains(&last) => dir = parent,
+            None if ARTIFACT_DIR_SEGMENTS.contains(&dir) => return "",
+            _ => return dir,
+        }
+    }
 }
 
+fn join_rel(base: &str, rest: &str) -> String {
+    if base.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), rest)
+    }
+}
+
+/// Source layouts JVM tools omit from their `package/File.java` keys.
+const JVM_SOURCE_PREFIXES: &[&str] = &[
+    "src/main/java",
+    "src/main/kotlin",
+    "src/main/scala",
+    "src/test/java",
+    "src/test/kotlin",
+    "src/test/scala",
+];
+
+fn is_jvm_source(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next(),
+        Some("java" | "kt" | "kts" | "scala" | "groovy")
+    )
+}
+
+/// Registers a Cobertura `<source>` root for the artifact being parsed.
+fn add_source_root(repo: &Path, raw: &str) {
+    let raw = decode_xml_entities(raw.trim());
+    if raw.is_empty() {
+        return;
+    }
+    let rel = if Path::new(&raw).is_absolute() {
+        relativize(repo, &raw)
+    } else {
+        let module = RESOLUTION.with(|r| r.borrow().module_dir.clone());
+        let cleaned = raw.replace('\\', "/");
+        let cleaned = cleaned.trim_start_matches("./").trim_end_matches('/');
+        let joined = join_rel(&module, cleaned);
+        is_safe_rel(&joined).then_some(joined)
+    };
+    // An absolute root outside the repository (or the repository itself, which
+    // `relativize` cannot express) simply adds nothing: the module and root
+    // bases below still apply.
+    if let Some(rel) = rel {
+        RESOLUTION.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.sources.len() < MAX_SOURCE_ROOTS && !r.sources.contains(&rel) {
+                r.sources.push(rel);
+            }
+        });
+    }
+}
+
+/// Maps a path as a coverage tool printed it to a file in the repository, or
+/// `None` when no file matches — an unmatched path is never invented, so it
+/// cannot count toward totals under a name that is not a file.
+///
+/// Tried in order: an absolute path inside the repository; the reported path
+/// under each Cobertura `<source>` root, the module that wrote the report and
+/// the repository root (with the Maven/Gradle source layouts for JVM files);
+/// then the longest tail of at least TWO components. A single-component tail
+/// (`main.go`) names every file of that name, so it never stands in for a path
+/// that did not resolve (Go's `cmd/main.go` must not land on the root
+/// `main.go`).
 fn relativize_or_suffix(repo: &Path, reported: &str) -> Option<String> {
-    let rel = relativize(repo, reported);
-    if let Some(ref path) = rel {
-        if path_exists_cached(repo, path) {
-            return rel;
+    let resolved = resolve_reported(repo, reported);
+    if resolved.is_none() {
+        RESOLUTION.with(|r| r.borrow_mut().unresolved += 1);
+    }
+    resolved
+}
+
+fn resolve_reported(repo: &Path, reported: &str) -> Option<String> {
+    let is_abs = Path::new(reported).is_absolute();
+    // An absolute path names one file. A relative one is read against the
+    // module that wrote the report before the repository root, so a nested
+    // module's `src/lib.rs` is not taken for the root's.
+    if is_abs {
+        let direct = relativize(repo, reported);
+        if let Some(ref path) = direct {
+            if path_exists_cached(repo, path) {
+                return direct;
+            }
         }
     }
     let cleaned = reported.replace('\\', "/");
     let parts: Vec<&str> = cleaned
         .split('/')
-        .filter(|p| !p.is_empty() && *p != "..")
+        .filter(|p| !p.is_empty() && *p != ".." && *p != ".")
         .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if !is_abs {
+        let tail = parts.join("/");
+        let (sources, module_dir) =
+            RESOLUTION.with(|r| (r.borrow().sources.clone(), r.borrow().module_dir.clone()));
+        let mut bases: Vec<String> = sources;
+        for base in [module_dir, String::new()] {
+            if !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+        let jvm = is_jvm_source(&tail);
+        for base in &bases {
+            let mut prefixes: Vec<&str> = vec![""];
+            if jvm {
+                prefixes.extend(JVM_SOURCE_PREFIXES);
+            }
+            for prefix in prefixes {
+                let candidate = join_rel(join_rel(base, prefix).trim_matches('/'), &tail);
+                if is_safe_rel(&candidate)
+                    && !skip_source(&candidate)
+                    && path_exists_cached(repo, &candidate)
+                {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
     // Longest-suffix-first (most specific match wins), bounded to the eight
-    // most specific attempts: deeper tails cost a stat each and ambiguity,
-    // not precision, dominates beyond that.
-    for i in parts.len().saturating_sub(8)..parts.len() {
+    // most specific attempts, and never down to a single component.
+    for i in parts.len().saturating_sub(8)..parts.len().saturating_sub(1) {
         let candidate = parts[i..].join("/");
         if is_safe_rel(&candidate)
             && !skip_source(&candidate)
@@ -3829,7 +4148,56 @@ fn relativize_or_suffix(repo: &Path, reported: &str) -> Option<String> {
             return Some(candidate);
         }
     }
-    rel
+    None
+}
+
+/// A report older than a source it describes describes the old source.
+const STALE_TOLERANCE: Duration = Duration::from_secs(2);
+/// Source files larger than this are not line-counted for the EOF check.
+const MAX_EOF_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Drops, per file, what a report cannot truthfully say about the code now on
+/// disk: files modified after the report was written (stale), and hit lines
+/// past the file's last line. Returns the kept map, the stale file count and
+/// the dropped-line count. A file that cannot be inspected is kept — it
+/// resolved to a real path already.
+fn drop_stale_and_out_of_range(
+    repo: &Path,
+    artifact_rel: &str,
+    map: HashMap<String, BTreeMap<usize, u64>>,
+) -> (HashMap<String, BTreeMap<usize, u64>>, usize, usize) {
+    let report_mtime = std::fs::metadata(repo.join(artifact_rel))
+        .and_then(|m| m.modified())
+        .ok();
+    let mut kept = HashMap::with_capacity(map.len());
+    let (mut stale, mut past_eof) = (0usize, 0usize);
+    for (path, mut lines) in map {
+        let Ok(source) = sandbox_join_canonical(repo, &path) else {
+            kept.insert(path, lines);
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&source) else {
+            kept.insert(path, lines);
+            continue;
+        };
+        if let (Some(report), Ok(edited)) = (report_mtime, meta.modified()) {
+            if edited > report + STALE_TOLERANCE {
+                stale += 1;
+                continue;
+            }
+        }
+        if let Ok(bytes) = read_capped(&source, MAX_EOF_CHECK_BYTES) {
+            let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+            let last_line = newlines + usize::from(bytes.last().is_some_and(|b| *b != b'\n'));
+            let before = lines.len();
+            lines.retain(|ln, _| *ln <= last_line);
+            past_eof += before - lines.len();
+        }
+        if !lines.is_empty() {
+            kept.insert(path, lines);
+        }
+    }
+    (kept, stale, past_eof)
 }
 
 #[cfg(test)]
@@ -3839,6 +4207,66 @@ mod tests {
     use crate::procguard::LockedSpawn;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// Every bounded read of repository content goes through `read_capped`, so
+    /// the cap must hold for the bytes read, exactly at and one past the limit.
+    #[test]
+    fn read_capped_holds_the_cap_on_the_bytes_it_reads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_capped(&path, 4).unwrap(), b"abcd");
+        assert!(matches!(read_capped(&path, 3), Err(BoundedRead::TooLarge)));
+        assert!(matches!(
+            read_capped(dir.path(), 100),
+            Err(BoundedRead::NotRegular)
+        ));
+    }
+
+    #[test]
+    fn oversized_files_are_refused_by_every_bounded_repository_read() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            repo.join("go.work"),
+            "x".repeat(MAX_GO_WORK_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert_eq!(read_go_work_modules(&repo), Some((Vec::new(), true)));
+        std::fs::write(
+            repo.join("package.json"),
+            format!(
+                "{{\"pad\":\"{}\"}}",
+                "x".repeat(MAX_PACKAGE_JSON_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        assert!(read_root_package_json(&repo).is_none());
+        std::fs::write(repo.join("lcov.info"), "x".repeat(64)).unwrap();
+        assert_ne!(content_probe(&repo, &repo.join("lcov.info"), 64), 0);
+        assert_eq!(content_probe(&repo, &repo.join("lcov.info"), 63), 0);
+        match read_artifact(&repo, "lcov.info", 63) {
+            ArtifactRead::Skipped { reason } => {
+                assert!(reason.contains("63 byte limit"), "{reason}")
+            }
+            _ => panic!("an artifact past the cap must be skipped"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_artifact_is_skipped_not_waited_on() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let fifo = repo.join("lcov.info");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        match read_artifact(&repo, "lcov.info", 1024) {
+            ArtifactRead::Skipped { reason } => assert_eq!(reason, "not a regular file"),
+            _ => panic!("a FIFO must be skipped"),
+        }
+        assert_eq!(content_probe(&repo, &fifo, 1024), 0);
+    }
 
     /// Regression (audit M4): every per-file detail request re-parsed every
     /// artifact on disk. A second identical scan must be served from the
@@ -4290,7 +4718,7 @@ mod tests {
                 duration_hint: String::new(),
             },
         );
-        let cands = collect_candidates(&families, &[], &[]);
+        let cands = collect_candidates(&families, &[], &[], &[]);
         assert!(cands.iter().any(|c| c.rel == "lcov.info"));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::Jacoco));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::GoCover));
@@ -4315,7 +4743,7 @@ mod tests {
                 duration_hint: String::new(),
             },
         );
-        let cands = collect_candidates(&families, &[], &[]);
+        let cands = collect_candidates(&families, &[], &[], &[]);
         assert!(cands.iter().any(|c| c.rel == "coverage.xml"));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::GoCover));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::Jacoco));
@@ -4324,6 +4752,7 @@ mod tests {
     #[test]
     fn parse_lcov_counts_hits_and_rejects_parent_escape() {
         let repo = git_repo();
+        write(repo.path(), "src/lib.rs", "a\nb\nc\n");
         let text = "\
 TN:
 SF:src/lib.rs
@@ -4370,6 +4799,7 @@ src/main.go:4.1,4.8 1 0
     #[test]
     fn parse_cobertura_and_istanbul() {
         let repo = git_repo();
+        write(repo.path(), "pkg/mod.py", "a\nb\n");
         let cob = r#"
 <coverage>
   <class filename="pkg/mod.py" line-rate="0.5">
@@ -4401,7 +4831,7 @@ src/main.go:4.1,4.8 1 0
   }}
 }}"#
         );
-        let ist = parse_istanbul(&istanbul, repo.path(), &mut EntryBudget::new(usize::MAX))
+        let ist = parse_json_coverage(&istanbul, repo.path(), &mut EntryBudget::new(usize::MAX))
             .expect("istanbul");
         assert_eq!(ist["src/app.ts"].get(&1), Some(&2));
         assert_eq!(ist["src/app.ts"].get(&2), Some(&0));
@@ -4410,7 +4840,7 @@ src/main.go:4.1,4.8 1 0
     #[test]
     fn rust_repo_scans_lcov_and_ignores_jacoco() {
         let repo = git_repo();
-        write(repo.path(), "src/lib.rs", "pub fn x() {}\n");
+        write(repo.path(), "src/lib.rs", "pub fn x() {}\n\n");
         write(
             repo.path(),
             "lcov.info",
@@ -4562,7 +4992,12 @@ src/main.go:4.1,4.8 1 0
     #[test]
     fn parse_jacoco_and_clover() {
         let repo = git_repo();
-        write(repo.path(), "com/foo/Bar.java", "class Bar {}\n");
+        write(
+            repo.path(),
+            "src/main/java/com/foo/Bar.java",
+            "class Bar {}\n\n",
+        );
+        write(repo.path(), "src/Foo.php", "<?php\n\n\n\n");
         let jacoco = r#"
 <report>
   <package name="com/foo">
@@ -4574,12 +5009,12 @@ src/main.go:4.1,4.8 1 0
 </report>
 "#;
         let map = parse_jacoco(jacoco, repo.path(), &mut EntryBudget::new(usize::MAX));
-        assert_eq!(map["com/foo/Bar.java"].get(&1), Some(&4));
-        assert_eq!(map["com/foo/Bar.java"].get(&2), Some(&0));
+        assert_eq!(map["src/main/java/com/foo/Bar.java"].get(&1), Some(&4));
+        assert_eq!(map["src/main/java/com/foo/Bar.java"].get(&2), Some(&0));
 
         let minified = r#"<report><package name="com/foo"><sourcefile name="Bar.java"><line nr="1" ci="4" mi="0"/></sourcefile></package></report>"#;
         let compact = parse_jacoco(minified, repo.path(), &mut EntryBudget::new(usize::MAX));
-        assert_eq!(compact["com/foo/Bar.java"].get(&1), Some(&4));
+        assert_eq!(compact["src/main/java/com/foo/Bar.java"].get(&1), Some(&4));
 
         let clover = r#"
 <coverage>
@@ -4762,6 +5197,7 @@ src/main.go:4.1,4.8 1 0
         write(repo.path(), "src/lib.rs", "fn a() {}\n");
         let mut text = String::new();
         for i in 1..=200usize {
+            write(repo.path(), &format!("src/gen/file_{i}.rs"), "fn a() {}\n");
             text.push_str(&format!("SF:src/gen/file_{i}.rs\nDA:1,1\nend_of_record\n"));
         }
         write(repo.path(), "lcov.info", &text);
@@ -6199,7 +6635,7 @@ src/main.go:4.1,4.8 1 0
     #[test]
     fn detail_lines_are_capped_with_flag() {
         let repo = git_repo();
-        write(repo.path(), "src/big.rs", "fn a() {}\n");
+        write(repo.path(), "src/big.rs", &"x\n".repeat(150_000));
         let mut text = String::from("SF:src/big.rs\n");
         for i in 1..=150_000usize {
             text.push_str(&format!("DA:{i},{}\n", i % 2));
@@ -6304,6 +6740,12 @@ src/main.go:4.1,4.8 1 0
         write(repo.path(), "src/lib.rs", "fn a() {}\n");
         let artifact = repo.path().join("lcov.info");
         std::fs::write(&artifact, "SF:src/lib.rs\nDA:1,1\nend_of_record\n").unwrap();
+        // The source must not be newer than the pinned report, or the report
+        // is (correctly) treated as stale and both scans read zero.
+        let _ = Command::new("touch")
+            .args(["-t", "202601010000"])
+            .arg(repo.path().join("src/lib.rs"))
+            .status_locked();
         let stamp_mtimes = |path: &Path| {
             // Pin both scans' view of mtime to a fixed coarse timestamp via
             // touch -t (macOS + GNU coreutils compatible).
@@ -6472,11 +6914,18 @@ src/main.go:4.1,4.8 1 0
             let mut cut = 0usize;
             while cut <= body.len() {
                 let prefix = &body[..cut];
-                clear_existence_memo();
+                begin_resolution("");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut budget = EntryBudget::new(10_000);
                     let mut go_capped = false;
-                    parse_artifact(*format, prefix, repo.path(), &mut budget, &mut go_capped)
+                    parse_artifact(
+                        *format,
+                        prefix,
+                        repo.path(),
+                        "",
+                        &mut budget,
+                        &mut go_capped,
+                    )
                 }));
                 assert!(
                     result.is_ok(),
@@ -7246,5 +7695,263 @@ src/main.go:4.1,4.8 1 0
                 vec!["dotnet", "test", "--collect:XPlat Code Coverage"]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    use crate::test_support::{git_repo, write};
+
+    fn parse(
+        format: CoverageFormat,
+        text: &str,
+        repo: &Path,
+        module: &str,
+    ) -> HashMap<String, BTreeMap<usize, u64>> {
+        parse_artifact(
+            format,
+            text,
+            repo,
+            module,
+            &mut EntryBudget::new(usize::MAX),
+            &mut false,
+        )
+        .expect("parse")
+    }
+
+    fn lines(n: usize) -> String {
+        "x\n".repeat(n)
+    }
+
+    #[test]
+    fn jacoco_keys_map_onto_the_maven_source_layout() {
+        let repo = git_repo();
+        write(repo.path(), "src/main/java/com/acme/Foo.java", &lines(5));
+        let jacoco = r#"<report><package name="com/acme"><sourcefile name="Foo.java">
+            <line nr="1" mi="0" ci="2"/><line nr="2" mi="1" ci="0"/></sourcefile></package></report>"#;
+        let map = parse(CoverageFormat::Jacoco, jacoco, repo.path(), "");
+        assert_eq!(map.len(), 1, "{:?}", map.keys());
+        assert_eq!(map["src/main/java/com/acme/Foo.java"].get(&1), Some(&2));
+        assert_eq!(take_unresolved_count(), 0);
+    }
+
+    #[test]
+    fn jacoco_for_a_file_that_does_not_exist_is_unresolved_not_invented() {
+        let repo = git_repo();
+        let jacoco = r#"<report><package name="com/acme"><sourcefile name="Gone.java">
+            <line nr="1" mi="0" ci="2"/></sourcefile></package></report>"#;
+        let map = parse(CoverageFormat::Jacoco, jacoco, repo.path(), "");
+        assert!(map.is_empty(), "a made-up path reached the totals: {map:?}");
+        assert_eq!(take_unresolved_count(), 1);
+    }
+
+    #[test]
+    fn cobertura_source_roots_are_applied() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "app/src/main/java/com/acme/Foo.java",
+            &lines(3),
+        );
+        write(
+            repo.path(),
+            "lib/src/main/java/com/acme/Bar.java",
+            &lines(3),
+        );
+        let abs_root = repo.path().join("lib/src/main/java");
+        let cob = format!(
+            r#"<coverage><sources><source>app/src/main/java</source><source>{}</source></sources>
+            <packages><package name="com.acme"><classes>
+              <class filename="com/acme/Foo.java"><lines><line number="1" hits="1"/></lines></class>
+              <class filename="com/acme/Bar.java"><lines><line number="2" hits="0"/></lines></class>
+            </classes></package></packages></coverage>"#,
+            abs_root.display()
+        );
+        let map = parse(CoverageFormat::Cobertura, &cob, repo.path(), "");
+        assert_eq!(map["app/src/main/java/com/acme/Foo.java"].get(&1), Some(&1));
+        assert_eq!(map["lib/src/main/java/com/acme/Bar.java"].get(&2), Some(&0));
+    }
+
+    #[test]
+    fn a_nested_report_resolves_against_its_module_not_the_repo_root() {
+        let repo = git_repo();
+        // A decoy at the root: the old resolution would land the module's
+        // hits on it.
+        write(repo.path(), "src/lib.rs", &lines(3));
+        write(repo.path(), "crates/x/src/lib.rs", &lines(3));
+        let lcov = "SF:src/lib.rs\nDA:1,1\nend_of_record\n";
+        let map = parse(CoverageFormat::Lcov, lcov, repo.path(), "crates/x");
+        assert!(map.contains_key("crates/x/src/lib.rs"), "{:?}", map.keys());
+        assert!(!map.contains_key("src/lib.rs"));
+        assert_eq!(
+            module_dir_of("crates/x/target/llvm-cov/lcov.info"),
+            "crates/x"
+        );
+        assert_eq!(module_dir_of("crates/x/lcov.info"), "crates/x");
+        assert_eq!(module_dir_of("target/site/jacoco/jacoco.xml"), "");
+        assert_eq!(module_dir_of("coverage/lcov.info"), "");
+    }
+
+    #[test]
+    fn a_single_component_tail_never_stands_in_for_an_unresolved_path() {
+        let repo = git_repo();
+        write(repo.path(), "main.go", &lines(5));
+        let report = "mode: set\nexample.com/m/cmd/main.go:1.1,2.10 2 1\n";
+        let map = parse(CoverageFormat::GoCover, report, repo.path(), "");
+        assert!(
+            map.is_empty(),
+            "cmd/main.go landed on the root main.go: {map:?}"
+        );
+        assert_eq!(take_unresolved_count(), 1);
+        // A real two-component tail still resolves.
+        write(repo.path(), "cmd/main.go", &lines(5));
+        let map = parse(CoverageFormat::GoCover, report, repo.path(), "");
+        assert!(map.contains_key("cmd/main.go"), "{:?}", map.keys());
+    }
+
+    #[test]
+    fn hits_past_the_end_of_the_file_and_stale_files_are_dropped() {
+        let repo = git_repo();
+        write(repo.path(), "src/a.rs", &lines(3));
+        write(repo.path(), "src/b.rs", &lines(3));
+        write(repo.path(), "lcov.info", "");
+        let mut map: HashMap<String, BTreeMap<usize, u64>> = HashMap::new();
+        map.insert(
+            "src/a.rs".into(),
+            BTreeMap::from([(1, 1), (3, 1), (4, 9), (500, 9)]),
+        );
+        map.insert("src/b.rs".into(), BTreeMap::from([(1, 1)]));
+        // b.rs is edited well after the report was written.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.path().join("lcov.info"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let (kept, stale, past_eof) = drop_stale_and_out_of_range(repo.path(), "lcov.info", map);
+        assert_eq!(stale, 2, "both sources are newer than the old report");
+        assert!(kept.is_empty());
+        assert_eq!(past_eof, 0);
+
+        // A report newer than its sources keeps them and trims past-EOF lines.
+        let mut map: HashMap<String, BTreeMap<usize, u64>> = HashMap::new();
+        map.insert(
+            "src/a.rs".into(),
+            BTreeMap::from([(1, 1), (3, 1), (4, 9), (500, 9)]),
+        );
+        let fresh = std::time::SystemTime::now() + Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.path().join("lcov.info"))
+            .unwrap()
+            .set_modified(fresh)
+            .unwrap();
+        let (kept, stale, past_eof) = drop_stale_and_out_of_range(repo.path(), "lcov.info", map);
+        assert_eq!((stale, past_eof), (0, 2));
+        assert_eq!(
+            kept["src/a.rs"].keys().copied().collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn scan_reports_a_stale_artifact_instead_of_merging_it() {
+        let repo = git_repo();
+        write(repo.path(), "src/lib.rs", &lines(4));
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            repo.path(),
+            "lcov.info",
+            "SF:src/lib.rs\nDA:1,1\nDA:2,1\nend_of_record\n",
+        );
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.path().join("lcov.info"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).unwrap();
+        let row = report
+            .artifacts
+            .iter()
+            .find(|a| a.path == "lcov.info")
+            .unwrap();
+        assert!(row.skipped, "{row:?}");
+        assert_eq!(row.stale_files, 1);
+        assert_eq!(
+            report.overall.lines_found, 0,
+            "stale hits reached the totals"
+        );
+    }
+
+    #[test]
+    fn simplecov_resultset_and_json_formatter_yield_line_data() {
+        let repo = git_repo();
+        write(repo.path(), "lib/widget.rb", &lines(4));
+        let abs = repo.path().join("lib/widget.rb").display().to_string();
+        let resultset = format!(
+            r#"{{"RSpec":{{"coverage":{{"{abs}":{{"lines":[null,1,0,3]}}}},"timestamp":1}}}}"#
+        );
+        let map = parse(CoverageFormat::SimpleCov, &resultset, repo.path(), "");
+        assert_eq!(map["lib/widget.rb"].get(&2), Some(&1));
+        assert_eq!(map["lib/widget.rb"].get(&3), Some(&0));
+        assert_eq!(map["lib/widget.rb"].get(&4), Some(&3));
+        assert!(
+            !map["lib/widget.rb"].contains_key(&1),
+            "null is not a code line"
+        );
+
+        // The JSON formatter's `coverage.json`, served through the Istanbul
+        // spec name, and the legacy bare-array form.
+        let formatter = format!(r#"{{"meta":{{}},"coverage":{{"{abs}":{{"lines":[1,null,0]}}}}}}"#);
+        let map = parse(CoverageFormat::Istanbul, &formatter, repo.path(), "");
+        assert_eq!(map["lib/widget.rb"].get(&1), Some(&1));
+        let legacy = format!(r#"{{"RSpec":{{"coverage":{{"{abs}":[1,null,0]}}}}}}"#);
+        let map = parse(CoverageFormat::SimpleCov, &legacy, repo.path(), "");
+        assert_eq!(map["lib/widget.rb"].get(&3), Some(&0));
+    }
+
+    #[test]
+    fn istanbul_json_is_still_istanbul() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", &lines(3));
+        let istanbul = r#"{"src/app.ts":{"path":"src/app.ts","l":{"1":2}}}"#;
+        let map = parse(CoverageFormat::Istanbul, istanbul, repo.path(), "");
+        assert_eq!(map["src/app.ts"].get(&1), Some(&2));
+    }
+
+    #[test]
+    fn a_ruby_repo_with_a_resultset_scans_to_line_data() {
+        let repo = git_repo();
+        write(repo.path(), "Gemfile", "source 'https://rubygems.org'\n");
+        write(repo.path(), "lib/widget.rb", &lines(4));
+        write(
+            repo.path(),
+            "coverage/.resultset.json",
+            r#"{"RSpec":{"coverage":{"lib/widget.rb":{"lines":[null,1,0,3]}},"timestamp":1}}"#,
+        );
+        let future = std::time::SystemTime::now() + Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.path().join("coverage/.resultset.json"))
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).unwrap();
+        let row = report
+            .artifacts
+            .iter()
+            .find(|a| a.path.ends_with(".resultset.json"))
+            .unwrap_or_else(|| panic!("resultset not discovered: {:?}", report.artifacts));
+        assert!(!row.skipped, "{row:?}");
+        assert_eq!(report.overall.lines_found, 3);
+        assert_eq!(report.overall.lines_hit, 2);
     }
 }

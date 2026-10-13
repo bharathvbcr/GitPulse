@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  ALREADY_ARCHIVED,
   ARCHIVE_RULE,
   archivable,
   archiveAction,
+  archiveControl,
+  archiveRefusal,
+  archiveSkipped,
   archiveStamp,
   archiveState,
   archiveSummary,
@@ -181,5 +185,32 @@ describe("refreshing in place", () => {
     const { read, reads } = store(["a"], 2);
     expect((await refreshPages<Row>(0, read)).items).toEqual([{ id: "a" }]);
     expect(reads).toEqual([undefined]);
+  });
+});
+
+describe("what the selection bar's Archive says", () => {
+  it("is disabled for an entirely archived selection, busy or not, and still says why", () => {
+    for (const busy of [false, true]) expect(archiveControl("all", busy)).toEqual({ disabled: true, title: ALREADY_ARCHIVED });
+    expect(ALREADY_ARCHIVED).toBe("Already archived");
+  });
+
+  it("is offered for a live or partly archived selection, says it keeps the status, and waits only for a write in flight", () => {
+    for (const state of ["none", "some"] as const) {
+      expect(archiveControl(state, false).disabled).toBe(false);
+      expect(archiveControl(state, true).disabled).toBe(true);
+      expect(archiveControl(state, false).title).toContain("keeping their status");
+      expect(archiveControl(state, false).title).not.toContain(ALREADY_ARCHIVED);
+    }
+  });
+
+  it("refuses an archive that would change nothing in words that match the selection's size", () => {
+    expect(archiveRefusal(1)).toBe("That task is already archived.");
+    expect(archiveRefusal(3)).toBe("Those tasks are already archived.");
+  });
+
+  it("names what it skipped apart from what it wrote, and says nothing when it skipped nothing", () => {
+    expect(archiveSkipped(0)).toBe("");
+    expect(archiveSkipped(1)).toBe("1 task already archived.");
+    expect(archiveSkipped(2)).toBe("2 tasks already archived.");
   });
 });

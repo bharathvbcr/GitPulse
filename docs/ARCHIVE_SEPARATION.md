@@ -13,13 +13,18 @@ pins each claim below to the vendored source.
 ## The store (dc-store schema 11)
 
 `dc-store` is vendored from DevCouncil
-([`src-tauri/vendored/VENDOR.json`](../src-tauri/vendored/VENDOR.json), crate
-`dc-store` at commit `e57f3d2`). The change was made upstream on DevCouncil's
+([`src-tauri/vendored/VENDOR.json`](../src-tauri/vendored/VENDOR.json) records
+the crate's origin commit; it is deliberately not repeated here, so a re-vendor
+cannot leave this record naming a commit that is no longer the vendored one). The schema 11 change was made upstream on DevCouncil's
 `feat/workbench-schema-11` branch, corrected on `fix/workbench-schema-11-audit`
 (below), and re-vendored with
 `node scripts/vendor-crates.mjs --crate=dc-store`, never edited here.
 
-Schema version is **11**. The 10 → 11 rung (`workbench/items.sql`):
+Schema version is **13**. The 11 → 12 rung only adds refinement proposals
+(`kind`, and an `acceptance_criteria` lock) and moves the version; the 12 → 13
+rung only moves it too, fencing the short request receipts (a retry rebuilds its
+response from the event, which a schema 12 host would not do). The archive
+behaviour below is unchanged by either. The 10 → 11 rung (`workbench/items.sql`):
 
 - adds `archived` and `completed_at` to `work_items` as **VIRTUAL** generated
   columns over the body. The original plan said STORED, but SQLite cannot
@@ -53,11 +58,13 @@ profile through the host and checks each of these against the pre-upgrade
 file read directly (see its header for how to run it; it refuses the live
 profile's path).
 
-The ladder is a hard fence: a host built against schema 10 refuses a schema 11
-profile (`schema_unsupported`). That is deliberate — a host that builds a task
-body without `archived` would silently unarchive every task it saved. GitPulse,
-DevCouncil and Manvi each link dc-store, so all three must be rebuilt from a
-schema 11 dc-store before any of them opens a migrated profile.
+The ladder is a hard fence: a host built against an older schema refuses a
+newer profile (`schema_unsupported`), and a host refuses one newer than itself.
+That is deliberate — a host that builds a task body without `archived` would
+silently unarchive every task it saved. GitPulse, DevCouncil and Manvi each link
+dc-store, so all three must be rebuilt from the same dc-store before any of them
+opens a migrated profile: once Manvi's dc-store takes a shared profile to 13, a
+GitPulse built at 12 refuses it.
 
 `items.put` accepts `archived`, `checklist` and `links`. Each follows the
 `locked_fields` rule: a request that **omits** the field keeps the stored

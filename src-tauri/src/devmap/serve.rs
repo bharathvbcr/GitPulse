@@ -142,7 +142,7 @@ pub(crate) fn test_endpoint_resolves() -> usize {
 pub(crate) struct TestEndpointBinding(
     /// Held, never read: the serial's whole job is to be released on drop.
     #[allow(dead_code)]
-    std::sync::MutexGuard<'static, ()>,
+    crate::test_support::env::EnvGuard,
 );
 
 #[cfg(all(test, unix))]
@@ -159,7 +159,7 @@ impl Drop for TestEndpointBinding {
 /// until the returned binding is dropped.
 #[cfg(all(test, unix))]
 pub(crate) fn bind_test_endpoint(endpoint: impl Into<String>) -> TestEndpointBinding {
-    let serial = super::cli::test_serial();
+    let serial = crate::test_support::env::env_serial();
     TEST_ENDPOINT_RESOLVES.store(0, std::sync::atomic::Ordering::Relaxed);
     *TEST_ENDPOINT
         .lock()

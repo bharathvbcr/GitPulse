@@ -29,7 +29,7 @@
  *    told; an unavailable report with no reason says "reason not reported".
  */
 
-import { formatAuditCounts, normalizeSeverity } from "./format";
+import { formatAuditCounts, formatAuditCoverage, normalizeSeverity } from "./format";
 import { coverageGap, inventoryOnlyTruncation, observedTotal } from "./report";
 import type {
   CodeScanningReport,
@@ -159,6 +159,7 @@ function vulnerabilityFacet(report: DepsHealthReport): HealthFacet {
   const gap = coverageGap(report);
   const ran = (report.scanners_ran ?? []).length > 0;
   const complete = report.audit_complete === true;
+  const census = formatAuditCoverage(report.audit_coverage);
 
   if (!ran) {
     return {
@@ -166,7 +167,7 @@ function vulnerabilityFacet(report: DepsHealthReport): HealthFacet {
       label,
       value: "did not run",
       tone: "unknown",
-      caveat: `No local audit ran${gap ? ` (${gap})` : ""}, so no finding count exists.`,
+      caveat: `No local audit ran${gap ? ` (${gap})` : ""}, so no finding count exists.${census ? ` ${census}.` : ""}`,
     };
   }
 
@@ -180,7 +181,7 @@ function vulnerabilityFacet(report: DepsHealthReport): HealthFacet {
       label,
       value: `${counts}, partial`,
       tone: worstTone([found, "unknown"]),
-      caveat: `The local audit did not cover every discovered target${gap ? ` (${gap})` : ""}; these counts are a floor.`,
+      caveat: `The local audit did not cover every discovered target${gap ? ` (${gap})` : ""}; these counts are a floor.${census ? ` ${census}.` : ""}`,
     };
   }
 

@@ -6,10 +6,10 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
-    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE,
-    VALIDITY_RANGE_TABLES,
+    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION,
+    READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -20,6 +20,21 @@ impl Store {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
         let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
         names.try_fold(false, |found, name| Ok(found || name? == column))
+    }
+
+    /// The v27 rung: the dead-row evidence columns, added only when absent.
+    ///
+    /// Probed for the reason every `ADD COLUMN` rung here is: the statement is
+    /// not repeatable, and the ladder must be re-entrant — racing openers of a
+    /// mid-chain store, and a store walked up from an old version through
+    /// batches that already recreated the table, both reach this rung on a
+    /// table that may have the columns. The three are added by one batch, so
+    /// the first is the probe for all of them.
+    fn add_dead_evidence_columns(conn: &Connection) -> Result<()> {
+        if !Self::has_column(conn, "generation_dead_symbols", "evidence_sites")? {
+            conn.execute_batch(MIGRATION_V26_TO_V27)?;
+        }
+        Ok(())
     }
 
     /// Whether `name` exists and is a base table rather than a view.
@@ -132,7 +147,74 @@ impl Store {
         Ok(Some(floor as i32))
     }
 
+    /// Refuse a store whose schema carries a trigger.
+    ///
+    /// No version of this schema has ever declared one, so a trigger in
+    /// `sqlite_master` was put there by whoever produced the file. It runs with
+    /// this process's authority on the next write: one survived `devmap build`
+    /// and rewrote what the build stored, another made the build spin. A store
+    /// is derived data; the remedy is the one for any untrusted store, to
+    /// quarantine it and rebuild.
+    pub(super) fn reject_triggers(conn: &Connection) -> Result<()> {
+        let trigger: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match trigger {
+            None => Ok(()),
+            Some(name) => Err(refusal(format!(
+                "the store carries a trigger ({name:?}), which no devmap schema declares; \
+                 refusing to run SQL somebody else put in the file — `dev map doctor --fix` \
+                 quarantines the store and rebuilds it"
+            ))),
+        }
+    }
+
+    /// Refuse a store whose core views are not the ones this binary declares.
+    ///
+    /// A view is SQL the store runs on every read of it. The column gate
+    /// answers for a view as it does for a table — the name and the columns
+    /// exist — so a store that redefines `generation_edges` with the same
+    /// columns and a `WHERE 0` passes it and answers every question from
+    /// nothing, or from rows somebody else chose. The expectation is the
+    /// schema's own, the views a fresh store builds, compared with whitespace
+    /// collapsed: SQLite keeps the text it was given, so a reflowed definition
+    /// is the same view.
+    ///
+    /// It runs from [`Self::validate_schema`], so after a migration and not
+    /// before it: a store below the current schema legitimately carries the
+    /// views of its own version until the ladder rebuilds them, and judging it
+    /// before that would refuse every store that needs migrating. What the
+    /// open reads through a view, it reads after this.
+    pub(super) fn reject_redefined_views(conn: &Connection) -> Result<()> {
+        for (name, declared) in declared_views() {
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // Absent is the required-object gate's refusal to make, with its
+            // own remedy; only a view that is present and different is ours.
+            if let Some(stored) = stored {
+                if collapse_whitespace(&stored) != collapse_whitespace(declared) {
+                    return Err(refusal(format!(
+                        "the store defines the view {name:?} differently from this binary's \
+                         schema; refusing to read through SQL somebody else put in the file — \
+                         `dev map doctor --fix` quarantines the store and rebuilds it"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_schema(conn: &Connection) -> Result<()> {
+        Self::reject_triggers(conn)?;
         for (table, required_columns) in REQUIRED_SCHEMA {
             let object_type: Option<String> = conn
                 .query_row(
@@ -165,6 +247,10 @@ impl Store {
                 }
             }
         }
+
+        // After the column gate, whose refusal is the more specific one when a
+        // view lost a column, and before the first query that reads a view.
+        Self::reject_redefined_views(conn)?;
 
         let identity_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_state WHERE singleton = 1
@@ -358,6 +444,7 @@ impl Store {
             // After v21's drop of the same index, as on the ladder.
             tx.execute_batch(MIGRATION_V23_TO_V24)?;
             tx.execute_batch(MIGRATION_V25_TO_V26)?;
+            Self::add_dead_evidence_columns(tx)?;
             Self::stamp_reader_compat(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(
@@ -751,6 +838,11 @@ impl Store {
             conn.execute("PRAGMA user_version = 26", [])?;
             version = 26;
         }
+        if version == 26 {
+            Self::add_dead_evidence_columns(conn)?;
+            conn.execute("PRAGMA user_version = 27", [])?;
+            version = 27;
+        }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
         }
@@ -761,4 +853,30 @@ impl Store {
         Self::validate_schema(conn)?;
         Ok(())
     }
+}
+
+fn collapse_whitespace(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The views a fresh store defines, `(name, sql)`, built once by running the
+/// schema's own batches in a throwaway in-memory database.
+fn declared_views() -> &'static [(String, String)] {
+    static VIEWS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    VIEWS.get_or_init(|| {
+        let conn = Connection::open_in_memory().expect("an in-memory database opens");
+        for batch in crate::schema::FRESH_SCHEMA_BATCHES {
+            conn.execute_batch(batch)
+                .expect("the schema's own batches run on an empty database");
+        }
+        let mut stmt = conn
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'view' ORDER BY name")
+            .expect("sqlite_schema is readable");
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("sqlite_schema is readable")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("sqlite_schema rows decode");
+        rows
+    })
 }

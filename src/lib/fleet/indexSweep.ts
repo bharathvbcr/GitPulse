@@ -22,7 +22,7 @@
  */
 
 import { buildDevmap, initializeDevcouncil } from "../codeintel/client";
-import type { DevmapBuildOutcome, InitReport } from "../codeintel/types";
+import { buildFailureReason, type DevmapBuildOutcome, type InitReport } from "../codeintel/types";
 
 export interface IndexTarget {
   path: string;
@@ -88,7 +88,7 @@ function outcomeFor(target: IndexTarget, built: DevmapBuildOutcome): IndexOutcom
       status: "failed",
       reason: built.timed_out
         ? "the build ran past its deadline"
-        : built.stderr.trim() || "the build failed",
+        : buildFailureReason(built, "the build failed"),
     };
   }
   return {

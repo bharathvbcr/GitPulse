@@ -85,7 +85,7 @@ describe("ptyBus routing", () => {
       bus.subscribe(`term-${i}`, { onOutput: vi.fn(), onExit: vi.fn() }),
     );
     await settle();
-    expect(transport.attached).toBe(2); // output + exit, once each
+    expect(transport.attached).toBe(3); // output + exit + loss, once each
     for (const release of releases) release();
     await settle();
     expect(transport.attached).toBe(0);
@@ -98,7 +98,7 @@ describe("ptyBus routing", () => {
     bus.subscribe("b", { onOutput: vi.fn(), onExit: vi.fn() });
     first();
     await settle();
-    expect(transport.attached).toBe(2);
+    expect(transport.attached).toBe(3);
   });
 
   it("re-attaches after the last tab closes and a new one opens", async () => {
@@ -110,7 +110,7 @@ describe("ptyBus routing", () => {
     const handlers = { onOutput: vi.fn(), onExit: vi.fn() };
     bus.subscribe("b", handlers);
     await settle();
-    expect(transport.attached).toBe(2);
+    expect(transport.attached).toBe(3);
     transport.emit("terminal-output", output("b", "Qg=="));
     expect(handlers.onOutput).toHaveBeenCalledWith("Qg==");
   });
@@ -125,7 +125,7 @@ describe("ptyBus routing", () => {
     const handlers = { onOutput: vi.fn(), onExit: vi.fn() };
     bus.subscribe("b", handlers);
     await settle();
-    expect(transport.attached).toBe(2);
+    expect(transport.attached).toBe(3);
     transport.emit("terminal-output", output("b", "Qg=="));
     expect(handlers.onOutput).toHaveBeenCalledTimes(1);
   });
@@ -385,6 +385,7 @@ describe("ptyBus early output", () => {
         write: async () => {},
         resize: async () => {},
         kill: async () => {},
+        detach: async () => true,
       },
       hooks,
       bus,
@@ -461,6 +462,7 @@ describe("ptyBus early output", () => {
         write: async () => {},
         resize: async () => {},
         kill: async () => {},
+        detach: async () => true,
       },
       hooks,
       bus,
@@ -506,6 +508,7 @@ describe("ptyBus early output", () => {
         write: async () => {},
         resize: async () => {},
         kill: async () => {},
+        detach: async () => true,
       },
       hooks,
       bus,
@@ -602,6 +605,7 @@ describe("ptyBus early output", () => {
         write: async () => {},
         resize: async () => {},
         kill: async () => {},
+        detach: async () => true,
       },
       hooks,
       bus,
@@ -645,7 +649,7 @@ describe("ptyBus attachment race", () => {
     bus.subscribe("b", handlers);
     transport.flush();
     await settle();
-    expect(transport.attached).toBe(2);
+    expect(transport.attached).toBe(3);
     transport.emit("terminal-output", output("b", "Qg=="));
     expect(handlers.onOutput).toHaveBeenCalledTimes(1);
   });
@@ -665,12 +669,13 @@ describe("ptyBus failure recovery", () => {
     const release = bus.subscribe("a", { onOutput: vi.fn(), onExit: vi.fn(), onError });
     await settle();
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("transport unavailable"));
-    expect(unlisten).toHaveBeenCalledTimes(1);
+    // Both siblings that did attach (output, loss) are released.
+    expect(unlisten).toHaveBeenCalledTimes(2);
     release();
     failed = false;
     const releaseReady = await bus.prepare();
     releaseReady();
-    expect(unlisten).toHaveBeenCalledTimes(3);
+    expect(unlisten).toHaveBeenCalledTimes(5);
   });
 
   it("listens before the very first spawn, preserving its early output and exit", async () => {
@@ -770,4 +775,42 @@ it("bounds listener setup time and releases listeners that arrive after timeout"
   finish?.(release); await vi.advanceTimersByTimeAsync(0);
   expect(release).toHaveBeenCalledTimes(2);
   vi.useRealTimers();
+});
+
+describe("ptyBus skipped-output notices", () => {
+  it("routes terminal-loss to the session's notice handler only, never as an error or exit", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const a = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn(), onNotice: vi.fn() };
+    const b = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn(), onNotice: vi.fn() };
+    const releaseA = bus.subscribe("a", a), releaseB = bus.subscribe("b", b);
+    await settle();
+    transport.emit("terminal-loss", { id: "a", message: "skipped" });
+    expect(a.onNotice).toHaveBeenCalledWith("skipped");
+    expect(b.onNotice).not.toHaveBeenCalled();
+    expect(a.onError).not.toHaveBeenCalled();
+    expect(a.onExit).not.toHaveBeenCalled();
+    // A later clean exit carries no loss: the session never failed.
+    transport.emit("terminal-exit", exit("a"));
+    expect(a.onExit).toHaveBeenCalledWith(expect.objectContaining({ error: null }));
+    releaseA(); releaseB();
+  });
+
+  it("drops a notice for an id nobody holds, and bounds a hostile message", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const a = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn(), onNotice: vi.fn() };
+    const release = bus.subscribe("a", a);
+    await settle();
+    transport.emit("terminal-loss", { id: "nobody", message: "x" });
+    expect(bus.pendingCount("nobody")).toBe(0);
+    transport.emit("terminal-loss", { id: "a", message: "y".repeat(100_000) });
+    expect(a.onNotice.mock.calls[0][0]).toHaveLength(1024);
+    for (const bad of [null, {}, { id: "a" }, { id: "a", message: "  " }, { id: 7, message: "m" }]) {
+      transport.emit("terminal-loss", bad);
+    }
+    expect(a.onNotice).toHaveBeenCalledTimes(1);
+    expect(a.onError).toHaveBeenCalledWith("Invalid terminal loss event");
+    release();
+  });
 });

@@ -53,8 +53,10 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { FileBlob } from "../files/types";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { currentHeadTip } from "../stores/headTip";
   import { graphStore } from "../stores/graphStore";
+  import { liveIndex } from "../codeintel/liveIndex";
   import type { CommitFileChange } from "../stores/graphStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import DiffFileRail from "./DiffFileRail.svelte";
@@ -65,6 +67,8 @@
     type RailEntry,
   } from "../diff/fileRail";
   import { buildCommitRail, type CommitEntry } from "../diff/commitRail";
+  import { createCommitPicker, type CommitFilesRead } from "../diff/commitPick";
+  import { formatError } from "../ui/formatError";
   import { invoke } from "../ipc/invoke";
   import {
     ArrowDownWideNarrow,
@@ -209,8 +213,12 @@
    * meant going back, finding the commit again, and clicking the next row.
    */
   let railOpen = $state(true);
+  // Reads primitives (`pending`, `currentCommitId`, both declared below), not
+  // `$repoStore.x`: that would re-run on every keystroke and status poll and
+  // reopen a rail the reader had just closed while a read was in flight. It
+  // runs when a working-tree read starts, which is what it is for.
   $effect(() => {
-    if ($repoStore.selectedDiffPending && !$repoStore.selectedCommitId) railOpen = true;
+    if (pending && !currentCommitId) railOpen = true;
   });
   let railWidth = $state(248);
   /** Owned here so unfolding the change picker survives a file switch. */
@@ -263,10 +271,40 @@
     ),
   );
 
+  /**
+   * Selection fields as primitives, for the query effects below.
+   *
+   * repoStore publishes a fresh object on every change — every ~6s status
+   * poll, loading flag and error — and an effect that reads `$repoStore.x`
+   * directly re-runs on each of those publishes. A `$derived` of a primitive
+   * compares with strict equality, so an effect that reads these (and the
+   * shared `$currentRepoPath`) re-runs only when the repository, the file or
+   * the commit actually changed — not on every poll.
+   */
+  const currentFilePath = $derived($repoStore.selectedFilePath);
+  const currentCommitId = $derived($repoStore.selectedCommitId);
+
+  /**
+   * Refresh signals for the codeintel answers below, which no longer re-run
+   * on every poll — so an index that was stale when the file was opened
+   * would otherwise keep its labels until the selection changed.
+   *
+   * HEAD: `currentHeadTip`. The index: the live index's per-repository count
+   * of successful publications. Both are existing published state; neither
+   * polls anything.
+   */
+  const indexSnapshots = liveIndex.snapshots;
+  const indexRevision = $derived(
+    $currentRepoPath ? ($indexSnapshots[$currentRepoPath]?.revision ?? 0) : 0,
+  );
+
   $effect(() => {
-    const repoPath = $repoStore.currentPath;
-    const filePath = $repoStore.selectedFilePath;
+    const repoPath = $currentRepoPath;
+    const filePath = currentFilePath;
     const rung = rungParam(minRung);
+    // Re-ask when HEAD moves or the index publishes a new generation.
+    void $currentHeadTip;
+    void indexRevision;
     impactGuard?.cancel();
     if (!repoPath || !filePath) {
       impactEdges = 0;
@@ -569,10 +607,35 @@
     return hunkSymbols.get(key) ?? "";
   });
 
+  /**
+   * Last (repo, path, commit, hunk headers) the symbol lookup ran for. A plain
+   * `let`, never $state.
+   *
+   * The memo hit returns early, and Svelte runs an effect's teardown before
+   * every re-run — so cancellation lives in `hunkSymbolsGuard`, cancelled only
+   * when the key changes (or on destroy), never in a teardown that a memo hit
+   * would fire and leave the in-flight lookup dead with nothing to replace it.
+   */
+  let hunkSymbolsKey: string | null = null;
+  let hunkSymbolsGuard: AsyncGuard | null = null;
+
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const section = singleSection;
-    const commitId = $repoStore.selectedCommitId;
+    const commitId = currentCommitId;
+    // A working-tree diff is labelled from HEAD, so a moved HEAD re-asks; a
+    // commit's labels are pinned to that commit. A new index generation can
+    // turn a head mismatch into labels for either.
+    const head = commitId ? "" : $currentHeadTip;
+    const index = indexRevision;
+    const key =
+      repo && section?.path
+        ? [repo, section.path, commitId ?? "", head, String(index), ...section.hunks.map((h) => h.header)].join("\u0000")
+        : null;
+    if (key === hunkSymbolsKey) return;
+    hunkSymbolsKey = key;
+    hunkSymbolsGuard?.cancel();
+    hunkSymbolsGuard = null;
     if (!repo || !section?.path) {
       hunkSymbols = new Map();
       return;
@@ -588,7 +651,8 @@
         new_lines: nums.new_lines,
       };
     });
-    let cancelled = false;
+    const guard = createAsyncGuard();
+    hunkSymbolsGuard = guard;
     void (async () => {
       try {
         // Work: HEAD. History: parent first (old side), then the commit itself.
@@ -596,22 +660,21 @@
           ? [`${commitId}^`, commitId]
           : [await invoke<string>("cmd_get_head_id", { repoPath: repo })];
         for (const headSha of candidates) {
-          if (cancelled || !headSha) continue;
+          if (!guard.isLive() || !headSha) continue;
           const page = await symbolsForFile(repo, path, headSha);
-          if (cancelled) return;
+          if (!guard.isLive()) return;
           if (!page.available || !page.head_matches) continue;
           hunkSymbols = hunkSymbolLabels(hunks, page.items);
           return;
         }
-        if (!cancelled) hunkSymbols = new Map();
+        if (guard.isLive()) hunkSymbols = new Map();
       } catch {
-        if (!cancelled) hunkSymbols = new Map();
+        if (guard.isLive()) hunkSymbols = new Map();
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   });
+
+  $effect(() => () => hunkSymbolsGuard?.cancel());
 
   // --- selection and staging ----------------------------------------------
 
@@ -634,14 +697,17 @@
    * empty and the rail would silently render nothing, which looks exactly
    * like a commit that touched one file.
    */
-  let fetchedFiles = $state<{ commitId: string; files: CommitFileChange[] } | null>(null);
+  let fetchedFiles = $state<CommitFilesRead | null>(null);
+  /** Bumped by Retry so the effect below asks again for a commit whose list failed. */
+  let filesRetry = $state(0);
   /** Last commit this effect asked for. A plain `let`, never $state. */
   let fetchedFor: string | null = null;
   let filesGuard: AsyncGuard | null = null;
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const commitId = $repoStore.selectedCommitId;
+    const repo = $currentRepoPath;
+    const commitId = currentCommitId;
+    void filesRetry;
     // Nothing to fetch when there is no commit, or when the graph store's
     // details already cover this one.
     if (!repo || !commitId || details?.id === commitId) return;
@@ -657,12 +723,13 @@
           commitId,
         });
         if (!guard.isLive()) return;
-        fetchedFiles = { commitId, files };
-      } catch {
-        // The rail is an aid, not the content. A failed list leaves the diff
-        // itself untouched and simply renders no rail, rather than pushing an
-        // error banner over a file the reader can already see.
-        if (guard.isLive()) fetchedFiles = { commitId, files: [] };
+        fetchedFiles = { commitId, files, error: null };
+      } catch (error) {
+        // The rail is an aid, not the content: the diff itself stays as it
+        // is. But a failed list is not an empty one, so it is recorded as an
+        // error (shown beside the rail, with a retry) rather than cached as
+        // "no files" for good.
+        if (guard.isLive()) fetchedFiles = { commitId, files: null, error: formatError(error) };
       }
     })();
   });
@@ -677,6 +744,16 @@
     if (fetchedFiles?.commitId === commitId) return fetchedFiles.files;
     return null;
   });
+
+  /** Why this commit's file list is missing, when its read failed. */
+  const filesError = $derived(
+    fetchedFiles?.commitId === $repoStore.selectedCommitId ? fetchedFiles?.error ?? null : null,
+  );
+
+  function retryCommitFiles(): void {
+    fetchedFor = null;
+    filesRetry += 1;
+  }
 
   const rail = $derived(
     buildFileRail({
@@ -718,7 +795,10 @@
   );
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    // Both dependencies are strings compared by value, so a repoStore publish
+    // that changed neither the repository nor the change-set's paths does not
+    // re-issue the layered walk.
+    const repo = $currentRepoPath;
     void changeSetPathsKey;
     untrack(() => {
       const paths = rail.entries.map((e) => e.path);
@@ -812,29 +892,17 @@
    * commit's file, so the first changed file is opened with it — the reader
    * asked to look at this change, not to be told it is selected.
    */
+  const pickCommitId = createCommitPicker({
+    repo: () => $repoStore.currentPath,
+    listFiles: (repo, commitId) => invoke<CommitFileChange[]>("cmd_get_commit_files", { repoPath: repo, commitId }),
+    cached: (commitId) => (fetchedFiles?.commitId === commitId ? fetchedFiles.files : null),
+    remember: (read) => (fetchedFiles = read),
+    openFile: (commitId, path) => void repoStore.selectCommitFileDiff(commitId, path),
+    openCommit: (commitId) => void repoStore.selectCommitDiff(commitId),
+  });
+
   async function pickCommit(entry: CommitEntry): Promise<void> {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
-    let files = fetchedFiles?.commitId === entry.id ? fetchedFiles.files : null;
-    if (!files) {
-      try {
-        files = await invoke<CommitFileChange[]>("cmd_get_commit_files", {
-          repoPath: repo,
-          commitId: entry.id,
-        });
-        fetchedFiles = { commitId: entry.id, files };
-      } catch {
-        files = [];
-      }
-    }
-    const first = files[0];
-    if (!first) {
-      // A commit that changed nothing (an empty or a merge with no diff) has
-      // no file to open; show the whole commit rather than nothing at all.
-      void repoStore.selectCommitDiff(entry.id);
-      return;
-    }
-    void repoStore.selectCommitFileDiff(entry.id, first.path);
+    await pickCommitId(entry.id);
   }
 
   /** Reuse the same working-tree preview as the workspace's change counts. */
@@ -1035,46 +1103,47 @@
   /**
    * Two reset keys, not one.
    *
-   * `viewKey` covers what the reader chose — a different file, side of the
+   * `viewSelectionKey` covers what the reader chose — a different file, side of the
    * index, or whitespace mode — and resets scroll with the selection, because
    * a new file starts at its top.
    *
-   * `contentKey` covers the diff TEXT changing under a selection that did
+   * `selectedDiffText` covers the diff TEXT changing under a selection that did
    * not: the watcher refetches after an external edit, and a mutation
    * refetches after staging. Line indices are what a patch is built from, so
    * a stale selection would stage lines the reader never picked. It clears
    * the selection and leaves the scroll alone, because the reader has not
    * gone anywhere.
    */
-  let viewKey: string | null = null;
-  let contentKey: string | null = null;
-
-  $effect(() => {
-    const key = [
+  const viewSelectionKey = $derived(
+    [
       $repoStore.selectedFilePath,
       $repoStore.selectedCommitId,
       $repoStore.selectedIsStaged,
       $repoStore.selectedIgnoreWhitespace,
-    ].join("\u0000");
-    if (key === viewKey) return;
-    viewKey = key;
-    selectedLines = new Set();
-    isDragging = false;
-    dragAnchor = null;
-    unifiedScroll = 0;
-    splitScroll = 0;
+    ].join("\u0000"),
+  );
+  const selectedDiffText = $derived($repoStore.selectedDiff);
+
+  $effect(() => {
+    void viewSelectionKey;
+    untrack(() => {
+      selectedLines = new Set();
+      isDragging = false;
+      dragAnchor = null;
+      unifiedScroll = 0;
+      splitScroll = 0;
+    });
   });
 
   $effect(() => {
-    const text = $repoStore.selectedDiff;
-    // Reference identity, not content: the parse cache already relies on the
-    // store handing back the same string object for an unchanged diff.
-    const key = text === null ? "\u0000null" : text;
-    if (key === contentKey) return;
-    contentKey = key;
-    selectedLines = new Set();
-    isDragging = false;
-    dragAnchor = null;
+    // Compared by value: the store hands back the same string for an
+    // unchanged diff, and an equal refetch is not new content either.
+    void selectedDiffText;
+    untrack(() => {
+      selectedLines = new Set();
+      isDragging = false;
+      dragAnchor = null;
+    });
   });
 
   /** Toggling layout keeps the reader's place instead of jumping to the top. */
@@ -1092,9 +1161,9 @@
   let imageBlobKey: string | null = null;
 
   $effect(() => {
-    const path = singleSection?.path ?? $repoStore.selectedFilePath;
-    const repo = $repoStore.currentPath;
-    const commitId = $repoStore.selectedCommitId;
+    const path = singleSection?.path ?? currentFilePath;
+    const repo = $currentRepoPath;
+    const commitId = currentCommitId;
     const key =
       showingImage && path && repo ? `${repo}\u0000${path}\u0000${commitId ?? ""}` : null;
     if (key === imageBlobKey) return;
@@ -1140,7 +1209,20 @@
   });
 
   const pending = $derived($repoStore.selectedDiffPending);
-  const showEmpty = $derived(!pending && lines.length === 0);
+  /** Why the selected diff could not be read; per selection, not the repository's `error`. */
+  const diffError = $derived($repoStore.selectedDiffError);
+  const showEmpty = $derived(!pending && !diffError && lines.length === 0);
+
+  /** Asks again for the selection whose read failed, through the same store call that failed. */
+  function retryDiff(): void {
+    const { selectedCommitId: commitId, selectedFilePath: path, selectedIsStaged: staged, selectionKind } = $repoStore;
+    if (selectionKind === "range" && path) {
+      const [from, to] = path.split("...");
+      if (from && to) void repoStore.selectRangeDiff(from, to);
+    } else if (commitId && path) void repoStore.selectCommitFileDiff(commitId, path);
+    else if (commitId) void repoStore.selectCommitDiff(commitId);
+    else if (path) void repoStore.selectFileDiff(path, staged);
+  }
 </script>
 
 <!-- Root-level: `svelte:window` may not sit inside a block, and the
@@ -1522,6 +1604,12 @@
        an image, and a pending fetch. Before this, each of those replaced the
        whole pane, so a clean merge or a `.png` left the reader with no way to
        reach the next file except by leaving for the Graph. -->
+  {#if filesError}
+    <div class="flex shrink-0 items-center gap-2 border-b border-border/60 bg-surface/60 px-3 py-1 font-sans text-[11px] text-amber-500" role="status">
+      <span class="min-w-0 truncate">Could not list this commit's files: {filesError}</span>
+      <button type="button" class="gp-btn shrink-0 text-xs py-0.5 px-2" onclick={retryCommitFiles}>Retry</button>
+    </div>
+  {/if}
   <div class="relative flex min-h-0 flex-1 overflow-hidden">
     {#if railOpen && hasRail}
       <DiffFileRail
@@ -1544,7 +1632,7 @@
 
     <div class="flex min-w-0 flex-1 flex-col">
       <!-- Where you are, when the file's own header has scrolled away. -->
-      {#if currentSection && !showingImage && !showEmpty && !pending && (outline.files.length > 1 || currentHunk)}
+      {#if currentSection && !showingImage && !showEmpty && !pending && !diffError && (outline.files.length > 1 || currentHunk)}
         <div
           class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 bg-surfaceHover/60 px-3 py-0.5 font-sans text-[10px] text-textMuted"
         >
@@ -1577,6 +1665,11 @@
           >
             <Loader2 size={14} class="animate-spin" />
             <span>Reading the diff…</span>
+          </div>
+        {:else if diffError}
+          <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center font-sans" role="alert">
+            <span class="text-[11px] text-amber-500">Could not read this diff: {diffError}</span>
+            <button type="button" class="gp-btn text-xs py-1 px-2.5" onclick={retryDiff}>Retry</button>
           </div>
         {:else if showingImage}
           <!-- Deferred: only an image diff reaches this pane, so it does not
@@ -1634,7 +1727,7 @@
 
         <!-- Minimap: ticks, file boundaries and the viewport band, all
              projected from the list actually on screen. -->
-        {#if ticks.length > 0 && !showingImage && !showEmpty && !pending}
+        {#if ticks.length > 0 && !showingImage && !showEmpty && !pending && !diffError}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <!-- Justified: pointer-only by design, and marked presentation so
                assistive tech skips it. Everything it does has a keyboard

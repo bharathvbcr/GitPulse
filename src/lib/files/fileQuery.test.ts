@@ -8,6 +8,7 @@ import {
   matchesFileQuery,
   parseFileQuery,
 } from "./fileQuery";
+import { wallClockBudget } from "../testing/wallClock";
 
 const paths = ["src/lib/main.ts", "src/App.svelte", "README.md", "docs/guide.md"];
 
@@ -84,7 +85,7 @@ describe("parseFileQuery", () => {
     expect(filterPathsByFileQuery(hostile, query).paths).toEqual([]);
     // Generous by three orders of magnitude against the measured 70 s, so it
     // stays honest under machine load rather than flapping on a busy box.
-    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(1_000));
   });
 
   /**
@@ -97,7 +98,7 @@ describe("parseFileQuery", () => {
     const many = Array.from({ length: 200_000 }, (_, i) => `src/lib/file${i}.ts`);
     const started = Date.now();
     const result = filterPathsByFileQuery(many, parseFileQuery("~fl"), { maxMillis: 5 });
-    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(3_000));
     expect(result.truncated).toBe(true);
     expect(result.paths.length).toBeLessThan(many.length);
   });
@@ -187,7 +188,7 @@ describe("globToRegExp", () => {
       if (!regex) continue;
       const started = performance.now();
       regex.test("a".repeat(40) + "!");
-      expect(performance.now() - started, glob).toBeLessThan(100);
+      expect(performance.now() - started, glob).toBeLessThan(wallClockBudget(100));
     }
   });
 });

@@ -214,18 +214,21 @@ fn hung_gh_probe_is_bounded() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+    let serial = common::env::env_serial();
     let old_path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var(
-        "PATH",
-        format!("{}:{}", fake_bin.path().display(), old_path),
-    );
+    let present;
     let start = Instant::now();
-    let present = gitpulse_lib::github::gh_cli_present();
-    std::env::set_var("PATH", old_path);
+    {
+        let _env = common::env::bind_env(&serial).set(
+            "PATH",
+            format!("{}:{}", fake_bin.path().display(), old_path),
+        );
+        present = gitpulse_lib::github::gh_cli_present();
+    }
 
     assert!(!present, "a hanging gh must not count as present");
     assert!(
-        start.elapsed() < Duration::from_secs(30),
+        start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(30)),
         "probe took {:?}; it must be bounded well below the fake gh's 300s sleep",
         start.elapsed()
     );
@@ -254,10 +257,12 @@ fn git_cli_strips_planted_git_config_parameters() {
         .expect("spawn git config");
     assert!(output.status.success());
 
-    // Process-global mutation is tolerable here: every other test that
-    // reaches git through the engine strips exactly this variable (that is
-    // the behavior under test), so parallel tests cannot observe the plant.
-    std::env::set_var("GIT_CONFIG_PARAMETERS", "'user.name=PWNED_NAME'");
+    // Scoped and serialized: the plant reaches every raw `git` in this binary
+    // while it is set, and the binding removes it even if an assertion below
+    // fails.
+    let serial = common::env::env_serial();
+    let planted =
+        common::env::bind_env(&serial).set("GIT_CONFIG_PARAMETERS", "'user.name=PWNED_NAME'");
 
     let control = std::process::Command::new("git")
         .args(["config", "user.name"])
@@ -270,7 +275,7 @@ fn git_cli_strips_planted_git_config_parameters() {
         .expect("engine git call must succeed with planted env");
     let ours_name = ours.trim().to_string();
 
-    std::env::remove_var("GIT_CONFIG_PARAMETERS");
+    drop(planted);
 
     assert_eq!(
         control_name, "PWNED_NAME",

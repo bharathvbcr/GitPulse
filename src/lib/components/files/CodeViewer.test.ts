@@ -16,6 +16,11 @@ describe("CodeViewer", () => {
     expect(body).not.toContain("Save (⌘S)");
     expect(body).toContain('aria-readonly="true"');
   });
+  it("holds the whole-document tree-sitter tokens in raw state: replaced wholesale, never written in place", () => {
+    expect(source).toContain("let treeSitterLines = $state.raw<SyntaxToken[][] | null>(null);");
+    expect(source).not.toMatch(/treeSitterLines\??\.(?:push|pop|shift|unshift|splice|sort|reverse|fill)\(/);
+    expect(source).not.toMatch(/treeSitterLines\??\[[^\]]+\](?:\.\w+|\[[^\]]+\])*\s*=[^=]/);
+  });
   it("integrates syntax tokenizer and language detection", () => {
     expect(source).toContain("detectLanguageFromPath");
     expect(source).toContain("tokenizeLine");
@@ -124,6 +129,12 @@ describe("CodeViewer", () => {
     expect(source).toContain("bind:scrollTop");
     expect(source).toContain("MAX_RENDER_LINES");
     expect(source).toContain("linesTruncated");
+  });
+
+  it("does not request a whole-document highlight for a file past the render cap", () => {
+    // ft-0ff882a6: the byte limit lives in highlightDocument (diff/highlight
+    // tests); the render cap is this viewer's, so the skip is here.
+    expect(source).toContain("if (!usesTreeSitter(lang) || isEditing || linesTruncated) return;");
   });
 
   it("scrolls long lines and chrome instead of letting them overlap", () => {

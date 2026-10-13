@@ -90,7 +90,7 @@ pub fn truncate_at_line_boundary(text: String, cap: usize) -> (String, bool) {
     if text.len() <= cap {
         return (text, false);
     }
-    let head = &text[..char_boundary_at_or_before(&text, cap)];
+    let head = &text[..text.floor_char_boundary(cap)];
     let cut = match head.rfind('\n') {
         // Keep the newline: the parser drops exactly one trailing empty
         // element, so a cut that ends mid-file still ends cleanly.
@@ -127,18 +127,26 @@ pub fn drop_partial_last_line(text: String) -> String {
     }
 }
 
-/// Largest index <= `cap` that is a UTF-8 character boundary in `text`.
-fn char_boundary_at_or_before(text: &str, cap: usize) -> usize {
-    let mut index = cap.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
+/// `text` cut to at most `max` characters, with `…` appended when anything was
+/// dropped. For short diagnostics quoted into an error message.
+pub(crate) fn truncate_chars_ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
     }
-    index
+    text.chars().take(max).collect::<String>() + "…"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ellipsis_truncation_counts_characters_not_bytes() {
+        assert_eq!(truncate_chars_ellipsis("abc", 3), "abc");
+        assert_eq!(truncate_chars_ellipsis("abcd", 3), "abc…");
+        assert_eq!(truncate_chars_ellipsis("ééé", 2), "éé…");
+        assert_eq!(truncate_chars_ellipsis("abc", 0), "…");
+    }
 
     #[test]
     fn text_within_budget_is_returned_untouched() {

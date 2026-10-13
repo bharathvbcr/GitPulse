@@ -63,8 +63,8 @@ pub struct SecretFinding {
     /// Repo-relative with `/` separators, except for `outside` rows, which
     /// keep the path Kingfisher printed.
     pub path: String,
-    /// 1-based; 0 when Kingfisher reported none.
-    pub line: u32,
+    /// 1-based; `None` when Kingfisher reported none.
+    pub line: Option<u32>,
     /// `low`, `medium` or `high`; empty when Kingfisher reported none.
     pub confidence: String,
     pub location: SecretLocation,
@@ -92,6 +92,10 @@ pub struct SecretsReport {
     pub diagnostic: Option<String>,
     pub kingfisher_present: bool,
     pub kingfisher_version: Option<String>,
+    /// The envelope named a version this parser refused (control characters,
+    /// empty after redaction). The probed version, when valid, is still the
+    /// one reported above.
+    pub kingfisher_version_rejected: bool,
     /// Kingfisher defaults nested-repo scanning on, and its CLI flag cannot
     /// take `false` (no `ArgAction::Set`). Always true for our invocation.
     pub nested_repos_scanned: bool,
@@ -126,6 +130,7 @@ impl SecretsReport {
             diagnostic: None,
             kingfisher_present: present,
             kingfisher_version: version,
+            kingfisher_version_rejected: false,
             nested_repos_scanned: true,
             completeness: ScanCompleteness::Unverified,
             findings: Vec::new(),
@@ -156,7 +161,7 @@ pub(crate) struct RawFinding {
     pub rule_id: String,
     pub rule_name: String,
     pub path: String,
-    pub line: u32,
+    pub line: Option<u32>,
     pub confidence: String,
     /// The `--redact` hash of the matched value. Measured on Kingfisher
     /// 2.7.0: equal for equal values within one run whatever the surrounding
@@ -170,6 +175,8 @@ pub(crate) struct RawFinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Envelope {
     pub version: Option<String>,
+    /// The envelope carried a version that failed [`clean_version`].
+    pub version_rejected: bool,
     pub findings: Vec<RawFinding>,
     pub unreadable: u32,
     pub omitted: bool,
@@ -208,13 +215,18 @@ pub(crate) fn parse_kingfisher_json(
         .and_then(|v| v.as_array())
         .ok_or_else(|| NOT_ENVELOPE.to_string())?;
 
-    let version = obj
+    // A rejected envelope version must not erase a valid probed one: each
+    // candidate is cleaned on its own, envelope first, and the rejection is
+    // reported either way.
+    let envelope_version = obj
         .get("metadata")
         .and_then(|m| m.get("kingfisher_version"))
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or(probed_version)
-        .and_then(|v| clean_version(&v));
+        .map(clean_version);
+    let version_rejected = matches!(envelope_version, Some(None));
+    let version = envelope_version
+        .flatten()
+        .or_else(|| probed_version.as_deref().and_then(clean_version));
 
     let omitted = obj
         .get("findings_omitted")
@@ -234,6 +246,7 @@ pub(crate) fn parse_kingfisher_json(
     let (completeness, failed) = audit_verdict(obj.get("audit"));
     Ok(Envelope {
         version,
+        version_rejected,
         findings,
         unreadable,
         omitted,
@@ -336,8 +349,9 @@ fn extract_finding(item: &serde_json::Value) -> Option<RawFinding> {
     let line = finding
         .get("line")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(u64::from(u32::MAX)) as u32;
+        // Lines are 1-based; a missing or zero line is "no line", not line 0.
+        .filter(|n| *n > 0)
+        .map(|n| n.min(u64::from(u32::MAX)) as u32);
     let confidence = finding
         .get("confidence")
         .and_then(|v| v.as_str())

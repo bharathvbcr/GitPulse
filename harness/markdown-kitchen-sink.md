@@ -95,6 +95,10 @@ A claim with a footnote.[^1] And another.[^note]
 [^1]: The first footnote.
 [^note]: A named footnote with `code`.
 
+## Note
+
+A heading whose slug is also a footnote label.
+
 ---
 
 <div onclick="alert(1)">raw html is shown as text</div>

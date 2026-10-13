@@ -27,6 +27,17 @@ describe("terminal context at the boundary", () => {
   });
 });
 
+describe("a shell with a job that is not in the foreground", () => {
+  it("is not idle, and closing it asks", () => {
+    const backgrounded = { ...idle, busy: false, jobs: true };
+    expect(parseTerminalContext(backgrounded)).toEqual(backgrounded);
+    expect(closeQuestion(backgrounded, "Shell")?.message).toMatch(/background or stopped job/);
+    expect(closeQuestion({ ...idle, jobs: false }, "Shell")).toBeNull();
+    expect(closeQuestion({ ...idle, jobs: null }, "Shell")).toBeNull();
+    expect(parseTerminalContext({ ...idle, jobs: "yes" })).toBeNull();
+  });
+});
+
 describe("where a tab opened beside another starts", () => {
   it("starts in the neighbour's directory when it is inside the repository", () => {
     expect(startDirFrom(idle)).toBe("crates/core");

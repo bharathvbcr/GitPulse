@@ -7,7 +7,7 @@
 //! removes them through the same validated, harness-gated paths as every other
 //! write.
 
-use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
+use crate::engine::git_cli::{git_text, plain_path_text, resolve_git_common_dir, validate_repo};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
@@ -43,6 +43,31 @@ pub fn resolve_worktree_family(
     repo_path: &str,
     worktree_path: &str,
 ) -> Result<WorktreeFamily, String> {
+    admit_worktree_pair(repo_path, worktree_path)?.authenticate()
+}
+
+/// A repository/worktree pair admitted from filesystem metadata alone.
+///
+/// Both paths are trusted checkouts sharing one common Git directory. Nothing
+/// has run Git yet, so membership is *not* established: a hand-written gitfile
+/// passes this step. [`AdmittedPair::authenticate`] is what proves it.
+#[derive(Debug, Clone)]
+pub struct AdmittedPair {
+    repo: PathBuf,
+    worktree: PathBuf,
+    common: PathBuf,
+}
+
+/// Linked-worktree registry entries read before the metadata view gives up.
+/// Far above any real family; past it the caller asks Git instead.
+const MAX_REGISTRY_ENTRIES: usize = 1024;
+
+/// A registry `gitdir` pointer is one path; anything longer is not one.
+const MAX_GITDIR_POINTER: u64 = 4096;
+
+/// The trust and common-directory checks of [`resolve_worktree_family`],
+/// which run before it spawns Git and fail with the same messages.
+pub fn admit_worktree_pair(repo_path: &str, worktree_path: &str) -> Result<AdmittedPair, String> {
     let repo = validate_repo(repo_path)?;
     let worktree = if Path::new(worktree_path) == repo {
         repo.clone()
@@ -63,56 +88,197 @@ pub fn resolve_worktree_family(
             repo.display()
         ));
     }
-
-    // `-z` makes paths containing newlines unambiguous. IPC repository paths
-    // are UTF-8 strings, so an unrepresentable list entry cannot equal either
-    // validated input and is safely ignored.
-    let raw = git_text(&repo, &["worktree", "list", "--porcelain", "-z"])?;
-    let mut registered = Vec::new();
-    for field in raw.split('\0') {
-        let Some(path) = field.strip_prefix("worktree ") else {
-            continue;
-        };
-        let Ok(canonical) = std::fs::canonicalize(path) else {
-            // Prunable entries are history, not active authority targets.
-            continue;
-        };
-        registered.push(canonical);
-    }
-
-    let Some(anchor) = registered.first().cloned() else {
-        return Err("Git returned no active worktrees for this repository".to_string());
-    };
-    if !registered.iter().any(|path| path == &repo) {
-        return Err(format!(
-            "Repository '{}' is not a registered worktree",
-            repo.display()
-        ));
-    }
-    if !registered.iter().any(|path| path == &worktree) {
-        return Err(format!(
-            "Worktree '{}' is not registered with repository '{}'",
-            worktree.display(),
-            repo.display()
-        ));
-    }
-
-    let anchor_common = if anchor == repo {
-        repo_common.clone()
-    } else if anchor == worktree {
-        worktree_common.clone()
-    } else {
-        resolve_git_common_dir(&anchor)?
-    };
-    if anchor_common != repo_common {
-        return Err("Git's primary worktree belongs to a different repository".to_string());
-    }
-
-    Ok(WorktreeFamily {
-        anchor,
+    Ok(AdmittedPair {
+        repo,
         worktree,
-        members: registered,
+        common: repo_common,
     })
+}
+
+impl AdmittedPair {
+    /// Every checkout the repository's own metadata names: the primary
+    /// working tree and each registered linked worktree, plus the admitted
+    /// pair itself. Read from the common directory, never from Git.
+    ///
+    /// A necessary-condition view, not an authentication: a caller may use it
+    /// to conclude that *no* checkout holds some state, and must ask Git
+    /// ([`Self::authenticate`]) for anything else. `None` when the metadata
+    /// cannot account for the whole family — a primary working tree that does
+    /// not hold the common directory directly, a configured `core.worktree`
+    /// (also written by `--separate-git-dir`), an unreadable registry entry,
+    /// or an oversized registry — so a caller falls back to Git rather than
+    /// act on a partial list.
+    pub fn metadata_checkouts(&self) -> Option<Vec<PathBuf>> {
+        // Git lists the primary working tree first: the directory holding
+        // `.git`, or the repository itself when it is bare. The candidate is
+        // proved the way `repository_trust` proves a main checkout — its own
+        // metadata must name this common directory as its private one.
+        let primary = if self.common.file_name() == Some(std::ffi::OsStr::new(".git")) {
+            self.common.parent()?.to_path_buf()
+        } else {
+            self.common.clone()
+        };
+        match crate::repository_trust::git_directories(&primary) {
+            Ok((private, common)) if private == self.common && common == self.common => {}
+            _ => return None,
+        }
+        // `core.worktree` (which `--separate-git-dir` also writes) moves the
+        // primary working tree somewhere this layout cannot see. A possible
+        // setting gives up — a false alarm costs one Git call.
+        if config_mentions_worktree(&self.common).unwrap_or(true) {
+            return None;
+        }
+        let mut checkouts = vec![primary, self.repo.clone(), self.worktree.clone()];
+
+        let entries = match std::fs::read_dir(self.common.join("worktrees")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(checkouts),
+            Err(_) => return None,
+        };
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_REGISTRY_ENTRIES {
+                return None;
+            }
+            let entry_dir = entry.ok()?.path();
+            let pointer = match read_registry_pointer(&entry_dir.join("gitdir")) {
+                Ok(Some(pointer)) => pointer,
+                // Not a registration (Git's own registry count skips these too).
+                Ok(None) => continue,
+                Err(()) => return None,
+            };
+            // Git writes `<checkout>/.git`; relative pointers are relative to
+            // the registry entry.
+            let pointer = entry_dir.join(pointer);
+            let checkout = pointer.parent()?;
+            match std::fs::canonicalize(checkout) {
+                Ok(canonical) => checkouts.push(canonical),
+                // Prunable: `git worktree list` drops it from the family too.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        Some(checkouts)
+    }
+
+    /// Proves membership with `git worktree list` and names the family.
+    pub fn authenticate(self) -> Result<WorktreeFamily, String> {
+        let AdmittedPair {
+            repo,
+            worktree,
+            common: repo_common,
+        } = self;
+
+        // IPC repository paths are UTF-8 strings, so an unrepresentable list
+        // entry cannot equal either validated input and is safely ignored.
+        let mut registered = Vec::new();
+        for entry in read_worktree_entries(&repo)? {
+            let Ok(canonical) = std::fs::canonicalize(&entry.path) else {
+                // Prunable entries are history, not active authority targets.
+                continue;
+            };
+            registered.push(canonical);
+        }
+
+        let Some(anchor) = registered.first().cloned() else {
+            return Err("Git returned no active worktrees for this repository".to_string());
+        };
+        if !registered.iter().any(|path| path == &repo) {
+            return Err(format!(
+                "Repository '{}' is not a registered worktree",
+                repo.display()
+            ));
+        }
+        if !registered.iter().any(|path| path == &worktree) {
+            return Err(format!(
+                "Worktree '{}' is not registered with repository '{}'",
+                worktree.display(),
+                repo.display()
+            ));
+        }
+
+        // The pair shares one common directory (admission checked it), so only a
+        // third checkout as the anchor needs its own read.
+        let anchor_common = if anchor == repo || anchor == worktree {
+            repo_common.clone()
+        } else {
+            resolve_git_common_dir(&anchor)?
+        };
+        if anchor_common != repo_common {
+            return Err("Git's primary worktree belongs to a different repository".to_string());
+        }
+
+        Ok(WorktreeFamily {
+            anchor,
+            worktree,
+            members: registered,
+        })
+    }
+}
+
+/// Largest repository `config` [`AdmittedPair::metadata_checkouts`] reads.
+const MAX_CONFIG_SCAN: u64 = 64 * 1024;
+
+/// Whether the common directory's `config` (or its `config.worktree`) may set
+/// `core.worktree`: a line whose key is exactly `worktree`, or any `include`
+/// section, which can pull that key in from a file not read here. `None` when
+/// a file could not be read whole, which the caller treats as "yes".
+///
+/// Keys only, so `extensions.worktreeConfig` — common, and harmless here —
+/// does not count.
+fn config_mentions_worktree(common: &Path) -> Option<bool> {
+    use std::io::Read;
+    for name in ["config", "config.worktree"] {
+        let file = match std::fs::File::open(common.join(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let mut raw = Vec::new();
+        file.take(MAX_CONFIG_SCAN + 1).read_to_end(&mut raw).ok()?;
+        if raw.len() as u64 > MAX_CONFIG_SCAN {
+            return None;
+        }
+        for line in String::from_utf8_lossy(&raw).lines() {
+            let line = line.trim_start().to_ascii_lowercase();
+            if line.starts_with('[') {
+                if line.contains("include") {
+                    return Some(true);
+                }
+                continue;
+            }
+            let key = line
+                .split(|c: char| c == '=' || c.is_whitespace())
+                .next()
+                .unwrap_or_default();
+            if key == "worktree" {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// One registry entry's `gitdir` pointer: `Ok(None)` when the entry has none,
+/// `Err(())` when it exists and could not be read whole.
+fn read_registry_pointer(path: &Path) -> Result<Option<PathBuf>, ()> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut raw = String::new();
+    file.take(MAX_GITDIR_POINTER + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| ())?;
+    if raw.len() as u64 > MAX_GITDIR_POINTER {
+        return Err(());
+    }
+    let pointer = raw.trim_end_matches(['\n', '\r']);
+    if pointer.is_empty() || pointer.contains('\0') {
+        return Err(());
+    }
+    Ok(Some(PathBuf::from(pointer)))
 }
 
 /// How many worktrees get a dirty-file scan when listing. Worktrees number in
@@ -120,14 +286,15 @@ pub fn resolve_worktree_family(
 /// tree from turning one listing call into hundreds of subprocess spawns.
 const MAX_DIRTY_SCANS: usize = 32;
 
-/// Worktrees one listing scans at a time. Each scan is three to five git
-/// children; an unbounded parallel walk put all 32 scans' children in the
+/// Worktrees one listing scans at a time. A full scan is one to three git
+/// children (status; a diff when status found changes; a `rev-list` when the
+/// batched divergence could not be read); an unbounded parallel walk put all 32 scans' children in the
 /// spawn gate's queue at once, ahead of everything else the app was asking.
 const DIRTY_SCAN_FAN_OUT: usize = 4;
 
 use crate::engine::cow_clone::reflink_ignored_caches;
 use crate::engine::portless::{detect_worktree_routes, WorktreeRouteInfo};
-use crate::engine::worktree_hooks::{execute_worktree_hooks, load_worktree_hooks};
+use crate::engine::worktree_hooks::run_repo_hooks;
 
 /// Diff stats for uncommitted changes in a worktree (`HEAD±`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,26 +347,48 @@ pub struct WorktreeInfo {
     pub scan_note: Option<String>,
 }
 
-/// One parsed block of `worktree list --porcelain`, before dirty counting.
+/// One parsed block of `worktree list --porcelain -z`, before dirty counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ParsedWorktree {
-    path: String,
-    head: String,
-    branch: Option<String>,
-    is_bare: bool,
-    is_detached: bool,
-    is_locked: bool,
-    is_prunable: bool,
+pub(crate) struct ParsedWorktree {
+    pub(crate) path: String,
+    pub(crate) head: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) is_bare: bool,
+    pub(crate) is_detached: bool,
+    pub(crate) is_locked: bool,
+    pub(crate) is_prunable: bool,
 }
 
-/// Parses `git worktree list --porcelain` output.
+/// Every worktree of `repo`, from `git worktree list --porcelain -z`.
 ///
-/// The format is newline-separated fields in blank-line-delimited blocks:
-/// `worktree <path>`, `HEAD <sha>`, one of `branch <ref>` / `detached`,
-/// optionally `bare`, `locked [reason]`, `prunable [reason]`. Unknown lines are
-/// skipped rather than rejected so a newer git can add fields without breaking
-/// this parser.
-fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
+/// The one reader of the worktree list: the listing, the checked-out-branch
+/// guards, the branch-cleanup plan and the agent-worktree reuse check all ask
+/// here. Without `-z` a path containing a newline split into two fields (the
+/// second read as an unknown line, or as a bogus entry), and a trailing space
+/// was trimmed into a different directory.
+pub(crate) fn read_worktree_entries(repo: &Path) -> Result<Vec<ParsedWorktree>, String> {
+    let run =
+        crate::engine::git_cli::git_captured(repo, &["worktree", "list", "--porcelain", "-z"])
+            .and_then(|run| run.require_complete("Worktree listing"))?;
+    if !run.success {
+        return Err(format!(
+            "Could not list this repository's worktrees: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    Ok(parse_worktree_porcelain_z(&String::from_utf8_lossy(
+        &run.stdout,
+    )))
+}
+
+/// Parses `git worktree list --porcelain -z` output.
+///
+/// Fields are NUL-terminated and a block ends with an empty field:
+/// `worktree <path>`, `HEAD <oid>`, one of `branch <ref>` / `detached`,
+/// optionally `bare`, `locked [reason]`, `prunable [reason]`. Unknown fields
+/// are skipped rather than rejected so a newer git can add some without
+/// breaking this parser. Values are taken verbatim: a path may end in a space.
+fn parse_worktree_porcelain_z(raw: &str) -> Vec<ParsedWorktree> {
     let mut out: Vec<ParsedWorktree> = Vec::new();
     let mut current: Option<ParsedWorktree> = None;
     let flush = |current: &mut Option<ParsedWorktree>, out: &mut Vec<ParsedWorktree>| {
@@ -210,74 +399,39 @@ fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
         }
     };
 
-    for line in raw.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
+    for field in raw.split('\0') {
+        if field.is_empty() {
             flush(&mut current, &mut out);
             continue;
         }
-        let Some((key, value)) = line.split_once(' ') else {
-            // A field with no payload ("detached" never appears alone, but a
-            // bare "locked" or "prunable" can).
-            match line {
-                "detached" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_detached = true;
-                    }
-                }
-                // `bare` carries no payload either.
-                "bare" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_bare = true;
-                    }
-                }
-                "locked" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_locked = true;
-                    }
-                }
-                "prunable" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_prunable = true;
-                    }
-                }
-                _ => {}
-            }
+        // A field with no payload ("detached", "bare", a bare "locked") has
+        // no space to split at.
+        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
+        if key == "worktree" {
+            flush(&mut current, &mut out);
+            current = Some(ParsedWorktree {
+                path: value.to_string(),
+                ..ParsedWorktree::default()
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
             continue;
         };
         match key {
-            "worktree" => {
-                flush(&mut current, &mut out);
-                current = Some(ParsedWorktree {
-                    path: value.to_string(),
-                    ..ParsedWorktree::default()
-                });
-            }
-            "HEAD" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.head = value.to_string();
-                }
-            }
+            "HEAD" => entry.head = value.to_string(),
             "branch" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.branch = Some(value.trim_start_matches("refs/heads/").to_string());
-                }
+                entry.branch = Some(
+                    value
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(value)
+                        .to_string(),
+                )
             }
-            "bare" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_bare = true;
-                }
-            }
-            "locked" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_locked = true;
-                }
-            }
-            "prunable" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_prunable = true;
-                }
-            }
+            "detached" => entry.is_detached = true,
+            "bare" => entry.is_bare = true,
+            "locked" => entry.is_locked = true,
+            "prunable" => entry.is_prunable = true,
             _ => {}
         }
     }
@@ -559,7 +713,8 @@ pub enum ScanDepth {
     Listing,
     /// Adds the dirty-file count (`git status`) for each scanned worktree.
     Dirty,
-    /// Adds diff stats, divergence from main/master, and portless routes.
+    /// Adds diff stats (a `git diff` only where status found changes),
+    /// divergence from main/master, and portless routes.
     Full,
 }
 
@@ -940,8 +1095,7 @@ fn before_publish_hook() {
 /// One listing with no sharing: what [`list_worktrees_scanned`] runs.
 fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
-    let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
-    let parsed = parse_worktree_porcelain(&stdout);
+    let parsed = read_worktree_entries(&repo)?;
     if depth == ScanDepth::Listing {
         return Ok(parsed
             .into_iter()
@@ -1083,6 +1237,14 @@ struct WorktreeScan {
     note: Option<String>,
 }
 
+/// Whether a listed `HEAD` names a commit: git lists an unborn branch's head
+/// as all zeros, and an entry it gave no head for is empty.
+fn head_is_born(head: &str) -> bool {
+    head.len() >= 40
+        && head.bytes().all(|b| b.is_ascii_hexdigit())
+        && head.bytes().any(|b| b != b'0')
+}
+
 fn scan_worktree(
     repo: &Path,
     entry: &ParsedWorktree,
@@ -1130,7 +1292,15 @@ fn scan_worktree(
     });
     let mut scan = WorktreeScan {
         dirty,
-        diff_stat: measure_diff_stat(dir),
+        diff_stat: if dirty == Some(0) && head_is_born(&entry.head) {
+            // `git status` just found HEAD, the index and the files in
+            // agreement, which is exactly an empty `git diff HEAD`; asking
+            // again cost a second child per worktree, and most worktrees in
+            // a listing are clean. An unborn or unknown HEAD is measured.
+            Some(WorktreeDiffStat::default())
+        } else {
+            measure_diff_stat(dir)
+        },
         divergence,
         routes: detect_worktree_routes(&entry.path, branch),
         note: None,
@@ -1189,6 +1359,10 @@ pub fn add_worktree(
         validate_oid_or_revision(start)?;
     }
 
+    // The spelling the gate judged ([`add_worktree_argv`]): a verbatim
+    // `\\?\` path from a canonicalized checkout is not one git can create.
+    let target_path = plain_path_text(target_path);
+    let target_path = target_path.as_str();
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if let Some(branch) = new_branch {
         args.push("-b");
@@ -1214,14 +1388,21 @@ pub fn add_worktree(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeCreated {
     pub path: String,
-    /// Copying build caches from the main checkout failed as a whole.
-    /// Individual cache directories that fail are logged and skipped there.
+    /// Some build cache could not be copied from the main checkout, or could
+    /// not be checked: each one named, with what was copied. A cache that
+    /// failed is absent from the worktree, never half there.
     pub cache_error: Option<String>,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
+    /// Hooks were asked for and the repository's file lists some that were not
+    /// approved, so none ran. Not a failure: the worktree is as plain as one
+    /// made without hooks, and this says why.
+    #[serde(default)]
+    pub hook_notice: Option<String>,
 }
 
-/// Creates a linked worktree with optional Copy-on-Write cache cloning and lifecycle hooks.
+/// Creates a linked worktree with optional Copy-on-Write cache cloning and,
+/// when `run_hooks` is set, the repository's approved `post_create` hooks.
 pub fn add_worktree_extended(
     repo_path: &str,
     target_path: &str,
@@ -1229,30 +1410,39 @@ pub fn add_worktree_extended(
     start_point: Option<&str>,
     detach: bool,
     cow_caches: bool,
+    run_hooks: bool,
 ) -> Result<WorktreeCreated, String> {
     let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
     let mut created = WorktreeCreated {
         path,
         cache_error: None,
         hook_error: None,
+        hook_notice: None,
     };
     if cow_caches {
         let repo = validate_repo(repo_path)?;
-        let target = Path::new(target_path);
-        created.cache_error = reflink_ignored_caches(&repo, target).err();
-        let hooks = load_worktree_hooks(&repo);
-        let branch_name = new_branch.unwrap_or("");
-        created.hook_error = execute_worktree_hooks(
+        created.cache_error = reflink_ignored_caches(
             &repo,
-            target,
-            &hooks.post_create,
+            Path::new(target_path),
+            &crate::engine::cow_clone::CacheSelection::default(),
+        )
+        .err();
+    }
+    if run_hooks {
+        let repo = validate_repo(repo_path)?;
+        let branch_name = new_branch.unwrap_or("");
+        match run_repo_hooks(
+            &repo,
+            Path::new(target_path),
             "post_create",
             &[
                 ("GITPULSE_BRANCH", branch_name),
                 ("GITPULSE_WORKTREE_PATH", target_path),
             ],
-        )
-        .err();
+        ) {
+            Ok(outcome) => created.hook_notice = outcome.skipped,
+            Err(e) => created.hook_error = Some(e),
+        }
     }
     Ok(created)
 }
@@ -1269,6 +1459,9 @@ pub struct MergeTeardownResult {
     /// the teardown had already happened; this says the cleanup after them
     /// did not, where it used to be discarded.
     pub hook_error: Option<String>,
+    /// Hooks the repository lists that were not approved, so did not run.
+    #[serde(default)]
+    pub hook_notice: Option<String>,
 }
 
 /// Merges a worktree branch into target_branch (defaulting to main/master) in the primary
@@ -1316,37 +1509,65 @@ pub fn merge_and_teardown_worktree(
     // The merge runs in the main checkout, onto whatever it has checked out.
     // It used to run there regardless and then report `target`: a main
     // checkout on another branch took the merge, and the panel said "main".
-    let current = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|head| head.trim().to_string())
-        .unwrap_or_default();
-    if current != target {
-        return Err(format!(
-            "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
-            if current.is_empty() { "a detached HEAD".to_string() } else { current }
-        ));
-    }
+    let main_is_on_target = || -> Result<(), String> {
+        // A refused read is an error, not "a detached HEAD": naming the wrong
+        // reason would send the user to fix the wrong thing.
+        let current = crate::engine::git_reader::head_branch(&repo)?.unwrap_or_default();
+        if current != target {
+            return Err(format!(
+                "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
+                if current.is_empty() { "a detached HEAD".to_string() } else { current }
+            ));
+        }
+        Ok(())
+    };
+    main_is_on_target()?;
 
     // 2. Pre-merge hooks
-    let hooks = load_worktree_hooks(&repo);
-    execute_worktree_hooks(
-        &repo,
-        &worktree,
-        &hooks.pre_merge,
-        "pre_merge",
-        &[
-            ("GITPULSE_BRANCH", &branch),
-            ("GITPULSE_WORKTREE_PATH", &worktree.to_string_lossy()),
-        ],
-    )?;
+    let mut hook_notices: Vec<String> = Vec::new();
+    hook_notices.extend(
+        run_repo_hooks(
+            &repo,
+            &worktree,
+            "pre_merge",
+            &[
+                ("GITPULSE_BRANCH", &branch),
+                ("GITPULSE_WORKTREE_PATH", &worktree.to_string_lossy()),
+            ],
+        )?
+        .skipped,
+    );
+
+    // Steps 3-6 hold one lock: the checks that the worktree is clean and that
+    // the branch is what will be merged, the merge, and the removal and branch
+    // deletion that destroy the worktree. They used to run in separate scopes,
+    // so anything written between the check and the removal was destroyed with
+    // it. The lock fences GitPulse's own writers; an outside process takes no
+    // lock, so each destructive step re-reads the state it is about to destroy
+    // and refuses, keeping the worktree and branch, when it moved.
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // The pre-merge hooks above may have switched the main checkout.
+    main_is_on_target()?;
 
     // 3. Collision / uncommitted changes check
-    let (changed, _) = changed_paths(&worktree.to_string_lossy())?;
+    let worktree_text = worktree.to_string_lossy().to_string();
+    let (changed, _) = changed_paths(&worktree_text)?;
     if !changed.is_empty() {
         return Err(format!(
             "Worktree has {} uncommitted file changes; commit or stash them before merging",
             changed.len()
         ));
     }
+    // The branch tip being merged. Anything that lands on the branch after
+    // this is not in the merge and must not be deleted with it.
+    let branch_ref = format!("refs/heads/{branch}");
+    let merged_tip = git_text(&repo, &["rev-parse", "--verify", branch_ref.as_str()])?
+        .trim()
+        .to_string();
 
     // Count commits being merged
     let count_stdout = git_text(
@@ -1357,64 +1578,87 @@ pub fn merge_and_teardown_worktree(
     let commits_merged: usize = count_stdout.trim().parse().unwrap_or(0);
 
     // 4. Merge in anchor repository
-    {
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        if squash {
-            // Nothing staged means the branch's changes are already on the
-            // target and there is nothing to commit — not a failure. A failed
-            // commit fails closed before anything is torn down: it used to be
-            // discarded, and the next steps removed the worktree and
-            // force-deleted the branch whose work was never committed.
-            GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(
-                |failure| match failure {
-                    SquashFailure::Merge(e) => e,
-                    SquashFailure::Commit(e) => {
-                        format!("{e} The worktree and the branch {branch} were kept on {target}.")
-                    }
-                },
-            )?;
-        } else {
-            let fast_forward = merge_teardown_argv(&branch, false);
-            let fast_forward: Vec<&str> = fast_forward.iter().map(String::as_str).collect();
-            gate(&fast_forward)?;
-            if let Err(ff_err) = git_text(&repo, &fast_forward) {
-                let commit_msg = format!("Merge branch '{branch}' into {target}");
-                let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
-                gate(&merge)?;
-                git_text(&repo, &merge)
-                    .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
+    if squash {
+        // Nothing staged means the branch's changes are already on the
+        // target and there is nothing to commit — not a failure. A failed
+        // commit fails closed before anything is torn down: it used to be
+        // discarded, and the next steps removed the worktree and
+        // force-deleted the branch whose work was never committed.
+        GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(|failure| match failure {
+            SquashFailure::Merge(e) => e,
+            SquashFailure::Commit(e) => {
+                format!("{e} The worktree and the branch {branch} were kept on {target}.")
             }
+        })?;
+    } else {
+        let fast_forward = merge_teardown_argv(&branch, false);
+        let fast_forward: Vec<&str> = fast_forward.iter().map(String::as_str).collect();
+        gate(&fast_forward)?;
+        if let Err(ff_err) = git_text(&repo, &fast_forward) {
+            let commit_msg = format!("Merge branch '{branch}' into {target}");
+            let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
+            gate(&merge)?;
+            git_text(&repo, &merge)
+                .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
         }
     }
 
+    // What the destructive steps below may destroy is what was merged.
+    let unchanged_since_merge = |repo: &Path, worktree_present: bool| -> Result<(), String> {
+        let kept = format!(
+            "The merge of {branch} into {target} is done; the worktree and the branch were kept"
+        );
+        if worktree_present {
+            let (changed, _) = changed_paths(&worktree_text).map_err(|e| {
+                format!("{kept}, because the worktree could not be re-checked: {e}")
+            })?;
+            if !changed.is_empty() {
+                return Err(format!(
+                    "{kept}: {} file change(s) appeared in the worktree after the merge was checked.",
+                    changed.len()
+                ));
+            }
+        }
+        let tip = git_text(repo, &["rev-parse", "--verify", branch_ref.as_str()])
+            .map_err(|e| format!("{kept}, because the branch could not be re-read: {e}"))?;
+        if tip.trim() != merged_tip {
+            return Err(format!(
+                "{kept}: {branch} moved from {merged_tip} to {} after the merge was checked.",
+                tip.trim()
+            ));
+        }
+        Ok(())
+    };
+
     // 5. Remove worktree
-    let worktree_text = worktree.to_string_lossy().to_string();
     let remove = remove_worktree_argv(&worktree_text, true);
     // That builder spells the program; the gate takes git's arguments.
     let remove: Vec<&str> = remove.iter().skip(1).map(String::as_str).collect();
     gate(&remove)?;
-    remove_worktree(repo_path, &worktree_text, true)?;
+    unchanged_since_merge(&repo, true)?;
+    remove_worktree_locked(&repo, &worktree_text, true)?;
 
     // 6. Delete merged branch
     let delete = ["branch", if squash { "-D" } else { "-d" }, branch.as_str()];
-    let branch_deleted = gate(&delete).is_ok() && git_text(&repo, &delete).is_ok();
+    let branch_deleted = gate(&delete).is_ok()
+        && unchanged_since_merge(&repo, false).is_ok()
+        && git_text(&repo, &delete).is_ok();
+    drop(_guard);
 
     // 7. Post-merge hooks
-    let hook_error = execute_worktree_hooks(
+    let mut hook_error = None;
+    match run_repo_hooks(
         &repo,
         &repo,
-        &hooks.post_merge,
         "post_merge",
         &[
             ("GITPULSE_BRANCH", &branch),
             ("GITPULSE_TARGET_BRANCH", target),
         ],
-    )
-    .err();
+    ) {
+        Ok(outcome) => hook_notices.extend(outcome.skipped),
+        Err(e) => hook_error = Some(e),
+    }
 
     Ok(MergeTeardownResult {
         merged_branch: branch,
@@ -1423,6 +1667,11 @@ pub fn merge_and_teardown_worktree(
         worktree_removed: true,
         branch_deleted,
         hook_error,
+        hook_notice: if hook_notices.is_empty() {
+            None
+        } else {
+            Some(hook_notices.join(" "))
+        },
     })
 }
 
@@ -1446,18 +1695,27 @@ pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Resul
     let _guard = _repo_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remove_worktree_locked(&repo, target_path, force)
+}
 
+/// [`remove_worktree`] for a caller that already holds `repo`'s mutation lock
+/// (the merge-and-teardown span, which checks and removes under one lock).
+fn remove_worktree_locked(repo: &Path, target_path: &str, force: bool) -> Result<(), String> {
     validate_target_path(target_path)?;
     // Git scans the target's status internally. Its config.worktree helpers
     // can execute even though the parent is the process's current directory.
     let target = validate_repo(target_path)?;
     let target_path = target.to_str().ok_or("Worktree path is not UTF-8")?;
+    // `validate_repo` canonicalizes, which on Windows is the `\\?\` form git
+    // does not take as an argument.
+    let target_path = plain_path_text(target_path);
+    let target_path = target_path.as_str();
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
     }
     args.push(target_path);
-    git_text(&repo, &args)?;
+    git_text(repo, &args)?;
     Ok(())
 }
 
@@ -1526,7 +1784,7 @@ pub fn add_worktree_argv(
     } else if detach {
         argv.push("--detach".into());
     }
-    argv.push(target_path.into());
+    argv.push(plain_path_text(target_path));
     if let Some(start) = start_point {
         argv.push(start.into());
     }
@@ -1538,7 +1796,7 @@ pub fn remove_worktree_argv(target_path: &str, force: bool) -> Vec<String> {
     if force {
         argv.push("--force".into());
     }
-    argv.push(target_path.into());
+    argv.push(plain_path_text(target_path));
     argv
 }
 
@@ -1578,6 +1836,109 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    /// `path.canonicalize()` in the spelling git reports its worktrees in. The
+    /// spawn log is keyed by the directory a child ran in, and git lists a
+    /// worktree as `C:/...`, never `\\?\C:\...`, so a verbatim key matches
+    /// nothing on Windows and a "spawned zero" assertion passes or fails for
+    /// the wrong reason. Plain `canonicalize` off Windows.
+    fn plain(path: impl AsRef<Path>) -> PathBuf {
+        crate::engine::git_cli::canonicalize_plain(path.as_ref()).unwrap()
+    }
+
+    /// The fixtures below are written in `--porcelain`'s newline layout for
+    /// readability; the parser reads the `-z` layout, whose NUL is that
+    /// layout's newline and whose empty field is its blank line.
+    fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
+        parse_worktree_porcelain_z(&raw.replace('\n', "\0"))
+    }
+
+    /// A worktree path may hold a newline or end in a space. Without `-z` the
+    /// first split into two fields and the second was trimmed into a
+    /// different directory, so the listing named worktrees that do not exist.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_paths_with_a_newline_or_trailing_space_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::test_support::git_in(&main, &["init", "-q", "-b", "main"]);
+        crate::test_support::git_in(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let main = main.canonicalize().unwrap();
+        let odd = [dir.path().join("trail "), dir.path().join("new\nline")];
+        for (n, path) in odd.iter().enumerate() {
+            crate::test_support::git_in(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("b{n}"),
+                    path.to_str().unwrap(),
+                ],
+            );
+        }
+
+        let entries = read_worktree_entries(&main).expect("entries");
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        assert_eq!(entries.len(), 3, "{paths:?}");
+        for path in &odd {
+            let canonical = path.canonicalize().unwrap();
+            assert!(
+                paths.iter().any(|listed| Path::new(listed) == canonical),
+                "{canonical:?} did not round-trip through {paths:?}"
+            );
+        }
+        let listed = list_worktrees(main.to_str().unwrap()).expect("listing");
+        assert_eq!(listed.len(), 3);
+        assert!(
+            crate::engine::git_writer::checked_out_branches(&main)
+                .unwrap()
+                .contains("b1"),
+            "the branch of the newline-path worktree was lost"
+        );
+    }
+
+    /// The command gate and the writer take the same spelling, and it is one
+    /// git accepts: a canonicalized checkout is `\\?\C:\...` on Windows, which
+    /// `git worktree add` and `remove` refuse as an argument.
+    #[cfg(windows)]
+    #[test]
+    fn worktree_argv_never_carries_a_verbatim_path() {
+        let verbatim = r"\\?\C:\repo\.gitpulse\worktrees\lane";
+        let plain = r"C:\repo\.gitpulse\worktrees\lane";
+        assert_eq!(
+            add_worktree_argv(verbatim, Some("b"), None, false),
+            ["git", "worktree", "add", "-b", "b", plain]
+        );
+        assert_eq!(
+            remove_worktree_argv(verbatim, true),
+            ["git", "worktree", "remove", "--force", plain]
+        );
+    }
+
+    /// A target that is already in canonical form still creates and removes a
+    /// worktree: the case every managed attempt is in, since its checkout came
+    /// from `validate_repo`.
+    #[test]
+    fn a_canonicalized_target_creates_and_removes_a_worktree() {
+        let main = tempfile::TempDir::new().unwrap();
+        git_in(main.path(), &["init", "-b", "main"]);
+        git_in(
+            main.path(),
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        );
+        crate::test_support::trust_repo(main.path());
+        let holder = tempfile::TempDir::new().unwrap();
+        let target = holder.path().canonicalize().unwrap().join("lane");
+        let target_text = target.to_str().unwrap();
+        let repo = main.path().to_str().unwrap();
+        add_worktree(repo, target_text, Some("lane"), None, false).expect("add");
+        assert!(target.join(".git").exists(), "{target:?} was not created");
+        remove_worktree(repo, target_text, false).expect("remove");
+        assert!(!target.exists(), "{target:?} was not removed");
+    }
 
     #[test]
     fn test_parse_porcelain_full_blocks() {
@@ -1827,34 +2188,123 @@ some-future-field whatever
         assert!(list_worktrees(dir.path().to_str().unwrap()).is_err());
     }
 
-    /// A main checkout with `linked` worktrees under one parent directory.
-    fn repo_with_worktrees(linked: usize) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>) {
-        let main = tempfile::TempDir::new().unwrap();
-        git_in(main.path(), &["init", "-b", "main"]);
-        std::fs::write(main.path().join("seed.txt"), "seed").unwrap();
-        git_in(main.path(), &["add", "."]);
-        git_in(main.path(), &["commit", "-m", "init"]);
-        let parent = tempfile::TempDir::new().unwrap();
-        let paths = (0..linked)
-            .map(|i| {
-                let path = parent.path().join(format!("wt-{i:02}"));
-                let branch = format!("agent/{i:02}");
-                git_in(
-                    main.path(),
-                    &[
-                        "worktree",
-                        "add",
-                        "-q",
-                        "-b",
-                        &branch,
-                        path.to_str().unwrap(),
-                    ],
-                );
-                crate::test_support::trust_repo(&path);
-                path.canonicalize().unwrap()
-            })
-            .collect();
-        (main, parent, paths)
+    use crate::test_support::repo_with_worktrees;
+
+    /// `diff` children a listing started in `dir`.
+    fn diff_spawns_in(dir: &Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(dir)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "diff"))
+            .count()
+    }
+
+    /// A full scan of a worktree whose `git status` came back empty does not
+    /// start a second child to be told the diff against HEAD is empty, and a
+    /// worktree with changes is still measured.
+    #[test]
+    fn a_full_scan_diffs_only_the_worktrees_status_found_changed() {
+        let (main, _parent, linked) = repo_with_worktrees(2);
+        std::fs::write(linked[1].join("seed.txt"), "seed\nand\nmore\n").unwrap();
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list");
+        let of = |dir: &Path| {
+            listed
+                .iter()
+                .find(|w| Path::new(&w.path) == dir)
+                .expect("listed")
+                .clone()
+        };
+        let clean = of(&linked[0]);
+        assert_eq!(clean.dirty_files, Some(0));
+        assert_eq!(clean.diff_stat, Some(WorktreeDiffStat::default()));
+        assert_eq!(clean.scan_note, None);
+        assert_eq!(diff_spawns_in(&linked[0]), 0, "a clean worktree was diffed");
+
+        let changed = of(&linked[1]);
+        assert_eq!(changed.dirty_files, Some(1));
+        assert_eq!(
+            diff_spawns_in(&linked[1]),
+            1,
+            "a changed worktree is diffed once"
+        );
+        let stat = changed.diff_stat.expect("measured");
+        assert_eq!((stat.files_changed, stat.insertions), (1, 3), "{stat:?}");
+    }
+
+    /// The skipped diff is only ever the empty one: whenever status reports
+    /// nothing, the listing's answer equals an unconditional `git diff HEAD`,
+    /// across the states that change one without the other's knowledge.
+    #[test]
+    fn a_clean_status_and_a_measured_diff_always_agree() {
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        type Step = (&'static str, Box<dyn Fn()>);
+        let steps: Vec<Step> = vec![
+            ("untouched", Box::new(|| {})),
+            ("mtime moved, content not", {
+                let dir = dir.clone();
+                Box::new(move || {
+                    let file = std::fs::File::options()
+                        .write(true)
+                        .open(dir.join("seed.txt"))
+                        .unwrap();
+                    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+                        .unwrap();
+                })
+            }),
+            ("only an untracked file", {
+                let dir = dir.clone();
+                Box::new(move || std::fs::write(dir.join("loose.txt"), "x").unwrap())
+            }),
+            ("a staged change", {
+                let dir = dir.clone();
+                Box::new(move || {
+                    std::fs::remove_file(dir.join("loose.txt")).unwrap();
+                    std::fs::write(dir.join("seed.txt"), "staged").unwrap();
+                    git_in(&dir, &["add", "seed.txt"]);
+                })
+            }),
+            ("that change committed", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["commit", "-q", "-m", "next"]))
+            }),
+            ("reset back past it", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["reset", "-q", "--hard", "HEAD~1"]))
+            }),
+        ];
+        let mut clean_states = 0;
+        for (label, step) in steps {
+            step();
+            let listed = list_worktrees(main.path().to_str().unwrap()).expect("list");
+            let wt = listed
+                .iter()
+                .find(|w| Path::new(&w.path) == dir)
+                .expect("listed");
+            assert_eq!(wt.scan_note, None, "{label}");
+            if wt.dirty_files == Some(0) {
+                clean_states += 1;
+            }
+            assert_eq!(wt.diff_stat, measure_diff_stat(&dir), "{label}");
+        }
+        assert!(clean_states >= 3, "the fixture never reached a clean state");
+    }
+
+    /// An unborn HEAD has nothing to diff against, so a clean status there
+    /// is not taken as an empty diff; it is measured, as before.
+    #[test]
+    fn an_unborn_head_is_never_assumed_clean() {
+        let (main, _parent, _linked) = repo_with_worktrees(0);
+        let repo = plain(main.path());
+        let entry = ParsedWorktree {
+            path: repo.to_str().unwrap().to_string(),
+            head: "0".repeat(40),
+            branch: Some("main".into()),
+            ..ParsedWorktree::default()
+        };
+        let before = diff_spawns_in(&repo);
+        let scan = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none());
+        assert_eq!(scan.dirty, Some(0));
+        assert_eq!(diff_spawns_in(&repo), before + 1);
     }
 
     /// Every absent count says why, and a scanned one says nothing.
@@ -1895,7 +2345,7 @@ some-future-field whatever
             branch: Some("main".into()),
             ..ParsedWorktree::default()
         };
-        let repo = main.path().canonicalize().unwrap();
+        let repo = plain(main.path());
         let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
             scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none())
         });
@@ -1934,6 +2384,11 @@ some-future-field whatever
     fn worktree_scans_keep_the_callers_admission_class() {
         use crate::engine::git_cli::{spawn_log, with_admission, Admission};
         let (main, _parent, linked) = repo_with_worktrees(6);
+        // Changed, so each scan starts both its children (status and diff):
+        // a clean worktree's diff is not asked for.
+        for dir in &linked {
+            std::fs::write(dir.join("seed.txt"), "changed").unwrap();
+        }
         let listed = with_admission(Admission::Background, || {
             list_worktrees(main.path().to_str().unwrap()).expect("list")
         });
@@ -2209,7 +2664,7 @@ some-future-field whatever
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
             "hostile paths took {elapsed:?}"
         );
     }
@@ -2400,12 +2855,18 @@ some-future-field whatever
         git(repo, &["add", "."]);
         git(repo, &["commit", "-m", "initial commit"]);
         crate::test_support::trust_repo(repo);
+        if let Some(hooks) = hooks {
+            // These tests exercise what approved hooks do; consent itself is
+            // tested in worktree_hooks.
+            crate::engine::approve_worktree_hooks(repo, hooks).expect("approve fixture hooks");
+        }
         let wt = tempfile::tempdir().expect("wt tempdir");
         let created = add_worktree_extended(
             repo.to_str().unwrap(),
             wt.path().to_str().unwrap(),
             Some("feature-x"),
             None,
+            false,
             false,
             false,
         )
@@ -2447,6 +2908,7 @@ some-future-field whatever
             None,
             false,
             true,
+            true,
         )
         .expect("the worktree itself was created");
         let hook = created.hook_error.expect("the failed hook was reported");
@@ -2464,9 +2926,71 @@ some-future-field whatever
             None,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!((created.cache_error, created.hook_error), (None, None));
+    }
+
+    /// Agent provisioning and the worktree dialog both ask for hooks; a
+    /// repository's file that nobody approved is reported, never run.
+    #[cfg(unix)]
+    #[test]
+    fn unapproved_post_create_hooks_do_not_run_from_provisioning() {
+        let (dir, _) = teardown_fixture(None);
+        let hooks = r#"{"worktree":{"post_create":["touch ran.marker"]}}"#;
+        std::fs::create_dir_all(dir.path().join(".gitpulse")).unwrap();
+        std::fs::write(dir.path().join(".gitpulse/hooks.json"), hooks).unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("feature-q"),
+            None,
+            false,
+            true,
+            true,
+        )
+        .expect("the worktree itself was created");
+        assert_eq!(created.hook_error, None);
+        let notice = created.hook_notice.expect("the skip is reported");
+        assert!(notice.contains("not been approved"), "{notice}");
+        assert!(!wt.path().join("ran.marker").exists());
+
+        // The same file, approved, runs; edited afterwards, it does not.
+        crate::engine::approve_worktree_hooks(dir.path(), hooks).unwrap();
+        let ok = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            ok.path().to_str().unwrap(),
+            Some("feature-r"),
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!((created.hook_error, created.hook_notice), (None, None));
+        assert!(ok.path().join("ran.marker").exists());
+
+        std::fs::write(
+            dir.path().join(".gitpulse/hooks.json"),
+            r#"{"worktree":{"post_create":["touch ran.marker","touch extra.marker"]}}"#,
+        )
+        .unwrap();
+        let changed = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            changed.path().to_str().unwrap(),
+            Some("feature-s"),
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(created.hook_notice.is_some());
+        assert!(!changed.path().join("extra.marker").exists());
     }
 
     /// The merge runs in the main checkout, onto what it has checked out. On
@@ -2663,9 +3187,16 @@ some-future-field whatever
         // Add linked worktree
         let wt_dir = tempfile::tempdir().expect("wt tempdir");
         let wt_path = wt_dir.path().to_str().unwrap();
-        let created =
-            add_worktree_extended(repo_path, wt_path, Some("feature-x"), None, false, false)
-                .expect("created worktree");
+        let created = add_worktree_extended(
+            repo_path,
+            wt_path,
+            Some("feature-x"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("created worktree");
         assert_eq!(created.path, wt_path);
         assert_eq!((created.cache_error, created.hook_error), (None, None));
         crate::test_support::trust_repo(wt_dir.path());
@@ -2701,6 +3232,68 @@ some-future-field whatever
         assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
     }
 
+    /// Runs a teardown whose gate performs `outside_write` on the worktree
+    /// when asked about the removal: an outside agent writing after the merge
+    /// was checked and before the worktree is destroyed.
+    #[cfg(unix)]
+    fn teardown_with_outside_write(
+        outside_write: impl Fn(&Path),
+    ) -> (
+        Result<MergeTeardownResult, String>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let (dir, wt) = teardown_fixture(None);
+        let wt_path = wt.path().to_path_buf();
+        let mut gate = |argv: &[&str]| -> Result<(), String> {
+            if argv.first() == Some(&"worktree") && argv.get(1) == Some(&"remove") {
+                outside_write(&wt_path);
+            }
+            Ok(())
+        };
+        let result = merge_and_teardown_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            &mut gate,
+        );
+        (result, dir, wt)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_written_after_the_check_keeps_the_worktree() {
+        let (result, dir, wt) = teardown_with_outside_write(|wt| {
+            std::fs::write(wt.join("outside.txt"), "an agent's work\n").unwrap();
+        });
+        let error = result.expect_err("the late write must stop the removal");
+        assert!(error.contains("kept"), "{error}");
+        assert!(
+            wt.path().join("outside.txt").exists(),
+            "the file was destroyed"
+        );
+        assert!(
+            branch_exists(dir.path(), "feature-x"),
+            "the branch was deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_landing_after_the_check_keeps_the_worktree_and_branch() {
+        let (result, dir, wt) = teardown_with_outside_write(|wt| {
+            crate::test_support::git_in(wt, &["commit", "-q", "--allow-empty", "-m", "late"]);
+        });
+        let error = result.expect_err("the late commit must stop the removal");
+        assert!(error.contains("moved"), "{error}");
+        assert!(wt.path().exists(), "the worktree was removed");
+        assert!(
+            branch_exists(dir.path(), "feature-x"),
+            "the unmerged commit's branch was deleted"
+        );
+    }
+
     fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {
         cwds.iter()
             .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
@@ -2713,7 +3306,7 @@ some-future-field whatever
     #[test]
     fn a_full_listing_looks_up_main_once_whatever_the_worktree_count() {
         let (main, _parent, linked) = repo_with_worktrees(5);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let listed = list_worktrees(root.to_str().unwrap()).expect("list");
         assert_eq!(listed.len(), 6);
         let mut cwds = linked.clone();
@@ -2755,7 +3348,7 @@ some-future-field whatever
     #[test]
     fn a_batch_that_cannot_answer_falls_back_to_each_worktrees_own_walk() {
         let (main, _parent, linked) = repo_with_worktrees(3);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         // Two commits on one agent branch, so the counts are not all zero.
         for n in 0..2 {
             std::fs::write(linked[1].join(format!("w{n}.txt")), "x").unwrap();
@@ -2795,7 +3388,7 @@ some-future-field whatever
         git_in(dir.path(), &["init", "-q", "-b", "master"]);
         git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
         git_in(dir.path(), &["branch", "main/feature"]);
-        let root = dir.path().canonicalize().unwrap();
+        let root = plain(dir.path());
         assert_eq!(main_ref(&root), MainRef::Found("master"));
         git_in(dir.path(), &["branch", "-q", "-m", "master", "trunk"]);
         assert_eq!(main_ref(&root), MainRef::Absent);
@@ -2806,7 +3399,7 @@ some-future-field whatever
     #[test]
     fn a_failed_main_lookup_is_named_on_the_worktrees_it_left_unmeasured() {
         let (main, _parent, _linked) = repo_with_worktrees(2);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let listed = crate::engine::git_cli::with_forced_spawn_failure_of("for-each-ref", || {
             list_worktrees(root.to_str().unwrap())
         })
@@ -2823,7 +3416,7 @@ some-future-field whatever
     #[test]
     fn each_scan_depth_spawns_only_what_it_measures() {
         let (main, _parent, linked) = repo_with_worktrees(3);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let mut cwds = linked.clone();
         cwds.push(root.clone());
 
@@ -2852,7 +3445,7 @@ some-future-field whatever
         scan_dirty(&mut target);
         assert_eq!(target.dirty_files, Some(1));
         assert_eq!(target.scan_note, None);
-        let others = [main.path().canonicalize().unwrap(), linked[0].clone()];
+        let others = [plain(main.path()), linked[0].clone()];
         assert_eq!(spawned_with(&others, "status"), 0);
     }
 
@@ -2910,7 +3503,10 @@ some-future-field whatever
     fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
         let started = std::time::Instant::now();
         while !ready() {
-            assert!(started.elapsed() < Duration::from_secs(10), "never {what}");
+            assert!(
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "never {what}"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -2934,7 +3530,7 @@ some-future-field whatever
     #[test]
     fn concurrent_listings_share_one_scan_at_the_deepest_depth() {
         let (main, _parent, linked) = repo_with_worktrees(3);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let before = listings_in(&root);
         let leader = lead(&root, ScanDepth::Dirty, Duration::from_secs(2));
         wait_until("gathering", || gathering(&root));
@@ -2974,7 +3570,7 @@ some-future-field whatever
     #[test]
     fn a_listing_already_reading_is_never_handed_to_a_later_caller() {
         let (main, _parent, linked) = repo_with_worktrees(1);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let before = listings_in(&root);
         let (computed_tx, computed_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -2999,15 +3595,28 @@ some-future-field whatever
         wait_until("queued behind the reading listing", || gathering(&root));
         // It does not read alongside the first: one scan of a repository at a
         // time.
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(
-            listings_in(&root) - before,
-            1,
-            "the later listing read early"
-        );
+        // Bounded negative: poll the whole window and fail at the first read
+        // that appears, rather than sampling once after a fixed sleep. The
+        // positive control is below: once released the later listing does
+        // read, so a counter that could never move would fail there.
+        let window = std::time::Instant::now() + Duration::from_millis(150);
+        while std::time::Instant::now() < window {
+            assert_eq!(
+                listings_in(&root) - before,
+                1,
+                "the later listing read early"
+            );
+            assert!(!late.is_finished(), "the later listing ended while queued");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         release_tx.send(()).unwrap();
         let early = early.join().unwrap().expect("early");
         let late = late.join().unwrap().expect("late");
+        assert_eq!(
+            listings_in(&root) - before,
+            2,
+            "positive control: the later listing read once released"
+        );
         assert_eq!(early[1].dirty_files, Some(0), "read before the change");
         assert_eq!(
             late[1].dirty_files,
@@ -3022,7 +3631,7 @@ some-future-field whatever
     fn listings_share_only_within_one_admission_class_and_depth_listing_never_waits() {
         use crate::engine::git_cli::{with_admission, Admission};
         let (main, _parent, _linked) = repo_with_worktrees(1);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let before = listings_in(&root);
         let leader = lead(&root, ScanDepth::Dirty, Duration::from_millis(500));
         wait_until("gathering", || gathering(&root));
@@ -3030,7 +3639,7 @@ some-future-field whatever
         let started = std::time::Instant::now();
         let bare = list_worktrees_scanned(&path, ScanDepth::Listing).expect("listing");
         assert!(
-            started.elapsed() < Duration::from_millis(400),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(400)),
             "a bare listing waited {:?}",
             started.elapsed()
         );
@@ -3053,7 +3662,7 @@ some-future-field whatever
     #[test]
     fn a_failed_shared_listing_fails_every_caller_and_frees_the_lane() {
         let (main, _parent, _linked) = repo_with_worktrees(0);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let leader = lead(&root, ScanDepth::Dirty, Duration::from_millis(300));
         wait_until("gathering", || gathering(&root));
         let path = root.to_str().unwrap().to_string();
@@ -3066,5 +3675,62 @@ some-future-field whatever
         let led = led.expect_err("the broken repository listed");
         assert_eq!(Err(led), joined.map(|listed| as_json(&listed)));
         assert!(!gathering(&root));
+    }
+
+    /// The metadata view names exactly what `git worktree list` names — the
+    /// primary checkout, live linked worktrees, no pruned ones — and gives up
+    /// (`None`) where the layout cannot account for the primary checkout.
+    #[test]
+    fn metadata_checkouts_match_git_and_give_up_on_core_worktree() {
+        let main = tempfile::TempDir::new().unwrap();
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").unwrap();
+        git_in(main.path(), &["add", "."]);
+        git_in(main.path(), &["commit", "-m", "init"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        let live = parent.path().join("live");
+        let pruned = parent.path().join("pruned");
+        for path in [&live, &pruned] {
+            git_in(
+                main.path(),
+                &["worktree", "add", "--detach", path.to_str().unwrap()],
+            );
+        }
+        crate::test_support::trust_repo(&live);
+        std::fs::remove_dir_all(&pruned).unwrap();
+
+        let repo = main.path().to_str().unwrap();
+        let live_path = live.canonicalize().unwrap();
+        let pair = admit_worktree_pair(repo, live_path.to_str().unwrap()).expect("admitted");
+        let mut from_metadata = pair
+            .metadata_checkouts()
+            .expect("a plain layout is accounted for");
+        from_metadata.sort();
+        from_metadata.dedup();
+        let mut from_git = pair.clone().authenticate().expect("authenticated").members;
+        from_git.sort();
+        assert_eq!(from_metadata, from_git);
+        assert!(!from_metadata.iter().any(|path| path.ends_with("pruned")));
+
+        git_in(
+            main.path(),
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        assert!(
+            pair.metadata_checkouts().is_some(),
+            "extensions.worktreeConfig does not move the primary checkout"
+        );
+
+        git_in(main.path(), &["config", "include.path", "elsewhere.cfg"]);
+        assert_eq!(pair.metadata_checkouts(), None, "an include may set it");
+        git_in(main.path(), &["config", "--unset", "include.path"]);
+        assert!(pair.metadata_checkouts().is_some());
+
+        git_in(main.path(), &["config", "core.worktree", repo]);
+        assert_eq!(
+            pair.metadata_checkouts(),
+            None,
+            "a configured core.worktree must send the caller to Git"
+        );
     }
 }

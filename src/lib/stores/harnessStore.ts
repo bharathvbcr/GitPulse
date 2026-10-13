@@ -795,6 +795,27 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       }));
     },
 
+    /**
+     * Drops a closed repository's journal cache: its bucket and the spellings
+     * that resolved to it. The ledger on disk is the record; this is only the
+     * in-memory copy, which otherwise grows with every repository ever
+     * opened. The unscoped bucket is never dropped, and an active bucket
+     * falls back to it until the next repository is activated.
+     */
+    forgetRepository: (repoPath: string): void => {
+      const key = repositoryAddress(repoPath).key;
+      if (key === UNSCOPED_REPOSITORY || !ledgerBuckets.has(key)) return;
+      ledgerBuckets.delete(key);
+      for (const [alias, destination] of [...repositoryAliases]) {
+        if (alias === key || destination === key) repositoryAliases.delete(alias);
+      }
+      repositoryAliases.delete(rawRepositoryAddress(repoPath).key);
+      if (activeRepositoryKey === key) activateRepository(null);
+    },
+
+    /** The repositories whose journals are cached, for tests and diagnostics that watch for growth. */
+    cachedRepositories: (): number => ledgerBuckets.size - 1,
+
     clearActions: () => {
       // Clears the *view*, never the ledger. The record on disk is what makes
       // the history answerable after a crash; a UI button must not be able to

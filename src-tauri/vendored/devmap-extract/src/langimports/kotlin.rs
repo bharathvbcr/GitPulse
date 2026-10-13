@@ -28,9 +28,15 @@ pub(crate) fn extract_import(node: Node, source: &str, imports: &mut Vec<Extract
     let Some(specifier) = jvm_dotted_specifier(node, source) else {
         return;
     };
-    imports.push(file_import(
-        &get_node_text(node, source),
-        specifier,
-        node_span(node),
-    ));
+    let mut import = file_import(&get_node_text(node, source), specifier, node_span(node));
+    // `import a.b.format as fmt`: the grammar puts the alias in an identifier
+    // after the dotted name. Without it `fmt(3)` names nothing the file binds.
+    let mut cursor = node.walk();
+    let mut named = node.named_children(&mut cursor);
+    if let (Some(path), Some(alias)) = (named.next(), named.next()) {
+        if path.kind() == "qualified_identifier" && alias.kind() == "identifier" {
+            import.alias = Some(get_node_text(alias, source));
+        }
+    }
+    imports.push(import);
 }

@@ -5,7 +5,6 @@ import {
   computeWordDiff,
   createParseCache,
   emptyDiffCopy,
-  filterFilePatch,
   isImagePath,
   parseUnifiedDiff,
   replacementBlockBounds,
@@ -453,98 +452,6 @@ describe("parseUnifiedDiff meta classification", () => {
     const lines = parseUnifiedDiff(twoFile);
     const five = lines.find((l) => l.type === "add" && l.content === "+five");
     expect(five?.newNo).toBe(5);
-  });
-});
-
-describe("filterFilePatch", () => {
-  const multiFile = [
-    "commit abcdef1234567890",
-    "Author: Ada <ada@example.com>",
-    "",
-    "    subject line",
-    "",
-    "diff --git a/src/a.rs b/src/a.rs",
-    "index aaa..bbb 100644",
-    "--- a/src/a.rs",
-    "+++ b/src/a.rs",
-    "@@ -1 +1 @@",
-    "-alpha",
-    "+ALPHA",
-    "diff --git a/src/b.ts b/src/b.ts",
-    "index ccc..ddd 100644",
-    "--- a/src/b.ts",
-    "+++ b/src/b.ts",
-    "@@ -1 +1 @@",
-    "-beta",
-    "+BETA",
-    "diff --git a/old_name.txt b/new_name.txt",
-    "similarity index 100%",
-    "rename from old_name.txt",
-    "rename to new_name.txt",
-  ].join("\n");
-
-  it("extracts exactly one file's patch with its metadata block", () => {
-    const patch = filterFilePatch(multiFile, "src/b.ts");
-    expect(patch).toContain("diff --git a/src/b.ts b/src/b.ts");
-    expect(patch).toContain("+BETA");
-    expect(patch).not.toContain("ALPHA");
-    expect(patch).not.toContain("rename from");
-    expect(patch.split("\n")[0]).toBe("diff --git a/src/b.ts b/src/b.ts");
-  });
-
-  it("matches pure renames by their new name", () => {
-    expect(filterFilePatch(multiFile, "new_name.txt")).toContain("rename to new_name.txt");
-    expect(filterFilePatch(multiFile, "old_name.txt")).toContain("rename from old_name.txt");
-  });
-
-  it("drops the git-show preamble before the first file header", () => {
-    const patch = filterFilePatch(multiFile, "src/a.rs");
-    expect(patch).not.toContain("Author:");
-    expect(patch).not.toContain("subject line");
-  });
-
-  it("returns empty for paths absent from the diff and for empty input", () => {
-    expect(filterFilePatch(multiFile, "src/missing.rs")).toBe("");
-    expect(filterFilePatch("", "src/a.rs")).toBe("");
-    expect(filterFilePatch(multiFile, "")).toBe("");
-  });
-
-  it("does not let one path shadow a longer sibling path", () => {
-    const tricky = [
-      "diff --git a/src/a.ts b/src/a.ts",
-      "--- a/src/a.ts",
-      "+++ b/src/a.ts",
-      "@@ -1 +1 @@",
-      "-x",
-      "diff --git a/src/a.ts.bak b/src/a.ts.bak",
-      "--- a/src/a.ts.bak",
-      "+++ b/src/a.ts.bak",
-      "@@ -1 +1 @@",
-      "-y",
-    ].join("\n");
-    expect(filterFilePatch(tricky, "src/a.ts")).not.toContain(".bak");
-    expect(filterFilePatch(tricky, "src/a.ts.bak")).toContain("-y");
-  });
-
-  it("handles quoted diff headers for paths with special characters", () => {
-    const quoted =
-      'diff --git "a/weird\tname" "b/weird\tname"\nindex aaa..bbb 100644\n--- "a/weird\tname"\n+++ "b/weird\tname"\n@@ -1 +1 @@\n-q\n+Q\n'.replace(
-        /\t/g,
-        " "
-      );
-    expect(filterFilePatch(quoted, "weird name")).toContain("+Q");
-  });
-
-  it("keeps timestamps after the path from breaking +++/--- matching", () => {
-    const stamped = [
-      "diff --git a/x.txt b/x.txt",
-      "--- a/x.txt\t2026-01-01 00:00:00.000000000 +0000",
-      "+++ b/x.txt\t2026-08-24 00:00:00.000000000 +0000",
-      "@@ -1 +1 @@",
-      "-t",
-      "+T",
-    ].join("\n");
-    expect(filterFilePatch(stamped, "x.txt")).toContain("+T");
   });
 });
 

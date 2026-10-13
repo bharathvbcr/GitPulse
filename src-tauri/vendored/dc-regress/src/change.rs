@@ -41,7 +41,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::history::{run_git, HistoryRefusal, LOG_OUTPUT_CAP};
+use crate::history::{commit_oid, run_git, HistoryRefusal, LOG_OUTPUT_CAP};
 
 /// Bytes of `git diff --unified=0` output kept.
 ///
@@ -278,10 +278,11 @@ pub fn parent_count(
     repo: &Path,
     commit: &str,
 ) -> Result<usize, HistoryRefusal> {
+    let commit = commit_oid(program, repo, commit)?;
     let captured = run_git(
         program,
         repo,
-        &["rev-list", "--parents", "--max-count=1", commit],
+        &["rev-list", "--parents", "--max-count=1", &commit],
         "git rev-list --parents",
         8 * 1024,
     )?;
@@ -305,6 +306,11 @@ pub fn changes_between_with_program(
     since: &str,
     until: &str,
 ) -> Result<ChangeSet, ChangeRefusal> {
+    let git_refusal = |refusal: HistoryRefusal| ChangeRefusal::Git {
+        reason: refusal.describe(),
+    };
+    let since = commit_oid(program, repo, since).map_err(git_refusal)?;
+    let until = commit_oid(program, repo, until).map_err(git_refusal)?;
     let captured = run_git(
         program,
         repo,
@@ -324,8 +330,8 @@ pub fn changes_between_with_program(
             // under its post-image name rather than a delete plus an add whose
             // added half looks like a wholly new file.
             "--find-renames",
-            since,
-            until,
+            &since,
+            &until,
         ],
         "git diff",
         DIFF_OUTPUT_CAP,

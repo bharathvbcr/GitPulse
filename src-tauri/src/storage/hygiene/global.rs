@@ -570,75 +570,75 @@ impl Cleaner {
         self.cancel.store(false, Ordering::SeqCst);
         let service = Arc::clone(self);
         let run_id = run.id.clone();
-        std::thread::Builder::new()
-            .name("gitpulse-cleaner-run".into())
-            .spawn(move || {
-                let _run_lock = run_lock;
-                let _reset = Reset(&service.active);
-                let mut run = run;
-                let done = Arc::new(AtomicBool::new(false));
-                let _monitor_stop = MonitorStop(Arc::clone(&done));
-                let finished = Arc::clone(&done);
-                let watched = Arc::clone(&service);
-                let watched_config = config.clone();
-                let watched_id = run.id.clone();
-                let monitor = std::thread::Builder::new()
-                    .name("gitpulse-cleaner-cancel".into())
-                    .spawn(move || {
-                        while !finished.load(Ordering::SeqCst) {
-                            if watched
-                                .still_authorized(&watched_config, &watched_id)
-                                .is_err()
-                            {
-                                if let Err(e) = watched.stop_current() {
-                                    log::error!("Could not stop revoked cleanup: {e}");
-                                }
-                                break;
+        crate::supervisor::spawn_once("gitpulse-cleaner-run", "cleaner run", move || {
+            let _run_lock = run_lock;
+            let _reset = Reset(&service.active);
+            let mut run = run;
+            let done = Arc::new(AtomicBool::new(false));
+            let _monitor_stop = MonitorStop(Arc::clone(&done));
+            let finished = Arc::clone(&done);
+            let watched = Arc::clone(&service);
+            let watched_config = config.clone();
+            let watched_id = run.id.clone();
+            let monitor = crate::supervisor::spawn_once(
+                "gitpulse-cleaner-cancel",
+                "cleaner cancellation monitor",
+                move || {
+                    while !finished.load(Ordering::SeqCst) {
+                        if watched
+                            .still_authorized(&watched_config, &watched_id)
+                            .is_err()
+                        {
+                            if let Err(e) = watched.stop_current() {
+                                log::error!("Could not stop revoked cleanup: {e}");
                             }
-                            std::thread::sleep(Duration::from_millis(200));
+                            break;
                         }
-                    });
-                let outcome = match monitor {
-                    Ok(monitor) => {
-                        let outcome = service.perform(&config, &mut run);
-                        done.store(true, Ordering::SeqCst);
-                        if monitor.join().is_err() {
-                            Err("Cancellation monitor failed".into())
-                        } else {
-                            outcome
-                        }
+                        std::thread::sleep(Duration::from_millis(200));
                     }
-                    Err(e) => Err(format!("Cancellation monitor unavailable: {e}")),
-                };
-                if let Err(error) = outcome {
-                    run.status = if service.cancel.load(Ordering::SeqCst) {
-                        "cancelled"
+                },
+            );
+            let outcome = match monitor {
+                Ok(monitor) => {
+                    let outcome = service.perform(&config, &mut run);
+                    done.store(true, Ordering::SeqCst);
+                    if monitor.join().is_err() {
+                        Err("Cancellation monitor failed".into())
                     } else {
-                        "incomplete"
-                    }
-                    .into();
-                    if run.issues.len() < 128 {
-                        run.issues.push(error);
+                        outcome
                     }
                 }
-                run.finished_at = super::now();
-                if let Err(e) = service.record(&run) {
-                    log::error!("Cleaner history could not be saved: {e}");
+                Err(e) => Err(format!("Cancellation monitor unavailable: {e}")),
+            };
+            if let Err(error) = outcome {
+                run.status = if service.cancel.load(Ordering::SeqCst) {
+                    "cancelled"
+                } else {
+                    "incomplete"
                 }
-            })
-            .map_err(|e| {
-                if let Err(failure) = self.update(|s| {
-                    if let Some(r) = s.history.iter_mut().find(|r| r.id == run_id) {
-                        r.status = "failed".into();
-                        r.finished_at = now;
-                        r.issues.push(e.to_string());
-                    }
-                    Ok(())
-                }) {
-                    log::error!("Cleaner dispatch failure could not be saved: {failure}");
+                .into();
+                if run.issues.len() < 128 {
+                    run.issues.push(error);
                 }
-                e.to_string()
-            })?;
+            }
+            run.finished_at = super::now();
+            if let Err(e) = service.record(&run) {
+                log::error!("Cleaner history could not be saved: {e}");
+            }
+        })
+        .map_err(|e| {
+            if let Err(failure) = self.update(|s| {
+                if let Some(r) = s.history.iter_mut().find(|r| r.id == run_id) {
+                    r.status = "failed".into();
+                    r.finished_at = now;
+                    r.issues.push(e.to_string());
+                }
+                Ok(())
+            }) {
+                log::error!("Cleaner dispatch failure could not be saved: {failure}");
+            }
+            e.to_string()
+        })?;
         std::mem::forget(reservation);
         self.state()
     }
@@ -834,28 +834,27 @@ pub fn start_scheduler() -> Result<(), String> {
     if SCHEDULER_STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    std::thread::Builder::new()
-        .name("gitpulse-cleaner-clock".into())
-        .spawn(move || loop {
-            match cleaner.state() {
-                Ok(state)
-                    if state.config.enabled
-                        && !state.running
-                        && super::now() >= state.config.next_run_at =>
-                {
-                    if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
-                        log::warn!("Scheduled cleaner could not start: {e}");
-                    }
+    crate::supervisor::spawn_loop(
+        "gitpulse-cleaner-clock",
+        Duration::from_secs(30),
+        move || match cleaner.state() {
+            Ok(state)
+                if state.config.enabled
+                    && !state.running
+                    && super::now() >= state.config.next_run_at =>
+            {
+                if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
+                    log::warn!("Scheduled cleaner could not start: {e}");
                 }
-                Ok(_) => {}
-                Err(e) => log::warn!("Cleaner schedule is unavailable: {e}"),
             }
-            std::thread::sleep(Duration::from_secs(30));
-        })
-        .map_err(|e| {
-            SCHEDULER_STARTED.store(false, Ordering::SeqCst);
-            e.to_string()
-        })?;
+            Ok(_) => {}
+            Err(e) => log::warn!("Cleaner schedule is unavailable: {e}"),
+        },
+    )
+    .map_err(|e| {
+        SCHEDULER_STARTED.store(false, Ordering::SeqCst);
+        e.to_string()
+    })?;
     Ok(())
 }
 

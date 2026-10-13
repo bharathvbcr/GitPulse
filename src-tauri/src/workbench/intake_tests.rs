@@ -354,6 +354,15 @@ fn concurrent_writers_never_duplicate_or_lose_a_task() {
     let (_dir, path) = profile();
     let repo = git_repo();
     let repo_path = repo.path().to_str().unwrap().to_string();
+    // The profile's tables are built, and migrated, by its first request. A
+    // second handle arriving while that is under way meets a schema that is
+    // not yet current and is refused (`schema_upgrade_required`), because a
+    // reader never upgrades; that is dc-store's creation race and not what
+    // this test is about, so the profile exists before the writers start.
+    Store::open(&path)
+        .unwrap()
+        .workbench_request("repositories.list", "{}")
+        .unwrap();
     let threads = 16;
     let keys = 25;
     let handles: Vec<_> = (0..threads)
@@ -366,16 +375,26 @@ fn concurrent_writers_never_duplicate_or_lose_a_task() {
                 for i in 0..keys {
                     // Every worker races on every key, in a different order.
                     let k = (i * 7 + worker) % keys;
-                    match add_task(
-                        &store,
-                        &repo_path,
-                        task(&format!("gp-{k}"), &format!("Task {k}")),
-                        false,
-                        &[],
-                    ) {
-                        Ok(v) => outcomes.push(v["outcome"].as_str().unwrap().to_string()),
-                        Err(e) => outcomes.push(e.code),
-                    }
+                    // `board_changed` is the store saying the board moved
+                    // under this writer's scan, which sixteen writers filing
+                    // at once make routine. The documented answer is to call
+                    // again, so a writer does, a bounded number of times.
+                    let mut tries = 0;
+                    let outcome = loop {
+                        tries += 1;
+                        match add_task(
+                            &store,
+                            &repo_path,
+                            task(&format!("gp-{k}"), &format!("Task {k}")),
+                            false,
+                            &[],
+                        ) {
+                            Ok(v) => break v["outcome"].as_str().unwrap().to_string(),
+                            Err(e) if e.code == "board_changed" && tries < 200 => continue,
+                            Err(e) => break e.code,
+                        }
+                    };
+                    outcomes.push(outcome);
                 }
                 outcomes
             })
@@ -583,6 +602,12 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
     let repo = git_repo();
     let repo_path = repo.path().to_str().unwrap();
     let id = filed(&store, &repo, "gp-ship", "Ship the exporter");
+    // An agent's `done` needs Manvi's passed verdict for the current head.
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    gate_tests::verified(&store, &repo, &id);
     complete_task(
         &store,
         repo_path,
@@ -590,6 +615,7 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
         "done",
         None,
         Some("Exporter shipped"),
+        None,
     )
     .unwrap();
     person_edits(&store, &id, |input| {
@@ -607,6 +633,7 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
         "done",
         None,
         Some("release notes shipped"),
+        None,
     )
     .unwrap();
     assert_eq!(again["outcome"], "updated", "{again}");
@@ -627,6 +654,7 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
         "done",
         None,
         Some("release notes shipped"),
+        None,
     )
     .unwrap();
     assert_eq!(retry["outcome"], "unchanged");
@@ -651,7 +679,16 @@ fn a_deletion_reason_is_written_as_its_own_block() {
             json!("--- Agent is deleting this task (2026-01-01T00:00:00Z) ---\nOlder attempt\n\nNote: duplicate of gp-ship"),
         );
     });
-    let deleted = delete_task(&store, repo_path, &id, None, "duplicate of gp-ship", false).unwrap();
+    let deleted = delete_task(
+        &store,
+        repo_path,
+        &id,
+        None,
+        "duplicate of gp-ship",
+        false,
+        None,
+    )
+    .unwrap();
     assert_eq!(deleted["outcome"], "deleted");
     let last = last_revision(&store, &id).unwrap().unwrap();
     assert!(
@@ -729,18 +766,19 @@ fn a_task_another_agent_is_running_is_not_deleted_by_default() {
 
     let id = filed(&store, &repo, "gp-busy", "Card an agent is working on");
     prepare_run(&store, &repo, &id, "run-busy");
-    let error = delete_task(&store, repo_path, &id, None, "duplicate", false).expect_err("refused");
+    let error =
+        delete_task(&store, repo_path, &id, None, "duplicate", false, None).expect_err("refused");
     assert_eq!(error.code, "task_in_use", "{}", error.message);
     assert!(error.message.contains("run-busy"), "{}", error.message);
     assert!(live(&store, &id).is_some());
 
     assert_eq!(
-        delete_task(&store, repo_path, &other, None, "duplicate", false).unwrap()["outcome"],
+        delete_task(&store, repo_path, &other, None, "duplicate", false, None).unwrap()["outcome"],
         "deleted"
     );
 
     // The caller who is that agent, or was asked by the person, says so.
-    let forced = delete_task(&store, repo_path, &id, None, "duplicate", true).unwrap();
+    let forced = delete_task(&store, repo_path, &id, None, "duplicate", true, None).unwrap();
     assert_eq!(forced["outcome"], "deleted");
 }
 
@@ -760,11 +798,13 @@ fn an_agent_whose_task_was_deleted_is_told_so_and_why() {
         None,
         "Folded into the exporter card",
         false,
+        None,
     )
     .unwrap();
 
     for error in [
-        complete_task(&store, repo_path, &id, "done", None, Some("did it")).expect_err("deleted"),
+        complete_task(&store, repo_path, &id, "done", None, Some("did it"), None)
+            .expect_err("deleted"),
         get_task(&store, repo_path, &id).expect_err("deleted"),
     ] {
         assert_eq!(error.code, "task_deleted", "{}", error.message);
@@ -848,4 +888,115 @@ fn an_archived_task_is_not_open_work_for_the_related_task_gate() {
     let error = add_task(&store, repo_path, task("dm-third", title), false, &[]).unwrap_err();
     assert_eq!(error.code, "related_tasks_exist", "{}", error.message);
     assert!(!error.message.contains(&shelved), "{}", error.message);
+}
+
+/// The identical call, retried after its response was lost, must be `unchanged`.
+#[test]
+fn complete_retry_with_expected_revision_is_unchanged() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-retry", "Retry me");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    let first = complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        Some(rev),
+        Some("did it"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(first["outcome"], "updated", "{first}");
+    let retry = complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        Some(rev),
+        Some("did it"),
+        None,
+    );
+    assert!(
+        retry.as_ref().is_ok_and(|v| v["outcome"] == "unchanged"),
+        "identical retry: {:?}",
+        retry.map_err(|e| (e.code, e.message))
+    );
+}
+
+/// A stale revision on a call that would change something is still refused.
+#[test]
+fn complete_with_a_stale_revision_that_would_change_the_task_is_refused() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-stale", "Stale");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    person_edits(&store, &id, |input| {
+        input.insert("title".into(), json!("Edited by a person"));
+    });
+    let error = complete_task(&store, repo_path, &id, "review", Some(rev), None, None).unwrap_err();
+    assert_eq!(error.code, "revision_conflict");
+}
+
+#[test]
+fn delete_retry_after_success_is_unchanged() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-del", "Delete me");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    let first = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None).unwrap();
+    assert_eq!(first["outcome"], "deleted", "{first}");
+    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None);
+    assert!(
+        retry.as_ref().is_ok_and(|v| v["outcome"] == "unchanged"),
+        "identical retry: {:?}",
+        retry.map_err(|e| (e.code, e.message))
+    );
+}
+
+/// The state `Removal::Interrupted` leaves (reason block recorded, revision
+/// bumped, item still live), whose error says "Run the same call again".
+#[test]
+fn delete_retry_after_interrupted_delete_finishes() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-int", "Interrupted delete");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    // Exactly what record_and_delete writes before its items.delete.
+    person_edits(&store, &id, |input| {
+        let logs = input["logs"].as_str().unwrap_or_default().to_owned();
+        let joined = append_log(&logs, &deletion_block("duplicate", now_millis())).unwrap();
+        input.insert("logs".into(), json!(joined));
+    });
+    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None);
+    assert!(
+        retry.as_ref().is_ok_and(|v| v["outcome"] == "deleted"),
+        "'run the same call again' after Interrupted: {:?}",
+        retry.map_err(|e| (e.code, e.message))
+    );
+}
+
+/// A reason block with someone else's edit on top is not the call's own work.
+#[test]
+fn delete_retry_after_an_unrelated_edit_is_still_a_conflict() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-edit", "Edited");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    person_edits(&store, &id, |input| {
+        input.insert("title".into(), json!("Edited by a person"));
+    });
+    let error =
+        delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None).unwrap_err();
+    assert_eq!(error.code, "revision_conflict");
 }

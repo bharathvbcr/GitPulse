@@ -26,7 +26,7 @@
 
 import type { LauncherKind } from "./tabs";
 import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
-import { DEFAULT_TERMINAL_SESSIONS, isTerminalSessionLimit } from "./sessionLimit";
+import { isTerminalSessionLimit } from "./sessionLimit";
 
 /**
  * Permission modes, least authority first, so the dangerous end of the range
@@ -105,7 +105,7 @@ export interface AgentDefaults {
   claude_setting_sources?: ClaudeSettingSource[];
   /**
    * How many terminal sessions may be open at once, across every repository.
-   * Absent means {@link DEFAULT_TERMINAL_SESSIONS}; see `sessionLimit.ts`.
+   * Absent means `DEFAULT_TERMINAL_SESSIONS`; see `sessionLimit.ts`.
    */
   max_terminal_sessions?: number;
   /**
@@ -164,6 +164,17 @@ export const MODEL_FIELDS_BY_LAUNCHER: Readonly<Partial<Record<LauncherKind, rea
  */
 export const MODEL_SUGGESTIONS: Readonly<Partial<Record<LauncherKind, Partial<Record<ModelField, readonly string[]>>>>> = {
   claude: { advisor: ["fable", "opus", "sonnet"] },
+};
+
+/**
+ * The models a task handoff offers as a choice rather than a typed name,
+ * per launcher and field. Claude Code's four family aliases, which always
+ * name its current model in each family, so the list does not go stale as
+ * model ids change; the advisor offers the three names above. A launcher or
+ * field absent here keeps a free-text field.
+ */
+export const HANDOFF_MODEL_CHOICES: Readonly<Partial<Record<LauncherKind, Partial<Record<"model" | "advisor", readonly string[]>>>>> = {
+  claude: { model: ["fable", "opus", "sonnet", "haiku"], advisor: MODEL_SUGGESTIONS.claude?.advisor },
 };
 
 /**
@@ -348,9 +359,4 @@ export function isLiveRunLimit(value: unknown): value is number {
 /** The limit a launch will pass: the stored one, or the store's default. */
 export function liveRunLimit(defaults: AgentDefaults): number {
   return isLiveRunLimit(defaults.max_live_runs) ? defaults.max_live_runs : DEFAULT_LIVE_RUNS;
-}
-
-/** The terminal session limit a save will apply: the stored one, or the default. */
-export function terminalSessionLimitOf(defaults: AgentDefaults): number {
-  return isTerminalSessionLimit(defaults.max_terminal_sessions) ? defaults.max_terminal_sessions : DEFAULT_TERMINAL_SESSIONS;
 }

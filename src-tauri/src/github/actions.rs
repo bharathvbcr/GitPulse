@@ -6,9 +6,8 @@
 //! run via the same `*_argv` builders this module owns, and a refusal happens
 //! before the first byte leaves the process.
 //!
-//! Repo pinning uses gh's documented `[HOST/]OWNER/REPO` form for `-R` —
-//! these subcommands inherit only `--repo` (verified against gh 2.95.0), not
-//! the separate `--hostname` flag the older repo-context calls use.
+//! Repo pinning is `super::gh_repo_flags`, gh's documented `[HOST/]OWNER/REPO`
+//! form for `-R`; these subcommands have no separate `--hostname` flag.
 
 use super::{
     discover_github_remote, gh_cli_reported_present, gh_unavailable_reason, probe_gh_cli,
@@ -56,23 +55,6 @@ impl WorkflowsReport {
             error,
         }
     }
-}
-
-/// The value of gh's `-R [HOST/]OWNER/REPO` flag for this remote.
-///
-/// The host prefix pins GHES calls to the right instance; on github.com it is
-/// omitted so the line stays exactly as documented.
-fn repo_flag_value(remote: &GitHubRepoRef) -> String {
-    if remote.host.eq_ignore_ascii_case("github.com") {
-        remote.slug()
-    } else {
-        format!("{}/{}/{}", remote.host, remote.owner, remote.name)
-    }
-}
-
-fn append_repo_flags(args: &mut Vec<String>, remote: &GitHubRepoRef) {
-    args.push("--repo".to_string());
-    args.push(repo_flag_value(remote));
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +119,7 @@ fn workflow_file_label(path: &str) -> String {
 pub fn list_workflows(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowInfo>, bool), String> {
     let fetch_limit = (WORKFLOW_DISPLAY_LIMIT + 1).to_string();
     let mut args = workflow_list_leading_args(&fetch_limit);
-    append_repo_flags(&mut args, remote);
+    args.extend(super::gh_repo_flags(remote));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = capture_command("gh", &refs, None, GH_CALL_TIMEOUT, &[])?;
     if !stdout.success {
@@ -200,7 +182,7 @@ pub fn trigger_workflow_argv(
         "--ref".to_string(),
         r#ref.to_string(),
     ];
-    append_repo_flags(&mut args, remote);
+    args.extend(super::gh_repo_flags(remote));
     Ok(args)
 }
 
@@ -223,7 +205,7 @@ pub fn rerun_run_argv(remote: &GitHubRepoRef, run_id: u64) -> Result<Vec<String>
         "rerun".to_string(),
         run_id.to_string(),
     ];
-    append_repo_flags(&mut args, remote);
+    args.extend(super::gh_repo_flags(remote));
     Ok(args)
 }
 
@@ -245,7 +227,7 @@ pub fn cancel_run_argv(remote: &GitHubRepoRef, run_id: u64) -> Result<Vec<String
         "cancel".to_string(),
         run_id.to_string(),
     ];
-    append_repo_flags(&mut args, remote);
+    args.extend(super::gh_repo_flags(remote));
     Ok(args)
 }
 
@@ -270,7 +252,7 @@ fn validate_run_id(run_id: u64) -> Result<(), String> {
 /// `args` is a full argv line starting with the program name; everything
 /// after it is passed to gh verbatim. Non-zero exits surface gh's stderr,
 /// tail-capped so a chatty failure cannot flood a report.
-fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
+pub(crate) fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
     debug_assert!(
         args.first().map(String::as_str) == Some("gh"),
         "argv builders must include the program name"
@@ -334,9 +316,12 @@ mod tests {
 
     #[test]
     fn repo_flag_value_prefixes_host_only_for_ghes() {
-        assert_eq!(repo_flag_value(&remote("github.com")), "acme/gitpulse");
         assert_eq!(
-            repo_flag_value(&remote("acme.ghe.com")),
+            crate::github::gh_repo_flag_value(&remote("github.com")),
+            "acme/gitpulse"
+        );
+        assert_eq!(
+            crate::github::gh_repo_flag_value(&remote("acme.ghe.com")),
             "acme.ghe.com/acme/gitpulse"
         );
     }

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { RefreshCw } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";
@@ -53,17 +54,21 @@
   let triggerEl: HTMLButtonElement | undefined = $state();
   let refreshing = $state(false);
 
+  // Keyed on the repository alone, so the store's other publishes do not
+  // resubscribe — each resubscription restarted the metric's debounce.
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       rawSnapshot = null;
       mix = EMPTY;
       open = false;
       return;
     }
-    return locMetric.subscribe(path, (snap: MetricSnapshot<LanguageStatsReport>) => {
-      rawSnapshot = snap;
-    });
+    return untrack(() =>
+      locMetric.subscribe(path, (snap: MetricSnapshot<LanguageStatsReport>) => {
+        rawSnapshot = snap;
+      }),
+    );
   });
 
   $effect(() => {

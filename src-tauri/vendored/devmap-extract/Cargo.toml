@@ -2,12 +2,25 @@
 name = "devmap-extract"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Tree-sitter extraction frontend for the DevCouncil code-intelligence kernel"
+autotests = false
+
+[[test]]
+name = "it"
+
+[[test]]
+name = "global_excludes_are_one_rule"
+
+[[test]]
+name = "a_deadline_reaches_the_children_the_child_started"
 
 [dependencies]
 dc-proc = { path = "../dc-proc" }
+dc-glob = { path = "../dc-glob" }
+dc-redact = { path = "../dc-redact" }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 rayon = { version = "1.10" }
@@ -117,86 +130,14 @@ parse = [
 # --no-default-features` reported a build error rather than results — meaning the
 # configuration an embedder ships had never had a single test run against it.
 #
-# `required-features` skips these targets when `parse` is off instead of failing
-# the build, so the feature-off configuration is testable. The two tests absent
-# from this list — `ignore_rule_tolerance` — touches only the model and the
-# walker, and runs in both configurations. The `budget_probe` example is
-# gated for the same reason: it drives the parser directly.
+# The integration tests are one target, `tests/it.rs`, whose modules are the
+# files under `tests/`. A file that needs a grammar is declared
+# `#[cfg(feature = "parse")]` there, which skips it when `parse` is off rather
+# than failing the build; `every_test_target_declares_its_grammar_need` reads
+# those lines.
 #
 # Nothing changes with default features on: `parse` is in `default`, so all
 # fifteen targets build and run exactly as before.
-
-[[test]]
-name = "adversarial_corpus"
-required-features = ["parse"]
-
-[[test]]
-name = "mutation_fuzz"
-required-features = ["parse"]
-
-[[test]]
-name = "budget_is_a_real_bound"
-required-features = ["parse"]
-
-[[test]]
-name = "c_family"
-required-features = ["parse"]
-
-[[test]]
-name = "capped_reads_say_so"
-required-features = ["parse"]
-
-[[test]]
-name = "a_call_is_one_site_hardening"
-required-features = ["parse"]
-
-[[test]]
-name = "a_receiver_is_not_its_operator"
-required-features = ["parse"]
-
-[[test]]
-name = "a_call_is_one_site_not_two"
-required-features = ["parse"]
-
-[[test]]
-name = "cprobe"
-required-features = ["parse"]
-
-[[test]]
-name = "declarations"
-required-features = ["parse"]
-
-[[test]]
-name = "grammar_matrix"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_jvm_dotnet"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_lua_r"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_ruby_php"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_swift_scala"
-required-features = ["parse"]
-
-[[test]]
-name = "stress_hardening"
-required-features = ["parse"]
-
-[[test]]
-name = "test_phase2_hardening"
-required-features = ["parse"]
-
-[[test]]
-name = "metal_coverage"
-required-features = ["parse"]
 
 [[example]]
 name = "budget_probe"
@@ -214,114 +155,3 @@ required-features = ["parse"]
 # `required-features` skips these when `parse` is off rather than failing the
 # build. Nothing changes with default features on, where `parse` is enabled.
 
-[[test]]
-name = "embedded_scripts"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_erlang_pascal"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_nix"
-required-features = ["parse"]
-
-[[test]]
-name = "langcalls_shell_sql_solidity"
-required-features = ["parse"]
-
-[[test]]
-name = "ts_import_export_fabrication"
-required-features = ["parse"]
-
-[[test]]
-name = "allow_unwired_and_dynamic_imports"
-required-features = ["parse"]
-
-[[test]]
-name = "wiring_port_under_stress"
-required-features = ["parse"]
-
-[[test]]
-name = "langimports_specifier_names_a_file"
-required-features = ["parse"]
-
-[[test]]
-name = "cargo_target_roots_are_wired"
-required-features = ["parse"]
-
-[[test]]
-name = "a_minified_bundle_is_not_parsed"
-required-features = ["parse"]
-
-[[test]]
-name = "heritage"
-required-features = ["parse"]
-
-[[test]]
-name = "language_capabilities"
-required-features = ["parse"]
-
-[[test]]
-name = "liquid_script_scanner_limits"
-required-features = ["parse"]
-
-[[test]]
-name = "rust_use_declarations"
-required-features = ["parse"]
-
-[[test]]
-name = "receiver_is_an_identity"
-required-features = ["parse"]
-
-[[test]]
-name = "file_liveness_eligibility"
-required-features = ["parse"]
-
-[[test]]
-name = "notebook_completeness"
-required-features = ["parse"]
-
-[[test]]
-name = "extract_bindings"
-required-features = ["parse"]
-
-
-[[test]]
-name = "nested_source_limits"
-required-features = ["parse"]
-
-
-
-[[test]]
-name = "a_declared_field_has_a_type"
-required-features = ["parse"]
-
-[[test]]
-name = "markup_and_style"
-required-features = ["parse"]
-
-[[test]]
-name = "markup_under_stress"
-required-features = ["parse"]
-
-
-[[test]]
-name = "python_path_loads"
-required-features = ["parse"]
-
-[[test]]
-name = "python_path_loads_under_stress"
-required-features = ["parse"]
-
-[[test]]
-name = "module_bindings_and_import_names"
-required-features = ["parse"]
-
-[[test]]
-name = "sql_check_constraint_parse"
-required-features = ["parse"]
-
-[[test]]
-name = "powershell_stays_pattern_recovered"
-required-features = ["parse"]

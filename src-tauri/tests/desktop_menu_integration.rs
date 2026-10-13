@@ -6,6 +6,11 @@
 //! exercised only through the running application. Tauri's MockRuntime
 //! supplies the handle, so the real functions run against real state.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::desktop::{
     cmd_take_pending_open, handle_menu_event, queue_and_emit_open, DesktopState,
 };

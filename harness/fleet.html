@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Fleet checks</title>
+    <style>
+      body { margin: 0; background: rgb(11 14 23); }
+      #stage { width: 1360px; height: 900px; display: flex; flex-direction: column; }
+      #outside { height: 20px; }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <input id="outside" aria-label="A text field outside Fleet" />
+    <div id="stage"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      /**
+       * The Fleet grid, rendered against fixtures.
+       *
+       * These checks replace FleetView.test.ts's reading of the .svelte
+       * source: expensive scans never start on their own, a per-cell scan
+       * reaches only its repository, an absence never sorts or totals as a
+       * zero, hiding a column cannot hide a failure, the page shortcuts belong
+       * to the view and never to a text field, Index all is abortable and
+       * counts only open repositories, and the row actions do what they say.
+       */
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      const unexpected = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const ALPHA = "/fleet/alpha";
+      const BETA = "/fleet/beta";
+      const DOT = "/fleet/dot.repo";
+      const OLD = "/fleet/old-recent";
+      const GAMMA = "/fleet/gamma";
+      const LINES = { [ALPHA]: 1200, [BETA]: 300 };
+      const nowEpoch = Math.floor(Date.now() / 1000);
+
+      const emptyMetrics = (path) => ({
+        repo_path: path, loc: null, loc_language: null, loc_truncated: false, loc_at: null,
+        storage_bytes: null, storage_git_bytes: null, storage_reclaimable_bytes: null, storage_truncated: false, storage_at: null,
+        vulns_critical: null, vulns_high: null, vulns_moderate: null, vulns_low: null, vulns_unknown: null, vulns_total: null,
+        health_complete: false, health_at: null, coverage_pct: null, coverage_truncated: false, coverage_at: null, languages: [],
+        loc_prev: null, loc_prev_day: null, storage_prev_bytes: null, storage_prev_day: null,
+        vulns_prev_total: null, vulns_prev_day: null, coverage_prev_pct: null, coverage_prev_day: null,
+      });
+      /** The ledger, as cmd_fleet_record_metrics leaves it. */
+      const ledger = {};
+      const facet = (path) => ({
+        repo_path: path, ok: true, error: "", worktrees_ok: true, worktrees_error: "", worktrees: 1,
+        agents: {
+          ok: true, sessions: path === ALPHA ? 2 : 0, truncated: false,
+          kinds: path === ALPHA ? [{ kind: "claude", sessions: 1 }, { kind: "gitpulse", sessions: 1 }] : [],
+          live: { ok: true, sessions: 0, kinds: [], worktrees: [] },
+        },
+        last_commit_ok: true, last_commit_epoch: nowEpoch - 3600,
+        commits_ok: false, commits_error: "git log refused", commits: null,
+        metrics_ok: true, metrics_error: "", metrics: ledger[path] ?? null,
+      });
+
+      const calls = [];
+      const count = (cmd) => calls.filter((c) => c.cmd === cmd).length;
+      const argsOf = (cmd) => calls.filter((c) => c.cmd === cmd).map((c) => c.args);
+      const held = (list) => new Promise((resolve) => list.push(resolve));
+      const heldScans = [];
+      let holdScans = false;
+      const heldBuilds = [];
+
+      const fixtures = {
+        cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
+        cmd_list_branches: () => [{
+          name: "main", is_current: true, is_remote: false, remote_name: null, tip_commit_id: "abc123456789",
+          is_default: true, is_gone: false, last_commit_timestamp: 1700000000, last_author: "Ada", last_summary: "Work",
+        }],
+        // Beta has uncommitted work, so exactly one repository needs attention.
+        cmd_get_status: (a) => a.repoPath === BETA
+          ? [{ path: "src/a.ts", is_staged: false, status_code: "M", is_conflicted: false, additions: 1, deletions: 1 }]
+          : [],
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_repo_operation: () => null,
+        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_watch_repo: (a) => a.repoPath,
+        cmd_unwatch_repo: () => null,
+        cmd_set_recent_menu: () => null,
+        cmd_last_fetch_at: () => null,
+        cmd_note_tab_activated: () => null,
+        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_devmap_maybe_refresh: () => ({
+          decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null,
+        }),
+        cmd_devcouncil_init: (a) => ({
+          repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: true,
+        }),
+        cmd_devmap_build: async () => {
+          await held(heldBuilds);
+          return { ok: true, binary: "devmap", lookup: "path", exit_code: 0, stdout: "", stderr: "", timed_out: false, report: { unchanged: false } };
+        },
+        cmd_fleet_snapshot: (a) => ({
+          repos: a.repoPaths.map(facet), requested: a.repoPaths.length, scanned: a.repoPaths.length,
+          anchor_epoch: nowEpoch, truncated: false, duration_ms: 3,
+        }),
+        cmd_fleet_record_metrics: (a) => {
+          const row = ledger[a.repoPath] ?? emptyMetrics(a.repoPath);
+          if (a.metrics.loc !== null) {
+            Object.assign(row, { loc: a.metrics.loc, loc_language: a.metrics.loc_language, loc_at: new Date().toISOString(), languages: a.metrics.languages ?? [] });
+          }
+          ledger[a.repoPath] = row;
+          return null;
+        },
+        cmd_get_language_stats: async (a) => {
+          if (holdScans) await held(heldScans);
+          return {
+            stats: [{ language: "Rust", color_hex: "#dea584", category: "programming", code_lines: LINES[a.repoPath] ?? 10, file_count: 3, percentage: 100 }],
+            truncated: false, scanned_files: 3, candidate_files: 3,
+          };
+        },
+        cmd_storage_scan: () => { throw new Error("the disk walk was refused"); },
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => {
+          if (cmd.startsWith("plugin:")) return 1;
+          calls.push({ cmd, args: args ?? {} });
+          if (fixtures[cmd]) return fixtures[cmd](args ?? {});
+          unexpected.push(cmd);
+          return null;
+        },
+        transformCallback: (cb) => cb,
+      };
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { createChecks } = await import("./checks.ts");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
+      const { toastStore } = await import("../src/lib/stores/toastStore.ts");
+      const { agentsRepositoryScope } = await import("../src/lib/agents/scope.ts");
+      const FleetView = (await import("../src/lib/components/FleetView.svelte")).default;
+
+      const { results, check, stopped } = createChecks();
+      const wait = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+      const settle = async () => { await tick(); await wait(); await tick(); };
+      const until = async (test, ms = 8000) => {
+        const end = Date.now() + ms;
+        while (!test() && Date.now() < end) await wait(40);
+        return test();
+      };
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const words = (el) => el.textContent.replace(/\s+/g, " ").trim();
+      const view = () => $('[data-testid="fleet-view"]');
+      const rows = () => $$('[data-testid="fleet-row"]');
+      const rowOf = (label) => rows().find((tr) => words($("[data-fleet-row]", tr)).startsWith(label));
+      const rowLabels = () => rows().map((tr) => words($("[data-fleet-row] .font-medium", tr)));
+      const th = (label) => $$("thead th", view()).find((el) => words(el).replace(/[▲▼]/g, "").trim() === label);
+      const headerButton = (label) => $("button", th(label));
+      const columnIndex = (label) => $$("thead th", view()).indexOf(th(label));
+      const cellOf = (label, column) => $$("td", rowOf(label))[columnIndex(column)];
+      const totals = () => $('[data-testid="fleet-totals"]');
+      const reading = (label) => $$(":scope > span", totals()).find((el) => words(el).startsWith(label.toUpperCase()) || words(el).startsWith(label));
+      const button = (name) => $$("button", view()).find((el) => words(el) === name);
+      const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+      const toasts = () => get(toastStore).map((t) => t.message);
+      const report_ = () => {
+        $("#result").textContent = results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
+      };
+      const EXPENSIVE = ["cmd_get_language_stats", "cmd_storage_scan", "cmd_scan_deps_health", "cmd_scan_coverage"];
+      const expensiveCalls = () => EXPENSIVE.reduce((sum, cmd) => sum + count(cmd), 0);
+
+      (async () => {
+        try {
+          interfaceStore.showAllFleetColumns();
+          interfaceStore.setGlobalSurface("fleet");
+          for (const path of [ALPHA, BETA, DOT, OLD]) await repoStore.openRepo(path, { activate: path === ALPHA });
+          await repoStore.closeTab(get(repoStore).openTabs.find((t) => t.path === OLD).id);
+          mount(FleetView, { target: $("#stage") });
+          await until(() => count("cmd_fleet_snapshot") >= 1 && !!th("Repository"));
+          await settle();
+
+          // ---- nothing expensive runs on its own ------------------------------
+          check("mounting sweeps the cheap facet once", () => count("cmd_fleet_snapshot") === 1);
+          check("and starts no expensive scan", () => expensiveCalls() === 0);
+          repoStore.setError("an unrelated store emission");
+          await settle();
+          repoStore.setError(null);
+          await settle();
+          check("an unrelated store emission does not re-sweep", () => count("cmd_fleet_snapshot") === 1);
+          await repoStore.openRepo(GAMMA, { activate: false });
+          await settle();
+          check("a change to the repository set does", () => count("cmd_fleet_snapshot") === 2 && expensiveCalls() === 0);
+          await repoStore.closeTab(get(repoStore).openTabs.find((t) => t.path === GAMMA).id);
+          await repoStore.removeRepo(GAMMA);
+          await settle();
+
+          // ---- the grid cannot invent a measurement -----------------------------
+          headerButton("Repository").click();
+          await settle();
+          check("sorting by repository draws every row flat, recents included", () =>
+            JSON.stringify(rowLabels()) === JSON.stringify(["alpha", "beta", "dot.repo", "old-recent"]) &&
+            th("Repository").getAttribute("aria-sort") === "ascending");
+          check("the Open reading takes its clause from the headline, singular and all", () =>
+            words(reading("Open")).includes("1 needs attention") && !!button("Needs attention (1)"));
+          check("every measurable column of every row is a stated cell, never a bare value", () =>
+            rows().every((tr) => $$('[data-testid="fleet-cell"]', tr).length === 9));
+          check("an unscanned cell says so instead of showing a zero", () =>
+            words(cellOf("alpha", "Lines")) === "not scanned" && words(cellOf("alpha", "Vulns")) === "not scanned");
+          check("a total nothing counted is a dash, and says what it did not count", () =>
+            words(reading("Lines")).includes("—") && !!$('[data-testid="fleet-total-shortfall"]', reading("Lines")) &&
+            words(reading("On disk")).includes("—") && words(reading("Vulns")).includes("—") && words(reading("Commits")).includes("—"));
+
+          // ---- per-repository scans: opt-in, open-only, one at a time -------------
+          check("an open repository's four scannable cells offer a scan", () =>
+            ["Lines", "Storage", "Vulns", "Coverage"].every((column) => !!$("button", cellOf("alpha", column))));
+          check("a recent repository's absent cells offer none", () =>
+            ["Lines", "Storage", "Vulns", "Coverage"].every((column) => $("button", cellOf("old-recent", column)) === null));
+          holdScans = true;
+          $("button", cellOf("alpha", "Lines")).click();
+          await settle();
+          check("an open repository's absent cell scans just that repository", () =>
+            count("cmd_get_language_stats") === 1 && argsOf("cmd_get_language_stats")[0].repoPath === ALPHA);
+          check("while it runs no other cell offers a second scan", () =>
+            $$('[data-testid="fleet-cell"]', view()).filter((el) => el.tagName === "BUTTON").length === 0);
+          heldScans.shift()();
+          await until(() => words(cellOf("alpha", "Lines")).includes("1,200"));
+          check("the measurement lands in the cell", () => words(cellOf("alpha", "Lines")).includes("1,200"));
+          holdScans = false;
+          $("button", cellOf("beta", "Lines")).click();
+          await until(() => words(cellOf("beta", "Lines")).includes("300"));
+
+          // ---- an absence never sorts as a low score --------------------------------
+          headerButton("Lines").click();
+          await settle();
+          check("lines sort largest first: measured rows in order, absences last", () =>
+            JSON.stringify(rowLabels().slice(0, 2)) === JSON.stringify(["alpha", "beta"]) &&
+            th("Lines").getAttribute("aria-sort") === "descending" && th("Repository").getAttribute("aria-sort") === "none");
+          headerButton("Lines").click();
+          await settle();
+          check("reversed, the absences still stay last", () =>
+            JSON.stringify(rowLabels()) === JSON.stringify(["beta", "alpha", "dot.repo", "old-recent"]) &&
+            th("Lines").getAttribute("aria-sort") === "ascending");
+          headerButton("Lines").click();
+          await settle();
+          check("the lines total sums what was measured and still names its shortfall", () =>
+            words(reading("Lines")).includes("1,500") && !!$('[data-testid="fleet-total-shortfall"]', reading("Lines")));
+
+          // ---- hiding a column cannot hide a failure ----------------------------------
+          $("button", cellOf("beta", "Storage")).click();
+          await until(() => words(cellOf("beta", "Storage")).includes("could not read"));
+          check("a failed scan says could not read in its own cell", () => words(cellOf("beta", "Storage")).includes("could not read"));
+          $('[data-testid="fleet-columns-toggle"]').click();
+          await settle();
+          const menu = $('[data-testid="fleet-columns-menu"]');
+          const switches = $$('[role="switch"]', menu).map(words);
+          check("the column menu never offers the Repository column", () =>
+            switches.includes("Storage") && !switches.includes("Repository") && !switches.includes("Severity"));
+          $$('[role="switch"]', menu).find((el) => words(el) === "Storage").click();
+          await settle();
+          check("hiding Storage removes the column…", () => !th("Storage") && get(interfaceStore).fleetHiddenColumns.includes("storage"));
+          check("…and says, by column and count, what hiding it costs", () =>
+            words($('[data-testid="fleet-hidden-failures"]')).includes("Storage (1)"));
+
+          // ---- the page shortcuts belong to the view ---------------------------------
+          const filterBox = () => $("#gitpulse-fleet-filter");
+          key(window, { key: "/" });
+          key($("#outside"), { key: "/" });
+          await settle();
+          check("a / typed outside Fleet is not taken by it", () => document.activeElement !== filterBox());
+          key(view(), { key: "/" });
+          await settle();
+          check("a / on the view focuses the filter", () => document.activeElement === filterBox());
+          key(filterBox(), { key: "s" });
+          key(filterBox(), { key: "p" });
+          await settle();
+          check("s and p typed into the filter are text, not shortcuts", () =>
+            th("Lines").getAttribute("aria-sort") === "descending" && get(interfaceStore).fleetPulseOpen === true);
+          filterBox().value = "zz";
+          filterBox().dispatchEvent(new Event("input", { bubbles: true }));
+          await settle();
+          key(filterBox(), { key: "Escape" });
+          await settle();
+          check("Escape in the filter clears it and hands the grid back", () =>
+            filterBox().value === "" && document.activeElement !== filterBox() && rows().length === 4);
+          key(view(), { key: "s", metaKey: true });
+          key(view(), { key: "s", ctrlKey: true });
+          key(view(), { key: "s", isComposing: true });
+          await settle();
+          check("a modified or composing s is left alone", () => th("Lines").getAttribute("aria-sort") === "descending");
+          key(view(), { key: "s" });
+          await settle();
+          check("s moves the sort to the next column on screen, skipping a hidden one", () =>
+            th("Lines").getAttribute("aria-sort") === "none" && th("Vulns").getAttribute("aria-sort") !== "none");
+          key(view(), { key: "p" });
+          await settle();
+          check("p folds the Pulse panel", () => get(interfaceStore).fleetPulseOpen === false);
+          key(view(), { key: "p" });
+          await settle();
+          const sweeps = count("cmd_fleet_snapshot");
+          key(view(), { key: "r" });
+          await settle();
+          check("r re-runs the cheap sweep", () => count("cmd_fleet_snapshot") === sweeps + 1);
+          check("each shortcut has a real control behind it", () =>
+            !!filterBox() && !!button("Refresh") && $$("button[aria-expanded]", view()).some((el) => /Pulse/i.test(words(el))));
+          button("Show all columns").click();
+          await settle();
+          check("Show all columns brings the column and its failure back, and the notice goes", () =>
+            !!th("Storage") && !$('[data-testid="fleet-hidden-failures"]') && get(interfaceStore).fleetHiddenColumns.length === 0);
+          $('[data-testid="fleet-columns-toggle"]').click();
+          await settle();
+
+          // ---- the Pulse panel reads the grid's rows --------------------------------
+          check("the Pulse panel says why it is empty rather than drawing a flat line", () =>
+            !!$('[data-testid="fleet-pulse-empty"]') && words($('[data-testid="fleet-pulse-empty"]')).includes("no commit history could be read"));
+          const pulseHeader = $$("button[aria-expanded]", view()).find((el) => /Pulse/i.test(words(el)));
+          pulseHeader.click();
+          await settle();
+          check("its header folds it and the choice is remembered", () =>
+            pulseHeader.getAttribute("aria-expanded") === "false" && get(interfaceStore).fleetPulseOpen === false);
+          pulseHeader.click();
+          await settle();
+
+          // ---- search is a substring, never a pattern -------------------------------
+          const search = async (value) => {
+            filterBox().value = value;
+            filterBox().dispatchEvent(new Event("input", { bubbles: true }));
+            await settle();
+          };
+          await search(".");
+          check("a dot matches a literal dot, not every name", () => JSON.stringify(rowLabels()) === JSON.stringify(["dot.repo"]));
+          await search("a(");
+          check("an unbalanced pattern is just text that matches nothing", () =>
+            rows().length === 0 && words(view()).includes("Nothing matches that") && errors.length === 0);
+          await search("");
+
+          // ---- Index all -------------------------------------------------------------
+          const indexAll = () => $('[data-testid="fleet-index-all"]');
+          indexAll().click();
+          await until(() => !!$('[data-testid="fleet-index-progress"]'));
+          check("Index all counts the open repositories only", () => words($('[data-testid="fleet-index-progress"]')) === "Indexing: 0/3");
+          check("it does not lock the network operations, which keep their own flag", () =>
+            !!button("Fetch all") && !button("Fetch all").disabled && !button("Pull all").disabled);
+          await until(() => heldBuilds.length === 1);
+          heldBuilds.shift()();
+          await until(() => words($('[data-testid="fleet-index-progress"]') ?? view()) === "Indexing: 1/3");
+          check("progress counts against the real total", () => words($('[data-testid="fleet-index-progress"]')) === "Indexing: 1/3");
+          await until(() => heldBuilds.length === 1);
+          $$("button", view()).find((el) => words(el) === "Stop" && el.previousElementSibling?.dataset.testid === "fleet-index-progress").click();
+          heldBuilds.shift()();
+          await until(() => !!indexAll());
+          await settle();
+          check("Stop lets the build in flight finish and starts no other", () =>
+            count("cmd_devmap_build") === 2 && !$('[data-testid="fleet-index-progress"]'));
+          check("and the summary says it stopped short", () => toasts().some((m) => m.startsWith("Stopped after 2 of 3 repositories")));
+
+          // ---- agent checkouts ----------------------------------------------------------
+          const agents = $('[data-testid="fleet-open-agents"]', rowOf("alpha"));
+          check("the agent count is pluralised and names the kinds", () =>
+            words(agents) === "2 agents" && agents.title === "Agent checkouts: Claude Code, GitPulse task. Show them in Agents.");
+          agents.click();
+          await until(() => get(interfaceStore).globalSurface === "agents");
+          await settle();
+          check("clicking it opens Agents narrowed to that repository, not the repository itself", () =>
+            get(interfaceStore).globalSurface === "agents" && get(agentsRepositoryScope) === ALPHA);
+          interfaceStore.setGlobalSurface("fleet");
+          await settle();
+
+          // ---- removing a repository -------------------------------------------------------
+          check("the actions column is named for assistive technology", () =>
+            $$("thead th", view()).at(-1).querySelector(".sr-only")?.textContent.trim() === "Actions");
+          const removeOf = (label) => $('[data-testid="fleet-remove-repo"]', rowOf(label));
+          check("an open row's remove says it closes the repository; a recent one's does not", () =>
+            removeOf("beta").title === "Remove beta from Fleet (closes repository)" && removeOf("old-recent").title === "Remove old-recent from Fleet" &&
+            removeOf("beta").getAttribute("aria-label") === "Remove beta from Fleet");
+          removeOf("old-recent").click();
+          await until(() => !rowOf("old-recent"));
+          check("removing a recent row drops it from the grid and from recents", () =>
+            !rowOf("old-recent") && !get(repoStore).recentRepos.includes(OLD));
+          const dotRow = $("[data-fleet-row]", rowOf("dot.repo"));
+          dotRow.focus();
+          key(dotRow, { key: "Delete" });
+          await until(() => !rowOf("dot.repo"));
+          check("Delete on a focused row closes and removes that repository", () =>
+            !rowOf("dot.repo") && !get(repoStore).openTabs.some((t) => t.path === DOT));
+          removeOf("beta").click();
+          await until(() => !rowOf("beta"));
+          check("the remove button closes an open repository", () => !get(repoStore).openTabs.some((t) => t.path === BETA));
+
+          check("no expensive scan ever ran except the ones asked for", () =>
+            count("cmd_get_language_stats") === 2 && count("cmd_storage_scan") === 1 && count("cmd_scan_deps_health") === 0 && count("cmd_scan_coverage") === 0);
+          check("every IPC call had a fixture", () => unexpected.length === 0);
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report_();
+        } catch (error) {
+          stopped(error);
+          report_();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      })();
+    </script>
+  </body>
+</html>

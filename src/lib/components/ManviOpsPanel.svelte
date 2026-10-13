@@ -1,9 +1,8 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { onMount, tick, untrack } from "svelte";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { invoke } from "../ipc/invoke";
-  import { listen } from "@tauri-apps/api/event";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
@@ -26,7 +25,7 @@
     Tag,
     Trash2,
   } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
@@ -40,10 +39,11 @@
     type TagCleanupPlan,
     type IssueInfo,
   } from "../ops/model";
-  import { registerRepository, type TaskCard } from "../workbench/client";
+  import { registerRepository, subscribeWorkbenchChanges, type TaskCard } from "../workbench/client";
   import {
     createTaskFromIssue,
     batchCreateTasksFromIssues,
+    TASK_CATALOG_UNREAD_MESSAGE,
     findTaskForIssue,
     listAllRepositoryTasks,
   } from "../workbench/issueTask";
@@ -106,9 +106,10 @@
   let releaseTag = $state("");
   let releaseMessage = $state("");
   let releaseConfirmed = $state(false);
-  let lastRepo: string | null = null;
 
-  let repoTasks = $state<TaskCard[]>([]);
+  /** The task catalog as read; `null` while loading or after a failed read — never "empty". */
+  let repoTasks = $state<TaskCard[] | null>(null);
+  let repoTasksError = $state<string | null>(null);
   let taskAddingNumber = $state<number | null>(null);
   let batchAdding = $state(false);
 
@@ -117,7 +118,9 @@
       ? github.issues.filter((issue) => !findTaskForIssue(repoTasks, issue.number))
       : [],
   );
-  let unimportedCount = $derived(unimportedIssues.length);
+  // Unknown, not zero: with no catalog every issue would look new.
+  let unimportedCount = $derived(repoTasks === null ? 0 : unimportedIssues.length);
+  let importPaused = $derived(repoTasks === null && !!github?.issues?.length);
 
   let tagPlan = $state<TagCleanupPlan | null>(null);
   let selectedTags = $state<string[]>([]);
@@ -196,7 +199,10 @@
       if ($repoStore.currentPath === repo) {
         github = next;
         if (opts.background) pollError = null;
-        void loadRepoTasks(repo);
+        // The issue poll does not re-read tasks while `workbench-changed`
+        // delivers them: that listener already reloads on every change, so a
+        // timed re-read only repeated it once a minute for nothing.
+        if (!opts.background || !tasksFollowChanges) void loadRepoTasks(repo);
       }
     } catch (error) {
       if ($repoStore.currentPath !== repo) return;
@@ -443,6 +449,8 @@
   }
 
   let repoTasksGeneration = 0;
+  /** True once the `workbench-changed` listener is attached; tasks then reload on change, not on a timer. */
+  let tasksFollowChanges = false;
   let refreshTasksTimer: number | null = null;
 
   function scheduleRefreshRepoTasks() {
@@ -459,7 +467,8 @@
 
   async function loadRepoTasks(repoPath: string = $repoStore.currentPath ?? "") {
     if (!repoPath) {
-      repoTasks = [];
+      repoTasks = null;
+      repoTasksError = null;
       return;
     }
     const currentGen = ++repoTasksGeneration;
@@ -469,9 +478,15 @@
       const tasks = await listAllRepositoryTasks(registered.id);
       if ($repoStore.currentPath === repoPath && currentGen === repoTasksGeneration) {
         repoTasks = tasks;
+        repoTasksError = null;
       }
-    } catch {
-      // Non-fatal: if task catalog cannot be reached, repoTasks remains empty
+    } catch (err) {
+      // Unknown, not empty: importing against a catalog that was not read
+      // would re-create every task that already exists.
+      if ($repoStore.currentPath === repoPath && currentGen === repoTasksGeneration) {
+        repoTasks = null;
+        repoTasksError = formatError(err);
+      }
     }
   }
 
@@ -482,12 +497,16 @@
       return;
     }
     if (taskAddingNumber !== null || batchAdding || busy !== null) return;
+    if (repoTasks === null) {
+      notice = TASK_CATALOG_UNREAD_MESSAGE;
+      return;
+    }
     taskAddingNumber = issue.number;
     notice = null;
     try {
       const saved = await createTaskFromIssue(issue, repoPath);
       if ($repoStore.currentPath === repoPath) {
-        repoTasks = [saved, ...repoTasks.filter((t) => t.id !== saved.id)];
+        repoTasks = [saved, ...(repoTasks ?? []).filter((t) => t.id !== saved.id)];
         toastStore.success(`Created task for issue #${issue.number}`);
         notice = `Task [#${issue.number}] created. Available on the Tasks board for agent handoff.`;
       }
@@ -504,6 +523,10 @@
     const repoPath = $repoStore.currentPath;
     if (!repoPath || !github?.issues?.length) return;
     if (batchAdding || taskAddingNumber !== null || busy !== null) return;
+    if (repoTasks === null) {
+      notice = TASK_CATALOG_UNREAD_MESSAGE;
+      return;
+    }
 
     if (unimportedIssues.length === 0) {
       notice = "All open issues are already in tasks.";
@@ -523,7 +546,7 @@
     try {
       const result = await batchCreateTasksFromIssues(unimportedIssues, repoPath, repoTasks);
       if ($repoStore.currentPath === repoPath) {
-        repoTasks = [...result.created, ...repoTasks];
+        repoTasks = [...result.created, ...(repoTasks ?? [])];
         if (result.created.length > 0) {
           toastStore.success(
             `Created ${result.created.length} task${result.created.length === 1 ? "" : "s"} from GitHub issues`,
@@ -634,7 +657,7 @@
     // window is on screen AND this pane is the one showing. The visibility
     // half belongs to the timer now — it used to keep firing behind other
     // windows and merely decline the work, which still woke the renderer.
-    const stopInterval = createVisibleInterval(() => {
+    const stopInterval = createAdaptiveTimer(() => {
       if (pane === "ops" && $repoStore.currentPath) {
         void loadIssues(undefined, { background: true });
       }
@@ -642,11 +665,14 @@
 
     const listeners = createListenerTracker();
     if (isTauri()) {
-      void listen("workbench-changed", scheduleRefreshRepoTasks)
-        .then((stop) => listeners.track(stop))
-        .catch(() => {
-          // Live updates unavailable in non-Tauri preview mode
-        });
+      // Following changes is a promise to stop polling tasks, so it is made
+      // only while the subscription stands; a failed one says so and the
+      // issue poll keeps the tasks fresh.
+      tasksFollowChanges = true;
+      listeners.track(subscribeWorkbenchChanges({
+        changed: scheduleRefreshRepoTasks,
+        unavailable: (message) => { tasksFollowChanges = false; notice = `Live updates unavailable: ${message}. Tasks refresh with the issue poll.`; },
+      }));
     }
     const onForeground = () => {
       if (readBackgroundDocument()) {
@@ -662,6 +688,7 @@
 
     return () => {
       stopInterval();
+      tasksFollowChanges = false;
       listeners.dispose();
       if (refreshTasksTimer !== null) {
         window.clearTimeout(refreshTasksTimer);
@@ -670,22 +697,25 @@
     };
   });
 
-  // `lastRepo` memoizes this effect's real dependency: repoStore republishes
-  // fresh objects on every status poll (~6s), and re-running the resets per
-  // emission would thrash panel state. A load skipped because an op holds
-  // `busy` is queued in pendingIssueRepo and drained by settleBusy().
+  // Keyed on the repository alone: repoStore republishes fresh objects on
+  // every status poll (~6s), and re-running the resets per emission would
+  // thrash panel state. A load skipped because an op holds `busy` is queued
+  // in pendingIssueRepo and drained by settleBusy().
+  const repoTags = $derived($repoStore.tags);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === lastRepo) return;
-    lastRepo = repo;
+    const repo = $currentRepoPath;
+    untrack(() => resetForRepository(repo));
+  });
+  function resetForRepository(repo: string | null) {
     cleanup = null;
     selectedBranches = [];
     review = null;
     github = null;
-    repoTasks = [];
+    repoTasks = null;
+    repoTasksError = null;
     notice = null;
     pollError = null;
-    const tag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
+    const tag = releaseTagSuggestion(repoTags.map((tag) => tag.name));
     releaseTag = tag;
     releaseMessage = `Release ${tag}`;
     releaseConfirmed = false;
@@ -694,7 +724,7 @@
       void loadIssues(repo);
       void loadRepoTasks(repo);
     }
-  });
+  }
 </script>
 
 <div class="flex-1 overflow-auto bg-background p-4 text-xs text-textPrimary">
@@ -902,6 +932,17 @@
         <div class="mb-3 flex items-center justify-between">
           <div><h3 class="font-semibold">Issue monitor</h3><p class="text-textMuted">Refreshes open GitHub issues every minute while this view is visible.</p></div>
           <div class="flex items-center gap-2">
+            {#if importPaused}
+              <button
+                type="button"
+                class="gp-btn text-xs py-1 px-2.5"
+                onclick={() => loadRepoTasks()}
+                title={repoTasksError ?? "Reading the existing task list"}
+              >
+                <RefreshCw size={12} />
+                <span>Retry task list</span>
+              </button>
+            {/if}
             {#if unimportedCount > 0}
               <button
                 type="button"
@@ -922,6 +963,9 @@
             <button class="gp-icon-btn" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
           </div>
         </div>
+        {#if importPaused && repoTasksError}
+          <div class="mb-2 flex items-center gap-2 text-amber-400" role="status"><AlertTriangle size={14} /> Task import paused: could not read the existing task list ({repoTasksError}), so issues are not checked against it.</div>
+        {/if}
         {#if github?.error}
           <div class="text-amber-400">{github.error}</div>
         {:else if github?.issues_error}
@@ -961,7 +1005,7 @@
                       type="button"
                       class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-surface hover:bg-surfaceHover border border-border text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50 cursor-pointer"
                       onclick={() => addIssueToTask(issue)}
-                      disabled={taskAddingNumber === issue.number || batchAdding || busy !== null}
+                      disabled={taskAddingNumber === issue.number || batchAdding || busy !== null || repoTasks === null}
                       title={`Create task from issue #${issue.number} for agents to work on`}
                     >
                       {#if taskAddingNumber === issue.number}

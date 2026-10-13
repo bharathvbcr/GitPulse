@@ -80,11 +80,7 @@
     filterTerminalTabs,
     stepSearchIndex,
   } from "../terminal/tabSearch";
-  import {
-    applyHorizontalScrollDelta,
-    scrollChildIntoHorizontalView,
-    verticalWheelToHorizontalDelta,
-  } from "../dom/overflowHint";
+  import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
@@ -344,15 +340,7 @@
   $effect(() => {
     const scroller = tabScroller;
     if (!scroller) return;
-    const onWheel = (event: WheelEvent) => {
-      const delta = verticalWheelToHorizontalDelta(event);
-      if (delta === null) return;
-      if (scroller.scrollWidth <= scroller.clientWidth + 0.5) return;
-      event.preventDefault();
-      scroller.scrollLeft = applyHorizontalScrollDelta(scroller, delta);
-    };
-    scroller.addEventListener("wheel", onWheel, { passive: false });
-    return () => scroller.removeEventListener("wheel", onWheel);
+    return bindHorizontalWheel(scroller);
   });
 
   /**
@@ -545,6 +533,14 @@
     closing.add(id);
     try {
       if (!(await confirmClose(id))) return;
+      // Close ends the process here, explicitly. Dropping the tab only
+      // unmounts it, and an unmount keeps whatever is still running.
+      try {
+        await sessions[id]?.close();
+      } catch (error: unknown) {
+        validationError = formatError(error);
+        return;
+      }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
     } finally {
       closing.delete(id);
@@ -606,7 +602,9 @@
   }
 
   /**
-   * Closing drops the component, whose teardown kills the shell. Emptying the
+   * Drops the tab. A Close has already ended its process (`requestClose`);
+   * any other teardown leaves a running one detached and listed in Sessions
+   * (`sessionLifecycle` `dispose`). Emptying the
    * strip is allowed and leaves the empty state, which offers a new tab — a
    * terminal that silently respawns what you just closed is worse than one
    * that waits to be asked.

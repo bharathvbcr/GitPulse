@@ -8,8 +8,17 @@ use rayon::prelude::*;
 use devmap_extract::model::*;
 
 use crate::model::*;
+
+mod gotypes;
+
+/// A protocol method's own declaration, and the conformers' declarations of it:
+/// `(file, symbol)` pairs.
+type ProtocolDispatch = ((String, String), Vec<(String, String)>);
 use devmap_extract::tsconfig::TsProject;
 use devmap_extract::{GoModule, ProjectManifests};
+use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
+
+mod pytypes;
 
 /// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
 /// the file that declares it, its qualified name, and its kind.
@@ -110,12 +119,8 @@ fn charge_ambiguity(
     candidates: &GlobalCandidates,
     limit: u64,
 ) -> Result<(), ResolutionLimitError> {
-    let rows = if candidates.rows.len() > AMBIGUOUS_FANOUT_CAP {
-        1
-    } else {
-        candidates.rows.len() as u64
-    };
-    let additional = candidates.evidence_bytes.saturating_mul(rows);
+    // One ledger row per ambiguous site, however many candidates it names.
+    let additional = candidates.evidence_bytes;
     // An explicit compare-exchange loop rather than `fetch_update`, which Rust
     // 1.99 deprecates in favour of `try_update` — a name older toolchains this
     // workspace still builds on do not have.
@@ -304,13 +309,39 @@ pub struct Resolver {
     /// Ambiguity abstains rather than picking, the same rule
     /// [`Self::unique_basename`] follows.
     rust_crate_roots: BTreeMap<String, Option<String>>,
+    /// The `Cargo.toml` packages the manifest pass read, so a crate is also
+    /// known by the names its manifest gives it — `[package] name` and `[lib]
+    /// name` — and not only by its directory. Set by
+    /// [`Self::index_project_manifests`], which a caller runs before
+    /// [`Self::index_extractions`]; that one builds `rust_crate_roots` from it.
+    rust_manifest_crates: Vec<devmap_extract::RustCrateManifest>,
+    /// The Python source roots each manifest declares, deepest directory
+    /// first. Set by [`Self::index_project_manifests`]; read by
+    /// [`Self::python_root_candidates`].
+    python_manifest_roots: Vec<devmap_extract::pyproject::PythonSourceRoots>,
+    /// Top-level Python package name → the directories that hold a package of
+    /// that name (`<dir>/<name>/__init__.py` indexed, `<dir>/__init__.py`
+    /// not). The no-manifest fallback: a name held by exactly one directory
+    /// is importable from it.
+    py_package_parents: BTreeMap<String, BTreeSet<String>>,
+    /// The Swift targets the manifests declare; see [`Self::swift_modules_of`].
+    swift_targets: Vec<devmap_extract::SwiftTarget>,
     /// `(file, qualified name)` → the header a Rust function was declared
     /// with. Read by the rungs that type a binding from a return type or a
     /// closure parameter; see `devmap_extract::rustsig`.
     rust_signatures: BTreeMap<(String, String), String>,
+    /// `(file, qualified name)` of every declaration the language hides from
+    /// other files: a Swift `private`/`fileprivate`, a non-exported binding of
+    /// a TS/JS module, a non-`pub` Rust item. Read by the bare-name rung so
+    /// it never binds a name its caller cannot see (S2).
+    unexported_symbols: BTreeSet<(String, String)>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
+    /// `<file>` -> the local binding its `export default` publishes. What an
+    /// importer's `import X from` and a barrel's `export { default } from` ask
+    /// for by the name `default`; see `default_binding`.
+    default_exports: BTreeMap<String, String>,
     receiver_types: BTreeMap<String, String>, // (file_path:var_name) -> ClassType
     /// (file_path:enclosing_symbol:var_name) -> ClassType.
     ///
@@ -479,8 +510,10 @@ pub struct Resolver {
     /// TypeScript / JavaScript project configs, deepest directory first: the
     /// `paths` / `baseUrl` mapping a non-relative specifier resolves through.
     ts_projects: Vec<TsProject>,
-    /// The `go_modules_fresh` contract, for `ts_projects`.
+    /// The `go_modules_fresh` contract, for `ts_projects` and `ts_workspaces`.
     ts_projects_fresh: bool,
+    /// Workspace packages by the name an importer spells them, sorted by name.
+    ts_workspaces: Vec<devmap_extract::workspaces::WorkspacePackage>,
     /// file_path → Go package identifier (`pkg` in `package pkg`).
     go_package_by_file: BTreeMap<String, String>,
     /// X45. `(directory, package clause, bare name)` → the **package-level**
@@ -509,12 +542,28 @@ pub struct Resolver {
     /// package here gets no unexported-selector answers at all: one unseen file
     /// could declare the second method or the vetoing field.
     go_package_dirs_unvouched: BTreeSet<String>,
+    /// The Go type model: declarations, signatures and imports by package.
+    go_model: GoModel,
     /// file_path → Swift module name derived from the path.
     ///
     /// A Swift target is one unqualified namespace. Computed from the path
     /// (`Sources/<Name>/`, `app/MarkDevKit/…`) rather than from a build graph
     /// this kernel does not read. See `devmap_extract::languages::swift_module_of`.
-    swift_module_by_file: BTreeMap<String, String>,
+    swift_module_by_file: BTreeMap<String, Vec<String>>,
+    /// Kotlin/Java `package` header per file: every file of one package shares
+    /// an unqualified namespace, test source sets included.
+    jvm_package_by_file: BTreeMap<String, String>,
+    /// `(package, declared name)` to the files of that package declaring it:
+    /// what a Kotlin/Java `import a.b.name` is read against, because a
+    /// top-level function or an extension is not in a file named for it.
+    jvm_package_symbols: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `{file}:{type}:{field}` to the call shape that initializes a Kotlin
+    /// property (`val clock = Clock.create()`), for a field no type annotation
+    /// types: its type is what the factory declares it returns.
+    field_initializers: BTreeMap<String, String>,
+    /// Gradle module directories named by `settings.gradle(.kts)` `include`
+    /// statements, repo-relative: each holds `src/<set>/{java,kotlin}` roots.
+    gradle_module_dirs: Vec<String>,
     /// module name → every indexed file that constitutes it.
     swift_module_files: BTreeMap<String, BTreeSet<String>>,
     /// `(module, bare name)` → the **file-level** declarations of that name.
@@ -538,6 +587,12 @@ pub struct Resolver {
     /// binds this name. Nothing here claims to know the value's *type*, so it
     /// can never feed dispatch, and no confidently-wrong edge can come out of it.
     scope_locals: BTreeSet<(String, String, String)>,
+    /// Per Rust file, the names of the inline `mod name { … }` blocks it
+    /// declares. See `Extraction::rust_inline_modules`.
+    rust_inline_modules: BTreeMap<String, BTreeSet<String>>,
+    /// Rust type name → the type it `Deref`s to; `None` when two indexed
+    /// `impl Deref` blocks disagree about a type of that name.
+    rust_deref_targets: BTreeMap<String, Option<String>>,
     /// Slash-separated components in the deepest path this resolver indexed.
     ///
     /// The module ladders in [`Self::resolve_import_path`] walk a specifier
@@ -586,8 +641,14 @@ impl Resolver {
             path_module_bindings: BTreeMap::new(),
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
+            rust_manifest_crates: Vec::new(),
+            python_manifest_roots: Vec::new(),
+            py_package_parents: BTreeMap::new(),
+            swift_targets: Vec::new(),
             rust_signatures: BTreeMap::new(),
+            unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
+            default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
             poisoned_receiver_keys: BTreeSet::new(),
@@ -611,15 +672,23 @@ impl Resolver {
             go_modules_fresh: false,
             ts_projects: Vec::new(),
             ts_projects_fresh: false,
+            ts_workspaces: Vec::new(),
             go_package_by_file: BTreeMap::new(),
             go_package_symbols: BTreeMap::new(),
             go_package_methods: BTreeMap::new(),
             go_package_member_vetoes: BTreeSet::new(),
             go_package_dirs_unvouched: BTreeSet::new(),
+            go_model: GoModel::default(),
             swift_module_by_file: BTreeMap::new(),
+            jvm_package_by_file: BTreeMap::new(),
+            jvm_package_symbols: BTreeMap::new(),
+            field_initializers: BTreeMap::new(),
+            gradle_module_dirs: Vec::new(),
             swift_module_files: BTreeMap::new(),
             swift_module_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
+            rust_inline_modules: BTreeMap::new(),
+            rust_deref_targets: BTreeMap::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
         }
@@ -880,7 +949,27 @@ impl Resolver {
             // Constructor shapes have their own rung, which needs no callee.
             return None;
         }
-        let (callee_file, callee) = if let Some((owner, function)) = shape.rsplit_once("::") {
+        let operator = (family == LangFamily::Swift
+            && !shape.is_empty()
+            && !shape.chars().any(|c| c.is_alphanumeric() || c == '_'))
+        .then(|| {
+            // `a <+> b`: the operator's own declaration says what it returns.
+            let mut declared =
+                self.symbol_index
+                    .get(shape)?
+                    .iter()
+                    .filter(|(_, kind, candidate, _)| {
+                        *kind == SymbolKind::Method && family.admits(*candidate)
+                    });
+            let (file, _, _, identity) = declared.next()?;
+            declared
+                .next()
+                .is_none()
+                .then(|| (file.clone(), identity.to_string()))
+        });
+        let (callee_file, callee) = if let Some(found) = operator {
+            found?
+        } else if let Some((owner, function)) = shape.rsplit_once("::") {
             let owner = owner.rsplit("::").next()?;
             self.unique_type_method(family, owner, function)?
         } else if let Some((receiver, function)) = shape.rsplit_once('.') {
@@ -1115,6 +1204,23 @@ impl Resolver {
     /// freshness contract `index_go_modules` states.
     pub fn index_project_manifests(&mut self, manifests: &ProjectManifests) {
         self.index_go_modules(&manifests.go_modules);
+        self.rust_manifest_crates = manifests.rust_crates.clone();
+        let mut python_roots = manifests.python_roots.clone();
+        // Deepest first: the nearest manifest's roots are probed first.
+        python_roots.sort_by(|left, right| {
+            Self::dir_depth(&right.dir)
+                .cmp(&Self::dir_depth(&left.dir))
+                .then_with(|| left.dir.cmp(&right.dir))
+        });
+        self.python_manifest_roots = python_roots;
+        self.swift_targets = manifests.swift_targets.clone();
+        self.gradle_module_dirs = manifests
+            .gradle_modules
+            .iter()
+            .flat_map(|settings| settings.modules.iter().cloned())
+            .collect();
+        self.gradle_module_dirs.sort();
+        self.gradle_module_dirs.dedup();
         let mut projects = manifests.ts_projects.clone();
         // Deepest first, whatever order arrived: the nearest config governs.
         projects.sort_by(|left, right| {
@@ -1124,6 +1230,7 @@ impl Resolver {
                 .then_with(|| left.dir.cmp(&right.dir))
         });
         self.ts_projects = projects;
+        self.ts_workspaces = manifests.ts_workspaces.clone();
         self.ts_projects_fresh = true;
     }
 
@@ -1212,6 +1319,27 @@ impl Resolver {
         ]
     }
 
+    /// The TypeScript sources a NodeNext/Node16 specifier ending in a JavaScript
+    /// extension can mean: `./a.js` is `a.ts` or `a.tsx`, `./a.jsx` is `a.tsx`,
+    /// `./a.mjs` is `a.mts`, `./a.cjs` is `a.cts`. Empty for any other ending.
+    fn nodenext_source_siblings(base: &str) -> Vec<String> {
+        let (stem, extensions): (&str, &[&str]) = if let Some(stem) = base.strip_suffix(".js") {
+            (stem, &[".ts", ".tsx"])
+        } else if let Some(stem) = base.strip_suffix(".jsx") {
+            (stem, &[".tsx"])
+        } else if let Some(stem) = base.strip_suffix(".mjs") {
+            (stem, &[".mts"])
+        } else if let Some(stem) = base.strip_suffix(".cjs") {
+            (stem, &[".cts"])
+        } else {
+            return Vec::new();
+        };
+        extensions
+            .iter()
+            .map(|extension| format!("{stem}{extension}"))
+            .collect()
+    }
+
     /// A non-relative JS/TS specifier resolved through the governing config:
     /// its `paths` first, then each mapping's `baseUrl`.
     fn resolve_ts_mapped(&self, file: &str, specifier: &str) -> Option<String> {
@@ -1239,14 +1367,82 @@ impl Resolver {
         })
     }
 
-    /// Whether a JS/TS specifier is a `paths` pattern into this tree: a miss
-    /// through one is an index gap, not an outside module.
+    /// Whether a JS/TS specifier is a `paths` pattern or a workspace package
+    /// into this tree: a miss through one is an index gap, not an outside
+    /// module.
     fn specifier_is_ts_mapped(&self, file: &str, lang: &str, specifier: &str) -> bool {
+        let specifier = specifier.trim_matches(|c| c == '\'' || c == '"');
         LangFamily::from_lang(lang) == LangFamily::JsTs
             && !specifier.starts_with('.')
-            && !self
-                .ts_paths_bases(file, specifier.trim_matches(|c| c == '\'' || c == '"'))
-                .is_empty()
+            && (!self.ts_paths_bases(file, specifier).is_empty()
+                || self.workspace_package_for(specifier).is_some())
+    }
+
+    /// The workspace package a bare specifier names, and the subpath written
+    /// after the name: `@acme/shared/utils` is `@acme/shared` + `utils`.
+    /// The longest name wins, so a package `@acme/shared-ui` is not mistaken
+    /// for `@acme/shared` plus a subpath.
+    fn workspace_package_for<'a>(
+        &'a self,
+        specifier: &'a str,
+    ) -> Option<(&'a devmap_extract::workspaces::WorkspacePackage, &'a str)> {
+        self.ts_workspaces
+            .iter()
+            .filter_map(|package| {
+                let rest = specifier.strip_prefix(package.name.as_str())?;
+                (rest.is_empty() || rest.starts_with('/'))
+                    .then(|| (package, rest.trim_start_matches('/')))
+            })
+            .max_by_key(|(package, _)| package.name.len())
+    }
+
+    /// The indexed file a workspace package specifier names.
+    ///
+    /// The package root asks the manifest's own entries first (`types`, `module`,
+    /// `main`, `exports["."]`), then the conventional source entries — a
+    /// `main` of `dist/index.js` is the build output of `src/index.ts`, and
+    /// the tree holds the source. A subpath is tried under the package
+    /// directory and under its `src/`.
+    fn resolve_workspace_package(&self, specifier: &str) -> Option<String> {
+        let (package, subpath) = self.workspace_package_for(specifier)?;
+        let join = |relative: &str| {
+            let relative = relative.trim_start_matches("./");
+            if package.dir.is_empty() {
+                Self::normalize_rel("", relative)
+            } else {
+                Self::normalize_rel(&package.dir, relative)
+            }
+        };
+        let mut bases: Vec<String> = Vec::new();
+        if subpath.is_empty() {
+            bases.extend(package.entries.iter().filter_map(|entry| join(entry)));
+            bases.extend(
+                ["src/index", "index"]
+                    .iter()
+                    .filter_map(|entry| join(entry)),
+            );
+        } else {
+            bases.extend(
+                [subpath.to_string(), format!("src/{subpath}")]
+                    .iter()
+                    .filter_map(|entry| join(entry)),
+            );
+        }
+        for base in bases {
+            if let Some(found) = Self::nodenext_source_siblings(&base)
+                .into_iter()
+                .find(|candidate| self.file_symbols.contains_key(candidate))
+            {
+                return Some(found);
+            }
+            if let Some(found) = Self::js_module_candidates(&base)
+                .into_iter()
+                .find(|candidate| self.file_symbols.contains_key(candidate))
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Resolve a (file, bare name) pair to its graph identity, falling back to
@@ -1348,6 +1544,22 @@ impl Resolver {
         name: &str,
         binding: Option<&devmap_extract::model::LocalBinding>,
     ) -> Option<String> {
+        // `rc.borrow_mut().m()`, `m.lock().unwrap().m()`: the method the
+        // wrapper's guard hands out is the wrapped value's own, so the guard
+        // chain is typed by what the root holds.
+        if let Some(root) = Self::rust_wrapper_chain_root(name) {
+            if self.family_of_file(file) == Some(LangFamily::Rust) {
+                return self.receiver_type_for(
+                    file,
+                    scope,
+                    root,
+                    binding.filter(|b| b.name == root),
+                );
+            }
+        }
+        if let Some(constructed) = self.swift_constructed_receiver(file, name) {
+            return Some(constructed);
+        }
         if let Some((root, field)) = Self::one_hop_field(name) {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self
@@ -1395,11 +1607,25 @@ impl Resolver {
             }) {
                 return Some(from_factory);
             }
-            let declaring_scope = binding.scope.as_deref()?;
+            // A Kotlin local whose initializer states no type (`val vm =
+            // createViewModel()`) is still the name the file types everywhere
+            // else it is constructed (`val vm = ViewModel(..)`): the file-wide
+            // maps below are asked instead of ending the answer here. Every
+            // other family keeps the binding's word as final (SC9).
+            let scoped = binding.scope.as_deref().and_then(|declaring_scope| {
+                self.scoped_receiver_types
+                    .get(&format!("{file}:{declaring_scope}:{name}"))
+                    .cloned()
+            });
+            if scoped.is_some() || self.family_of_file(file) != Some(LangFamily::Kotlin) {
+                return scoped;
+            }
             return self
-                .scoped_receiver_types
-                .get(&format!("{file}:{declaring_scope}:{name}"))
-                .cloned();
+                .receiver_types
+                .get(&format!("{file}:{name}"))
+                .cloned()
+                .or_else(|| self.lookup_declared_type_name(file, None, name))
+                .or_else(|| self.imported_receiver_type(file, name));
         }
         if let Some(scope) = scope {
             if let Some(typed) = self
@@ -1433,6 +1659,244 @@ impl Resolver {
             // A Go package-level value is in scope in every file of its
             // package, with no import between them.
             .or_else(|| self.module_value_type(file, name))
+            // A Rust call's own value, used as a receiver: `make().run()`,
+            // `open(p)?.read()`. Last, because a name this file binds is a
+            // value and every rung above has already looked for it.
+            .or_else(|| self.rust_call_value_type(file, scope, name))
+    }
+
+    /// The method `method` of `class_type`, or — in Rust, when the type
+    /// declares no such method — of the type it `Deref`s to, through at most
+    /// [`Self::RUST_DEREF_HOPS`] hops. The type that declared it comes back
+    /// with the declaration.
+    ///
+    /// A type that declares the name itself, even ambiguously, ends the walk:
+    /// auto-deref only reaches the target when the receiver's own type has no
+    /// such method, and an ambiguity is the answer, not a reason to look
+    /// further.
+    #[allow(clippy::too_many_arguments)]
+    fn receiver_method_through_deref(
+        &self,
+        ext: &Extraction,
+        family: LangFamily,
+        scope: Option<&str>,
+        receiver: &str,
+        binding: Option<&LocalBinding>,
+        class_type: &str,
+        method: &str,
+    ) -> Option<(&(String, String), String)> {
+        let mut class_type = class_type.to_string();
+        for _ in 0..=Self::RUST_DEREF_HOPS {
+            let key = (family, class_type.clone(), method.to_string());
+            if let Some(hits) = self.type_methods.get(&key) {
+                return self
+                    .receiver_type_method(ext, scope, receiver, binding, &class_type, hits)
+                    .map(|hit| (hit, class_type));
+            }
+            if family != LangFamily::Rust {
+                return None;
+            }
+            class_type = self.rust_deref_targets.get(&class_type)?.clone()?;
+        }
+        None
+    }
+
+    /// How many `Deref` hops a method lookup follows.
+    const RUST_DEREF_HOPS: usize = 4;
+
+    /// `x` for the guard chains `x.borrow`, `x.borrow_mut`, `x.lock.unwrap`,
+    /// `x.lock.expect`, `x.read.unwrap`, `x.write.unwrap` (and `expect`) the
+    /// extractor spells a receiver `x.lock().unwrap()` as. A field that happens
+    /// to share one of those names would be read the same way, which is why the
+    /// root's type must still declare the method called on the result.
+    fn rust_wrapper_chain_root(receiver: &str) -> Option<&str> {
+        let (root, chain) = receiver.split_once('.')?;
+        matches!(
+            chain,
+            "borrow"
+                | "borrow_mut"
+                | "lock.unwrap"
+                | "lock.expect"
+                | "read.unwrap"
+                | "read.expect"
+                | "write.unwrap"
+                | "write.expect"
+        )
+        .then_some(root)
+        .filter(|root| Self::is_plain_ident(root))
+    }
+
+    /// The types a Rust literal can have, as its receiver text spells it:
+    /// a string literal is `str` (or `String` for a method both answer), a
+    /// suffixed number is its suffix, an unsuffixed one any integer (or float)
+    /// type, `true`/`false` a `bool`, a quoted character a `char`. Anything else
+    /// is no literal.
+    fn rust_literal_types(receiver: &str) -> &'static [&'static str] {
+        const INTS: &[&str] = &[
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        ];
+        const FLOATS: &[&str] = &["f32", "f64"];
+        let text = receiver.trim();
+        if text.starts_with('"') || text.starts_with("r\"") || text.starts_with("r#") {
+            return &["str", "String"];
+        }
+        if text.starts_with('\'') {
+            return &["char"];
+        }
+        if matches!(text, "true" | "false") {
+            return &["bool"];
+        }
+        if !text.starts_with(|ch: char| ch.is_ascii_digit()) {
+            return &[];
+        }
+        for ty in INTS.iter().chain(FLOATS) {
+            if text.ends_with(ty) {
+                return std::slice::from_ref(ty);
+            }
+        }
+        if text.contains('.') || (text.contains('e') && !text.starts_with("0x")) {
+            FLOATS
+        } else {
+            INTS
+        }
+    }
+
+    /// The type of a Rust call's value spelled as a receiver.
+    ///
+    /// The extractor names a call receiver by the call's callee (`make().run()`
+    /// → `make`, `m::make().run()` → `m.make`) and keeps the text of anything
+    /// it cannot reduce (`open(p)?.read()` → `open(p)?`). None of those can be
+    /// a binding — the caller has already established that — so the written
+    /// name is a function and its declared return type, unwrapped as far as a
+    /// `?` unwraps it, is the receiver's type.
+    ///
+    /// Refuses a scope that binds the name itself, and any callee that does not
+    /// resolve to exactly one function.
+    fn rust_call_value_type(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        receiver: &str,
+    ) -> Option<String> {
+        if self.family_of_file(file)? != LangFamily::Rust {
+            return None;
+        }
+        let (callee, unwrapped) = Self::rust_call_receiver_shape(receiver)?;
+        if !callee.contains("::")
+            && scope.is_some_and(|scope| self.scope_declares_local(file, scope, &callee))
+        {
+            return None;
+        }
+        let (callee_file, callee_identity) = self.rust_called_function(file, scope, &callee)?;
+        self.rust_function_value_type(file, &callee_file, &callee_identity, unwrapped)
+    }
+
+    /// `(callee path, unwrapped)` for a receiver that can only be a call's
+    /// value: `f`, `m.f` or `a::b.f` (the extractor's callee identity, with the
+    /// module joined by `.`), or `f(..)?` / `m::f(..)?` (raw text under a `?`).
+    /// The callee comes back as a `::` path.
+    fn rust_call_receiver_shape(receiver: &str) -> Option<(String, bool)> {
+        let (body, unwrapped) = match receiver.strip_suffix('?') {
+            Some(body) => (body, true),
+            None => (receiver, false),
+        };
+        let callee = if body.ends_with(')') {
+            let mut depth = 0usize;
+            let mut open = None;
+            for (index, ch) in body.char_indices().rev() {
+                match ch {
+                    ')' => depth += 1,
+                    '(' => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            open = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &body[..open?]
+        } else if unwrapped {
+            // `x?.m()` on a value: nothing here says it is a call.
+            return None;
+        } else {
+            body
+        };
+        let path = match callee.rsplit_once('.') {
+            Some((module, name)) if !module.contains('.') => format!("{module}::{name}"),
+            Some(_) => return None,
+            None => callee.to_string(),
+        };
+        (!path.is_empty() && path.split("::").all(Self::is_plain_ident))
+            .then_some((path, unwrapped))
+    }
+
+    /// The one Rust function a call path names: a bare name this file declares
+    /// or imports, `module::f` for a module the file's own path rules place, or
+    /// `Type::f` for the one associated function a type declares.
+    fn rust_called_function(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        path: &str,
+    ) -> Option<(String, String)> {
+        let Some((module, name)) = path.rsplit_once("::") else {
+            let found = self
+                .lookup_in_package(file, path)
+                .filter(|(found_file, found)| {
+                    self.symbol_kind_in(found_file, found) == Some(SymbolKind::Function)
+                })
+                .or_else(|| {
+                    let (target, declared) = self.import_bindings.get(file)?.get(path)?;
+                    let (target, declared) = self.declaring_site(target, declared);
+                    self.lookup_in_package(&target, &declared)
+                })?;
+            return Some(found);
+        };
+        let _ = scope;
+        if self.names_inline_modules_only(file, module) {
+            return self
+                .lookup_in_package(file, name)
+                .filter(|(found_file, found)| {
+                    self.symbol_kind_in(found_file, found) == Some(SymbolKind::Function)
+                });
+        }
+        if let RustModulePlace::Unique(module_file) = self.rust_exact_module(file, module) {
+            let (decl_file, decl_name) = self.declaring_site(&module_file, name);
+            return self
+                .lookup_in_package(&decl_file, &decl_name)
+                .filter(|(found_file, found)| {
+                    self.symbol_kind_in(found_file, found) == Some(SymbolKind::Function)
+                });
+        }
+        let owner = module.rsplit("::").next()?;
+        if owner.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+            return self.unique_type_method(LangFamily::Rust, owner, name);
+        }
+        None
+    }
+
+    /// The nominal type a call to the function `(callee_file, callee)` yields
+    /// at a call site in `file`, or `None` unless it names one indexed type.
+    fn rust_function_value_type(
+        &self,
+        file: &str,
+        callee_file: &str,
+        callee: &str,
+        unwrapped: bool,
+    ) -> Option<String> {
+        let written = self
+            .return_types
+            .get(&(callee_file.to_string(), callee.to_string()))?;
+        let value = devmap_extract::rustsig::value_type(written, unwrapped)?;
+        let mut nominal = Self::admissible_nominal_type(value)?;
+        if nominal == "Self" {
+            nominal = self.declaring_type_of(callee_file, callee)?.to_string();
+        }
+        (self.unique_indexed_type(LangFamily::Rust, &nominal)
+            || self.names_one_type_in_both(file, callee_file, &nominal))
+        .then_some(nominal)
     }
 
     /// The type a Rust binding has according to a **function header** in the
@@ -1479,6 +1943,24 @@ impl Resolver {
             Some(call) => (call, true),
             None => (shape.strip_suffix("()")?, false),
         };
+        // `f()?` / `m::f()?` — a free function's value, not an associated
+        // function's. The last path segment before the name is a module (or
+        // absent) rather than a capitalised type.
+        let names_a_type = call.rsplit_once("::").is_some_and(|(owner, _)| {
+            owner
+                .rsplit("::")
+                .next()
+                .is_some_and(|last| last.starts_with(|ch: char| ch.is_ascii_uppercase()))
+        });
+        if !names_a_type {
+            if !call.contains("::")
+                && scope.is_some_and(|scope| self.scope_declares_local(file, scope, call))
+            {
+                return None;
+            }
+            let (callee_file, callee) = self.rust_called_function(file, scope, call)?;
+            return self.rust_function_value_type(file, &callee_file, &callee, unwrapped);
+        }
         let (written_type, function) = call.split_once("::")?;
         if !Self::is_plain_ident(written_type) || !Self::is_plain_ident(function) {
             return None;
@@ -1633,6 +2115,40 @@ impl Resolver {
         self.declared_types
             .get(&format!("{file}:{qualified}:{name}@type"))
             .and_then(|typed| Self::admissible_nominal_type(typed))
+            // A Kotlin extension is written beside neither its receiver type
+            // nor that type's properties: `val Task.label get() = title..`
+            // reads `Task.title` as an implicit member, declared where `Task`
+            // is. Asked of the one file that declares the type.
+            .or_else(|| {
+                let family = self.family_of_file(file)?;
+                if family != LangFamily::Kotlin {
+                    return None;
+                }
+                let mut owners = self
+                    .symbol_index
+                    .get(enclosing)?
+                    .iter()
+                    .filter(|(path, kind, owner_family, _)| {
+                        path != file
+                            && *owner_family == family
+                            && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+                    })
+                    .map(|(path, _, _, _)| path.as_str());
+                let owner = owners.next()?;
+                if owners.next().is_some() {
+                    return None;
+                }
+                self.declared_types
+                    .get(&format!("{owner}:{owner}::{enclosing}:{name}@type"))
+                    .and_then(|typed| Self::admissible_nominal_type(typed))
+            })
+            .or_else(|| {
+                let shape = self
+                    .field_initializers
+                    .get(&format!("{file}:{qualified}:{name}"))?;
+                let family = self.family_of_file(file)?;
+                self.factory_return_type(family, file, None, shape)
+            })
     }
 
     /// Type of `field` on `owner`, from the field Type ref indexed at build.
@@ -1723,16 +2239,27 @@ impl Resolver {
     /// a symbol whose parent is the caller (or the callee itself, for the
     /// recursive call inside that arrow) is the one case the binding's value
     /// is the extracted function.
+    ///
+    /// A bare name in Go is never a method: a method is reachable only through
+    /// a receiver, so `Rebuild(1)` written inside `func (Holder) Rebuild()`
+    /// names the package function, not the method it sits in, and `delete(m,
+    /// k)` inside `func (c *cache) delete` is the builtin. The caller's own
+    /// identity matches below (a function calling itself), which for a method
+    /// caller used to answer a self-edge at DETERMINISTIC.
     fn local_extracted_callee(
         &self,
         file: &str,
+        family: LangFamily,
         caller: Option<&str>,
         name: &str,
     ) -> Option<String> {
         let caller = caller?;
         let hits = self.symbol_index.get(name)?;
-        let mut candidates = hits.iter().filter_map(|(path, _, _, identity)| {
+        let mut candidates = hits.iter().filter_map(|(path, kind, _, identity)| {
             if path != file {
+                return None;
+            }
+            if family == LangFamily::Go && *kind == SymbolKind::Method {
                 return None;
             }
             let identity = identity.as_ref();
@@ -1837,6 +2364,16 @@ impl Resolver {
                     return UnresolvedClass::Unresolved;
                 }
             }
+        }
+
+        // Swift: an operator no indexed type overloads is the standard
+        // library's, whatever its operands are.
+        if family == LangFamily::Swift
+            && !callee_name.is_empty()
+            && !callee_name.chars().any(|c| c.is_alphanumeric() || c == '_')
+            && !self.symbol_index.contains_key(callee_name)
+        {
+            return UnresolvedClass::NoNamesake;
         }
 
         // The enclosing scope's own binding beats every wider authority, so it
@@ -2250,6 +2787,29 @@ impl Resolver {
         }
     }
 
+    /// Record `name` as the crate rooted at `root`, abstaining when another
+    /// root already claims it.
+    ///
+    /// A crate with both a `lib.rs` and a `main.rs` is one crate with one root,
+    /// not two claimants. Two *directories* of the same name are the ambiguity
+    /// this abstains on.
+    fn claim_rust_crate_name(
+        rust_crate_roots: &mut BTreeMap<String, Option<String>>,
+        name: String,
+        root: String,
+    ) {
+        match rust_crate_roots.entry(name) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Some(root));
+            }
+            std::collections::btree_map::Entry::Occupied(mut held) => {
+                if held.get().as_deref() != Some(root.as_str()) {
+                    held.insert(None);
+                }
+            }
+        }
+    }
+
     pub fn index_extractions(&mut self, extractions: &[Extraction]) {
         // The resolver indexes a complete snapshot. Resetting prevents stale
         // candidates and duplicate bindings when a caller reuses the object
@@ -2264,7 +2824,9 @@ impl Resolver {
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
         self.rust_signatures.clear();
+        self.unexported_symbols.clear();
         self.reexport_chains.clear();
+        self.default_exports.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -2289,10 +2851,16 @@ impl Resolver {
         self.go_package_methods.clear();
         self.go_package_member_vetoes.clear();
         self.go_package_dirs_unvouched.clear();
+        self.go_model = GoModel::default();
         self.swift_module_by_file.clear();
+        self.jvm_package_by_file.clear();
+        self.jvm_package_symbols.clear();
+        self.field_initializers.clear();
         self.swift_module_files.clear();
         self.swift_module_symbols.clear();
         self.scope_locals.clear();
+        self.rust_inline_modules.clear();
+        self.rust_deref_targets.clear();
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -2331,6 +2899,7 @@ impl Resolver {
         }
         if !std::mem::take(&mut self.ts_projects_fresh) {
             self.ts_projects.clear();
+            self.ts_workspaces.clear();
         }
 
         // Pass one establishes the complete file/symbol universe. Import
@@ -2347,6 +2916,13 @@ impl Resolver {
                             signature.clone(),
                         );
                     }
+                }
+                if !sym.is_exported
+                    && Self::visibility_is_enforced(family)
+                    && (family != LangFamily::JsTs || Self::is_js_module(ext))
+                {
+                    self.unexported_symbols
+                        .insert((ext.file_path.clone(), sym.qualified_name.clone()));
                 }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
                 self.symbol_index
@@ -2421,6 +2997,22 @@ impl Resolver {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
             }
+            for (owner, target) in &ext.rust_deref_targets {
+                self.rust_deref_targets
+                    .entry(owner.clone())
+                    .and_modify(|known| {
+                        if known.as_deref() != Some(target.as_str()) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(target.clone()));
+            }
+            if !ext.rust_inline_modules.is_empty() {
+                self.rust_inline_modules.insert(
+                    ext.file_path.clone(),
+                    ext.rust_inline_modules.iter().cloned().collect(),
+                );
+            }
             if let Some(pkg) = ext.go_package.as_deref().filter(|pkg| !pkg.is_empty()) {
                 self.go_package_by_file
                     .insert(ext.file_path.clone(), pkg.to_string());
@@ -2454,6 +3046,7 @@ impl Resolver {
                             .push((ext.file_path.clone(), sym.qualified_name.clone()));
                     }
                 }
+                self.go_model.index(ext, &dir, pkg);
                 for name in ext.go_member_names.iter().flatten() {
                     self.go_package_member_vetoes.insert((
                         dir.clone(),
@@ -2477,29 +3070,48 @@ impl Resolver {
                 self.go_package_dirs_unvouched
                     .insert(Self::parent_dir(&ext.file_path));
             }
-            if ext.language == "swift" {
-                if let Some(module) = devmap_extract::languages::swift_module_of(&ext.file_path) {
-                    self.swift_module_by_file
-                        .insert(ext.file_path.clone(), module.clone());
-                    self.swift_module_files
-                        .entry(module.clone())
-                        .or_default()
-                        .insert(ext.file_path.clone());
-                    for sym in &ext.symbols {
-                        if sym.kind == SymbolKind::File {
-                            continue;
-                        }
-                        let file_level = sym
-                            .parent_symbol
-                            .as_deref()
-                            .is_none_or(|parent| parent == ext.file_path);
-                        if !file_level {
-                            continue;
-                        }
-                        self.swift_module_symbols
-                            .entry((module.clone(), sym.name.clone()))
+            if let Some(package) = ext.jvm_package.as_deref() {
+                self.jvm_package_by_file
+                    .insert(ext.file_path.clone(), package.to_string());
+                for sym in &ext.symbols {
+                    if sym.kind != SymbolKind::File {
+                        self.jvm_package_symbols
+                            .entry((package.to_string(), sym.name.clone()))
                             .or_default()
-                            .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
+                            .insert(ext.file_path.clone());
+                    }
+                }
+            }
+            if ext.language == "swift" {
+                let modules = self.swift_modules_of(&ext.file_path);
+                if !modules.is_empty() {
+                    self.swift_module_by_file
+                        .insert(ext.file_path.clone(), modules.clone());
+                    for module in &modules {
+                        self.swift_module_files
+                            .entry(module.clone())
+                            .or_default()
+                            .insert(ext.file_path.clone());
+                        for sym in &ext.symbols {
+                            if sym.kind == SymbolKind::File {
+                                continue;
+                            }
+                            let file_level = sym
+                                .parent_symbol
+                                .as_deref()
+                                .is_none_or(|parent| parent == ext.file_path);
+                            if !file_level {
+                                continue;
+                            }
+                            self.swift_module_symbols
+                                .entry((module.clone(), sym.name.clone()))
+                                .or_default()
+                                .push((
+                                    ext.file_path.clone(),
+                                    sym.qualified_name.clone(),
+                                    sym.kind,
+                                ));
+                        }
                     }
                 }
             }
@@ -2538,6 +3150,24 @@ impl Resolver {
                 .push(path.clone());
         }
         self.py_files_by_name = py_files_by_name;
+        let mut py_package_parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for path in self.file_symbols.keys() {
+            let Some(package_dir) = path.strip_suffix("/__init__.py") else {
+                continue;
+            };
+            let parent = Self::parent_dir(package_dir);
+            let is_top_level = !self
+                .file_symbols
+                .contains_key(&format!("{parent}/__init__.py"))
+                && !(parent.is_empty() && self.file_symbols.contains_key("__init__.py"));
+            if let (true, Some(name)) = (is_top_level, package_dir.rsplit('/').next()) {
+                py_package_parents
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(parent);
+            }
+        }
+        self.py_package_parents = py_package_parents;
 
         // Which crate each indexed `src/lib.rs` or `src/main.rs` is the root
         // of, keyed by the name a `use` would spell. Built here for the same
@@ -2560,25 +3190,109 @@ impl Resolver {
             };
             let name = name.replace('-', "_");
             let root = src_root.to_string();
-            match rust_crate_roots.entry(name) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(Some(root));
+            Self::claim_rust_crate_name(&mut rust_crate_roots, name, root);
+        }
+        // The names a manifest gives the same roots. A package whose library
+        // is `[lib] name = "xlib"` is spelled `use xlib::…` by every caller,
+        // and its directory name is no help (GitPulse: `src-tauri`, package
+        // `gitpulse`, lib `gitpulse_lib`). Only where the crate's own root
+        // file is indexed, and under the same abstain-on-conflict rule.
+        for manifest in &self.rust_manifest_crates {
+            let src_root = if manifest.dir.is_empty() {
+                "src".to_string()
+            } else {
+                format!("{}/src", manifest.dir)
+            };
+            let indexed = ["lib.rs", "main.rs"].iter().any(|file| {
+                self.file_symbols
+                    .contains_key(&format!("{src_root}/{file}"))
+            });
+            if !indexed {
+                continue;
+            }
+            for name in &manifest.names {
+                if rust_crate_roots.get(name).and_then(Option::as_deref) == Some(src_root.as_str())
+                {
+                    continue;
                 }
-                std::collections::btree_map::Entry::Occupied(mut held) => {
-                    // A crate with both a `lib.rs` and a `main.rs` is one crate
-                    // with one root, not two claimants. Two *directories* of
-                    // the same name are the ambiguity this abstains on.
-                    if held.get().as_deref() != Some(root.as_str()) {
-                        held.insert(None);
-                    }
-                }
+                Self::claim_rust_crate_name(&mut rust_crate_roots, name.clone(), src_root.clone());
             }
         }
         self.rust_crate_roots = rust_crate_roots;
+        // Python packages this corpus indexes, by the name an absolute import
+        // would spell: every directory holding an indexed `__init__.py`.
+        let python_packages: BTreeSet<String> = self
+            .file_symbols
+            .keys()
+            .filter_map(|path| {
+                let dir = path.strip_suffix("/__init__.py")?;
+                dir.rsplit('/').next().map(str::to_string)
+            })
+            .collect();
+        let rust_crates: BTreeSet<String> = self.rust_crate_roots.keys().cloned().collect();
+        // The directory path of every indexed JVM source file, at every suffix:
+        // `core/src/main/java/com/fx/util/A.kt` holds `util`, `fx/util`,
+        // `com/fx/util` and so on. A JVM package is its directory path, so a
+        // dotted import whose package matches one is an import into this
+        // repository, whatever the build layout puts above it.
+        // Directory names of indexed JS/TS files: a scoped specifier
+        // `@acme/shared` whose last segment names one is a workspace package
+        // of this repository, not a registry package.
+        let js_dir_names: BTreeSet<String> = self
+            .file_symbols
+            .keys()
+            .filter(|path| {
+                matches!(
+                    path.rsplit('.').next(),
+                    Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+                )
+            })
+            .flat_map(|path| {
+                let mut parts: Vec<&str> = path.split('/').collect();
+                parts.pop();
+                parts.into_iter().map(str::to_string)
+            })
+            .collect();
+        let jvm_package_dirs: BTreeSet<String> = self
+            .file_symbols
+            .keys()
+            .filter(|path| {
+                matches!(
+                    path.rsplit('.').next(),
+                    Some("kt" | "kts" | "java" | "scala")
+                )
+            })
+            .flat_map(|path| {
+                let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+                let mut suffixes = Vec::new();
+                let mut rest = dir;
+                while !rest.is_empty() {
+                    suffixes.push(rest.to_string());
+                    match rest.split_once('/') {
+                        Some((_, tail)) => rest = tail,
+                        None => break,
+                    }
+                }
+                suffixes
+            })
+            .collect();
 
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
         // bindings need the chains.
+        self.default_exports = extractions
+            .iter()
+            .filter_map(|ext| {
+                ext.exports
+                    .iter()
+                    .find(|export| {
+                        export.exported_name == "default" && export.module_specifier.is_none()
+                    })
+                    .and_then(|export| export.local_name.clone())
+                    .filter(|local| !local.is_empty() && local != "default")
+                    .map(|local| (ext.file_path.clone(), local))
+            })
+            .collect();
         self.reexport_chains = self.compute_reexport_chains(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
@@ -2614,9 +3328,47 @@ impl Resolver {
                 })
                 .map(|imp| imp.module_specifier.clone())
                 .collect();
+            // An absolute specifier whose root names a package this corpus
+            // indexes — `from pkg.core import Engine` with `lib/pkg/__init__.py`
+            // indexed, `use xlib::engine` with `xlib` a `[lib] name` here — is
+            // an index gap however the ladder failed it, exactly as a
+            // repo-relative one is. Filing it `External` printed live code's
+            // only callers as "expected", and nothing vetoed the dead verdict.
+            let names_an_indexed_package = |specifier: &str| {
+                let root = Self::path_root(specifier.trim_matches(|c| c == '\'' || c == '"'));
+                match ext.language.as_str() {
+                    "python" => python_packages.contains(root),
+                    "rust" => rust_crates.contains(root),
+                    "typescript" | "tsx" | "javascript" | "jsx" => {
+                        let spec = specifier.trim_matches(|c| c == '\'' || c == '"');
+                        spec.starts_with('@')
+                            && spec
+                                .rsplit('/')
+                                .next()
+                                .is_some_and(|name| js_dir_names.contains(name))
+                    }
+                    "kotlin" | "java" | "scala" => {
+                        // `com.fx.util.format` names the package `com.fx.util`
+                        // (the last segment is the member) or, for `com.fx.*`
+                        // or an import of a package itself, the whole path.
+                        let dotted = specifier
+                            .trim_matches(|c| c == '\'' || c == '"')
+                            .trim_end_matches(".*");
+                        let whole = dotted.replace('.', "/");
+                        jvm_package_dirs.contains(&whole)
+                            || dotted.rsplit_once('.').is_some_and(|(package, _)| {
+                                jvm_package_dirs.contains(&package.replace('.', "/"))
+                            })
+                    }
+                    _ => false,
+                }
+            };
             let mut unresolved_import = |local: String, specifier: &str| {
                 let root = Self::path_root(specifier);
-                if Self::specifier_is_repo_relative(specifier) || ts_mapped.contains(specifier) {
+                if Self::specifier_is_repo_relative(specifier)
+                    || ts_mapped.contains(specifier)
+                    || names_an_indexed_package(specifier)
+                {
                     if !root.is_empty() {
                         file_local_roots.insert(root.to_string());
                     }
@@ -2701,10 +3453,23 @@ impl Resolver {
                         // The `__init__` binding still wins when it really does
                         // declare the name, which is what a re-exporting
                         // package means and the order Python itself uses.
-                        let declares_name = direct
-                            .as_deref()
-                            .and_then(|file| self.file_symbols.get(file))
-                            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name));
+                        // `import { default as X }` and the default a mixed
+                        // `import X, { y }` carries ask the module for the name
+                        // `default`, which no symbol has: the module's own
+                        // `export default <local>` says which one it is.
+                        let default_local = (name == "default")
+                            .then(|| {
+                                direct
+                                    .as_deref()
+                                    .and_then(|file| self.default_exports.get(file))
+                            })
+                            .flatten();
+                        let name = default_local.unwrap_or(name);
+                        let declares_name = default_local.is_some()
+                            || direct
+                                .as_deref()
+                                .and_then(|file| self.file_symbols.get(file))
+                                .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name));
                         // The barrel's own statement, used before the
                         // fallbacks. `export { thing } from './impl'` says
                         // where `thing` comes from; without consulting it the
@@ -2868,12 +3633,25 @@ impl Resolver {
                                 }
                                 let others: Vec<_> = decls
                                     .iter()
-                                    .filter(|(path, _, _)| path != &ext.file_path)
+                                    .filter(|(path, symbol, _)| {
+                                        path != &ext.file_path
+                                            && self.candidate_is_visible_from(
+                                                LangFamily::Swift,
+                                                &ext.file_path,
+                                                path,
+                                                symbol,
+                                            )
+                                    })
                                     .collect();
                                 if others.len() != 1 {
                                     continue;
                                 }
                                 let (file, _, _) = others[0];
+                                // The importing file's own module shadows what an
+                                // import brings in under the same name.
+                                if self.own_module_declares(&ext.file_path, name) {
+                                    continue;
+                                }
                                 file_bindings
                                     .entry(name.clone())
                                     .or_insert_with(|| (file.clone(), name.clone()));
@@ -2883,7 +3661,24 @@ impl Resolver {
                     let local = alias.map(str::to_string).unwrap_or_else(|| {
                         Self::import_local_name(&ext.language, &imp.module_specifier)
                     });
-                    file_bindings.insert(local.clone(), (target_f, local));
+                    // A JS/TS `import X from './m'` binds whatever `./m`
+                    // publishes as its default, under whatever name `./m` gave
+                    // it — not a symbol called `X`.
+                    //
+                    // A Kotlin `import a.b.format as fmt` binds `fmt`, but the
+                    // declaration it names is `format`: the binding's second
+                    // half is what the target file declares.
+                    let binding = if LangFamily::from_lang(&ext.language) == LangFamily::JsTs {
+                        self.default_binding(&target_f, &local)
+                    } else if ext.language == "kotlin" && alias.is_some() {
+                        (
+                            target_f,
+                            Self::import_local_name(&ext.language, &imp.module_specifier),
+                        )
+                    } else {
+                        (target_f, local.clone())
+                    };
+                    file_bindings.insert(local, binding);
                 }
             }
             if !file_external.is_empty() {
@@ -2970,6 +3765,22 @@ impl Resolver {
                 let Some(receiver) = &reference.assigned_to else {
                     continue;
                 };
+                // A Kotlin property initialized by a factory call names no type,
+                // but the factory's declaration does. `lazy` itself is the
+                // delegate, not the value.
+                if family == LangFamily::Kotlin
+                    && reference.kind == ReferenceKind::Call
+                    && reference.name != "lazy"
+                {
+                    if let (Some(scope), Some(shape)) = (
+                        reference.enclosing_symbol.as_deref(),
+                        reference.initializer_shape(&ext.calls),
+                    ) {
+                        self.field_initializers
+                            .entry(format!("{}:{}:{}", ext.file_path, scope, receiver))
+                            .or_insert(shape);
+                    }
+                }
                 // SC25: record what the author declared *before* asking whether
                 // it is indexed. A `*testing.T` parameter names a type this
                 // corpus will never contain, which is exactly what makes it
@@ -3015,7 +3826,15 @@ impl Resolver {
                     })
                     .map(|(path, kind, _, _)| (path, kind))
                     .collect();
-                if types.len() == 1 {
+                // Python says which class a name is — this file's own `class`
+                // statement, else the import that bound it — so a name more
+                // than one file declares still types the receiver; the lookup
+                // at the call restricts to that class's file.
+                let python_names_one_class = family == LangFamily::Python
+                    && self
+                        .python_class_named(&ext.file_path, &reference.name)
+                        .is_some();
+                if types.len() == 1 || python_names_one_class {
                     if let Some(scope) = reference.enclosing_symbol.as_deref() {
                         Self::bind_receiver(
                             &mut self.scoped_receiver_types,
@@ -3297,6 +4116,100 @@ impl Resolver {
         }
     }
 
+    /// Whether `name` is bound in `file` by an import whose module is **not in
+    /// this tree**: a package (`import { formatTitle } from 'some-npm-lib'`) or
+    /// a relative specifier that names no indexed file.
+    ///
+    /// The file states where the name comes from, so a repository declaration
+    /// that merely shares the spelling is no evidence about it. Letting the
+    /// global tier answer anyway bound an npm import to a local namesake at 0.9
+    /// confidence — 658 of 1,042 JS/TS global-tier edges on the audit corpus
+    /// were of exactly this shape, and none of the 16 sampled was right. The
+    /// site is left to `classify_unresolved`, which files it `external` or
+    /// `unresolved` by the same two tables.
+    ///
+    /// JS/TS only: its import statement is the one place the module a bare name
+    /// comes from is written, and the rule is not claimed for the other
+    /// families here.
+    fn is_bound_by_non_local_import(&self, file: &str, family: LangFamily, name: &str) -> bool {
+        family == LangFamily::JsTs
+            && (self
+                .external_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(name))
+                || self
+                    .unindexed_local_imports
+                    .get(file)
+                    .is_some_and(|imports| imports.contains_key(name)))
+    }
+
+    /// The `(file, declared name)` a default import of `target` binds.
+    ///
+    /// The module's own `export default <local>` when it has one; else the
+    /// barrel's `export { default } from` / `export { default as X } from`
+    /// chain to the file that declares it; else the importer's own spelling,
+    /// which is right whenever the default export is named after its binding
+    /// and is what this answered before default exports were recorded.
+    fn default_binding(&self, target: &str, local: &str) -> (String, String) {
+        if let Some(declared) = self.default_exports.get(target) {
+            return (target.to_string(), declared.clone());
+        }
+        if let Some((file, declared)) = self
+            .reexport_chains
+            .get(&format!("{target}::default"))
+            .and_then(|terminal| terminal.rsplit_once("::"))
+        {
+            return (file.to_string(), declared.to_string());
+        }
+        (target.to_string(), local.to_string())
+    }
+
+    /// One hop for each JS/TS local export that publishes an imported binding:
+    /// `import { x } from './m'; export { x };` and `import X from './m';
+    /// export { X };`. The export names the importing file's own binding and
+    /// the import says where it came from, which is all a barrel's
+    /// `export { x } from './m'` states in one statement.
+    fn js_import_reexport_hops(
+        &self,
+        ext: &Extraction,
+        hops: &mut BTreeMap<String, (String, String)>,
+    ) {
+        for export in &ext.exports {
+            if export.module_specifier.is_some() || export.exported_name.is_empty() {
+                continue;
+            }
+            let Some(local) = export
+                .local_name
+                .as_deref()
+                .filter(|local| !local.is_empty() && *local != "default")
+            else {
+                continue;
+            };
+            for imp in &ext.imports {
+                let imported = if imp.imported_names.is_empty() {
+                    // A default import: `import X from './m'`.
+                    (imp.alias.as_deref() == Some(local)).then(|| "default".to_string())
+                } else {
+                    imp.imported_names
+                        .iter()
+                        .zip(&imp.local_names)
+                        .find(|(_, bound)| bound.as_str() == local)
+                        .map(|(name, _)| name.clone())
+                };
+                let Some(imported) = imported.filter(|name| name != "*") else {
+                    continue;
+                };
+                if let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, &imp.module_specifier)
+                {
+                    hops.entry(format!("{}::{}", ext.file_path, export.exported_name))
+                        .or_insert((target, imported));
+                    break;
+                }
+            }
+        }
+    }
+
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
@@ -3334,6 +4247,9 @@ impl Resolver {
             if ext.language == "python" {
                 self.python_import_hops(ext, &mut hops);
             }
+            if LangFamily::from_lang(&ext.language) == LangFamily::JsTs {
+                self.js_import_reexport_hops(ext, &mut hops);
+            }
         }
 
         // A glob names a *module*, not a symbol, so the hop it states —
@@ -3362,6 +4278,13 @@ impl Resolver {
                 }
                 let Some((file, name)) = hops.get(&cursor) else {
                     break;
+                };
+                // A hop asking for `default` asks for what the file's own
+                // `export default` publishes.
+                let name = if name == "default" {
+                    self.default_exports.get(file).unwrap_or(name)
+                } else {
+                    name
                 };
                 let next = format!("{file}::{name}");
                 // The file this hop names declares the symbol itself, so the
@@ -3428,7 +4351,7 @@ impl Resolver {
         let per_file: Vec<FileResolution> = extractions
             .par_iter()
             .map(|ext| -> Result<FileResolution, ResolutionLimitError> {
-                let mut local_candidates: BTreeMap<&str, Arc<GlobalCandidates>> = BTreeMap::new();
+                let mut local_candidates: BTreeMap<(&str, bool), Arc<GlobalCandidates>> = BTreeMap::new();
                 let mut edges: Vec<ResolvedEdge> = Vec::new();
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
                 let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -3490,7 +4413,12 @@ impl Resolver {
                     }
                 }
                 if family == LangFamily::Swift {
-                    if let Some(module) = self.swift_module_by_file.get(&ext.file_path) {
+                    for module in self
+                        .swift_module_by_file
+                        .get(&ext.file_path)
+                        .into_iter()
+                        .flatten()
+                    {
                         let key = format!("module:{module}");
                         package_groups
                             .entry(key)
@@ -3588,8 +4516,22 @@ impl Resolver {
                     }
                 }
 
+                // The Go type evaluator's per-file tables; `None` for a file
+                // with no extracted Go facts, which leaves its calls to the
+                // name-based ladder below.
+                let go_index = if family == LangFamily::Go {
+                    GoFileIndex::new(ext)
+                } else {
+                    None
+                };
+
                 // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
-                for call in &ext.calls {
+                let explicit_calls = ext.calls.len();
+                for (call_index, call) in ext.calls.iter().chain(&ext.rust_implicit_calls).enumerate() {
+                    // An implicit call is a candidate: when no rung binds it
+                    // it is dropped, not recorded (see
+                    // `Extraction::rust_implicit_calls`).
+                    let implicit_candidate = call_index >= explicit_calls;
                     // The resolution is the *only* record of what was found:
                     // it names the target file and symbol, and
                     // `Resolution::confidence` scores it. A parallel
@@ -3607,9 +4549,79 @@ impl Resolver {
                     // is tried first and does not depend on `local_bindings`
                     // covering nested const arrows (they are function
                     // symbols, not site bindings).
-                    if call.receiver_expr.is_none() {
+                    // Kotlin `op(2)` where `op` is a typed value: the call is
+                    // `op.invoke(2)`. Asked first because a local is otherwise
+                    // refused below as "a local binding whose value is not
+                    // known" — here its *type* is known and names the target.
+                    if family == LangFamily::Kotlin && call.receiver_expr.is_none() {
+                        let binding = ext.local_binding_at(call.span.start_byte, &call.callee_name);
+                        if let Some(class_type) = self.receiver_type_for(
+                            &ext.file_path,
+                            call.caller_symbol.as_deref(),
+                            &call.callee_name,
+                            binding,
+                        ) {
+                            let key = (family, class_type.clone(), "invoke".to_string());
+                            if let Some((target_f, target_symbol)) = self
+                                .type_methods
+                                .get(&key)
+                                .and_then(|hits| self.type_method_target(&ext.file_path, &class_type, hits))
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol: target_symbol.to_string(),
+                                    target_file: target_f.to_string(),
+                                    receiver_type: class_type,
+                                }));
+                            }
+                        }
+                    }
+                    // A bare call inside `x.apply { .. }` / `with(x) { .. }` is
+                    // first a member of `x`'s type (Kotlin tries the implicit
+                    // receiver before any function in scope). A member of an
+                    // indexed type is that type's; a type the corpus does not
+                    // declare may declare it, so a project namesake is not
+                    // evidence about this call and binding it would be a guess.
+                    if family == LangFamily::Kotlin
+                        && call.receiver_expr.is_none()
+                        && resolution.is_none()
+                        && ext
+                            .local_binding_at(call.span.start_byte, &call.callee_name)
+                            .is_none()
+                    {
+                        if let Some(receiver) = ext.scope_receiver_at(call.span.start_byte) {
+                            let root = Self::path_root(receiver);
+                            let binding = ext.local_binding_at(call.span.start_byte, root);
+                            if let Some(class_type) = self.receiver_type_for(
+                                &ext.file_path,
+                                call.caller_symbol.as_deref(),
+                                receiver,
+                                binding,
+                            ) {
+                                let key = (family, class_type.clone(), call.callee_name.clone());
+                                if let Some((target_f, target_symbol)) =
+                                    self.type_methods.get(&key).and_then(|hits| {
+                                        self.type_method_target(&ext.file_path, &class_type, hits)
+                                    })
+                                {
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol: target_symbol.to_string(),
+                                        target_file: target_f.to_string(),
+                                        receiver_type: class_type,
+                                    }));
+                                } else if !self.declares_type(family, &class_type) {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: format!(
+                                            "the implicit receiver is a {class_type}, which the index does not declare, so a member of it may be meant"
+                                        ),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    if call.receiver_expr.is_none() && resolution.is_none() {
                         if let Some(target_symbol) = self.local_extracted_callee(
                             &ext.file_path,
+                            family,
                             call.caller_symbol.as_deref(),
                             &call.callee_name,
                         ) {
@@ -3617,18 +4629,108 @@ impl Resolver {
                                 target_symbol,
                                 target_file: ext.file_path.clone(),
                             }));
-                        } else if ext
-                            .local_binding_at(call.span.start_byte, &call.callee_name)
-                            .is_some()
+                        } else if let Some((class_file, identity)) = (family == LangFamily::Python
+                            && call.callee_name == "cls")
+                            .then_some(call.caller_symbol.as_deref())
+                            .flatten()
+                            .and_then(|caller| self.python_cls_target(&ext.file_path, caller))
                         {
-                            resolution = Some(Arc::new(Resolution::Unresolved {
-                                reason: "the callee is a local binding whose value is not known".to_string(),
+                            // `cls(...)` inside a method constructs the class
+                            // the method is written in. `cls` is a parameter,
+                            // so the local-binding arm below would otherwise
+                            // claim it.
+                            resolution = Some(Arc::new(Resolution::ReceiverType {
+                                receiver_type: identity
+                                    .rsplit("::")
+                                    .next()
+                                    .unwrap_or(&identity)
+                                    .to_string(),
+                                target_symbol: identity,
+                                target_file: class_file,
                             }));
+                        } else if let Some(binding) =
+                            ext.local_binding_at(call.span.start_byte, &call.callee_name)
+                        {
+                            // A Kotlin value of a declared, non-function type is
+                            // not what `name(..)` calls unless the type declares
+                            // `invoke` (asked above): `privacyMode: PrivacyMode =
+                            // privacyMode()` and `text(context, text)` both call
+                            // the *function* beside a parameter of that name.
+                            // Only a value of unknown or function type shadows.
+                            let typed_non_invokable =
+                                family == LangFamily::Kotlin && binding.declared_type.is_some();
+                            if !typed_non_invokable {
+                                resolution = Some(Arc::new(Resolution::Unresolved {
+                                    reason: "the callee is a local binding whose value is not known".to_string(),
+                                }));
+                            }
+                        }
+                    }
+
+                    // 0. A Go receiver whose type the evaluator can state: the
+                    // type is identified (package and name, not a bare name), so
+                    // the method is the one Go's selector rules pick — and a
+                    // type that lives outside the index binds nothing in it.
+                    // What it cannot tell falls through to the rungs below.
+                    let mut go_class: Option<UnresolvedClass> = None;
+                    if resolution.is_none() {
+                        if let Some(index) = &go_index {
+                            match self.go_call(ext, index, call) {
+                                GoCall::Concrete {
+                                    file,
+                                    symbol,
+                                    receiver_type,
+                                } => {
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol: symbol,
+                                        target_file: file,
+                                        receiver_type,
+                                    }));
+                                }
+                                GoCall::External(module) => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: format!(
+                                            "the receiver's type is declared in {module}, outside the index"
+                                        ),
+                                    }));
+                                    go_class = Some(UnresolvedClass::External { module });
+                                }
+                                GoCall::Absent { receiver_type } => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: format!(
+                                            "the receiver is a {receiver_type}, which declares no member {:?}",
+                                            call.callee_name
+                                        ),
+                                    }));
+                                    go_class = Some(UnresolvedClass::UnresolvedMember);
+                                }
+                                GoCall::Interface {
+                                    iface,
+                                    iface_file,
+                                    iface_symbol,
+                                    targets,
+                                } => {
+                                    resolution = Some(self.dispatch_through_interface(
+                                        ext,
+                                        call,
+                                        &mut edges,
+                                        iface.name(),
+                                        (iface_file, iface_symbol),
+                                        targets.unwrap_or_default(),
+                                    ));
+                                }
+                                GoCall::Pass => {}
+                            }
                         }
                     }
 
                     // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
-                    if let Some(recv) = &call.receiver_expr {
+                    //
+                    // Not after rung 0: a receiver the Go evaluator typed — as an
+                    // external type, or an indexed one with no such member — has
+                    // its answer, and a bare-name rung overwriting it is the
+                    // false edge rung 0 exists to prevent.
+                    if let Some(recv) = call.receiver_expr.as_ref().filter(|_| resolution.is_none()) {
                         // Prefer the binding scoped to the calling symbol; fall back
                         // to the file-wide map only when it is unambiguous. Poisoned
                         // keys are absent from both maps, so a collision falls
@@ -3655,23 +4757,124 @@ impl Resolver {
                             )
                             .filter(|_| family.admits(family))
                         {
-                            let key = (family, class_type.clone(), call.callee_name.clone());
-                            if let Some((target_f, target_symbol)) =
-                                self.type_methods.get(&key).and_then(|hits| {
-                                    self.receiver_type_method(
-                                        ext,
-                                        call.caller_symbol.as_deref(),
-                                        recv,
-                                        site_binding,
+                            // Python names its class: the file's own `class`
+                            // statement, else the import that bound it. A flat
+                            // `type_methods` hit in another file's namesake is
+                            // not that class, and an alias is not its key.
+                            let python_class = (family == LangFamily::Python)
+                                .then(|| {
+                                    self.python_method_on(
+                                        &ext.file_path,
                                         &class_type,
-                                        hits,
+                                        &call.callee_name,
                                     )
                                 })
+                                .and_then(Result::ok);
+                            let class_is_known = python_class.is_some();
+                            if let Some(Some(found)) = python_class {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol: found.symbol,
+                                    target_file: found.file,
+                                    receiver_type: found.declaring_type,
+                                }));
+                            }
+                            let key = (family, class_type.clone(), call.callee_name.clone());
+                            let own = self
+                                .receiver_method_through_deref(
+                                    ext,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    recv,
+                                    site_binding,
+                                    &class_type,
+                                    &call.callee_name,
+                                )
+                                .filter(|_| !class_is_known);
+                            // Swift: a method the type does not write is the one
+                            // a protocol extension or base class supplies.
+                            let inherited = (own.is_none()
+                                && family == LangFamily::Swift
+                                && !self.type_methods.contains_key(&key))
+                            .then(|| self.inherited_method(family, &class_type, &call.callee_name))
+                            .flatten();
+                            if let Some(((target_f, target_symbol), receiver_type)) = own
+                                .map(|(target, receiver_type)| (target.clone(), receiver_type))
+                                .or_else(|| {
+                                    inherited
+                                        .map(|(file, symbol, _)| ((file, symbol), class_type.clone()))
+                                })
                             {
+                                resolution = Some(match family {
+                                    // A receiver typed by a protocol is a call
+                                    // through it: see `protocol_dispatch`.
+                                    LangFamily::Swift => self
+                                        .protocol_dispatch(family, &class_type, &call.callee_name)
+                                        .map(|(direct, targets)| {
+                                            self.dispatch_through_interface(
+                                                ext,
+                                                call,
+                                                &mut edges,
+                                                &class_type,
+                                                direct,
+                                                targets,
+                                            )
+                                        }),
+                                    // A Kotlin receiver typed by an interface, an
+                                    // abstract or an open class may run any indexed
+                                    // subtype's override: the declaration is a symbol
+                                    // and each override is a possible runtime target.
+                                    LangFamily::Kotlin => {
+                                        let overriders = self.overriding_methods(
+                                            family,
+                                            &class_type,
+                                            &call.callee_name,
+                                            &ext.file_path,
+                                        );
+                                        (!overriders.is_empty()).then(|| {
+                                            self.dispatch_through_interface(
+                                                ext,
+                                                call,
+                                                &mut edges,
+                                                &class_type,
+                                                (target_f.clone(), target_symbol.clone()),
+                                                overriders,
+                                            )
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                                .unwrap_or_else(|| {
+                                    Arc::new(Resolution::ReceiverType {
+                                        target_symbol: target_symbol.clone(),
+                                        target_file: target_f.clone(),
+                                        receiver_type: receiver_type.clone(),
+                                    })
+                                }));
+                            }
+                        }
+                    }
+
+                    // 1a. A Rust literal receiver: `"abc".ext()`, `5u8.double()`.
+                    // The literal states its type, so the method is the one an
+                    // extension trait implements for that primitive — and only
+                    // when exactly one declaration answers across every type the
+                    // literal can be.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            let mut answers: Vec<(&(String, String), &str)> = Vec::new();
+                            for candidate in Self::rust_literal_types(recv) {
+                                let key = (family, candidate.to_string(), call.callee_name.clone());
+                                for hit in self.type_methods.get(&key).into_iter().flatten() {
+                                    answers.push((hit, candidate));
+                                }
+                            }
+                            answers.sort();
+                            answers.dedup_by(|a, b| a.0 == b.0);
+                            if let [((target_f, target_symbol), receiver_type)] = answers.as_slice() {
                                 resolution = Some(Arc::new(Resolution::ReceiverType {
                                     target_symbol: target_symbol.clone(),
                                     target_file: target_f.clone(),
-                                    receiver_type: class_type.clone(),
+                                    receiver_type: receiver_type.to_string(),
                                 }));
                             }
                         }
@@ -3715,16 +4918,48 @@ impl Resolver {
                                     }));
                                 }
                                 Some(ImplicitReceiverAnswer::VirtualOverride) => {
-                                    // Block SameFile / other deterministic
-                                    // fallthrough: the declaration is unique on
-                                    // the enclosing type, but an indexed subtype
-                                    // overrides it, so `self` is not a proven
-                                    // single target.
-                                    resolution = Some(Arc::new(Resolution::Unresolved {
-                                        reason: "implicit receiver method is overridden by an indexed subtype".to_string(),
-                                    }));
+                                    // Inside a protocol extension `self` is any
+                                    // conformer: `greet()` written in `extension
+                                    // Greeter` is a call through the protocol.
+                                    let through_protocol = (family == LangFamily::Swift)
+                                        .then(|| self.self_type_at(&ext.file_path, family, caller))
+                                        .flatten()
+                                        .and_then(|own| {
+                                            self.protocol_dispatch(family, &own, &call.callee_name)
+                                                .map(|found| (own, found))
+                                        });
+                                    resolution = Some(match through_protocol {
+                                        Some((own, (direct, targets))) => self
+                                            .dispatch_through_interface(
+                                                ext, call, &mut edges, &own, direct, targets,
+                                            ),
+                                        None => Arc::new(Resolution::Unresolved {
+                                            reason: "implicit receiver method is overridden by an indexed subtype".to_string(),
+                                        }),
+                                    });
                                 }
                                 None => {}
+                            }
+                        }
+                    }
+
+                    // 1c. `super.m()` names the nearest supertype that declares
+                    // `m` — static dispatch, so an override in a subtype is not a
+                    // candidate. Kotlin records the receiver as `super`; every
+                    // other family keeps the refusal below.
+                    if resolution.is_none()
+                        && family == LangFamily::Kotlin
+                        && call.receiver_expr.as_deref() == Some("super")
+                    {
+                        if let Some(caller) = call.caller_symbol.as_deref() {
+                            if let Some((target_file, target_symbol, receiver_type)) =
+                                self.super_method_target(&ext.file_path, family, caller, &call.callee_name)
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol,
+                                    target_file,
+                                    receiver_type,
+                                }));
                             }
                         }
                     }
@@ -3754,6 +4989,26 @@ impl Resolver {
                                         reason: "the named import has no unambiguous declaration in its module".to_string(),
                                     }));
                                 }
+                            }
+                        }
+                    }
+
+                    // 2a'. Kotlin and Java name each other's members through an
+                    // imported or fully-qualified type: `LegacyMath.twice(2)` from
+                    // Kotlin, `com.fx.app.Registry.INSTANCE.register(..)` from
+                    // Java. The two languages sit in different families, so the
+                    // typed-receiver map cannot join them; the package headers
+                    // and the member's own declaration can.
+                    if resolution.is_none() && (family == LangFamily::Kotlin || ext.language == "java") {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some((target_file, target_symbol)) =
+                                self.jvm_qualified_member(&ext.file_path, recv, &call.callee_name)
+                            {
+                                resolution = Some(Arc::new(Resolution::ImportScoped {
+                                    target_symbol,
+                                    target_file,
+                                    imported_from: recv.to_string(),
+                                }));
                             }
                         }
                     }
@@ -3880,7 +5135,8 @@ impl Resolver {
                                 target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
                             }));
                         } else if family == LangFamily::Rust
-                            && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function) {
+                            && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function)
+                            && !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), call.receiver_expr.as_deref()) {
                             // Rust reaches a **free function** through a `self`
                             // receiver, which no other family here does.
                             //
@@ -3909,6 +5165,30 @@ impl Resolver {
                             resolution = Some(Arc::new(Resolution::SameFile {
                                 target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
                             }));
+                        }
+                    }
+
+                    // 2c'. Swift: a bare call that bound to a method of a protocol is
+                    // a call through it — `greet()` written in `extension Greeter`
+                    // runs whichever conformer `self` is.
+                    if family == LangFamily::Swift && call.receiver_expr.is_none() {
+                        let through_protocol = match resolution.as_deref() {
+                            Some(Resolution::SameFile {
+                                target_symbol,
+                                target_file,
+                            }) => self
+                                .declaring_type_of(target_file, target_symbol)
+                                .and_then(|own| {
+                                    self.protocol_dispatch(family, own, &call.callee_name)
+                                        .map(|found| (own.to_string(), found))
+                                })
+                                .filter(|(_, (_, targets))| !targets.is_empty()),
+                            _ => None,
+                        };
+                        if let Some((own, (direct, targets))) = through_protocol {
+                            resolution = Some(self.dispatch_through_interface(
+                                ext, call, &mut edges, &own, direct, targets,
+                            ));
                         }
                     }
 
@@ -3968,7 +5248,95 @@ impl Resolver {
                                         }));
                                         break;
                                     }
+                                    // A Swift file compiled into several targets
+                                    // reaches each target's own type: one edge
+                                    // per target, none of them a guess.
+                                    let per_target = if family == LangFamily::Swift {
+                                        self.type_method_targets_per_module(&ext.file_path, hits)
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    if let Some(((first_file, first_symbol), rest)) =
+                                        per_target.split_first().filter(|_| per_target.len() > 1)
+                                    {
+                                        let caller = call
+                                            .caller_symbol
+                                            .clone()
+                                            .unwrap_or_else(|| ext.file_path.clone());
+                                        for (target_f, target_symbol) in rest {
+                                            edges.push(ResolvedEdge::resolved(
+                                                ext.file_path.clone(),
+                                                target_f.to_string(),
+                                                caller.clone(),
+                                                self.qualified_for(target_f, target_symbol),
+                                                EdgeKind::Calls,
+                                                Arc::new(Resolution::ReceiverType {
+                                                    target_symbol: target_symbol.to_string(),
+                                                    target_file: target_f.to_string(),
+                                                    receiver_type: type_name.to_string(),
+                                                }),
+                                                None,
+                                            ));
+                                        }
+                                        resolution = Some(Arc::new(Resolution::ReceiverType {
+                                            target_symbol: first_symbol.to_string(),
+                                            target_file: first_file.to_string(),
+                                            receiver_type: type_name.to_string(),
+                                        }));
+                                        break;
+                                    }
                                 }
+                            }
+                        }
+                    }
+
+                    // 2d''. Python: a class written at the call — `Engine(1).quack()`,
+                    // `E2.create()` — through the alias or inheritance 2d cannot
+                    // see — and `super().m()`, which names the enclosing class's
+                    // bases. A local of the same name shadows the class.
+                    if resolution.is_none() && family == LangFamily::Python {
+                        let found = match call.receiver_expr.as_deref() {
+                            Some("super" | "super()") => call.caller_symbol.as_deref().and_then(
+                                |caller| {
+                                    self.python_super_method(&ext.file_path, caller, &call.callee_name)
+                                },
+                            ),
+                            Some(recv)
+                                if Self::is_plain_ident(recv)
+                                    && ext.local_binding_at(call.span.start_byte, recv).is_none()
+                                    && !call.caller_symbol.as_deref().is_some_and(|scope| {
+                                        self.scope_declares_local(&ext.file_path, scope, recv)
+                                    }) =>
+                            {
+                                self.python_method_on(&ext.file_path, recv, &call.callee_name)
+                                    .ok()
+                                    .flatten()
+                            }
+                            _ => None,
+                        };
+                        if let Some(found) = found {
+                            resolution = Some(Arc::new(Resolution::ReceiverType {
+                                target_symbol: found.symbol,
+                                target_file: found.file,
+                                receiver_type: found.declaring_type,
+                            }));
+                        }
+                    }
+
+                    // 2d''. `Outer.Inner(..)`: a nested Kotlin class named through
+                    // its enclosing type is a constructor call on it. Like 2d, the
+                    // type must be corroborated by this file — declared here,
+                    // imported here, or in this file's package.
+                    if resolution.is_none() && family == LangFamily::Kotlin {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some((target_file, target_symbol)) =
+                                self.nested_type_target(&ext.file_path, recv, &call.callee_name)
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol,
+                                    target_file,
+                                    receiver_type: recv.to_string(),
+                                }));
                             }
                         }
                     }
@@ -4001,6 +5369,7 @@ impl Resolver {
                                     .import_bindings
                                     .get(&ext.file_path)
                                     .is_some_and(|bindings| bindings.contains_key(recv));
+                            if !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), Some(recv)) {
                             if let Some(found) = self.rust_qualified_call(
                                 &ext.file_path,
                                 recv,
@@ -4008,6 +5377,7 @@ impl Resolver {
                                 bare_root_is_free,
                             ) {
                                 resolution = Some(Arc::new(found));
+                            }
                             }
                         }
                     }
@@ -4107,27 +5477,74 @@ impl Resolver {
                         }));
                     }
 
+                    // A Ruby bare send is an implicit-`self` send: first a method
+                    // of the class it is written in or of an ancestor (a superclass
+                    // or an `include`d module), and only then a function in scope.
+                    // Asked before the global tier, which would otherwise bind an
+                    // inherited attribute to whichever class elsewhere declares the
+                    // same name.
+                    if resolution.is_none()
+                        && family == LangFamily::Ruby
+                        && call.receiver_expr.is_none()
+                    {
+                        if let Some(caller) = call.caller_symbol.as_deref() {
+                            if let Some(ImplicitReceiverAnswer::Unique {
+                                target_file,
+                                target_symbol,
+                                receiver_type,
+                            }) = self.implicit_receiver_target(
+                                &ext.file_path,
+                                family,
+                                caller,
+                                &call.callee_name,
+                            ) {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol,
+                                    target_file,
+                                    receiver_type,
+                                }));
+                            }
+                        }
+                    }
+
                     // Bare global names share one immutable set per visibility
                     // scope. Receiver and earlier proven rungs stay unchanged.
-                    if resolution.is_none() && call.receiver_expr.is_none() {
-                        let candidates = match local_candidates.get(call.callee_name.as_str()) {
+                    //
+                    // S2. This rung answers only when nothing else is known
+                    // about the name: an import, a builtin or a host global
+                    // already says what it is, and a name that is merely the
+                    // same *spelling* as a repository declaration is not
+                    // evidence of that declaration. Declining leaves the site
+                    // to `classify_unresolved`, which names the evidence.
+                    if resolution.is_none()
+                        && call.receiver_expr.is_none()
+                        && !self.bare_name_has_other_evidence(&ext.file_path, family, &call.callee_name)
+                    {
+                        let in_type = self.call_is_inside_a_type(
+                            &ext.file_path,
+                            family,
+                            call.caller_symbol.as_deref(),
+                        );
+                        let candidates = match local_candidates.get(&(call.callee_name.as_str(), in_type)) {
                             Some(candidates) => Arc::clone(candidates),
                             None => {
-                                let candidates = self.global_candidates(&global_candidates, &ext.file_path, family, &call.callee_name, limits)?;
-                                local_candidates.insert(&call.callee_name, Arc::clone(&candidates));
+                                let candidates = self.global_candidates(
+                                    &global_candidates,
+                                    &ext.file_path,
+                                    family,
+                                    &call.callee_name,
+                                    in_type,
+                                    limits,
+                                )?;
+                                local_candidates.insert((&call.callee_name, in_type), Arc::clone(&candidates));
                                 candidates
                             }
                         };
                         if candidates.declarations == 1 {
                             let (target_f, target_identity) = &candidates.rows[0];
-                            let is_python_stdlib_guard = family == LangFamily::Python
-                                && matches!(call.callee_name.as_str(), "open" | "dir" | "print" | "type" | "id" | "len")
-                                && target_f != &ext.file_path;
-                            if !is_python_stdlib_guard {
-                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
-                                    target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
-                                }));
-                            }
+                            resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
+                            }));
                         } else if candidates.declarations > 1 {
                             charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
                             resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));
@@ -4145,18 +5562,40 @@ impl Resolver {
                     let mut emitted = false;
                     if let Some(resolution) = &resolution {
                         match resolution.as_ref() {
-                            Resolution::AmbiguousGlobal { candidates, .. } => {
-                                // R7 / dead-hardening: at or below the ceiling,
-                                // emit one edge per candidate (SC4). Above it,
-                                // emit **no** edges — a capped sample of a
-                                // 241-candidate site was still 16 wrong callers
-                                // per site, and every candidate past the old
-                                // take() lost the only_ambiguous_callers
-                                // downgrade while the emitted ones fabricated
-                                // inbound edges. The complete list stays on the
-                                // ledger row's AmbiguousGlobal resolution.
-                                let total = candidates.len();
-                                if total > AMBIGUOUS_FANOUT_CAP {
+                            Resolution::AmbiguousGlobal { .. } => {
+                                // S2. A bare name with several in-repo namesakes
+                                // and no other evidence is **not** a call to any
+                                // of them: measured 0/8 (TS), 1/26 (Swift), 4/12
+                                // (Kotlin) correct, so a fan-out was three wrong
+                                // callers in four standing beside edges that
+                                // were checked. The site keeps one ledger row
+                                // carrying the complete candidate list, classed
+                                // `Unresolved` — it is by definition a bare name
+                                // with namesakes — and liveness reads the
+                                // ambiguity from that row, not from edges.
+                                unresolved.push(UnresolvedReference {
+                                    source_file: ext.file_path.clone(),
+                                    source_symbol: caller_sym.clone(),
+                                    callee_name: call.callee_name.clone(),
+                                    kind: UnresolvedKind::Call,
+                                    resolution: (**resolution).clone(),
+                                    class: UnresolvedClass::Unresolved,
+                                    receiver: call.receiver_expr.clone(),
+                                });
+                                emitted = true;
+                            }
+                            Resolution::Dispatch {
+                                candidates,
+                                via_symbol,
+                                ..
+                            } => {
+                                // One edge per implementing method, each carrying
+                                // the interface method it was reached through. Past
+                                // the cap: no edges, and one ledger row holding the
+                                // whole candidate list — the interface method's own
+                                // direct edge stays.
+                                let via = via_symbol.rsplit("::").next().unwrap_or(via_symbol);
+                                if candidates.len() > DISPATCH_FANOUT_CAP {
                                     unresolved.push(UnresolvedReference {
                                         source_file: ext.file_path.clone(),
                                         source_symbol: caller_sym.clone(),
@@ -4166,7 +5605,6 @@ impl Resolver {
                                         class: UnresolvedClass::Unresolved,
                                         receiver: call.receiver_expr.clone(),
                                     });
-                                    emitted = true;
                                 } else {
                                     for (target_f, target_sym) in candidates.iter() {
                                         edges.push(ResolvedEdge::resolved(
@@ -4176,11 +5614,11 @@ impl Resolver {
                                             self.qualified_for(target_f, target_sym),
                                             EdgeKind::Calls,
                                             Arc::clone(resolution),
-                                            None,
+                                            Some(format!("via {via}")),
                                         ));
-                                        emitted = true;
                                     }
                                 }
+                                emitted = true;
                             }
                             named => {
                                 if let Some((target_file, target_symbol)) = named.target() {
@@ -4198,22 +5636,24 @@ impl Resolver {
                             }
                         }
                     }
-                    if !emitted {
+                    if !emitted && !implicit_candidate {
                         // D17 / R5: a call the ladder could not resolve is recorded,
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
-                        let class = self.classify_unresolved(
-                            &ext.file_path,
-                            family,
-                            &call.callee_name,
-                            call.receiver_expr.as_deref(),
-                            &caller_sym,
-                            UsePosition::value_at(
-                                ext,
-                                call.span.start_byte,
+                        let class = go_class.unwrap_or_else(|| {
+                            self.classify_unresolved(
+                                &ext.file_path,
+                                family,
+                                &call.callee_name,
                                 call.receiver_expr.as_deref(),
-                            ),
-                        );
+                                &caller_sym,
+                                UsePosition::value_at(
+                                    ext,
+                                    call.span.start_byte,
+                                    call.receiver_expr.as_deref(),
+                                ),
+                            )
+                        });
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
                             source_symbol: caller_sym,
@@ -4608,27 +6048,43 @@ impl Resolver {
         file: &str,
         family: LangFamily,
         name: &str,
+        caller_in_type: bool,
         limits: ResolutionLimits,
     ) -> Result<Arc<GlobalCandidates>, ResolutionLimitError> {
-        // Unexported Go names have directory visibility. Exported Go names and
-        // other families share the same family/name view across source files.
-        let visibility = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
+        // Visibility is part of the cache key: unexported Go names are visible
+        // from their directory, and a private Swift declaration, a non-exported
+        // TS binding or a non-`pub` Rust item from another crate from nowhere
+        // else. Exported names and the other families share one view.
+        let hits = self
+            .symbol_index
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let hidden_somewhere = hits.iter().any(|(path, _, _, identity)| {
+            self.unexported_symbols
+                .contains(&(path.clone(), identity.to_string()))
+        });
+        let view = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
             Self::parent_dir(file)
+        } else if hidden_somewhere && Self::visibility_is_enforced(family) {
+            match family {
+                LangFamily::Rust => Self::rust_crate_src_root(file),
+                _ => file.to_string(),
+            }
         } else {
             String::new()
         };
-        let key = (family, name.to_string(), visibility);
+        let key = (
+            family,
+            name.to_string(),
+            format!("{view}|{}", u8::from(caller_in_type)),
+        );
         let mut cache = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(known) = cache.sets.get(&key) {
             return Ok(Arc::clone(known));
         }
-        let hits = self
-            .symbol_index
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         charge(
             &mut cache.visits,
             hits.len() as u64,
@@ -4643,6 +6099,10 @@ impl Resolver {
                     || Self::go_symbol_visible_from(file, path, name))
                 && (!Self::family_needs_explicit_receiver(family)
                     || self.declared_at_file_level(path, identity))
+                && self.candidate_is_visible_from(family, file, path, identity)
+                && (caller_in_type
+                    || *kind != SymbolKind::Method
+                    || !Self::method_needs_a_type_scope(family))
             {
                 let bytes =
                     (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64;
@@ -4669,6 +6129,115 @@ impl Resolver {
         });
         cache.sets.insert(key, Arc::clone(&candidates));
         Ok(candidates)
+    }
+
+    /// Families whose declarations carry a visibility the extractor reads into
+    /// `is_exported`, and the bare-name rung must honour (S2): a Swift
+    /// `private`/`fileprivate` declaration is invisible outside its file, a
+    /// non-exported TS/JS module binding outside its module, and a non-`pub`
+    /// Rust item outside its crate.
+    fn visibility_is_enforced(family: LangFamily) -> bool {
+        matches!(
+            family,
+            LangFamily::Swift | LangFamily::JsTs | LangFamily::Rust
+        )
+    }
+
+    /// Whether a JS/TS file is a module, so that an un-exported top-level
+    /// binding is private to it. A classic script shares its top-level names
+    /// with every other script on the page, so for one the absence of `export`
+    /// proves nothing.
+    fn is_js_module(ext: &Extraction) -> bool {
+        // The extractor files one synthetic export for every file, so the
+        // export list says nothing; a real `export` shows as an exported
+        // non-file symbol.
+        matches!(ext.language.as_str(), "typescript" | "tsx")
+            || !ext.imports.is_empty()
+            || ext
+                .symbols
+                .iter()
+                .any(|sym| sym.is_exported && sym.kind != SymbolKind::File)
+    }
+
+    /// Whether `candidate` (declared in `path`) can be named from `file`.
+    fn candidate_is_visible_from(
+        &self,
+        family: LangFamily,
+        file: &str,
+        path: &str,
+        identity: &str,
+    ) -> bool {
+        if path == file
+            || !Self::visibility_is_enforced(family)
+            || !self
+                .unexported_symbols
+                .contains(&(path.to_string(), identity.to_string()))
+        {
+            return true;
+        }
+        family == LangFamily::Rust
+            && Self::rust_crate_src_root(file) == Self::rust_crate_src_root(path)
+    }
+
+    /// Languages whose method is reachable by a bare name only from inside a
+    /// type: a Kotlin or Swift function outside every type has no implicit
+    /// receiver to dispatch on, so a method namesake is not what it calls.
+    fn method_needs_a_type_scope(family: LangFamily) -> bool {
+        matches!(family, LangFamily::Kotlin | LangFamily::Swift)
+    }
+
+    /// Whether the call's enclosing symbol sits (at any depth) inside a type.
+    /// Computed only for the families that ask; it is `false` elsewhere.
+    fn call_is_inside_a_type(&self, file: &str, family: LangFamily, caller: Option<&str>) -> bool {
+        if !Self::method_needs_a_type_scope(family) {
+            return false;
+        }
+        let mut scope = caller.unwrap_or(file).to_string();
+        for _ in 0..1024 {
+            if scope == file {
+                return false;
+            }
+            let is_type = self.symbol_index.get(&scope).is_some_and(|hits| {
+                hits.iter().any(|(path, kind, _, identity)| {
+                    path == file
+                        && identity.as_ref() == scope
+                        && matches!(
+                            kind,
+                            SymbolKind::Class
+                                | SymbolKind::Struct
+                                | SymbolKind::Enum
+                                | SymbolKind::Interface
+                                | SymbolKind::Trait
+                                | SymbolKind::Module
+                        )
+                })
+            });
+            if is_type {
+                return true;
+            }
+            match self.symbol_parents.get(&(file.to_string(), scope.clone())) {
+                Some(parent) => scope = parent.clone(),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Evidence about a bare callee name that outranks its spelling matching a
+    /// repository declaration (S2): this file imports the name from a package
+    /// or from a repo-relative path that is not indexed, or it is a builtin or
+    /// a host global of the language. Each such name is classified by
+    /// `classify_unresolved` instead of being bound to a namesake.
+    fn bare_name_has_other_evidence(&self, file: &str, family: LangFamily, name: &str) -> bool {
+        self.external_imports
+            .get(file)
+            .is_some_and(|imports| imports.contains_key(name))
+            || self
+                .unindexed_local_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(name))
+            || crate::builtins::is_builtin(family, name)
+            || crate::builtins::host_global_environment(family, name).is_some()
     }
 
     /// Whether a declaration of `kind` can never be what a bare call in
@@ -5134,6 +6703,24 @@ impl Resolver {
         if !Self::is_plain_ident(callee) {
             return None;
         }
+        // `fast_impl::gated()` beside `mod fast_impl { pub fn gated() }`: the
+        // module is this file, and its items are filed under the file's own
+        // namespace, so the path names a function this file declares. Only a
+        // module the extractor saw declared inline qualifies — a crate or a
+        // sibling file spelled the same way is not this file's function.
+        if (bare_root_is_free || !Self::is_plain_ident(receiver))
+            && self.names_inline_modules_only(file, receiver)
+        {
+            if self.symbol_kind_in(file, callee) != Some(SymbolKind::Function)
+                || !self.declared_at_file_level(file, callee)
+            {
+                return None;
+            }
+            return Some(Resolution::SameFile {
+                target_symbol: self.qualified_for(file, callee),
+                target_file: file.to_string(),
+            });
+        }
         let bare_crate = bare_root_is_free
             && Self::is_plain_ident(receiver)
             && matches!(self.rust_path_root(file, receiver), RustPathRoot::Crate(_));
@@ -5192,6 +6779,19 @@ impl Resolver {
             target_file: target_file.clone(),
             receiver_type: type_name,
         })
+    }
+
+    /// Whether every segment of the Rust path `receiver` (a leading `self::`
+    /// allowed) is an inline module `file` declares.
+    fn names_inline_modules_only(&self, file: &str, receiver: &str) -> bool {
+        let Some(modules) = self.rust_inline_modules.get(file) else {
+            return false;
+        };
+        let path = receiver.strip_prefix("self::").unwrap_or(receiver);
+        !path.is_empty()
+            && path
+                .split("::")
+                .all(|segment| Self::is_plain_ident(segment) && modules.contains(segment))
     }
 
     /// The file and name that actually declare `name` as `file` exposes it.
@@ -5326,6 +6926,30 @@ impl Resolver {
         matches!(receiver, "self" | "this" | "cls" | "$this" | "me" | "Self")
     }
 
+    /// Whether a Rust `self` receiver written inside `caller` is the method's
+    /// `self` value rather than the `self::` module path.
+    ///
+    /// The extractor reduces `self.f()` and `self::f()` to the same receiver
+    /// text, so the caller decides: only a function owned by a type can have a
+    /// `self` parameter, and there `self.f()` is a method call on a value, which
+    /// no free function can answer (`self.spawn()` inside
+    /// `impl SpawnExt for Command` is std's `Command::spawn`, not this file's
+    /// `spawn`). A free-function caller can only have written the path.
+    fn rust_self_is_a_value(
+        &self,
+        file: &str,
+        caller: Option<&str>,
+        receiver: Option<&str>,
+    ) -> bool {
+        receiver == Some("self")
+            && caller
+                .and_then(|caller| {
+                    self.symbol_parents
+                        .get(&(file.to_string(), caller.to_string()))
+                })
+                .is_some_and(|parent| parent != file)
+    }
+
     /// How far the supertype walk may climb.
     ///
     /// A bound rather than a cycle check alone: `class A(B)` / `class B(A)` is
@@ -5418,6 +7042,22 @@ impl Resolver {
     /// through a name two files declare is a chain this resolver cannot follow
     /// — and following it anyway would dispatch on whichever declaration the
     /// merge happened to produce.
+    /// Whether the index declares a type of this name in `family`.
+    fn declares_type(&self, family: LangFamily, type_name: &str) -> bool {
+        self.symbol_index.get(type_name).into_iter().flatten().any(
+            |(_, kind, candidate_family, _)| {
+                family.admits(*candidate_family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                    )
+            },
+        )
+    }
+
     fn type_name_is_identifiable(&self, family: LangFamily, type_name: &str) -> bool {
         let mut files: BTreeSet<&str> = BTreeSet::new();
         for (path, kind, candidate_family, _) in
@@ -5486,7 +7126,33 @@ impl Resolver {
                 return None;
             }
         }
-        let mut frontier = vec![enclosing.clone()];
+        let (target_file, target_symbol, receiver_type) =
+            self.supertype_method(family, vec![enclosing.clone()], method)?;
+        Some(self.implicit_receiver_unique(
+            family,
+            &enclosing,
+            method,
+            target_file,
+            target_symbol,
+            receiver_type,
+        ))
+    }
+
+    /// The one method `method` that `frontier`'s types, or the nearest of their
+    /// declared supertypes, declare — breadth-first, so an inherited method is
+    /// found at the level it is first declared.
+    ///
+    /// Abstains on every ambiguity: a type that declares the name twice, a level
+    /// where two supertypes declare it, and a type name two files declare. The
+    /// language's own MRO might pick one; this resolver has no MRO, and a guess
+    /// at DETERMINISTIC is the one answer it must not give. Returns `(file,
+    /// symbol, declaring type)`.
+    fn supertype_method(
+        &self,
+        family: LangFamily,
+        mut frontier: Vec<String>,
+        method: &str,
+    ) -> Option<(String, String, String)> {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
             let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -5514,22 +7180,8 @@ impl Resolver {
                 }
             }
             match found.len() {
-                1 => {
-                    let (target_file, target_symbol, receiver_type) =
-                        found.into_iter().next().expect("len 1");
-                    return Some(self.implicit_receiver_unique(
-                        family,
-                        &enclosing,
-                        method,
-                        target_file,
-                        target_symbol,
-                        receiver_type,
-                    ));
-                }
+                1 => return found.into_iter().next(),
                 0 => {}
-                // Two supertypes at one level declare the name. The language's
-                // own MRO might pick one; this resolver has no MRO, and a guess
-                // at DETERMINISTIC is the one answer it must not give.
                 _ => return None,
             }
             if next.is_empty() {
@@ -5564,6 +7216,113 @@ impl Resolver {
 
     /// True when some indexed subtype of `enclosing` (transitively) declares
     /// `method` — evidence that `self.method()` inside `enclosing` is virtual.
+    /// The `(file, symbol)` of every indexed subtype's declaration of `method`:
+    /// the runtime targets of a call written against `receiver_type`. A test
+    /// source set's subtypes are targets of test code only.
+    ///
+    /// Breadth-first over the recorded subtype edges, bounded by the same
+    /// heritage depth as every other walk here. The receiver type's own
+    /// declaration is not a candidate (it is the direct edge).
+    fn overriding_methods(
+        &self,
+        family: LangFamily,
+        receiver_type: &str,
+        method: &str,
+        caller_file: &str,
+    ) -> Vec<(String, String)> {
+        let mut frontier: Vec<String> = self
+            .subtypes
+            .get(&(family, receiver_type.to_string()))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<String> = Vec::new();
+            for type_name in frontier.drain(..) {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, type_name.clone(), method.to_string()))
+                {
+                    found.extend(hits.iter().cloned());
+                }
+                if let Some(subs) = self.subtypes.get(&(family, type_name)) {
+                    next.extend(subs.iter().cloned());
+                }
+            }
+            frontier = next;
+        }
+        // A fake or stub declared in a test source set is a runtime target of a
+        // test's call and never of production code's: shipping code cannot
+        // reach a class that only exists in the test build.
+        let from_test = devmap_extract::wiring::is_test_path(caller_file);
+        found
+            .into_iter()
+            .filter(|(file, _)| from_test || !devmap_extract::wiring::is_test_path(file))
+            .collect()
+    }
+
+    /// The declaration `super.method()` reaches from inside `caller_symbol`'s
+    /// type: the nearest supertype level that declares it, exactly once.
+    ///
+    /// Abstains on a level where two supertypes declare it (an MRO this
+    /// resolver does not model) and on any supertype it cannot identify.
+    fn super_method_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller_symbol: &str,
+        method: &str,
+    ) -> Option<(String, String, String)> {
+        let enclosing = self.self_type_at(file, family, caller_symbol)?;
+        let mut frontier: Vec<String> = self
+            .supertypes
+            .get(&(family, enclosing))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            if frontier.is_empty() {
+                return None;
+            }
+            let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+            let mut next: Vec<String> = Vec::new();
+            for type_name in frontier.drain(..) {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, type_name.clone(), method.to_string()))
+                {
+                    if hits.len() != 1 {
+                        return None;
+                    }
+                    found.insert((hits[0].0.clone(), hits[0].1.clone(), type_name.clone()));
+                }
+                if let Some(bases) = self.supertypes.get(&(family, type_name)) {
+                    next.extend(bases.iter().cloned());
+                }
+            }
+            match found.len() {
+                0 => frontier = next,
+                1 => return found.into_iter().next(),
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn method_overridden_by_indexed_subtype(
         &self,
         family: LangFamily,
@@ -5753,6 +7512,23 @@ impl Resolver {
         let mut uniq: Vec<&(String, String)> = hits.iter().collect();
         uniq.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         uniq.dedup();
+        // Swift: a type the caller's own module declares shadows the same name
+        // an import brings in, and a module is where `Theme` is looked up first.
+        // When some hits sit in the caller's modules, only those are candidates.
+        if let Some(own) = self.swift_module_by_file.get(call_file) {
+            let in_own: Vec<&(String, String)> = uniq
+                .iter()
+                .copied()
+                .filter(|hit| {
+                    self.swift_module_by_file
+                        .get(&hit.0)
+                        .is_some_and(|modules| modules.iter().any(|m| own.contains(m)))
+                })
+                .collect();
+            if !in_own.is_empty() {
+                uniq = in_own;
+            }
+        }
         if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
             return None;
         }
@@ -5766,10 +7542,128 @@ impl Resolver {
                 self.swift_module_by_file.get(call_file),
                 self.swift_module_by_file.get(target_file.as_str()),
             ) {
-                (Some(caller_module), Some(target_module)) => caller_module == target_module,
+                (Some(caller), Some(target)) => caller.iter().any(|module| target.contains(module)),
+                _ => false,
+            }
+            // An extension function reaches its receiver type through the
+            // function's own import: `import p.slugify` is the evidence that
+            // `"x".slugify()` names it, and the receiver type is not imported.
+            || hits_import_binding(
+                self.import_bindings.get(call_file),
+                target_symbol,
+                target_file,
+            )
+            // A Kotlin type of the caller's own package needs no import.
+            || match (
+                self.jvm_package_by_file.get(call_file),
+                self.jvm_package_by_file.get(target_file.as_str()),
+            ) {
+                (Some(caller_package), Some(target_package)) => caller_package == target_package,
                 _ => false,
             };
         corroborated.then_some((target_file.as_str(), target_symbol.as_str()))
+    }
+
+    /// Every `type_methods` hit a Swift type spelling reaches from `call_file`
+    /// when the file is compiled into more than one target: one per target.
+    ///
+    /// `ios/Shared/Formatter.swift` is built into the app and the widget, and
+    /// its `Theme.accent()` is each target's own `Theme`. Both are right — in
+    /// different builds — so both are edges. Abstains (empty) unless every
+    /// target of the file resolves the type to exactly one file.
+    fn type_method_targets_per_module<'a>(
+        &self,
+        call_file: &str,
+        hits: &'a [(String, String)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let Some(own) = self
+            .swift_module_by_file
+            .get(call_file)
+            .filter(|m| m.len() > 1)
+        else {
+            return Vec::new();
+        };
+        let mut found: Vec<(&str, &str)> = Vec::new();
+        for module in own {
+            let in_module: Vec<&(String, String)> = hits
+                .iter()
+                .filter(|hit| {
+                    self.swift_module_by_file
+                        .get(&hit.0)
+                        .is_some_and(|modules| modules.contains(module))
+                })
+                .collect();
+            let files: BTreeSet<&str> = in_module.iter().map(|hit| hit.0.as_str()).collect();
+            if files.len() != 1 {
+                return Vec::new();
+            }
+            let hit = in_module[0];
+            if !found.contains(&(hit.0.as_str(), hit.1.as_str())) {
+                found.push((hit.0.as_str(), hit.1.as_str()));
+            }
+        }
+        found
+    }
+
+    /// The modules a Swift file is compiled into.
+    ///
+    /// A `Package.swift` target owns the folders it names exclusively (the
+    /// deepest claim wins); otherwise every XcodeGen target listing a folder
+    /// above the file compiles it, so `Shared/` belongs to both targets that
+    /// list it. A file no manifest claims falls back to the path heuristic
+    /// (`swift_module_of`), which is right for the conventional layouts.
+    fn swift_modules_of(&self, file: &str) -> Vec<String> {
+        let claim = |target: &devmap_extract::SwiftTarget| -> Option<usize> {
+            target
+                .paths
+                .iter()
+                .filter(|path| {
+                    file == path.as_str()
+                        || file
+                            .strip_prefix(path.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .map(String::len)
+                .max()
+        };
+        let mut package: Vec<(usize, &str)> = Vec::new();
+        let mut project: BTreeSet<&str> = BTreeSet::new();
+        for target in &self.swift_targets {
+            let Some(depth) = claim(target) else {
+                continue;
+            };
+            if target.package {
+                package.push((depth, target.name.as_str()));
+            } else {
+                project.insert(target.name.as_str());
+            }
+        }
+        if let Some(deepest) = package.iter().map(|(depth, _)| *depth).max() {
+            let names: BTreeSet<String> = package
+                .iter()
+                .filter(|(depth, _)| *depth == deepest)
+                .map(|(_, name)| name.to_string())
+                .collect();
+            return names.into_iter().collect();
+        }
+        if !project.is_empty() {
+            return project.into_iter().map(str::to_string).collect();
+        }
+        devmap_extract::languages::swift_module_of(file)
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether a module `file` is compiled into declares a top-level `name`
+    /// anywhere — in which case that declaration, and not an import's, is what
+    /// the name means in `file`.
+    fn own_module_declares(&self, file: &str, name: &str) -> bool {
+        self.swift_module_by_file.get(file).is_some_and(|modules| {
+            modules.iter().any(|module| {
+                self.swift_module_symbols
+                    .contains_key(&(module.clone(), name.to_string()))
+            })
+        })
     }
 
     fn same_swift_module_target(
@@ -5778,18 +7672,34 @@ impl Resolver {
         name: &str,
         accept: impl Fn(SymbolKind) -> bool,
     ) -> Option<(String, String, String)> {
-        let module = self.swift_module_by_file.get(file)?;
-        let hits = self
-            .swift_module_symbols
-            .get(&(module.clone(), name.to_string()))?;
-        let mut visible = hits
-            .iter()
-            .filter(|(path, _, kind)| path != file && accept(*kind));
-        let (target_file, target_symbol, _) = visible.next()?;
-        visible
-            .next()
-            .is_none()
-            .then(|| (target_file.clone(), target_symbol.clone(), module.clone()))
+        let mut answers: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for module in self.swift_module_by_file.get(file)? {
+            let Some(hits) = self
+                .swift_module_symbols
+                .get(&(module.clone(), name.to_string()))
+            else {
+                continue;
+            };
+            let mut visible = hits.iter().filter(|(path, symbol, kind)| {
+                path != file
+                    && accept(*kind)
+                    && self.candidate_is_visible_from(LangFamily::Swift, file, path, symbol)
+            });
+            let Some((target_file, target_symbol, _)) = visible.next() else {
+                continue;
+            };
+            if visible.next().is_some() {
+                return None;
+            }
+            answers.insert((target_file.clone(), target_symbol.clone(), module.clone()));
+        }
+        let mut answers = answers.into_iter();
+        let first = answers.next()?;
+        // A target per module that resolves the name to different files has no
+        // single answer for a file compiled into both.
+        answers
+            .all(|other| other.0 == first.0 && other.1 == first.1)
+            .then_some(first)
     }
 
     /// The Swift module a specifier names, if this corpus indexed one.
@@ -5914,6 +7824,217 @@ impl Resolver {
         candidates.sort();
         candidates.dedup();
         (candidates.len() == 1).then(|| candidates.pop().unwrap())
+    }
+
+    /// A call written against an interface (a Go interface, a Swift protocol):
+    /// the interface method is a symbol, so its direct callers are every call
+    /// written against it, and each in-repo implementer is a possible runtime
+    /// target. The one place that shape is built, whichever language found it.
+    ///
+    /// With no implementer the direct edge is the whole answer, returned as an
+    /// ordinary `ReceiverType` for the generic emission to write. Otherwise the
+    /// direct edge is pushed here and the returned [`Resolution::Dispatch`] is
+    /// emitted per candidate — or, past [`DISPATCH_FANOUT_CAP`], as one ledger
+    /// row — by the generic emission.
+    fn dispatch_through_interface(
+        &self,
+        ext: &Extraction,
+        call: &ExtractedCall,
+        edges: &mut Vec<ResolvedEdge>,
+        interface: &str,
+        (iface_file, iface_symbol): (String, String),
+        targets: Vec<(String, String)>,
+    ) -> Arc<Resolution> {
+        let direct = Arc::new(Resolution::ReceiverType {
+            target_symbol: iface_symbol.clone(),
+            target_file: iface_file.clone(),
+            receiver_type: interface.to_string(),
+        });
+        if targets.is_empty() {
+            return direct;
+        }
+        let caller = call
+            .caller_symbol
+            .clone()
+            .unwrap_or_else(|| ext.file_path.clone());
+        edges.push(ResolvedEdge::resolved(
+            ext.file_path.clone(),
+            iface_file.clone(),
+            caller,
+            self.qualified_for(&iface_file, &iface_symbol),
+            EdgeKind::Calls,
+            direct,
+            None,
+        ));
+        Arc::new(Resolution::Dispatch {
+            candidates: targets.into(),
+            via_file: iface_file,
+            via_symbol: iface_symbol,
+        })
+    }
+
+    /// Swift: `Meter(v: 1).bump()` — a receiver that is itself a construction
+    /// is a value of the constructed type. The text must be exactly one call of
+    /// a capitalised name (generic arguments allowed) and the name must be an
+    /// indexed class, struct or enum; a capitalised *function* returning
+    /// something else, or a chain (`Meter(v: 1).scaled().bump()`), is not typed.
+    fn swift_constructed_receiver(&self, file: &str, receiver: &str) -> Option<String> {
+        if !file.ends_with(".swift") || !receiver.ends_with(')') {
+            return None;
+        }
+        let open = receiver.find('(')?;
+        let head = receiver[..open].trim();
+        let head = head.split('<').next().unwrap_or(head);
+        if !head.chars().next().is_some_and(char::is_uppercase) || !Self::is_plain_ident(head) {
+            return None;
+        }
+        // One call spanning the whole text: the parentheses balance only at the end.
+        let mut depth = 0usize;
+        for (index, ch) in receiver.char_indices().skip_while(|(i, _)| *i < open) {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 && index + 1 != receiver.len() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let declared = self
+            .symbol_index
+            .get(head)?
+            .iter()
+            .any(|(_, kind, family, _)| {
+                *family == LangFamily::Swift
+                    && matches!(
+                        kind,
+                        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum
+                    )
+            });
+        declared.then(|| head.to_string())
+    }
+
+    /// Swift: the method `type_name` inherits from a supertype it conforms to —
+    /// a protocol-extension default or a base class's method — when exactly one
+    /// supertype level declares it once. Abstains on every ambiguity, as
+    /// [`Self::implicit_receiver_target`] does.
+    fn inherited_method(
+        &self,
+        family: LangFamily,
+        type_name: &str,
+        method: &str,
+    ) -> Option<(String, String, String)> {
+        let mut frontier: Vec<String> = self
+            .supertypes
+            .get(&(family, type_name.to_string()))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        visited.insert(type_name.to_string());
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+            let mut next: Vec<String> = Vec::new();
+            for name in frontier.drain(..) {
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+                if !self.type_name_is_identifiable(family, &name) {
+                    return None;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, name.clone(), method.to_string()))
+                {
+                    let [hit] = hits.as_slice() else {
+                        return None;
+                    };
+                    found.insert((hit.0.clone(), hit.1.clone(), name.clone()));
+                }
+                next.extend(
+                    self.supertypes
+                        .get(&(family, name))
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+            match found.len() {
+                0 => {}
+                1 => return found.into_iter().next(),
+                _ => return None,
+            }
+            if next.is_empty() {
+                return None;
+            }
+            frontier = next;
+        }
+        None
+    }
+
+    /// Swift: the protocol method `method` of `protocol`, and the in-repo
+    /// conformers' declarations of it.
+    ///
+    /// `None` unless `protocol` is one indexed protocol declaration that
+    /// declares `method` exactly once. The conformers are the protocol's
+    /// transitive subtypes (`subtypes` is built from the `: Greeter`
+    /// conformance lists, extensions included); a conformer that does not write
+    /// the method inherits a protocol-extension default, which is the direct
+    /// target already. A protocol that refines another contributes its own
+    /// conformers and is not itself a candidate.
+    fn protocol_dispatch(
+        &self,
+        family: LangFamily,
+        protocol: &str,
+        method: &str,
+    ) -> Option<ProtocolDispatch> {
+        let is_protocol = self.symbol_index.get(protocol).is_some_and(|hits| {
+            let mut kinds = hits
+                .iter()
+                .filter(|(_, _, candidate, _)| family.admits(*candidate));
+            kinds.all(|(_, kind, _, _)| *kind == SymbolKind::Interface)
+        });
+        if !is_protocol || !self.type_name_is_identifiable(family, protocol) {
+            return None;
+        }
+        let mut declared = self
+            .type_methods
+            .get(&(family, protocol.to_string(), method.to_string()))?
+            .clone();
+        declared.sort();
+        declared.dedup();
+        let [direct] = declared.as_slice() else {
+            return None;
+        };
+        let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut frontier = vec![protocol.to_string()];
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next = Vec::new();
+            for name in frontier.drain(..) {
+                for sub in self.subtypes.get(&(family, name)).into_iter().flatten() {
+                    if !visited.insert(sub.clone()) {
+                        continue;
+                    }
+                    if let Some(hits) =
+                        self.type_methods
+                            .get(&(family, sub.clone(), method.to_string()))
+                    {
+                        candidates.extend(hits.iter().cloned());
+                    }
+                    next.push(sub.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        candidates.remove(direct);
+        Some((direct.clone(), candidates.into_iter().collect()))
     }
 
     /// The one `type_methods` hit a typed receiver dispatches to.
@@ -6215,10 +8336,10 @@ impl Resolver {
         // one directory. `import com.foo.*;` and `import foo.bar._` really do
         // depend on all of them, so all of them get an edge.
         //
-        // Not capped, deliberately. `AMBIGUOUS_FANOUT_CAP` bounds an ambiguous
-        // *guess* — N candidates of which at most one is right — where emitting
-        // all N is how a resolver launders uncertainty into volume. These N are
-        // all correct, and the consumer is `unwired_candidates`: truncating the
+        // Not capped, deliberately. An ambiguous bare-name *guess* — N
+        // candidates of which at most one is right — is not emitted as edges at
+        // all, because emitting N is how a resolver launders uncertainty into
+        // volume. These N are all correct, and the consumer is `unwired_candidates`: truncating the
         // list would leave the files past the cut falsely reported as imported
         // by nothing, turning a bound into a false finding. The bound here is
         // the repository's own size, which already bounds everything else.
@@ -6230,9 +8351,160 @@ impl Resolver {
         if lang == "hcl" {
             return self.resolve_terraform_module(current_file, specifier);
         }
-        self.resolve_import_path(current_file, lang, specifier)
-            .into_iter()
-            .collect()
+        let by_path = self.resolve_import_path(current_file, lang, specifier);
+        if by_path.is_none() && matches!(lang, "kotlin" | "java") {
+            return self.resolve_jvm_import(current_file, specifier);
+        }
+        by_path.into_iter().collect()
+    }
+
+    /// The file(s) a Kotlin or Java import names, read from the `package`
+    /// headers the corpus declares rather than from a directory layout.
+    ///
+    /// `import a.b.C` and `import a.b.helper` both name `helper`/`C` in package
+    /// `a.b`; a top-level function or an extension lives in whatever file the
+    /// author chose, and a module's source root (`core/src/main/java`) is not a
+    /// prefix any fixed root list can know. Splitting from the right tries
+    /// `a.b.C.member` as member `member` of type `C` in `a.b` as well. The file
+    /// must declare the name; a package alone is not an answer. Never the
+    /// importing file itself.
+    /// The member `type_name.member` a Kotlin or Java file reaches through a
+    /// type the corpus declares: written fully qualified (`com.fx.app.Registry`,
+    /// with Kotlin's `.INSTANCE`/`.Companion` accessor dropped), imported, or
+    /// declared in the caller's own package.
+    fn jvm_qualified_member(
+        &self,
+        file: &str,
+        receiver: &str,
+        member: &str,
+    ) -> Option<(String, String)> {
+        let receiver = receiver
+            .strip_suffix(".INSTANCE")
+            .or_else(|| receiver.strip_suffix(".Companion"))
+            .unwrap_or(receiver);
+        let parts: Vec<&str> = receiver.split('.').collect();
+        if parts
+            .iter()
+            .any(|part| part.is_empty() || !Self::is_plain_ident(part))
+        {
+            return None;
+        }
+        let (type_name, type_file) = if let [only] = parts.as_slice() {
+            let imported = self
+                .import_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(*only))
+                .map(|(target, _)| target.clone())
+                .filter(|target| target.ends_with(".java") || target.ends_with(".kt"));
+            let same_package = || {
+                let package = self.jvm_package_by_file.get(file)?;
+                let files = self
+                    .jvm_package_symbols
+                    .get(&(package.clone(), (*only).to_string()))?;
+                let mut others = files.iter().filter(|candidate| candidate.as_str() != file);
+                let first = others.next()?;
+                others.next().is_none().then(|| first.clone())
+            };
+            ((*only).to_string(), imported.or_else(same_package)?)
+        } else {
+            let (type_name, package_parts) = parts.split_last()?;
+            let files = self
+                .jvm_package_symbols
+                .get(&(package_parts.join("."), (*type_name).to_string()))?;
+            let mut others = files.iter().filter(|candidate| candidate.as_str() != file);
+            let first = others.next()?;
+            if others.next().is_some() {
+                return None;
+            }
+            ((*type_name).to_string(), first.clone())
+        };
+        self.jvm_member_target(&type_file, &type_name, member)
+            .map(|identity| (type_file, identity))
+    }
+
+    /// The one nested Kotlin type `receiver.name` names, when this file can see
+    /// `receiver`: declared in it, imported by it, or in its package.
+    fn nested_type_target(
+        &self,
+        file: &str,
+        receiver: &str,
+        name: &str,
+    ) -> Option<(String, String)> {
+        let hits = self.symbol_index.get(name)?;
+        let own = format!("{receiver}.{name}");
+        let nested = format!(".{own}");
+        let scoped = format!("::{own}");
+        let root = Self::path_root(receiver);
+        let imported = self
+            .import_bindings
+            .get(file)
+            .and_then(|bindings| bindings.get(root))
+            .map(|(target, _)| target.as_str());
+        let package = self.jvm_package_by_file.get(file);
+        let mut found: Vec<(&str, &str)> = hits
+            .iter()
+            .filter(|(path, kind, family, identity)| {
+                *family == LangFamily::Kotlin
+                    && matches!(
+                        kind,
+                        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum
+                    )
+                    && (identity.as_ref() == own
+                        || identity.ends_with(&nested)
+                        || identity.ends_with(&scoped))
+                    && (path == file
+                        || imported == Some(path.as_str())
+                        || (package.is_some() && self.jvm_package_by_file.get(path) == package))
+            })
+            .map(|(path, _, _, identity)| (path.as_str(), identity.as_ref()))
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        match found.as_slice() {
+            [(path, identity)] => Some(((*path).to_string(), (*identity).to_string())),
+            _ => None,
+        }
+    }
+
+    /// The identity of the one method `type_name.member` a file declares.
+    fn jvm_member_target(&self, file: &str, type_name: &str, member: &str) -> Option<String> {
+        let hits = self.symbol_index.get(member)?;
+        let own = format!("{type_name}.{member}");
+        let nested = format!(".{own}");
+        let scoped = format!("::{own}");
+        let mut found: Vec<&str> = hits
+            .iter()
+            .filter(|(path, kind, _, identity)| {
+                path == file
+                    && matches!(kind, SymbolKind::Method | SymbolKind::Function)
+                    && (identity.as_ref() == own
+                        || identity.ends_with(&nested)
+                        || identity.ends_with(&scoped))
+            })
+            .map(|(_, _, _, identity)| identity.as_ref())
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        (found.len() == 1).then(|| found[0].to_string())
+    }
+
+    fn resolve_jvm_import(&self, current_file: &str, specifier: &str) -> Vec<String> {
+        let parts: Vec<&str> = specifier.split('.').collect();
+        for split in (1..parts.len()).rev() {
+            let package = parts[..split].join(".");
+            let name = parts[split];
+            if let Some(files) = self.jvm_package_symbols.get(&(package, name.to_string())) {
+                let others: Vec<String> = files
+                    .iter()
+                    .filter(|file| file.as_str() != current_file)
+                    .cloned()
+                    .collect();
+                if !others.is_empty() {
+                    return others;
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// The indexed file a Python path load names, or `None`.
@@ -6402,6 +8674,35 @@ impl Resolver {
         (!vetoed).then_some(target)
     }
 
+    /// Whether a directory inserted into `sys.path` before `at` holds a file for
+    /// `module` other than the ones ordinary resolution found (`found`).
+    fn sys_path_shadows(
+        &self,
+        ext: &Extraction,
+        at: usize,
+        module: &str,
+        found: &[String],
+    ) -> bool {
+        let Some(search) = self.py_search_dirs.get(&ext.file_path) else {
+            return false;
+        };
+        let module = module.trim_matches(|c| c == '\'' || c == '"');
+        if module.is_empty() || module.starts_with('.') {
+            return false;
+        }
+        let relative = module.replace('.', "/");
+        [format!("{relative}.py"), format!("{relative}/__init__.py")]
+            .iter()
+            .any(|candidate| {
+                search
+                    .entries
+                    .iter()
+                    .filter(|(inserted, _)| *inserted < at)
+                    .filter_map(|(_, directory)| Self::normalize_rel(directory, candidate))
+                    .any(|path| self.file_symbols.contains_key(&path) && !found.contains(&path))
+            })
+    }
+
     /// Ordinary import resolution, then — for Python only, and only when that
     /// found nothing — this file's `sys.path` entries.
     fn resolve_import_targets_or_search_dirs(
@@ -6411,8 +8712,24 @@ impl Resolver {
     ) -> Vec<String> {
         let targets =
             self.resolve_import_targets(&ext.file_path, &ext.language, &imp.module_specifier);
-        if !targets.is_empty() || ext.language != "python" {
+        if ext.language != "python" {
             return targets;
+        }
+        if !targets.is_empty() {
+            // A directory this file put on `sys.path` before the import that
+            // holds a *different* file for the module outranks the ordinary
+            // rule at run time, so the ordinary answer may be the wrong
+            // module. Abstain rather than bind it confidently.
+            return if self.sys_path_shadows(
+                ext,
+                imp.span.start_byte,
+                &imp.module_specifier,
+                &targets,
+            ) {
+                Vec::new()
+            } else {
+                targets
+            };
         }
         self.resolve_via_search_dirs(ext, imp.span.start_byte, &imp.module_specifier)
             .into_iter()
@@ -6541,24 +8858,49 @@ impl Resolver {
             ext.local_binding_at(reference.span.start_byte, root)
                 .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
         };
-        if let Some(class_type) = self.receiver_type_for(
+        let receiver_type = self.receiver_type_for(
             &ext.file_path,
             reference.enclosing_symbol.as_deref(),
             receiver,
             binding,
-        ) {
-            let key = (family, class_type.clone(), name.to_string());
-            if let Some((target_file, target_symbol)) =
-                self.type_methods.get(&key).and_then(|hits| {
-                    self.receiver_type_method(
-                        ext,
-                        reference.enclosing_symbol.as_deref(),
-                        receiver,
-                        binding,
-                        &class_type,
-                        hits,
-                    )
+        );
+        // Python: a property read (`Engine(1).size`) or attribute of a class
+        // written at the reference, or of a typed receiver, through the file's
+        // own class identity and the declared bases — the call ladder's rule.
+        let python_class = (family == LangFamily::Python)
+            .then(|| {
+                receiver_type.clone().or_else(|| {
+                    (binding.is_none() && Self::is_plain_ident(receiver))
+                        .then(|| receiver.to_string())
                 })
+            })
+            .flatten()
+            .and_then(|written| self.python_method_on(&ext.file_path, &written, name).ok());
+        let class_is_known = python_class.is_some();
+        if let Some(Some(found)) = python_class {
+            return Some(self.reference_edge(
+                ext,
+                &found.file,
+                &found.symbol,
+                reference,
+                Resolution::ReceiverType {
+                    target_symbol: found.symbol.clone(),
+                    target_file: found.file.clone(),
+                    receiver_type: found.declaring_type,
+                },
+            ));
+        }
+        if let Some(class_type) = receiver_type.filter(|_| !class_is_known) {
+            if let Some(((target_file, target_symbol), receiver_type)) = self
+                .receiver_method_through_deref(
+                    ext,
+                    family,
+                    reference.enclosing_symbol.as_deref(),
+                    receiver,
+                    binding,
+                    &class_type,
+                    name,
+                )
             {
                 return Some(self.reference_edge(
                     ext,
@@ -6568,9 +8910,104 @@ impl Resolver {
                     Resolution::ReceiverType {
                         target_symbol: self.qualified_for(target_file, target_symbol),
                         target_file: target_file.clone(),
-                        receiver_type: class_type.clone(),
+                        receiver_type,
                     },
                 ));
+            }
+        }
+
+        // A Rust associated function or method named as a value by its type:
+        // `.map(Item::score)`. The receiver is the type itself, written at the
+        // use site, so there is no binding to type — the call ladder's rung 2d
+        // reads it the same way. Corroborated by this file (declared here or
+        // imported here), never by the name existing somewhere in the corpus.
+        if family == LangFamily::Rust
+            && Self::is_plain_ident(receiver)
+            && !Self::receiver_is_self(receiver)
+            && receiver.starts_with(|ch: char| ch.is_ascii_uppercase())
+            && binding.is_none()
+        {
+            let key = (family, receiver.to_string(), name.to_string());
+            if let Some((target_file, target_symbol)) = self
+                .type_methods
+                .get(&key)
+                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    target_file,
+                    target_symbol,
+                    reference,
+                    Resolution::ReceiverType {
+                        target_symbol: self.qualified_for(target_file, target_symbol),
+                        target_file: target_file.to_string(),
+                        receiver_type: receiver.to_string(),
+                    },
+                ));
+            }
+        }
+
+        // Swift: `Meter.privDouble` passed by name is a member of the type the
+        // receiver spells — the reference half of call rung 2d. The type must be
+        // corroborated by this file, as `type_method_target` requires.
+        if family == LangFamily::Swift
+            && Self::is_plain_ident(receiver)
+            && receiver.chars().next().is_some_and(char::is_uppercase)
+        {
+            let key = (family, receiver.to_string(), name.to_string());
+            if let Some((target_file, target_symbol)) = self
+                .type_methods
+                .get(&key)
+                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    target_file,
+                    target_symbol,
+                    reference,
+                    Resolution::ReceiverType {
+                        target_symbol: self.qualified_for(target_file, target_symbol),
+                        target_file: target_file.to_string(),
+                        receiver_type: receiver.to_string(),
+                    },
+                ));
+            }
+        }
+
+        // A Rust function named as a value through a module path:
+        // `commands::run` in `generate_handler![..]`, `.map(util::helper)`. The
+        // call ladder's rung 2d' places the module the same way and binds only
+        // a function in the one file that path names. A bare first segment is a
+        // module only when nothing here binds that name.
+        if family == LangFamily::Rust && !Self::receiver_is_self(receiver) {
+            let bare_root_is_free = !Self::is_plain_ident(receiver)
+                || (binding.is_none()
+                    && !self.root_is_a_value(
+                        &ext.file_path,
+                        reference
+                            .enclosing_symbol
+                            .as_deref()
+                            .unwrap_or(&ext.file_path),
+                        receiver,
+                        None,
+                    )
+                    && !self
+                        .import_bindings
+                        .get(&ext.file_path)
+                        .is_some_and(|bindings| bindings.contains_key(receiver)));
+            if bare_root_is_free {
+                if let Some(found) = self.rust_qualified_call(&ext.file_path, receiver, name, true)
+                {
+                    if let Some((target_file, target_symbol)) = found.target() {
+                        return Some(self.reference_edge(
+                            ext,
+                            target_file,
+                            target_symbol,
+                            reference,
+                            found.clone(),
+                        ));
+                    }
+                }
             }
         }
 
@@ -6780,6 +9217,9 @@ impl Resolver {
                     | SymbolKind::Interface
                     | SymbolKind::Trait
             )
+                // A Ruby module is what `include` mixes in, and the only thing
+                // its heritage position can name besides a class.
+                || (family == LangFamily::Ruby && kind == SymbolKind::Module)
         };
         // What the same-file rung accepts in type and heritage position.
         //
@@ -7010,6 +9450,9 @@ impl Resolver {
             return None;
         }
 
+        if self.is_bound_by_non_local_import(&ext.file_path, family, name) {
+            return None;
+        }
         if let Some(hits) = self.symbol_index.get(name) {
             let family_hits: Vec<_> = hits
                 .iter()
@@ -7290,6 +9733,18 @@ impl Resolver {
         declaration.in_global_sheet || reference.name.starts_with('#')
     }
 
+    /// Whether `symbol` in `file` is an interface (protocol, trait) declaration.
+    fn declares_interface(&self, file: &str, symbol: &str) -> bool {
+        let bare = symbol.rsplit("::").next().unwrap_or(symbol);
+        self.symbol_index.get(bare).is_some_and(|hits| {
+            hits.iter().any(|(path, kind, _, identity)| {
+                path == file
+                    && *kind == SymbolKind::Interface
+                    && (identity.as_ref() == symbol || identity.rsplit("::").next() == Some(bare))
+            })
+        })
+    }
+
     fn reference_edge(
         &self,
         ext: &Extraction,
@@ -7319,6 +9774,13 @@ impl Resolver {
             // nothing as usual. Both variants were declared with no producer;
             // every reference to them was a label map or a string parser.
             match reference.kind {
+                // Swift, Kotlin and Python write a base class and an interface
+                // in one syntax, so the extractor can only say `Extends`. The
+                // resolver knows what the supertype is: an indexed interface is
+                // implemented, not extended.
+                ReferenceKind::Heritage if self.declares_interface(target_file, target_sym) => {
+                    EdgeKind::Implements
+                }
                 ReferenceKind::Heritage => EdgeKind::Extends,
                 ReferenceKind::HeritageInterface => EdgeKind::Implements,
                 _ => EdgeKind::References,
@@ -7355,6 +9817,44 @@ impl Resolver {
         }
     }
 
+    /// Where an absolute Python import `py_path` (`pkg/util`) may live, beyond
+    /// the repository root and `src/`: the source roots of every manifest
+    /// governing `current_file`, nearest manifest first, and failing those the
+    /// one directory that holds a top-level package of that name. Each root
+    /// yields the module file and the package `__init__.py`.
+    fn python_root_candidates(&self, current_file: &str, py_path: &str) -> Vec<String> {
+        let mut roots: Vec<&str> = self
+            .python_manifest_roots
+            .iter()
+            .filter(|set| set.dir.is_empty() || current_file.starts_with(&format!("{}/", set.dir)))
+            .flat_map(|set| set.roots.iter().map(String::as_str))
+            .collect();
+        let first = py_path.split('/').next().unwrap_or(py_path);
+        // The standard library owns its names: a repository directory called
+        // `logging` is not evidence about `import logging`, so the fallback
+        // abstains for them like it does for a name two directories hold.
+        if let Some(parents) = self
+            .py_package_parents
+            .get(first)
+            .filter(|_| !crate::builtins::is_python_stdlib_module(first))
+        {
+            // Held by two directories, it names neither: abstain.
+            if parents.len() == 1 {
+                roots.extend(parents.iter().map(String::as_str));
+            }
+        }
+        roots
+            .into_iter()
+            .filter(|root| !root.is_empty())
+            .flat_map(|root| {
+                [
+                    format!("{root}/{py_path}.py"),
+                    format!("{root}/{py_path}/__init__.py"),
+                ]
+            })
+            .collect()
+    }
+
     fn resolve_import_path(
         &self,
         current_file: &str,
@@ -7371,9 +9871,29 @@ impl Resolver {
         // import — the corpus was told a local file came from outside it.
         if LangFamily::from_lang(lang) == LangFamily::JsTs && clean_spec.starts_with('.') {
             let base = Self::normalize_rel(&dir, clean_spec)?;
+            // NodeNext writes the extension the *emitted* file will have:
+            // `'./arrows.js'` names `arrows.ts`. TypeScript tries the source
+            // sibling first, so for a TS importer it goes before the literal
+            // path; a JS importer names the file it wrote and only falls back.
+            let source_sibling = |this: &Self| {
+                Self::nodenext_source_siblings(&base)
+                    .into_iter()
+                    .find(|candidate| this.file_symbols.contains_key(candidate))
+            };
+            let from_ts = matches!(lang, "typescript" | "tsx");
+            if from_ts {
+                if let Some(found) = source_sibling(self) {
+                    return Some(found);
+                }
+            }
             for cand in Self::js_module_candidates(&base) {
                 if self.file_symbols.contains_key(&cand) {
                     return Some(cand);
+                }
+            }
+            if !from_ts {
+                if let Some(found) = source_sibling(self) {
+                    return Some(found);
                 }
             }
         }
@@ -7382,6 +9902,9 @@ impl Resolver {
         if LangFamily::from_lang(lang) == LangFamily::JsTs && !clean_spec.starts_with('.') {
             if let Some(mapped) = self.resolve_ts_mapped(current_file, clean_spec) {
                 return Some(mapped);
+            }
+            if let Some(package) = self.resolve_workspace_package(clean_spec) {
+                return Some(package);
             }
         }
 
@@ -7457,6 +9980,13 @@ impl Resolver {
                 py_path = py_path.replace('.', "/");
             }
 
+            if dots == 0 {
+                for cand in self.python_root_candidates(current_file, &py_path) {
+                    if self.file_symbols.contains_key(&cand) {
+                        return Some(cand);
+                    }
+                }
+            }
             let candidates = [
                 format!("{}.py", py_path),
                 format!("{}/__init__.py", py_path),
@@ -7655,7 +10185,17 @@ impl Resolver {
             let spec = crate::importpath::strip_dart_package_prefix(clean_spec)
                 .filter(|_| lang == "dart")
                 .unwrap_or(clean_spec);
-            let candidates = crate::importpath::candidates(rule, &dir, spec);
+            let mut candidates = crate::importpath::candidates(rule, &dir, spec);
+            // A Gradle module's own source roots: `core/src/main/java/com/..`.
+            // The list is the settings script's `include` statements, so a
+            // module nothing includes is not probed.
+            if matches!(lang, "kotlin" | "java") {
+                candidates.extend(crate::importpath::module_candidates(
+                    rule,
+                    &self.gradle_module_dirs,
+                    spec,
+                ));
+            }
             for candidate in &candidates {
                 if self.file_symbols.contains_key(candidate) {
                     return Some(candidate.clone());
@@ -9062,25 +11602,31 @@ mod reference_resolution_tests {
         assert_eq!(unique_edges.len(), 1);
         assert_eq!(unique_edges[0].confidence, Confidence::HIGH);
 
-        // Several candidates must all stay speculative — never HIGH.
+        // Several candidates are not a call to any of them: no edge, and the
+        // site's ledger row carries the complete list (S2).
         let ambiguous = resolve(&[
             ("u.py", "def use():\n    return shared()\n"),
             ("x.py", "def shared():\n    pass\n"),
             ("y.py", "def shared():\n    pass\n"),
         ]);
-        let ambiguous_edges: Vec<_> = ambiguous
-            .edges
+        assert!(
+            ambiguous
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != EdgeKind::Calls),
+            "an ambiguous bare name binds no caller: {:?}",
+            edges_of(&ambiguous, &[EdgeKind::Calls])
+        );
+        let row = ambiguous
+            .unresolved
             .iter()
-            .filter(|edge| edge.edge_kind == EdgeKind::Calls)
-            .collect();
-        assert_eq!(ambiguous_edges.len(), 2, "both candidates are recorded");
-        for edge in &ambiguous_edges {
-            assert_eq!(
-                edge.confidence,
-                Confidence::SPECULATIVE,
-                "a multi-candidate guess must never carry HIGH confidence (G5)"
-            );
-        }
+            .find(|row| row.callee_name == "shared")
+            .expect("the ambiguous site is recorded in the ledger");
+        assert!(matches!(
+            &row.resolution,
+            Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
+        ));
+        assert_eq!(row.class, UnresolvedClass::Unresolved);
     }
 
     /// A route binds to its handler only when the handler is unambiguous and
@@ -9221,8 +11767,21 @@ mod reference_resolution_tests {
         let cors = express
             .unresolved
             .iter()
-            .find(|row| row.callee_name == "cors")
+            .find(|row| row.callee_name == "cors" && row.kind == UnresolvedKind::Route)
             .expect("the package middleware is recorded, not dropped");
+        // The `cors()` call itself is the package's too: it used to bind to
+        // util.js at the global tier, a confident edge to a namesake the file
+        // demonstrably does not call.
+        let call = express
+            .unresolved
+            .iter()
+            .find(|row| row.callee_name == "cors" && row.kind == UnresolvedKind::Call)
+            .expect("the call is recorded external, not bound to the namesake");
+        assert!(
+            matches!(&call.class, UnresolvedClass::External { module } if module == "cors"),
+            "{:?}",
+            call.class
+        );
         assert_eq!(cors.kind, UnresolvedKind::Route);
         assert!(
             matches!(&cors.class, UnresolvedClass::External { module } if module == "cors"),
@@ -9505,4 +12064,17 @@ mod reference_resolution_tests {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// Whether `bindings` imports the member a symbol names (`Type.member` or a
+/// bare `member`) from `target_file`.
+fn hits_import_binding(
+    bindings: Option<&BTreeMap<String, (String, String)>>,
+    symbol: &str,
+    target_file: &str,
+) -> bool {
+    let member = symbol.rsplit('.').next().unwrap_or(symbol);
+    bindings
+        .and_then(|bindings| bindings.get(member))
+        .is_some_and(|(file, _)| file == target_file)
 }

@@ -16,3 +16,14 @@ export function mulberry32(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+/**
+ * The same stream as {@link mulberry32} as unsigned 32-bit integers, for
+ * suites that pick with `rng() % n`. Exactly the integer the generator
+ * produced before the float division (the quotient by 2^32 is exact in a
+ * double, so the product recovers it), which keeps a seed's walk identical.
+ */
+export function mulberry32Uint32(seed: number): () => number {
+  const next = mulberry32(seed);
+  return () => next() * 4294967296;
+}

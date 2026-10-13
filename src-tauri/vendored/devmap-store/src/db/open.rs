@@ -5,6 +5,17 @@ use std::path::Path;
 use std::sync::Mutex;
 
 impl Store {
+    /// Make a connection safe to point at a file this process did not write.
+    ///
+    /// `trusted_schema = OFF` stops SQL stored in the schema (views, triggers,
+    /// generated and CHECK expressions) from calling functions with side
+    /// effects. It is set before the first statement runs, because the schema
+    /// is parsed on first use. Refusing triggers outright is
+    /// [`Self::reject_triggers`]; this is the second layer under it.
+    pub(super) fn harden_connection(conn: &Connection) -> Result<()> {
+        conn.pragma_update(None, "trusted_schema", "OFF")
+    }
+
     fn configure_connection(conn: &Connection) -> Result<()> {
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -238,6 +249,7 @@ impl Store {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        Self::harden_connection(&conn)?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         let first_read = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
         drop(setup);
@@ -251,6 +263,7 @@ impl Store {
             Err(error) => return Err(error),
         };
         Self::admit_reader_schema(&conn, &path.display().to_string(), stamped)?;
+        Self::reject_triggers(&conn)?;
         Self::configure_connection(&conn)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
@@ -358,6 +371,7 @@ impl Store {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut conn = Connection::open(path)?;
+        Self::harden_connection(&conn)?;
         let store = path.display().to_string();
 
         // Decide whether this binary may touch the file *before* touching it.
@@ -392,6 +406,8 @@ impl Store {
         if !Self::schema_is_migratable(stamped) {
             return Err(Self::unsupported_schema(&store, stamped));
         }
+        // Before WAL, before migration: a trigger runs on the first write.
+        Self::reject_triggers(&conn)?;
         let read_only = conn.is_readonly(rusqlite::MAIN_DB)?;
         if read_only && stamped != CURRENT_SCHEMA_VERSION {
             // Migration is a write. A read-only store at an older schema can
@@ -454,12 +470,14 @@ impl Store {
                 other => encoded.push(other as char),
             }
         }
-        Connection::open_with_flags(
+        let conn = Connection::open_with_flags(
             format!("file:{encoded}?immutable=1"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
+        )?;
+        Self::harden_connection(&conn)?;
+        Ok(conn)
     }
 
     /// Whether this store can only be read. See the `read_only` field.
@@ -894,6 +912,7 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
+        Self::harden_connection(&conn)?;
         Self::configure_connection(&conn)?;
         Self::migrate(&mut conn, ":memory:")?;
         Ok(Self {

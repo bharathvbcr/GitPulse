@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(report.findings[0].rule_id, "betterleaks.github-pat");
         assert_eq!(report.findings[0].rule_name, "github-pat");
         assert_eq!(report.findings[0].path, "scripts/ci.sh");
-        assert_eq!(report.findings[0].line, 12);
+        assert_eq!(report.findings[0].line, Some(12));
         let serialized = serde_json::to_string(&report).expect("serialize");
         for needle in [
             PLANTED,
@@ -636,6 +636,54 @@ mod tests {
         let long = "9".repeat(500);
         let r = report_from_exit(0, body(&long, "low").as_bytes(), None);
         assert_eq!(r.kingfisher_version.map(|v| v.len()), Some(64));
+    }
+
+    #[test]
+    fn a_rejected_envelope_version_does_not_replace_the_valid_probed_one() {
+        let body = |version: &str| {
+            json!({
+                "findings": [],
+                "metadata": { "kingfisher_version": version }
+            })
+            .to_string()
+        };
+        let bad = "2.7.0\u{1b}[31m";
+        let r = report_from_exit(0, body(bad).as_bytes(), Some("kingfisher 2.7.0".into()));
+        assert_eq!(r.kingfisher_version.as_deref(), Some("2.7.0"));
+        assert!(
+            r.kingfisher_version_rejected,
+            "the rejection went unreported"
+        );
+        // With no valid probe the version stays unknown, and the rejection shows.
+        let r = report_from_exit(0, body(bad).as_bytes(), None);
+        assert_eq!(r.kingfisher_version, None);
+        assert!(r.kingfisher_version_rejected);
+        // A good envelope version is neither rejected nor overridden.
+        let r = report_from_exit(0, body("2.8.0").as_bytes(), Some("kingfisher 2.7.0".into()));
+        assert_eq!(r.kingfisher_version.as_deref(), Some("2.8.0"));
+        assert!(!r.kingfisher_version_rejected);
+    }
+
+    #[test]
+    fn a_finding_without_a_line_has_no_line() {
+        let item =
+            |finding: serde_json::Value| json!({ "rule": { "id": "r" }, "finding": finding });
+        let doc = json!({ "findings": [
+            item(json!({ "path": "/repo/a" })),
+            item(json!({ "path": "/repo/b", "line": 0 })),
+            item(json!({ "path": "/repo/c", "line": 9 })),
+        ] })
+        .to_string();
+        let env = envelope(&doc);
+        let lines: Vec<Option<u32>> = env.findings.iter().map(|f| f.line).collect();
+        assert_eq!(lines, [None, None, Some(9)]);
+        let report = report_from_exit(0, doc.as_bytes(), None);
+        let wire = serde_json::to_value(&report).expect("serialize");
+        assert!(wire["findings"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|f| f["line"].is_null()));
     }
 
     fn view(tracked: &[&str], ignored: &[&str]) -> GitView {

@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Repository store churn checks</title>
+    <style>
+      body { margin: 0; background: rgb(11 14 23); }
+      #app { width: 1200px; height: 800px; display: flex; overflow: hidden; }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      // An effect that reads `$repoStore.x` re-runs on every publish of the
+      // store, and the store publishes a fresh object for anything at all: a
+      // status poll, a loading flag, an error. Each panel below is mounted on
+      // one repository, then the store is made to publish things none of them
+      // read, and the page asks what that cost: native calls, cancelled loads,
+      // and local state put back to its default. The answer must be nothing.
+      import "../src/app.css";
+      import { mount, unmount, tick } from "svelte";
+      import { get } from "svelte/store";
+      import { createChecks } from "./checks";
+      import { mockIPCWithEvents } from "./tauriMocks";
+
+      const params = new URLSearchParams(location.search);
+      const { results, check, stopped } = createChecks();
+      const crashes = [];
+      const unexpected = [];
+      const calls = [];
+      addEventListener("error", (event) => crashes.push(event.message));
+      addEventListener("unhandledrejection", (event) => crashes.push(String(event.reason)));
+
+      const REPO = "/fixture/churn";
+      const stagedReadme = { path: "README.md", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 };
+      /** What `cmd_get_status` answers; the composer checks widen it. */
+      let statusRows = [stagedReadme];
+      /** Every commit the composer sent, staged-only or quick. */
+      const commits = [];
+      const OTHER = "/fixture/churn-other";
+      const now = Math.floor(Date.now() / 1000);
+      const branch = (name, tip, extra = {}) => ({
+        name, is_current: name === "main", is_remote: false, remote_name: null, tip_commit_id: tip,
+        is_default: name === "main", is_gone: false, last_commit_timestamp: now, last_author: "A",
+        last_summary: "s", ahead_count: 0, behind_count: 0, commits_ahead_of_base: 0,
+        commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0, ...extra,
+      });
+      const wt = (path, branchName, main = false) => ({
+        path, name: path.split("/").pop(), branch: branchName, head: "b".repeat(40), is_main: main,
+        is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 0,
+      });
+      // 250 worktrees: more rows than WorkView renders before "Show more".
+      const worktrees = [wt(REPO, "main", true), ...Array.from({ length: 249 }, (_, i) => wt(`${REPO}-wt/${i}`, `topic/${i}`))];
+      const graphNode = (id) => ({
+        id, short_id: id.slice(0, 7), summary: `Commit ${id}`, message: `Commit ${id}`, author: "A", email: "a@example.com",
+        timestamp: now, parents: [], refs: [], lane: 0,
+      });
+      /** The GitHub context call parks until the page releases it. */
+      let releaseContext = null;
+      const githubContext = { available: true, cli_present: true, host: "github.com", owner: "acme", repo: "churn",
+        html_url: "", pull_requests: [], prs_truncated: false, issues: [], issues_truncated: false, issues_error: null,
+        workflow_runs: [], runs_error: null, runs_truncated: false, releases: [], releases_truncated: false,
+        releases_error: null, warnings: [], error: "" };
+      const fixtures = {
+        cmd_resolve_repo: (a) => ({ path: a.repoPath ?? a.path, name: "churn", is_bare: false }),
+        cmd_list_branches: () => [branch("main", "m1"), branch("feature/a", "a1")],
+        cmd_get_status: () => statusRows,
+        cmd_commit: (a) => { commits.push({ kind: "commit", message: a.message, amend: a.amend }); return "ok"; },
+        cmd_quick_commit: (a) => { commits.push({ kind: "quick", message: a.message }); return "ok"; },
+        cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null,
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        cmd_watch_repo: (a) => a.repoPath, cmd_unwatch_repo: () => null,
+        cmd_list_repo_files: () => ["README.md", "src/a.ts"],
+        cmd_get_commit_graph: () => ({ nodes: [graphNode("c".repeat(40))], edges: [], total_commits: 1, truncated: false }),
+        cmd_set_recent_menu: () => null, cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_devcouncil_init: () => ({ repo: REPO, state_dir: `${REPO}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false }),
+        cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable",
+          facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
+        // Verified at exactly this tree, so every row draws a badge.
+        cmd_provenance_freshness_batch: (a) => a.revisions.map((commit_sha) => ({ commit_sha, distance: 0, confidence: 1,
+          is_fresh: true, unmeasured_reason: null, notes_readable: true, session: null,
+          verification: { verdict: "passed", verified_at: now, checked_by: "ci", task_id: null, details: null } })),
+        cmd_provenance_freshness: (a) => ({ commit_sha: a.commitSha, distance: 1, confidence: "high", is_fresh: true,
+          unmeasured_reason: null, notes_readable: true, verification: null, session: null }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_repo_operation: () => null,
+        cmd_list_worktrees: () => worktrees,
+        cmd_repository_trust: () => ({ path: REPO, git_dir: `${REPO}/.git`, common_dir: `${REPO}/.git`, identity: "fixture", scope: "repository", worktrees: 2 }),
+        cmd_task_view: () => ({ available: false, store_path: "", leases: [], error: "" }),
+        cmd_worktree_task: () => null,
+        cmd_github_context: () => new Promise((resolve) => { releaseContext = () => resolve(githubContext); }),
+        cmd_github_workflows: () => ({ available: false, cli_present: true, workflows: [], truncated: false, error: null }),
+        cmd_get_reflog: () => [],
+        cmd_get_head_id: () => "c".repeat(40),
+        cmd_get_file_content: () => "# churn\n",
+        cmd_codeintel_cancel: () => null,
+        // No index, no AI, no pulse history: each panel has a path for that,
+        // and none of it is what these checks are about.
+        cmd_codeintel_impact_at_rung: () => ({ source_freshness: { fresh: null, reason: "fixture: no index" }, available: false,
+          reason: "Not indexed in fixture", items: [], shown: 0, total: 0, truncated: false }),
+        ...Object.fromEntries(["cmd_codeintel_impact_layered_many", "cmd_apple_intelligence_status",
+          "cmd_get_pulse_report", "cmd_get_knowledge_report", "cmd_get_dora_report", "cmd_get_pulse_snapshots", "cmd_storage_scan", "cmd_codeintel_symbols_for_file", "cmd_devmap_preview_many",
+          "cmd_firebase_status"]
+          .map((cmd) => [cmd, () => { throw new Error(`fixture: ${cmd} unavailable`); }])),
+        cmd_record_pulse_snapshot: () => null,
+        cmd_get_file_diff: () => ({ text: "diff --git a/README.md b/README.md\n", truncated: false, truncation_reason: null }),
+        cmd_get_commit_diff: () => ({ text: "", truncated: false, truncation_reason: null }),
+        cmd_get_stack_hierarchy: () => ({ stacks: [], branches: [], truncated: false }),
+        cmd_detect_language: () => "markdown",
+        cmd_get_language_stats: () => ({ languages: [], total_files: 0, total_lines: 0, truncated: false }),
+        cmd_scan_coverage: () => null,
+        cmd_ledger_tail: () => [],
+        cmd_grants_view: () => ({ available: false, path: "", grants: [], error: "" }),
+        cmd_collision_risk: () => ({ ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: worktrees.length,
+          unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [], shared_worktree_files: 0, sessions_ok: true,
+          sessions_error: "", shared_worktrees: [] }),
+      };
+      mockIPCWithEvents(async (cmd, args) => {
+        calls.push(cmd);
+        if (fixtures[cmd]) return fixtures[cmd](args ?? {});
+        unexpected.push(cmd);
+        throw new Error(`Unconfigured command: ${cmd}`);
+      });
+
+      // The app's modules after the mock layer, so nothing they do on import
+      // can reach a native call that is not there.
+      const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { freshnessStore } = await import("../src/lib/provenance/store");
+      const { coverageMetric, locMetric, storageMetric } = await import("../src/lib/metrics/repoMetrics");
+      const FileTreePanel = (await import("../src/lib/components/files/FileTreePanel.svelte")).default;
+      const WorktreesPanel = (await import("../src/lib/components/WorktreesPanel.svelte")).default;
+      const BranchList = (await import("../src/lib/components/BranchList.svelte")).default;
+      const GitHubPanel = (await import("../src/lib/components/GitHubPanel.svelte")).default;
+      const ReflogViewer = (await import("../src/lib/components/ReflogViewer.svelte")).default;
+      const CodeStackViewer = (await import("../src/lib/components/CodeStackViewer.svelte")).default;
+      const TrustExtensionBanner = (await import("../src/lib/components/TrustExtensionBanner.svelte")).default;
+      const CommitDetails = (await import("../src/lib/components/CommitDetails.svelte")).default;
+      const LivePulseDashboard = (await import("../src/lib/components/files/LivePulseDashboard.svelte")).default;
+      const PulseView = (await import("../src/lib/components/pulse/PulseView.svelte")).default;
+      const StoragePanel = (await import("../src/lib/components/StoragePanel.svelte")).default;
+      const LanguageSegment = (await import("../src/lib/components/LanguageSegment.svelte")).default;
+      const WorkView = (await import("../src/lib/components/WorkView.svelte")).default;
+      const DiffViewer = (await import("../src/lib/components/DiffViewer.svelte")).default;
+      const CommitComposer = (await import("../src/lib/components/CommitComposer.svelte")).default;
+
+      // Each subscription delivers its snapshot synchronously and may record
+      // it (PulseView writes a history point), so a resubscription per publish
+      // is work per publish even when the metric itself measures nothing.
+      let subscriptions = 0;
+      for (const metric of [locMetric, coverageMetric, storageMetric]) {
+        const subscribe = metric.subscribe.bind(metric);
+        metric.subscribe = (path, listener) => { subscriptions += 1; return subscribe(path, listener); };
+      }
+
+      const app = document.getElementById("app");
+      const settle = async (n = 5) => {
+        for (let i = 0; i < n; i += 1) { await tick(); await new Promise((r) => setTimeout(r, 20)); }
+      };
+      const count = (cmd) => calls.filter((c) => c === cmd).length;
+      /**
+       * Waits for something asynchronous to arrive, up to `deadlineMs`, then
+       * returns either way so the check after it reports what is true. Only
+       * for arrivals: the "nothing happened during churn" checks keep their
+       * short, fixed settle, because waiting longer there proves nothing more.
+       */
+      async function until(fn, deadlineMs = 5000) {
+        const stop = Date.now() + deadlineMs;
+        while (Date.now() < stop) {
+          try { if (fn()) return; } catch { /* not there yet */ }
+          await tick();
+          await new Promise((r) => setTimeout(r, 20));
+        }
+      }
+      /**
+       * Publishes the store three times with nothing any panel reads: an
+       * error set and cleared, the way a failed background read reports.
+       * Every field but `error` keeps its identity across these publishes.
+       */
+      async function churn() {
+        for (let i = 0; i < 3; i += 1) {
+          repoStore.setError(`unrelated ${i}`);
+          await settle(1);
+          repoStore.setError(null);
+          await settle(1);
+        }
+        await settle(5);
+      }
+      /** Native calls `fn` caused, by name. */
+      async function callsDuring(fn) {
+        const from = calls.length;
+        await fn();
+        return calls.slice(from);
+      }
+      const buttons = () => [...app.querySelectorAll("button")];
+      let component = null;
+      async function show(Component, props = {}) {
+        if (component) unmount(component);
+        app.innerHTML = "";
+        component = mount(Component, { target: app, props });
+        await settle(10);
+      }
+
+      /**
+       * Mount, wait, publish unrelated changes, and require none of the
+       * component's own native calls and no new metric subscription. The
+       * store's own reads (its status poll among them) are not the panel's,
+       * so each panel names the commands that are.
+       */
+      async function quietUnderChurn(name, Component, owned, props = {}) {
+        const mountedFrom = calls.length;
+        await show(Component, props);
+        const onMount = calls.slice(mountedFrom).filter((cmd) => owned.includes(cmd));
+        // A panel that never made its call would pass the next check by
+        // doing nothing at all.
+        check(`${name}: mounting makes its own native call (saw ${onMount.join(", ") || "none"})`, () => onMount.length > 0);
+        const subscribedBefore = subscriptions;
+        const during = (await callsDuring(churn)).filter((cmd) => owned.includes(cmd));
+        const resubscribed = subscriptions - subscribedBefore;
+        check(`${name}: unrelated store publishes cause none of its native calls (saw ${during.join(", ") || "none"})`, () => during.length === 0);
+        check(`${name}: unrelated store publishes do not resubscribe a metric (saw ${resubscribed})`, () => resubscribed === 0);
+      }
+
+      async function run() {
+        await repoStore.openRepo(REPO);
+        await settle(10);
+        let published = -1;
+        const stopCounting = repoStore.subscribe(() => (published += 1));
+        await churn();
+        stopCounting();
+        // Otherwise every check below passes because nothing happened.
+        check(`the probe publishes the store (${published} publishes)`, () => published >= 6);
+
+        // ---- FileTreePanel: one listing per repository, not per publish.
+        await quietUnderChurn("FileTreePanel", FileTreePanel, ["cmd_list_repo_files"]);
+
+        // ---- WorktreesPanel: an armed confirmation is local state.
+        await show(WorktreesPanel);
+        const findRemove = () => buttons().find((b) => b.getAttribute("aria-label") === "Remove this worktree");
+        await until(findRemove);
+        const remove = findRemove();
+        check("WorktreesPanel: a removable worktree row is rendered", () => remove);
+        remove.click();
+        await settle(3);
+        const armed = () => buttons().some((b) => (b.getAttribute("aria-label") ?? "").includes("Click again to remove"));
+        check("WorktreesPanel: the first click arms the removal", armed);
+        const worktreeCalls = (await callsDuring(churn)).filter((cmd) => ["cmd_list_worktrees", "cmd_repository_trust", "cmd_task_view", "cmd_worktree_task"].includes(cmd));
+        check("WorktreesPanel: the armed confirmation survives unrelated publishes", armed);
+        check(`WorktreesPanel: no reload during unrelated publishes (saw ${worktreeCalls.join(", ") || "none"})`, () => worktreeCalls.length === 0);
+
+        // ---- BranchList: badges after mount, with nothing else happening.
+        freshnessStore.forRepo(null);
+        let before = count("cmd_provenance_freshness_batch");
+        await show(BranchList);
+        const badges = () => app.querySelectorAll('[data-testid="freshness-dot"]').length;
+        const landed = () => Object.keys(get(freshnessStore).byRevision).length;
+        await until(() => landed() === 2 && badges() === 2);
+        const asked = count("cmd_provenance_freshness_batch") - before;
+        check(`BranchList: one freshness batch on mount (saw ${asked})`, () => asked === 1);
+        check(`BranchList: the batch's rows are kept after mount (have ${landed()})`, () => landed() === 2);
+        // The badges themselves, with nothing else happening: the reset effect
+        // used to run right after the load in the same flush and discard it.
+        check(`BranchList: a freshness badge renders for each branch after mount (rendered ${badges()})`, () => badges() === 2);
+        const branchCalls = (await callsDuring(churn)).filter((cmd) => cmd === "cmd_provenance_freshness_batch");
+        check(`BranchList: no batch during unrelated publishes (saw ${branchCalls.join(", ") || "none"})`, () => branchCalls.length === 0);
+        check(`BranchList: the rows survive unrelated publishes (have ${landed()})`, () => landed() === 2);
+        check(`BranchList: the badges survive unrelated publishes (rendered ${badges()})`, () => badges() === 2);
+
+        // ---- GitHubPanel: a publish while the context is in flight.
+        await repoStore.openRepo(OTHER);
+        await settle(10);
+        await repoStore.openRepo(REPO);
+        await settle(10);
+        releaseContext = null;
+        before = count("cmd_github_context");
+        await show(GitHubPanel);
+        await until(() => typeof releaseContext === "function");
+        check("GitHubPanel: the context call is in flight", () => typeof releaseContext === "function");
+        const ghCalls = (await callsDuring(churn)).filter((cmd) => cmd.startsWith("cmd_github_"));
+        releaseContext?.();
+        await until(() => !app.querySelector(".animate-spin"));
+        check(`GitHubPanel: one context call across unrelated publishes (saw ${count("cmd_github_context") - before})`, () => count("cmd_github_context") - before === 1);
+        check(`GitHubPanel: nothing re-asked during unrelated publishes (saw ${ghCalls.join(", ") || "none"})`, () => ghCalls.length === 0);
+        check("GitHubPanel: the spinner clears when the answer lands", () => !app.querySelector(".animate-spin"));
+        fixtures.cmd_github_context = () => githubContext;
+
+        // ---- Loaders keyed on the repository alone.
+        await quietUnderChurn("ReflogViewer", ReflogViewer, ["cmd_get_reflog"]);
+        await quietUnderChurn("CodeStackViewer", CodeStackViewer, ["cmd_get_stack_hierarchy"]);
+        await quietUnderChurn("TrustExtensionBanner", TrustExtensionBanner, ["cmd_repository_trust"]);
+        await quietUnderChurn("LivePulseDashboard", LivePulseDashboard, ["cmd_detect_language", "cmd_get_commit_graph"], { selectedFile: "README.md" });
+        // LanguageSegment first: it shares PulseView's line-count metric, which
+        // measures once, so mounted second it would have nothing of its own to ask.
+        await quietUnderChurn("LanguageSegment", LanguageSegment, ["cmd_get_language_stats"]);
+        await quietUnderChurn("PulseView", PulseView, ["cmd_get_pulse_report", "cmd_get_knowledge_report", "cmd_get_dora_report",
+          "cmd_get_pulse_snapshots", "cmd_record_pulse_snapshot", "cmd_get_language_stats", "cmd_scan_coverage"]);
+        await quietUnderChurn("StoragePanel", StoragePanel, ["cmd_storage_scan"]);
+
+        // ---- CommitDetails: provenance for the selected commit, once.
+        await repoStore.selectCommitDiff("c".repeat(40));
+        await settle(5);
+        await quietUnderChurn("CommitDetails", CommitDetails, ["cmd_provenance_freshness"]);
+
+        // ---- DiffViewer and CommitComposer: impact walks per selection.
+        await repoStore.selectFileDiff("README.md", true);
+        await settle(5);
+        await quietUnderChurn("DiffViewer", DiffViewer, ["cmd_codeintel_impact_at_rung", "cmd_get_head_id", "cmd_get_file_content", "cmd_get_file_diff"]);
+        await quietUnderChurn("CommitComposer", CommitComposer, ["cmd_codeintel_impact_layered_many", "cmd_get_file_content", "cmd_codeintel_cancel"]);
+
+        // ---- CommitComposer: what a commit sends, and when it refuses.
+        // A staged file and an unstaged one, so staged-only and "Commit all"
+        // differ in what they would take.
+        statusRows = [stagedReadme, { path: "src/a.ts", status_code: "M", is_staged: false, is_conflicted: false, additions: 2, deletions: 0 }];
+        await repoStore.refresh(); await settle(10);
+        const commitButton = () => buttons().find((b) => /^(Commit|Commit all) \(\d+\)$/.test(b.textContent.trim()));
+        const message = () => app.querySelector("textarea");
+        const type = async (text) => { message().value = text; message().dispatchEvent(new Event("input", { bubbles: true })); await settle(5); };
+        const chord = async (shiftKey) => { message().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, ctrlKey: true, shiftKey, bubbles: true, cancelable: true })); await until(() => commits.length > sentBefore); await settle(10); };
+        let sentBefore = commits.length;
+        check("CommitComposer: the default commit takes the staged files only",
+          () => commitButton()?.textContent.trim() === "Commit (1)" && !buttons().some((b) => b.textContent.trim().startsWith("Commit all")));
+        check("CommitComposer: an empty message cannot commit", () => commitButton()?.disabled === true);
+        await type("Staged only");
+        await chord(false);
+        check("CommitComposer: Cmd/Ctrl+Enter commits the staged files, not amending",
+          () => commits.length === sentBefore + 1 && commits.at(-1).kind === "commit" && commits.at(-1).message === "Staged only" && commits.at(-1).amend === false);
+        sentBefore = commits.length;
+        await type("Everything");
+        await chord(true);
+        check("CommitComposer: Shift adds the unstaged files, as a quick commit",
+          () => commits.length === sentBefore + 1 && commits.at(-1).kind === "quick" && commits.at(-1).message === "Everything");
+        const include = app.querySelector('input[aria-label="Include unstaged files in this commit"]');
+        if (include && !include.checked) { include.click(); await settle(5); }
+        check("CommitComposer: Include unstaged names the wider commit and counts both files",
+          () => commitButton()?.textContent.trim() === "Commit all (2)");
+        statusRows = [{ path: "README.md", status_code: "UU", is_staged: false, is_conflicted: true, additions: 0, deletions: 0 }, stagedReadme];
+        await repoStore.refresh(); await settle(10);
+        await type("With conflicts");
+        sentBefore = commits.length;
+        message().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true }));
+        await settle(20);
+        check("CommitComposer: a conflict disables Commit and the chord sends nothing",
+          () => commitButton()?.disabled === true && commits.length === sentBefore);
+        statusRows = [stagedReadme];
+        await repoStore.refresh(); await settle(10);
+
+        // ---- WorkView: "Show more" is the reader's, not the store's.
+        await show(WorkView);
+        const rows = () => app.querySelectorAll("[data-work-row]").length;
+        const findMore = () => buttons().find((b) => /show more/i.test(b.textContent ?? ""));
+        await until(() => rows() >= 100 && findMore());
+        const shown = rows();
+        const more = findMore();
+        check(`WorkView: more rows than the first page (rendered ${shown})`, () => more && shown > 0);
+        more.click();
+        await until(() => rows() > shown);
+        const expanded = rows();
+        check(`WorkView: "Show more" renders more rows (${shown} -> ${expanded})`, () => expanded > shown);
+        await churn();
+        check(`WorkView: "Show more" persists across unrelated publishes (${expanded} -> ${rows()})`, () => rows() === expanded);
+
+        // ---- WorkView: a filter that hides every row says so, in its own words.
+        const filterField = () => app.querySelector('input[aria-label="Filter work rows"]');
+        filterField().value = "zzz-matches-nothing"; filterField().dispatchEvent(new Event("input", { bubbles: true }));
+        await until(() => app.textContent.includes("No row matches this filter"));
+        check("WorkView: a filter matching nothing says so, never \"Nothing in flight\", and counts what it hid",
+          () => rows() === 0 && !app.textContent.includes("Nothing in flight") && app.textContent.includes(`0 of ${worktrees.length}`));
+        buttons().find((b) => b.textContent.trim() === "Clear filter")?.click();
+        await until(() => rows() > 0);
+        check("WorkView: Clear filter brings the rows back and empties the field", () => rows() > 0 && filterField().value === "");
+        const dirtyFacet = () => buttons().find((b) => b.textContent.trim() === "Uncommitted changes");
+        const pressedBefore = dirtyFacet()?.getAttribute("aria-pressed");
+        dirtyFacet()?.click(); await settle(5);
+        check("WorkView: the Uncommitted changes facet is a pressed toggle that narrows the rows",
+          () => pressedBefore === "false" && dirtyFacet()?.getAttribute("aria-pressed") === "true" && app.textContent.includes(`of ${worktrees.length}`));
+        dirtyFacet()?.click(); await settle(5);
+        check("WorkView: names the repository the reader is standing in", () => Boolean(app.querySelector('section[aria-label="Current repository"]')));
+        // A collision scan that failed is not a scan that found nothing.
+        const collisionFixture = fixtures.cmd_collision_risk;
+        fixtures.cmd_collision_risk = () => { throw new Error("fixture: collision scan unavailable"); };
+        await show(WorkView);
+        await until(() => app.textContent.includes("Could not check overlapping files"));
+        check("WorkView: a failed collision scan says it could not check, never that there is no overlap",
+          () => app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
+        fixtures.cmd_collision_risk = collisionFixture;
+
+        check(`no crash (${crashes.join(" | ") || "none"})`, () => crashes.length === 0);
+        check(`no unconfigured native command (${[...new Set(unexpected)].join(", ") || "none"})`, () => unexpected.length === 0);
+      }
+
+      try {
+        await run();
+      } catch (error) {
+        stopped(error);
+      }
+      if (component) unmount(component);
+      const result = { results, passed: results.filter((r) => r.pass).length, total: results.length,
+        crashes: crashes.slice(0, 10), unexpected: [...new Set(unexpected)] };
+      document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify(result)));
+      document.getElementById("result").textContent = results.map((r) => `${r.pass ? "ok  " : "FAIL"} ${r.name}`).join("\n");
+      if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    </script>
+  </body>
+</html>

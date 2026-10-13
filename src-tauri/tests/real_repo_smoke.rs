@@ -13,6 +13,11 @@
 //! sandbox; it FAILS (never silently passes) when the env var is set but
 //! unusable, so a check that could not run can never report as one that ran.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::analyzer::CommitFilter;
 use gitpulse_lib::commands::{assemble_commit_graph, resolve_mainline_hint, GraphNotes};
 use gitpulse_lib::engine::GitReader;

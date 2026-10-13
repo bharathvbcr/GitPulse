@@ -10,9 +10,10 @@ Resolve this checkout with `devmap paths --json`, then check `devmap status --js
 
 Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. Always pass `repo_path` (the absolute repository path) on every `devmap_*` and `gitpulse_codeintel_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one `devmap mcp` process across tabs. Discover the actual tool names and schemas; a host need not expose every CLI capability.
 
-1. Run `devmap explore <name> --json` for definitions, callers, callees, and blast radius.
-2. Use `devmap trace <from> <to> --json` for a specific entry-to-symbol path.
-3. Use the resolved map's subsystems, entry points, and critical files for ownership.
-4. Confirm the explanation against source and call sites. Graph paths describe static relationships, not proof that a path executed.
+1. When you know the behaviour but not the name, run `devmap ask --evidence "<question>" --json` (MCP `devmap_ask_evidence`): ranked files with their source, the call edges between the hits, and the tests that reach them. Read its source before opening the same files again.
+2. Run `devmap explore <name> --json` for definitions, callers, callees, and blast radius.
+3. Use `devmap trace <from> <to> --json` for a specific entry-to-symbol path.
+4. Use the resolved map's subsystems, entry points, and critical files for ownership.
+5. Confirm the explanation against source and call sites. Graph paths describe static relationships, not proof that a path executed.
 
 Read `shown`, `total`, `truncated`, and `walk_incomplete`. Increase query bounds only within supported limits. When DevMap cannot answer, explain the limitation and use source inspection or a suitable available fallback, subject to user and repository instructions.

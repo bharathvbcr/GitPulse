@@ -19,16 +19,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// `LAPPI_COLLECT` is process-wide, and [`Store::append`] reads it on every
-/// call, so every test that appends or sets it holds this.
-static COLLECT_ENV: Mutex<()> = Mutex::new(());
-
-fn collect_env() -> std::sync::MutexGuard<'static, ()> {
-    COLLECT_ENV
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 const ID: &str = "0123456789abcdef0123456789abcdef";
 const DEADLINE: Duration = Duration::from_secs(2);
 
@@ -61,7 +51,8 @@ struct Agent {
 fn agent(behave: impl FnOnce(UnixStream) + Send + 'static) -> Agent {
     let dir = socket_dir();
     let path = dir.path().join("qd.sock");
-    let listener = UnixListener::bind(&path).expect("the fake agent binds");
+    let listener = crate::procguard::with_inheritance_lock(|| UnixListener::bind(&path))
+        .expect("the fake agent binds");
     let (tx, requests) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let Ok((stream, _)) = listener.accept() else {
@@ -128,7 +119,8 @@ fn a_reply_written_at_accept_is_read_even_when_the_request_write_fails() {
     for round in 0..30 {
         let dir = socket_dir();
         let path = dir.path().join("qd.sock");
-        let listener = UnixListener::bind(&path).expect("binds");
+        let listener =
+            crate::procguard::with_inheritance_lock(|| UnixListener::bind(&path)).expect("binds");
         let refuser = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
             stream.write_all(ERROR.as_bytes()).expect("writes");
@@ -200,7 +192,7 @@ fn no_socket_is_socket_not_found() {
 fn a_socket_nobody_listens_on_is_connect_refused() {
     let dir = socket_dir();
     let path = dir.path().join("stale.sock");
-    drop(UnixListener::bind(&path).expect("bind"));
+    drop(crate::procguard::with_inheritance_lock(|| UnixListener::bind(&path)).expect("bind"));
     assert!(path.exists(), "the stale socket file stays behind");
     assert_eq!(
         client::ask(&path, &request_line(), DEADLINE),
@@ -253,7 +245,7 @@ fn a_dripping_agent_cannot_hold_the_caller_past_the_whole_exchange_deadline() {
     let elapsed = started.elapsed();
     assert_eq!(outcome, unavailable(UnavailableReason::Deadline));
     assert!(
-        elapsed < Duration::from_millis(1500),
+        elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(1500)),
         "held for {elapsed:?} by a dripping agent"
     );
 }
@@ -267,7 +259,7 @@ fn an_agent_that_accepts_and_never_writes_is_a_deadline() {
     let started = Instant::now();
     let outcome = client::ask(&agent.path, &request_line(), Duration::from_millis(300));
     assert_eq!(outcome, unavailable(UnavailableReason::Deadline));
-    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(1500)));
 }
 
 #[test]
@@ -511,7 +503,7 @@ fn mode(path: &Path) -> u32 {
 
 #[test]
 fn records_are_append_only_0600_in_0700_directories() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (root, store) = held_out_store();
     assert_eq!(
         store.append(DAY, b"{\"n\":1}").expect("append"),
@@ -543,7 +535,7 @@ fn records_are_append_only_0600_in_0700_directories() {
 
 #[test]
 fn a_loose_existing_file_is_tightened_to_0600() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     std::fs::create_dir_all(store.dir()).expect("mkdir");
     let file = store.dir().join(format!("{DAY}.jsonl"));
@@ -555,7 +547,7 @@ fn a_loose_existing_file_is_tightened_to_0600() {
 
 #[test]
 fn a_line_over_64_kib_is_dropped_and_counted() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     let line = vec![b'a'; record::MAX_RECORD_BYTES + 1];
     assert_eq!(
@@ -580,7 +572,7 @@ fn a_line_over_64_kib_is_dropped_and_counted() {
 
 #[test]
 fn a_full_day_file_stops_recording_and_counts_every_drop() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     std::fs::create_dir_all(store.dir()).expect("mkdir");
     let file = store.dir().join(format!("{DAY}.jsonl"));
@@ -610,7 +602,7 @@ fn a_full_day_file_stops_recording_and_counts_every_drop() {
 
 #[test]
 fn a_full_store_stops_recording() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     std::fs::create_dir_all(store.dir()).expect("mkdir");
     for (i, day) in ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
@@ -636,7 +628,7 @@ fn a_full_store_stops_recording() {
 
 #[test]
 fn lappi_collect_zero_forces_recording_off() {
-    let serial = collect_env();
+    let serial = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     {
         let _off = crate::test_support::env::bind_env(&serial).set(record::COLLECT_ENV, "0");
@@ -653,7 +645,7 @@ fn lappi_collect_zero_forces_recording_off() {
 
 #[test]
 fn concurrent_writers_produce_only_whole_lines() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let root = tempfile::tempdir().expect("temp dir");
     let dir = root.path().join("heldout/caller-records/gitpulse");
     const WRITERS: usize = 8;
@@ -891,7 +883,7 @@ fn a_credential_in_a_reply_is_redacted_before_it_is_written() {
 
 #[test]
 fn a_decision_and_its_commit_pair_through_the_pending_map() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     let agent = replying(REFUSED);
     let pending = Mutex::new(Pending::new());
@@ -998,7 +990,7 @@ fn the_shapes_match_the_contract_fixture_when_it_is_present() {
 
 #[test]
 fn records_pass_the_contract_checker_binary_when_it_is_available() {
-    let _env = collect_env();
+    let _env = crate::test_support::env::env_serial();
     let (_root, store) = held_out_store();
     let mut outcomes = every_outcome();
     // A reply carrying a credential: what the redactor leaves must still pass
@@ -1050,7 +1042,7 @@ fn records_pass_the_contract_checker_binary_when_it_is_available() {
 
 #[test]
 fn both_switches_default_off_and_a_malformed_block_stays_off() {
-    let serial = crate::tool_config::lock_config_env();
+    let serial = crate::test_support::env::env_serial();
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("tools.json");
     let _env = crate::test_support::env::bind_env(&serial)

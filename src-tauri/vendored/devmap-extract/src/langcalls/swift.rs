@@ -52,7 +52,13 @@ pub fn extract_swift_call(
     let Some(call) = swift_call_identity(node, source) else {
         return;
     };
-    if !is_callee_identity(&call.callee_name) {
+    // An operator's name is punctuation, which `is_callee_identity` refuses by
+    // design for an *expression*. A `custom_operator` node is a declared
+    // operator's own spelling, so it is an identity and passes.
+    if !call.operator
+        && call.name_node.kind() != "custom_operator"
+        && !is_callee_identity(&call.callee_name)
+    {
         return;
     }
     let enclosing = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
@@ -80,6 +86,8 @@ struct SwiftCall<'tree> {
     receiver_expr: Option<String>,
     name_node: Node<'tree>,
     kind: ReferenceKind,
+    /// The name is an operator's spelling, not an identifier.
+    operator: bool,
 }
 
 fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCall<'tree>> {
@@ -110,6 +118,7 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
             // through `if !f(…)` were reported dead at 0.9 confidence, from a
             // call the graph never saw.
             let target = swift_unwrap_prefix(target).unwrap_or(target);
+            let target = swift_call_operand(target);
             if target.kind() == "navigation_expression" {
                 return swift_navigation_call(target, source);
             }
@@ -127,6 +136,7 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
                 receiver_expr: receiver.as_deref().and_then(clamp_receiver),
                 name_node: target,
                 kind: ReferenceKind::Call,
+                operator: false,
             })
         }
         // `Set<Int>()`, `Box<Int>(value: 1)`. The constructed type is a field,
@@ -139,6 +149,61 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
                 receiver_expr,
                 name_node: constructed,
                 kind: ReferenceKind::Constructor,
+                operator: false,
+            })
+        }
+        // `a <+> b`. A custom operator is a call of the `static func <+>` some
+        // type declares; tree-sitter-swift spells the use as an
+        // `infix_expression` whose `op` is a `custom_operator`, and before this
+        // arm nothing recorded it, so a `fileprivate static func <+>` used only
+        // through its operator was published dead at 0.9 (the audit's Swift
+        // P1). Standard operators (`+`, `==`) parse as their own expression
+        // kinds and are not recorded: every `a + b` on an `Int` would be a
+        // ledger row. Their in-repo overloads are exempt at the declaration
+        // instead — see `swift_operator_declaration_reason`.
+        "infix_expression" => {
+            let op = node.child_by_field_name("op")?;
+            if op.kind() != "custom_operator" {
+                return None;
+            }
+            Some(SwiftCall {
+                callee_name: get_node_text(op, source),
+                receiver_expr: None,
+                name_node: op,
+                kind: ReferenceKind::Call,
+                operator: true,
+            })
+        }
+        // `a + b`, `a == b`, `a < b` on an operand that could be a user type:
+        // the call of the `static func +` that type declares, with the left
+        // operand as its receiver (the type an overload is declared on). A
+        // literal left operand is never one; the operators' use on the standard
+        // library's own types is not worth a ledger row per expression, and an
+        // unindexed receiver type is classified as such, not as a defect.
+        "additive_expression"
+        | "multiplicative_expression"
+        | "comparison_expression"
+        | "equality_expression" => {
+            let lhs = node.child_by_field_name("lhs")?;
+            if !matches!(
+                lhs.kind(),
+                "simple_identifier" | "navigation_expression" | "self_expression"
+            ) {
+                return None;
+            }
+            let rhs = node.child_by_field_name("rhs")?;
+            let mut cursor = node.walk();
+            let op = node.children(&mut cursor).find(|child| {
+                !child.is_named()
+                    && child.start_byte() >= lhs.end_byte()
+                    && child.end_byte() <= rhs.start_byte()
+            })?;
+            Some(SwiftCall {
+                callee_name: get_node_text(op, source),
+                receiver_expr: clamp_receiver(&get_node_text(lhs, source)),
+                name_node: op,
+                kind: ReferenceKind::Call,
+                operator: true,
             })
         }
         _ => None,
@@ -162,6 +227,31 @@ fn swift_unwrap_prefix<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
         return None;
     }
     target.child_by_field_name("target")
+}
+
+/// The operand a call's callee really is, when the grammar bound the operator
+/// too tightly.
+///
+/// tree-sitter-swift parses `"x" + f()` as `call_expression(additive_expression
+/// ("x" + f), call_suffix)`: the argument list attaches to the whole sum, so the
+/// callee text was `"x" + f`, no identity at all, and the call was dropped
+/// (recorded as a bare reference). `1 - q.r()` is the same shape one level down,
+/// with the sum as the *target* of the member access, and `a.bump() + g.bump()`
+/// typed its second call by the receiver `a.bump() + g`. The right operand of
+/// the sum is the callee (or the member target); `+ - * /` are the only
+/// operators the grammar treats this way.
+fn swift_call_operand<'tree>(node: Node<'tree>) -> Node<'tree> {
+    let mut node = node;
+    while matches!(
+        node.kind(),
+        "additive_expression" | "multiplicative_expression"
+    ) {
+        match node.child_by_field_name("rhs") {
+            Some(rhs) => node = rhs,
+            None => break,
+        }
+    }
+    node
 }
 
 /// Whether a `call_expression` is really a subscript: `items[0]`, `dict["k"]`.
@@ -204,7 +294,7 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
     let suffix = nav.child_by_field_name("suffix")?;
     let name_node = suffix.child_by_field_name("suffix")?;
     let (callee_name, _) = split_call_target(name_node, source)?;
-    let target = nav.child_by_field_name("target")?;
+    let target = swift_call_operand(nav.child_by_field_name("target")?);
     // `Person.init(name:)` constructs a `Person`; recording `init` as the callee
     // would name a symbol that does not exist, because the generic declaration
     // arm emits nothing for an `init_declaration`. `self.init` and `super.init`
@@ -217,6 +307,7 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
             receiver_expr: qualifier,
             name_node: target,
             kind: ReferenceKind::Constructor,
+            operator: false,
         });
     }
     Some(SwiftCall {
@@ -224,6 +315,7 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
         receiver_expr: receiver_from(target, source),
         name_node,
         kind: ReferenceKind::Call,
+        operator: false,
     })
 }
 

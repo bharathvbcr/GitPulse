@@ -1,13 +1,15 @@
 /**
  * Which repository tabs still have a live terminal panel.
  *
- * A PTY dies with its component. App used to `{#key}` the dock on
+ * A PTY used to die with its component. App used to `{#key}` the dock on
  * `currentPath`, so switching repository tabs unmounted every session and
  * wiped the scrollback. The dock now keeps one panel per visited tab and
  * hides the rest; this helper is the latch for that set.
  *
  * Closing a repository tab drops it from `openTabIds`, which is what
- * unmounts that panel and kills its shells. Switching away only hides.
+ * unmounts that panel. Its idle shells end; a running agent or job is
+ * detached and listed under Sessions (`sessionLifecycle` `dispose`).
+ * Switching away only hides.
  * Opening the dock on a tab that has never hosted one adds it. Visiting a
  * tab while the dock is closed does not spawn a shell in the background.
  *

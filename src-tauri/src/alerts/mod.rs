@@ -462,10 +462,9 @@ pub fn start(host: Arc<dyn Host>) {
     if HUB.set(installed).is_err() {
         return;
     }
-    match std::thread::Builder::new()
-        .name("gitpulse-alerts".into())
-        .spawn(move || run(receiver, host, counters, last_error, standing))
-    {
+    match crate::supervisor::spawn_once("gitpulse-alerts", "notification worker", move || {
+        run(receiver, host, counters, last_error, standing)
+    }) {
         Ok(_) => running.store(true, Ordering::SeqCst),
         Err(error) => {
             // Left false on purpose. A queue that quietly fills and drops would

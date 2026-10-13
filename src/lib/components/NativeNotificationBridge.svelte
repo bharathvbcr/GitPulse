@@ -18,7 +18,10 @@
     try {
       const client = await import("../workbench/client");
       const activation = await client.pendingNotificationActivation();
-      if (!activation || disposed) return;
+      if (disposed) return;
+      // The read worked, so an earlier failure's card no longer describes anything.
+      error = "";
+      if (!activation) return;
       current = activation; error = "";
       const latest = await client.getAttention(activation.id);
       if (disposed) return;
@@ -66,7 +69,7 @@
     <div class="receipt"><strong>{notice?.title ?? "GitPulse activity"}</strong><p>{notice?.target_status === "current" ? "Opened from a desktop notification. Review and task acceptance remain your decision." : notice ? `This notification’s target is ${notice.target_status.replaceAll("_", " ")}. Available task details show the current saved version.` : "Resolving the saved notification…"}</p>{#if error}<p role="alert">{error}</p>{/if}{#if !task}<button type="button" class="gp-btn" onclick={close} disabled={busy}>Close notification</button>{/if}</div>
     {#if Editor && task}<Editor value={task} {repositories} {workspaces} onSaved={(value) => { task = value; }} onClose={() => { void close(); }} />{/if}
   </div>
-{:else if error}<div class="activation-error gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status">{error}</div>{/if}
+{:else if error}<div class="activation-error gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status">{error} <button type="button" class="gp-btn" onclick={() => { error = ""; }}>Dismiss</button></div>{/if}
 
 <style>
   .native-activation{position:fixed;top:48px;bottom:24px;left:50%;transform:translateX(-50%);width:min(620px,calc(100vw - 48px));overflow:hidden;display:flex;flex-direction:column;color:rgb(var(--c-text))}.native-activation :global(.task-editor){width:100%;box-sizing:border-box;border-left:0;flex:1;min-height:0;overflow:hidden}.receipt{flex-shrink:0;padding:16px 20px;font-size:12px;border-bottom:1px solid rgb(var(--c-border))}.receipt p{color:rgb(var(--c-text-muted));line-height:1.5}.activation-error{position:fixed;bottom:30px;right:20px;max-width:360px;padding:12px;font-size:12px}[role=alert]{color:#ef9a9a}

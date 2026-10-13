@@ -24,12 +24,13 @@ Uncommitted counts that could not be scanned show nothing rather than `0`. A ver
 
 ## Code (`⌘1` / `Ctrl+1`)
 
-Explorer and Blame are two lenses on one **file** (selection survives the switch). **Map** is the structural navigator — DevMap repo map, code/doc graph, and tracked-markdown search — not a third reading of the open file. Sections: `⌥1` / `⌥2` / `⌥3`.
+Explorer and Blame are two lenses on one **file** (selection survives the switch). **Search** scans file contents across the working tree or revisions. **Map** is the structural navigator — DevMap repo map, code/doc graph, and tracked-markdown search — not a third reading of the open file. Sections: `⌥1` / `⌥2` / `⌥3` / `⌥4`.
 
 | Section | Purpose |
 | --- | --- |
 | **Explorer** | File tree with live Git status, dual-backend highlighting (MarkDev tree-sitter for six languages; regex for the rest), virtualized code viewer with proportional row-height zoom scaling (70%–160%), responsive header scroll cues (`ScrollCue`), boundary-aware tooltips, in-file search, go-to-line, inline edit, MarkDev bidirectional scrolling preview / image / hex previews. Status bar language mix toggle (LOC vs percentage). Commit composer shows pre-commit blast radius from `devmap preview`, drafts structured commit briefs from the patch, and supports on-device Apple Intelligence phrasing fallback. |
 | **Blame** | Per-line author, age, commit and coverage gutter with SWR caching, with consecutive lines of one commit read as a block. A **code-age timeline** above it shows what share of the file was last changed in each period, a **legend** carrying each age band's share filters on it, and an **age rail** down the right edge maps where in the file each age lives (click or drag to navigate; it maps the list actually drawn, so a filter re-maps it). Column, chip and band are one selection model: each selects exactly what it counted. Uncommitted lines render as `uncommitted`, not as a link to a fake commit, and — with clock-skewed and undated lines — ride beside the axis as their own labelled shares rather than being left out of the total. Coverage unavailable is marked separately from uncovered. |
+| **Search** | Fast repository-wide text search across the working tree or an explicit Git revision using `git grep`. Respects `.gitignore` rules across tracked and untracked files. A search that is cancelled, timed out, capped, or truncated explicitly declares its status and reason. Case-sensitive and regex modes with line match jumping. |
 | **Map** | Subsystems / entry points from the `repo_map` resolved by `devmap paths --json` (default `.devmap/repo_map.json`, legacy `.devcouncil` supported), code and doc graph canvas, docs search and broken links, cross-repo link candidates. Build/Refresh via the `devmap` CLI; watcher refreshes a stale index. Caps, `walk_incomplete`, and schema mismatch are named. |
 
 The graph filters include **Hide notes & Markdown**, off by default. It hides

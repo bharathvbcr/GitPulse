@@ -749,7 +749,7 @@ SELECT m.generation_id      AS generation_id,
 ///
 /// `generation_edges` and `generation_unresolved` keep their names and their
 /// exact column sets as views over the ranges, so all twenty-odd read sites,
-/// `tools/fanout.sql`, `tools/soak.sh`, `verify.sh`'s determinism digest and
+/// `tools/fanout.sql`, the soak's digest (`tools/soak`), `verify.sh`'s determinism digest and
 /// the tests are unchanged. `ordinal` is the row's own id: it is still unique
 /// within a generation, and nothing reads it as a position any more — see
 /// `edge_read_order`, whose final key was the resolver's emission ordinal and
@@ -1355,7 +1355,21 @@ CREATE INDEX IF NOT EXISTS idx_generation_literals_value
     ON generation_literals (generation_id, value);
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 26;
+/// v27: three nullable columns on `generation_dead_symbols` carrying the site
+/// evidence an unconfirmed dead row names — how many unbound sites name the
+/// symbol and where the first one is. Additive and never selected by an older
+/// reader, so the reader floor stays where v26 left it.
+///
+/// Added by `ALTER TABLE` on the fresh path too, because the table itself is
+/// created by the v3 batch the fresh path also runs: declaring the columns in
+/// `CREATE TABLE` as well would make the fresh path's `ALTER` fail.
+pub const MIGRATION_V26_TO_V27: &str = r#"
+ALTER TABLE generation_dead_symbols ADD COLUMN evidence_sites INTEGER;
+ALTER TABLE generation_dead_symbols ADD COLUMN evidence_path TEXT;
+ALTER TABLE generation_dead_symbols ADD COLUMN evidence_byte INTEGER;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 27;
 
 /// The oldest reader schema that can read a store this binary writes.
 ///
@@ -1372,7 +1386,7 @@ pub const CURRENT_SCHEMA_VERSION: i32 = 26;
 ///
 /// * **keep the previous floor** when the bump only adds tables, indexes or
 ///   nullable columns that older readers never select (v26:
-///   `generation_literals`);
+///   `generation_literals`; v27: the dead-row evidence columns);
 /// * **raise it to the new version** when the bump changes what an existing
 ///   column means, writes a value an older binary would misdecode, or removes
 ///   or renames anything an older reader selects. v23 and v25 were exactly
@@ -1388,7 +1402,7 @@ pub const MIN_READER_SCHEMA_VERSION: i32 = 25;
 /// first. The last row must be `(CURRENT_SCHEMA_VERSION,
 /// MIN_READER_SCHEMA_VERSION)`; a unit test holds that, so bumping the schema
 /// without deciding the new floor fails rather than silently inheriting one.
-pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25)];
+pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25), (27, 25)];
 
 /// Where a writer records [`MIN_READER_SCHEMA_VERSION`].
 ///
@@ -1446,6 +1460,7 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     // Empty: v25 only stamps `user_version`.
     MIGRATION_V24_TO_V25,
     MIGRATION_V25_TO_V26,
+    MIGRATION_V26_TO_V27,
     // Not a rung: no `user_version` bump. Every writer open creates it — the
     // fresh path and the ladder alike — so both still land on one schema.
     READER_COMPAT_TABLE,

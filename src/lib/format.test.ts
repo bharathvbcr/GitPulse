@@ -86,3 +86,15 @@ describe("shortHash", () => {
     expect(shortHash(undefined, 8)).toBe("");
   });
 });
+
+describe("clock minutes", () => {
+  it("round-trips HH:MM and rejects malformed or out-of-range values", async () => {
+    const { formatClockMinutes, parseClockMinutes } = await import("./format");
+    expect(formatClockMinutes(0)).toBe("00:00");
+    expect(formatClockMinutes(23 * 60 + 59)).toBe("23:59");
+    expect(parseClockMinutes("07:05")).toBe(425);
+    for (const bad of ["", "24:00", "7:05", "12:60", "12:5", "ab:cd", "12:30:00"]) {
+      expect(() => parseClockMinutes(bad)).toThrow("Choose valid local quiet hours.");
+    }
+  });
+});

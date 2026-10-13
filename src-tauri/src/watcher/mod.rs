@@ -7,14 +7,13 @@ pub use debouncer::RepoFileWatcher;
 use crate::engine::git_cli::{
     git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
 };
-use notify::Event;
+use notify::{Event, EventKind};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -196,9 +195,7 @@ fn git_path_kind(path: &Path, internal_roots: &[PathBuf]) -> ChangeKind {
 
 impl WatcherState {
     fn lock_sessions(&self) -> Result<MutexGuard<'_, HashMap<String, WatchSession>>, String> {
-        self.sessions
-            .lock()
-            .map_err(|e| format!("Watcher lock poisoned: {}", e))
+        Ok(crate::supervisor::lock_or_recover(&self.sessions))
     }
 
     /// Drops a reserved slot only if it is still the session we inserted.
@@ -298,6 +295,10 @@ struct IgnoreRules {
     prefixes: HashSet<String>,
     /// `None` only when the query finished and the prefix list was complete.
     load_error: Option<String>,
+    /// True when the query finished and the list was cut at
+    /// [`MAX_IGNORE_PREFIXES`]. That is a final, partial answer: asking again
+    /// returns the same cut list, so [`rules_due`] does not.
+    truncated: bool,
 }
 
 impl IgnoreRules {
@@ -309,6 +310,7 @@ impl IgnoreRules {
         Self {
             prefixes: HashSet::new(),
             load_error: None,
+            truncated: false,
         }
     }
 
@@ -338,11 +340,13 @@ impl IgnoreRules {
                     Self {
                         prefixes,
                         load_error: Some(error),
+                        truncated: true,
                     }
                 } else {
                     Self {
                         prefixes,
                         load_error: None,
+                        truncated: false,
                     }
                 }
             }
@@ -355,6 +359,7 @@ impl IgnoreRules {
                 Self {
                     prefixes: HashSet::new(),
                     load_error: Some(error),
+                    truncated: false,
                 }
             }
         }
@@ -438,7 +443,7 @@ fn rules_due(
     if rule_file_changed {
         return elapsed >= SCAN_COALESCE;
     }
-    rules.load_error.is_some() && elapsed >= IGNORE_RETRY
+    rules.load_error.is_some() && !rules.truncated && elapsed >= IGNORE_RETRY
 }
 
 fn event_updates_ignore_rules(event: &Event) -> bool {
@@ -499,6 +504,21 @@ fn record_event_signal(
     rules: &IgnoreRules,
     change: &mut ChangeAccumulator,
 ) -> bool {
+    // The backend says events were lost (FSEvents MustScanSubDirs, inotify
+    // Q_OVERFLOW): whatever changed is unknowable, and these name the git dir
+    // or worktree root — paths the noise rules below would drop. Refresh
+    // everything, whatever the paths say.
+    if event.need_rescan() {
+        change.kind(ChangeKind::Unknown);
+        return true;
+    }
+    // Reads move nothing. inotify reports opens and closes (the app's own
+    // `git status` opens the index and every tracked file), so counting them
+    // made each refresh announce itself and run again. A write is always
+    // reported as a modify of its own, so nothing real is lost.
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
     if event.paths.is_empty() {
         change.kind(ChangeKind::Unknown);
         return true;
@@ -707,7 +727,44 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     if is_fsmonitor_daemon_path(path, internal_roots) {
         return true;
     }
+    if is_other_checkout_state(path, internal_roots) {
+        return true;
+    }
     is_noise_leaf_name(path)
+}
+
+/// State that belongs to another checkout of the same repository, seen only
+/// because the common directory is watched for shared refs.
+///
+/// `git add` in a sibling worktree rewrites `<common>/worktrees/<name>/index`
+/// (and its `logs/`), and a commit in the main checkout moves the common
+/// `HEAD`, `index` and `logs/` — none of it changes this checkout's files,
+/// index or branch, yet N agents running `git add` made N full refreshes in
+/// every other worktree. `refs/` stays shared (a branch moved by anyone shows
+/// in this checkout's branch list), and so does a sibling's own `HEAD` and the
+/// existence of its directory, which move this repository's worktree list.
+/// `internal_roots[0]` is this checkout's own git directory.
+fn is_other_checkout_state(path: &Path, internal_roots: &[PathBuf]) -> bool {
+    let Some((relative, is_own)) = internal_roots.iter().enumerate().find_map(|(i, root)| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|relative| (relative, i == 0))
+    }) else {
+        return false;
+    };
+    let mut components = relative
+        .components()
+        .map(|c| c.as_os_str().to_str().unwrap_or(""));
+    match (components.next(), components.next(), components.next()) {
+        // `worktrees/<name>/<index|logs>/...`: a sibling's private files. For
+        // a linked checkout `internal_roots[0]` is its own `worktrees/<name>`,
+        // so its own `index` strips to a first component of `index` instead.
+        (Some("worktrees"), Some(_), Some("index" | "logs")) => true,
+        // The common directory's own checkout state (`is_own` is false only
+        // for the shared directory behind a linked worktree).
+        (Some("HEAD" | "index" | "logs"), _, _) => !is_own,
+        _ => false,
+    }
 }
 
 /// The daemon's state directory (`fsmonitor--daemon`, cookies included) or its
@@ -880,6 +937,16 @@ where
         } else {
             dead_misses = 0;
         }
+        // Events the bounded queue dropped are unknowable: one full refresh,
+        // like a backend `Rescan`.
+        if watcher.take_overflow() {
+            change.kind(ChangeKind::Unknown);
+            if !pending {
+                first_pending = Some(Instant::now());
+            }
+            pending = true;
+            last_event = Instant::now();
+        }
         match watcher.receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(event)) => {
                 // Noise gate before any accumulation: a batch whose every
@@ -924,14 +991,19 @@ where
                     rules = IgnoreRules::load(worktree);
                     last_rules_load = Instant::now();
                 }
-                if !significant {
-                    continue;
+                // Noise never opens or extends the pending window, but it
+                // must not stop one already open from being served: the
+                // emission check below runs for every event, or 5 Hz
+                // `index.lock` / fsmonitor churn postponed a real change
+                // forever (the receive never times out, so the timeout arm's
+                // check never ran).
+                if significant {
+                    if !pending {
+                        first_pending = Some(Instant::now());
+                    }
+                    pending = true;
+                    last_event = Instant::now();
                 }
-                if !pending {
-                    first_pending = Some(Instant::now());
-                }
-                pending = true;
-                last_event = Instant::now();
                 if scan_is_due(
                     pending,
                     last_event,
@@ -1160,71 +1232,69 @@ where
     let thread_stop = stop.clone();
     let session_stop = stop.clone();
     let loop_sessions = state.sessions.clone();
-    if let Err(e) = thread::Builder::new()
-        .name("gitpulse-fs-watch".into())
-        .spawn(move || {
-            // The loop runs under catch_unwind so a panic inside it can
-            // neither kill its thread silently nor leak the session slot:
-            // the supervisor logs the outcome and, on panic, performs the
-            // same ptr_eq-guarded reap the DeadRepo path uses.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_watch_loop(
-                    &watcher,
-                    WatchLoopContext {
-                        git_dir,
-                        internal_roots,
-                        emit_path: emit_path.clone(),
-                    },
-                    thread_stop,
-                    Some(loop_sessions.clone()),
-                    session_stop.clone(),
-                    on_change,
-                )
-            }));
-            match result {
-                Ok(WatchLoopExit::Stopped) => {
-                    log::debug!(target: "watcher", "watch on {emit_path} stopped by request");
-                }
-                Ok(WatchLoopExit::DeadRepo) => {
-                    log::info!(target: "watcher", "watch on {emit_path} ended: repository disappeared");
-                    // One announcement, not a change: nothing may refresh a
-                    // path that no longer exists.
-                    on_gone(RepoGonePayload {
-                        path: emit_path.clone(),
-                    });
-                }
-                Ok(WatchLoopExit::EventStreamClosed) => {
-                    log::warn!(
-                        target: "watcher",
-                        "watch event stream closed unexpectedly for {emit_path}; \
-                         UI refresh for this repo is dead until it is re-watched"
-                    );
-                }
-                Err(panic) => {
-                    log::error!(
-                        target: "watcher",
-                        "fs-watch thread PANICKED for {emit_path}: {}; reaping session slot",
-                        panic_payload_text(&*panic)
-                    );
-                    if let Ok(mut guard) = loop_sessions.lock() {
-                        if guard
-                            .get(&emit_path)
-                            .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
-                        {
-                            guard.remove(&emit_path);
-                        }
+    if let Err(e) = crate::supervisor::spawn_once("gitpulse-fs-watch", "file watcher", move || {
+        // The loop runs under catch_unwind so a panic inside it can
+        // neither kill its thread silently nor leak the session slot:
+        // the supervisor logs the outcome and, on panic, performs the
+        // same ptr_eq-guarded reap the DeadRepo path uses.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_watch_loop(
+                &watcher,
+                WatchLoopContext {
+                    git_dir,
+                    internal_roots,
+                    emit_path: emit_path.clone(),
+                },
+                thread_stop,
+                Some(loop_sessions.clone()),
+                session_stop.clone(),
+                on_change,
+            )
+        }));
+        match result {
+            Ok(WatchLoopExit::Stopped) => {
+                log::debug!(target: "watcher", "watch on {emit_path} stopped by request");
+            }
+            Ok(WatchLoopExit::DeadRepo) => {
+                log::info!(target: "watcher", "watch on {emit_path} ended: repository disappeared");
+                // One announcement, not a change: nothing may refresh a
+                // path that no longer exists.
+                on_gone(RepoGonePayload {
+                    path: emit_path.clone(),
+                });
+            }
+            Ok(WatchLoopExit::EventStreamClosed) => {
+                log::warn!(
+                    target: "watcher",
+                    "watch event stream closed unexpectedly for {emit_path}; \
+                     UI refresh for this repo is dead until it is re-watched"
+                );
+            }
+            Err(panic) => {
+                crate::supervisor::note_stopped("file watcher", &*panic);
+                log::error!(
+                    target: "watcher",
+                    "fs-watch thread PANICKED for {emit_path}: {}; reaping session slot",
+                    panic_payload_text(&*panic)
+                );
+                if let Ok(mut guard) = loop_sessions.lock() {
+                    if guard
+                        .get(&emit_path)
+                        .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
+                    {
+                        guard.remove(&emit_path);
                     }
                 }
             }
-            // Release the callback and native handles before acknowledging
-            // retirement. No sessions mutex is held while waiting here.
-            let retired = watcher.shutdown();
-            if let Err(error) = &retired {
-                log::warn!(target: "watcher", "{emit_path}: {error}");
-            }
-            let _ = retired_tx.send(retired);
-        })
-    {
+        }
+        // Release the callback and native handles before acknowledging
+        // retirement. No sessions mutex is held while waiting here.
+        let retired = watcher.shutdown();
+        if let Err(error) = &retired {
+            log::warn!(target: "watcher", "{emit_path}: {error}");
+        }
+        let _ = retired_tx.send(retired);
+    }) {
         let _ = state.abandon_watch_slot(&key, &stop);
         return Err(format!("Failed to start watcher: {}", e));
     }
@@ -1331,6 +1401,7 @@ mod tests {
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::thread;
     use tempfile::TempDir;
 
     fn git_init(dir: &Path, bare: bool) {
@@ -2743,10 +2814,24 @@ mod tests {
             notify::Event::new(notify::EventKind::Any).add_path(root.join("src").join(long_name));
         assert!(event_has_signal(&long, &[], root, Some(root), &rules));
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "40k classifications took {:?}",
             started.elapsed()
         );
+    }
+
+    /// A list cut at the prefix cap is a finished, partial answer. Re-running
+    /// `git ls-files -o -i --directory` every 30 s forever returned the same
+    /// cut list at the cost of a full untracked-tree walk.
+    #[test]
+    fn a_truncated_ignore_list_is_final_not_retried() {
+        let mut rules = IgnoreRules::builtin();
+        rules.load_error = Some("truncated".into());
+        rules.truncated = true;
+        let now = Instant::now();
+        assert!(!rules_due(&rules, now, now + IGNORE_RETRY * 10, false));
+        // A real `.gitignore` edit still reloads it.
+        assert!(rules_due(&rules, now, now + SCAN_COALESCE, true));
     }
 
     #[test]
@@ -2797,9 +2882,15 @@ mod tests {
         while let Ok(item) = watcher.receiver.try_recv() {
             events += 1;
             if let Ok(event) = item {
+                // Below `target/`, not `target` itself: Windows reports the
+                // directory entry as modified (its last-write time) for every
+                // file created inside it, which is no nested write reaching the
+                // watch. That event is shown below to carry no signal.
                 let names_target = event.paths.iter().any(|path| {
-                    path.components()
-                        .any(|component| component.as_os_str() == "target")
+                    path != &target
+                        && path
+                            .components()
+                            .any(|component| component.as_os_str() == "target")
                 });
                 if names_target {
                     target_events += 1;
@@ -2829,6 +2920,18 @@ mod tests {
         assert!(
             sentinel_events >= 1,
             "the watch must still deliver a file at the worktree root, else the zero above is a dead stream"
+        );
+        // What the platform may deliver for `target/` itself changes nothing.
+        let directory_touched = notify::Event::new(notify::EventKind::Any).add_path(target);
+        assert!(
+            !event_has_signal(
+                &directory_touched,
+                &internal_roots_for(dir.path()),
+                dir.path(),
+                None,
+                &IgnoreRules::builtin()
+            ),
+            "a modified `target` directory entry must not count as signal"
         );
     }
 
@@ -3255,9 +3358,15 @@ mod tests {
                 path.display()
             );
         }
+        // Another checkout's index is that checkout's: `git add` there must
+        // not refresh this one (see `is_other_checkout_state`). The previous
+        // expectation listed it as moving the repository.
+        assert!(
+            is_git_internal_noise(&linked.join("index"), &roots),
+            "a sibling worktree's index is not this checkout's change"
+        );
         for path in [
             linked.join("HEAD"),
-            linked.join("index"),
             common.join("worktrees").join("fsmonitor--daemon"),
             common.join("refs").join("heads").join("worktrees"),
         ] {
@@ -3879,7 +3988,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_millis(750),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(750)),
             "10k linked-worktree internal-root classifications took {elapsed:?} (alias walk regression)"
         );
 
@@ -4104,5 +4213,245 @@ mod tests {
             );
         }
         stop.store(true, Ordering::SeqCst);
+    }
+
+    // ---- audit: access events, rescans, noise starvation, sibling worktrees ----
+
+    fn modify(path: impl Into<PathBuf>) -> notify::Event {
+        notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(path.into())
+    }
+
+    #[test]
+    fn access_events_are_not_changes() {
+        let dir = TempDir::new().unwrap();
+        let rules = IgnoreRules::builtin();
+        for kind in [
+            notify::event::AccessKind::Open(notify::event::AccessMode::Any),
+            notify::event::AccessKind::Close(notify::event::AccessMode::Read),
+            notify::event::AccessKind::Close(notify::event::AccessMode::Write),
+        ] {
+            let read = notify::Event::new(notify::EventKind::Access(kind))
+                .add_path(dir.path().join("src").join("main.rs"));
+            assert!(
+                !event_has_signal(&read, &[], dir.path(), None, &rules),
+                "{kind:?}: the app's own `git status` reads must not refresh"
+            );
+        }
+        assert!(event_has_signal(
+            &modify(dir.path().join("src").join("main.rs")),
+            &[],
+            dir.path(),
+            None,
+            &rules
+        ));
+    }
+
+    #[test]
+    fn a_rescan_event_is_a_full_refresh_even_when_it_names_the_git_dir() {
+        let dir = TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        let roots = vec![git_dir.clone()];
+        let rules = IgnoreRules::builtin();
+        for named in [git_dir.clone(), dir.path().to_path_buf()] {
+            let rescan = notify::Event::new(notify::EventKind::Other)
+                .set_flag(notify::event::Flag::Rescan)
+                .add_path(named.clone());
+            let mut change = ChangeAccumulator::default();
+            assert!(
+                record_event_signal(&rescan, &roots, dir.path(), None, &rules, &mut change),
+                "a rescan naming {} was dropped as noise",
+                named.display()
+            );
+            assert!(change.kinds.contains(&ChangeKind::Unknown));
+        }
+    }
+
+    #[test]
+    fn another_checkouts_index_and_head_are_not_this_checkouts_change() {
+        let dir = TempDir::new().unwrap();
+        let common = dir.path().join("main/.git");
+        let own = common.join("worktrees/a");
+        let rules = IgnoreRules::builtin();
+        let worktree = dir.path().join("a");
+        // Linked worktree A: private dir first, shared common dir second.
+        let linked = vec![own.clone(), common.clone()];
+        let signal = |roots: &[PathBuf], p: PathBuf| {
+            event_has_signal(&modify(p), roots, &worktree, None, &rules)
+        };
+        assert!(
+            !signal(&linked, common.join("worktrees/b/index")),
+            "sibling git add"
+        );
+        assert!(!signal(&linked, common.join("worktrees/b/logs/HEAD")));
+        assert!(
+            !signal(&linked, common.join("HEAD")),
+            "the main checkout's HEAD"
+        );
+        assert!(
+            !signal(&linked, common.join("index")),
+            "the main checkout's index"
+        );
+        assert!(
+            signal(&linked, own.join("index")),
+            "this checkout's own index"
+        );
+        assert!(
+            signal(&linked, own.join("HEAD")),
+            "this checkout's own HEAD"
+        );
+        assert!(
+            signal(&linked, common.join("refs/heads/topic")),
+            "refs stay shared"
+        );
+        assert!(
+            signal(&linked, common.join("worktrees/b")),
+            "the worktree list moved"
+        );
+        assert!(
+            signal(&linked, common.join("worktrees/b/HEAD")),
+            "a sibling's checkout moved a branch"
+        );
+        // The main checkout watches the same directory as its own.
+        let main = vec![common.clone()];
+        assert!(
+            !signal(&main, common.join("worktrees/b/index")),
+            "sibling git add"
+        );
+        assert!(signal(&main, common.join("index")), "its own index");
+        assert!(signal(&main, common.join("HEAD")), "its own HEAD");
+    }
+
+    /// Runs the real debounce loop over a hand-fed event channel, reporting
+    /// when each refresh was emitted.
+    struct FedLoop {
+        events: std::sync::mpsc::Sender<Result<notify::Event, notify::Error>>,
+        emitted: std::sync::mpsc::Receiver<(Instant, RepoChangedPayload)>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+        root: PathBuf,
+        _dir: TempDir,
+    }
+
+    impl FedLoop {
+        fn start(overflow_first: bool) -> Self {
+            let dir = TempDir::new().unwrap();
+            git_init(dir.path(), false);
+            let root = dir.path().canonicalize().unwrap();
+            let git_dir = root.join(".git");
+            let mut watcher = RepoFileWatcher::watch(&git_dir).unwrap();
+            let (events, receiver) = std::sync::mpsc::channel();
+            watcher.receiver = receiver;
+            if overflow_first {
+                watcher.simulate_overflow();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let (tx, emitted) = std::sync::mpsc::channel();
+            let ctx = WatchLoopContext {
+                git_dir: git_dir.clone(),
+                internal_roots: vec![git_dir],
+                emit_path: root.to_string_lossy().into_owned(),
+            };
+            let (loop_stop, session_stop) = (stop.clone(), stop.clone());
+            let thread = thread::spawn(move || {
+                run_watch_loop(&watcher, ctx, loop_stop, None, session_stop, move |p| {
+                    let _ = tx.send((Instant::now(), p));
+                });
+            });
+            Self {
+                events,
+                emitted,
+                stop,
+                thread: Some(thread),
+                root,
+                _dir: dir,
+            }
+        }
+
+        fn send(&self, event: notify::Event) {
+            self.events.send(Ok(event)).unwrap();
+        }
+    }
+
+    impl Drop for FedLoop {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Continuous 10 Hz noise (`index.lock`, fsmonitor cookies) used to hold a
+    /// real change back for as long as it lasted: every noise event hit a
+    /// `continue` before the emission check, and the receive never timed out.
+    #[test]
+    fn a_real_change_is_emitted_within_the_cap_under_continuous_noise() {
+        let fed = FedLoop::start(false);
+        let git_dir = fed.root.join(".git");
+        let began = Instant::now();
+        fed.send(modify(fed.root.join("src").join("main.rs")));
+        let sender = fed.events.clone();
+        let noise_stop = Arc::new(AtomicBool::new(false));
+        let noisy = noise_stop.clone();
+        let noise = thread::spawn(move || {
+            while !noisy.load(Ordering::Relaxed) {
+                let _ = sender.send(Ok(modify(git_dir.join("index.lock"))));
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let first = fed.emitted.recv_timeout(Duration::from_secs(6));
+        noise_stop.store(true, Ordering::Relaxed);
+        noise.join().unwrap();
+        let (at, payload) = first.expect("the change was never emitted under noise");
+        assert!(
+            at.duration_since(began) < Duration::from_millis(2500),
+            "emitted after {:?}",
+            at.duration_since(began)
+        );
+        assert!(payload.change.kinds.contains(&ChangeKind::Worktree));
+    }
+
+    #[test]
+    fn a_synthetic_rescan_causes_exactly_one_full_refresh() {
+        let fed = FedLoop::start(false);
+        fed.send(
+            notify::Event::new(notify::EventKind::Other)
+                .set_flag(notify::event::Flag::Rescan)
+                .add_path(fed.root.join(".git")),
+        );
+        let (_, payload) = fed
+            .emitted
+            .recv_timeout(Duration::from_secs(3))
+            .expect("a rescan must refresh");
+        assert!(
+            payload.change.kinds.contains(&ChangeKind::Unknown),
+            "{payload:?}"
+        );
+        assert!(
+            fed.emitted
+                .recv_timeout(Duration::from_millis(1200))
+                .is_err(),
+            "one rescan, one refresh"
+        );
+    }
+
+    #[test]
+    fn a_dropped_event_queue_causes_one_full_refresh() {
+        let fed = FedLoop::start(true);
+        let (_, payload) = fed
+            .emitted
+            .recv_timeout(Duration::from_secs(3))
+            .expect("an overflow must refresh");
+        assert!(
+            payload.change.kinds.contains(&ChangeKind::Unknown),
+            "{payload:?}"
+        );
+        assert!(fed
+            .emitted
+            .recv_timeout(Duration::from_millis(1200))
+            .is_err());
     }
 }

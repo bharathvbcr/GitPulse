@@ -5,6 +5,7 @@ import { applyPlatformClass } from "./lib/platform";
 import { loadHostPlatform } from "./lib/stores/platformStore";
 import { installGlobalDiagnostics, diagnostics } from "./lib/diagnostics/diagnostics";
 import { installResponsivenessDiagnostics } from "./lib/diagnostics/responsiveness";
+import { installNavigationDiagnostics } from "./lib/diagnostics/navigation";
 import { get } from "svelte/store";
 import { interfaceStore } from "./lib/stores/interfaceStore";
 import { repoStore } from "./lib/stores/repoStore";
@@ -32,6 +33,26 @@ const stopResponsivenessDiagnostics = installResponsivenessDiagnostics(diagnosti
   },
 });
 import.meta.hot?.dispose(stopResponsivenessDiagnostics);
+// Times each switch of surface, repository or view; the startup destination
+// is the launch, not a navigation.
+const navigation = installNavigationDiagnostics(diagnostics);
+let destination: string | null = null;
+let surface = get(interfaceStore).globalSurface;
+let repo = get(repoStore);
+const followDestination = () => {
+  const key = surface === "repository" ? `repository\n${repo.currentPath ?? ""}\n${repo.activeTab}` : surface;
+  if (key === destination) return;
+  const first = destination === null;
+  destination = key;
+  if (!first) navigation.navigate(key, surface === "repository" ? `repository/${repo.activeTab}` : surface);
+};
+const stopNavigationSurface = interfaceStore.subscribe((state) => { surface = state.globalSurface; followDestination(); });
+const stopNavigationRepo = repoStore.subscribe((state) => { repo = state; followDestination(); });
+import.meta.hot?.dispose(() => {
+  stopNavigationSurface();
+  stopNavigationRepo();
+  navigation.stop();
+});
 
 const app = mount(App, {
   target: document.getElementById("app")!,

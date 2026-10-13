@@ -93,6 +93,7 @@
       const { get } = await import("svelte/store");
       const { createChecks } = await import("./checks.ts");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { promptState, completePrompt } = await import("../src/lib/stores/modalStore.ts");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
       const { resetStackState } = await import("../src/lib/repos/stackState.ts");
       const RepoTabBar = (await import("../src/lib/components/RepoTabBar.svelte")).default;
@@ -130,6 +131,11 @@
           interfaceStore.setStackWorktreeTabs(true);
           interfaceStore.setAutoHideRepoTabs(false);
           mount(RepoTabBar, { target: $("#stage") });
+          // A workspace pane drawn beneath the bar, later in source order and
+          // lower in z-order, to prove the bar's dropdowns are not clipped by it.
+          const pane = document.createElement("div");
+          pane.style.cssText = "position:relative;z-index:10;height:700px;background:rgb(30 41 59)";
+          $("#stage").append(pane);
           // Opened in the order agents and people actually do it: the
           // worktrees arrive after unrelated repositories.
           for (const path of [MAIN, SITE, WT_A, API, WT_B, API_FEATURE]) {
@@ -319,6 +325,367 @@
           check("…seated right after its repository on the strip", () =>
             order().indexOf(SITE_WT) === order().indexOf(SITE) + 1);
 
+          // ---- overflow cue: the fade is a mask, never a painted patch ---
+          // A painted fade was one colour on every host, so on the glass strip
+          // it read as a blank block at the edge with nothing hovered.
+          const cueOverlays = () => $$(".gp-scroll-cue, .gp-scroll-cue-y", strip().parentElement);
+          const maskOf = (el) => { const cs = getComputedStyle(el); return cs.maskImage || cs.webkitMaskImage || "none"; };
+          check("a strip that fits carries no fade and no cue", () =>
+            strip().scrollWidth <= strip().clientWidth + 0.5 && strip().dataset.gpFade === undefined &&
+            maskOf(strip()) === "none" && cueOverlays().length === 0);
+
+          // ---- the tab bar as a control: menus, focus, reorder, groups -------
+          // Moved here from RepoTabBar.test.ts, which used to read the .svelte
+          // source for the names of these handlers. Stacking is off so every
+          // checkout is a tab of its own and each action has one unambiguous
+          // target.
+          interfaceStore.setStackWorktreeTabs(false);
+          repoStore.ungroupTabs();
+          await settle();
+          const rec = (path) => get(repoStore).openTabs.find((t) => t.path === path);
+          const tabBtn = (path) => $(`[role="tab"][data-tab-id="${CSS.escape(rec(path).id)}"]`, strip());
+          const shellOf = (path) => tabBtn(path).closest("[data-tab-shell-index]");
+          const contextAt = (el) => {
+            const box = el.getBoundingClientRect();
+            el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: box.left + 8, clientY: box.top + 8 }));
+          };
+          const repoMenu = () => $("[data-repo-menu]");
+          const items = (root) => $$('[role="menuitem"]', root);
+          const words = (el) => el.textContent.replace(/\s+/g, " ").trim();
+          const itemNamed = (root, text) => items(root).find((el) => words(el).startsWith(text));
+          const openTabMenu = async (path) => { contextAt(shellOf(path)); await settle(); await wait(20); return repoMenu(); };
+          const press = async (target, init) => { key(target, init); await settle(); await wait(20); };
+          const promptNow = () => get(promptState);
+          const answer = async (value) => { completePrompt(value); await settle(); await wait(20); };
+
+          let m = await openTabMenu(WT_B);
+          check("right-clicking a tab opens a labelled menu whose every control is a menuitem", () =>
+            m?.getAttribute("role") === "menu" && m.getAttribute("aria-label") === "Repository actions for agent-models" &&
+            items(m).length >= 12 && $$("button", m).every((button) => button.getAttribute("role") === "menuitem"));
+          check("focus moves into the opened menu, onto its first item", () => items(m)[0] === document.activeElement);
+          const menuItems = items(m);
+          key(m, { key: "ArrowDown" });
+          const walkedDown = document.activeElement === menuItems[1];
+          key(m, { key: "ArrowUp" }); key(m, { key: "ArrowUp" });
+          const wrappedUp = document.activeElement === menuItems.at(-1);
+          key(m, { key: "Home" });
+          const atHome = document.activeElement === menuItems[0];
+          key(m, { key: "End" });
+          check("ArrowDown, ArrowUp (wrapping), Home and End walk the menu items", () =>
+            walkedDown && wrappedUp && atHome && document.activeElement === menuItems.at(-1));
+          await press(m, { key: "Escape" });
+          check("Escape closes the menu and returns focus to the tab that opened it", () =>
+            !repoMenu() && document.activeElement === tabBtn(WT_B));
+
+          m = await openTabMenu(WT_B);
+          const opener = tabBtn(WT_B);
+          await press(m, { key: "Tab" });
+          check("Tab closes the menu and carries on after the opener in document order", () =>
+            !repoMenu() && document.activeElement !== document.body && document.activeElement !== opener &&
+            !!(opener.compareDocumentPosition(document.activeElement) & Node.DOCUMENT_POSITION_FOLLOWING));
+          m = await openTabMenu(WT_B);
+          await press(m, { key: "Tab", shiftKey: true });
+          check("Shift+Tab carries on before the opener instead", () =>
+            !repoMenu() && document.activeElement !== document.body &&
+            !!(opener.compareDocumentPosition(document.activeElement) & Node.DOCUMENT_POSITION_PRECEDING));
+
+          // Copy path goes through the shared clipboard seam and says so when it fails.
+          const writes = [];
+          const stubClipboard = (writeText, exec) => {
+            Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+            document.execCommand = exec;
+          };
+          stubClipboard(async (text) => { writes.push(text); throw new Error("denied"); }, () => false);
+          m = await openTabMenu(WT_B);
+          itemNamed(m, "Copy path").click();
+          await settle(); await wait(20);
+          check("a refused clipboard is reported on the store, and the menu is gone", () =>
+            writes[0] === WT_B && get(repoStore).error === "Could not copy path to clipboard" && !repoMenu());
+          repoStore.setError(null);
+          stubClipboard(async (text) => { writes.push(text); }, () => false);
+          m = await openTabMenu(WT_B);
+          itemNamed(m, "Copy path").click();
+          await settle(); await wait(20);
+          check("a working clipboard receives the path and reports nothing", () =>
+            writes[1] === WT_B && get(repoStore).error === null);
+
+          // ---- tabs: roving stop, close outside the tab, keyboard ----------
+          check("every tab is a button and the tablist itself is not a tab stop", () =>
+            $$('[role="tab"]', strip()).every((el) => el.tagName === "BUTTON") && strip().tabIndex === -1);
+          check("close controls sit beside their tab, never inside it, and are not tab stops", () => {
+            const closes = $$("[data-tab-close]", strip());
+            return closes.length === pills().length && closes.every((el) => !el.closest('[role="tab"]') && el.tabIndex === -1);
+          });
+          check("exactly one tab is the roving stop, and it is the active one", () => {
+            const stops = $$('[role="tab"]', strip()).filter((el) => el.tabIndex === 0);
+            return stops.length === 1 && stops[0].getAttribute("aria-selected") === "true";
+          });
+          check("a tab advertises its keyboard commands", () =>
+            tabBtn(WT_B).getAttribute("aria-keyshortcuts") === "Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight" &&
+            shellOf(WT_B).title.includes("Drag to reorder"));
+          tabBtn(WT_B).focus();
+          key(tabBtn(WT_B), { key: "p" });
+          await settle();
+          check("P pins the focused tab", () => rec(WT_B).pinned === true);
+          key(tabBtn(WT_B), { key: "p" });
+          await settle();
+          check("and P again unpins it", () => rec(WT_B).pinned !== true);
+
+          // ---- labels render in full, in a plate, with Open beside them ----
+          const LONG = "/code/long/a-remarkably-long-repository-name-that-used-to-clip";
+          BRANCH[LONG] = "feature/an-equally-long-branch-name-that-used-to-clip";
+          await repoStore.openRepo(LONG, { activate: false });
+          await settle();
+          const longName = LONG.split("/").pop();
+          const spanWith = (root, text) => [...root.querySelectorAll("span")].find((el) => el.textContent.trim() === text);
+          const label = spanWith(tabBtn(LONG), longName);
+          const branchSpan = spanWith(tabBtn(LONG), BRANCH[LONG]);
+          const ink = (el) => { const range = document.createRange(); range.selectNodeContents(el); return range.getBoundingClientRect().width; };
+          check("a long repository name is drawn whole, not ellipsised", () =>
+            !!label && getComputedStyle(label).textOverflow !== "ellipsis" && getComputedStyle(label).whiteSpace === "nowrap" &&
+            label.getBoundingClientRect().width + 1 >= ink(label));
+          check("a long branch name is drawn whole as well", () =>
+            !!branchSpan && getComputedStyle(branchSpan).textOverflow !== "ellipsis" && branchSpan.getBoundingClientRect().width + 1 >= ink(branchSpan));
+          check("the tab grows past the old 14rem cap to hold both", () => {
+            const shell = shellOf(LONG).getBoundingClientRect();
+            return shell.width > 224 && shell.right + 1 >= branchSpan.getBoundingClientRect().right;
+          });
+          const alpha = (color) => { const parts = color.match(/[\d.]+/g) ?? []; return parts.length > 3 ? Number(parts[3]) : 1; };
+          const plate = (path) => getComputedStyle(shellOf(path));
+          check("an inactive tab is a plate with a border and a fill, not ghost text", () =>
+            alpha(plate(WT_B).borderTopColor) > 0 && alpha(plate(WT_B).backgroundColor) > 0 && plate(WT_B).borderTopWidth !== "0px");
+          check("the active tab's plate is distinct from an inactive one", () =>
+            plate(activePath()).backgroundColor !== plate(WT_B).backgroundColor && plate(activePath()).borderTopColor !== plate(WT_B).borderTopColor);
+          const openBtn = $('[data-testid="open-repo-tab"]');
+          check("Open is a labelled pill, not a bare icon", () =>
+            words(openBtn) === "Open" && openBtn.getBoundingClientRect().width > openBtn.getBoundingClientRect().height * 1.8 &&
+            openBtn.getAttribute("title") === "Open repository");
+          await repoStore.closeTab(rec(LONG).id);
+          await settle();
+
+          // ---- the surface chips and choosing a repository tab -------------
+          const tasksChip = $('[data-testid="tasks-tab-chip"]');
+          const tasksMain = $("button", tasksChip);
+          const inactiveChipInk = getComputedStyle(tasksMain).color;
+          check("with Tasks closed its chip has no close control", () => !$('[data-testid="tasks-tab-close"]'));
+          tasksMain.click();
+          await settle();
+          check("clicking the Tasks chip opens Tasks and pins the chip", () =>
+            get(interfaceStore).globalSurface === "tasks" && tasksMain.getAttribute("aria-pressed") === "true");
+          tasksMain.click();
+          await settle();
+          check("clicking it again keeps Tasks open rather than toggling it away", () => get(interfaceStore).globalSurface === "tasks");
+          check("an open Tasks chip is painted as the selected surface", () => getComputedStyle(tasksMain).color !== inactiveChipInk);
+          const tasksClose = $('[data-testid="tasks-tab-close"]');
+          check("closing is a sibling control, outside the chip's own button", () => !!tasksClose && !tasksMain.contains(tasksClose));
+          tasksClose.click();
+          await settle();
+          check("the close control returns to the repository", () => get(interfaceStore).globalSurface === "repository" && !$('[data-testid="tasks-tab-close"]'));
+          interfaceStore.setGlobalSurface("fleet");
+          await settle();
+          tabBtn(WT_B).click();
+          await settle();
+          check("choosing a repository tab reveals the repository surface and activates it", () =>
+            get(interfaceStore).globalSurface === "repository" && activePath() === WT_B);
+
+          // ---- reorder: the context menu, the keyboard, a drag --------------
+          const placeOf = (path) => order().indexOf(path);
+          m = await openTabMenu(WT_B);
+          const startAt = placeOf(WT_B);
+          itemNamed(m, "Move right").click();
+          await settle(); await wait(20);
+          check("Move right shifts the tab one place and announces its position", () =>
+            placeOf(WT_B) === startAt + 1 && /^Moved agent-models to position \d+ of \d+$/.test($('[role="status"][aria-live="polite"]').textContent));
+          m = await openTabMenu(WT_B);
+          itemNamed(m, "Move left").click();
+          await settle(); await wait(20);
+          check("Move left puts it back", () => placeOf(WT_B) === startAt);
+          m = await openTabMenu(WT_B);
+          itemNamed(m, "Move to start").click();
+          await settle(); await wait(20);
+          check("Move to start seats it first", () => placeOf(WT_B) === 0);
+          m = await openTabMenu(WT_B);
+          check("a tab already first cannot be told to move left or to the start", () =>
+            itemNamed(m, "Move left").getAttribute("aria-disabled") === "true" && itemNamed(m, "Move to start").getAttribute("aria-disabled") === "true" &&
+            itemNamed(m, "Move right").getAttribute("aria-disabled") === "false");
+          itemNamed(m, "Move to end").click();
+          await settle(); await wait(20);
+          check("Move to end seats it last", () => placeOf(WT_B) === order().length - 1);
+          const endAt = placeOf(WT_B);
+          tabBtn(WT_B).focus();
+          key(tabBtn(WT_B), { key: "ArrowLeft", ctrlKey: true, shiftKey: true });
+          await settle(); await wait(20);
+          check("Ctrl+Shift+← moves the focused tab and keeps focus on it", () => placeOf(WT_B) === endAt - 1 && document.activeElement === tabBtn(WT_B));
+          const dragTransfer = new DataTransfer();
+          const dragged = shellOf(API);
+          drag("dragstart", dragged, "left", dragTransfer);
+          check("a drag carries the tab id under both the plain and the app-specific type", () => {
+            const id = rec(API).id;
+            return dragTransfer.getData("text/plain") === id && dragTransfer.getData("application/x-gitpulse-repo-tab") === id;
+          });
+          drag("dragover", shellOf(MAIN), "left", dragTransfer);
+          drag("drop", shellOf(MAIN), "left", dragTransfer);
+          drag("dragend", dragged, "left", dragTransfer);
+          await settle();
+          check("dropping on the left half of another tab lands it before that tab", () => placeOf(API) === placeOf(MAIN) - 1);
+
+          // ---- groups: head, keyboard, menus, spring-loaded drag ------------
+          repoStore.setTabGroup(rec(SITE).id, "ops");
+          repoStore.setTabGroup(rec(SITE_WT).id, "ops");
+          await settle();
+          const groupHead = (name) => $(`[data-group-head="${name}"]`, strip());
+          const groupHeader = (name) => $(`[data-group-header="${name}"]`, strip());
+          const groupMenuEl = () => $("[data-group-menu]");
+          check("a group head names the group, counts its repositories and reports it expanded", () =>
+            !!groupHead("ops") && words(groupHead("ops")).includes("ops") && words(groupHead("ops")).includes("(2)") &&
+            groupHead("ops").getAttribute("aria-expanded") === "true" && groupHead("ops").getAttribute("aria-label").startsWith("Group ops, 2 repositories"));
+          groupHead("ops").click();
+          await settle();
+          check("clicking the head collapses the group and hides its member tabs", () =>
+            groupHead("ops").getAttribute("aria-expanded") === "false" && !$(`[data-tab-id="${CSS.escape(rec(SITE).id)}"]`, strip()));
+          groupHead("ops").focus();
+          key(groupHead("ops"), { key: "ArrowRight" });
+          await settle();
+          check("ArrowRight on a collapsed head expands it", () => groupHead("ops").getAttribute("aria-expanded") === "true" && !!tabBtn(SITE));
+          key(groupHead("ops"), { key: "ArrowLeft" });
+          await settle();
+          check("ArrowLeft on an expanded head collapses it", () => groupHead("ops").getAttribute("aria-expanded") === "false");
+          key(groupHead("ops"), { key: "ArrowRight" });
+          await settle();
+
+          key(groupHead("ops"), { key: "F2" });
+          await settle(); await wait(20);
+          check("F2 on a head asks for a new name", () => !!promptNow() && promptNow().options.title === 'Rename group "ops"');
+          await answer("operations");
+          check("the answer renames the group on every member and on the head", () =>
+            rec(SITE).group === "operations" && rec(SITE_WT).group === "operations" && !!groupHead("operations") && !groupHead("ops"));
+          key(groupHead("operations"), { key: "Delete" });
+          await settle(); await wait(20);
+          check("Delete on a head asks before closing the group, and names the count", () =>
+            promptNow()?.options.destructive === true && promptNow().options.message.includes("all 2 repository tabs"));
+          await answer(false);
+          groupHead("operations").dispatchEvent(new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }));
+          await settle(); await wait(20);
+          check("a middle click on a head asks the same question", () => !!promptNow() && promptNow().options.destructive === true);
+          await answer(false);
+          check("declining closes nothing", () => !!rec(SITE) && !!rec(SITE_WT));
+
+          // Spring-loaded: hovering a dragged tab over a collapsed head opens it.
+          groupHead("operations").click();
+          await settle();
+          const spring = new DataTransfer();
+          drag("dragstart", shellOf(API), "left", spring);
+          drag("dragover", groupHead("operations"), "left", spring);
+          await wait(120);
+          check("a drag over a collapsed head does not open it at once", () => groupHead("operations").getAttribute("aria-expanded") === "false");
+          await wait(450);
+          await settle();
+          check("but holds long enough, and the group springs open", () => groupHead("operations").getAttribute("aria-expanded") === "true");
+          groupHead("operations").click();
+          await settle();
+          drag("dragover", groupHead("operations"), "left", spring);
+          drag("dragleave", groupHead("operations"), "left", spring);
+          await wait(550);
+          await settle();
+          check("leaving the head before the delay cancels the spring", () => groupHead("operations").getAttribute("aria-expanded") === "false");
+          drag("dragover", groupHead("operations"), "left", spring);
+          drag("drop", groupHeader("operations"), "left", spring);
+          drag("dragend", shellOf(API), "left", spring);
+          await settle();
+          check("dropping a tab on a head joins that group and opens it", () =>
+            rec(API).group === "operations" && groupHead("operations").getAttribute("aria-expanded") === "true" && words(groupHead("operations")).includes("(3)"));
+
+          // Group menu.
+          // A second group, so "Close other groups…" has something to offer.
+          repoStore.setTabGroup(rec(WT_A).id, "scratch");
+          await settle();
+          contextAt(groupHead("operations"));
+          await settle(); await wait(20);
+          const gm = groupMenuEl();
+          check("a group head's menu is a labelled menu of menuitems", () =>
+            gm?.getAttribute("role") === "menu" && gm.getAttribute("aria-label") === "Group actions for operations" &&
+            $$("button", gm).every((button) => button.getAttribute("role") === "menuitem") && items(gm)[0] === document.activeElement);
+          const groupLabels = items(gm).map(words);
+          check("it offers collapse, expand-all, rename, ungroup, add-ungrouped and the two closes", () =>
+            ["Collapse group", "Expand all groups", "Collapse all groups", "Rename group…", "Ungroup repositories", "Close other groups…", "Close group repositories…"]
+              .every((label) => groupLabels.includes(label)) && groupLabels.some((label) => label.startsWith("Add open ungrouped repositories (")));
+          $('[data-color-choice="teal"]', gm).click();
+          await settle();
+          check("choosing a group colour paints the head and every member tab", () =>
+            !!$('[data-group-color="teal"]', groupHead("operations")) && $$('[data-tab-color="teal"][data-tab-color-source="group"]', strip()).length === 3);
+          m = await openTabMenu(MAIN);
+          const tabLabels = items(m).map(words);
+          check("a tab outside any group offers Add to group, Move to group and the group-wide actions", () =>
+            tabLabels.includes("Add to group…") && tabLabels.includes('Move to group "operations"') && tabLabels.includes("Group all by parent folder") &&
+            tabLabels.includes("Collapse all groups") && tabLabels.includes("Expand all groups") && tabLabels.includes("Ungroup all repositories") &&
+            !tabLabels.includes("Remove from group"));
+          itemNamed(m, "Add to group…").click();
+          await settle(); await wait(20);
+          check("Add to group asks for a name", () => promptNow()?.options.title === "Add to group");
+          await answer("tools");
+          check("the name becomes the tab's group", () => rec(MAIN).group === "tools" && !!groupHead("tools"));
+          m = await openTabMenu(MAIN);
+          const inGroupLabels = items(m).map(words);
+          check("a grouped tab offers Change group, Remove from group, Collapse group and Close group", () =>
+            inGroupLabels.includes("Change group… (tools)") && inGroupLabels.includes("Remove from group") &&
+            inGroupLabels.includes('Collapse group "tools"') && inGroupLabels.includes('Close group "tools"…'));
+          itemNamed(m, "Remove from group").click();
+          await settle();
+          check("Remove from group ungroups just that tab", () => !rec(MAIN).group && rec(SITE).group === "operations");
+          m = await openTabMenu(MAIN);
+          $('[data-color-choice="blue"]', m).click();
+          await settle();
+          check("choosing a tab colour paints that tab as its own, not inherited", () =>
+            shellOf(MAIN).dataset.tabColor === "blue" && shellOf(MAIN).dataset.tabColorSource === "own" && rec(MAIN).color === "blue");
+          check("a tab with no colour of its own inherits its group's", () =>
+            shellOf(SITE).dataset.tabColor === "teal" && shellOf(SITE).dataset.tabColorSource === "group");
+          if (repoMenu()) { key(repoMenu(), { key: "Escape" }); await settle(); await wait(20); }
+
+          // Strip background menu.
+          contextAt(strip());
+          await settle(); await wait(20);
+          const sm = $("[data-strip-menu]");
+          const stripLabels = sm ? items(sm).map(words) : [];
+          check("right-clicking the strip's background opens a labelled strip menu", () =>
+            sm?.getAttribute("role") === "menu" && sm.getAttribute("aria-label") === "Repository tab strip actions" &&
+            stripLabels.includes("Open repository…") && stripLabels.includes("Group all by parent folder") && stripLabels.includes("Close all repositories…"));
+          itemNamed(sm, "Close all repositories…").click();
+          await settle(); await wait(20);
+          check("Close all asks first, destructively, with the count", () =>
+            promptNow()?.options.destructive === true && /^Close all \d+ open repository tabs\?$/.test(promptNow().options.message));
+          const openBefore = get(repoStore).openTabs.length;
+          await answer(false);
+          check("declining closes no repository", () => get(repoStore).openTabs.length === openBefore);
+          await repoStore.closeTab(rec(API_FEATURE).id);
+          await settle();
+          contextAt(strip());
+          await settle(); await wait(20);
+          check("after a close, the strip menu offers to reopen it by name", () =>
+            items($("[data-strip-menu]")).some((el) => words(el) === "Reopen closed repository (Api-feature)"));
+          key($("[data-strip-menu]"), { key: "Escape" });
+          await settle(); await wait(20);
+
+          // Close group confirmation really closes the group.
+          contextAt(groupHead("operations"));
+          await settle(); await wait(20);
+          itemNamed(groupMenuEl(), "Close group repositories…").click();
+          await settle(); await wait(20);
+          await answer(true);
+          await wait(60); await settle();
+          check("confirming Close group closes every member and its head goes", () =>
+            !rec(SITE) && !rec(SITE_WT) && !rec(API) && !groupHead("operations"));
+          repoStore.ungroupTabs();
+          await repoStore.openRepo(SITE, { activate: false });
+          await repoStore.openRepo(API, { activate: false });
+          interfaceStore.setStackWorktreeTabs(true);
+          await settle();
+          // A few tabs, so a spacer that grew would show as a gap. With none left
+          // to overflow the strip, Open must sit right where the last tab ends.
+          check("Open sits right beside the last tab instead of after a growing spacer", () => {
+            const gap = $('[data-testid="open-repo-tab"]').getBoundingClientRect().left - strip().lastElementChild.getBoundingClientRect().right;
+            return strip().scrollWidth <= strip().clientWidth + 1 && gap >= 0 && gap < 24;
+          });
+
           // ---- many more repositories than the watch pool ----------------
           // The strip used to refuse a twenty-fifth repository. Now watches
           // are pooled by recency and the rest are parked, visibly.
@@ -357,6 +724,76 @@
             activePath() === parked && tabFor(parked).watch === "watching" && watched.has(parked) &&
             domTab(parked).dataset.parked === undefined);
           check("…without growing the native watch table", () => watched.size <= WATCH_POOL_SIZE);
+
+          // Two hundred tabs overflow the strip; walk it from end to end.
+          const frames = async () => { await settle(); await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); await tick(); };
+          strip().scrollLeft = 0;
+          await frames();
+          check("an overflowing strip fades its own trailing edge", () =>
+            strip().scrollWidth > strip().clientWidth && strip().dataset.gpFade === "x-end" &&
+            maskOf(strip()) !== "none");
+          check("the cue overlay paints nothing behind its chevron", () => {
+            const overlays = cueOverlays();
+            return overlays.length === 1 && overlays.every((el) => {
+              const cs = getComputedStyle(el);
+              return cs.backgroundImage === "none" && cs.backgroundColor === "rgba(0, 0, 0, 0)" && cs.pointerEvents === "none";
+            });
+          });
+          strip().scrollLeft = Math.floor((strip().scrollWidth - strip().clientWidth) / 2);
+          await frames();
+          check("in the middle both edges fade", () => strip().dataset.gpFade === "x-both" && cueOverlays().length === 2);
+          strip().scrollLeft = strip().scrollWidth;
+          await frames();
+          check("at the end only the leading edge fades", () => strip().dataset.gpFade === "x-start" && cueOverlays().length === 1);
+          check("the strip draws no scrollbar track under the tabs", () => {
+            const cs = getComputedStyle(strip());
+            return cs.overflowY === "hidden" && cs.scrollbarWidth === "none" &&
+              strip().offsetHeight - strip().clientHeight === 0;
+          });
+          strip().scrollLeft = 0;
+          await frames();
+          const wheelEvent = new WheelEvent("wheel", { deltaY: 120, bubbles: true, cancelable: true });
+          strip().dispatchEvent(wheelEvent);
+          check("a mouse wheel pans the hidden-track strip", () => strip().scrollLeft > 0 && wheelEvent.defaultPrevented);
+
+          // ---- the recent-repositories dropdown ---------------------------------
+          // By now two hundred repositories have been opened, so the recents
+          // list is far longer than the window can show.
+          const recentsTrigger = $('[title="Recent repositories"]');
+          const recentsMenu = () => $("#recent-repositories-menu");
+          check("the recents trigger announces a menu and starts closed", () =>
+            recentsTrigger.getAttribute("aria-haspopup") === "menu" && recentsTrigger.getAttribute("aria-expanded") === "false" && !recentsMenu());
+          recentsTrigger.click();
+          await settle(); await wait(20);
+          const rm = recentsMenu();
+          check("opening it reports expanded and shows a labelled menu", () =>
+            recentsTrigger.getAttribute("aria-expanded") === "true" && rm?.getAttribute("role") === "menu" &&
+            rm.getAttribute("aria-label") === "Recent repositories" && recentsTrigger.getAttribute("aria-controls") === "recent-repositories-menu");
+          check("focus moves onto its first item", () => items(rm)[0] === document.activeElement);
+          const recentItems = items(rm);
+          key(rm, { key: "ArrowDown" });
+          const recentsDown = document.activeElement === recentItems[1];
+          key(rm, { key: "End" });
+          check("its items are walked with the arrow keys", () => recentsDown && document.activeElement === recentItems.at(-1));
+          const rbox = rm.getBoundingClientRect();
+          const list = rm.querySelector(".overflow-y-auto");
+          check("the menu is bounded to the window instead of running off the bottom", () =>
+            rbox.top >= 0 && rbox.bottom <= innerHeight && getComputedStyle(rm).maxHeight !== "none");
+          check("its list scrolls inside the menu while the heading stays put", () =>
+            getComputedStyle(list).overflowY === "auto" && list.scrollHeight > list.clientHeight &&
+            rm.firstElementChild.getBoundingClientRect().height > 0 && rm.firstElementChild.getBoundingClientRect().top >= rbox.top - 1);
+          check("the bar is a stacking layer above the workspace pane that follows it", () => {
+            const bar = $('[data-testid="open-repo-tab"]').parentElement;
+            const z = Number(getComputedStyle(bar).zIndex);
+            return getComputedStyle(bar).position !== "static" && Number.isFinite(z) && z > Number(getComputedStyle(pane).zIndex);
+          });
+          check("the dropdown paints above a workspace pane drawn beneath the bar", () => {
+            const hit = document.elementFromPoint(rbox.left + rbox.width / 2, rbox.top + Math.min(rbox.height / 2, 60));
+            return !!hit && rm.contains(hit);
+          });
+          await press(rm, { key: "Escape" });
+          check("Escape closes it and returns focus to the trigger", () =>
+            !recentsMenu() && document.activeElement === recentsTrigger && recentsTrigger.getAttribute("aria-expanded") === "false");
 
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);

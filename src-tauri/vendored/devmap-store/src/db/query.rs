@@ -7,7 +7,9 @@ use super::{
 };
 use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
 use devmap_analyze::clones::CloneCandidate;
-use devmap_analyze::model::{AnalysisDisclosure, DeadSymbolReport};
+use devmap_analyze::model::{
+    AnalysisDisclosure, DeadEvidence, DeadSymbolReport, ExcludedPopulation,
+};
 use devmap_analyze::DeadClusterScan;
 use devmap_extract::model::{Extraction, SymbolKind};
 use rusqlite::types::ToSql;
@@ -1338,6 +1340,7 @@ impl Store {
             dead_clusters,
             rows: Self::dead_symbols_page_in(&snapshot, generation, limit)?,
             total_non_exempt: Self::count_dead_non_exempt_in(&snapshot, generation)?,
+            excluded: Self::dead_excluded_in(&snapshot, generation)?,
         }))
     }
 
@@ -1359,7 +1362,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DeadSymbolReport>> {
         let mut stmt = snapshot.prepare(
-            "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
+            "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason,
+                    evidence_sites, evidence_path, evidence_byte
              FROM generation_dead_symbols
              WHERE generation_id = ?1 AND is_exempt = 0
              ORDER BY confidence DESC, file_path, symbol_name, ordinal
@@ -1374,10 +1378,43 @@ impl Store {
                     confidence: row.get(2)?,
                     is_exempt: row.get::<_, i64>(3)? != 0,
                     exemption_reason: row.get(4)?,
+                    evidence: dead_evidence_from(row, 5)?,
                 })
             },
         )?;
         rows.collect()
+    }
+
+    /// The population `dead` never examined, per language, by reason token.
+    ///
+    /// Counted beside [`Self::count_dead_non_exempt_in`] and over the same
+    /// rows: every exempt row of the generation, joined to its file's language.
+    /// Grouped by the stored reason in SQL — the reasons are a small set of
+    /// sentences per generation — and folded to tokens by
+    /// [`devmap_analyze::exemption_token`], the one owner of that mapping.
+    fn dead_excluded_in(snapshot: &Connection, gen: u32) -> Result<ExcludedPopulation> {
+        let mut stmt = snapshot.prepare(
+            "SELECT COALESCE(f.language, ''), d.exemption_reason, COUNT(*)
+             FROM generation_dead_symbols d
+             LEFT JOIN paths p ON p.path = d.file_path
+             LEFT JOIN generation_files f
+                    ON f.generation_id = d.generation_id AND f.file_id = p.id
+             WHERE d.generation_id = ?1 AND d.is_exempt = 1
+             GROUP BY 1, 2",
+        )?;
+        let rows = stmt.query_map(params![gen], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut grouped = Vec::new();
+        for row in rows {
+            let (language, reason, count) = row?;
+            grouped.push((language, reason, u64::try_from(count).unwrap_or(0)));
+        }
+        Ok(ExcludedPopulation::from_grouped_rows(grouped))
     }
 
     fn count_dead_non_exempt_in(snapshot: &Connection, gen: u32) -> Result<usize> {
@@ -1405,7 +1442,8 @@ impl Store {
     /// engine wants is [`Store::dead_symbols_page_in`].
     fn dead_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<DeadSymbolReport>> {
         let mut stmt = snapshot.prepare(
-            "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
+            "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason,
+                    evidence_sites, evidence_path, evidence_byte
              FROM generation_dead_symbols
              WHERE generation_id = ?1
              ORDER BY is_exempt, confidence DESC, file_path, symbol_name, ordinal",
@@ -1417,6 +1455,7 @@ impl Store {
                 confidence: row.get(2)?,
                 is_exempt: row.get::<_, i64>(3)? != 0,
                 exemption_reason: row.get(4)?,
+                evidence: dead_evidence_from(row, 5)?,
             })
         })?;
         rows.collect()
@@ -1637,4 +1676,25 @@ impl Store {
              about the repository; rebuild the index with `devmap repair --fts`"
         )))
     }
+}
+
+/// The evidence columns of one dead row, starting at `first` (sites, path, byte).
+///
+/// `NULL` sites is "no evidence recorded" — an exempt or confident row, or a
+/// generation written before v27 — which is not the same fact as zero sites.
+fn dead_evidence_from(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+) -> rusqlite::Result<Option<DeadEvidence>> {
+    let Some(sites) = row.get::<_, Option<i64>>(first)? else {
+        return Ok(None);
+    };
+    Ok(Some(DeadEvidence {
+        sites: u32::try_from(sites).unwrap_or(u32::MAX),
+        first_path: row.get(first + 1)?,
+        first_byte: row
+            .get::<_, Option<i64>>(first + 2)?
+            .and_then(|byte| u32::try_from(byte).ok()),
+        first_line: None,
+    }))
 }

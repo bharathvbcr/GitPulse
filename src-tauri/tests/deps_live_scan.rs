@@ -44,14 +44,15 @@ fn git_add(dir: &Path, rel: &str) {
 
 /// Prepends `bin_dir` to the process PATH so `capture_command` finds the
 /// instrumented CLI first while keeping every normal lookup (git, node…)
-/// working for tests running concurrently in this binary.
-fn prepend_path(bin_dir: &Path) {
+/// working for tests running concurrently in this binary. The PATH is put back
+/// when the returned binding drops, which these four tests used to never do.
+fn prepend_path(bin_dir: &Path) -> common::env::EnvBinding<'static> {
     let current = std::env::var("PATH").unwrap_or_default();
     let next = std::env::join_paths(
         std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&current)),
     )
     .expect("join paths");
-    std::env::set_var("PATH", next);
+    common::env::bind_env_owned(common::env::env_serial()).set("PATH", next)
 }
 
 fn resolve_tool(env_key: &str, name: &str) -> Option<PathBuf> {
@@ -78,7 +79,7 @@ fn live_pip_audit_reports_flask_advisories() {
         eprintln!("skip: pip-audit not on PATH and GITPULSE_TEST_PIP_AUDIT unset");
         return;
     };
-    prepend_path(bin.parent().expect("bin dir"));
+    let _path = prepend_path(bin.parent().expect("bin dir"));
 
     let repo = git_repo();
     write(repo.path(), "requirements.txt", "flask==0.5\n");
@@ -133,7 +134,7 @@ fn live_bundler_audit_reports_nokogiri_advisory() {
         eprintln!("skip: bundler-audit not on PATH and GITPULSE_TEST_BUNDLER_AUDIT unset");
         return;
     };
-    prepend_path(bin.parent().expect("bin dir"));
+    let _path = prepend_path(bin.parent().expect("bin dir"));
 
     let repo = git_repo();
     // bundler-audit resolves Bundler.root, which requires a Gemfile beside
@@ -203,7 +204,7 @@ fn live_cargo_audit_reports_time_rustsec() {
         return;
     };
     // `cargo audit` resolves cargo-* subcommands from PATH.
-    prepend_path(bin.parent().expect("bin dir"));
+    let _path = prepend_path(bin.parent().expect("bin dir"));
 
     let repo = git_repo();
     write(
@@ -349,7 +350,7 @@ fn live_govulncheck_reports_xtext_module_findings() {
         eprintln!("skip: govulncheck not on PATH and GITPULSE_TEST_GOVULNCHECK unset");
         return;
     };
-    prepend_path(bin.parent().expect("bin dir"));
+    let _path = prepend_path(bin.parent().expect("bin dir"));
 
     let repo = git_repo();
     write(

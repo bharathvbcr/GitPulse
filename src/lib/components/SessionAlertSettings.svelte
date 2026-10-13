@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatClockMinutes, parseClockMinutes } from "../format";
   /**
    * Notifications for agent sessions running in a terminal tab.
    *
@@ -46,13 +47,6 @@
       : notificationUnavailableReason($hostPlatform.os, native?.available ?? false, native?.error ?? null),
   );
 
-  const clock = (n: number) =>
-    `${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`;
-  const minute = (s: string) => {
-    if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(s)) throw new Error("Choose valid local quiet hours.");
-    const [h, m] = s.split(":").map(Number);
-    return h * 60 + m;
-  };
 
   /**
    * Everything the notifier chose not to show, by reason.
@@ -91,8 +85,8 @@
       draft = { ...fresh.settings };
       quiet = fresh.settings.quiet_start !== null;
       if (fresh.settings.quiet_start !== null && fresh.settings.quiet_end !== null) {
-        start = clock(fresh.settings.quiet_start);
-        end = clock(fresh.settings.quiet_end);
+        start = formatClockMinutes(fresh.settings.quiet_start);
+        end = formatClockMinutes(fresh.settings.quiet_end);
       }
       if (isTauri()) {
         const status = await nativeNotificationStatus();
@@ -112,8 +106,8 @@
     try {
       const next: SessionAlertSettings = {
         ...draft,
-        quiet_start: quiet ? minute(start) : null,
-        quiet_end: quiet ? minute(end) : null,
+        quiet_start: quiet ? parseClockMinutes(start) : null,
+        quiet_end: quiet ? parseClockMinutes(end) : null,
       };
       if (quiet && next.quiet_start === next.quiet_end) {
         throw new Error("Quiet-hour start and end must differ.");

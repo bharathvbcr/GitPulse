@@ -1,5 +1,6 @@
 import { invoke } from "../ipc/invoke";
 import type { CoveredLine, FileCoverage } from "./types";
+import { isRecord } from "../record";
 
 export function buildHitMap(lines: CoveredLine[]): Map<number, number> {
   const hits = new Map<number, number>();
@@ -7,10 +8,6 @@ export function buildHitMap(lines: CoveredLine[]): Map<number, number> {
     hits.set(line.line_no, line.hits);
   }
   return hits;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function parseFileCoverage(value: unknown): FileCoverage {

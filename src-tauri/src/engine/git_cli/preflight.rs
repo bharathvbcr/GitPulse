@@ -16,6 +16,18 @@ use std::time::Duration;
 /// which the checkout and discard paths run.
 pub const MIN_GIT_VERSION: (u32, u32, u32) = (2, 23, 0);
 
+/// Oldest git that may clone. 2.45.1 is the first release with the fixes for
+/// CVE-2024-32002 (a hostile repository's symlinked submodule writes into
+/// `.git` during clone and runs a hook), CVE-2024-32004 and CVE-2024-32465
+/// (local clones of a crafted repository). The Apple developer-tools git
+/// often reports an older version than that, and a version string is the only
+/// signal we have, so it is refused with instructions rather than trusted.
+pub const MIN_CLONE_GIT_VERSION: (u32, u32, u32) = (2, 45, 1);
+
+/// Oldest git that may initialise submodules: CVE-2025-48384 (a carriage
+/// return in a submodule path escapes the checkout) is fixed from 2.50.1.
+pub const MIN_SUBMODULE_GIT_VERSION: (u32, u32, u32) = (2, 50, 1);
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +152,49 @@ pub fn git_preflight() -> GitPreflight {
     answer
 }
 
+/// Whether `preflight`'s git may run a clone (`submodules` false) or any
+/// operation that fetches and checks out submodules (`submodules` true).
+///
+/// Fails closed: a git that could not be probed, or whose version cannot be
+/// read, is refused. The message says what to install, because the person who
+/// hits this cannot act on a bare version number.
+pub(crate) fn assess_for_clone(preflight: &GitPreflight, submodules: bool) -> Result<(), String> {
+    let (need, why) = if submodules {
+        (
+            MIN_SUBMODULE_GIT_VERSION,
+            "recursing into submodules (CVE-2025-48384, CVE-2024-32002)",
+        )
+    } else {
+        (
+            MIN_CLONE_GIT_VERSION,
+            "cloning (CVE-2024-32002, CVE-2024-32004, CVE-2024-32465)",
+        )
+    };
+    if preflight.status != GitPreflightStatus::Ok {
+        return Err(preflight
+            .message
+            .clone()
+            .unwrap_or_else(|| "Git could not be verified, so it was not used to clone".into()));
+    }
+    let line = preflight.version.clone().unwrap_or_default();
+    match parse_git_version(&line) {
+        Some(found) if found >= need => Ok(()),
+        Some((major, minor, patch)) => Err(format!(
+            "Git {major}.{minor}.{patch} has known security flaws when {why}. Update to Git \
+             {}.{}.{} or newer (for example `brew install git`), then restart GitPulse.",
+            need.0, need.1, need.2
+        )),
+        None => Err(format!(
+            "Git reported an unrecognised version ({line}); refusing to clone with it."
+        )),
+    }
+}
+
+/// [`assess_for_clone`] against the git this app drives.
+pub fn require_git_for_clone(submodules: bool) -> Result<(), String> {
+    assess_for_clone(&git_preflight(), submodules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +255,60 @@ mod tests {
         let answer = git_preflight();
         assert_eq!(answer.status, GitPreflightStatus::Ok, "{answer:?}");
         assert!(answer.version.unwrap().starts_with("git version "));
+    }
+
+    fn preflight_of(line: &str) -> GitPreflight {
+        assess(ToolProbe::Present(line.to_string()))
+    }
+
+    #[test]
+    fn cloning_is_refused_below_the_patched_git_with_a_message_that_says_what_to_do() {
+        for old in [
+            "git version 2.39.3 (Apple Git-146)",
+            "git version 2.45.0",
+            "git version 2.30.2",
+        ] {
+            let error = assess_for_clone(&preflight_of(old), false).expect_err(old);
+            assert!(
+                error.contains("2.45.1") && error.contains("Update"),
+                "{old}: {error}"
+            );
+        }
+        for ok in [
+            "git version 2.45.1",
+            "git version 2.50.1",
+            "git version 2.54.0 (Apple Git-157)",
+        ] {
+            assert!(assess_for_clone(&preflight_of(ok), false).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn submodule_recursion_needs_the_newer_git() {
+        let error = assess_for_clone(&preflight_of("git version 2.49.0"), true).expect_err("old");
+        assert!(
+            error.contains("2.50.1") && error.contains("CVE-2025-48384"),
+            "{error}"
+        );
+        assert!(assess_for_clone(&preflight_of("git version 2.49.0"), false).is_ok());
+        assert!(assess_for_clone(&preflight_of("git version 2.50.1"), true).is_ok());
+    }
+
+    /// A probe that could not run is not a pass.
+    #[test]
+    fn an_unprobed_or_unreadable_git_is_refused_for_cloning() {
+        for probe in [
+            ToolProbe::NotFound("no git".into()),
+            ToolProbe::FoundButFailed("shim".into()),
+            ToolProbe::NotRun("busy".into()),
+        ] {
+            assert!(assess_for_clone(&assess(probe), false).is_err());
+        }
+        let unreadable = GitPreflight {
+            status: GitPreflightStatus::Ok,
+            version: Some("git version banana".into()),
+            message: None,
+        };
+        assert!(assess_for_clone(&unreadable, false).is_err());
     }
 }

@@ -8,6 +8,7 @@ import {
   summarizeWalkIncomplete,
   WALK_INCOMPLETE_MAX_CHARS,
 } from "./walkIncomplete";
+import { isRecord } from "../record";
 
 export interface CodeintelSymbolHit {
   symbol_name: string;
@@ -117,10 +118,6 @@ export interface CodeintelStatus {
   total_symbols?: number | null;
   total_edges?: number | null;
   reason?: string | null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function optionalBoolean(value: unknown): boolean | null | undefined {
@@ -492,6 +489,24 @@ export interface DevmapBuildOutcome {
   stderr: string;
   timed_out: boolean;
   report?: unknown;
+}
+
+/**
+ * Why a failed devmap build failed, in the CLI's own words.
+ *
+ * Under `--json` the CLI answers a refusal as one `{"error": ...}` document on
+ * stdout and keeps its human lines off stderr, so stderr is empty for exactly
+ * the failures that have a reason. The envelope comes first, then stderr, then
+ * the caller's fallback. This helper never quotes stdout: it is a JSON document,
+ * not a sentence.
+ */
+export function buildFailureReason(outcome: DevmapBuildOutcome, fallback: string): string {
+  const report: unknown = outcome.report;
+  if (report && typeof report === "object") {
+    const error = (report as { error?: unknown }).error;
+    if (typeof error === "string" && error.trim() !== "") return error.trim();
+  }
+  return outcome.stderr.trim() || fallback;
 }
 
 export interface DevmapCliStatus {
@@ -911,7 +926,13 @@ export type LiveRefreshDecision =
    * The backend's spawn gate declined to start the probe or build under load.
    * Nothing was examined; ask again after a backoff, never settle on it.
    */
-  | "skip_deferred";
+  | "skip_deferred"
+  /**
+   * A build was started on a background thread and the call did not wait for
+   * it. The next ask for the repository collects its outcome (a `refresh`
+   * carrying the build); until then every ask answers `skip_building`.
+   */
+  | "started";
 
 export interface LiveRefreshFactsDto {
   available: boolean;
@@ -935,8 +956,19 @@ export interface LiveRefreshOutcome {
   facts: LiveRefreshFactsDto;
   build?: DevmapBuildOutcome | null;
   reason?: string | null;
-  /** Remaining echo/failure backoff when `decision` is `skip_cooldown`. */
+  /**
+   * How long the backend now waits before the next automatic build: the
+   * remaining wait when `decision` is `skip_cooldown`, and the rest a finished
+   * build just set when it is `refresh`. A watcher tick inside it is answered
+   * without a build, so the next ask is held until it ends.
+   */
   cooldown_remaining_ms?: number | null;
+  /**
+   * The last automatic build ran past its deadline and automatic indexing is
+   * paused (at least 10 min). Set on that build's outcome and on every
+   * `skip_cooldown` answered during the pause.
+   */
+  index_too_slow?: boolean;
   /**
    * The build wrote consumer artifacts that were missing beforehand. Such a
    * build reports the *store* `unchanged` whenever the database was already
@@ -1097,6 +1129,8 @@ export interface WorkspaceLinkCandidate {
 
 export interface WorkspaceLinksResult {
   links: WorkspaceLinkCandidate[];
+  /** What could not be read, per repository and why. Empty `links` means "none" only when this is empty too. */
+  coverage_gaps: { repo: string; reason: string }[];
   count: number;
   repos_considered: number;
 }

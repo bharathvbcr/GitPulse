@@ -225,6 +225,26 @@ describe("summarizeHealth — the local audit", () => {
     expect(f.caveat).toContain("no finding count exists");
   });
 
+  it("names the audit census on a partial audit and on one that never ran", () => {
+    const audit_coverage = { found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] };
+    const partial = facet(
+      cleanInput({ report: report({ audit_complete: false, audit_coverage }) }),
+      "vulnerabilities",
+    );
+    expect(partial.caveat).toContain("1 of 2 audited; not audited: cargo:Cargo.lock.");
+    const none = facet(
+      cleanInput({
+        report: report({
+          scanners_ran: [],
+          audit_complete: false,
+          audit_coverage: { found: 2, audited: 0, unaudited: ["npm:package-lock.json", "cargo:Cargo.lock"] },
+        }),
+      }),
+      "vulnerabilities",
+    );
+    expect(none.caveat).toContain("0 of 2 audited; not audited: npm:package-lock.json, cargo:Cargo.lock.");
+  });
+
   it("marks a partial audit's counts as a floor even when it found things", () => {
     const f = facet(
       cleanInput({

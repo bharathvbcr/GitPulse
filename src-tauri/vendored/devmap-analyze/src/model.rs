@@ -7,6 +7,130 @@ pub struct DeadSymbolReport {
     pub confidence: f32,
     pub is_exempt: bool,
     pub exemption_reason: Option<String>,
+    /// What a reader checks before acting on an unconfirmed row.
+    ///
+    /// Set on every non-exempt row below the confident tier, `None` elsewhere.
+    /// A 0.4 row says "something may reach this"; without the count and the
+    /// first site, checking that claim meant grepping the whole tree for a
+    /// name, which is the work the row was supposed to save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<DeadEvidence>,
+}
+
+impl DeadEvidence {
+    /// No site names the symbol. The analyzer starts every unconfirmed row
+    /// here and the site pass raises it.
+    pub fn none() -> Self {
+        Self {
+            sites: 0,
+            first_path: None,
+            first_byte: None,
+            first_line: None,
+        }
+    }
+}
+
+/// The symbols `dead` never examined, so that a short list over a corpus that
+/// was mostly exempted cannot read as a clean bill of health.
+///
+/// Counts exempt rows: symbols nothing calls that the analysis spared, either
+/// for their visibility (`not_examined`) or for evidence that something reaches
+/// them outside the call graph (`exempt` — a runtime entry point, an interface
+/// it implements, a test file). A symbol something *calls* writes no dead row
+/// at all and is in neither number.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedPopulation {
+    /// Uncalled symbols spared by visibility alone, across every language.
+    pub not_examined: u64,
+    /// Uncalled symbols spared by a recorded reason, across every language.
+    pub exempt: u64,
+    /// One entry per language with any exempt row, sorted by language.
+    pub languages: Vec<ExcludedLanguage>,
+}
+
+/// One language's share of [`ExcludedPopulation`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedLanguage {
+    pub language: String,
+    /// Spared by a visibility keyword or a language default — see
+    /// [`crate::liveness::VISIBILITY_TOKENS`].
+    pub not_examined: u64,
+    /// Spared by evidence.
+    pub exempt: u64,
+    /// Both of the above by [`crate::liveness::exemption_token`]; sums to
+    /// `not_examined + exempt`.
+    pub by_reason: std::collections::BTreeMap<String, u64>,
+}
+
+impl ExcludedPopulation {
+    /// Fold `(language, stored reason, count)` rows into the disclosure.
+    ///
+    /// A row with no reason is counted as `exported`: the only writer that
+    /// leaves the reason empty on an exempt row predates the split of the old
+    /// "Exported or exempt" fallback, whose dominant case was visibility.
+    pub fn from_grouped_rows(
+        rows: impl IntoIterator<Item = (String, Option<String>, u64)>,
+    ) -> Self {
+        let mut by_language: std::collections::BTreeMap<String, ExcludedLanguage> =
+            std::collections::BTreeMap::new();
+        for (language, reason, count) in rows {
+            let token = reason
+                .as_deref()
+                .map(crate::liveness::exemption_token)
+                .unwrap_or("exported");
+            let entry = by_language
+                .entry(language.clone())
+                .or_insert_with(|| ExcludedLanguage {
+                    language,
+                    ..ExcludedLanguage::default()
+                });
+            *entry.by_reason.entry(token.to_string()).or_default() += count;
+            if crate::liveness::VISIBILITY_TOKENS.contains(&token) {
+                entry.not_examined += count;
+            } else {
+                entry.exempt += count;
+            }
+        }
+        let languages: Vec<ExcludedLanguage> = by_language.into_values().collect();
+        Self {
+            not_examined: languages.iter().map(|entry| entry.not_examined).sum(),
+            exempt: languages.iter().map(|entry| entry.exempt).sum(),
+            languages,
+        }
+    }
+}
+
+/// The sites behind an unconfirmed dead row.
+///
+/// `sites` counts the call or reference sites that name the symbol and that
+/// the resolver could not bind to exactly one target — ambiguous edges into it
+/// and unattributed ledger rows naming it. Zero is a statement, not an absence:
+/// a `confident_tier_unproven` or `exported_unreferenced` row with no such site
+/// carries `sites: 0`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadEvidence {
+    pub sites: u32,
+    /// The first such site, ordered by `(path, byte)`, so the answer is stable
+    /// across builds. `None` exactly when `sites` is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_path: Option<String>,
+    /// Byte offset of that site in `first_path`, as extracted. The index keeps
+    /// no line table, so the query layer converts this to `first_line` against
+    /// the file on disk, the way `skeleton` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_byte: Option<u32>,
+    /// One-based line of the first site, when the query layer could read the
+    /// file. `None` from the analyzer, which never has the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_line: Option<u32>,
+}
+
+/// One source file discovery skipped for exceeding the size ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OverLimitFile {
+    pub path: String,
+    pub bytes: u64,
+    pub limit: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +226,21 @@ pub struct AnalysisSummary {
     /// before this field existed, which is the honest reading of them.
     #[serde(default)]
     pub discovery_refused_files: Option<usize>,
+    /// Source files skipped for exceeding the size ceiling, by path.
+    ///
+    /// Persisted for the reason `discovery_refused_files` is — a skipped file
+    /// has no rows, so nothing derived from the graph can name it — and as a
+    /// list rather than a count because `repo_map.json` is read by agents
+    /// deciding what to trust, and "3 files were not read" without the three
+    /// paths is not something they can act on.
+    ///
+    /// Not part of `discovery_refused_files`: an over-limit file is not a
+    /// refusal (see `DiscoverySkipReason::over_limit`), and only the ones that
+    /// could hold calls cap the dead-code pass.
+    ///
+    /// `None` means not recorded, as for `discovery_refused_files`.
+    #[serde(default)]
+    pub over_limit_files: Option<Vec<OverLimitFile>>,
     /// How much of what the resolver tried to attribute, it attributed —
     /// corpus-wide and per language. See [`crate::resolution_rate`].
     ///
@@ -167,6 +306,7 @@ mod disclosure_tests {
                     confidence: 0.9,
                     is_exempt: false,
                     exemption_reason: None,
+                    evidence: None,
                 })
                 .collect(),
             communities: Vec::new(),

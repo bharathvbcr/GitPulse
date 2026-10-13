@@ -255,7 +255,32 @@ describe("App overlay wiring", () => {
     expect(source).toContain("hasUnsavedEditorDrafts()");
     expect(source).toContain("Quit with Unsaved Edits?");
     expect(source).toContain("Conflict drafts are retained for recovery when local storage is available");
-    expect(source.indexOf("conflictSessions.flush()")).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
+    // Every deferred save is flushed before the native exit, through the one
+    // registry the stores join, not a list App keeps by hand.
+    const flushCall = source.indexOf("    flushBeforeExit();\n    exitApproved = true;");
+    expect(flushCall).toBeGreaterThan(-1);
+    expect(flushCall).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
+    expect(source).toContain("for (const failure of flushPendingWrites())");
+    expect(source).not.toContain("conflictSessions.flush()");
+  });
+
+  it("answers every native quit request it saw, so a held quit or logout is never stranded", () => {
+    const start = source.indexOf("async function answerNativeExitRequest()");
+    const end = source.indexOf("\n  }\n", start);
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, end);
+    const returns = body.match(/return;/g) ?? [];
+    const cancelled = body.match(/cancelNativeExitRequest\(\);\s*return;/g) ?? [];
+    // The one return that answers nothing is the repeat of an open request.
+    expect(body).toContain("if (exitRequestPending) return;");
+    expect(cancelled.length).toBe(returns.length - 1);
+    expect(cancelled.length).toBeGreaterThanOrEqual(5);
+    expect(body).toContain("cancelNativeExitRequest();\n      diagnostics.error(\"desktop:exit\"");
+
+    // The acknowledgement goes out before the confirmation can await anything.
+    const listener = source.slice(source.indexOf('listen<void>("gitpulse-exit-requested"'));
+    expect(listener.indexOf('answer: "seen"')).toBeGreaterThan(-1);
+    expect(listener.indexOf('answer: "seen"')).toBeLessThan(listener.indexOf("answerNativeExitRequest()"));
   });
 
   it("owns boot unlistens through createListenerTracker, not an inline array", () => {
@@ -283,7 +308,7 @@ describe("App overlay wiring", () => {
   it("forwards repoStore.error without tracking the diagnostics/toast/setError writes", () => {
     const { script } = scriptAndTemplate(source);
     expect(script).toMatch(/import\s*\{[^}]*\buntrack\b[^}]*\}\s*from\s*"svelte"/);
-    const start = script.indexOf("const err = $repoStore.error");
+    const start = script.indexOf("const err = repoError;");
     expect(start).toBeGreaterThan(-1);
     const effect = script.slice(script.lastIndexOf("$effect", start), start + 280);
     expect(effect).toContain("untrack(() => {");
@@ -294,13 +319,12 @@ describe("App overlay wiring", () => {
 
   it("catches up the harness journal only on a genuine repository path change", () => {
     const { script } = scriptAndTemplate(source);
-    const start = script.indexOf("let lastCaughtUpPath");
+    // Keyed on the canonical path store and a derived trust flag, both
+    // compared by value, so a status poll does not re-run it.
+    expect(script).toContain("const trustRequired = $derived($repoStore.trustRequired);");
+    const start = script.indexOf("const path = $currentRepoPath;\n    if (trustRequired) return;");
     expect(start).toBeGreaterThan(-1);
-    const effect = script.slice(start, start + 900);
-    expect(effect).toContain("if (path === lastCaughtUpPath) return");
-    expect(effect.indexOf("if (path === lastCaughtUpPath) return")).toBeLessThan(
-      effect.indexOf("harnessStore.activateRepository"),
-    );
+    const effect = script.slice(start, start + 400);
     expect(effect).toContain("untrack(() => {");
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(
       effect.indexOf("harnessStore.activateRepository"),
@@ -382,6 +406,19 @@ describe("App display preferences", () => {
     expect(source, `${name} is imported but never called from the store`).toContain(call);
   });
 
+  it("re-applies the UI scale only when the scale itself changes", () => {
+    // interfaceStore publishes a fresh object per preference write; reading
+    // `$interfaceStore.uiFontScale` inside the effect re-ran the webview
+    // setZoom IPC on every unrelated emission.
+    const { script } = scriptAndTemplate(source);
+    expect(script).toContain("const uiFontScale = $derived($interfaceStore.uiFontScale);");
+    const call = script.indexOf("applyUiScale(scale");
+    expect(call).toBeGreaterThan(-1);
+    const effect = script.slice(script.lastIndexOf("$effect(() => {", call), call);
+    expect(effect).toContain("const scale = uiFontScale;");
+    expect(effect).not.toContain("$interfaceStore");
+  });
+
   it("re-applies the accent when the resolved theme flips", () => {
     // Each accent is a light/dark pair; keying only on the choice would leave
     // the dark shade painted on a light window.
@@ -389,5 +426,31 @@ describe("App display preferences", () => {
     const call = script.indexOf("applyAccent($interfaceStore.accent");
     expect(call).toBeGreaterThan(-1);
     expect(script.slice(call)).toContain("$themeStore");
+  });
+});
+
+/**
+ * The title-bar row is `min-w-full w-max`, so everything in it counts toward
+ * the scroller's width. A drag spacer with a minimum width, or padding after
+ * the last control, made the row wider than the header by that much while
+ * every control was in view: the overflow cue then sat on the right edge over
+ * empty space (at ~912-940px wide), and its chevron scrolled into nothing.
+ */
+describe("title-bar overflow", () => {
+  const start = source.indexOf("bind:this={headerScroller}");
+  const end = source.indexOf("<ScrollCue target={headerScroller}", start);
+  const region = source.slice(start, end);
+
+  it("is measured from the controls, not from empty space", () => {
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const row = /<div class="([^"]*min-w-full w-max[^"]*)"([^>]*)>/.exec(region);
+    expect(row).not.toBeNull();
+    // No padding after the last control...
+    expect(row![1]).not.toMatch(/(^|\s)(px|pr|pe)-/);
+    // ...and no spacer element after it either; the row itself is the drag
+    // region, which a bare attribute limits to direct hits on the row.
+    expect(row![2]).toMatch(/\sdata-tauri-drag-region(\s|$)/);
+    expect(region.match(/data-tauri-drag-region/g)).toHaveLength(1);
   });
 });

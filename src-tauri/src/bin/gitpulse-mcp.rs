@@ -88,9 +88,13 @@ struct Wire {
 
 impl Wire {
     fn new() -> Self {
+        Self::to(io::stdout())
+    }
+
+    fn to(writer: impl io::Write + Send + 'static) -> Self {
         Self {
             out: gitpulse_lib::output::BoundedOutput::new(
-                io::stdout(),
+                writer,
                 "gitpulse-mcp-stdout",
                 MAX_FRAME_BYTES,
                 Duration::from_secs(1),
@@ -199,7 +203,7 @@ impl Watchlist {
 /// request arrives — so an idle server costs no wakeups and an overdue
 /// request is answered at its deadline rather than up to a tick late.
 fn spawn_watchdog(watchlist: Arc<Watchlist>, wire: Arc<Wire>) {
-    std::thread::spawn(move || {
+    let _ = gitpulse_lib::supervisor::spawn_service("mcp-watchdog", move || {
         let Ok(mut queue) = watchlist.queue.lock() else {
             return;
         };
@@ -265,9 +269,33 @@ fn dispatch(
     in_flight: Arc<AtomicUsize>,
     budget: Duration,
 ) {
+    dispatch_with(
+        |work| {
+            gitpulse_lib::supervisor::spawn_once("mcp-request", "mcp request worker", work)
+                .map(drop)
+        },
+        ready,
+        wire,
+        watchlist,
+        in_flight,
+        budget,
+    );
+}
+
+/// [`dispatch`], with the thread start passed in so a failed start — the
+/// process is out of threads — can be exercised.
+fn dispatch_with(
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ready: Ready,
+    wire: Arc<Wire>,
+    watchlist: Arc<Watchlist>,
+    in_flight: Arc<AtomicUsize>,
+    budget: Duration,
+) {
     let answered = Arc::new(AtomicBool::new(false));
     let timeout_response = ready.timed_out(budget);
     let panicked = ready.panicked();
+    let unstarted = ready.unstarted();
     if !watchlist.push(Pending {
         deadline: Instant::now() + budget,
         answered: Arc::clone(&answered),
@@ -280,34 +308,35 @@ fn dispatch(
 
     let worker_answered = Arc::clone(&answered);
     let worker_in_flight = Arc::clone(&in_flight);
-    let spawned = std::thread::Builder::new()
-        .name("mcp-request".into())
-        .spawn(move || {
-            // Without this a panic anywhere under a tool call takes the whole
-            // process with it, and the client sees a dead server rather than a
-            // failed call. `install_panic_hook` only logs; it does not unwind.
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mcp::run(ready)));
-            let response = match outcome {
-                Ok(response) => response,
-                Err(_) => panicked,
-            };
-            if worker_answered
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                wire.send(&response);
-            }
-            worker_in_flight.fetch_sub(1, Ordering::AcqRel);
-        });
+    let worker_wire = Arc::clone(&wire);
+    let spawned = spawn(Box::new(move || {
+        // Without this a panic anywhere under a tool call takes the whole
+        // process with it, and the client sees a dead server rather than a
+        // failed call. `install_panic_hook` only logs; it does not unwind.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mcp::run(ready)));
+        let response = match outcome {
+            Ok(response) => response,
+            Err(_) => panicked,
+        };
+        if worker_answered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            worker_wire.send(&response);
+        }
+        worker_in_flight.fetch_sub(1, Ordering::AcqRel);
+    }));
 
-    if spawned.is_err() {
-        // Out of threads. Say so rather than dropping the request silently.
+    if let Err(error) = spawned {
+        // Out of threads. The closure that held the request's answers is gone
+        // with the failed spawn, and the watchdog skips an answered entry, so
+        // the reply must be sent here or the client waits for nothing.
         if answered
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            log::error!(target: "mcp", "could not spawn a worker thread");
+            log::error!(target: "mcp", "could not spawn a worker thread: {error}");
+            let _ = wire.send(&unstarted);
         }
         in_flight.fetch_sub(1, Ordering::AcqRel);
     }
@@ -387,9 +416,10 @@ impl HostInput {
         if let Ok(mut wake) = wire.input_wake.lock() {
             *wake = Some(sender.clone());
         }
-        std::thread::Builder::new()
-            .name("gitpulse-mcp-stdin".into())
-            .spawn(move || {
+        gitpulse_lib::supervisor::spawn_once(
+            "gitpulse-mcp-stdin",
+            "mcp stdin reader",
+            move || {
                 // `Wire` keeps a sender clone to wake the reader, so the
                 // channel cannot report this worker's death by disconnecting.
                 // Whatever ends the loop — EOF, an error, a panic — the reader
@@ -430,7 +460,8 @@ impl HostInput {
                         break;
                     }
                 }
-            })?;
+            },
+        )?;
         Ok(Self {
             receiver,
             buffered: io::Cursor::new(Vec::new()),
@@ -736,4 +767,65 @@ fn main() {
         log::warn!(target: "shutdown", "{}", sweep.describe());
     }
     gitpulse_lib::procguard::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer the test can read back after the wire's worker wrote to it.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_request_whose_thread_cannot_start_is_still_answered_once() {
+        let request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/list"
+        }))
+        .unwrap();
+        let Accepted::Ready(ready) = mcp::accept(request, &mut Era::Legacy) else {
+            panic!("a legacy tools/list is dispatched");
+        };
+        let captured = Captured::default();
+        let wire = Arc::new(Wire::to(captured.clone()));
+        let watchlist = Arc::new(Watchlist::default());
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        dispatch_with(
+            |_| Err(io::Error::other("no threads left")),
+            ready,
+            Arc::clone(&wire),
+            Arc::clone(&watchlist),
+            Arc::clone(&in_flight),
+            Duration::from_secs(30),
+        );
+
+        let start = Instant::now();
+        while captured.0.lock().unwrap().is_empty() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one answer, got {text:?}");
+        let answer: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(answer["id"], 7, "the answer names the request");
+        assert_eq!(answer["error"]["data"]["ran"], false, "{answer}");
+        assert_eq!(in_flight.load(Ordering::Acquire), 0, "the slot is released");
+        let queue = watchlist.queue.lock().unwrap();
+        assert!(
+            queue
+                .iter()
+                .all(|entry| entry.answered.load(Ordering::Acquire)),
+            "the watchdog must not answer it a second time"
+        );
+    }
 }

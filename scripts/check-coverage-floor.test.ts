@@ -155,6 +155,31 @@ describe("coverage floor contract", () => {
     expect(parsed.totals.branches).toEqual({ found: 2, hit: 1 });
   });
 
+  it("accepts a BRF that differs from the BRDA record count, as branch-mode llvm-cov emits", () => {
+    // Real output of `cargo llvm-cov --branch` (nightly-2026-10-05): 11 of 193
+    // records carry a BRF that is not the number of BRDA lines, in both
+    // directions (devmap/live.rs: BRF 107 with 108 BRDA; terminal/mod.rs: BRF
+    // 532 with 516). The producer counts branch regions per instantiation and
+    // writes BRDA per source position, so neither side is the corrupt one.
+    const more = [
+      "TN:",
+      "SF:src-tauri/src/example.rs",
+      "DA:1,1",
+      "BRF:1",
+      "BRH:1",
+      "BRDA:1,0,0,1",
+      "BRDA:1,0,1,0",
+      "LF:1",
+      "LH:1",
+      "end_of_record",
+    ].join("\n");
+    const fewer = more.replace("BRF:1\nBRH:1", "BRF:3\nBRH:2");
+    expect(parseLcov(more).totals.branches).toEqual({ found: 1, hit: 1 });
+    expect(parseLcov(fewer).totals.branches).toEqual({ found: 3, hit: 2 });
+    // The summary must still be internally possible.
+    expect(() => parseLcov(more.replace("BRH:1", "BRH:2"))).toThrow(/BRH cannot exceed BRF/);
+  });
+
   it("still rejects an execution count that is not a number at all", () => {
     // Relaxing the range must not relax the shape.
     for (const bad of ["abc", "-5", "1.5", ""]) {
@@ -217,5 +242,54 @@ describe("coverage floor contract", () => {
     const malformed = await runScript(["--root", root]);
     expect(malformed.code).toBe(2);
     expect(malformed.output).toMatch(/Frontend invalid:.*unterminated/);
+  });
+
+  it("reports Rust branch coverage when the LCOV has it, and says when it has none", async () => {
+    const root = await scratchRoot();
+    await writeFile(
+      path.join(root, "coverage", "lcov.info"),
+      report({ source: "src/frontend.ts", lineCounts: Array.from({ length: 10 }, () => 1), branchHits: [1, 1] }),
+    );
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [1, 0, 1, 1] }),
+    );
+    const withBranches = await runScript(["--root", root]);
+    expect(withBranches.code).toBe(0);
+    expect(withBranches.output).toMatch(/Rust branches 75\.00% \(3\/4\) \(not gated\)/);
+
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [] }),
+    );
+    const without = await runScript(["--root", root]);
+    expect(without.code).toBe(0);
+    expect(without.output).toMatch(/Rust branches unavailable \(the LCOV carries no branch data\) \(not gated\)/);
+  });
+
+  it("enforces a Rust branch floor only when one is asked for, and never passes a report with no branch data against it", async () => {
+    const root = await scratchRoot();
+    await writeFile(
+      path.join(root, "coverage", "lcov.info"),
+      report({ source: "src/frontend.ts", lineCounts: Array.from({ length: 10 }, () => 1), branchHits: [1, 1] }),
+    );
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [1, 0, 1, 1] }),
+    );
+    const met = await runScript(["--root", root, "--rust-branches", "70"]);
+    expect(met.code).toBe(0);
+    expect(met.output).toMatch(/Rust branches 75\.00% \(3\/4\) \(required >= 70\.00%\)/);
+
+    const missed = await runScript(["--root", root, "--rust-branches", "80"]);
+    expect(missed.code).toBe(1);
+    expect(missed.output).toMatch(/Rust branches 75\.00% is below required 80\.00%/);
+
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [] }),
+    );
+    const unmeasurable = await runScript(["--root", root, "--rust-branches", "10"]);
+    expect(unmeasurable.code).not.toBe(0);
   });
 });

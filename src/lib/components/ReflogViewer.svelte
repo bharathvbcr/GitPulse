@@ -9,7 +9,8 @@
 
 <script lang="ts">
   import type { ReflogEntry, ResetPreview } from "../branches/types";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import { GitBranchPlus, History, RotateCcw } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -119,32 +120,31 @@
     return () => inflight?.cancel();
   });
 
-  // Memoized on currentPath: the ~6s status poll and stats drains re-emit the
-  // store object, so an unguarded rerun would cancel and restart the reflog
-  // IPC on every emission.
-  let prevRepo: string | null = null;
+  // Keyed on the repository alone: the ~6s status poll and stats drains
+  // re-emit the store object, and a rerun per emission would cancel and
+  // restart the reflog IPC each time.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === prevRepo) return;
-    prevRepo = repo;
-    if (!repo) {
-      inflight?.cancel();
-      entries = [];
-      errorMsg = null;
-      loading = false;
-      return;
-    }
-    // Hydrate last-known entries synchronously so a revisit renders instantly
-    // and the refresh below updates the table in place.
-    const cached = reflogCache.get(repo);
-    if (cached) entries = cached;
-    void load();
-    const started = inflight;
-    return () => {
-      if (inflight === started) {
-        started?.cancel();
+    const repo = $currentRepoPath;
+    return untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        entries = [];
+        errorMsg = null;
+        loading = false;
+        return undefined;
       }
-    };
+      // Hydrate last-known entries synchronously so a revisit renders
+      // instantly and the refresh below updates the table in place.
+      const cached = reflogCache.get(repo);
+      if (cached) entries = cached;
+      void load();
+      const started = inflight;
+      return () => {
+        if (inflight === started) {
+          started?.cancel();
+        }
+      };
+    });
   });
 </script>
 

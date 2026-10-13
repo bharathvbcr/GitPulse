@@ -18,6 +18,7 @@ import {
   probeServer,
   resolveOnPath,
 } from "./check-mcp-install.mjs";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 const tempDirs: string[] = [];
 
@@ -43,7 +44,7 @@ async function fakeServer(prefix: string, body: string) {
   return file;
 }
 
-async function identityServer(prefix: string, schema: number) {
+async function identityServer(prefix: string, schema: number, extra: Record<string, unknown> = {}) {
   return fakeServer(prefix, `
     let input = "";
     process.stdin.on("data", chunk => {
@@ -55,7 +56,7 @@ async function identityServer(prefix: string, schema: number) {
         if (request.id === 1) {
           process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "fake", version: "1.2.3" } } }) + "\\n");
         } else if (request.id === 2 && request.method === "resources/read") {
-          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType: "application/json", text: JSON.stringify({ storeSchemaVersion: ${schema} }) }] } }) + "\\n");
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType: "application/json", text: JSON.stringify({ storeSchemaVersion: ${schema}, ...${JSON.stringify(extra)} }) }] } }) + "\\n");
         }
       }
     });
@@ -169,12 +170,12 @@ describe("classify", () => {
 });
 
 describe("parseServerManifest", () => {
-  function response(schema: unknown, mimeType = "application/json", id = 2) {
-    return JSON.stringify({ jsonrpc: "2.0", id, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType, text: JSON.stringify({ storeSchemaVersion: schema }) }] } });
+  function response(schema: unknown, mimeType = "application/json", id = 2, extra: Record<string, unknown> = {}) {
+    return JSON.stringify({ jsonrpc: "2.0", id, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType, text: JSON.stringify({ storeSchemaVersion: schema, ...extra }) }] } });
   }
 
   it("requires the requested resource and response id", () => {
-    expect(parseServerManifest(response(20), 2)).toEqual({ storeSchema: 20, error: null });
+    expect(parseServerManifest(response(20), 2)).toEqual({ storeSchema: 20, dcStoreSchema: null, workbenchSchema: null, error: null });
     expect(parseServerManifest(response(20, "application/json", 3), 2)).toBeNull();
     expect(parseServerManifest(response(20).replace("server/manifest", "server/health"), 2)?.storeSchema).toBeNull();
   });
@@ -183,6 +184,16 @@ describe("parseServerManifest", () => {
     const result = parseServerManifest(response(schema), 2);
     expect(result?.storeSchema).toBeNull();
     expect(result?.error).toBeTruthy();
+  });
+
+  it("reads the dc-store and workbench schemas a newer server declares", () => {
+    const declared = response(27, "application/json", 2, { dcStoreSchemaVersion: 9, workbenchSchemaVersion: 13 });
+    expect(parseServerManifest(declared, 2)).toEqual({ storeSchema: 27, dcStoreSchema: 9, workbenchSchema: 13, error: null });
+  });
+
+  it("reports an older server's missing or invalid dc-store schemas as unknown, never as a number", () => {
+    const invalid = response(27, "application/json", 2, { dcStoreSchemaVersion: 0, workbenchSchemaVersion: "13" });
+    expect(parseServerManifest(invalid, 2)).toEqual({ storeSchema: 27, dcStoreSchema: null, workbenchSchema: null, error: null });
   });
 
   it("distinguishes missing replies, failed replies, and truncated content", () => {
@@ -203,14 +214,14 @@ const onPosix = it.runIf(process.platform !== "win32");
 
 describe("probeServer", () => {
   onPosix("reads version and schema through the handshake and manifest", async () => {
-    const server = await identityServer("ok", 20);
+    const server = await identityServer("ok", 20, { dcStoreSchemaVersion: 9, workbenchSchemaVersion: 13 });
     const result = await probeServer(server, 8000);
-    expect(result).toEqual({ version: "1.2.3", storeSchema: 20, error: null });
+    expect(result).toEqual({ version: "1.2.3", storeSchema: 20, dcStoreSchema: 9, workbenchSchema: 13, error: null });
   });
 
   onPosix("observes an older schema instead of inferring it from the version", async () => {
     const result = await probeServer(await identityServer("older", 19), 8000);
-    expect(result).toEqual({ version: "1.2.3", storeSchema: 19, error: null });
+    expect(result).toEqual({ version: "1.2.3", storeSchema: 19, dcStoreSchema: null, workbenchSchema: null, error: null });
   });
 
   onPosix("bounds a server that floods stdout without a response", async () => {
@@ -407,7 +418,7 @@ describe("probeHook", () => {
     const started = Date.now();
     const result = await probeHook(file, 400);
     expect(result.error).toContain("within 400ms");
-    expect(Date.now() - started).toBeLessThan(5000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(5000));
   });
 });
 

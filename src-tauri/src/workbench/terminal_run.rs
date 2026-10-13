@@ -37,12 +37,7 @@ pub(super) fn parse(input: &str) -> Result<Launch, WorkbenchError> {
     }
     let launch: Launch = serde_json::from_str(input)
         .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
-    if launch.id.is_empty()
-        || launch.id.len() > 128
-        || !launch
-            .id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if !super::is_record_id(&launch.id)
         || launch.expected_revision != terminal_launch::PREPARED_REVISION
         || launch.rows == 0
         || launch.rows > 1000
@@ -425,7 +420,7 @@ mod tests {
         let waited = Instant::now();
         while !output.lock().unwrap().contains(&expected) {
             assert!(
-                waited.elapsed() < Duration::from_secs(30),
+                waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
                 "the agent did not start in {}: {}",
                 canonical.display(),
                 output.lock().unwrap()
@@ -468,7 +463,8 @@ mod tests {
             let parked = Instant::now();
             while state.0.terminal_launches.waiting() == 0 {
                 assert!(
-                    parked.elapsed() < Duration::from_secs(10),
+                    parked.elapsed()
+                        < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
                     "the second launch never waited"
                 );
                 std::thread::sleep(Duration::from_millis(5));
@@ -574,7 +570,7 @@ mod tests {
                 break std::fs::read_to_string(path).unwrap();
             }
             assert!(
-                waited.elapsed() < Duration::from_secs(30),
+                waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
                 "the launch prompt never named the brief"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -605,7 +601,7 @@ mod tests {
         // nothing. The pid came from this test's own child moments ago.
         while unsafe { libc::kill(pid, 0) } == 0 {
             assert!(
-                waited.elapsed() < Duration::from_secs(120),
+                waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(120)),
                 "the pty child never exited after being told to finish"
             );
             std::thread::sleep(Duration::from_millis(20));

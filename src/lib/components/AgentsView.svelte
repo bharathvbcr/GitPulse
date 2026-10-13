@@ -18,9 +18,11 @@
    */
   import { get } from "svelte/store";
   import { Bot, CircleAlert, FolderOpen, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { sessionActivity } from "../terminal/sessionActivity";
@@ -53,7 +55,6 @@
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const board = createBoardAgents();
   let now = $state(Date.now());
-  let sweepKey = "";
   /** Registered repositories, so a task names its repository and not its cwd. */
   const registered = createRegisteredRepositories();
   const registeredStatus = registered.status;
@@ -189,26 +190,30 @@
   $effect(() => {
     if (!showing) return;
     board.start();
-    const timer = setInterval(() => {
+    // The "x ago" clock stops while the window is hidden and catches up when
+    // it returns, rather than waking the renderer every second behind it.
+    const stopClock = createAdaptiveTimer(() => {
       now = Date.now();
     }, 1000);
     return () => {
-      clearInterval(timer);
+      stopClock();
       board.stop();
     };
   });
 
+  // The tab set as a value: repoStore rebuilds openTabs on every publish, so
+  // the sweep depends on this key and reads the tabs themselves untracked.
+  const openTabs = $derived($repoStore.openTabs);
+  const sweepTabsKey = $derived(
+    openTabs.map((tab) => `${tab.path}\0${tab.label}\0${tab.family ?? ""}\0${tab.familyRoot ?? ""}`).join("\n"),
+  );
   $effect(() => {
     const open = showing;
-    const key = $repoStore.openTabs.map((tab) => `${tab.path}\0${tab.label}\0${tab.family ?? ""}\0${tab.familyRoot ?? ""}`).join("\n");
-    if (!open) {
-      sweepKey = "";
-      agentPlaneStore.cancel();
-      return;
-    }
-    if (key === sweepKey) return;
-    sweepKey = key;
-    void agentPlaneStore.refresh(sweepTargets($repoStore.openTabs));
+    void sweepTabsKey;
+    untrack(() => {
+      if (!open) agentPlaneStore.cancel();
+      else void agentPlaneStore.refresh(sweepTargets(openTabs));
+    });
   });
 
   $effect(() => {

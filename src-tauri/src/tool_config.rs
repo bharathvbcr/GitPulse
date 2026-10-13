@@ -11,23 +11,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const TOOL_CONFIG_ENV: &str = "GITPULSE_TOOL_CONFIG";
-
-#[cfg(test)]
-static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Serialize tests that mutate [`TOOL_CONFIG_ENV`].
-#[cfg(test)]
-pub(crate) fn lock_config_env() -> std::sync::MutexGuard<'static, ()> {
-    CONFIG_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 fn is_false(v: &bool) -> bool {
     !*v
@@ -500,6 +488,52 @@ where
     }))
 }
 
+/// The host-load sensor's kill switch (`host_load.enabled`).
+///
+/// On unless the user turns it off. The sampler publishes the value in every
+/// snapshot it writes, so hooks and other GitPulse processes learn it from
+/// `host-load.v1` without ever reading this file, and a flip reaches them on
+/// the next tick. Off still publishes — a heartbeat with no readings — so
+/// "switched off" never reads as "no sampler".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostLoadSettings {
+    #[serde(default = "host_load_enabled_default")]
+    pub enabled: bool,
+}
+
+fn host_load_enabled_default() -> bool {
+    true
+}
+
+impl Default for HostLoadSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl HostLoadSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Read leniently, like `lappi`: a malformed block keeps the default (on)
+/// and says so, rather than costing every other setting in the file.
+fn lenient_host_load<'de, D>(deserializer: D) -> Result<HostLoadSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable host_load block, the sensor stays on: {error}"
+        );
+        HostLoadSettings::default()
+    }))
+}
+
 /// Whether merging an agent attempt's commits needs a recorded review
 /// (`docs/AGENT_OUTPUT_REVIEW.md`): a host-wide default, and a per-repository
 /// override keyed by the repository's canonical common Git directory, so every
@@ -561,6 +595,38 @@ where
     )
 }
 
+/// Which repositories have turned on posting a verification result to GitHub
+/// as a commit status, keyed by the canonical common Git directory like
+/// [`ReviewGateSettings`]. Off for every repository until the person turns it
+/// on, and a block this cannot read is read as off: posting is the side that
+/// writes to someone else's service, so an unreadable setting never enables it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyStatusSettings {
+    #[serde(default)]
+    pub repositories: std::collections::BTreeSet<String>,
+}
+
+impl VerifyStatusSettings {
+    pub fn is_default(&self) -> bool {
+        self.repositories.is_empty()
+    }
+}
+
+fn lenient_verify_status<'de, D>(deserializer: D) -> Result<VerifyStatusSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable verify_status block, posting stays off everywhere: {error}"
+        );
+        VerifyStatusSettings::default()
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolConfig {
     pub version: u32,
@@ -607,6 +673,20 @@ pub struct ToolConfig {
         skip_serializing_if = "ReviewGateSettings::is_default"
     )]
     pub review_gate: ReviewGateSettings,
+    /// Repositories that post verification results to GitHub. Off by default.
+    #[serde(
+        default,
+        deserialize_with = "lenient_verify_status",
+        skip_serializing_if = "VerifyStatusSettings::is_default"
+    )]
+    pub verify_status: VerifyStatusSettings,
+    /// The host-load sensor's kill switch.
+    #[serde(
+        default,
+        deserialize_with = "lenient_host_load",
+        skip_serializing_if = "HostLoadSettings::is_default"
+    )]
+    pub host_load: HostLoadSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -626,6 +706,8 @@ impl Default for ToolConfig {
             agent_launch: StoredAgentLaunch::default(),
             lappi: LappiSettings::default(),
             review_gate: ReviewGateSettings::default(),
+            verify_status: VerifyStatusSettings::default(),
+            host_load: HostLoadSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -657,9 +739,66 @@ pub struct ToolConfigView {
     pub stale: Vec<StalePath>,
 }
 
-fn cache() -> &'static Mutex<Option<(PathBuf, ToolConfig)>> {
-    static CACHE: OnceLock<Mutex<Option<(PathBuf, ToolConfig)>>> = OnceLock::new();
+/// What the cached copy was read from: path plus the file's modification time
+/// and length (`None` when the file did not exist), so a hand edit or another
+/// process's save is noticed on the next [`load`] instead of being overwritten
+/// by a stale in-memory copy.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn cache() -> &'static Mutex<Option<(PathBuf, Stamp, ToolConfig)>> {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, Stamp, ToolConfig)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Serializes in-process writers; [`FileLock`] serializes processes.
+fn writer() -> &'static Mutex<()> {
+    static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
+    WRITER.get_or_init(|| Mutex::new(()))
+}
+
+fn stamp_of(path: &Path) -> Stamp {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+}
+
+/// How long a writer waits for another process's save before giving up.
+const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Exclusive advisory lock on `tools.json.lock`, released on drop.
+struct FileLock(File);
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let lock_path = path.with_extension("json.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("failed to open {}: {e}", lock_path.display()))?;
+        let deadline = std::time::Instant::now() + WRITE_LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "tools.json is being written by another process ({}): {e}",
+                        lock_path.display()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Where the platform keeps application support / config for GitPulse.
@@ -741,29 +880,37 @@ fn parse_config(text: &str) -> Result<ToolConfig, String> {
     Ok(cfg)
 }
 
+fn read_disk(path: &Path) -> Result<ToolConfig, String> {
+    if path.is_file() {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        parse_config(&text)
+    } else {
+        Ok(ToolConfig::default())
+    }
+}
+
 /// Load the config from disk (or default). Does not refuse on missing file.
+///
+/// The in-process copy is reused only while the file still has the stamp it
+/// was read at; any outside change is picked up.
 pub fn load() -> Result<ToolConfig, String> {
     let path = config_path()?;
+    let stamp = stamp_of(&path);
     {
         let guard = cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((cached_path, cfg)) = guard.as_ref() {
-            if *cached_path == path {
+        if let Some((cached_path, cached_stamp, cfg)) = guard.as_ref() {
+            if *cached_path == path && *cached_stamp == stamp {
                 return Ok(cfg.clone());
             }
         }
     }
-    let cfg = if path.is_file() {
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        parse_config(&text)?
-    } else {
-        ToolConfig::default()
-    };
+    let cfg = read_disk(&path)?;
     *cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, cfg.clone()));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, stamp, cfg.clone()));
     Ok(cfg)
 }
 
@@ -774,9 +921,58 @@ pub fn invalidate_cache() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
-/// Atomic write: sibling temp, `sync_all`, rename.
-pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
-    let path = config_path()?;
+/// Executable locations `next` points at that `current` did not: a tool
+/// binary or a source checkout GitPulse would build and run code from.
+///
+/// An empty string is a clear, not a new location. A load failure upstream
+/// passes the default config here, which makes every set path count as new:
+/// when the prior state cannot be read, the user is asked rather than assumed.
+pub fn new_executable_paths(current: &ToolConfig, next: &ToolConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for (tool, before, after) in [
+        ("devmap", &current.devmap, &next.devmap),
+        ("manvi", &current.manvi, &next.manvi),
+    ] {
+        for (label, old, new) in [
+            ("binary", &before.binary, &after.binary),
+            ("source root", &before.source_root, &after.source_root),
+        ] {
+            if let Some(new) = new.as_deref().filter(|p| !p.trim().is_empty()) {
+                if old.as_deref() != Some(new) {
+                    out.push(format!("{tool} {label}: {new}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`save`] for a request that came from the webview. Pointing a tool at a
+/// new binary or source root makes GitPulse run that code, so each new
+/// location is confirmed by `confirm` (the OS dialog in production) before
+/// anything is written; a refusal writes nothing.
+pub fn save_confirmed(
+    config: &ToolConfig,
+    confirm: &dyn Fn(&str, &str) -> bool,
+) -> Result<PathBuf, String> {
+    let current = load().unwrap_or_default();
+    let changes = new_executable_paths(&current, config);
+    if !changes.is_empty() {
+        let message = format!(
+            "GitPulse will run programs from these locations:\n\n{}\n\nOnly continue if you chose them.",
+            changes.join("\n")
+        );
+        if !confirm("Change which programs GitPulse runs?", &message) {
+            return Err("Tool locations were not changed: the change was not confirmed".into());
+        }
+    }
+    save(config)
+}
+
+/// Atomically publishes `config` (`devmap_query::write_atomic`: unique
+/// sibling temp, rename) and refreshes the cache. Callers hold the writer and
+/// file locks.
+fn write_locked(path: &Path, config: &ToolConfig) -> Result<ToolConfig, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -785,27 +981,48 @@ pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
     to_write.version = CONFIG_VERSION;
     let body = serde_json::to_string_pretty(&to_write)
         .map_err(|e| format!("failed to serialise tools.json: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file =
-            File::create(&tmp).map_err(|e| format!("failed to create {}: {e}", tmp.display()))?;
-        file.write_all(body.as_bytes())
-            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
-        file.sync_all()
-            .map_err(|e| format!("failed to sync {}: {e}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!(
-            "failed to rename {} → {}: {e}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
+    devmap_query::write_atomic(path, body.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     *cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path.clone(), to_write));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((path.to_path_buf(), stamp_of(path), to_write.clone()));
     crate::tool_capability::invalidate_all();
+    Ok(to_write)
+}
+
+/// Read-modify-write under the writer lock and the file lock, starting from
+/// what is on disk now (never the cache), so concurrent updates of different
+/// fields do not lose each other and a hand edit is not overwritten by a
+/// stale copy. `edit` failing writes nothing.
+pub fn update<T>(edit: impl FnOnce(&mut ToolConfig) -> Result<T, String>) -> Result<T, String> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let _in_process = writer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cross_process = FileLock::acquire(&path)?;
+    let mut cfg = read_disk(&path)?;
+    let out = edit(&mut cfg)?;
+    write_locked(&path, &cfg)?;
+    Ok(out)
+}
+
+/// Replaces the whole config under the same locks as [`update`].
+pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let _in_process = writer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cross_process = FileLock::acquire(&path)?;
+    write_locked(&path, config)?;
     Ok(path)
 }
 
@@ -920,31 +1137,31 @@ pub fn saved_source_root(tool: crate::tool_install::ExternalTool) -> Option<Path
 
 /// Persist a binary path after a successful install.
 pub fn set_binary(tool: crate::tool_install::ExternalTool, binary: &str) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => {
-            cfg.devmap.binary = Some(binary.to_string());
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => {
+                cfg.devmap.binary = Some(binary.to_string());
+            }
+            crate::tool_install::ExternalTool::Manvi => {
+                cfg.manvi.binary = Some(binary.to_string());
+            }
         }
-        crate::tool_install::ExternalTool::Manvi => {
-            cfg.manvi.binary = Some(binary.to_string());
-        }
-    }
-    save(&cfg)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn set_source_root(tool: crate::tool_install::ExternalTool, root: &str) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => {
-            cfg.devmap.source_root = Some(root.to_string());
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => {
+                cfg.devmap.source_root = Some(root.to_string());
+            }
+            crate::tool_install::ExternalTool::Manvi => {
+                cfg.manvi.source_root = Some(root.to_string());
+            }
         }
-        crate::tool_install::ExternalTool::Manvi => {
-            cfg.manvi.source_root = Some(root.to_string());
-        }
-    }
-    save(&cfg)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The session-notification preferences, or the defaults when `tools.json`
@@ -1057,30 +1274,30 @@ pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
         Some(sources) => canonical_setting_sources(sources)?,
         None => None,
     };
-    let mut cfg = load()?;
-    cfg.agent_defaults = StoredAgentPermissions {
-        permission: next.permission,
-    };
-    cfg.agent_launch = StoredAgentLaunch {
-        max_live_runs: next.max_live_runs,
-        claude_setting_sources: sources,
-        max_terminal_sessions: next.max_terminal_sessions,
-        models: next
-            .models
-            .into_iter()
-            .filter(|(_, choice)| !choice.is_empty())
-            .collect(),
-    };
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.agent_defaults = StoredAgentPermissions {
+            permission: next.permission,
+        };
+        cfg.agent_launch = StoredAgentLaunch {
+            max_live_runs: next.max_live_runs,
+            claude_setting_sources: sources,
+            max_terminal_sessions: next.max_terminal_sessions,
+            models: next
+                .models
+                .into_iter()
+                .filter(|(_, choice)| !choice.is_empty())
+                .collect(),
+        };
+        Ok(())
+    })
 }
 
 pub fn set_session_alerts(next: SessionAlertSettings) -> Result<(), String> {
     next.validate()?;
-    let mut cfg = load()?;
-    cfg.session_alerts = next;
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.session_alerts = next;
+        Ok(())
+    })
 }
 
 /// The stored Lappi switches, or both off.
@@ -1121,48 +1338,85 @@ pub fn review_gate_settings() -> Result<ReviewGateSettings, String> {
 /// Sets the host-wide default (`common_dir: None`), or one repository's
 /// override; `enabled: None` clears that override so the default applies.
 pub fn set_review_gate(common_dir: Option<&str>, enabled: Option<bool>) -> Result<(), String> {
+    update(|cfg| {
+        if cfg.review_gate.unreadable {
+            return Err(
+                "the review_gate block in tools.json could not be read; fix or remove it first"
+                    .into(),
+            );
+        }
+        match (common_dir, enabled) {
+            (None, Some(on)) => cfg.review_gate.default_on = on,
+            (None, None) => cfg.review_gate.default_on = false,
+            (Some(dir), Some(on)) => {
+                cfg.review_gate.repositories.insert(dir.to_string(), on);
+            }
+            (Some(dir), None) => {
+                cfg.review_gate.repositories.remove(dir);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Whether the repository whose canonical common Git directory is `common_dir`
+/// has opted in to posting verification results to GitHub.
+pub fn verify_status_enabled(common_dir: &str) -> Result<bool, String> {
+    Ok(load()?.verify_status.repositories.contains(common_dir))
+}
+
+/// Opts one repository in or out of posting verification results.
+pub fn set_verify_status(common_dir: &str, enabled: bool) -> Result<(), String> {
     let mut cfg = load()?;
-    if cfg.review_gate.unreadable {
-        return Err(
-            "the review_gate block in tools.json could not be read; fix or remove it first".into(),
-        );
+    if enabled {
+        cfg.verify_status
+            .repositories
+            .insert(common_dir.to_string());
+    } else {
+        cfg.verify_status.repositories.remove(common_dir);
     }
-    match (common_dir, enabled) {
-        (None, Some(on)) => cfg.review_gate.default_on = on,
-        (None, None) => cfg.review_gate.default_on = false,
-        (Some(dir), Some(on)) => {
-            cfg.review_gate.repositories.insert(dir.to_string(), on);
-        }
-        (Some(dir), None) => {
-            cfg.review_gate.repositories.remove(dir);
-        }
-    }
+    save(&cfg)?;
+    Ok(())
+}
+
+/// The stored host-load switch, or the default (on).
+///
+/// An unreadable file is "on": the sensor only measures and publishes, and a
+/// broken config must not be what silently blinds every consumer of it. The
+/// read error is surfaced through [`view`].
+pub fn host_load_settings() -> HostLoadSettings {
+    load().map(|cfg| cfg.host_load).unwrap_or_default()
+}
+
+pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
+    let mut cfg = load()?;
+    cfg.host_load = next;
     save(&cfg)?;
     Ok(())
 }
 
 pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
-    let mut cfg = load()?;
-    cfg.lappi = next;
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.lappi = next;
+        Ok(())
+    })
 }
 
 pub fn set_onboarding(state: OnboardingState) -> Result<(), String> {
-    let mut cfg = load()?;
-    cfg.onboarding = state;
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.onboarding = state;
+        Ok(())
+    })
 }
 
 pub fn clear_binary(tool: crate::tool_install::ExternalTool) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => cfg.devmap.binary = None,
-        crate::tool_install::ExternalTool::Manvi => cfg.manvi.binary = None,
-    }
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => cfg.devmap.binary = None,
+            crate::tool_install::ExternalTool::Manvi => cfg.manvi.binary = None,
+        }
+        Ok(())
+    })
 }
 
 pub fn is_disabled(tool: crate::tool_install::ExternalTool) -> bool {
@@ -1176,13 +1430,13 @@ pub fn is_disabled(tool: crate::tool_install::ExternalTool) -> bool {
 }
 
 pub fn set_disabled(tool: crate::tool_install::ExternalTool, disabled: bool) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => cfg.devmap.disabled = disabled,
-        crate::tool_install::ExternalTool::Manvi => cfg.manvi.disabled = disabled,
-    }
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => cfg.devmap.disabled = disabled,
+            crate::tool_install::ExternalTool::Manvi => cfg.manvi.disabled = disabled,
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1190,7 +1444,7 @@ mod tests {
     use super::*;
 
     fn with_temp_config(f: impl FnOnce(&Path)) {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tools.json");
         // Dropped before `dir`, so the variable stops naming the temporary
@@ -1206,6 +1460,69 @@ mod tests {
     fn write_raw(path: &Path, json: &str) {
         fs::write(path, json).unwrap();
         invalidate_cache();
+    }
+
+    /// A webview can call the save command directly, so a new binary path or
+    /// source root is only written after the native confirmation says yes.
+    #[test]
+    fn saving_a_new_binary_or_source_root_needs_confirmation() {
+        with_temp_config(|_| {
+            let mut next = ToolConfig::default();
+            next.devmap.binary = Some("/tmp/evil/devmap".into());
+            next.manvi.source_root = Some("/tmp/evil/manvi".into());
+
+            let asked = std::cell::RefCell::new(String::new());
+            let refused = save_confirmed(&next, &|_, body| {
+                *asked.borrow_mut() = body.to_string();
+                false
+            })
+            .expect_err("a declined confirmation must refuse");
+            assert!(refused.contains("not confirmed"), "{refused}");
+            assert!(
+                asked.borrow().contains("/tmp/evil/devmap"),
+                "{}",
+                asked.borrow()
+            );
+            assert!(
+                asked.borrow().contains("/tmp/evil/manvi"),
+                "{}",
+                asked.borrow()
+            );
+            assert_eq!(load().unwrap().devmap.binary, None);
+
+            save_confirmed(&next, &|_, _| true).expect("confirmed");
+            assert_eq!(
+                load().unwrap().devmap.binary.as_deref(),
+                Some("/tmp/evil/devmap")
+            );
+            // Resaving the same paths, or changing something else, asks nothing.
+            next.onboarding = OnboardingState::default();
+            save_confirmed(&next, &|_, _| panic!("unchanged paths must not prompt"))
+                .expect("unchanged");
+            // Clearing a path is not a new location.
+            next.devmap.binary = Some(String::new());
+            save_confirmed(&next, &|_, _| panic!("clearing must not prompt")).expect("clear");
+        });
+    }
+
+    #[test]
+    fn verify_status_posting_is_off_until_a_repository_opts_in_and_an_unreadable_block_is_off() {
+        with_temp_config(|path| {
+            assert!(!verify_status_enabled("/a/.git").unwrap());
+            set_verify_status("/a/.git", true).unwrap();
+            assert!(verify_status_enabled("/a/.git").unwrap());
+            assert!(!verify_status_enabled("/b/.git").unwrap(), "per repository");
+            set_verify_status("/a/.git", false).unwrap();
+            assert!(!verify_status_enabled("/a/.git").unwrap());
+            write_raw(
+                path,
+                r#"{"version":1,"verify_status":{"repositories":"not a list"}}"#,
+            );
+            assert!(
+                !verify_status_enabled("/a/.git").unwrap(),
+                "a block that cannot be read never enables posting"
+            );
+        });
     }
 
     #[test]
@@ -1249,6 +1566,39 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(stored["review_gate"]["default_on"], "yes please");
             assert!(review_gate_enabled("/repo/.git").is_err());
+        });
+    }
+
+    /// The host-load kill switch is on until turned off, is written only
+    /// when it differs from that, and a malformed block degrades to on
+    /// without costing the file's other settings.
+    #[test]
+    fn the_host_load_switch_is_on_by_default_and_survives_a_malformed_block() {
+        with_temp_config(|path| {
+            assert!(host_load_settings().enabled, "on by default");
+            set_host_load_settings(HostLoadSettings { enabled: false }).unwrap();
+            invalidate_cache();
+            assert!(!host_load_settings().enabled);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load"]["enabled"], false);
+            set_host_load_settings(HostLoadSettings::default()).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored.get("host_load").is_none(),
+                "the default is not written"
+            );
+
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load":{"enabled":"nope"}}"#,
+            );
+            assert!(host_load_settings().enabled);
+            assert_eq!(
+                load().map(|c| c.devmap.binary).unwrap_or_default(),
+                Some("/tmp/fake".to_owned())
+            );
         });
     }
 
@@ -1664,6 +2014,74 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_updates_of_different_fields_lose_nothing_and_leave_valid_json() {
+        with_temp_config(|path| {
+            std::thread::scope(|scope| {
+                for i in 0..8 {
+                    scope.spawn(move || {
+                        for round in 0..10 {
+                            if i % 2 == 0 {
+                                set_onboarding(OnboardingState::default()).unwrap();
+                            } else {
+                                set_source_root(
+                                    crate::tool_install::ExternalTool::Devmap,
+                                    &format!("/src/{i}/{round}"),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            let text = fs::read_to_string(path).unwrap();
+            parse_config(&text).expect("concurrent saves interleaved into invalid JSON");
+            // Both writers' fields survive: no update was a lost overwrite.
+            assert!(load().unwrap().devmap.source_root.is_some());
+            let siblings: Vec<_> = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".tmp"))
+                .collect();
+            assert!(siblings.is_empty(), "temp files left behind: {siblings:?}");
+        });
+    }
+
+    #[test]
+    fn a_hand_edit_is_seen_and_not_overwritten_by_the_next_update() {
+        with_temp_config(|path| {
+            set_source_root(crate::tool_install::ExternalTool::Devmap, "/one").unwrap();
+            // Edited behind the cache's back, without invalidate_cache().
+            let mut edited: ToolConfig =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            edited.manvi.binary = Some("/hand/edited/manvi".into());
+            // A different length guarantees a new stamp even on coarse mtimes.
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&edited).unwrap() + "\n\n",
+            )
+            .unwrap();
+            assert_eq!(
+                load().unwrap().manvi.binary.as_deref(),
+                Some("/hand/edited/manvi")
+            );
+            set_source_root(crate::tool_install::ExternalTool::Devmap, "/two").unwrap();
+            let after = load().unwrap();
+            assert_eq!(after.manvi.binary.as_deref(), Some("/hand/edited/manvi"));
+            assert_eq!(after.devmap.source_root.as_deref(), Some("/two"));
+        });
+    }
+
+    #[test]
+    fn set_binary_reports_a_failed_persist() {
+        with_temp_config(|path| {
+            // tools.json is a directory: the write cannot succeed.
+            fs::create_dir_all(path).unwrap();
+            let err = set_binary(crate::tool_install::ExternalTool::Devmap, "/x/devmap");
+            assert!(err.is_err(), "a failed persist reported success");
+        });
+    }
+
+    #[test]
     fn stale_binary_is_reported_not_silently_dropped() {
         with_temp_config(|_| {
             let mut cfg = ToolConfig::default();
@@ -1713,7 +2131,7 @@ mod model_setting_tests {
     use super::*;
 
     fn with_temp_config(f: impl FnOnce(&Path)) {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&serial)

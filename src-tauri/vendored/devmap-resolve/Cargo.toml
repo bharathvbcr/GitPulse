@@ -2,9 +2,14 @@
 name = "devmap-resolve"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Call and import resolution into a defended edge graph"
+autotests = false
+
+[[test]]
+name = "it"
 
 [dependencies]
 # Already a workspace dependency built for devmap-extract and devmap-store, so
@@ -30,204 +35,9 @@ parse = ["devmap-extract/parse"]
 # fails a whole target, so the command returned a build error rather than
 # results — which reads as "not meant to be tested", and is how it survived.
 #
-# `required-features` skips these when `parse` is off instead of failing the
-# build. The inline tests are gated the same way, per fn rather than per module,
-# so the 20 that need no grammar still run in the feature-off configuration.
+# The integration tests are one target, `tests/it.rs`, whose modules are the
+# files under `tests/`. A file that needs a grammar is declared
+# `#[cfg(feature = "parse")]` there, which skips it when `parse` is off rather
+# than failing the build; `every_test_target_declares_its_grammar_need` reads
+# those lines.
 
-[[test]]
-name = "adversarial_resolve"
-required-features = ["parse"]
-
-[[test]]
-name = "python_module_constants"
-required-features = ["parse"]
-
-[[test]]
-name = "type_aliases_are_not_call_targets"
-required-features = ["parse"]
-
-[[test]]
-name = "same_file_type_position"
-required-features = ["parse"]
-
-[[test]]
-name = "rust_qualified_super_calls"
-required-features = ["parse"]
-
-[[test]]
-name = "rust_qualified_path_calls"
-required-features = ["parse"]
-
-[[test]]
-name = "audit_regressions"
-required-features = ["parse"]
-
-[[test]]
-name = "module_singleton_receivers"
-required-features = ["parse"]
-
-[[test]]
-name = "factory_return_types"
-required-features = ["parse"]
-
-[[test]]
-name = "a_prelude_type_receiver_is_not_a_value"
-required-features = ["parse"]
-
-[[test]]
-name = "embedded_script_families"
-required-features = ["parse"]
-
-[[test]]
-name = "markup_selectors_resolve"
-required-features = ["parse"]
-
-[[test]]
-name = "parallel_determinism"
-required-features = ["parse"]
-
-[[test]]
-name = "primary_languages"
-required-features = ["parse"]
-
-[[test]]
-name = "test_phase3_hardening"
-required-features = ["parse"]
-
-[[test]]
-name = "resolution_honesty"
-required-features = ["parse"]
-
-[[test]]
-name = "import_paths_resolve_to_real_files"
-required-features = ["parse"]
-
-[[test]]
-name = "reexport_chains"
-required-features = ["parse"]
-
-[[test]]
-name = "type_position_classification"
-required-features = ["parse"]
-
-[[test]]
-name = "rust_module_paths"
-required-features = ["parse"]
-
-[[test]]
-name = "implicit_receiver_dispatch"
-required-features = ["parse"]
-
-[[test]]
-name = "qualified_module_paths"
-required-features = ["parse"]
-
-[[test]]
-name = "every_site_is_counted_once"
-required-features = ["parse"]
-
-[[test]]
-name = "go_package_scope"
-required-features = ["parse"]
-
-[[test]]
-name = "go_own_package_receiver"
-required-features = ["parse"]
-
-[[test]]
-name = "rust_self_type"
-required-features = ["parse"]
-
-[[test]]
-name = "implicit_receiver_reference"
-required-features = ["parse"]
-
-[[test]]
-name = "host_global_objects"
-required-features = ["parse"]
-
-[[test]]
-name = "swift_modules"
-required-features = ["parse"]
-
-[[test]]
-name = "semantic_scope_and_identity"
-required-features = ["parse"]
-
-[[test]]
-name = "imports_stay_in_the_named_tree"
-required-features = ["parse"]
-
-[[test]]
-name = "dead_hardening_characterization"
-required-features = ["parse"]
-
-[[test]]
-name = "ambiguity_budget"
-required-features = ["parse"]
-
-[[test]]
-name = "captured_receiver_attribution"
-required-features = ["parse"]
-
-[[test]]
-name = "self_in_a_type_is_that_type"
-required-features = ["parse"]
-
-
-
-[[test]]
-name = "a_field_types_its_receiver"
-required-features = ["parse"]
-
-[[test]]
-name = "reexported_module_surfaces"
-required-features = ["parse"]
-
-[[test]]
-name = "shell_source_resolves"
-required-features = ["parse"]
-
-[[test]]
-name = "language_server_edges"
-required-features = ["parse"]
-
-[[test]]
-name = "deref_transparent_receivers"
-required-features = ["parse"]
-
-[[test]]
-name = "go_unexported_selector"
-required-features = ["parse"]
-
-[[test]]
-name = "python_modules_loaded_by_path"
-required-features = ["parse"]
-
-[[test]]
-name = "python_path_constants_and_loaders"
-required-features = ["parse"]
-
-[[test]]
-name = "python_sys_path_imports"
-required-features = ["parse"]
-
-[[test]]
-name = "typed_receivers"
-required-features = ["parse"]
-
-[[test]]
-name = "real_corpus_resolution"
-required-features = ["parse"]
-
-[[test]]
-name = "commonjs_require_bindings"
-required-features = ["parse"]
-
-[[test]]
-name = "a_receiver_member_nothing_declares"
-required-features = ["parse"]
-
-[[test]]
-name = "function_values_and_platform_targets"
-required-features = ["parse"]

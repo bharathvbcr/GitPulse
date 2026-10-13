@@ -2,7 +2,8 @@
   import { untrack } from "svelte";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
-  import { repoStore, type FileStatus } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore, type FileStatus } from "../../stores/repoStore";
+  import { currentHeadTip } from "../../stores/headTip";
   import { invoke } from "../../ipc/invoke";
   import {
     ChevronDown,
@@ -60,7 +61,7 @@
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
   import { popover, restoreFocusTo } from "../../ui/popover";
-  import { enumerateFocusables } from "../../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import EmptyState from "../EmptyState.svelte";
@@ -98,7 +99,9 @@
   type StatusFilter = "all" | "modified" | "staged" | "untracked" | "conflicted";
   type SortOrder = "name-asc" | "name-desc" | "status" | "churn";
 
-  let files = $state<string[]>([]);
+  // Replaced wholesale by each listing, never edited in place — a deep proxy
+  // over tens of thousands of paths would buy nothing.
+  let files = $state.raw<string[]>([]);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
   let inflight: AsyncGuard | null = null;
@@ -191,29 +194,36 @@
     return () => inflight?.cancel();
   });
 
-  let lastRepo = "";
+  // `$repoStore.x` inside an effect tracks the whole store, and the store
+  // publishes a fresh object on every change — every status poll, loading
+  // flag and error. The repository key, this membership string and HEAD
+  // (see `currentHeadTip`) compare by value, so the listing below reloads only
+  // when the repository, the set of dirty paths, or HEAD changes.
+  const statusMembership = $derived(statusPathKey($repoStore.statuses));
+
+  // A new repository starts with every folder expanded again.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const membership = statusPathKey($repoStore.statuses);
-    void membership;
-    if (!repo) {
-      inflight?.cancel();
-      files = [];
-      errorMsg = null;
-      isLoading = false;
-      selectedIndex = -1;
-      lastRepo = "";
-      return;
-    }
-    if (repo !== lastRepo) {
-      collapsed = {};
-      lastRepo = repo;
-    }
-    void loadFiles(repo);
-    const started = inflight;
-    return () => {
-      if (inflight === started) started?.cancel();
-    };
+    void $currentRepoPath;
+    untrack(() => (collapsed = {}));
+  });
+
+  // No teardown: `loadFiles` cancels its predecessor itself, and unmount is
+  // the effect above.
+  $effect(() => {
+    const repo = $currentRepoPath;
+    void statusMembership;
+    void $currentHeadTip;
+    untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        files = [];
+        errorMsg = null;
+        isLoading = false;
+        selectedIndex = -1;
+        return;
+      }
+      void loadFiles(repo);
+    });
   });
 
   let listedPaths = $derived.by(() =>
@@ -294,8 +304,11 @@
 
 
   // Flattened rows
+  // The tree depends only on the listing; a folder toggle re-flattens it
+  // without rebuilding it. `flattenFileTree` reads the tree, never mutates it.
+  let tree = $derived(buildFileTree(filteredPaths));
   let rows = $derived.by<FileRow[]>(() => {
-    const flattened = flattenFileTree(buildFileTree(filteredPaths), (dirPath) =>
+    const flattened = flattenFileTree(tree, (dirPath) =>
       isFiltering ? false : collapsed[dirPath] === true,
     );
     if (sortOrder === "name-asc") return flattened;
@@ -440,34 +453,6 @@
     }, 0);
     return () => window.clearTimeout(timer);
   });
-
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
-  }
 
   function handleMenuKeydown(e: KeyboardEvent) {
     if (e.key === "Tab") {

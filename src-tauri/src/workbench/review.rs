@@ -440,7 +440,7 @@ mod tests {
     /// and the refusal is GitPulse's, before the harness is asked.
     #[test]
     fn an_unreviewed_attempt_cannot_be_merged() {
-        let config_lock = crate::tool_config::lock_config_env();
+        let config_lock = crate::test_support::env::env_serial();
         let config = tempfile::tempdir().unwrap();
         let _env = crate::test_support::env::bind_env(&config_lock)
             .set(

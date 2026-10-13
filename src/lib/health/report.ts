@@ -1,4 +1,4 @@
-import { formatAuditCounts } from "./format";
+import { formatAuditCounts, formatAuditCoverage } from "./format";
 import { cappedSuffix, observedTotal as observedScanTotal } from "../scan/limits";
 import { safeText } from "../terminal/agentPromptText";
 import type {
@@ -224,6 +224,8 @@ export function formatHealthReport(
     ? formatAuditCounts(report.audit, { complete: auditComplete, ran: auditsRan })
     : `audit did not run${skipped.length > 0 ? ` (CLI missing: ${skipped.join(", ")})` : ""}`;
   out.push(`Audit summary: ${auditSummary}; ${outdatedTotal} outdated npm package(s).`);
+  const coverageLine = formatAuditCoverage(report.audit_coverage);
+  if (coverageLine) out.push(`Audit coverage: ${coverageLine}.`);
   if (skipped.length > 0) {
     out.push(
       `NOTE: checks that did NOT run (CLI missing): ${skipped.join(", ")}. The counts above are not complete coverage.`,

@@ -33,7 +33,7 @@
 
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import {
     PanelLeftClose,
@@ -445,7 +445,7 @@
   }
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     if (repo === hydratedRepo) return;
     if (hydratedRepo) untrack(() => persistTabs(hydratedRepo));
     viewerLease?.release();
@@ -496,8 +496,9 @@
     prevLoadKey = "";
   });
 
+  const storeSelection = $derived($repoStore.selectedFilePath);
   $effect(() => {
-    const storeSelected = $repoStore.selectedFilePath;
+    const storeSelected = storeSelection;
     if (!storeSelected) {
       lastAppliedStoreFile = "";
       return;
@@ -514,12 +515,13 @@
     });
   });
 
+  const activeStatusCode = $derived(
+    tabState.active ? ($repoStore.statuses.find((s) => s.path === tabState.active)?.status_code ?? "") : "",
+  );
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const path = tabState.active;
-    const code = path
-      ? ($repoStore.statuses.find((s) => s.path === path)?.status_code ?? "")
-      : "";
+    const code = activeStatusCode;
     const key = `${repo ?? ""}\u0000${path ?? ""}\u0000${code}`;
     if (key === prevLoadKey) return;
     prevLoadKey = key;

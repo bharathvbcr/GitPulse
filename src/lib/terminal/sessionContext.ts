@@ -32,7 +32,9 @@ export function parseTerminalContext(raw: unknown): TerminalContext | null {
   const busy = record.busy === null || record.busy === undefined ? null : record.busy;
   if (process === undefined || cwd === undefined || repoDir === undefined) return null;
   if (busy !== null && typeof busy !== "boolean") return null;
-  return { process, busy, cwd, repo_dir: repoDir };
+  const jobs = record.jobs === null || record.jobs === undefined ? null : record.jobs;
+  if (jobs !== null && typeof jobs !== "boolean") return null;
+  return { process, busy, ...(jobs === null ? {} : { jobs }), cwd, repo_dir: repoDir };
 }
 
 /**
@@ -78,7 +80,15 @@ export function closeQuestion(
         : `${agent.name} is still running in this tab. Closing it stops the agent.`,
     };
   }
-  if (context?.busy !== true) return null;
+  if (context?.busy !== true) {
+    // Nothing in the foreground, but a background or stopped job is still the
+    // user's work, and a close kills it as surely as it kills the foreground.
+    if (context?.jobs !== true) return null;
+    return {
+      title: `Close ${tabLabel}?`,
+      message: "A background or stopped job is still running in this terminal. Closing it stops that job.",
+    };
+  }
   const program = context.process?.trim() || "A program";
   return {
     title: `Close ${tabLabel}?`,

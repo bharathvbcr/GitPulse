@@ -7,13 +7,15 @@
 //! on every hook invocation — the second time the same tree had just been
 //! enumerated, because the build in front of it had already walked it.
 //!
-//! Computing them here is only useful if the answers are *identical*, so this
-//! module is a deliberate transcription of
+//! This module is a deliberate transcription of the Python
 //! `RepoMapper.get_git_files` / `_files_fingerprint` / `_content_fingerprint`
 //! and `indexing.graph.build.content_fingerprint`, down to the `\0` separator,
-//! the `c2:` scheme prefix and the `(size, mtime_ns, ctime_ns)` memo key.
-//! `tests/freshness_parity.rs` runs both implementations over a real tree and
-//! compares the strings; anything here that drifts from Python fails there.
+//! the `c2:` scheme prefix and the `(size, mtime_ns, ctime_ns)` memo key. The
+//! Python package is retired, so the kernel is the only producer and the only
+//! reader: `tests/freshness_parity.rs`, which compared the two over a real tree
+//! and printed SKIPPED (passing) once no interpreter could import `devcouncil`,
+//! was deleted rather than left to report ok without running. The scheme is
+//! pinned by `digest.rs`'s published test vectors and by the inventory tests.
 //!
 //! **Only the git path is implemented.** Python falls back to an `os.walk` when
 //! git cannot answer, and that fallback stays the Python side's: a second
@@ -207,8 +209,10 @@ pub const GIT_LS_FILES_OUTPUT_CAP: usize = 64 * 1024 * 1024;
 /// [`git_head`] with the program named, so a test can stand a script in for it.
 #[doc(hidden)]
 pub fn git_head_with_program(program: &OsStr, root: &Path) -> String {
-    let mut command = subprocess::git_with_program(program, root);
-    command.args(["rev-parse", "HEAD"]);
+    let Ok(mut command) = subprocess::git_with_program(program, root, ["rev-parse", "HEAD"]) else {
+        // No git this process may run against root: "cannot be answered".
+        return String::new();
+    };
     let bounds = Bounds {
         deadline: GIT_HEAD_DEADLINE,
         stdout_cap: 4096,
@@ -279,8 +283,9 @@ pub(crate) fn ls_files(
     root: &Path,
     flags: &[&str],
 ) -> Result<Vec<String>, String> {
-    let mut command = subprocess::git_with_program(program, root);
-    command.arg("ls-files").arg("-z").args(flags);
+    let args = ["ls-files", "-z"].iter().chain(flags);
+    let mut command = subprocess::git_with_program(program, root, args)
+        .map_err(|failure| format!("git ls-files {}: {failure}", flags.join(" ")))?;
     let bounds = Bounds {
         deadline: GIT_LS_FILES_DEADLINE,
         stdout_cap: GIT_LS_FILES_OUTPUT_CAP,

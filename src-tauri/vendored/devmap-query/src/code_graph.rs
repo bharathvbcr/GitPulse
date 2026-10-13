@@ -422,10 +422,9 @@ fn reached_dynamically(path: &str, forms: &BTreeSet<&str>) -> bool {
 ///   `MemberOf` record that a file holds its own symbols. Cross-file instances
 ///   exist for re-exports, and counting them would let a file's own declaration
 ///   wire it to itself through a third party.
-/// * **A guess is not evidence.** An ambiguous call fans out to as many as
-///   `AMBIGUOUS_FANOUT_CAP` candidate files of which at most one is right, so
-///   accepting it would mark up to fifteen files wired on the strength of a
-///   name collision. Only the confident tier counts — the same line
+/// * **A guess is not evidence.** A language server's dispatch set fans out to
+///   several candidate files of which at most one is right, so accepting it
+///   would mark all of them wired on the strength of a name collision. Only the confident tier counts — the same line
 ///   `EXTRACTED_FLOOR_MILLIS` draws for a dead-code verdict, and for the same
 ///   reason: this scan's output is also a delete-this suggestion.
 fn is_wiring_evidence(edge: &ResolvedEdge) -> bool {
@@ -2110,6 +2109,7 @@ mod tests {
             confidence: 0.9,
             is_exempt: false,
             exemption_reason: None,
+            evidence: None,
         }];
         let value = graph(
             &[extract_file("k.py", "def a(): pass\n")],
@@ -2279,6 +2279,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
             DeadSymbolReport {
                 symbol_name: "a1".to_string(),
@@ -2286,6 +2287,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
         ];
         let edges = vec![
@@ -2500,6 +2502,7 @@ mod tests {
                 confidence: 0.3,
                 is_exempt: true,
                 exemption_reason: Some("Go init function".to_string()),
+                evidence: None,
             },
             DeadSymbolReport {
                 symbol_name: "gone".to_string(),
@@ -2507,6 +2510,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
         ];
         let value = graph(
@@ -2548,6 +2552,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
             DeadSymbolReport {
                 symbol_name: "ghost".to_string(),
@@ -2555,6 +2560,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
         ];
         let source = "def a(): pass\ndef gone(): pass\n";

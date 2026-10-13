@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { attemptTerminalView } from "./taskSessions";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
+import { wallClockBudget } from "../testing/wallClock";
+import { mulberry32 } from "../__tests__/prng";
 
 /**
  * The pane's join under arbitrary registry and queue contents.
@@ -14,18 +16,8 @@ import type { TaskTerminalRequest } from "../terminal/taskLaunches";
  * unit test happens to build.
  */
 
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), a | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 const RUNS = ["a", "b", "c", ""];
-const STATUSES = ["starting", "running", "exited", "", "Close failed; use Sessions to retry.", "x".repeat(400), "Still running — not shown since the window reloaded"];
+const STATUSES = ["starting", "running", "exited", "", "Close failed; use Sessions to retry.", "x".repeat(400), "Still running — not shown in any tab"];
 const close = async () => {};
 
 describe("attemptTerminalView under arbitrary mixtures", () => {
@@ -97,6 +89,6 @@ describe("attemptTerminalView under arbitrary mixtures", () => {
     const started = performance.now();
     const view = attemptTerminalView("a", records, [], false);
     expect(view.sessions).toHaveLength(25_000);
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2_000));
   });
 });

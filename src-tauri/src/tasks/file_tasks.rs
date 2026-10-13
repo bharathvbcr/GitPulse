@@ -190,28 +190,45 @@ pub fn normalize_status(raw: &str) -> Result<String, String> {
     }
 }
 
-/// Parse a priority: `0`–`3`, `p0`–`p3`, a word, or the brief form `1 (High)`.
+/// ASCII-only trim, matching `fold` in `src/lib/workbench/taskPriority.ts`.
+fn trim_ascii_ws(raw: &str) -> &str {
+    raw.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+}
+
+/// A priority name (`urgent`, `high`, `normal`, `medium`, `low`).
+fn priority_name(word: &str) -> Option<u8> {
+    match word {
+        "urgent" => Some(0),
+        "high" => Some(1),
+        "normal" | "medium" => Some(2),
+        "low" => Some(3),
+        _ => None,
+    }
+}
+
+/// Parse a priority from the whole value: `0`–`3`, `p0`–`p3`, a name, or the
+/// brief form `1 (High)` whose number and name agree. Anything else (`0 (Low)`,
+/// `High (1)`, `02`, `3.0`, `urgent!!`) is refused, not read by its first
+/// word. Held to `src/lib/workbench/priority.cases.json`, the corpus the
+/// TypeScript twin `parsePriority` also passes.
 pub fn parse_priority(raw: &str) -> Result<u8, String> {
-    let lower = raw.trim().to_ascii_lowercase();
-    let head = lower.split_whitespace().next().unwrap_or("");
-    let number = head.strip_prefix('p').unwrap_or(head);
-    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
-        return match number.parse::<u8>() {
-            Ok(value) if value <= 3 => Ok(value),
-            _ => Err(format!(
-                "priority {raw:?} is out of range; use 0 (urgent) to 3 (low)"
-            )),
-        };
-    }
-    match lower.as_str() {
-        "urgent" => Ok(0),
-        "high" => Ok(1),
-        "normal" | "medium" => Ok(2),
-        "low" => Ok(3),
-        _ => Err(format!(
-            "priority {raw:?} is not 0–3 or urgent/high/normal/low"
-        )),
-    }
+    let lower = trim_ascii_ws(raw).to_ascii_lowercase();
+    let digit = |text: &str| match text.as_bytes() {
+        [b @ b'0'..=b'3'] => Some(b - b'0'),
+        _ => None,
+    };
+    let parsed = digit(lower.strip_prefix('p').unwrap_or(&lower))
+        .or_else(|| priority_name(&lower))
+        .or_else(|| {
+            let (number, rest) = lower.split_once(" (")?;
+            let value = digit(number)?;
+            (priority_name(rest.strip_suffix(')')?) == Some(value)).then_some(value)
+        });
+    parsed.ok_or_else(|| {
+        format!(
+            "priority {raw:?} is out of range or not recognised; use 0 (urgent) to 3 (low), p0-p3, urgent/high/normal/medium/low, or the form `1 (High)`"
+        )
+    })
 }
 
 /// Parse a severity. `none` is the absence of one.

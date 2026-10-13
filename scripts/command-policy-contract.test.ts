@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
-const source = readFileSync(new URL("../src-tauri/src/commands/mod.rs", import.meta.url), "utf8");
+const source = readCommandsSource();
 
 function functionSource(name: string): string {
   const start = source.indexOf(`pub async fn ${name}(`);

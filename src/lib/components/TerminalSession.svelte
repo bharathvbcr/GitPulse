@@ -82,7 +82,7 @@
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
-  import { createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
@@ -96,7 +96,7 @@
     type PermissionMode,
   } from "../terminal/agentDefaults";
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
-  import { terminalAttendance } from "../stores/sessionAlertsStore";
+  import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
   import { sessionActivity } from "../terminal/sessionActivity";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -108,6 +108,7 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
+  import { keepDetached, parseListing } from "../terminal/detachedSessions";
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -462,8 +463,10 @@
         else console.debug("[gitpulse-terminal]", line);
       }
       // The reader answering whatever the agent last asked; xterm's own
-      // replies (focus, cursor reports) are told apart inside.
-      if (nativeSessionId) sessionActivity.input(nativeSessionId, data);
+      // replies (focus, cursor reports) are told apart inside. When something
+      // stood, the notifier is told too, or it would replay the question and
+      // leave its banner up.
+      if (nativeSessionId && sessionActivity.input(nativeSessionId, data)) reportAttentionAnswered(nativeSessionId);
       lifecycle?.write(data);
     });
     created.onBinary((data) => { lifecycle?.write(data, true); });
@@ -491,11 +494,20 @@
     return term;
   }
 
-  function acknowledgeOutput(sessionId: string, bytes: number) {
-    if (bytes <= 0) return;
+  /**
+   * Released credit is owed here and sent once per frame (or at once past
+   * `ACK_FLUSH_THRESHOLD`), not as one IPC call per 4 KiB chunk. Teardown
+   * flushes it synchronously.
+   */
+  const acks = createAckCoalescer((sessionId, bytes) => {
     void invoke("cmd_terminal_ack", { sessionId, bytes }).catch((err: unknown) => {
       if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`, true);
     });
+  });
+
+  function acknowledgeOutput(sessionId: string, bytes: number) {
+    if (bytes <= 0) return;
+    acks.add(sessionId, bytes);
   }
 
   function paintOutput(token: PaintToken) {
@@ -604,6 +616,24 @@
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
         resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
         kill: (sessionId) => invoke("cmd_terminal_kill", { sessionId }),
+        detach: (sessionId) => invoke<boolean>("cmd_terminal_detach", { sessionId }),
+      },
+      // Only a plain shell positively at its prompt may end with its view.
+      // An agent, a running job, or a context that cannot be read is kept.
+      idle: async (sessionId) => {
+        if (launcher !== "shell") return false;
+        const context = parseTerminalContext(await invoke<unknown>("cmd_terminal_context", { sessionId }));
+        // `busy` is only the foreground; a `cmd &` or a `^Z`'d editor is a job too.
+        return context?.busy === false && context.jobs === false;
+      },
+      // Listed in Sessions, where it can be shown again or stopped. Looked up
+      // while this tab still holds the slot, which it then hands over.
+      keep: async (sessionId) => {
+        const raw = await invoke<unknown>("cmd_terminal_sessions");
+        const listing = Array.isArray(raw) ? raw.map(parseListing).find((row) => row?.id === sessionId) ?? null : null;
+        if (!listing) return null;
+        const family = listing.run_id ? await repoStore.familyOf(listing.repo).catch(() => null) : null;
+        return (slot) => keepDetached({ ...listing, detached: true }, slot, { family });
       },
       hooks: {
         state(status, message) {
@@ -648,10 +678,13 @@
           } else if (decision.action === "overflow") {
             for (const owed of decision.owed) acknowledgeOutput(owed.sessionId, owed.bytes);
             lifecycle?.fail(decision.failure, true);
-          } else if (decision.action === "stop") {
-            void lifecycle?.stop(decision.failure);
+          } else if (decision.action === "lost") {
+            // An unreadable frame is lost output, not a dead process. The
+            // host sheds rather than waits forever on the credit this frame
+            // could not name, so nothing here needs to end the session.
+            lifecycle?.fail(decision.failure, true);
           }
-          if (decision.action !== "stop" && !disposed) {
+          if (decision.action !== "lost" && !disposed) {
             sessionActivity.output(sessionId);
             if (!active) onActivity();
           }
@@ -670,6 +703,10 @@
           });
         },
         warning(message) { warning = message; },
+        // CAN aborts any escape, OSC or DCS sequence the gap cut short, and
+        // does nothing at all on the ground state. Queued behind what was
+        // painted, ahead of what the resumed stream sends.
+        skipped() { if (term && !disposed) term.write("\x18"); },
         admitted() { onAdmitted?.(); },
         refused(message) { return onRefused?.(message) ?? false; },
       },
@@ -729,6 +766,13 @@
   }
 
   export function restart() { void lifecycle?.restart(); }
+
+  /**
+   * The user's Close: ends the process. Called before the tab is dropped, so
+   * the unmount that follows has nothing left to keep. Rejects when the
+   * process could not be stopped; the tab then stays, with its retry.
+   */
+  export async function close(): Promise<void> { await lifecycle?.close(); }
 
   /**
    * The attempt this tab belongs to: its own, or the one a resumed
@@ -1056,6 +1100,9 @@
       armTimers.clear();
       disposed = true;
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
+      // Before `lifecycle` goes: nothing owed waits for a frame this view
+      // will not see, and a failure is still reported against the session.
+      acks.flush();
       if (nativeSessionId) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
       lifecycle?.dispose();
       lifecycle = null;

@@ -304,6 +304,19 @@ it.each(["edited", "missing", "extra"])("reports a contract %s here rather than 
   } finally { f.cleanup(); }
 });
 
+it("keeps a contract Manvi owns through a refresh and does not call it a local edit", () => {
+  const f = withContracts();
+  try {
+    expect(f.run("--contracts").status).toBe(0);
+    writeFileSync(path.join(f.contracts, "serve.ops.schema.json"), "{}\n");
+    const check = f.run("--check");
+    expect(check.status, check.stderr).toBe(0);
+    expect(f.contractsOf(check.stdout)).toMatchObject({ edited: [], upstream: "matches" });
+    expect(f.run("--contracts").status).toBe(0);
+    expect(readFileSync(path.join(f.contracts, "serve.ops.schema.json"), "utf8")).toBe("{}\n");
+  } finally { f.cleanup(); }
+});
+
 it("never reports contracts as matching when DevCouncil is not there to compare", () => {
   const f = withContracts();
   try {

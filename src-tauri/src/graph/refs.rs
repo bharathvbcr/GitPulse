@@ -44,6 +44,11 @@ pub struct RefDecoration {
     pub commit_id: String,
     /// True for the branch HEAD is currently on.
     pub is_head: bool,
+    /// For a remote-tracking ref, the remote that owns it, by the longest
+    /// configured remote name (`team/fork` for `team/fork/main`). Carried so a
+    /// consumer never has to guess it from the first path segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 /// Ceiling on decorations for refs outside branches, remotes and tags.
@@ -167,18 +172,15 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
     let patterns = ref_scope::decoration_patterns(scope);
     for_each_ref.extend_from_slice(patterns);
     let raw = crate::engine::ref_cache::git_text(&repo, patterns, &for_each_ref)?;
+    let remote_names = crate::engine::git_reader::configured_remote_names(&repo);
 
     // A detached HEAD makes this exit 1, which is an answer: no current
     // branch. A refusal is not, and used to render the graph with no HEAD
     // branch label at all, so it fails the listing with its own cause.
     let failures = crate::engine::git_cli::process_failures();
-    let current_branch = crate::engine::ref_cache::git_text(
-        &repo,
-        &["refs/heads"],
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .map(|s| s.trim().to_string())
-    .unwrap_or_default();
+    let current_branch = crate::engine::git_reader::head_branch_cached(&repo)
+        .unwrap_or_default()
+        .unwrap_or_default();
     if crate::engine::git_cli::process_failures() != failures {
         return Err(crate::engine::git_cli::last_process_failure()
             .unwrap_or_else(|| "the current-branch lookup produced no answer".into()));
@@ -216,7 +218,8 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
         } else if let Some(short) = refname.strip_prefix("refs/remotes/") {
             // `origin/HEAD` is a symbolic pointer, not a branch a user checks
             // out from the graph; showing it duplicates the branch it names.
-            if short.ends_with("/HEAD") {
+            // A branch merely named `release/HEAD` is a branch.
+            if crate::engine::git_reader::is_remote_head(&remote_names, refname) {
                 continue;
             }
             (RefKind::Remote, short)
@@ -242,6 +245,10 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
             kind,
             commit_id: commit_id.to_string(),
             is_head: kind == RefKind::Local && !current_branch.is_empty() && name == current_branch,
+            remote: (kind == RefKind::Remote)
+                .then(|| crate::engine::remotes::split_tracking_ref(&remote_names, name))
+                .flatten()
+                .map(|(owner, _)| owner.to_string()),
         };
         match decoration.kind {
             RefKind::Tag => tags.push((decoration, creatordate)),
@@ -279,6 +286,7 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
                     kind: RefKind::Head,
                     commit_id: head,
                     is_head: true,
+                    remote: None,
                 });
             }
         }

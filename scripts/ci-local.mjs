@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Run every gate CI runs, on this machine, without letting one failure hide
- * the rest.
+ * Run the local gates (`--list` prints them) on this machine, without letting
+ * one failure hide the rest. It is not all of CI: `bun audit`, `cargo deny`, the
+ * Go jobs and the scheduled workflows run only there.
  *
  * `ci:local` used to be a single `&&` chain. That is the one shape
  * `.github/workflows/ci.yml` deliberately refuses: every step there carries
@@ -53,12 +54,11 @@ const CARGO_MANIFEST = "src-tauri/Cargo.toml";
  */
 export const GATES = [
   {
-    id: "vendor-drift",
-    name: "Vendored crate drift",
-    program: "node",
-    args: ["scripts/vendor-crates.mjs", "--check", "--allow-drift"],
-    local: true,
-    why: "vendored sources are compared against upstream checkouts only a developer has",
+    id: "vendor-edits",
+    name: "Vendored crates unedited",
+    program: "bun",
+    args: ["run", "check:vendor-edits"],
+    why: "upstream drift is reported, not failed: it is a refresh signal, and failing on it would make every upstream commit break this gate",
   },
   {
     id: "vendor-schema",
@@ -74,6 +74,15 @@ export const GATES = [
     program: "bun",
     args: ["run", "check:workflows"],
     covers: ["./actionlint -color"],
+  },
+  {
+    // ci.yml's fixture-authors job checks the pushed range; here it checks what
+    // this checkout has not pushed, which is what the next push would add.
+    id: "fixture-authors",
+    name: "No commit authored as a test fixture",
+    program: "bun",
+    args: ["run", "check:fixture-authors"],
+    covers: ['bun run check:fixture-authors "$TIP" "$BASE"'],
   },
   {
     id: "ipc-contract",
@@ -286,7 +295,7 @@ export function summarize(outcomes) {
 function usage() {
   return formatUsage({
     name: "ci-local",
-    summary: "Run every gate CI runs, locally, without one failure hiding the rest.",
+    summary: "Run the local gates (a subset of CI), without one failure hiding the rest.",
     flags: [
       { flag: "--list", description: "Print the gates and exit" },
       { flag: "--help, -h", description: "Show this message" },

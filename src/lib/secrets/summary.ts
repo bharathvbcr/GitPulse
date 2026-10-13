@@ -241,10 +241,10 @@ export function shouldCache(cached: SecretsReport | undefined, incoming: Secrets
 
 /** `path:line`, or the bare path when Kingfisher gave no line. */
 export function locationLabel(finding: SecretFinding): string {
-  return finding.line > 0 ? `${finding.path}:${finding.line}` : finding.path;
+  return finding.line !== null ? `${finding.path}:${finding.line}` : finding.path;
 }
 
 /** Row key; `keyedList` disambiguates exact duplicates. */
 export function findingKey(finding: SecretFinding): string {
-  return `${finding.location}:${finding.path}:${finding.line}:${finding.rule_id}:${finding.secret_group}`;
+  return `${finding.location}:${finding.path}:${finding.line ?? ""}:${finding.rule_id}:${finding.secret_group}`;
 }

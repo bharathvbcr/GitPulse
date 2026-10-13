@@ -43,8 +43,8 @@
 
 import { writable } from "svelte/store";
 import {
-  deferredRetryDelayMs,
   isDeferredUnderLoad,
+  jitteredRetryDelayMs,
   MAX_DEFERRED_RETRIES,
 } from "../async/deferral";
 import type { BackgroundScope } from "../async/pacedQueue";
@@ -116,8 +116,11 @@ export function createAutoInit(opts?: {
   debounceMs?: number;
   initialize?: (repoPath: string, openRepos: string[]) => Promise<InitReport>;
   warn?: (scope: string, message: string) => void;
+  /** Source in [0, 1) that spreads retry waits; see `jitteredDelayMs`. */
+  random?: () => number;
 }): AutoInitController {
   const debounceMs = opts?.debounceMs ?? AUTO_INIT_DEBOUNCE_MS;
+  const random = opts?.random ?? Math.random;
   const initialize = opts?.initialize ?? initializeDevcouncil;
   const warn = opts?.warn ?? ((scope: string, message: string) => diagnostics.warn(scope, message));
   const snapshots = writable<Record<string, AutoInitSnapshot>>({});
@@ -175,7 +178,7 @@ export function createAutoInit(opts?: {
         lastScope.activeKey === activeKey &&
         signature(lastScope.activeKey, lastScope.retained) === sig;
       if (willRetry) {
-        const delayMs = deferredRetryDelayMs(attempt);
+        const delayMs = jitteredRetryDelayMs(attempt, random);
         held.set(activeKey, { sig, until: Date.now() + delayMs, attempt });
         // `pending` is set by a scope change that has not flushed yet. Stealing
         // the timer from it would drop that change and retry the old scope.

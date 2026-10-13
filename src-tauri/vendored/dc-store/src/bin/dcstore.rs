@@ -176,6 +176,9 @@ const KNOWN_FLAGS: &[&str] = &[
     // above asks for.
     "stdout-path",
     "stderr-path",
+    // `gaps-replace`: one verification (run record and gap set) in the framing
+    // dc_store::commit_wire documents.
+    "wire",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -397,11 +400,26 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 ttl_seconds: ttl,
                 force,
             };
-            match store.acquire(&request) {
-                Ok(lease) => Ok(object(&[
-                    ("ok", &json_bool(true)),
-                    ("lease", &lease_json(&lease)),
-                ])),
+            match store.acquire_outcome(&request) {
+                Ok((lease, retired)) => {
+                    let mut reply =
+                        object(&[("ok", &json_bool(true)), ("lease", &lease_json(&lease))]);
+                    // A forced acquire over a lease whose expiry could not be
+                    // read cleared it rather than stole it; say which, so the
+                    // record shows what was retired and why.
+                    if let Some(r) = retired {
+                        reply.pop();
+                        reply.push_str(&format!(
+                            ",\"retired_unreadable_lease\":{}}}",
+                            object(&[
+                                ("lease_id", &quote(&r.lease_id)),
+                                ("owner", &quote(&r.owner)),
+                                ("expires_at", &quote(&r.expires_at)),
+                            ])
+                        ));
+                    }
+                    Ok(reply)
+                }
                 Err(StoreError::LeaseHeld { task_id, holder }) => {
                     Err(Failure::Conflict(object(&[
                         ("ok", &json_bool(false)),
@@ -572,9 +590,16 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 .ready_tasks()
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
             let items: Vec<String> = ids.iter().map(|id| quote(id)).collect();
+            // Tasks held by a lease whose expiry cannot be read are left out of
+            // `tasks` (they are not free) and named here, so an operator sees
+            // why a task is missing instead of the whole store failing.
+            let unreadable = store
+                .unreadable_leases()
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
             Ok(object(&[
                 ("ok", &json_bool(true)),
                 ("tasks", &format!("[{}]", items.join(","))),
+                ("unreadable_leases", &unreadable_json(&unreadable)),
             ]))
         }
 
@@ -583,9 +608,13 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 .active_leases()
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
             let items: Vec<String> = leases.iter().map(lease_json).collect();
+            let unreadable = store
+                .unreadable_leases()
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
             Ok(object(&[
                 ("ok", &json_bool(true)),
                 ("leases", &format!("[{}]", items.join(","))),
+                ("unreadable_leases", &unreadable_json(&unreadable)),
             ]))
         }
 
@@ -605,8 +634,17 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             let leases = store
                 .active_leases()
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
+            // Still `ok`: the store works and every other task is served. But a
+            // row whose expiry cannot be read is a fault someone has to fix, so
+            // health says so instead of reporting the same thing as a clean
+            // store.
+            let unreadable = store
+                .unreadable_leases()
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
             Ok(object(&[
                 ("ok", &json_bool(true)),
+                ("degraded", &json_bool(!unreadable.is_empty())),
+                ("unreadable_leases", &unreadable_json(&unreadable)),
                 ("id", &quote(COMPONENT_ID)),
                 ("component", &quote(STORE_IDENTITY)),
                 ("store", &quote(STORE_IDENTITY)),
@@ -637,32 +675,38 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             let items: Vec<String> = rows
                 .iter()
                 .map(|r| {
-                    object(&[
-                        ("id", &r.id.to_string()),
-                        ("type", &quote(&r.kind)),
-                        (
-                            "task_id",
-                            &r.task_id
-                                .as_deref()
-                                .map(quote)
-                                .unwrap_or_else(|| "null".into()),
-                        ),
-                        (
-                            "requirement_id",
-                            &r.requirement_id
-                                .as_deref()
-                                .map(quote)
-                                .unwrap_or_else(|| "null".into()),
-                        ),
-                        (
-                            "acceptance_criterion_id",
-                            &r.acceptance_criterion_id
-                                .as_deref()
-                                .map(quote)
-                                .unwrap_or_else(|| "null".into()),
-                        ),
-                        ("data_json", &r.data_json),
-                    ])
+                    let (data, data_error) =
+                        embed_raw(&r.data_json, dc_store::json::check_container, "null");
+                    with_error(
+                        object(&[
+                            ("id", &r.id.to_string()),
+                            ("type", &quote(&r.kind)),
+                            (
+                                "task_id",
+                                &r.task_id
+                                    .as_deref()
+                                    .map(quote)
+                                    .unwrap_or_else(|| "null".into()),
+                            ),
+                            (
+                                "requirement_id",
+                                &r.requirement_id
+                                    .as_deref()
+                                    .map(quote)
+                                    .unwrap_or_else(|| "null".into()),
+                            ),
+                            (
+                                "acceptance_criterion_id",
+                                &r.acceptance_criterion_id
+                                    .as_deref()
+                                    .map(quote)
+                                    .unwrap_or_else(|| "null".into()),
+                            ),
+                            ("data_json", &data),
+                        ]),
+                        "data_error",
+                        data_error,
+                    )
                 })
                 .collect();
             Ok(object(&[
@@ -727,39 +771,45 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             let items: Vec<String> = rows
                 .iter()
                 .map(|r| {
-                    object(&[
-                        ("id", &quote(&r.id)),
-                        ("severity", &quote(&r.severity)),
-                        ("gap_type", &quote(&r.gap_type)),
-                        ("task_id", &maybe(r.task_id.as_deref())),
-                        ("description", &quote(&r.description)),
-                        ("recommended_fix", &quote(&r.recommended_fix)),
-                        ("blocking", &json_bool(r.blocking)),
-                        ("evidence_json", &r.evidence_json),
-                        // What a criterion gap is about and how it was meant to
-                        // be proven. Stored by `gap-upsert` all along; without
-                        // them here the reply named a criterion gap but not its
-                        // criterion. `null` when the gap is not about one.
-                        ("requirement_id", &maybe(r.requirement_id.as_deref())),
-                        (
-                            "acceptance_criterion_id",
-                            &maybe(r.acceptance_criterion_id.as_deref()),
-                        ),
-                        (
-                            "expected_verification_method",
-                            &maybe(r.expected_verification_method.as_deref()),
-                        ),
-                        // Where the gap is and what reproduces it, dropped the
-                        // same way and for as long.
-                        ("file", &maybe(r.file.as_deref())),
-                        (
-                            "line",
-                            &r.line.map_or_else(|| "null".to_string(), |n| n.to_string()),
-                        ),
-                        ("suggested_command", &maybe(r.suggested_command.as_deref())),
-                        ("stdout_path", &maybe(r.stdout_path.as_deref())),
-                        ("stderr_path", &maybe(r.stderr_path.as_deref())),
-                    ])
+                    let (evidence, evidence_error) =
+                        embed_raw(&r.evidence_json, dc_store::json::check_array, "[]");
+                    with_error(
+                        object(&[
+                            ("id", &quote(&r.id)),
+                            ("severity", &quote(&r.severity)),
+                            ("gap_type", &quote(&r.gap_type)),
+                            ("task_id", &maybe(r.task_id.as_deref())),
+                            ("description", &quote(&r.description)),
+                            ("recommended_fix", &quote(&r.recommended_fix)),
+                            ("blocking", &json_bool(r.blocking)),
+                            ("evidence_json", &evidence),
+                            // What a criterion gap is about and how it was meant to
+                            // be proven. Stored by `gap-upsert` all along; without
+                            // them here the reply named a criterion gap but not its
+                            // criterion. `null` when the gap is not about one.
+                            ("requirement_id", &maybe(r.requirement_id.as_deref())),
+                            (
+                                "acceptance_criterion_id",
+                                &maybe(r.acceptance_criterion_id.as_deref()),
+                            ),
+                            (
+                                "expected_verification_method",
+                                &maybe(r.expected_verification_method.as_deref()),
+                            ),
+                            // Where the gap is and what reproduces it, dropped the
+                            // same way and for as long.
+                            ("file", &maybe(r.file.as_deref())),
+                            (
+                                "line",
+                                &r.line.map_or_else(|| "null".to_string(), |n| n.to_string()),
+                            ),
+                            ("suggested_command", &maybe(r.suggested_command.as_deref())),
+                            ("stdout_path", &maybe(r.stdout_path.as_deref())),
+                            ("stderr_path", &maybe(r.stderr_path.as_deref())),
+                        ]),
+                        "evidence_error",
+                        evidence_error,
+                    )
                 })
                 .collect();
             Ok(object(&[
@@ -810,6 +860,21 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 ("ok", &json_bool(true)),
                 ("task_id", &quote(&task)),
                 ("count", &zero),
+            ]))
+        }
+
+        "gaps-replace" => {
+            let task = required("task")?.to_string();
+            let (run, gaps) = dc_store::commit_wire::decode(required("wire")?)
+                .map_err(|e| Failure::Fatal(format!("--wire: {e}")))?;
+            store
+                .verification_commit(run.as_ref(), &task, &gaps)
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let count = gaps.len().to_string();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("task_id", &quote(&task)),
+                ("count", &count),
             ]))
         }
 
@@ -901,7 +966,7 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
         }
 
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gap-history, gap-upsert, run-record, handoff, work)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, handoff, work)"
         ))),
     }
 }
@@ -1173,6 +1238,46 @@ fn task_json(t: &dc_store::Task) -> String {
         ("requirement_ids", &t.requirement_ids_json),
         ("acceptance_criterion_ids", &t.acceptance_criterion_ids_json),
     ])
+}
+
+/// Text from a column the store embeds into its reply *unquoted*. A value that
+/// is not provably one JSON value of the expected kind is never spliced in —
+/// that is how a stored `[]}],"gaps":[],"x":[{"q":0` made two gaps decode as
+/// none. The row is kept, `fallback` stands in for the value, and the reason
+/// travels beside it so the reader reports the row instead of trusting it.
+fn embed_raw(
+    text: &str,
+    check: fn(&str) -> Result<(), String>,
+    fallback: &str,
+) -> (String, Option<String>) {
+    match check(text) {
+        Ok(()) => (text.to_string(), None),
+        Err(why) => (fallback.to_string(), Some(why)),
+    }
+}
+
+/// Appends `"key": <reason>` to an already-built object when there is a reason.
+fn with_error(mut object: String, key: &str, error: Option<String>) -> String {
+    if let Some(why) = error {
+        object.pop();
+        object.push_str(&format!(",{}:{}}}", quote(key), quote(&why)));
+    }
+    object
+}
+
+/// The leases a sweep could not judge, each with its expiry as stored.
+fn unreadable_json(leases: &[Lease]) -> String {
+    let items: Vec<String> = leases
+        .iter()
+        .map(|l| {
+            object(&[
+                ("task_id", &quote(&l.task_id)),
+                ("lease_id", &quote(&l.id)),
+                ("expires_at", &maybe(l.expires_at.as_deref())),
+            ])
+        })
+        .collect();
+    format!("[{}]", items.join(","))
 }
 
 fn object(fields: &[(&str, &String)]) -> String {

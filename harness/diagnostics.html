@@ -28,6 +28,7 @@
   const fixture = {
     cmd_resolve_repo: a => ({path:a.path,name:"diagnostics",is_bare:false}),
     cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({tags:[],truncated:false}),
+    cmd_degraded_subsystems: () => [], cmd_daemon_status: () => ({running:false,pid:null,version:null,app_version:"0.0.0",mismatch:false,error:null}),
     cmd_repo_operation: () => null, cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_watch_repo: () => null,
     cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null,
     cmd_unwatch_repo: () => null, cmd_list_repo_files: () => ["A.md", "B.md"],
@@ -199,6 +200,8 @@
     try {
       Storage.prototype.setItem=function(key,value){if(key===DIAGNOSTIC_STORAGE_KEY)throw Error("Harness quota failure");return originalSetItem.call(this,key,value);};
       diagnostics.error("storage-canary","Harness diagnostic save failure");
+      // Saves are deferred; flush while the failing setItem is still installed.
+      diagnostics.flush();
       host.show("diagnostics");await settle();
       check("diagnostics window identifies memory-only errors",target.textContent.includes("memory only")&&target.textContent.includes("Harness quota failure"));
     } finally {Storage.prototype.setItem=originalSetItem;}

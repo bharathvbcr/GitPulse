@@ -153,8 +153,8 @@ pub(super) fn after_save(
         conn: input.conn,
         raw: body,
     };
-    let locked = enhancements::fields(&task, "locked_fields", false)?;
-    if !enabled || locked.len() == 2 {
+    let locked = enhancements::locks(&task, "locked_fields")?;
+    if !enabled || enhancements::text_locked(&locked) {
         input
             .conn
             .execute("DELETE FROM work_enhancement_queue WHERE task_id=?1", [id])?;
@@ -217,8 +217,8 @@ pub(super) fn prepare(
             message: "the task is still within its enhancement debounce".into(),
         });
     }
-    let locked = enhancements::fields(&task, "locked_fields", false)?;
-    if locked.len() == 2 {
+    let locked = enhancements::locks(&task, "locked_fields")?;
+    if enhancements::text_locked(&locked) {
         return Err(Error {
             code: "field_locked",
             message: "all enhancement fields are locked".into(),

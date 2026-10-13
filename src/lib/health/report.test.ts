@@ -196,6 +196,15 @@ describe("formatHealthReport", () => {
     expect(skipped).not.toContain("npm audit/outdated");
   });
 
+  it("reports the audit census beside the summary", () => {
+    const report = emptyReport();
+    expect(formatHealthReport(report)).not.toContain("Audit coverage:");
+    report.audit_coverage = { found: 3, audited: 1, unaudited: ["go:go.mod", "uv:uv.lock"] };
+    expect(formatHealthReport(report)).toContain(
+      "Audit coverage: 1 of 3 audited; not audited: go:go.mod, uv:uv.lock.",
+    );
+  });
+
   it("names local audits that could not run instead of letting counts read as clean", () => {
     const report = emptyReport();
     report.npm_cli_present = false;

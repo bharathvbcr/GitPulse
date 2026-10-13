@@ -47,8 +47,24 @@ use tree_sitter::Node;
 /// bind a real name to the wrong type. Binding nothing is the fail-closed
 /// direction (SC9).
 pub(super) fn assigned_binding(mut node: Node, source: &str) -> Option<String> {
-    for _ in 0..4 {
+    for _ in 0..8 {
         node = crate::treesitter::bounded_parent(node)?;
+        // Kotlin `val clock by lazy { Clock.create() }`: the delegate's lambda
+        // is the property's initializer, so its single call is what the
+        // property holds. Climbed only for `lazy` and only when the call is
+        // the lambda's whole body — any other lambda (`list.map { f() }`)
+        // makes the property something other than what `f()` returns.
+        match node.kind() {
+            "lambda_literal" => {
+                if node.named_child_count() != 1 {
+                    return None;
+                }
+                continue;
+            }
+            "annotated_lambda" | "property_delegate" => continue,
+            "call_expression" if is_lazy_call(node, source) => continue,
+            _ => {}
+        }
         let target = match node.kind() {
             // Java, C#
             "variable_declarator" => node.child_by_field_name("name"),
@@ -62,9 +78,10 @@ pub(super) fn assigned_binding(mut node: Node, source: &str) -> Option<String> {
             "assignment" => node.child_by_field_name("left"),
             // Kotlin `val w = Widget()`: the grammar gives the declaration no
             // fields and hangs the name off a `variable_declaration` child.
+            // `private val w = Widget()` has a `modifiers` child first.
             "property_declaration" => node
-                .named_child(0)
-                .filter(|child| child.kind() == "variable_declaration")
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "variable_declaration")
                 .and_then(|child| child.named_child(0)),
             _ => None,
         };
@@ -84,6 +101,13 @@ pub(super) fn assigned_binding(mut node: Node, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a Kotlin call expression is `lazy { .. }`.
+fn is_lazy_call(call: Node, source: &str) -> bool {
+    call.named_child(0).is_some_and(|callee| {
+        callee.kind() == "identifier" && get_node_text(callee, source) == "lazy"
+    })
 }
 
 /// One identifier, or nothing.

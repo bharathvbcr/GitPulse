@@ -1,4 +1,5 @@
-import { withinDeadline, workTimeout } from "./request";
+import { withDeadline } from "../async/deadline";
+import { WORK_DEADLINE_MESSAGE, workTimeout } from "./request";
 import { validateWorkResponse } from "./contracts";
 import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
@@ -83,7 +84,7 @@ export async function loadWork(
   const deadline = Date.now() + workTimeout(deps.timeoutMs);
   const call: typeof invoke = async <T>(command: string, args?: Parameters<typeof invoke>[1], options?: Parameters<typeof invoke>[2]): Promise<T> => {
     if (deps.signal?.aborted) throw new Error("Overview refresh superseded");
-    const result = await withinDeadline(() => nativeCall<T>(command, args, options), deadline);
+    const result = await withDeadline(() => nativeCall<T>(command, args, options), deadline - Date.now(), { signal: deps.signal, message: WORK_DEADLINE_MESSAGE });
     validateWorkResponse(command, result);
     return result;
   };

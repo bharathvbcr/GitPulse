@@ -3,10 +3,34 @@ import { STATUSES, type TaskCard, type TaskStatus } from "./client";
 /** Pointer movement (px²) before a press becomes a card drag. */
 export const TASK_DRAG_THRESHOLD_PX = 6;
 
-export const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low"] as const;
-
 export function dragExceeded(dx: number, dy: number, threshold = TASK_DRAG_THRESHOLD_PX): boolean {
   return dx * dx + dy * dy >= threshold * threshold;
+}
+
+/** Where a card was held, and the size its drag preview is drawn at. */
+export interface GrabPoint {
+  dx: number;
+  dy: number;
+  width: number;
+  height: number;
+}
+
+const extent = (value: number) => (Number.isFinite(value) && value > 0 ? value : 0);
+const within = (value: number, max: number) => (Number.isFinite(value) ? Math.min(Math.max(value, 0), max) : 0);
+
+/**
+ * The press point inside the card's box. The preview is drawn at
+ * `pointer - (dx, dy)` with the card's own size, so the spot the card was
+ * picked up by stays under the pointer for the whole drag. Clamped into the
+ * box, so a degenerate or stale measurement can never place the preview
+ * away from the pointer.
+ */
+export function grabPoint(
+  press: { x: number; y: number },
+  box: { left: number; top: number; width: number; height: number },
+): GrabPoint {
+  const width = extent(box.width), height = extent(box.height);
+  return { dx: within(press.x - box.left, width), dy: within(press.y - box.top, height), width, height };
 }
 
 export function parseColumnStatus(value: string | null | undefined): TaskStatus | null {
@@ -24,12 +48,21 @@ export function neighborStatus(status: TaskStatus, delta: -1 | 1): TaskStatus | 
  * When both neighbors exist the result is strictly between them; it is never
  * a `Date.now()` append in that case. Empty-column / end-of-column may use
  * `now` or `before + 1`.
+ *
+ * `more` says the column has cards beyond the ones loaded. Then a slot with
+ * no card after it is only the end of what is loaded: `before + 1` would sort
+ * after page one and the card would vanish on the next read. The answer is
+ * `null`, and the caller reads the rest of the column before asking again.
  */
+export function insertionPosition(before: number | null, after: number | null, now?: number, more?: false): number;
+export function insertionPosition(before: number | null, after: number | null, now: number | undefined, more: boolean): number | null;
 export function insertionPosition(
   before: number | null,
   after: number | null,
   now = Date.now(),
-): number {
+  more = false,
+): number | null {
+  if (after == null && more) return null;
   if (before == null && after == null) return now;
   if (before == null) return after != null && after > 0 ? Math.floor(after / 2) : 0;
   if (after == null) return before + 1;

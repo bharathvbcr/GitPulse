@@ -1,7 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "status-popover",
-  "description": "Local status view: receive workspace presentation updates only.",
-  "windows": ["status-popover"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "description": "Local status view: receive workspace presentation updates and call only the three status commands.",
+  "windows": [
+    "status-popover"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-cmd-get-status-state",
+    "allow-cmd-status-action",
+    "allow-cmd-resize-status"
+  ]
 }
