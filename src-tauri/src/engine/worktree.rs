@@ -6216,57 +6216,118 @@ some-future-field whatever
         );
     }
 
-    /// The retry prune must be offered to the gate as its own command.
+    /// Originally `adv_the_retry_prune_is_gated`, which recorded the defect
+    /// that the retry ran a repo-wide `worktree prune --expire now` (and only
+    /// asked that the gate see it). It flipped when the prune was removed: a
+    /// prune drops every stale record, an unmounted unrelated lane's included.
+    /// Now no prune reaches the gate or runs, and a partial removal deletes
+    /// only this lane's own record.
     #[test]
-    fn adv_the_retry_prune_is_gated() {
+    fn adv_removal_never_prunes_the_whole_repository() {
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
-        crate::test_support::git_in(repo, &["worktree", "lock", wt.path().to_str().unwrap()]);
+        let lane = wt.path().to_str().unwrap().to_string();
+        crate::test_support::git_in(repo, &["worktree", "lock", &lane]);
         let wt_dir = wt.path().to_path_buf();
         let mut asked: Vec<String> = Vec::new();
         let mut gate = |argv: &[&str]| -> Result<(), String> {
             asked.push(argv.join(" "));
             Ok(())
         };
-        let _ = merge_and_teardown_with(
+        let result = merge_and_teardown_with(
             repo.to_str().unwrap(),
-            wt.path().to_str().unwrap(),
+            &lane,
             Some("main"),
             false,
             None,
             &mut gate,
             &mut |_| {
+                // The lock is lifted and the directory goes, as a partial delete leaves it.
+                let _ = git_text(repo, &["worktree", "unlock", &lane]);
                 let _ = std::fs::remove_dir_all(&wt_dir);
             },
+        )
+        .expect("the merge landed");
+        assert!(
+            !asked.iter().any(|a| a.contains("prune")),
+            "a prune reached the gate: {asked:?}"
         );
         assert!(
-            asked.iter().any(|a| a.starts_with("worktree prune")),
-            "prune never reached the gate: {asked:?}"
+            result.worktree_removed,
+            "only this lane's record should have finished the removal: {:?}",
+            result.removal_error
         );
+        let listed = git_text(repo, &["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(listed.matches("worktree ").count(), 1, "{listed}");
+        let records = crate::engine::git_cli::resolve_git_common_dir(repo)
+            .unwrap()
+            .join("worktrees");
+        let left = std::fs::read_dir(&records).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "this lane's record was not removed");
     }
 
-    /// Rollback is not gated. Show what the gate sees on a conflict: the
-    /// merge was gated; the rollback `reset --merge` / `merge --abort` is not.
+    /// Originally `adv_the_rollback_runs_commands_the_gate_never_saw`, which
+    /// recorded the bypass: the rollback's `merge --abort` / `reset --merge`
+    /// ran without the gate being asked. It flipped when the rollback was put
+    /// to the gate. A refusal does not stop the rollback (leaving main parked
+    /// is worse, and the gate allowed the merge it undoes); it is recorded.
     #[test]
-    fn adv_the_rollback_runs_commands_the_gate_never_saw() {
+    fn adv_the_rollback_is_shown_to_the_gate() {
         let (dir, wt) = conflicting_fixture();
+        let repo = dir.path();
         let mut asked: Vec<String> = Vec::new();
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut allow = |argv: &[&str]| -> Result<(), String> {
             asked.push(argv.join(" "));
             Ok(())
         };
         let _ = merge_and_teardown_worktree(
-            dir.path().to_str().unwrap(),
+            repo.to_str().unwrap(),
             wt.path().to_str().unwrap(),
             Some("main"),
             false,
             None,
-            &mut gate,
+            &mut allow,
         );
-        eprintln!("gate saw: {asked:?}");
-        assert!(!asked
-            .iter()
-            .any(|a| a.contains("reset") || a.contains("--abort")));
+        assert!(
+            asked
+                .iter()
+                .any(|a| a == "merge --abort" || a == "reset --merge"),
+            "the rollback never reached the gate: {asked:?}"
+        );
+        main_checkout_is_idle(repo);
+
+        // A gate that refuses the rollback is overruled, and says so.
+        let (dir, wt) = conflicting_fixture();
+        let repo = dir.path();
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut |argv: &[&str]| {
+                if argv.contains(&"--abort") || argv.contains(&"reset") {
+                    Err("policy: no aborts".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        let MergeTeardownError::Conflict {
+            message,
+            rolled_back,
+            ..
+        } = refused
+        else {
+            panic!("{refused:?}");
+        };
+        assert!(rolled_back, "{message}");
+        assert!(
+            message.contains("the gate refused") && message.contains("no aborts"),
+            "{message}"
+        );
+        main_checkout_is_idle(repo);
     }
 
     /// A gate that refuses `reset` (a policy where reset is denied) cannot
