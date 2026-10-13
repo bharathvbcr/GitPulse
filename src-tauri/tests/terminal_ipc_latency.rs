@@ -685,7 +685,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
         .collect();
     assert_eq!(list_sessions(&state).len(), SESSIONS);
 
-    let slowest = Mutex::new(Duration::ZERO);
+    let took_all: Mutex<Vec<Duration>> = Mutex::default();
     let failures: Mutex<Vec<String>> = Mutex::default();
     // Calls that wait for the blocking pool would wait for ever here, because
     // it is released only afterwards: the watchdog lets go of it after a minute
@@ -705,8 +705,8 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
             }
         });
         for (index, id) in ids.iter().enumerate() {
-            let (handle, slowest, failures, unfinished) =
-                (&handle, &slowest, &failures, &unfinished);
+            let (handle, took_all, failures, unfinished) =
+                (&handle, &took_all, &failures, &unfinished);
             scope.spawn(move || {
                 let _done = Decrement(unfinished);
                 for n in 0..ROUNDS {
@@ -720,8 +720,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
                         binary,
                     ));
                     let took = started.elapsed();
-                    let mut slowest = slowest.lock().unwrap();
-                    *slowest = (*slowest).max(took);
+                    took_all.lock().unwrap().push(took);
                     if let Err(error) = result {
                         failures
                             .lock()
@@ -760,8 +759,16 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
         failures.len(),
         failures.first()
     );
-    let slowest = slowest.into_inner().unwrap();
-    println!("slowest of {} writes: {slowest:?}", SESSIONS * ROUNDS);
+    let mut took_all = took_all.into_inner().unwrap();
+    took_all.sort();
+    let slowest = took_all[took_all.len() - 1];
+    println!(
+        "{} writes with the blocking pool full: min {:?} median {:?} p99 {:?} max {slowest:?}",
+        took_all.len(),
+        took_all[0],
+        took_all[took_all.len() / 2],
+        took_all[took_all.len() * 99 / 100]
+    );
     assert!(
         slowest < Duration::from_secs(5),
         "a write took {slowest:?} with the blocking pool full; the frontend gives up at 5s"
