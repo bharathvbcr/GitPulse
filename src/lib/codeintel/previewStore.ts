@@ -5,7 +5,7 @@
 
 import { writable, derived, get } from "svelte/store";
 import { invoke } from "../ipc/invoke";
-import { previewDevmapEdits } from "./client";
+import { cancelCodeintelQuery, newCodeintelCancelToken, previewDevmapEdits } from "./client";
 import {
   CODEINTEL_FANOUT_CAP,
   capFanout,
@@ -42,6 +42,20 @@ const initial: PreviewStoreState = {
 
 const { subscribe, update, set } = writable<PreviewStoreState>(initial);
 const generation = beginGeneration();
+
+/**
+ * Cancel token of the `preview_many` call in flight. A superseded or reset
+ * request used to leave its batch running in the backend (up to sixteen
+ * `devmap preview` spawns) with only the answer ignored; tripping the token
+ * stops it before its next file.
+ */
+let inflightCancelToken: string | null = null;
+
+function abandonInflightPreview(): void {
+  const token = inflightCancelToken;
+  inflightCancelToken = null;
+  if (token) void Promise.resolve(cancelCodeintelQuery(token)).catch(() => {});
+}
 
 function pathsKey(paths: string[]): string {
   return [...paths].sort().join("\0");
@@ -106,6 +120,7 @@ export const previewStore = {
   subscribe,
 
   reset() {
+    abandonInflightPreview();
     generation.next();
     set(initial);
   },
@@ -130,6 +145,7 @@ export const previewStore = {
       ) {
         return;
       }
+      abandonInflightPreview();
       generation.next();
       set({
         repoPath,
@@ -151,6 +167,7 @@ export const previewStore = {
     }
 
     const { kept, omitted, truncated, total } = capFanout(paths);
+    abandonInflightPreview();
     const token = generation.next();
     update((s) => ({
       ...s,
@@ -167,7 +184,13 @@ export const previewStore = {
       let outcome: DevmapPreviewOutcome | null = null;
       let fromPreview: DevmapPreviewFileResult[] = [];
       if (pairs.length > 0) {
-        outcome = await previewDevmapEdits(repoPath, pairs);
+        const cancelToken = newCodeintelCancelToken();
+        inflightCancelToken = cancelToken;
+        try {
+          outcome = await previewDevmapEdits(repoPath, pairs, cancelToken);
+        } finally {
+          if (inflightCancelToken === cancelToken) inflightCancelToken = null;
+        }
         if (!generation.isCurrent(token)) return;
         fromPreview = (outcome.files ?? []).map(normalizePreviewFileResult);
       } else {

@@ -79,6 +79,18 @@ function failureWiring(source: keyof typeof REPORTERS) {
 const MAX_TRACKED_REPOS = 8;
 
 /**
+ * The floor each metric waits after a refresh completes is the larger of its
+ * base `minIntervalMs` and ten times that repository's recent measured cost
+ * (an EWMA of the last runs, kept per repository across reloads), up to ten
+ * minutes. Ten keeps a metric busy at most about 9% of the time: a 10 s
+ * language scan on a large repository used to be restarted 20 s after it
+ * finished, a third of the time, while a 50 ms one stays at the base. The base
+ * numbers below are therefore the floor for a *cheap* repository, and the
+ * floor falls back to them on its own once a scan gets cheap.
+ */
+const COST_FLOOR = { factor: 10, maxMs: 10 * 60_000 } as const;
+
+/**
  * Language and line-count statistics.
  *
  * The whole report is the measurement, not just the summed line count: the
@@ -90,6 +102,7 @@ export const locMetric: Metric<LanguageStatsReport> = createMetric<LanguageStats
   measure: (repoPath) => invoke<LanguageStatsReport>("cmd_get_language_stats", { repoPath }),
   debounceMs: 1_500,
   minIntervalMs: 20_000,
+  costFloor: COST_FLOOR,
   // The backend says so itself when its deadline or its 10k-file cap fired.
   // A truncated report is a floor, and must never render as a total.
   isPartial: (report) => report?.truncated === true,
@@ -111,6 +124,7 @@ export const coverageMetric: Metric<CoverageReport> = createMetric<CoverageRepor
   measure: (repoPath) => invoke<CoverageReport>("cmd_scan_coverage", { repoPath }),
   debounceMs: 2_000,
   minIntervalMs: 30_000,
+  costFloor: COST_FLOOR,
   isPartial: (report) => report?.truncated === true,
   maxRepos: MAX_TRACKED_REPOS,
   dependsOn: dependsOnWorktreeContent,
@@ -123,6 +137,7 @@ export const storageMetric: Metric<StorageReport> = createMetric<StorageReport>(
   measure: (repoPath) => invoke<StorageReport>("cmd_storage_scan", { repoPath }),
   debounceMs: 5_000,
   minIntervalMs: 120_000,
+  costFloor: COST_FLOOR,
   isPartial: (report) => report?.scan?.truncated === true,
   maxRepos: MAX_TRACKED_REPOS,
   dependsOn: dependsOnStorage,

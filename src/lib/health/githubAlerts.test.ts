@@ -389,14 +389,62 @@ describe("loadGithubAlerts production cache", () => {
     }
   });
 
-  it("still caches a real failure, which a retry would only repeat", async () => {
+  it("still caches GitHub's own refusal, which a retry would only repeat", async () => {
     mockGithubInvoke({
-      codeScanning: async () => {
-        throw new Error("You are not authorized to read code scanning alerts. (HTTP 403)");
-      },
+      codeScanning: async () =>
+        codeScanningReport({
+          available: false,
+          error: "You are not authorized to read code scanning alerts. (HTTP 403)",
+          unavailable_reason: "forbidden",
+        }),
     });
     await loadGithubAlerts("/forbidden");
-    expect(githubAlertsCache.get("/forbidden")?.codeScanningRequestFailed).toBe(true);
+    expect(githubAlertsCache.get("/forbidden")?.codeScanning.unavailable_reason).toBe("forbidden");
+  });
+
+  // G8: one transient timeout kept showing until a forced refresh, because any
+  // failure but a deferral was cached for the session.
+  it("does not cache a request that failed in transit, so reopening fetches again", async () => {
+    let failing = true;
+    let calls = 0;
+    mockGithubInvoke({
+      dependabot: async () => {
+        calls += 1;
+        if (failing) throw new Error("gh api timed out after 45s");
+        return dependabotReport({}, []);
+      },
+    });
+    const failed = await loadGithubAlerts("/transient");
+    expect(failed.dependabotRequestFailed).toBe(true);
+    expect(githubAlertsCache.get("/transient")).toBeUndefined();
+
+    failing = false;
+    const reopened = await loadGithubAlerts("/transient");
+    expect(calls).toBe(2);
+    expect(reopened.dependabotRequestFailed).toBe(false);
+    expect(githubAlertsCache.get("/transient")?.dependabotRequestFailed).toBe(false);
+  });
+
+  it("does not cache a report the backend classed as a transport failure", async () => {
+    mockGithubInvoke({
+      codeScanning: async () =>
+        codeScanningReport({
+          available: false,
+          error: "gh api timed out after 45s",
+          unavailable_reason: "transport",
+        }),
+    });
+    await loadGithubAlerts("/transport-report");
+    expect(githubAlertsCache.get("/transport-report")).toBeUndefined();
+  });
+
+  it("does not cache a result that is missing severity tiers", async () => {
+    mockGithubInvoke({
+      dependabot: async () =>
+        dependabotReport({ truncated: true, partial_tiers: ["high"] }),
+    });
+    await loadGithubAlerts("/partial");
+    expect(githubAlertsCache.get("/partial")).toBeUndefined();
   });
 
   it("does not let a superseded fetch overwrite a later refresh", async () => {
@@ -560,6 +608,23 @@ describe("maybeNotifyGithubAlerts", () => {
     await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
     expect(d.onError).toHaveBeenCalledWith("HTTP 403");
     expect(d.notify).not.toHaveBeenCalled();
+  });
+
+  it("does not call a result missing a severity tier clean", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport(
+            { truncated: true, partial_tiers: ["critical", "high"] },
+            [dependabotAlert({ severity: "low" })],
+          ),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalledWith(
+      "Dependabot alerts are incomplete: the critical, high severity tiers could not be read.",
+    );
   });
 
   it("still warns about known serious alerts when the other check failed", async () => {

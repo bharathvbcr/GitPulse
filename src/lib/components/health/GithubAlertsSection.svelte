@@ -72,7 +72,26 @@
 
   const spec = $derived(healthSection(id));
   const empty = $derived(count.shown === 0);
+  /**
+   * Severity tiers the fetch could not read. The list is then a lower bound,
+   * and an empty one is not "no open alerts": it is shown beside the rows (or
+   * instead of the all-clear), never as an unavailable report.
+   */
+  const missingTiers = $derived(report?.partial_tiers ?? []);
 </script>
+
+{#snippet partialNotice()}
+  <div
+    role="status"
+    data-testid="github-alerts-partial"
+    class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200"
+  >
+    Incomplete: the {missingTiers.join(", ")} severity
+    {missingTiers.length === 1 ? "tier" : "tiers"} of {noun} could not be fetched, so alerts
+    of {missingTiers.length === 1 ? "that severity" : "those severities"} may be missing.
+    Check again to retry.
+  </div>
+{/snippet}
 
 <HealthSection {id} count={empty ? null : count} {tone}>
   {#if !report}
@@ -101,8 +120,15 @@
       {report.slug || "this repository"}.
     </p>
   {:else if empty}
-    <p class="text-textMuted">No open {noun} on {report.slug || "this repository"}.</p>
+    {#if missingTiers.length > 0}
+      {@render partialNotice()}
+    {:else}
+      <p class="text-textMuted">No open {noun} on {report.slug || "this repository"}.</p>
+    {/if}
   {:else}
+    {#if missingTiers.length > 0}
+      {@render partialNotice()}
+    {/if}
     <HealthTable caption={`${spec?.heading ?? id}: ${noun}`} {columns}>
       {@render row()}
     </HealthTable>
