@@ -24,6 +24,22 @@ mod common;
 use gitpulse_lib::devmap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+/// The live index runs one automatic build at a time across every repository
+/// in the process (`devmap::live::LiveBuildSlot`, deliberate since the duty
+/// cycle governor): a second ask while another repository's build runs answers
+/// `SkipBuilding`, and the frontend retries it. Two tests here each drive a
+/// cold `maybe_refresh` on their own scratch repository, and libtest runs them
+/// in one process on parallel threads, so without this they race for the slot
+/// and the loser sees `SkipBuilding` where it asked for `Refresh`. A test that
+/// asserts a `Refresh` holds this for its whole body.
+fn one_live_build_at_a_time() -> MutexGuard<'static, ()> {
+    static LIVE_BUILD: Mutex<()> = Mutex::new(());
+    LIVE_BUILD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -73,6 +89,7 @@ fn devmap_installed() -> bool {
 
 #[test]
 fn opening_a_repository_leaves_it_indexed_and_clean() {
+    let _one_build = one_live_build_at_a_time();
     if !devmap_installed() {
         eprintln!("SKIPPED: no `devmap` binary resolved; nothing to measure against");
         return;
@@ -142,6 +159,7 @@ fn opening_a_repository_leaves_it_indexed_and_clean() {
 
 #[test]
 fn a_deleted_map_artifact_heals_on_the_next_activation() {
+    let _one_build = one_live_build_at_a_time();
     if !devmap_installed() {
         eprintln!("SKIPPED: no `devmap` binary resolved; nothing to measure against");
         return;
