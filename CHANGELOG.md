@@ -21,9 +21,91 @@ before that tag is pushed.
   answer still in flight for the repository you left no longer lands in the one
   you are looking at. The contents of each view panel are still rebuilt per
   repository. One visible difference: the view's entrance fade no longer replays
-  on a switch.
+  on a switch. A merge dialog left open across a switch stays up, says the
+  repository changed, and refuses to merge until you close it.
+- **The live code index no longer rebuilds on every edit.**
+  - After a productive build it rests for a while, at least 30 s and twice the
+    build's own time, before the next one.
+  - Its own writes no longer count as edits.
+  - Only one automatic build runs at a time.
+  - Only the active tab's repository is kept live.
+  - A repository whose index takes too long backs off for 10 minutes, doubling
+    up to an hour, and says so.
+  - In the edit-storm benchmark, builds per 40 edits went from 40 to 1.
+- **Listing worktrees is cheap by default.** The list asks git only for what
+  every caller needs, and a worktree whose status is clean skips its diff. The
+  Worktrees panel still asks for the full measurements.
+- **Language statistics are cached per file and read in parallel.** Each file is
+  cached by size, inode and modification time. Files under `vendored/` and
+  `framework/`, and anything `.gitattributes` marks `linguist-vendored` or
+  `linguist-generated`, are no longer counted. A large binary no longer makes
+  the scan stop early on this repository.
+- **The documentation vault refreshes incrementally.**
+  - It reads only the notes that changed.
+  - The build happens outside the lock that queries wait on.
+  - Renaming a note reuses the cached vault instead of rebuilding it.
+- **Reading the ledger no longer asks git for the worktree list every time.**
+  - Git's answer is remembered while the repository's worktree registry is
+    unchanged. A worktree that is added, removed or moved, or a checkout that
+    only claims to belong, is checked with git again. Trust is still checked on
+    every call.
+  - A sibling worktree's ledger is imported again only when its files change.
+- **Catching up on agent activity is bounded and done once per repository.**
+  - One time budget covers the whole pass: the git calls, the ledger reads, the
+    directory walk and the transcript reads. A pass cut short says so, with how
+    much it read and how much there was.
+  - A repository is caught up at most once a minute, however often you switch
+    tabs.
+  - Each Claude and Codex transcript is read and parsed once for all of a
+    repository's worktrees, instead of once per worktree, in 1 MiB chunks.
+- **The Insights snapshot reads each worktree's status once.**
+  - The worktree rows and the collision check now describe the same read.
+  - The whole snapshot stays within its deadline, and a worktree it did not
+    reach is reported as not scanned.
+  - The collision check runs in the caller's background class.
+  - Detecting a paused rebase or merge no longer starts git.
+  - On an 18-worktree fixture, the snapshot went from 37 git processes to 21.
+- **Commit details take one git call, and repeat views take none.** Re-opening
+  the same commit is served from a cache for about a minute. A commit whose file
+  list is larger than 4 MB shows how many files it listed and marks the totals
+  as partial.
+- **The menu-bar status popover stays quiet while hidden.** It receives updates
+  only while it is open, and its web view is closed after five minutes hidden.
+- **The spawn budget shared between GitPulse processes is versioned.**
+  - It is now `spawn-budget.v2`.
+  - A record that cannot be read now counts as an empty budget, not a full one.
+  - Concurrent writers no longer tear records.
+- **Benchmarks are committed.** `cargo bench` covers:
+  - terminal throughput and echo latency;
+  - idle wake-ups;
+  - the live-index duty cycle;
+  - the main command timings;
+  - graph layout and word diff;
+  - watcher event handling;
+  - the MCP protocol.
+
+  Each run is interleaved, records the host's load, and is compared against a
+  committed baseline by `scripts/bench-compare.mjs`. See
+  `docs/PERFORMANCE.md`.
 
 ### Fixed
+
+- **Branch names that git allows now work.**
+  - Branches such as `fix/a&b`, `feat(ui)=x` or `a]b` were refused as "Invalid
+    ref name". GitPulse now applies git's own ref-name rules.
+  - Two rules stay stricter than git: a name may not start with `-`, and it may
+    not contain C1 control characters.
+  - Branch-backup files quote each name, so a pasted restore line cannot run
+    part of a name as a command.
+- **Copying build caches into a new worktree is all or nothing.**
+  - A partial copy is reported as a failure.
+  - The target must be one of the repository's own worktrees.
+  - Cargo's `target/` is shared only by a real copy-on-write clone, and never
+    while a build holds it.
+- **A liveness probe on the instance mailbox no longer logs a warning.**
+- **WebView2-only browser arguments no longer sit in the macOS configuration.**
+  They now live only in the Windows configuration.
+- **A build that would ship source maps now fails.**
 
 - **A commit that finished after you switched repository tabs cleared the other
   repository's message.** The commit box wiped the draft and the amend flag of
