@@ -292,6 +292,46 @@ name = "host_load"
 harness = false
 test = false
 
+# The benches below run on the shared harness in `benches/common` (JSON report,
+# host-load snapshot, work counters; see docs/PERFORMANCE.md "Benchmark
+# harness"). `harness = false` is required: the default libtest harness would
+# refuse their `fn main`. `test = false` keeps them out of `cargo test` for the
+# same reason as above; the scheduled `benches.yml` workflow runs them.
+[[bench]]
+name = "graph_diff"
+harness = false
+test = false
+
+[[bench]]
+name = "watcher"
+harness = false
+test = false
+
+[[bench]]
+name = "repo_read"
+harness = false
+test = false
+
+[[bench]]
+name = "command_timings"
+harness = false
+test = false
+
+[[bench]]
+name = "terminal_pty"
+harness = false
+test = false
+
+[[bench]]
+name = "idle_wakeups"
+harness = false
+test = false
+
+[[bench]]
+name = "live_index"
+harness = false
+test = false
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"

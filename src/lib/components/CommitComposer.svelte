@@ -15,6 +15,7 @@
   import { isIdentityMissing } from "../repos/gitPreflight";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatError } from "../ui/formatError";
+  import { repoScope } from "../repos/repoScope.svelte";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { previewStore, previewSummary } from "../codeintel/previewStore";
   import { getImpactLayeredMany, cancelCodeintelQuery, newCodeintelCancelToken } from "../codeintel/client";
@@ -133,9 +134,39 @@
 
   $effect(() => () => blastGuard?.cancel());
 
+  /**
+   * Mounted once per window, so a tab switch re-points the store (the draft and
+   * the amend flag are session fields, and follow it) and nothing else. What is
+   * local is the previous repository's last generation, error, verdict, the
+   * "include unstaged" choice, an in-flight commit or generation and the blast
+   * radius over its staged set: all of it described a commit that is not the
+   * one on screen now. `apple` is a property of the host, not of a repository.
+   */
+  const tabScope = repoScope(
+    () => $currentRepoPath,
+    () => {
+      includeUnstaged = false;
+      isGenerating = false;
+      generation = null;
+      aiError = null;
+      commitError = null;
+      isCommitting = false;
+      lastVerdict = null;
+      // Cancelled once, here, and let go: the blast effect cancels whatever
+      // guard it finds when it re-runs for the new repository, and a guard
+      // that is still held would be cancelled (and its query cancelled over
+      // IPC) a second time.
+      blastGuard?.cancel();
+      blastGuard = null;
+      blast = null;
+      blastLoading = false;
+    },
+  );
+
   async function generateMessage() {
     const path = $repoStore.currentPath;
     if (!path || isGenerating) return;
+    const epoch = tabScope.epoch;
     isGenerating = true;
     aiError = null;
     generation = null;
@@ -143,17 +174,26 @@
       const result = await harnessStore.generateCommitMessage(path);
       // The user may have switched repositories while generation ran; writing
       // the draft now would land it in the active session — the wrong repo.
-      if ($repoStore.currentPath !== path) return;
+      // The epoch also catches A -> B -> A, which a path comparison cannot.
+      if (!tabScope.isCurrent(epoch)) return;
       generation = result;
       commitDraft.set(result.text);
     } catch (err: unknown) {
+      if (!tabScope.isCurrent(epoch)) return;
       aiError = formatError(err);
     } finally {
-      isGenerating = false;
+      if (tabScope.isCurrent(epoch)) isGenerating = false;
     }
   }
 
-  async function finishCommit(outcome: { ok: boolean; error?: string; policy?: PolicyVerdict | null }) {
+  async function finishCommit(
+    outcome: { ok: boolean; error?: string; policy?: PolicyVerdict | null },
+    epoch: number,
+  ) {
+    // The commit ran against the repository it was started in. When the person
+    // has since switched, its verdict and error describe a commit that is not
+    // on screen, and clearing the draft would clear the other repository's.
+    if (!tabScope.isCurrent(epoch)) return;
     lastVerdict = outcome.policy ?? null;
     if (!outcome.ok) {
       // A refused commit keeps its message: the user has to change the action,
@@ -172,12 +212,16 @@
     if (!message) return;
     if (conflictedCount > 0) return;
     if (useQuick ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending) return;
+    const epoch = tabScope.epoch;
     commitError = null;
     isCommitting = true;
     try {
-      await finishCommit(useQuick ? await repoStore.quickCommit(message) : await repoStore.commit(message, isAmending));
+      await finishCommit(
+        useQuick ? await repoStore.quickCommit(message) : await repoStore.commit(message, isAmending),
+        epoch,
+      );
     } finally {
-      isCommitting = false;
+      if (tabScope.isCurrent(epoch)) isCommitting = false;
     }
   }
 

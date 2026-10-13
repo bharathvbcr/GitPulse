@@ -634,9 +634,13 @@ pub fn create_backup(repo_path: &str, branches: &[StaleBranchInfo]) -> Result<St
 
     for branch in branches {
         content.push_str(&format!("# {}\n", branch.name));
+        // The file tells a person to run these lines, so a name git allows but
+        // a shell reads as syntax (`fix/a;b`, `x$(y)`) is quoted, and
+        // [`restore_backup_with_gate`] reads the quoting back.
         content.push_str(&format!(
             "git branch {} {}\n\n",
-            branch.short_name, branch.last_commit_sha
+            crate::harness::policy::shell_quote(&branch.short_name),
+            branch.last_commit_sha
         ));
     }
 
@@ -973,9 +977,17 @@ where
             continue;
         };
         let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let Some(&name) = parts.first() else {
+        let Some(&word) = parts.first() else {
             continue;
         };
+        let Some(unquoted) = unquote_backup_word(word) else {
+            failed.push((
+                word.to_string(),
+                "Malformed backup line: the branch name's quoting is not closed".to_string(),
+            ));
+            continue;
+        };
+        let name = unquoted.as_str();
 
         if let Some(ref set) = filter_set {
             if !set.contains(name) {
@@ -1083,6 +1095,30 @@ fn validate_full_oid(oid: &str) -> Result<(), String> {
         return Err("Invalid commit id: expected a full object id".into());
     }
     Ok(())
+}
+
+/// The branch name in a backup line, with the quoting
+/// [`crate::harness::policy::shell_quote`] wrote taken off: a bare word (every
+/// backup before names were quoted) is itself, and quoted runs are joined with
+/// `\'`. `None` when a quote is left open.
+///
+/// A ref name never contains a backslash or whitespace, so splitting the line on
+/// whitespace first cannot cut a quoted name in two.
+fn unquote_backup_word(word: &str) -> Option<String> {
+    let mut name = String::with_capacity(word.len());
+    let mut quoted = false;
+    let mut chars = word.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => quoted = !quoted,
+            '\\' if !quoted && chars.peek() == Some(&'\'') => {
+                name.push('\'');
+                chars.next();
+            }
+            _ => name.push(c),
+        }
+    }
+    (!quoted).then_some(name)
 }
 
 /// Every local branch and the commit it points at, from one listing.
@@ -1307,6 +1343,94 @@ mod tests {
         assert_eq!(rev(&repo, "refs/heads/taken"), Some(second));
         assert!(rev(&repo, "refs/heads/short").is_none());
         assert!(rev(&repo, "refs/heads/extra").is_none());
+    }
+
+    fn stale(name: &str, sha: &str) -> StaleBranchInfo {
+        StaleBranchInfo {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            age_days: 400,
+            severity: "stale".to_string(),
+            is_merged: true,
+            merged_by_tree: false,
+            is_remote: false,
+            is_protected: false,
+            is_wip: false,
+            is_current_or_worktree: false,
+            last_commit_sha: sha.to_string(),
+            last_commit_timestamp: 0,
+            last_author: "t".to_string(),
+            last_summary: "s".to_string(),
+        }
+    }
+
+    /// The backup file says "run the git command shown below". A branch name
+    /// git allows but a shell reads as syntax must be written quoted, so a
+    /// person pasting the line cannot run part of the name; and the app's own
+    /// restore must read the quoting back to the exact name.
+    #[test]
+    fn a_backup_quotes_names_a_shell_would_run_and_restores_them_exactly() {
+        let _store = BackupStore::new();
+        let (_dir, repo) = seeded_repo();
+        let tip = rev(&repo, "HEAD").unwrap();
+        let names = [
+            "fix/a&b",
+            "x;touch${IFS}owned",
+            "q$(id)",
+            "it's",
+            "plain/ok",
+        ];
+        let branches: Vec<StaleBranchInfo> = names.iter().map(|n| stale(n, &tip)).collect();
+        let backup = create_backup(repo.to_str().unwrap(), &branches).unwrap();
+
+        let text = std::fs::read_to_string(&backup).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("git branch "))
+            .collect();
+        assert_eq!(lines.len(), names.len(), "{text}");
+        assert!(
+            lines.contains(&format!("git branch 'fix/a&b' {tip}").as_str()),
+            "{text}"
+        );
+        assert!(lines.contains(&format!("git branch 'x;touch${{IFS}}owned' {tip}").as_str()));
+        assert!(lines.contains(&format!("git branch 'q$(id)' {tip}").as_str()));
+        assert!(lines.contains(&format!("git branch 'it'\\''s' {tip}").as_str()));
+        assert!(lines.contains(&format!("git branch plain/ok {tip}").as_str()));
+
+        let result =
+            restore_backup_with_gate(repo.to_str().unwrap(), &backup, None, |_| Ok(())).unwrap();
+        assert!(result.failed.is_empty(), "{result:?}");
+        let mut restored = result.restored.clone();
+        restored.sort();
+        let mut expected: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        assert_eq!(restored, expected);
+        for name in names {
+            assert_eq!(
+                rev(&repo, &format!("refs/heads/{name}")),
+                Some(tip.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_quote_in_a_backup_line_fails_that_line_only() {
+        let _store = BackupStore::new();
+        let (_dir, repo) = seeded_repo();
+        let tip = rev(&repo, "HEAD").unwrap();
+        let backup = create_backup(repo.to_str().unwrap(), &[]).unwrap();
+        std::fs::write(
+            &backup,
+            format!("git branch 'open {tip}\ngit branch fine {tip}\n"),
+        )
+        .unwrap();
+        let result =
+            restore_backup_with_gate(repo.to_str().unwrap(), &backup, None, |_| Ok(())).unwrap();
+        assert_eq!(result.restored, vec!["fine".to_string()], "{result:?}");
+        assert_eq!(result.failed.len(), 1, "{result:?}");
+        assert!(result.failed[0].1.contains("quoting"), "{result:?}");
     }
 
     /// A refused clean deletes nothing, so it journals no deletion.

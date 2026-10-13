@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Repository tab switch checks</title>
+    <style>
+      html, body { margin: 0; background: rgb(11 14 23); }
+      #app { width: 1280px; height: 900px; overflow: hidden; position: relative; }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      import "../src/app.css";
+
+      // The real App, two real repositories, and a fixture backend that can hold
+      // any one answer back. What this page proves is what a tab switch does to
+      // the parts of the window that are NOT re-created for it: the same DOM
+      // nodes must survive, none of the repository being left may stay on
+      // screen, and an answer that was in flight for it must not land in the
+      // repository now showing. A remount produces a new node, so identity is
+      // the mount count; nothing in production is instrumented for this.
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      const unexpected = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+      // A frame, or 50 ms if none comes: a window that is not on screen (the
+      // WebKit runner's) never delivers animation frames.
+      const raf = () => new Promise((resolve) => {
+        const timer = setTimeout(resolve, 50);
+        requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
+      });
+
+      const ALPHA = "/code/tabs/alpha";
+      const BETA = "/code/tabs/beta";
+      const NOW = Math.floor(Date.now() / 1000);
+
+      const branch = (name, extra = {}) => ({
+        name, is_current: false, is_remote: false, remote_name: null, tip_commit_id: `${name.length}`.padEnd(12, "a"),
+        ahead_count: 0, behind_count: 0, upstream: null, is_default: false, is_gone: false,
+        last_commit_timestamp: NOW - 3600, last_author: "Alex", last_summary: "Work",
+        commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0, compared_to: "main",
+        ...extra,
+      });
+      const file = (path, staged = false) => ({
+        path, old_path: null, status_code: "M", is_staged: staged, is_conflicted: false, additions: 3, deletions: 1,
+      });
+      const worktree = (path, name, branchName, isMain) => ({
+        path, name, head: "abcdef0123456789", branch: branchName, is_bare: false, is_detached: false, is_main: isMain,
+        is_locked: false, is_prunable: false, dirty_files: 0, diff_stat: null, main_divergence: null, active_routes: [],
+      });
+      // Alpha is deliberately the bigger one: enough changed files that the
+      // sidebar body scrolls, so a scroll offset left behind is observable.
+      // Gamma carries a branch row the branch list cannot draw (no name), so the
+      // sidebar's pane fails on it and on nothing else: the status bar and the
+      // workspace read branches too, but only the grouping in BranchList throws.
+      const GAMMA = "/code/tabs/gamma";
+      const DATA = {
+        [GAMMA]: {
+          branches: [branch("main", { is_current: true, is_default: true }), { ...branch("undrawable"), name: null }],
+          statuses: [file("src/gamma.ts")],
+          worktrees: [worktree(GAMMA, "gamma", "main", true)],
+        },
+        [ALPHA]: {
+          branches: [branch("main", { is_current: true, is_default: true }), branch("feat/alpha-only")],
+          statuses: [file("src/alpha/staged.ts", true), ...Array.from({ length: 60 }, (_, i) => file(`src/alpha/file-${String(i).padStart(2, "0")}.ts`))],
+          worktrees: [worktree(ALPHA, "alpha", "main", true), worktree(`${ALPHA}-wt-one`, "alpha-wt-one", "feat/alpha-only", false)],
+        },
+        [BETA]: {
+          branches: [branch("main", { is_current: true, is_default: true }), branch("fix/beta-only")],
+          statuses: [file("docs/beta-staged.md", true), file("docs/beta.md")],
+          worktrees: [worktree(BETA, "beta", "main", true), worktree(`${BETA}-wt-two`, "beta-wt-two", "fix/beta-only", false)],
+        },
+      };
+
+      // ---- the fixture backend ------------------------------------------------
+      const calls = [];
+      // A held answer: `hold(cmd, repoPath)` makes the next such call wait until
+      // `release()`. Calls are matched by command and by the repository asked.
+      const holds = new Map();
+      const hold = (cmd, repoPath) => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        holds.set(`${cmd}|${repoPath}`, gate);
+        return () => { holds.delete(`${cmd}|${repoPath}`); release(); };
+      };
+      const langStats = () => ({
+        stats: [
+          { language: "TypeScript", code_lines: 25000, percentage: 62, color_hex: "#3178c6", category: "programming", file_count: 400 },
+          { language: "Rust", code_lines: 15000, percentage: 38, color_hex: "#dea584", category: "programming", file_count: 120 },
+        ],
+        truncated: false, scanned_files: 520, candidate_files: 520,
+      });
+      const fixtures = {
+        cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
+        cmd_list_branches: (a) => DATA[a.repoPath]?.branches ?? [],
+        cmd_get_status: (a) => DATA[a.repoPath]?.statuses ?? [],
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_repo_operation: () => null,
+        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_watch_repo: (a) => a.repoPath,
+        cmd_unwatch_repo: () => null,
+        cmd_set_recent_menu: () => null,
+        cmd_last_fetch_at: () => null,
+        cmd_note_tab_activated: () => null,
+        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_devcouncil_init: (a) => ({
+          repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false,
+        }),
+        cmd_devmap_maybe_refresh: () => ({
+          decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null,
+        }),
+        cmd_list_worktrees: (a) => DATA[a.repoPath]?.worktrees ?? [],
+        cmd_get_language_stats: () => langStats(),
+        cmd_apple_intelligence_status: () => ({ compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "Not in this build." }),
+        cmd_commit: () => null,
+        cmd_ai_generate_commit_message: (a) => ({
+          text: `generated for ${a.repoPath}`, model: "fixture-model", context_source: "staged diff", prompt_tokens: 0, elapsed_ms: 1,
+          budget: { planned_by_harness: true }, warnings: [],
+        }),
+        // Both repositories are fully trusted and have a sibling worktree, so
+        // the trust banner has nothing to offer.
+        cmd_repository_trust: (a) => ({
+          path: a.repoPath, git_dir: `${a.repoPath}/.git`, common_dir: `${a.repoPath}/.git`, identity: "fixture", scope: "repository", worktrees: 2,
+        }),
+        // One row per revision asked, in order -- the store refuses a short answer.
+        cmd_provenance_freshness_batch: (a) => (a.revisions ?? []).map((rev) => ({
+          commit_sha: rev, distance: null, confidence: null, is_fresh: false, unmeasured_reason: "harness fixture",
+          notes_readable: false, verification: null, session: null,
+        })),
+        cmd_task_view: () => ({
+          available: false, store_path: "", leases: [], evidence: [], evidence_truncated: false, gaps: [], gaps_truncated: false,
+          runs: [], runs_truncated: false, error: "",
+        }),
+        cmd_worktree_task: () => null,
+        cmd_collision_risk: () => ({
+          ok: true, truncated: false, overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1, unscanned_worktrees: 0,
+          failed_worktrees: 0, shared_worktree_files: 0, sessions_ok: true, sessions_error: "", shared_worktrees: [], items: [], error: "",
+        }),
+        cmd_github_context: () => ({
+          available: false, error: "", runs_error: "", warnings: [], pull_requests: [], workflow_runs: [], issues: [], releases: [],
+        }),
+        cmd_grants_view: () => ({ available: false, error: "", grants: [] }),
+        cmd_terminal_sessions: () => [],
+        cmd_ledger_tail: () => [],
+        cmd_get_file_content: () => "export {};\n",
+      };
+      // Answered with nothing, on purpose: the window's background services
+      // (menus, alerts, tool discovery, the ledger, GitHub alerts) that a tab
+      // switch neither starts nor waits for. Listed rather than defaulted so a
+      // command this page has not met is still reported as unexpected.
+      const QUIET = new Set([
+        "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
+        "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
+        "cmd_workbench_request", "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
+        "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel", "cmd_host_load_status",
+      ]);
+      // The code-graph service is not installed in this fixture, which is what
+      // a refused call means to its callers.
+      const REFUSED = new Set(["cmd_devmap_preview_many", "cmd_codeintel_impact_layered_many"]);
+      const handler = async (cmd, args) => {
+        calls.push({ cmd, repo: args?.repoPath ?? null, at: performance.now() });
+        const gate = holds.get(`${cmd}|${args?.repoPath}`);
+        if (gate) await gate;
+        if (cmd.startsWith("plugin:")) return 1;
+        if (fixtures[cmd]) return fixtures[cmd](args ?? {});
+        if (QUIET.has(cmd)) return null;
+        if (REFUSED.has(cmd)) throw new Error("code graph unavailable in this fixture");
+        unexpected.push(cmd);
+        return null;
+      };
+
+      // The window is looked at for the whole run (WKWebView reports no focus).
+      const { holdForeground } = await import("./foreground.ts");
+      holdForeground();
+      const { mockIPCWithEvents } = await import("./tauriMocks.ts");
+      mockIPCWithEvents(handler);
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { createChecks, CheckFailed } = await import("./checks.ts");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
+      const { locMetric } = await import("../src/lib/metrics/repoMetrics.ts");
+      const App = (await import("../src/App.svelte")).default;
+      // The view is a lazy chunk; on a cold dev server compiling its graph is
+      // seconds of work that has nothing to do with a switch. Pulled in now,
+      // the app's own import of it is a cache hit.
+      const loadStarted = performance.now();
+      await import("../src/lib/components/HistoryView.svelte");
+      const viewLoadMs = Math.round(performance.now() - loadStarted);
+
+      const { results, check: hardCheck, stopped } = createChecks();
+      // A failed check is recorded and the page carries on, so one run names
+      // every way a switch leaks rather than the first. Preconditions use
+      // `hardCheck`: a page that did not boot has nothing worth continuing.
+      const check = (name, assertion) => {
+        try { hardCheck(name, assertion); } catch (error) { if (!(error instanceof CheckFailed)) throw error; }
+      };
+      const wait = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+      const settle = async () => { await tick(); await wait(); await tick(); await raf(); };
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const text = (el) => (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+      const type = (el, value) => { el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); };
+      const tabFor = (path) => get(repoStore).openTabs.find((t) => t.path === path);
+      const activePath = () => get(repoStore).currentPath;
+      const switchTo = async (path) => { await repoStore.activateTab(tabFor(path).id); await settle(); };
+      const sleepUntil = async (predicate, ms = 3000) => {
+        const end = performance.now() + ms;
+        while (performance.now() < end) { if (predicate()) return true; await wait(20); }
+        return predicate();
+      };
+
+      // ---- where things are -----------------------------------------------------
+      const sidebar = () => $("aside.gp-sidebar");
+      const statusBar = () => $('footer[aria-label="Repository Status Bar"]');
+      const branchList = () => $('[role="tree"][aria-label="Branches"]');
+      const worktreesPanel = () => {
+        const label = $$("span").find((el) => el.children.length === 0 && /^Worktrees \(\d+\)$/.test(text(el)));
+        return label?.closest("div.flex")?.parentElement ?? null;
+      };
+      const composerBox = () => $('textarea[placeholder^="Commit message"]')?.parentElement ?? null;
+      const textarea = () => $('textarea[placeholder^="Commit message"]');
+      const fileFilter = () => $('input[aria-label="Filter files"]');
+      const bodyScroller = () => fileFilter()?.closest(".overflow-y-auto");
+      const branchFilter = () => $('input[placeholder="Filter branches…"]');
+      const chip = (label) => $$("button", branchList()).find((b) => text(b).startsWith(label));
+      const createInput = () => $('input[placeholder="feat/name"]');
+      const worktreeAdd = () => $('button[aria-label="Create worktree"]');
+      const worktreePath = () => $('input[placeholder="/absolute/path for the worktree"]');
+      const includeUnstaged = () => $('input[aria-label="Include unstaged files in this commit"]');
+      const generateBtn = () => $$("button", composerBox()).find((b) => text(b).includes("Generate") || text(b).includes("Writing"));
+      const commitBtn = () => $('button[title^="Commit staged files"]');
+      const agentTrigger = () => $("aside [data-agent-commit-menu] button");
+      const agentPanel = () => $('[data-testid="agent-commit-menu"]');
+      const agentNote = () => $('input[placeholder^="e.g. Focus on UI fix"]');
+      const langTrigger = () => $("[data-language-trigger]");
+      const langPanel = () => $("[data-language-panel]");
+      const contextMenu = () => $('[role="menu"]');
+
+      // The nodes whose survival is the whole point.
+      const probes = () => ({
+        sidebar: sidebar(),
+        statusBar: statusBar(),
+        branchList: branchList(),
+        worktrees: worktreesPanel(),
+        composer: textarea(),
+        workspace: $("main.gp-workspace"),
+        viewShell: $("main.gp-workspace .gp-view"),
+        sectionBar: $('[role="tablist"][aria-label$="sections"]'),
+        panel: $('main.gp-workspace [role="tabpanel"]'),
+      });
+      const PROBE_KEYS = ["sidebar", "statusBar", "branchList", "worktrees", "composer", "workspace", "viewShell", "sectionBar", "panel"];
+      const panelContent = () => $('main.gp-workspace [role="tabpanel"] > *');
+      const same = (before, after, key) => !!before[key] && before[key] === after[key] && after[key].isConnected;
+
+      const report_ = () => {
+        $("#result").textContent = results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
+      };
+      let diagnostics = "";
+
+      // A run that hangs is reported, not timed out: the runner hands back only
+      // the verdict, so a hang would otherwise say nothing about where.
+      let published = false;
+      const publish = async () => {
+        if (published) return;
+        published = true;
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected: [...new Set(unexpected)], diagnostics }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      };
+      setTimeout(() => {
+        if (published) return;
+        const last = results.at(-1)?.name ?? "the start";
+        results.push({
+          name: `hung after "${last}"; sidebar=${!!sidebar()} workspace=${!!$("main.gp-workspace")} lastCalls=${calls.slice(-6).map((c) => c.cmd).join(",")} errors=${errors.join(" | ").slice(0, 300)}`,
+          pass: false,
+        });
+        void publish();
+      }, 105000);
+
+      (async () => {
+        try {
+          interfaceStore.setAutoHideRepoTabs(false);
+          mount(App, { target: $("#app") });
+          await settle();
+          await repoStore.openRepo(ALPHA, { activate: true });
+          await repoStore.openRepo(BETA, { activate: false });
+          // Both on History: the wrappers swap when the view changes, so a
+          // mount count across a switch only means something inside one view.
+          await switchTo(BETA);
+          repoStore.setActiveTab("history");
+          await switchTo(ALPHA);
+          repoStore.setActiveTab("history");
+          // Measurements follow the visible window on their own; an unfocused
+          // WebKit runner is not one, so ask for the scans a person would have.
+          await locMetric.refresh(ALPHA, { force: true });
+          await locMetric.refresh(BETA, { force: true });
+          await sleepUntil(() => worktreesPanel() && text(worktreesPanel()).includes("alpha-wt-one") && langTrigger() && $('main.gp-workspace [role="tabpanel"]'), 25000);
+          await settle();
+          hardCheck("boots on alpha with the sidebar, status bar and workspace on screen", () =>
+            activePath() === ALPHA && sidebar() && statusBar() && $("main.gp-workspace"));
+          const first = probes();
+          hardCheck("every shell probe resolves before the first switch", () => {
+            const missing = PROBE_KEYS.filter((k) => !first[k]);
+            if (missing.length) throw new Error(`missing: ${missing.join(", ")}; workspace html: ${($("main.gp-workspace")?.innerHTML ?? "none").slice(0, 700)}; activeTab=${get(repoStore).activeTab}`);
+            return true;
+          });
+          hardCheck("alpha's own data is on screen (worktree, language segment)", () =>
+            text(worktreesPanel()).includes("alpha-wt-one") && langTrigger());
+          const firstContent = panelContent();
+          hardCheck("the view panel has content to compare", () => !!firstContent);
+
+          // ---- 1. mount counts: the shell survives A -> B -> A -> B -------------
+          const applePerSwitch = [];
+          const ipcPerSwitch = [];
+          const sequence = [BETA, ALPHA, BETA];
+          let lastProbes = first;
+          for (const [i, target] of sequence.entries()) {
+            const mark = calls.length;
+            await switchTo(target);
+            const issued = calls.slice(mark);
+            applePerSwitch.push(issued.filter((c) => c.cmd === "cmd_apple_intelligence_status").length);
+            const tally = {};
+            for (const call of issued) tally[call.cmd] = (tally[call.cmd] ?? 0) + 1;
+            ipcPerSwitch.push(`${issued.length} calls: ${Object.entries(tally).sort().map(([cmd, n]) => `${cmd.replace(/^cmd_/, "")}x${n}`).join(" ")}`);
+            const now = probes();
+            const label = `switch ${i + 1} (-> ${target.split("/").pop()})`;
+            for (const key of PROBE_KEYS) {
+              check(`${label}: ${key} is the same node (not remounted)`, () => same(first, now, key));
+            }
+            check(`${label}: the keyed panel content is rebuilt for the new repository`, () =>
+              panelContent() && panelContent() !== lastProbes.__content && panelContent() !== firstContent);
+            lastProbes = { ...now, __content: panelContent() };
+          }
+          check("IPC: a tab switch does not re-ask the host whether Apple Intelligence exists", () =>
+            applePerSwitch.every((n) => n === 0));
+
+          // ---- 2. nothing of the repository being left stays behind -------------
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+          const scroller = bodyScroller();
+          scroller.scrollTop = 300;
+          await wait(40);
+          hardCheck("alpha's sidebar body can be scrolled", () => scroller.scrollTop > 100);
+          type(fileFilter(), "src/alpha");
+          type(branchFilter(), "feat");
+          chip("Local")?.click();
+          $('button[aria-label="Create branch"]').click();
+          await settle();
+          type(createInput(), "feat/half-typed");
+          worktreeAdd().click();
+          await settle();
+          type(worktreePath(), "/tmp/alpha-new-worktree");
+          includeUnstaged().click();
+          repoStore.commitDraft.set("alpha draft");
+          agentTrigger().click();
+          await settle();
+          type(agentNote(), "note about alpha");
+          langTrigger().click();
+          await settle();
+          const row = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
+          row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
+          await settle();
+          hardCheck("alpha's leftovers are all in place before the switch", () =>
+            fileFilter().value === "src/alpha" && scroller.scrollTop > 100 && branchFilter().value === "feat" &&
+            createInput()?.value === "feat/half-typed" && worktreePath()?.value === "/tmp/alpha-new-worktree" &&
+            includeUnstaged().checked && agentPanel() && langPanel() && contextMenu() && textarea().value === "alpha draft");
+
+          const releaseBetaWorktrees = hold("cmd_list_worktrees", BETA);
+          await switchTo(BETA);
+          check("switched to beta", () => activePath() === BETA);
+          check("sidebar: file filter is empty", () => fileFilter().value === "");
+          check("sidebar: scroll offset is back at the top", () => bodyScroller().scrollTop === 0);
+          check("sidebar: shows beta's changed files and none of alpha's", () =>
+            text(sidebar()).includes("beta.md") && !text(sidebar()).includes("alpha"));
+          check("branches: filter text is cleared", () => branchFilter().value === "");
+          check("branches: the Local chip is no longer selected, All is", () =>
+            chip("All").className.includes("bg-accent/15") && !chip("Local").className.includes("bg-accent/15"));
+          check("branches: the half-typed new branch and its form are gone", () => !createInput());
+          check("branches: the context menu opened on alpha's branch is gone", () => !contextMenu());
+          check("branches: lists beta's branches and none of alpha's", () =>
+            text(branchList()).includes("beta-only") && !text(branchList()).includes("alpha-only"));
+          check("worktrees: none of alpha's rows are shown while beta's load is in flight", () =>
+            !text(worktreesPanel()).includes("alpha-wt-one") && text(worktreesPanel()).includes("Worktrees (0)"));
+          check("worktrees: the add form and its typed path are gone", () => !worktreePath());
+          check("composer: alpha's draft does not follow (the draft is the session's)", () => textarea().value === "");
+          check("composer: 'Include unstaged' is back to unchecked", () => includeUnstaged().checked === false);
+          check("agent menu: the panel opened over alpha is closed", () => !agentPanel());
+          check("languages: the breakdown opened over alpha is closed", () => !langPanel());
+          releaseBetaWorktrees();
+          await sleepUntil(() => text(worktreesPanel()).includes("beta-wt-two"));
+          check("worktrees: beta's rows arrive and alpha's never appeared", () =>
+            text(worktreesPanel()).includes("beta-wt-two") && !text(worktreesPanel()).includes("alpha-wt-one"));
+          agentTrigger().click();
+          await settle();
+          check("agent menu: reopened over beta, the note is empty", () => agentNote()?.value === "");
+          agentTrigger().click();
+          await settle();
+
+          // ---- 3. and back again: the same shell, alpha's own state restored ----
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+          const back = probes();
+          for (const key of PROBE_KEYS) check(`B -> A: ${key} is still the original node`, () => same(first, back, key));
+          check("B -> A: alpha's draft is back (it is the session's), local filters are not", () =>
+            textarea().value === "alpha draft" && fileFilter().value === "" && branchFilter().value === "");
+
+          // Which sections and folders are open is the list's own state, keyed by
+          // ids that two repositories share ("local"), so it must not follow.
+          const localHeader = () => $$("button", branchList()).find((b) => !b.closest(".chip-strip") && /^Local\s*\(/.test(text(b)));
+          localHeader()?.click();
+          await settle();
+          check("branches (alpha): collapsing the Local section hides its rows", () => !text(branchList()).includes("alpha-only"));
+          await switchTo(BETA);
+          check("branches: alpha's collapsed Local section does not hide beta's rows", () => text(branchList()).includes("beta-only"));
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+
+          // A merge dialog carries the repository it was opened for. It owns the
+          // switch itself: it stays up, says the repository changed, and refuses
+          // to merge into the new one (the `branches` harness pins the same).
+          const mergeRow = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
+          mergeRow?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
+          await settle();
+          $$('[role="menuitem"]').find((el) => text(el).includes("Merge into current"))?.click();
+          await settle();
+          check("branches (alpha): the merge dialog is open", () => !!$("#merge-branch-title"));
+          await switchTo(BETA);
+          check("branches: the merge dialog aimed at alpha says the repository changed and cannot merge", () => {
+            const box = $("#merge-branch-title")?.closest('[role="dialog"], div');
+            const merge = $$("button").find((b) => text(b) === "Merge branch");
+            return !!$("#merge-branch-title") && text(document.body).includes("The repository changed") && merge?.disabled === true && !!box;
+          });
+          $('button[aria-label="Close merge dialog"]')?.click();
+          await settle();
+          check("…and closes from its own button", () => !$("#merge-branch-title"));
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+
+          // ---- 4. an answer in flight for the repository left does not land -----
+          const releaseGenerate = hold("cmd_ai_generate_commit_message", ALPHA);
+          generateBtn().click();
+          await sleepUntil(() => calls.some((c) => c.cmd === "cmd_ai_generate_commit_message" && c.repo === ALPHA));
+          await switchTo(BETA);
+          repoStore.commitDraft.set("beta draft");
+          releaseGenerate();
+          await settle();
+          check("in flight: alpha's generated message does not replace beta's draft", () => textarea().value === "beta draft");
+          check("in flight: nothing about alpha's generation is shown on beta", () =>
+            !text(composerBox()).includes("fixture-model") && !text(composerBox()).includes("Writing"));
+
+          await switchTo(ALPHA);
+          repoStore.commitDraft.set("alpha commit message");
+          const releaseCommit = hold("cmd_commit", ALPHA);
+          commitBtn().click();
+          await sleepUntil(() => calls.some((c) => c.cmd === "cmd_commit" && c.repo === ALPHA));
+          await switchTo(BETA);
+          repoStore.commitDraft.set("beta draft must survive");
+          releaseCommit();
+          await settle();
+          check("in flight: alpha's finished commit does not clear beta's draft", () => textarea().value === "beta draft must survive");
+          check("in flight: beta shows no commit in progress or alpha's verdict", () =>
+            !text(composerBox()).includes("Running hooks") && !text(composerBox()).includes("alpha"));
+
+          const releaseAlphaWorktrees = hold("cmd_list_worktrees", ALPHA);
+          await switchTo(ALPHA);
+          await switchTo(BETA);
+          await sleepUntil(() => text(worktreesPanel()).includes("beta-wt-two"));
+          releaseAlphaWorktrees();
+          await settle();
+          check("in flight: alpha's late worktree list does not replace beta's", () =>
+            text(worktreesPanel()).includes("beta-wt-two") && !text(worktreesPanel()).includes("alpha-wt-one"));
+
+          check("every IPC call had a fixture", () => unexpected.length === 0);
+          check("no unhandled runtime errors", () => errors.length === 0);
+
+          // ---- a crashed sidebar recovers on the next switch --------------------
+          // The sidebar used to be rebuilt per repository, which cleared a crash
+          // caused by one repository's data. It is not rebuilt now, so its
+          // failure view resets the pane when the repository changes.
+          const paneFailedText = () => $$("span").some((el) => text(el) === "Pane failed to render");
+          await repoStore.openRepo(GAMMA, { activate: false });
+          await switchTo(GAMMA);
+          await sleepUntil(() => !sidebar() && paneFailedText(), 5000);
+          check("a repository whose branch list cannot be drawn fails the sidebar pane", () => !sidebar() && paneFailedText());
+          check("…and only the sidebar: the status bar and the workspace are still up", () =>
+            statusBar() && $("main.gp-workspace") && $$("span").filter((el) => text(el) === "Pane failed to render").length === 1);
+          await switchTo(ALPHA);
+          await sleepUntil(() => sidebar() && !paneFailedText(), 5000);
+          check("switching to another repository brings the sidebar back", () => !!sidebar() && !paneFailedText());
+          check("…showing that repository's own data", () => text(branchList()).includes("alpha-only") || text(sidebar()).includes("file-00"));
+
+          // ---- a harness-level proxy for the switch itself -----------------------
+          // Not the installed app's performance:nav settle: no native webview,
+          // no real git. It times store activation through the next two frames
+          // with instant fixtures, so it isolates what this page can see, which
+          // is the cost of rebuilding (or not) the window around the store.
+          await switchTo(ALPHA);
+          const flushed = [];
+          const framed = [];
+          const rounds = Number(params.get("rounds") ?? 24);
+          // Bounded in time as well as in count: a window that is not on screen
+          // clamps timers, and the bench is a proxy, not a verdict.
+          const benchEnds = performance.now() + 20000;
+          for (let i = 0; i < rounds && performance.now() < benchEnds; i += 1) {
+            const target = i % 2 === 0 ? BETA : ALPHA;
+            const started = performance.now();
+            await repoStore.activateTab(tabFor(target).id);
+            await tick();
+            flushed.push(performance.now() - started);
+            await raf();
+            await raf();
+            framed.push(performance.now() - started);
+            await wait(30);
+          }
+          const stat = (series) => {
+            const sorted = [...series].sort((a, b) => a - b);
+            return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
+          };
+          diagnostics = `${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          report_();
+        } catch (error) {
+          stopped(error);
+          report_();
+        }
+        await publish();
+      })();
+    </script>
+  </body>
+</html>

@@ -247,6 +247,13 @@ pub struct CommitDetails {
     /// frontend interface that has declared both optional all along.
     #[serde(default, skip_serializing_if = "is_false")]
     pub files_list_truncated: bool,
+    /// Why git's output was cut short of the end, as a clause the pane can
+    /// render after naming its subject ("git output exceeded 4 MB"); absent
+    /// when it was read whole. When set the file list, the file count and the
+    /// churn totals all come from a prefix: the totals are a lower bound and
+    /// the true count is unknown, so `files_total_count` stays absent too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numstat_truncation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1402,15 +1409,11 @@ impl GitReader {
             &repo,
             &["show", "--pretty=format:", "--numstat", "-z", commit_id],
         )?;
-        // Deliberately NOT capped here. `get_commit_details` calls this and
-        // derives three things from the full list: the churn totals, the true
-        // file count, and `files_list_truncated`. Capping at this level made
-        // all three read off an already-cut slice — the totals silently
-        // understated a huge commit's churn, and the flag's own test
-        // (`files_total > MAX_COMMIT_FILES`) became `5000 > 5000`, so the
-        // "+only first N listed" notice could never fire again. The cap
-        // belongs where the truncation can be reported, which is
-        // `get_commit_details`.
+        // Not capped here: this returns a bare `Vec`, which cannot say it is
+        // a prefix, and a cut slice read as the whole list is the failure the
+        // payload budgets exist to prevent. The commit pane no longer comes
+        // through here; `get_commit_details` reads the same records in its
+        // one capped `git show` and reports a cut.
         Ok(parse_numstat_files(&stdout))
     }
 
@@ -1491,62 +1494,40 @@ impl GitReader {
         })
     }
 
+    /// One commit's metadata and changed files, from a single `git show`.
+    ///
+    /// A commit is immutable by object id, so a complete answer for a full id
+    /// is kept in [`ref_cache`] and re-selecting the commit spawns nothing. An
+    /// abbreviated id is not a stable name (it can become ambiguous as objects
+    /// arrive), so it is read every time rather than keyed.
     pub fn get_commit_details(repo_path: &str, commit_id: &str) -> Result<CommitDetails, String> {
+        Self::commit_details_capped(repo_path, commit_id, budget::MAX_COMMIT_NUMSTAT_BYTES)
+    }
+
+    fn commit_details_capped(
+        repo_path: &str,
+        commit_id: &str,
+        cap: usize,
+    ) -> Result<CommitDetails, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let stdout = git_text(
-            &repo,
-            &[
-                "show",
-                "-s",
-                // `%ad`/`%cd` follow `log.date`; pin git's default rendering
-                // so a developer's `relative` or `human` does not stale the
-                // dates the panel shows.
-                "--date=default",
-                "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%G?%x00%s%x00%b",
-                commit_id,
-            ],
-        )?;
-        let fields: Vec<&str> = stdout.split('\x00').collect();
-        if fields.len() < 11 {
-            return Err("Failed to parse commit metadata format".into());
-        }
-        let body = fields[10].trim().to_string();
-        // Surface file-list failures instead of reporting a commit with
-        // silently-empty changes.
-        let mut changed_files = Self::get_commit_files(repo_path, commit_id)?;
-        // Summed over the full list, before the cap below cuts it: summing the
-        // truncated slice would understate a huge commit's churn silently.
-        let total_additions = changed_files.iter().map(|f| f.additions).sum();
-        let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
-        let files_total = changed_files.len();
-        let files_list_truncated = files_total > MAX_COMMIT_FILES;
-        if files_list_truncated {
-            changed_files.truncate(MAX_COMMIT_FILES);
-        }
-        Ok(CommitDetails {
-            id: fields[0].to_string(),
-            parent_ids: if fields[1].is_empty() {
-                Vec::new()
-            } else {
-                fields[1].split_whitespace().map(String::from).collect()
-            },
-            author_name: fields[2].to_string(),
-            author_email: fields[3].to_string(),
-            author_date: fields[4].to_string(),
-            committer_name: fields[5].to_string(),
-            committer_email: fields[6].to_string(),
-            committer_date: fields[7].to_string(),
-            gpg_status: fields[8].to_string(),
-            summary: fields[9].to_string(),
-            co_authors: parse_co_authors(&body),
-            body,
-            changed_files,
-            total_additions,
-            total_deletions,
-            files_total_count: files_list_truncated.then_some(files_total),
-            files_list_truncated,
-        })
+        let args = [
+            "show",
+            "--numstat",
+            "-z",
+            // `%ad`/`%cd` follow `log.date`; pin git's default rendering
+            // so a developer's `relative` or `human` does not stale the
+            // dates the panel shows.
+            "--date=default",
+            COMMIT_SHOW_FORMAT,
+            commit_id,
+        ];
+        let (stdout, cut) = if is_full_oid(commit_id) {
+            ref_cache::git_text_capped(&repo, &[], &args, cap)?
+        } else {
+            git_text_capped(&repo, &args, cap)?
+        };
+        parse_commit_show(&stdout, cut.as_ref())
     }
 
     pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
@@ -1628,16 +1609,24 @@ impl GitReader {
     }
 
     pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
+        Self::get_reflog_within(repo_path, max_entries, None)
+    }
+
+    /// [`Self::get_reflog`] with the Git child held to `timeout` when one is
+    /// given, so a caller on a deadline is not left behind the default
+    /// ninety-second ceiling.
+    pub fn get_reflog_within(
+        repo_path: &str,
+        max_entries: usize,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<ReflogEntry>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_entries.clamp(1, 10_000).to_string();
-        let stdout = git_text(
-            &repo,
-            &[
-                "reflog",
-                &format!("-n{}", count),
-                "--format=%H%x00%gd%x00%gs%x00%ct",
-            ],
-        )?;
+        let limit = format!("-n{}", max_entries.clamp(1, 10_000));
+        let args = ["reflog", limit.as_str(), "--format=%H%x00%gd%x00%gs%x00%ct"];
+        let stdout = match timeout {
+            Some(timeout) => crate::engine::git_cli::git_text_with_timeout(&repo, &args, timeout)?,
+            None => git_text(&repo, &args)?,
+        };
         let mut entries = Vec::new();
         for (idx, line) in stdout.lines().enumerate() {
             let parts: Vec<&str> = line.split('\x00').collect();
@@ -4653,6 +4642,102 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
         }
     }
     files
+}
+
+/// The metadata `git show` prints before a commit's numstat, NUL-separated.
+/// The body is last and free text, but git cannot put a NUL in a message, so
+/// the Nth NUL is always the end of field N.
+const COMMIT_SHOW_FORMAT: &str =
+    "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%G?%x00%s%x00%b";
+
+/// Fields in [`COMMIT_SHOW_FORMAT`].
+const COMMIT_SHOW_FIELDS: usize = 11;
+
+/// True for a full-length object id (SHA-1 or SHA-256): the only form that
+/// names one commit for good. `validate_oid` has already vouched for the hex.
+fn is_full_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64)
+}
+
+/// Splits `git show --numstat -z` output, metadata then records, into the
+/// commit payload.
+///
+/// `cut` is why git's output stopped short, if it did. The record being
+/// written when it stopped is dropped (it may be a rename missing its second
+/// path, or a count missing a digit), and everything derived from the records
+/// is then a lower bound that the payload says is one.
+fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDetails, String> {
+    let mut parts = stdout.splitn(COMMIT_SHOW_FIELDS + 1, '\0');
+    let fields: Vec<&str> = parts.by_ref().take(COMMIT_SHOW_FIELDS).collect();
+    if fields.len() < COMMIT_SHOW_FIELDS {
+        return Err(match cut {
+            Some(why) => format!(
+                "Commit metadata was cut short: git output {}",
+                why.describe()
+            ),
+            None => "Failed to parse commit metadata format".into(),
+        });
+    }
+    // The terminator after the body is followed by the newline that separates
+    // the message from the diff; it belongs to neither.
+    let records = parts.next().unwrap_or("");
+    let records = records.strip_prefix('\n').unwrap_or(records);
+    let records = if cut.is_some() {
+        drop_partial_numstat_tail(records)
+    } else {
+        records
+    };
+    let body = fields[10].trim().to_string();
+    let mut changed_files = parse_numstat_files(records);
+    // Summed over the full list, before the cap below cuts it: summing the
+    // truncated slice would understate a huge commit's churn silently.
+    let total_additions = changed_files.iter().map(|f| f.additions).sum();
+    let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
+    let files_total = changed_files.len();
+    let over_file_cap = files_total > MAX_COMMIT_FILES;
+    if over_file_cap {
+        changed_files.truncate(MAX_COMMIT_FILES);
+    }
+    Ok(CommitDetails {
+        id: fields[0].to_string(),
+        parent_ids: if fields[1].is_empty() {
+            Vec::new()
+        } else {
+            fields[1].split_whitespace().map(String::from).collect()
+        },
+        author_name: fields[2].to_string(),
+        author_email: fields[3].to_string(),
+        author_date: fields[4].to_string(),
+        committer_name: fields[5].to_string(),
+        committer_email: fields[6].to_string(),
+        committer_date: fields[7].to_string(),
+        gpg_status: fields[8].to_string(),
+        summary: fields[9].to_string(),
+        co_authors: parse_co_authors(&body),
+        body,
+        changed_files,
+        total_additions,
+        total_deletions,
+        // A count taken from a cut stream would be a floor presented as the
+        // commit's size, so it is only offered when git was read to the end.
+        files_total_count: (over_file_cap && cut.is_none()).then_some(files_total),
+        files_list_truncated: over_file_cap || cut.is_some(),
+        numstat_truncation_reason: cut.map(|why| format!("git output {}", why.describe())),
+    })
+}
+
+/// `records` up to, not including, the last numstat record: the one a cut
+/// stream may have ended inside. Nothing at all when no record began.
+fn drop_partial_numstat_tail(records: &str) -> &str {
+    let mut offset = 0;
+    let mut last_header = None;
+    for token in records.split('\0') {
+        if is_numstat_header(token) {
+            last_header = Some(offset);
+        }
+        offset += token.len() + 1;
+    }
+    last_header.map_or("", |start| &records[..start])
 }
 
 fn parse_co_authors(body: &str) -> Vec<String> {
@@ -9496,6 +9581,236 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let before = remote_listings();
         assert_eq!(resolve_default_remote(&repo), expected);
         assert_eq!(remote_listings() - before, 1, "`git remote` was asked");
+    }
+
+    /// A repository whose one commit touches `files` files, and that
+    /// commit's full object id.
+    fn repo_with_commit_of(files: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        for n in 0..files {
+            std::fs::write(repo.join(format!("file-{n:04}.txt")), format!("line {n}\n")).unwrap();
+        }
+        git_in(&repo, &["add", "--", "."]);
+        git_in(&repo, &["commit", "-m", "touch files\n\nbody text"]);
+        let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        (dir, repo, head)
+    }
+
+    /// Children started in `repo` since `before`, counted by the spawn gate's
+    /// own log rather than inferred from timing.
+    fn spawned_since(repo: &Path, before: usize) -> Vec<Vec<String>> {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .into_iter()
+            .skip(before)
+            .collect()
+    }
+
+    /// One click on a commit used to cost two sequential `git show` children
+    /// (metadata, then numstat), each waiting on the spawn gate.
+    #[test]
+    fn commit_details_first_load_spawns_one_git_process() {
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(3);
+            let path = repo.to_string_lossy().into_owned();
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let details = GitReader::get_commit_details(&path, &head).expect("details");
+            assert_eq!(details.summary, "touch files");
+            assert_eq!(details.body, "body text");
+            assert_eq!(details.changed_files.len(), 3);
+            let spawned = spawned_since(&repo, before);
+            assert_eq!(
+                spawned.len(),
+                1,
+                "one git process per first load: {spawned:?}"
+            );
+        });
+    }
+
+    /// A commit is immutable by object id, so selecting it again is answered
+    /// without a child.
+    #[test]
+    fn reselecting_a_commit_spawns_nothing() {
+        // The answer must stay in the process-wide table between the two
+        // calls; the test that fills that table's byte budget evicts it.
+        let _held = ref_cache::retention();
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(3);
+            let path = repo.to_string_lossy().into_owned();
+            let first = GitReader::get_commit_details(&path, &head).expect("first");
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let again = GitReader::get_commit_details(&path, &head).expect("again");
+            let spawned = spawned_since(&repo, before);
+            assert!(spawned.is_empty(), "re-selecting spawned {spawned:?}");
+            assert_eq!(again.id, first.id);
+            assert_eq!(again.changed_files.len(), first.changed_files.len());
+            assert_eq!(again.total_additions, first.total_additions);
+        });
+    }
+
+    /// An abbreviation is not a stable name for a commit (it turns ambiguous
+    /// as objects arrive), so it is never a cache key: it is read each time.
+    #[test]
+    fn an_abbreviated_commit_id_is_not_cached() {
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(2);
+            let path = repo.to_string_lossy().into_owned();
+            let short = &head[..12];
+            for round in 0..2 {
+                let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+                let details = GitReader::get_commit_details(&path, short).expect("details");
+                assert_eq!(details.id, head);
+                assert_eq!(
+                    spawned_since(&repo, before).len(),
+                    1,
+                    "round {round}: an abbreviated id costs one process every time"
+                );
+            }
+        });
+    }
+
+    /// The payload is the same one the two-process version built: the single
+    /// stream's metadata/record boundary is exactly where the old pair split
+    /// it, for renames, binaries, an empty commit and a merge.
+    #[test]
+    fn single_show_payload_matches_the_separate_file_listing() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        std::fs::write(repo.join("moved.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(repo.join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+        git_in(&repo, &["add", "--", "."]);
+        git_in(&repo, &["commit", "-m", "seed"]);
+        git_in(&repo, &["mv", "moved.txt", "renamed.txt"]);
+        std::fs::write(repo.join("renamed.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(repo.join("blob.bin"), [9u8, 0, 0, 7]).unwrap();
+        git_in(&repo, &["add", "-A"]);
+        git_in(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "rename and rewrite\n\nCo-authored-by: Pat <pat@example.com>",
+            ],
+        );
+        git_in(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        std::fs::write(repo.join("side.txt"), "side\n").unwrap();
+        git_in(&repo, &["add", "side.txt"]);
+        git_in(&repo, &["commit", "-m", "side work"]);
+        git_in(&repo, &["checkout", "main"]);
+        git_in(&repo, &["merge", "--no-ff", "-m", "merge side", "side"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "nothing changed"]);
+
+        let ids = git_stdout(&repo, &["rev-list", "--reverse", "main"]);
+        let mut checked = 0;
+        let mut by_summary = HashMap::new();
+        for id in ids.lines() {
+            let details = GitReader::get_commit_details(&path, id).expect("details");
+            by_summary.insert(details.summary.clone(), details.clone());
+            let files = GitReader::get_commit_files(&path, id).expect("files");
+            assert_eq!(details.id, id);
+            assert_eq!(
+                serde_json::to_value(&details.changed_files).unwrap(),
+                serde_json::to_value(&files).unwrap(),
+                "commit {id}: the listing must not depend on which command read it"
+            );
+            assert_eq!(
+                details.total_additions,
+                files.iter().map(|f| f.additions).sum::<usize>()
+            );
+            assert!(details.numstat_truncation_reason.is_none());
+            assert!(!details.files_list_truncated);
+            checked += 1;
+        }
+        assert!(
+            checked >= 5,
+            "seed, rename, side, merge and an empty commit: {checked}"
+        );
+        let renamed = &by_summary["rename and rewrite"];
+        assert_eq!(
+            renamed.co_authors,
+            vec!["Pat <pat@example.com>".to_string()]
+        );
+        assert!(renamed
+            .changed_files
+            .iter()
+            .any(|f| f.path == "renamed.txt" && f.status_code == "R"));
+        assert!(renamed
+            .changed_files
+            .iter()
+            .any(|f| f.path == "blob.bin" && f.status_code == "B"));
+        assert_eq!(by_summary["merge side"].parent_ids.len(), 2);
+        let empty = &by_summary["nothing changed"];
+        assert!(empty.changed_files.is_empty());
+        let value = serde_json::to_value(empty).unwrap();
+        assert!(
+            value.get("numstat_truncation_reason").is_none(),
+            "absent, not null, when git was read whole: {value}"
+        );
+    }
+
+    /// Output past the byte budget is a flagged prefix, never a short list
+    /// passing for the whole commit: no half record survives, the count is not
+    /// invented, and the cut answer is not kept.
+    #[test]
+    fn oversized_numstat_is_flagged_and_never_cached() {
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(200);
+            let path = repo.to_string_lossy().into_owned();
+            let cap = 2048;
+            let details = GitReader::commit_details_capped(&path, &head, cap).expect("cut details");
+            let reason = details
+                .numstat_truncation_reason
+                .as_deref()
+                .expect("a cut stream says so");
+            assert!(reason.starts_with("git output "), "{reason}");
+            assert!(details.files_list_truncated);
+            assert_eq!(details.files_total_count, None, "a floor is not a count");
+            assert!(!details.changed_files.is_empty());
+            assert!(details.changed_files.len() < 200, "the stream was cut");
+            for (n, file) in details.changed_files.iter().enumerate() {
+                assert_eq!(file.path, format!("file-{n:04}.txt"), "only whole records");
+                assert_eq!((file.additions, file.deletions), (1, 0));
+            }
+            assert_eq!(details.total_additions, details.changed_files.len());
+            assert_eq!(details.summary, "touch files");
+
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            GitReader::commit_details_capped(&path, &head, cap).expect("cut again");
+            assert_eq!(
+                spawned_since(&repo, before).len(),
+                1,
+                "a cut answer is read again, not served"
+            );
+            let whole = GitReader::get_commit_details(&path, &head).expect("whole");
+            assert_eq!(whole.changed_files.len(), 200);
+            assert!(whole.numstat_truncation_reason.is_none());
+        });
+    }
+
+    #[test]
+    fn a_cut_stream_drops_the_record_it_ended_inside() {
+        let stream = "1\t0\ta.txt\x002\t1\t\0old name\0new name\x003\t3\tb";
+        assert_eq!(
+            drop_partial_numstat_tail(stream),
+            "1\t0\ta.txt\x002\t1\t\0old name\0new name\0"
+        );
+        let renaming = "1\t0\ta.txt\x002\t1\t\0old name\0";
+        assert_eq!(drop_partial_numstat_tail(renaming), "1\t0\ta.txt\0");
+        assert_eq!(drop_partial_numstat_tail("4\t"), "");
+        assert_eq!(drop_partial_numstat_tail(""), "");
+    }
+
+    #[test]
+    fn metadata_cut_before_the_body_is_an_error_that_names_the_cut() {
+        let cut = Incomplete::OverCap(1024);
+        let err = parse_commit_show("abc\0def\0", Some(&cut)).unwrap_err();
+        assert!(err.contains("cut short"), "{err}");
+        assert!(err.contains("exceeded"), "{err}");
+        assert_eq!(
+            parse_commit_show("abc\0def\0", None).unwrap_err(),
+            "Failed to parse commit metadata format"
+        );
     }
 
     #[test]

@@ -43,6 +43,7 @@ pub struct DesktopState {
     pending_open: Mutex<Option<String>>,
     exit: exit::ExitGate,
     tray_glyph: Mutex<Option<GlyphVariant>>,
+    popover: popover::Presence,
 }
 
 #[derive(Clone, Serialize)]
@@ -150,7 +151,9 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
 /// Returns whether the native close must be prevented after routing it.
 fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
     if window.label() == popover::LABEL {
-        if let Err(error) = window.hide() {
+        // Through the popover's own hide, so its visibility and idle timer
+        // follow a close the way they follow every other dismissal.
+        if let Err(error) = popover::hide(window.app_handle()) {
             log::warn!(target: "desktop", "Could not dismiss status popover: {error}");
         }
         return true;

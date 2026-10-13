@@ -756,21 +756,75 @@ impl Drop for HandlerSlot {
 }
 
 fn handle(mut stream: UnixStream, shared: &Shared) {
-    if let Err(error) = answer(&mut stream, shared) {
-        log::warn!(target: "desktop", "instance mailbox refused a launch: {error}");
+    if let Err(ended) = answer(&mut stream, shared) {
+        let (level, line) = ended.log_line();
+        log::log!(target: "desktop", level, "{line}");
     }
 }
 
-fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
+/// How a conversation ended when it did not serve its peer.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The peer connected, never sent a byte and left. Hooks do this to ask
+    /// whether the owner is alive, many times an hour; nothing was refused
+    /// because nothing was asked.
+    Probe(String),
+    /// Everything else, including a peer that sent part of a frame, a
+    /// stranger's uid, and a peer that stalled while still connected.
+    Refused(String),
+}
+
+impl Ended {
+    /// The level and line this ending is logged with. A probe is routine and
+    /// is not a warning; a refusal is, and keeps the line it has always had.
+    fn log_line(&self) -> (log::Level, String) {
+        match self {
+            Self::Probe(reason) => (
+                log::Level::Debug,
+                format!("instance mailbox probe left before its first frame: {reason}"),
+            ),
+            Self::Refused(reason) => (
+                log::Level::Warn,
+                format!("instance mailbox refused a launch: {reason}"),
+            ),
+        }
+    }
+
+    /// A failure with nothing of the peer's first frame read: a [`Probe`]
+    /// only if the peer is provably gone and sent nothing. When that cannot be
+    /// established it is a refusal, so an unexplained failure stays loud.
+    ///
+    /// [`Probe`]: Ended::Probe
+    fn before_first_frame(stream: &UnixStream, reason: String) -> Self {
+        if crate::local_socket::peer_hung_up_silently(stream) {
+            Self::Probe(reason)
+        } else {
+            Self::Refused(reason)
+        }
+    }
+}
+
+impl From<String> for Ended {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     // Inherited from the non-blocking listener on the BSDs.
-    stream
+    if let Err(error) = stream
         .set_nonblocking(false)
         .and_then(|()| stream.set_read_timeout(Some(HANDLER_TIMEOUT)))
         .and_then(|()| stream.set_write_timeout(Some(HANDLER_TIMEOUT)))
-        .map_err(|error| format!("socket setup: {error}"))?;
+    {
+        return Err(Ended::before_first_frame(
+            stream,
+            format!("socket setup: {error}"),
+        ));
+    }
     let uid = crate::local_socket::peer_uid(stream);
     if !peer_allowed(uid, shared.own_uid) {
-        return Err(format!("connection from uid {uid:?}"));
+        return Err(Ended::Refused(format!("connection from uid {uid:?}")));
     }
     if shared.closing.load(Ordering::Acquire) {
         return Ok(());
@@ -781,9 +835,19 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
             v: PROTOCOL,
             pid: std::process::id(),
         },
-    )?;
+    )
+    .map_err(|reason| Ended::before_first_frame(stream, reason))?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
-    // A launch that only wanted to know whether we are alive closes here.
+    // A launch that only wanted to know whether we are alive closes here. An
+    // error with nothing buffered is also before the first frame; once a byte
+    // is buffered, anything that goes wrong is a frame cut short.
+    match reader.fill_buf() {
+        Ok([]) => return Ok(()),
+        Ok(_) => {}
+        Err(error) => {
+            return Err(Ended::before_first_frame(stream, format!("read: {error}")));
+        }
+    }
     let Some(line) = read_frame(&mut reader)? else {
         return Ok(());
     };
@@ -800,11 +864,11 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
         Ok(request) => request,
         Err(reason) => {
             write_frame(stream, &Ack::refused(reason.clone()))?;
-            return Err(reason);
+            return Err(Ended::Refused(reason));
         }
     };
     if let Request::GateCommand { id, cwd, command } = &request {
-        return answer_gate(stream, shared, id, cwd, command);
+        return answer_gate(stream, shared, id, cwd, command).map_err(Ended::Refused);
     }
     let verdict = admit(shared, request);
     let ack = match &verdict {
@@ -818,7 +882,7 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
             Ok(())
         }
         Ok(None) => Ok(()),
-        Err(reason) => Err(reason),
+        Err(reason) => Err(Ended::Refused(reason)),
     }
 }
 

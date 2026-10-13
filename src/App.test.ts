@@ -364,6 +364,16 @@ describe("App chrome preferences", () => {
     expect(tasks).toContain("bg-background");
   });
 
+  it("hands a crashed sidebar back to its boundary when the repository changes", () => {
+    // The sidebar is no longer rebuilt per repository, so the recovery that
+    // rebuild gave a crashed pane has to be explicit. The browser harness
+    // `tab-switch` forces the crash and proves the recovery.
+    const start = source.indexOf('paneCrashes.report("sidebar"');
+    expect(start).toBeGreaterThan(-1);
+    expect(source.slice(Math.max(0, start - 120), start)).toContain("failed={sidebarFailed}");
+    expect(source).toMatch(/\{#snippet sidebarFailed[\s\S]*?<RepoPaneRecovery \{reset\} \/>[\s\S]*?\{\/snippet\}/);
+  });
+
   it("isolates StatusBar crashes under the status pane boundary", () => {
     const start = source.indexOf('paneCrashes.report("status"');
     expect(start).toBeGreaterThan(-1);

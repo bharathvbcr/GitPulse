@@ -165,6 +165,41 @@ pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
     }
 }
 
+/// Whether the other end has closed without ever sending a byte.
+///
+/// A liveness probe connects and closes. Whatever the owner then attempts on
+/// that connection fails with `EPIPE`, a reset, or on macOS an `EINVAL` from
+/// `setsockopt` on the departed socket — none of which says anything about the
+/// peer except that it left. What does is this: the socket reads end-of-file
+/// (or a reset) with nothing queued ahead of it.
+///
+/// Peeks without consuming and never blocks, whatever the descriptor's own
+/// mode, so a silent peer that is still connected answers `false` at once.
+/// Anything it cannot establish is `false`: callers treat that as a real
+/// failure, never as a probe.
+pub fn peer_hung_up_silently(stream: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: `fd` is a live socket owned by `stream`, and the buffer is one
+    // initialised byte that outlives the call. `MSG_PEEK` leaves the queue as
+    // it was; `MSG_DONTWAIT` makes this call non-blocking on its own.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            std::ptr::addr_of_mut!(byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match read {
+        0 => true,
+        n if n > 0 => false,
+        _ => matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECONNRESET | libc::ECONNABORTED | libc::EPIPE | libc::ENOTCONN)
+        ),
+    }
+}
+
 /// Waits for a listener to have a connection ready, or for the timeout.
 ///
 /// `poll` rather than a sleep between non-blocking `accept` calls: the
@@ -184,6 +219,32 @@ pub fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_is_hung_up_silently_only_when_it_left_without_sending() {
+        use std::io::{Read, Write};
+        // Connected and quiet: not hung up, and the call must not wait for it.
+        let (server, mut client) = UnixStream::pair().unwrap();
+        assert!(!peer_hung_up_silently(&server), "a live, silent peer");
+        // Sent something and left: the bytes are what matters, and are kept.
+        client.write_all(b"x").unwrap();
+        drop(client);
+        assert!(!peer_hung_up_silently(&server), "a peer that sent a byte");
+        let mut server = server;
+        let mut byte = [0u8; 1];
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x", "the peek consumed the byte");
+        // Now drained and gone: end of file with nothing ahead of it.
+        assert!(peer_hung_up_silently(&server), "a peer that left");
+        // Gone before it ever wrote.
+        let (server, client) = UnixStream::pair().unwrap();
+        drop(client);
+        assert!(peer_hung_up_silently(&server), "a peer that never wrote");
+        // A blocking descriptor is not waited on either.
+        let (server, _client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(false).unwrap();
+        assert!(!peer_hung_up_silently(&server));
+    }
 
     /// Binding must not change how anything else in the process creates
     /// files. Directories made on other threads while sockets are bound keep

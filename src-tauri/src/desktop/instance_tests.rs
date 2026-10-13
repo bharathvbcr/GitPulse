@@ -368,6 +368,196 @@ fn a_liveness_probe_that_sends_nothing_is_harmless() {
     assert!(received.try_recv().is_err());
 }
 
+// ---------------------------------------------------------------------------
+// How a conversation that ended early is classified (and so logged)
+// ---------------------------------------------------------------------------
+
+/// Runs one conversation over a socket pair: `peer` is the client end, handed
+/// to the closure and dropped when it returns, then the owner answers it.
+fn converse(peer: impl FnOnce(&mut UnixStream)) -> (Result<(), Ended>, Shared) {
+    let (mut server, mut client) = UnixStream::pair().expect("socket pair");
+    peer(&mut client);
+    drop(client);
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    (answer(&mut server, &shared), shared)
+}
+
+#[test]
+fn a_peer_that_leaves_before_it_is_greeted_is_a_probe_logged_at_debug() {
+    // What a hook's liveness check does: connect, close, never read or write.
+    // The owner's greeting then meets a closed socket (EPIPE, or on macOS an
+    // EINVAL setting the socket up) — 3,280 `warn` lines in the installed log.
+    let (outcome, _) = converse(|_| {});
+    let Err(ended) = outcome else {
+        panic!("a peer that left cannot have been served")
+    };
+    assert!(matches!(ended, Ended::Probe(_)), "{ended:?}");
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Debug, "{line}");
+}
+
+#[test]
+fn a_failed_greeting_is_a_probe_only_when_the_peer_is_gone_and_sent_nothing() {
+    // The 3,033 installed-log lines: the greeting write failed with EPIPE. The
+    // classifier is the same whichever step failed first, so it is checked on
+    // its own against each state the peer can be in.
+    let epipe = || "write: Broken pipe (os error 32)".to_string();
+
+    let (server, client) = UnixStream::pair().unwrap();
+    drop(client);
+    assert_eq!(
+        Ended::before_first_frame(&server, epipe()),
+        Ended::Probe(epipe()),
+        "gone, and it never wrote"
+    );
+
+    let (server, _held) = UnixStream::pair().unwrap();
+    assert_eq!(
+        Ended::before_first_frame(&server, epipe()),
+        Ended::Refused(epipe()),
+        "still connected: the failure is not explained by a probe leaving"
+    );
+
+    let (server, mut client) = UnixStream::pair().unwrap();
+    client.write_all(b"{\"v\":1").unwrap();
+    drop(client);
+    assert_eq!(
+        Ended::before_first_frame(&server, epipe()),
+        Ended::Refused(epipe()),
+        "gone, but it had started to say something"
+    );
+}
+
+#[test]
+fn a_peer_that_leaves_after_the_greeting_without_a_frame_ends_quietly() {
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let reader = std::thread::spawn(move || {
+        let mut greeting = BufReader::new(client);
+        read_frame(&mut greeting).unwrap().expect("greeting");
+    });
+    // The client closes after reading the greeting: end of file, not an error.
+    let outcome = answer(&mut server, &shared);
+    reader.join().unwrap();
+    assert_eq!(outcome, Ok(()));
+}
+
+#[test]
+fn a_peer_that_sent_part_of_a_frame_is_refused_at_warn() {
+    // Hello reaches the peer, which answers with half a request and goes.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let peer = std::thread::spawn(move || {
+        let mut writer = client.try_clone().unwrap();
+        let mut greeting = BufReader::new(client);
+        read_frame(&mut greeting).unwrap().expect("greeting");
+        writer
+            .write_all(b"{\"v\":1,\"request\":{\"op\":\"reve")
+            .unwrap();
+    });
+    let outcome = answer(&mut server, &shared);
+    peer.join().unwrap();
+    let Err(ended) = outcome else {
+        panic!("half a frame cannot be served")
+    };
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Warn);
+    assert!(line.contains("refused a launch"), "{line}");
+    assert!(line.contains("newline"), "{line}");
+}
+
+#[test]
+fn a_peer_that_sent_bytes_and_left_before_the_greeting_is_still_refused() {
+    // The greeting fails with the same EPIPE a probe causes, but this peer
+    // asked for something: that it left is not a reason to stop saying so.
+    let (outcome, _) = converse(|peer| {
+        peer.write_all(b"{\"v\":1,\"request\":{\"op\":\"revea")
+            .unwrap();
+    });
+    let Err(ended) = outcome else {
+        panic!("a peer that left cannot have been served")
+    };
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
+#[test]
+fn a_broken_pipe_while_answering_a_real_request_is_refused_at_warn() {
+    // A complete, valid request from a sender that has stopped listening: the
+    // greeting reaches it, then it closes its read side before sending, so the
+    // ack write is the EPIPE. That is after the first frame, so not a probe.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: Request::Reveal,
+    })
+    .unwrap();
+    let peer = std::thread::spawn(move || {
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        read_frame(&mut reader).unwrap().expect("greeting");
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+    });
+    let outcome = answer(&mut server, &shared);
+    peer.join().unwrap();
+    let Err(ended) = outcome else {
+        panic!("an unanswerable request is not a served one")
+    };
+    assert!(
+        matches!(&ended, Ended::Refused(reason) if reason.starts_with("write:")),
+        "{ended:?}"
+    );
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
+#[test]
+fn a_valid_frame_is_handled_and_logs_nothing() {
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: Request::Reveal,
+    })
+    .unwrap();
+    let peer = std::thread::spawn(move || {
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+        read_frame(&mut reader).unwrap().expect("greeting");
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let ack: Ack =
+            serde_json::from_str(&read_frame(&mut reader).unwrap().expect("ack")).unwrap();
+        ack
+    });
+    let outcome = answer(&mut server, &shared);
+    let ack = peer.join().unwrap();
+    assert_eq!(outcome, Ok(()));
+    assert!(ack.accepted, "ack: {:?}", ack.reason);
+    assert_eq!(shared.inbox.lock().unwrap().queued.len(), 1);
+}
+
+#[test]
+fn a_stranger_is_refused_at_warn_not_taken_for_a_probe() {
+    // Held open: the peer is connected and silent, and it is not our user.
+    let (mut server, _client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let own = unsafe { libc::getuid() };
+    let shared = Shared::new(own.wrapping_add(1));
+    let outcome = answer(&mut server, &shared);
+    let Err(ended) = outcome else {
+        panic!("another user's connection must not be served")
+    };
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
 #[test]
 fn senders_that_stall_cannot_starve_a_launch() {
     let dir = profile();

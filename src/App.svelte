@@ -45,6 +45,7 @@
   import ScrollCue from "./lib/components/ScrollCue.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
+  import RepoPaneRecovery from "./lib/components/RepoPaneRecovery.svelte";
   import InsightsView from "./lib/components/InsightsView.svelte";
   import {
     FOCUS_COMMIT_SEARCH_EVENT,
@@ -228,9 +229,11 @@
   // PTY has to survive a view switch, so this pane was already mounted once
   // and hidden thereafter — a page you could never leave without closing.
   // TerminalDock owns the mount-once-keep-mounted rule, including across
-  // repository tabs (one panel per visited tab). The {#key currentPath}
-  // around the git UI remounts Sidebar/views/StatusBar; the dock sits
-  // outside that key so a tab switch cannot kill the shell.
+  // repository tabs (one panel per visited tab). Sidebar and StatusBar are
+  // not remounted on a tab switch (they reset their per-repository state in
+  // place, see repoScope) and the view panels are keyed per repository inside
+  // ViewSectionPanel; the dock sits outside every such key so a tab switch
+  // cannot kill the shell.
   // Per repository tab, not per workspace: opening a shell in one repository
   // used to open the dock over every other repository the user switched to,
   // and — because hosting a panel starts a shell — spawn a process in each.
@@ -1019,6 +1022,14 @@
     </div>
   {/snippet}
 
+  <!-- The sidebar is not rebuilt on a repository switch, so a crash caused by
+       one repository's data would stay until Reset is pressed. This failure
+       view also resets itself when the repository changes. -->
+  {#snippet sidebarFailed(error: unknown, reset: () => void)}
+    <RepoPaneRecovery {reset} />
+    {@render paneFailed(error, reset)}
+  {/snippet}
+
 <div
   class="gp-shell h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative"
 >
@@ -1164,18 +1175,18 @@
     </div>
   {:else}
       <div class="flex-1 flex overflow-hidden">
-        {#key $repoStore.currentPath}
-        <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
+        <svelte:boundary failed={sidebarFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
           <Sidebar />
         </svelte:boundary>
-        {/key}
         <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("workspace", error)}>
           <main id={VIEW_PANE_ID} class="gp-workspace flex-1 flex flex-col min-w-0 bg-background gp-pane">
-            <!-- No {#key activeTab}: keying here destroyed and rebuilt the
-                 entire pane on every view switch and replayed the .gp-view
-                 entrance fade — a full-screen flicker per tab. The {#if}
-                 chain alone swaps panes; state lives in stores. -->
-            {#key $repoStore.currentPath}
+            <!-- No {#key activeTab} and no {#key currentPath}: keying here
+                 destroyed and rebuilt the entire pane on every view switch
+                 (and, for currentPath, on every repository switch) and
+                 replayed the .gp-view entrance fade — a full-screen flicker
+                 per tab. The {#if} chain alone swaps panes; state lives in
+                 stores. The per-repository leaves are keyed where they live,
+                 inside ViewSectionPanel. -->
             <div class="gp-view flex-1 flex flex-col min-h-0">
               {#if $repoStore.activeTab === "work"}
                 <WorkspaceView
@@ -1206,12 +1217,12 @@
                 />
               {/if}
             </div>
-            {/key}
             <!-- The terminal sits under the view rather than replacing it, so
                  a command's output can be read against the thing that
                  prompted it. A crash in the shell must not take the view with
-                 it, hence its own boundary. Outside the {#key} so a repository
-                 tab switch cannot unmount the PTY. -->
+                 it, hence its own boundary. Outside every per-repository key
+                 (ViewSectionPanel's), so a repository tab switch cannot
+                 unmount the PTY. -->
             <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("terminal", error)}>
               <TerminalDock
                 open={terminalDockOpen}
@@ -1225,9 +1236,7 @@
 
       <!-- Bottom Ambient Status Bar -->
       <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("status", error)}>
-      {#key $repoStore.currentPath}
       <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} />
-      {/key}
       </svelte:boundary>
 
     <!-- First-run coach mark onboarding tip -->

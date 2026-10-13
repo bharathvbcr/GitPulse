@@ -65,6 +65,16 @@ pub const MAX_REFLOG_BYTES: usize = 4 * 1024 * 1024;
 /// Scan Deeper control raises the commit cap, not this byte budget.
 pub const MAX_PULSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// `git show --numstat -z` for one commit: its metadata plus one record per
+/// changed path.
+///
+/// 4 MiB is some 40,000 ordinary paths, eight times the 5,000-row list the
+/// pane keeps (`MAX_COMMIT_FILES`). Past it the churn totals are a lower bound
+/// and the payload says so (`numstat_truncation_reason`) rather than the
+/// commit passing for a smaller one. Kept at half the ref cache's per-entry
+/// ceiling so a complete answer is always retained.
+pub const MAX_COMMIT_NUMSTAT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Cut `text` to at most `cap` bytes, ending on a line boundary.
 ///
 /// A diff cut mid-line renders as a corrupt row and, worse, can parse as a

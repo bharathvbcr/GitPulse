@@ -1194,7 +1194,7 @@ mod readonly_tests {
     use crate::engine::git_cli::spawn_log;
     use crate::test_support::git_in;
 
-    fn fresh_repo() -> tempfile::TempDir {
+    pub(super) fn fresh_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         git_in(dir.path(), &["init", "-b", "main"]);
         std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
@@ -1203,14 +1203,14 @@ mod readonly_tests {
         dir
     }
 
-    fn canonical(dir: &std::path::Path) -> String {
+    pub(super) fn canonical(dir: &std::path::Path) -> String {
         dir.canonicalize()
             .expect("canonical path")
             .to_string_lossy()
             .into_owned()
     }
 
-    fn linked(repo: &std::path::Path) -> (tempfile::TempDir, String) {
+    pub(super) fn linked(repo: &std::path::Path) -> (tempfile::TempDir, String) {
         let parent = tempfile::tempdir().expect("worktree parent");
         let path = parent.path().join("task-worktree");
         git_in(
@@ -1222,7 +1222,7 @@ mod readonly_tests {
     }
 
     /// Git children spawned in `cwd` by `f`, by argument vector.
-    fn spawned_by<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+    pub(super) fn spawned_by<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
         let cwd = std::path::Path::new(cwd);
         let before = spawn_log::spawns_in(cwd).len();
         let value = f();
@@ -1230,7 +1230,7 @@ mod readonly_tests {
         (value, spawned)
     }
 
-    fn record(repo: &str) {
+    pub(super) fn record(repo: &str) {
         crate::ledger::append(crate::ledger::Draft {
             repo_path: repo.to_string(),
             action: "git.commit".into(),
@@ -1484,5 +1484,171 @@ mod readonly_tests {
         let error =
             resolve_binding_readonly(&other_repo, &forged).expect_err("unregistered checkout");
         assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+}
+
+/// What a ledger read costs once the family is known: the worktree list and the
+/// sibling-ledger consolidation are paid when something changed, not on every
+/// status, tail and task view.
+#[cfg(test)]
+mod family_cost_tests {
+    use super::readonly_tests::{canonical, fresh_repo, linked, record, spawned_by};
+    use super::*;
+    use crate::ledger::tests_support::sibling_opens;
+
+    /// A repository with `count` linked worktrees that each still hold their own
+    /// pre-family ledger, as an upgraded install does.
+    fn family_with_legacy_ledgers(
+        count: usize,
+    ) -> (tempfile::TempDir, String, Vec<(tempfile::TempDir, String)>) {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let siblings: Vec<_> = (0..count).map(|_| linked(dir.path())).collect();
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        (dir, repo, siblings)
+    }
+
+    /// The audit's slow command: `cmd_ledger_status` reached
+    /// `repository_status`, which ran `git worktree list`, then a
+    /// `git hash-object` and a database open per sibling, every time.
+    #[test]
+    fn a_warm_status_spawns_no_git_and_opens_no_sibling_ledger() {
+        let (_dir, repo, _siblings) = family_with_legacy_ledgers(3);
+
+        let cold = repository_status(&repo).expect("cold status imports the siblings");
+        assert!(cold.recording, "{}", cold.error);
+
+        let opens = sibling_opens();
+        let (warm, spawned) = spawned_by(&repo, || repository_status(&repo));
+        let warm = warm.expect("warm status");
+        assert!(warm.recording, "{}", warm.error);
+        assert!(spawned.is_empty(), "a warm status spawned git: {spawned:?}");
+        assert_eq!(
+            sibling_opens(),
+            opens,
+            "a warm status reopened a sibling ledger"
+        );
+    }
+
+    /// The same for every other read that resolves the family: the ledger tail,
+    /// the task view and the gate's lookups all go through `repository_address`.
+    #[test]
+    fn a_warm_address_and_binding_lookup_cost_no_git_and_no_sibling_open() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        let worktree = &siblings[0].1;
+        repository_address(&repo).expect("cold address imports the siblings");
+        let opens = sibling_opens();
+        let (address, spawned) = spawned_by(&repo, || repository_address(&repo));
+        address.expect("warm address");
+        assert!(
+            spawned.is_empty(),
+            "a warm address spawned git: {spawned:?}"
+        );
+
+        let (resolved, spawned) = spawned_by(&repo, || resolve_binding(&repo, worktree));
+        assert_eq!(resolved.expect("warm binding lookup"), None);
+        assert!(spawned.is_empty(), "a warm lookup spawned git: {spawned:?}");
+        assert_eq!(sibling_opens(), opens, "a warm read reopened a sibling");
+    }
+
+    /// Gating consolidation on change must not turn into never consolidating:
+    /// a row a sibling writes after a warm read is imported by the next one.
+    #[test]
+    fn a_row_a_sibling_writes_after_a_warm_read_is_still_imported() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(2);
+        let before = repository_address(&repo).expect("cold address");
+        let imported = crate::ledger::tail(&before.anchor, 0, 100)
+            .expect("tail")
+            .len();
+        assert_eq!(imported, 2);
+        // Warm, and a no-op.
+        repository_address(&repo).expect("warm address");
+
+        record(&siblings[1].1);
+
+        let after = repository_address(&repo).expect("address after the sibling grew");
+        let rows = crate::ledger::tail(&after.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 3, "the sibling's new row was skipped");
+    }
+
+    /// The data-migration case: a sibling that had no ledger when the verdict
+    /// was cached, and starts one afterwards, is a first-time import.
+    #[test]
+    fn a_sibling_ledger_that_appears_after_a_warm_read_is_imported_once() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        // A warm read over a family with no sibling ledger: nothing to import.
+        record(&repo);
+        repository_address(&repo).expect("first address");
+        repository_address(&repo).expect("second address");
+
+        record(&worktree);
+
+        let address = repository_address(&repo).expect("address after first sibling ledger");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 2, "the first-time sibling import was skipped");
+        repository_address(&repo).expect("and again");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 2, "the import must stay idempotent");
+    }
+
+    /// A worktree added after a warm read joins the family: the cached
+    /// resolution must not freeze the member list.
+    #[test]
+    fn a_worktree_added_after_a_warm_read_joins_the_family() {
+        let (dir, repo, _siblings) = family_with_legacy_ledgers(1);
+        repository_address(&repo).expect("warm address");
+        let (_late_parent, late) = linked(dir.path());
+        record(&late);
+
+        let address = repository_address(&repo).expect("address after a worktree was added");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the new worktree's ledger was never consolidated"
+        );
+        assert_eq!(
+            resolve(&late, &late).expect("a binding lookup from the new worktree"),
+            None
+        );
+    }
+
+    /// Remembering the family must not turn a forged checkout into a member: a
+    /// directory whose gitfile points at the repository's git dir is not in the
+    /// registry, warm cache or not.
+    #[test]
+    fn a_forged_checkout_is_refused_after_a_warm_read() {
+        let (dir, repo, _siblings) = family_with_legacy_ledgers(1);
+        repository_address(&repo).expect("warm address");
+        let impostor = tempfile::tempdir().expect("impostor directory");
+        std::fs::write(
+            impostor.path().join(".git"),
+            format!("gitdir: {}\n", dir.path().join(".git").display()),
+        )
+        .expect("impostor gitfile");
+        crate::test_support::trust_repo(impostor.path());
+
+        let error = bind(&repo, &canonical(impostor.path()), "TASK-1")
+            .expect_err("a forged checkout must not resolve");
+        assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+
+    /// A worktree removed after a warm read leaves the family: it can no longer
+    /// be addressed, and the cached member list must not authenticate it.
+    #[test]
+    fn a_worktree_removed_after_a_warm_read_is_no_longer_authenticated() {
+        let (dir, repo, siblings) = family_with_legacy_ledgers(1);
+        let gone = siblings[0].1.clone();
+        repository_address(&gone).expect("warm address from the worktree");
+
+        crate::test_support::git_in(dir.path(), &["worktree", "remove", "--force", &gone]);
+
+        let error = repository_address(&gone).expect_err("a removed worktree must not resolve");
+        assert_eq!(error.code, MISSING_WORKTREE, "{error}");
+        repository_address(&repo).expect("the repository itself still resolves");
     }
 }

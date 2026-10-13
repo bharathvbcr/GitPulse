@@ -62,8 +62,8 @@ describe("the Fleet surface stays reachable", () => {
 
 describe("Fleet is not a repository view", () => {
   it("is absent from the ViewTab union", () => {
-    // A ViewTab is persisted per repository session and its pane lives inside
-    // `{#key currentPath}`. Fleet answers a question about the workspace, so
+    // A ViewTab is persisted per repository session and its panel content is keyed on
+    // `currentPath` (ViewSectionPanel). Fleet answers a question about the workspace, so
     // making it one would both scope it wrongly and rebuild it on every
     // repository switch.
     expect(persist).not.toMatch(/\|\s*"fleet"/);
@@ -78,7 +78,7 @@ describe("Fleet is not a repository view", () => {
 
 describe("Fleet is swapped by hiding, never by unmounting", () => {
   it("keeps the repository pane mounted behind a hidden class", () => {
-    // The repo block is keyed on `currentPath` and holds the live terminal.
+    // The repo block holds the live terminal and the whole repository surface.
     // An `{#if fleetOpen}` / `{:else}` swap would destroy that subtree on
     // every toggle: the PTY dies with its pane, and coming back re-hydrates
     // every open tab from scratch.

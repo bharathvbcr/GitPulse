@@ -2578,60 +2578,64 @@ fn plan_push_argv(
     Ok(args)
 }
 
+/// The one validator for a branch, tag, remote or revision name that reaches a
+/// git argv: git's own `check-ref-format` rules (rules 1 and 3-10 of
+/// `git help check-ref-format`; rule 2 is not enforced, so one-level names such
+/// as `main` and `HEAD` pass), reimplemented here so it never spawns git — it
+/// runs in loops on read paths.
+///
+/// There is no shell in the way: every caller hands the name to git as one argv
+/// element, so a character git allows (`&`, `(`, `=`, `;`, `$`, `]`, ...) needs
+/// no refusal here. Anything that renders a name into text a human might paste
+/// into a shell must quote it (see `deadbranch`'s backup file).
+///
+/// Two rules are stricter than git, on purpose:
+/// - a leading `-` is refused on every path, so a name can never be read as an
+///   option;
+/// - the C1 control code points U+0080-U+009F are refused. Git sees them as
+///   ordinary bytes and accepts them, but branch names are rendered into
+///   xterm.js terminals, which act on them (U+009B is CSI), so accepting one
+///   would be a terminal escape-injection path.
+///
+/// The tests check this function against `git check-ref-format` over a table and
+/// a sweep of short names, and name the C1 rows as the expected divergence.
 pub fn validate_ref_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Invalid ref name".into());
     }
+    // Rule 3.
     if name.contains("..") {
         return Err("Invalid ref name: contains traversal '..'".into());
     }
-    if name.starts_with('.') || name.ends_with('.') || name.ends_with('/') {
-        return Err("Invalid ref name: invalid prefix or suffix".into());
+    // Rule 6: no leading or trailing '/', no '//' — every component has a body.
+    if name.split('/').any(str::is_empty) {
+        return Err("Invalid ref name: empty path component".into());
     }
-    // A ".lock" suffix on ANY component collides with git's lock files under
-    // .git/refs/ — not just when the whole ref ends in .lock. The split also
-    // covers the single-component case.
+    // Rule 1: a ".lock" suffix on ANY component collides with git's lock files
+    // under .git/refs/, and a leading '.' on any component hides it.
     for component in name.split('/') {
         if component.starts_with('.') || component.ends_with(".lock") {
             return Err("Invalid ref name: invalid path component".into());
         }
     }
+    // Rule 7.
+    if name.ends_with('.') {
+        return Err("Invalid ref name: invalid suffix".into());
+    }
+    // Rules 8 and 9.
     if name == "@" || name.contains("@{") {
         return Err("Invalid ref name: invalid '@' sequence".into());
     }
-    if name.contains("//") {
-        return Err("Invalid ref name: contains '//'".into());
-    }
+    // Rules 4, 5 and 10: ASCII control characters (DEL included), space, and
+    // `~ ^ : ? * [ \`. A lone `]` is legal; only `[` opens a glob. DEL and the
+    // C1 range U+0080-U+009F are refused together (the C1 half is stricter than
+    // git; see above).
     if name.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                ' ' | '~'
-                    | '^'
-                    | ':'
-                    | '?'
-                    | '*'
-                    | '['
-                    | ']'
-                    | '\\'
-                    | ';'
-                    | '`'
-                    | '$'
-                    | '|'
-                    | '&'
-                    | '<'
-                    | '>'
-                    | '!'
-                    | '('
-                    | ')'
-                    | '{'
-                    | '}'
-                    | '='
-                    | '"'
-                    | '\''
-            )
+        c < ' '
+            || ('\u{7f}'..='\u{9f}').contains(&c)
+            || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
     }) {
-        return Err("Invalid ref name: contains forbidden characters".into());
+        return Err("Invalid ref name: contains a character git forbids in ref names".into());
     }
     Ok(())
 }
@@ -3055,6 +3059,328 @@ mod tests {
         assert!(validate_ref_name(".hidden/inner").is_err());
         assert!(validate_ref_name("feat/dot.file").is_ok());
         assert!(validate_ref_name("feat/auth").is_ok());
+    }
+
+    /// Every row is `(name, git accepts it)`. A name is refused here when git
+    /// refuses it (check-ref-format rules 1, 3-10; one-level names allowed),
+    /// plus a leading `-`, which git's `--branch` mode also refuses and which
+    /// is the argv option-injection guard on every path.
+    const REF_NAME_TABLE: &[(&str, bool)] = &[
+        // Ordinary names.
+        ("main", true),
+        ("feat/auth", true),
+        ("v1.0.0", true),
+        ("a/b/c", true),
+        ("refs/heads/x", true),
+        // Characters the old shell-metacharacter list refused, which git allows.
+        ("a&b", true),
+        ("fix/a&b", true),
+        ("x(y)", true),
+        ("feat(ui)", true),
+        ("feat(ui)=x", true),
+        ("k=v", true),
+        ("a]b", true),
+        ("{a}", true),
+        ("a{b", true),
+        ("a}b", true),
+        ("a'b", true),
+        ("a\"b", true),
+        ("a`b", true),
+        ("a;b", true),
+        ("a$b", true),
+        ("a${IFS}b", true),
+        ("a|b", true),
+        ("a<b", true),
+        ("a>b", true),
+        ("a!b", true),
+        ("a#b", true),
+        ("a%b", true),
+        ("a+b", true),
+        ("a,b", true),
+        // `@`, `.`, `-` and `.lock` are only special in some positions.
+        ("a@b", true),
+        ("a@", true),
+        ("@a", true),
+        ("@@", true),
+        ("a/@", true),
+        ("a-", true),
+        ("a/-b", true),
+        ("a.b", true),
+        ("a.lock.x", true),
+        ("a/lockfile", true),
+        ("foo.lockdown", true),
+        // Other non-ASCII text is ordinary.
+        ("ü", true),
+        ("日本語/ブランチ", true),
+        ("a\u{a0}b", true),
+        // Rule 1: a component may not start with `.` or end with `.lock`.
+        (".a", false),
+        ("a/.b", false),
+        (".lock", false),
+        ("a.lock", false),
+        ("a/b.lock", false),
+        ("a.lock/b", false),
+        // Rule 3.
+        ("a..b", false),
+        ("...", false),
+        ("..", false),
+        (".", false),
+        ("a..", false),
+        // Rule 4: control characters (DEL included), space, `~ ^ :`.
+        ("a b", false),
+        ("a\tb", false),
+        ("a\nb", false),
+        ("a\u{1}b", false),
+        ("a\u{7f}b", false),
+        ("a~b", false),
+        ("a^b", false),
+        ("a:b", false),
+        // Rule 5: `? * [`. A lone `]` is fine.
+        ("a?b", false),
+        ("a*b", false),
+        ("a[b", false),
+        // Rule 6: no leading or trailing `/`, no `//`.
+        ("/a", false),
+        ("a/", false),
+        ("a//b", false),
+        // Rule 7.
+        ("a.", false),
+        ("a/.", false),
+        // Rule 8.
+        ("x@{1}", false),
+        ("a@{b", false),
+        ("a/@{u}", false),
+        ("@{-1}", false),
+        // Rule 9 (also covered below against `--branch`, which differs).
+        ("@", false),
+        // Rule 10.
+        ("a\\b", false),
+        // The extras.
+        ("", false),
+        ("-x", false),
+        ("--force", false),
+        ("-", false),
+        ("a\0b", false),
+        // Stricter than git: C1 control code points (see `REF_NAME_C1_ROWS`).
+        ("a\u{80}b", false),
+        ("a\u{85}b", false),
+        ("a\u{9b}b", false),
+        ("a\u{9f}b", false),
+    ];
+
+    /// The rows of [`REF_NAME_TABLE`] where `validate_ref_name` is deliberately
+    /// stricter than git: C1 control code points, which git accepts and which
+    /// xterm.js interprets (U+009B is CSI). The git comparison expects git to
+    /// ACCEPT each of these and the validator to refuse it; it never skips them.
+    const REF_NAME_C1_ROWS: &[&str] = &["a\u{80}b", "a\u{85}b", "a\u{9b}b", "a\u{9f}b"];
+
+    /// Rows `git check-ref-format --branch` answers about something other than
+    /// the name: `HEAD` is refused as a branch name, and `@` / `@{-N}` are
+    /// expanded to a previously checked-out branch. `validate_ref_name` guards
+    /// remote, tag and revision arguments as well, where `HEAD` is a legal
+    /// value, so these rows are checked against plain
+    /// `check-ref-format --allow-onelevel` (rules 1-10, which is the rule list
+    /// the validator implements) instead.
+    const REF_NAME_PLAIN_MODE_ROWS: &[&str] = &["HEAD", "@", "@{-1}"];
+
+    /// What git says about `name`: `Some(true)` accepted, `Some(false)` refused
+    /// (exit 1 or 128), `None` when git cannot be run at all. Any other exit status
+    /// is a usage error, not a verdict, and fails the test.
+    ///
+    /// `check-ref-format` takes no `--` terminator (exit 129), so a leading
+    /// `-` can only be asked of `--branch`, which reads it as a name.
+    fn git_ref_verdict(flags: &[&str], name: &str, cwd: &std::path::Path) -> Option<bool> {
+        let output = std::process::Command::new("git")
+            .arg("check-ref-format")
+            .args(flags)
+            .arg(name)
+            .current_dir(cwd)
+            .output_locked()
+            .ok()?;
+        match output.status.code() {
+            Some(0) => Some(true),
+            // Plain mode exits 1 on a bad name; `--branch` dies with 128.
+            Some(1 | 128) => Some(false),
+            other => panic!(
+                "git check-ref-format {flags:?} {name:?} exited {other:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    #[test]
+    fn ref_name_table_is_decided_by_git_rules_not_a_shell_reject_list() {
+        for &(name, accepted) in REF_NAME_TABLE {
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                accepted,
+                "validate_ref_name({name:?}) should {}",
+                if accepted { "accept" } else { "refuse" }
+            );
+        }
+        for name in REF_NAME_PLAIN_MODE_ROWS {
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                *name == "HEAD",
+                "validate_ref_name({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_name_table_agrees_with_git_check_ref_format() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        if git_ref_verdict(&["--allow-onelevel"], "main", cwd.path()).is_none() {
+            eprintln!("SKIPPED: git is not runnable here, so there is no oracle to compare to");
+            return;
+        }
+        for &(name, accepted) in REF_NAME_TABLE {
+            // argv cannot carry a NUL byte, so git cannot be asked.
+            if name.contains('\0') {
+                continue;
+            }
+            let git = git_ref_verdict(&["--branch"], name, cwd.path()).expect("git runs");
+            // `--branch` on a plain name is the whole of what a branch needs;
+            // the table's `@` and `@{-1}` rows are asked of plain mode below.
+            if REF_NAME_PLAIN_MODE_ROWS.contains(&name) {
+                continue;
+            }
+            if REF_NAME_C1_ROWS.contains(&name) {
+                // The one intended divergence: git accepts, the validator refuses.
+                assert!(
+                    git && !accepted && validate_ref_name(name).is_err(),
+                    "{name:?} must be accepted by git and refused by validate_ref_name"
+                );
+                continue;
+            }
+            assert_eq!(
+                git, accepted,
+                "the table says {name:?} is {accepted}, but git check-ref-format --branch disagrees"
+            );
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                git,
+                "validate_ref_name({name:?}) disagrees with git check-ref-format --branch"
+            );
+        }
+        for name in REF_NAME_PLAIN_MODE_ROWS {
+            let git = git_ref_verdict(&["--allow-onelevel"], name, cwd.path()).expect("git runs");
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                git,
+                "validate_ref_name({name:?}) disagrees with git check-ref-format --allow-onelevel"
+            );
+        }
+    }
+
+    /// The table is hand-picked; this sweeps every short sequence of the
+    /// tokens the rules turn on, so a rule that only bites in combination
+    /// (`a/.lock`, `@/{`, `a./b`) cannot hide between rows.
+    #[test]
+    fn ref_name_sweep_agrees_with_git_check_ref_format() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        if git_ref_verdict(&["--allow-onelevel"], "main", cwd.path()).is_none() {
+            eprintln!("SKIPPED: git is not runnable here, so there is no oracle to compare to");
+            return;
+        }
+        const TOKENS: [&str; 6] = ["a", ".", "/", "@", "{", ".lock"];
+        let mut names: Vec<String> = Vec::new();
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for token in TOKENS {
+                    next.push(format!("{prefix}{token}"));
+                }
+            }
+            names.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut disagreements = Vec::new();
+        for name in &names {
+            let git = git_ref_verdict(&["--allow-onelevel"], name, cwd.path()).expect("git runs");
+            if validate_ref_name(name).is_ok() != git {
+                disagreements.push(format!("{name:?}: git {git}"));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "{} of {} names disagree with git: {disagreements:?}",
+            disagreements.len(),
+            names.len()
+        );
+    }
+
+    #[test]
+    fn a_leading_dash_is_refused_by_every_branch_taking_entry_point() {
+        let repo = init_repo_with_commit();
+        let path = repo_path(&repo);
+        for name in ["-x", "--force", "-", "--orphan"] {
+            let refused = |what: &str, result: Result<(), String>| {
+                let err = result.expect_err(&format!("{what} must refuse {name:?}"));
+                assert!(
+                    err.starts_with("Invalid ref name"),
+                    "{what}({name:?}) was refused for the wrong reason: {err}"
+                );
+            };
+            refused("checkout_branch", GitWriter::checkout_branch(&path, name));
+            refused("create_branch", GitWriter::create_branch(&path, name, None));
+            refused(
+                "delete_branch",
+                GitWriter::delete_branch(&path, name, false).map(|_| ()),
+            );
+            refused(
+                "rename_branch (old)",
+                GitWriter::rename_branch(&path, name, "ok"),
+            );
+            refused(
+                "rename_branch (new)",
+                GitWriter::rename_branch(&path, "main", name),
+            );
+            refused(
+                "get_range_diff (from)",
+                crate::engine::git_reader::GitReader::get_range_diff(&path, name, "main")
+                    .map(|_| ()),
+            );
+            refused(
+                "get_range_diff (to)",
+                crate::engine::git_reader::GitReader::get_range_diff(&path, "main", name)
+                    .map(|_| ()),
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_with_shell_punctuation_can_be_made_checked_out_diffed_and_deleted() {
+        let repo = init_repo_with_commit();
+        let path = repo_path(&repo);
+        for name in ["fix/a&b", "feat(ui)=x", "k;l$m"] {
+            GitWriter::create_branch(&path, name, None).expect("create");
+            GitWriter::checkout_branch(&path, name).expect("checkout");
+            let file = "touched.txt";
+            std::fs::write(repo.path().join(file), format!("on {name}\n")).unwrap();
+            git_ok(repo.path(), &["add", "--", file]);
+            git_ok(
+                repo.path(),
+                &["commit", "-q", "-m", "work on the odd branch"],
+            );
+            let diff = crate::engine::git_reader::GitReader::get_range_diff(&path, "main", name)
+                .expect("diff")
+                .text;
+            assert!(diff.contains(file), "{name}: {diff}");
+            GitWriter::checkout_branch(&path, "main").expect("back to main");
+            // Force: the branch carries a commit main does not have.
+            GitWriter::delete_branch(&path, name, true).expect("delete");
+            let listed = git_text(
+                &validate_repo(&path).unwrap(),
+                &["branch", "--list", "--format=%(refname:short)"],
+            )
+            .unwrap();
+            assert!(
+                !listed.lines().any(|line| line == name),
+                "{name} should be gone: {listed}"
+            );
+        }
     }
 
     /// The destination resolver mirrors sandbox_join_canonical: an existing
