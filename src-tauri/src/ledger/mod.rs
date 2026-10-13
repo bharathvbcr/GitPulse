@@ -3097,11 +3097,22 @@ mod reliability_tests;
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
-    /// Drops every cached connection, as a process restart would.
-    pub fn reset_registry() {
-        super::registry().lock().unwrap().clear();
-        super::dropped_registry().lock().unwrap().clear();
-        super::consolidated::clear();
+    /// Drops `repo_path`'s cached connection, as a process restart would for
+    /// that repository.
+    ///
+    /// Scoped to the caller's own repository on purpose. The registry is
+    /// process-wide and every test runs in parallel against it, so emptying it
+    /// closed the last connection to another test's sibling ledger between that
+    /// test's cold and warm read; closing a WAL database's last connection
+    /// checkpoints it and deletes its `-wal`, which changes the stamp
+    /// consolidation compares, and the warm read then re-imported the sibling
+    /// (the `family_cost_tests` flake). The consolidation memory is left alone
+    /// for the same reason: it is keyed by anchor path and checked against the
+    /// anchor database's file identity, so nothing in it belongs to the caller.
+    pub fn reset_registry_for(repo_path: &str) {
+        let db = super::ledger_path(repo_path);
+        super::registry().lock().unwrap().remove(&db);
+        super::dropped_registry().lock().unwrap().remove(&db);
     }
 
     /// Read-write ledger opens this thread has made so far.
@@ -3612,7 +3623,7 @@ mod tests {
             Ok(())
         })
         .expect("drop");
-        tests_support::reset_registry();
+        tests_support::reset_registry_for(repo);
 
         let found = read_fleet_metrics(repo).expect("read").expect("a row");
         assert_eq!(found.loc, Some(10));
@@ -3781,7 +3792,7 @@ mod tests {
             Ok(())
         })
         .expect("drop");
-        tests_support::reset_registry();
+        tests_support::reset_registry_for(repo);
 
         let found = read_fleet_metrics(repo).expect("read").expect("a row");
         assert_eq!(found.loc, Some(300), "the metrics row still reads");
@@ -3915,6 +3926,35 @@ mod tests {
         );
     }
 
+    /// `reset_registry` stands in for a restart of one repository. It used to
+    /// close *every* cached connection in the process, so a parallel test's
+    /// reset closed the last connection to another test's sibling ledger
+    /// between that test's cold and warm read. Closing the last connection to
+    /// a WAL database checkpoints and deletes its `-wal` file, which changes the
+    /// stamp consolidation compares: the warm read then re-imported the
+    /// sibling, spawning `git hash-object` and opening it again.
+    #[test]
+    fn resetting_one_repository_leaves_another_repositorys_connection_alone() {
+        let mine = temp_repo();
+        let theirs = temp_repo();
+        let mine = mine.path().to_str().unwrap();
+        let theirs = theirs.path().to_str().unwrap();
+        append(draft(mine, "git.commit")).expect("append");
+        append(draft(theirs, "git.commit")).expect("append");
+
+        tests_support::reset_registry_for(mine);
+
+        let held = registry().lock().unwrap();
+        assert!(
+            !held.contains_key(&ledger_path(mine)),
+            "the reset must close the caller's own connection"
+        );
+        assert!(
+            held.contains_key(&ledger_path(theirs)),
+            "a reset closed a connection belonging to another repository"
+        );
+    }
+
     #[test]
     fn a_ledger_without_the_table_reads_as_never_scanned() {
         let dir = temp_repo();
@@ -3928,7 +3968,7 @@ mod tests {
             conn.execute("DROP TABLE IF EXISTS fleet_metrics", [])
                 .expect("drop");
         }
-        registry().lock().unwrap().clear();
+        tests_support::reset_registry_for(repo);
 
         // Not an error: a missing table is "nothing was ever recorded", and a
         // read-only connection could not create it anyway.
@@ -3982,7 +4022,7 @@ mod tests {
         append(draft(&repo, "git.rebase")).expect("append");
 
         // Drop the cached connection, as a restart would.
-        registry().lock().unwrap().clear();
+        tests_support::reset_registry_for(&repo);
 
         let events = tail(&repo, 0, 100).expect("tail after reopen");
         assert_eq!(events.len(), 1);

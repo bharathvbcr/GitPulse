@@ -13,6 +13,7 @@ use crate::engine::git_cli::{
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
+use crate::lru_map::LruMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
@@ -265,13 +266,14 @@ struct Remembered {
 }
 
 /// Families remembered at once. Far above the repositories one session opens;
-/// past it the memory is dropped and the next call asks Git.
+/// past it the family used longest ago is dropped and its next call asks Git.
+/// Only that one: emptying the whole memory on each new family made every
+/// other family ask Git again.
 const MAX_REMEMBERED_FAMILIES: usize = 256;
 
-fn remembered_families() -> &'static Mutex<std::collections::HashMap<PathBuf, Remembered>> {
-    static REMEMBERED: OnceLock<Mutex<std::collections::HashMap<PathBuf, Remembered>>> =
-        OnceLock::new();
-    REMEMBERED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+fn remembered_families() -> &'static Mutex<LruMap<PathBuf, Remembered>> {
+    static REMEMBERED: OnceLock<Mutex<LruMap<PathBuf, Remembered>>> = OnceLock::new();
+    REMEMBERED.get_or_init(|| Mutex::new(LruMap::new(MAX_REMEMBERED_FAMILIES)))
 }
 
 /// The remembered family for `common`, if the registry is still the one it was
@@ -283,7 +285,7 @@ fn remembered_family(
     repo: &Path,
     worktree: &Path,
 ) -> Option<WorktreeFamily> {
-    let held = remembered_families()
+    let mut held = remembered_families()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let remembered = held.get(common).filter(|r| r.registry == registry)?;
@@ -304,9 +306,6 @@ fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFam
     let mut held = remembered_families()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if held.len() >= MAX_REMEMBERED_FAMILIES && !held.contains_key(&common) {
-        held.clear();
-    }
     held.insert(
         common,
         Remembered {
@@ -2192,6 +2191,52 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    /// A full family memory used to empty itself: the first family past the
+    /// cap forgot every other one, so a session with more repositories than the
+    /// cap asked Git again for all of them, and a parallel test's insert wiped
+    /// a sibling test's warm entry between its cold and warm read. Only the
+    /// least recently used family may go, and a hit is a use.
+    #[test]
+    fn a_full_family_memory_forgets_only_what_has_gone_unused() {
+        fn family(root: &Path) -> (Vec<PathBuf>, WorktreeFamily) {
+            let anchor = root.join("anchor");
+            let members = vec![anchor.clone(), root.join("linked")];
+            let family = WorktreeFamily {
+                anchor,
+                worktree: members[1].clone(),
+                members: members.clone(),
+            };
+            (members, family)
+        }
+        let root = Path::new("/gp-family-lru-test");
+        let (hot_members, hot_family) = family(&root.join("hot"));
+        let hot_common = root.join("hot").join(".git");
+        remember_family(hot_common.clone(), hot_members.clone(), &hot_family);
+
+        for i in 0..MAX_REMEMBERED_FAMILIES * 3 {
+            let (members, fam) = family(&root.join(format!("filler-{i}")));
+            remember_family(root.join(format!("filler-{i}")).join(".git"), members, &fam);
+            if i % 16 == 0 {
+                assert_eq!(
+                    remembered_family(&hot_common, &hot_members, &hot_members[0], &hot_members[1]),
+                    Some(hot_family.clone()),
+                    "the family in use was forgotten after {i} others arrived"
+                );
+            }
+        }
+        let (old_members, _) = family(&root.join("filler-0"));
+        assert_eq!(
+            remembered_family(
+                &root.join("filler-0").join(".git"),
+                &old_members,
+                &old_members[0],
+                &old_members[1]
+            ),
+            None,
+            "the cap no longer bounds the memory"
+        );
+    }
 
     /// `path.canonicalize()` in the spelling git reports its worktrees in. The
     /// spawn log is keyed by the directory a child ran in, and git lists a

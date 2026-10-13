@@ -572,7 +572,7 @@ mod tests {
     fn resolution_survives_a_restart() {
         let (_d, repo) = repo();
         bind(&repo, &repo, "TASK-1").unwrap();
-        super::super::tests_support::reset_registry();
+        super::super::tests_support::reset_registry_for(&repo);
         assert_eq!(resolve(&repo, &repo).unwrap(), Some("TASK-1".into()));
     }
 
@@ -1304,7 +1304,7 @@ mod readonly_tests {
         let dir = fresh_repo();
         let repo = canonical(dir.path());
         bind(&repo, &repo, "TASK-RO").expect("bind");
-        crate::ledger::tests_support::reset_registry();
+        crate::ledger::tests_support::reset_registry_for(&repo);
 
         let db = crate::ledger::ledger_path(&repo);
         {
