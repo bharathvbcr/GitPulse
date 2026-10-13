@@ -21,6 +21,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("hooks/mod.rs", 1, "per-call budget worker in a short-lived hook process that exits right after"),
     ("ai/discovery.rs", 1, "per-call model listing joined by its caller, which reports a panic as an error"),
     ("engine/git_cli/thread_io.rs", 1, "per-command pipe drain joined by the command runner"),
+    ("engine/git_reader.rs", 2, "scoped language-scan helpers (Builder::new + spawn_scoped, the only fallible named scoped spawn) joined by the caller, where a panic resumes; bounded by the scan, not long-lived"),
     ("harness/sidecar.rs", 1, "per-write stdin helper bounded by a deadline; its failure is the call's error"),
     ("commands/mod.rs", 1, "per-IPC-call off-thread work whose JoinError reaches the caller"),
     ("desktop/mod.rs", 1, "per-call off-thread work whose JoinError reaches the caller"),
