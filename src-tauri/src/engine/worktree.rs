@@ -7,14 +7,16 @@
 //! removes them through the same validated, harness-gated paths as every other
 //! write.
 
-use crate::engine::git_cli::{git_text, plain_path_text, resolve_git_common_dir, validate_repo};
+use crate::engine::git_cli::{
+    git_text, git_text_with_timeout, plain_path_text, resolve_git_common_dir, validate_repo,
+};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Canonical address of one checkout inside a linked-worktree family.
 ///
@@ -345,7 +347,58 @@ pub struct WorktreeInfo {
     /// an absent count never reads the same as a clean one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_note: Option<String>,
+    /// The paths the same `git status` read that produced `dirty_files`
+    /// returned, so a caller that wants both does not read twice. Never
+    /// crosses IPC: it is a hand-off between Rust callers, not part of the
+    /// listing's contract.
+    #[serde(skip)]
+    pub status_read: StatusRead,
 }
+
+/// What reading one worktree's status produced, beside its count.
+///
+/// Three states, because they mean three different things to a collision
+/// scan: a worktree that was never read must be read (or reported unread), one
+/// whose read failed must be reported failed and not asked again inside the
+/// same pass, and one that was read is not asked at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StatusRead {
+    /// No status read of this worktree is attached to the listing.
+    #[default]
+    NotRead,
+    /// Repo-relative changed paths, cut at [`MAX_CHANGED_PATHS`] with
+    /// `truncated` saying so.
+    Read { paths: Vec<String>, truncated: bool },
+    /// The read ran and failed, or was refused; the reason is the scan note.
+    Failed(String),
+}
+
+/// One point in time past which a scan stops starting work and stops waiting
+/// on what it started. Handed down through every stage of a pass, so each
+/// stage asks the same clock rather than being given its own slice of it.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanDeadline(Instant);
+
+impl ScanDeadline {
+    /// The deadline `budget` after `start`.
+    pub fn after(start: Instant, budget: Duration) -> Self {
+        Self(start.checked_add(budget).unwrap_or(start))
+    }
+
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.0
+    }
+
+    pub fn remaining(&self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
+
+/// The least a git read already begun is given once the deadline has nearly
+/// passed. Cutting a status that is a few milliseconds from finishing would
+/// report a reachable worktree as unreadable; this is the most a pass
+/// overruns its deadline by, apart from the process-exit grace.
+const STATUS_GRACE: Duration = Duration::from_millis(500);
 
 /// One parsed block of `worktree list --porcelain -z`, before dirty counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -632,11 +685,24 @@ pub const MAX_CHANGED_PATHS: usize = 256;
 
 /// The one `git status --porcelain -z` read of a worktree, which both the
 /// dirty-file scan and the changed-path scan go through.
-fn read_porcelain(dir: &Path) -> Result<String, String> {
+///
+/// With a `deadline`, a read that has not started by then does not start, and
+/// one in flight is given the time left (at least [`STATUS_GRACE`]) rather
+/// than git's 90 s command timeout. Either way the caller gets an error that
+/// says why, which is how a worktree it could not read stays "unknown".
+fn read_porcelain(dir: &Path, deadline: Option<&ScanDeadline>) -> Result<String, String> {
     #[cfg(test)]
     status_probes::fire(dir);
-    git_text(dir, &["status", "--porcelain", "-z"])
+    let args = ["status", "--porcelain", "-z"];
+    match deadline {
+        None => git_text(dir, &args),
+        Some(deadline) if deadline.expired() => Err(DEADLINE_PASSED.to_string()),
+        Some(deadline) => git_text_with_timeout(dir, &args, deadline.remaining().max(STATUS_GRACE)),
+    }
 }
+
+/// Why a status that never started did not.
+const DEADLINE_PASSED: &str = "the deadline passed before this worktree's status was read";
 
 /// Test seam: runs a closure just before the status read of chosen worktrees,
 /// so a test can make a read slow, or edit a worktree at a known moment,
@@ -700,6 +766,15 @@ pub(crate) mod status_probes {
 /// across many worktrees. Past [`MAX_CHANGED_PATHS`] the vector is cut and
 /// the caller sees `truncated`.
 pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), String> {
+    changed_paths_within(worktree_path, None)
+}
+
+/// [`changed_paths`] that stops waiting on git when `deadline` passes. A read
+/// that is cut returns an error saying so, never an empty list.
+pub fn changed_paths_within(
+    worktree_path: &str,
+    deadline: Option<&ScanDeadline>,
+) -> Result<(Vec<String>, bool), String> {
     let repo = validate_repo(worktree_path)?;
     if !repo.is_dir() {
         return Err(format!(
@@ -707,20 +782,28 @@ pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), String>
             repo.display()
         ));
     }
-    let stdout = read_porcelain(&repo)?;
-    let mut paths = status_paths(stdout.as_bytes());
+    let stdout = read_porcelain(&repo, deadline)?;
+    Ok(bounded_status_paths(stdout.as_bytes()))
+}
+
+/// The changed paths of one status read, cut at [`MAX_CHANGED_PATHS`], and
+/// whether anything was cut. Stops parsing at the cap, so a worktree that
+/// dirtied a hundred thousand files costs 257 strings, not a hundred thousand.
+fn bounded_status_paths(bytes: &[u8]) -> (Vec<String>, bool) {
+    let mut paths = status_paths_up_to(bytes, MAX_CHANGED_PATHS + 1);
     let truncated = paths.len() > MAX_CHANGED_PATHS;
     if truncated {
         paths.truncate(MAX_CHANGED_PATHS);
     }
-    Ok((paths, truncated))
+    (paths, truncated)
 }
 
-/// Paths from `git status --porcelain -z`, including the origin of a rename.
-fn status_paths(bytes: &[u8]) -> Vec<String> {
+/// Paths from `git status --porcelain -z`, including the origin of a rename,
+/// until at least `limit` have been read.
+fn status_paths_up_to(bytes: &[u8], limit: usize) -> Vec<String> {
     let mut paths = Vec::new();
     let mut i = 0usize;
-    while i + 3 <= bytes.len() {
+    while i + 3 <= bytes.len() && paths.len() < limit {
         let x = bytes[i] as char;
         let y = bytes[i + 1] as char;
         i += 3;
@@ -1176,9 +1259,6 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    // Scoped threads in bounded waves rather than rayon's pool: a pool thread
-    // starts in the default admission class, so the scans of a listing asked
-    // for as background work were promoted to refresh traffic.
     let class = crate::engine::git_cli::current_admission();
     // Asked once for the whole listing, and only when some scanned branch
     // is measured against it.
@@ -1201,32 +1281,9 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
     } else {
         Base::none()
     };
-    let mut metrics: HashMap<usize, WorktreeScan> = HashMap::new();
-    for wave in scan_targets.chunks(DIRTY_SCAN_FAN_OUT) {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = wave
-                .iter()
-                .map(|&idx| {
-                    let entry = &parsed[idx];
-                    let repo = &repo;
-                    let base = &base;
-                    let handle = scope.spawn(move || {
-                        crate::engine::git_cli::with_admission(class, || {
-                            scan_worktree(repo, entry, depth, base)
-                        })
-                    });
-                    (idx, handle)
-                })
-                .collect();
-            for (idx, handle) in handles {
-                let scan = handle.join().unwrap_or_else(|_| WorktreeScan {
-                    note: Some("the scan panicked; nothing was measured".into()),
-                    ..WorktreeScan::default()
-                });
-                metrics.insert(idx, scan);
-            }
-        });
-    }
+    let mut metrics = scan_in_waves(&scan_targets, class, None, |idx| {
+        scan_worktree(&repo, &parsed[idx], depth, &base, None)
+    });
 
     Ok(parsed
         .into_iter()
@@ -1245,6 +1302,53 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
         .collect())
 }
 
+/// Runs `scan` for each of `targets`, [`DIRTY_SCAN_FAN_OUT`] at a time, each
+/// in `class`.
+///
+/// Scoped threads in bounded waves rather than rayon's pool: a pool thread
+/// starts in the default admission class, so the scans of a listing asked for
+/// as background work were promoted to refresh traffic.
+///
+/// With a `deadline`, no wave starts once it has passed. A target that was
+/// never started has no entry in the result, which is how a caller tells "cut
+/// off" from "scanned and found nothing"; the ones already running are bounded
+/// by the same deadline inside their own status read.
+fn scan_in_waves<F>(
+    targets: &[usize],
+    class: crate::engine::git_cli::Admission,
+    deadline: Option<&ScanDeadline>,
+    scan: F,
+) -> HashMap<usize, WorktreeScan>
+where
+    F: Fn(usize) -> WorktreeScan + Sync,
+{
+    let mut metrics: HashMap<usize, WorktreeScan> = HashMap::new();
+    for wave in targets.chunks(DIRTY_SCAN_FAN_OUT) {
+        if deadline.is_some_and(ScanDeadline::expired) {
+            break;
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|&idx| {
+                    let scan = &scan;
+                    let handle = scope
+                        .spawn(move || crate::engine::git_cli::with_admission(class, || scan(idx)));
+                    (idx, handle)
+                })
+                .collect();
+            for (idx, handle) in handles {
+                let scan = handle.join().unwrap_or_else(|_| WorktreeScan {
+                    note: Some("the scan panicked; nothing was measured".into()),
+                    ..WorktreeScan::default()
+                });
+                metrics.insert(idx, scan);
+            }
+        });
+    }
+    metrics
+}
+
 fn info_from(idx: usize, entry: ParsedWorktree, scan: WorktreeScan) -> WorktreeInfo {
     WorktreeInfo {
         name: display_name(&entry.path),
@@ -1254,6 +1358,7 @@ fn info_from(idx: usize, entry: ParsedWorktree, scan: WorktreeScan) -> WorktreeI
         main_divergence: scan.divergence,
         active_routes: scan.routes,
         scan_note: scan.note,
+        status_read: scan.status_read,
         path: entry.path,
         head: entry.head,
         branch: entry.branch,
@@ -1285,10 +1390,74 @@ pub fn scan_dirty(info: &mut WorktreeInfo) {
             &entry,
             ScanDepth::Dirty,
             &Base::none(),
+            None,
         )
     };
     info.dirty_files = scan.dirty;
     info.scan_note = scan.note;
+    info.status_read = scan.status_read;
+}
+
+/// Reads the status of every scannable worktree of an already-made listing,
+/// once, and attaches the answer to it: the dirty-file count, the changed
+/// paths, or the reason there is neither. The listing and the read are separate
+/// steps so a caller that wants the read to be the last thing it does can make
+/// the listing first and the read when it has nothing else left to wait for.
+///
+/// Reads at most [`MAX_DIRTY_SCANS`] worktrees, [`DIRTY_SCAN_FAN_OUT`] at a
+/// time, in the caller's admission class, and stops starting reads once
+/// `deadline` has passed; one already running is given what time is left. A
+/// worktree that was not read keeps `dirty_files: None` and a note that names
+/// the deadline. Returns how many were cut off that way, so a caller can say
+/// the pass was cut short instead of inferring it from a clock it read later.
+pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
+    let targets: Vec<usize> = list
+        .iter()
+        .enumerate()
+        .filter(|(_, info)| !info.is_bare)
+        .map(|(idx, _)| idx)
+        .take(MAX_DIRTY_SCANS)
+        .collect();
+    let entries: Vec<ParsedWorktree> = list
+        .iter()
+        .map(|info| ParsedWorktree {
+            path: info.path.clone(),
+            branch: info.branch.clone(),
+            is_bare: info.is_bare,
+            ..ParsedWorktree::default()
+        })
+        .collect();
+    let class = crate::engine::git_cli::current_admission();
+    let mut scans = scan_in_waves(&targets, class, Some(deadline), |idx| {
+        // The repository path is read only at `Full` depth.
+        scan_worktree(
+            Path::new(&entries[idx].path),
+            &entries[idx],
+            ScanDepth::Dirty,
+            &Base::none(),
+            Some(deadline),
+        )
+    });
+    let mut cut = 0;
+    for (idx, info) in list.iter_mut().enumerate() {
+        let scan = match scans.remove(&idx) {
+            Some(scan) => scan,
+            None if targets.contains(&idx) => WorktreeScan::cut_off(),
+            None => WorktreeScan {
+                note: Some(if info.is_bare {
+                    "bare entry: no working tree to scan".to_string()
+                } else {
+                    format!("not scanned: past the {MAX_DIRTY_SCANS}-worktree scan limit")
+                }),
+                ..WorktreeScan::default()
+            },
+        };
+        cut += usize::from(scan.cut);
+        info.dirty_files = scan.dirty;
+        info.scan_note = scan.note;
+        info.status_read = scan.status_read;
+    }
+    cut
 }
 
 /// What one worktree's scan measured, and why anything is missing.
@@ -1299,6 +1468,20 @@ struct WorktreeScan {
     divergence: Option<WorktreeDivergence>,
     routes: Vec<WorktreeRouteInfo>,
     note: Option<String>,
+    status_read: StatusRead,
+    /// The deadline passed before this worktree's status was read, so it was
+    /// not: neither scanned nor failed, and counted as cut off.
+    cut: bool,
+}
+
+impl WorktreeScan {
+    fn cut_off() -> Self {
+        Self {
+            note: Some(format!("not scanned: {DEADLINE_PASSED}")),
+            cut: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Whether a listed `HEAD` names a commit: git lists an unborn branch's head
@@ -1314,11 +1497,14 @@ fn scan_worktree(
     entry: &ParsedWorktree,
     depth: ScanDepth,
     base: &Base,
+    deadline: Option<&ScanDeadline>,
 ) -> WorktreeScan {
     let dir = Path::new(&entry.path);
     if !dir.is_dir() {
+        let note = "the worktree directory is missing".to_string();
         return WorktreeScan {
-            note: Some("the worktree directory is missing".into()),
+            status_read: StatusRead::Failed(note.clone()),
+            note: Some(note),
             ..WorktreeScan::default()
         };
     }
@@ -1326,19 +1512,24 @@ fn scan_worktree(
     // failure counter is what says whether one was a refusal rather than a
     // real absence (no upstream, no main branch).
     let failures = crate::engine::git_cli::process_failures();
-    let status = match read_porcelain(dir) {
+    let status = match read_porcelain(dir, deadline) {
         Ok(status) => status,
+        Err(reason) if reason == DEADLINE_PASSED => return WorktreeScan::cut_off(),
         Err(reason) => {
             return WorktreeScan {
+                status_read: StatusRead::Failed(reason.clone()),
                 note: Some(format!("status could not be read: {reason}")),
                 ..WorktreeScan::default()
             }
         }
     };
     let dirty = Some(count_status_entries(status.as_bytes()));
+    let (paths, truncated) = bounded_status_paths(status.as_bytes());
+    let status_read = StatusRead::Read { paths, truncated };
     if depth != ScanDepth::Full {
         return WorktreeScan {
             dirty,
+            status_read,
             ..WorktreeScan::default()
         };
     }
@@ -1368,6 +1559,8 @@ fn scan_worktree(
         divergence,
         routes: detect_worktree_routes(&entry.path, branch),
         note: None,
+        status_read,
+        cut: false,
     };
     // The listing's one main/master lookup failed outside this scan's
     // failure window, so it is named here or not at all.
@@ -2366,7 +2559,7 @@ some-future-field whatever
             ..ParsedWorktree::default()
         };
         let before = diff_spawns_in(&repo);
-        let scan = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none());
+        let scan = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none(), None);
         assert_eq!(scan.dirty, Some(0));
         assert_eq!(diff_spawns_in(&repo), before + 1);
     }
@@ -2411,7 +2604,7 @@ some-future-field whatever
         };
         let repo = plain(main.path());
         let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
-            scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none())
+            scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none(), None)
         });
         assert_eq!(scan.dirty, Some(0));
         assert_eq!(scan.diff_stat, None);
@@ -2421,7 +2614,7 @@ some-future-field whatever
             "{note}"
         );
         assert!(note.contains("forced by test"), "{note}");
-        let whole = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none());
+        let whole = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none(), None);
         assert_eq!(whole.note, None);
         assert!(whole.diff_stat.is_some());
     }
@@ -2855,10 +3048,13 @@ some-future-field whatever
 
     #[test]
     fn status_paths_reads_porcelain_and_rename_pairs() {
-        assert!(status_paths(b"").is_empty());
-        assert_eq!(status_paths(b" M src/lib.rs\0"), vec!["src/lib.rs"]);
+        assert!(status_paths_up_to(b"", usize::MAX).is_empty());
         assert_eq!(
-            status_paths(b"R  new.rs\0old.rs\0"),
+            status_paths_up_to(b" M src/lib.rs\0", usize::MAX),
+            vec!["src/lib.rs"]
+        );
+        assert_eq!(
+            status_paths_up_to(b"R  new.rs\0old.rs\0", usize::MAX),
             vec!["new.rs", "old.rs"]
         );
     }

@@ -209,6 +209,19 @@ pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
     }))
 }
 
+/// Which operation `repo`'s worktree is parked in, and nothing else about it.
+///
+/// A look at the control files and no more: no process is started, whatever
+/// is parked. [`detect`] goes on to name the branch, describe the incoming
+/// commit and list the conflicts, which costs a child each; a caller that
+/// reports only the kind (the insights snapshot, once per worktree) should not
+/// pay for the rest. Same precedence, same classification.
+pub fn detect_kind(repo: &Path) -> Result<Option<OperationKind>, String> {
+    let paths = resolve_control_paths(repo)?;
+    let mut warnings: Vec<String> = Vec::new();
+    Ok(classify(repo, &paths, &mut warnings)?.map(|(kind, _)| kind))
+}
+
 /// Resolves every probe path without starting git.
 ///
 /// This used to be one `git rev-parse --git-path` per probe set — a spawn on
@@ -1007,6 +1020,39 @@ mod tests {
         // so nothing a concurrent test spawns can land here.
         let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
         assert!(spawned.is_empty(), "spawned: {spawned:?}");
+    }
+
+    /// The kind alone is the kind the full report names, for every probe, and
+    /// is read without starting a process even when an operation is parked.
+    #[test]
+    fn detect_kind_names_what_detect_names_without_a_process() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        assert_eq!(detect_kind(&root).unwrap(), None);
+        let git_dir = root.join(".git");
+        let head = "deadbeef\n";
+        for probe in PROBE_ORDER {
+            let path = git_dir.join(probe);
+            if *probe == "rebase-merge" || *probe == "rebase-apply" {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::write(&path, head).unwrap();
+            }
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let kind = detect_kind(&root).unwrap();
+            assert_eq!(
+                crate::engine::git_cli::spawn_log::spawns_in(&root).len(),
+                before,
+                "{probe}: reading the kind started a process"
+            );
+            let full = detect(&root).unwrap().map(|op| op.kind);
+            assert!(kind.is_some(), "{probe} was not classified");
+            assert_eq!(kind, full, "{probe}");
+            std::fs::remove_dir_all(&path)
+                .or_else(|_| std::fs::remove_file(&path))
+                .unwrap();
+        }
+        assert_eq!(detect_kind(&root).unwrap(), None);
     }
 
     fn head_ref_of(repo: &Path) -> (Option<String>, Vec<String>) {
