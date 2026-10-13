@@ -29,8 +29,7 @@
         "trafficLightPosition": {
           "x": 16,
           "y": 14
-        },
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist --enable-features=CanvasOopRasterization"
+        }
       }
     ],
     "security": {

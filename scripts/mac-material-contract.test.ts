@@ -168,6 +168,51 @@ describe("macOS material", () => {
   });
 
   /*
+   * WebView2-only window keys live in `tauri.windows.conf.json` and nowhere
+   * else. `additionalBrowserArgs` is handed to the WebView2 builder alone:
+   * tauri-runtime-wry applies it under `#[cfg(windows)]`
+   * (framework/tauri-runtime-wry/src/lib.rs:4982-4985) and wry declares the
+   * setter only for Windows (framework/wry/src/lib.rs:1781-1782, 1876-1878).
+   * Under WKWebView or WebKitGTK it does nothing, and a Chromium GPU flag list
+   * in a file those builds read reads as though their GPU path were tuned.
+   * The Windows file restates the window for the same reason the macOS one
+   * does: the merge replaces arrays.
+   */
+  const WINDOWS_ONLY_WINDOW_KEYS = ["additionalBrowserArgs"];
+  const winConf = JSON.parse(
+    readFileSync(new URL("../src-tauri/tauri.windows.conf.json", import.meta.url), "utf8"),
+  );
+
+  it("keeps WebView2-only window keys out of the base and macOS configs", () => {
+    for (const key of WINDOWS_ONLY_WINDOW_KEYS) {
+      for (const [name, conf] of [["tauri.conf.json", baseConf], ["tauri.macos.conf.json", macConf]] as const) {
+        expect(
+          key in conf.app.windows[0],
+          `${name} sets "${key}", which only the Windows WebView2 builder reads`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("gives the Windows window the base window plus its WebView2-only keys", () => {
+    const base = baseConf.app.windows[0];
+    const win = winConf.app.windows[0];
+    expect(winConf.app.windows).toHaveLength(1);
+    expect(Object.keys(win).filter((key) => !(key in base)).sort()).toEqual(
+      [...WINDOWS_ONLY_WINDOW_KEYS].sort(),
+    );
+    for (const [key, value] of Object.entries(base)) {
+      expect(win[key], `tauri.windows.conf.json drifted from the base window at "${key}"`).toEqual(
+        value,
+      );
+    }
+    for (const key of WINDOWS_ONLY_WINDOW_KEYS) expect(win[key]).toBeTruthy();
+    // What a Windows build sees, after the merge replaces the array.
+    const merged = (mergePatch(baseConf, winConf) as { app: { windows: object[] } }).app.windows[0];
+    expect(merged).toEqual(win);
+  });
+
+  /*
    * `tauri-build` re-derives, on EVERY platform it builds, the Cargo features
    * the config implies, and aborts when they differ from the ones declared on
    * the `[dependencies] tauri` entry. The manifest is one file for all
@@ -291,7 +336,7 @@ describe("macOS material", () => {
     expect(isFullyClear(macConf.app.windows[0].backgroundColor)).toBe(true);
     // The status window is built in Rust, so its colour is set there.
     const native = readFileSync(new URL("../src-tauri/src/desktop/popover.rs", import.meta.url), "utf8");
-    const construction = native.slice(native.indexOf("pub fn toggle"), native.indexOf("fn keeps_popover"));
+    const construction = native.slice(native.indexOf("fn ensure_window"), native.indexOf("fn keeps_popover"));
     expect(construction).toMatch(/\.background_color\(\s*(?:tauri::window::)?Color\(0,\s*0,\s*0,\s*0\)\s*\)/);
   });
 
@@ -323,11 +368,14 @@ describe("macOS material", () => {
     // The main-window JSON cannot configure this lazy window. A transparent
     // status webview alone exposes the desktop without blurring it.
     const native = readFileSync(new URL("../src-tauri/src/desktop/popover.rs", import.meta.url), "utf8");
-    const construction = native.slice(native.indexOf("pub fn toggle"), native.indexOf("fn keeps_popover"));
+    const construction = native.slice(native.indexOf("fn ensure_window"), native.indexOf("fn keeps_popover"));
     expect(construction).toContain(".transparent(true)");
     expect(construction).toMatch(/\.effects\([\s\S]*?\.effect\(Effect::UnderWindowBackground\)/);
     expect(construction).toContain(".radius(18.0)");
-    expect(construction).toContain('#[cfg(target_os = "macos")]');
+    // macOS only, and not under `cfg(test)`: the crate's unit tests build this
+    // window on the mock runtime, which has no NSWindow to apply a material to.
+    // tests/native_status_material.rs checks the real material on AppKit.
+    expect(construction).toContain('#[cfg(all(target_os = "macos", not(test)))]');
     expect(construction).toContain("height.clamp(100.0, MAX_HEIGHT)");
   });
 
