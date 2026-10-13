@@ -267,6 +267,14 @@ pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<S
     .await
 }
 
+/// A person's "Admit anyway" on a refused agent launch: after a Yes in a
+/// native dialog that page script cannot click, launches pass for two
+/// minutes (`sysload::admit_anyway`). There is no agent path to this.
+#[tauri::command(async)]
+pub async fn cmd_host_load_admit_anyway() -> Result<String, String> {
+    off_thread(|| crate::sysload::admit_anyway(&crate::desktop::confirm::native)).await
+}
+
 /// The host-load kill switch, as stored.
 #[tauri::command(async)]
 pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSettings, String> {

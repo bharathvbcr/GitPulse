@@ -1725,6 +1725,11 @@ pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low"
         ),
+        Refusal::Pressure { reactive } => format!(
+            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while the host is under memory \
+             pressure",
+            if reactive { "reactive" } else { "background" }
+        ),
     }
 }
 
@@ -2272,6 +2277,12 @@ pub(crate) enum Refusal {
     /// Background work refused without waiting: the rate budget was at or
     /// below the reserve kept for reactive reads.
     Shed,
+    /// Refused without waiting because the host is under memory pressure and
+    /// this class is shed while it lasts (`sysload::governor`). Carries the
+    /// deferral marker, so the frontend retries it once the pressure clears.
+    Pressure {
+        reactive: bool,
+    },
     /// No concurrency slot became free before the command's own deadline.
     TimedOut {
         deadline: Duration,
@@ -2296,7 +2307,7 @@ impl AdmissionCounters {
     fn count(&mut self, refusal: Refusal) {
         match refusal {
             Refusal::Refused { .. } => self.refused += 1,
-            Refusal::Shed => self.shed += 1,
+            Refusal::Shed | Refusal::Pressure { .. } => self.shed += 1,
             Refusal::TimedOut { .. } => self.timed_out += 1,
             Refusal::Cancelled => self.cancelled += 1,
         }
@@ -2580,6 +2591,24 @@ impl SpawnGate {
         let class = current_admission();
         let background = class == Admission::Background;
         let interactive = class == Admission::Interactive;
+        // The load governor's verdict, one owner (`sysload::governor`): under
+        // memory pressure these classes are refused at once with the
+        // deferral marker. A user action is never shed, and neither is a read
+        // credited to one (`take_post_action_credit` promoted it already).
+        if !interactive {
+            let shed = crate::sysload::shed();
+            if (background && shed.background) || (!background && shed.reactive) {
+                let refusal = Refusal::Pressure {
+                    reactive: !background,
+                };
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .counters[class.index()]
+                .count(refusal);
+                return Err(refusal);
+            }
+        }
         let rate_limited = self.refill_per_sec != u32::MAX
             && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed);
         let entered = Instant::now();
@@ -4367,6 +4396,72 @@ mod tests {
             "the reserve is for refreshes"
         );
         assert_eq!(gate.counters()[Admission::Background.index()].shed, 1);
+    }
+
+    /// Under memory pressure (the load governor's verdict) the gate sheds its
+    /// own optional classes with the deferral marker the frontend retries on:
+    /// background at `warn`, background and reactive at `critical` or a
+    /// thrashing compressor. A user action is never shed, a read credited to
+    /// one is not shed either, and everything resumes once the pressure
+    /// clears. No spawn budget is spent on a shed spawn.
+    #[test]
+    fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resumes() {
+        use super::{with_admission, with_background_processes, Admission, Refusal};
+        use crate::sysload::{GovernorInput, Level};
+        let gate = super::SpawnGate::new(8);
+        let far = || Instant::now() + std::time::Duration::from_secs(10);
+        let background =
+            || with_background_processes(|| gate.acquire_until(far(), &|| false).err());
+        let reactive = || {
+            with_admission(Admission::Reactive, || {
+                gate.acquire_until(far(), &|| false).err()
+            })
+        };
+        let interactive = || {
+            with_admission(Admission::Interactive, || {
+                gate.acquire_until(far(), &|| false).err()
+            })
+        };
+
+        let calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        assert_eq!(
+            (background(), reactive(), interactive()),
+            (None, None, None)
+        );
+        drop(calm);
+
+        let warn = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Warn));
+        assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
+        assert_eq!((reactive(), interactive()), (None, None));
+        drop(warn);
+
+        let critical =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
+        assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+        assert_eq!(interactive(), None, "a click is never shed");
+        let message = refusal_message("git status", Refusal::Pressure { reactive: true });
+        assert!(is_deferred_under_load(&message), "{message}");
+        assert!(message.contains("memory pressure"), "{message}");
+        let counters = gate.counters();
+        assert_eq!(counters[Admission::Background.index()].shed, 2);
+        assert_eq!(counters[Admission::Reactive.index()].shed, 1);
+        drop(critical);
+
+        // A thrashing compressor sheds like critical while the level lags.
+        let thrash = crate::sysload::inject_governor(GovernorInput {
+            compressor_thrash: true,
+            ..GovernorInput::test_pressure(Level::Normal)
+        });
+        assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+        drop(thrash);
+
+        // Cleared: everything resumes.
+        let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        assert_eq!(
+            (background(), reactive(), interactive()),
+            (None, None, None)
+        );
     }
 
     /// A waiting user action takes the next free slot even with refreshes

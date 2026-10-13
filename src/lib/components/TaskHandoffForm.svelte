@@ -20,6 +20,7 @@
   import { FolderOpen } from "@lucide/svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
+  import { admitAnyway, HOST_PRESSURE_REFUSAL } from "../stores/hostLoadStore";
   import { startPreparedAttempt } from "../workbench/taskTerminal";
   import { bounded, WORKTREE_PREPARE_TIMEOUT_MS } from "../workbench/taskActions";
   import {
@@ -121,6 +122,8 @@
   let provisionWorktree = $state(false);
   let busy = $state(false);
   let error = $state("");
+  /** The last launch was refused by the load governor: offer Retry and Admit anyway. */
+  let refusedByPressure = $state(false);
   let note = $state("");
   /** Restored for this task when an earlier form's preparation is still unanswered: closing a sheet must not forget it. */
   let pending = $state<RunPreparation | null>(untrack(() => pendingPreparationFor(taskId)));
@@ -282,6 +285,20 @@
   }
 
   /**
+   * "Admit anyway" after the load governor refused: a system dialog the page
+   * cannot answer, then the launch again. A No leaves the refusal standing.
+   */
+  async function admitAndRetry() {
+    try {
+      await admitAnyway();
+    } catch (cause) {
+      error = explainError(cause);
+      return;
+    }
+    await launch();
+  }
+
+  /**
    * Prepare, then hand the accepted attempt to its owner.
    *
    * The task is re-read first: the caller carries the revision it last loaded,
@@ -309,7 +326,7 @@
     const preparing = onPreparing;
     /** The request actually sent, once it is: what a settled answer releases. */
     let sent: RunPreparation | null = null;
-    busy = true; error = ""; note = "";
+    busy = true; error = ""; note = ""; refusedByPressure = false;
     try {
       if (!pending) {
         const path = normalizeCheckout(checkout);
@@ -380,6 +397,7 @@
       if (settled && sent) releasePendingPreparation(sent.task_id, sent.id);
       if (disposed) return;
       error = explainError(cause);
+      refusedByPressure = cause instanceof WorkbenchError && cause.code === HOST_PRESSURE_REFUSAL;
       if (settled) pending = null;
       // The store answered and the reply could not be read: it committed or
       // refused, and replaying gets the same unreadable answer, so the retry
@@ -546,6 +564,14 @@
   {/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
   {#if error}<p role="alert" class="error">{error}</p>{/if}
+  {#if refusedByPressure}
+    <!-- The load governor refused the launch (docs/LOAD_GOVERNOR.md). Retry
+         asks again; Admit anyway asks in a system dialog, then asks again. -->
+    <p class="meta" data-testid="handoff-pressure-actions">
+      <button type="button" class="gp-btn" disabled={locked} onclick={() => void launch()}>Retry</button>
+      <button type="button" class="gp-btn" disabled={locked} onclick={() => void admitAndRetry()}>Admit anyway</button>
+    </p>
+  {/if}
 </div>
 
 <style>

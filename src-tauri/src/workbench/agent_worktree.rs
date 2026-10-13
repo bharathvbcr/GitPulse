@@ -349,6 +349,18 @@ pub(super) fn reclaim(
     run: &Value,
     open_files: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Option<Reclaimed> {
+    // Cancel and release give a tree back; under memory pressure that is the
+    // last work to defer, so its git children run as the user action they
+    // are, never shed with the refreshes (`sysload::governor`).
+    crate::engine::git_cli::with_admission(crate::engine::git_cli::Admission::Interactive, || {
+        reclaim_unshed(run, open_files)
+    })
+}
+
+fn reclaim_unshed(
+    run: &Value,
+    open_files: &dyn Fn(&Path) -> Result<(), String>,
+) -> Option<Reclaimed> {
     if !run["owner_id"].is_null() {
         return None;
     }

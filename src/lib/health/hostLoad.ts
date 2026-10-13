@@ -9,6 +9,8 @@
  */
 import { humanBytes } from "../storage/format";
 import type {
+  GovernorPulse,
+  GovernorReport,
   HostLoadPulse,
   Level,
   MemguardHealth,
@@ -105,22 +107,90 @@ export function statusChip(pulse: HostLoadPulse | null): StatusChip | null {
   }
   const stale = pulse.state === "stale_recent" && pulse.age_ms !== null ? ` · stale ${formatAge(pulse.age_ms)}` : "";
   const thrash = pulse.compressor_thrash ? " · thrashing" : "";
+  const governing = governorSuffix(pulse.governor);
   if (pulse.level === "critical" || pulse.level === "warn") {
     return {
-      text: `Memory: ${levelLabel(pulse.level)}${thrash}${stale}`,
+      text: `Memory: ${levelLabel(pulse.level)}${thrash}${governing}${stale}`,
       tone: pulse.level === "critical" ? "danger" : "warn",
       title:
-        "The kernel reports memory pressure. Heavy work started now competes for memory; open Health for what is using it.",
+        "The kernel reports memory pressure. Heavy work started now competes for memory; open Health for what is using it and what GitPulse is shedding.",
     };
   }
   if (pulse.compressor_thrash) {
     return {
-      text: `Memory: compressor thrashing${stale}`,
+      text: `Memory: compressor thrashing${governing}${stale}`,
       tone: "warn",
       title: "The memory compressor has been thrashing for three samples in a row.",
     };
   }
   return null;
+}
+
+/**
+ * What the governor is doing with GitPulse's own work, in one line for
+ * Health: which classes are shed and why, or that nothing is. A sensor that
+ * is stale-old or dead says so and says that nothing extra is shed — the
+ * governor fails open, and Health must not look like it is governing then.
+ */
+export function governorLine(report: GovernorReport): string {
+  const { verdict } = report;
+  switch (verdict.reason) {
+    case "not_governed":
+    case "switched_off":
+      return `Not governing: ${verdict.message}.`;
+    case "sensor_unavailable":
+      return `Ungoverned: ${verdict.message}.`;
+    case "healthy":
+      return `Nothing is shed. ${capitalise(verdict.message)}.`;
+    default: {
+      const shed = [
+        verdict.shed.background ? "background" : null,
+        verdict.shed.reactive ? "reactive" : null,
+      ].filter((name): name is string => name !== null);
+      const stale = verdict.warnings.length > 0 ? ` (${verdict.warnings.join("; ")})` : "";
+      return `Shedding ${shed.join(" and ")} work: ${verdict.message}${stale}.`;
+    }
+  }
+}
+
+function capitalise(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** Admission in a line: whether agent launches are being refused, for how long. */
+export function admissionLine(report: GovernorReport): string {
+  const { verdict } = report;
+  if (report.override_remaining_s !== null && !verdict.admit) {
+    return `Launches are admitted for ${report.override_remaining_s} s more, on your say-so.`;
+  }
+  if (!verdict.admit) {
+    const since =
+      report.refusing_for_s === null ? "" : ` for ${formatAge(report.refusing_for_s * 1000)}`;
+    return `Agent launches are refused${since}: ${verdict.message}.`;
+  }
+  if (verdict.reason === "launch_gate_off") return "Agent launches are admitted: refusal is switched off in Settings.";
+  return verdict.warnings.length > 0
+    ? `Agent launches are admitted (${verdict.warnings.join("; ")}).`
+    : "Agent launches are admitted.";
+}
+
+/** The toast text once refusal has run past the notice threshold. */
+export function refusalNotice(governor: GovernorPulse): string {
+  const minutes = Math.max(30, Math.floor((governor.refusing_for_s ?? 0) / 60));
+  const largest =
+    governor.largest_foreign === null
+      ? "largest foreign footprint unknown"
+      : `largest foreign footprint ${bytes(governor.largest_foreign)}`;
+  const cause =
+    governor.binding === "compressor_thrash" ? "a thrashing memory compressor" : "memory pressure";
+  return `Refusing agent launches for ${minutes} min under ${cause}; ${largest}.`;
+}
+
+/** What the governor adds to the status chip: refused launches outrank shedding. */
+function governorSuffix(governor: GovernorPulse): string {
+  if (!governor.admit && !governor.overridden) return " · launches refused";
+  if (governor.shed_background || governor.shed_reactive) return " · shedding";
+  return "";
 }
 
 /** memguard in one line, for Health. */
