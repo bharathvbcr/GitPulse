@@ -172,9 +172,9 @@ export const sessionAlerts: Readable<SessionAlertsView> = { subscribe: store.sub
  * Outside Tauri it still records, so the panel's own tests can observe it
  * without a backend; the push is simply a no-op.
  */
-export const terminalAttendance = createAttendance(async (sessionIds) => {
+export const terminalAttendance = createAttendance(async (sessionIds, backgroundIds) => {
   if (!isTauri()) return;
-  await invoke("cmd_session_alerts_visible", { sessionIds });
+  await invoke("cmd_session_alerts_visible", { sessionIds, backgroundIds });
 });
 
 /**

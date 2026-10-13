@@ -219,21 +219,6 @@ export interface TerminalListing {
 }
 
 /**
- * Streamed terminal output. Consumed as an anonymous `{ id; data_b64 }` at the
- * listen() call until it was named — events are a wire surface too, and
- * check:types could not see this one at all.
- */
-export interface TerminalOutputPayload {
-  id: string;
-  data_b64: string;
-  /**
-   * Bytes the reader reserved for this chunk. Absent on events from a host
-   * that predates the field. A present value outside one read is ignored.
-   */
-  bytes?: number;
-}
-
-/**
  * What a live session is running and where, read once on request
  * (`cmd_terminal_context`). Every field can be unknown: the OS may decline to
  * describe a process, and unknown is never read as idle or as the root.

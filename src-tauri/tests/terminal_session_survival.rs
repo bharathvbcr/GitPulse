@@ -152,6 +152,7 @@ impl View {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), script]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(self.app.handle()),
         )
         .unwrap();
         (session.id, read_pid(&pidfile, Duration::from_secs(5)))
@@ -240,7 +241,7 @@ fn a_view_that_stops_acknowledging_does_not_end_the_session() {
         wait_until(Duration::from_secs(5), || view
             .received
             .load(Ordering::SeqCst)
-            > before + 256 * 1024),
+            > before + 512 * 1024),
         "output resumes once the view repays its window"
     );
     assert!(alive(pid));
@@ -295,7 +296,14 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
     assert!(alive(pid));
     assert!(view.exits.try_recv().is_err());
 
-    attach_session(&view.state, &id, 30, 100).unwrap();
+    attach_session(
+        &view.state,
+        &id,
+        30,
+        100,
+        gitpulse_lib::terminal::OutputSink::events(view.app.handle()),
+    )
+    .unwrap();
     assert!(wait_until(Duration::from_secs(5), || view
         .received
         .load(Ordering::SeqCst)
@@ -333,7 +341,14 @@ fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
         view.catch_up();
         for (n, (id, _)) in sessions.iter().enumerate() {
             if (n + round) % 3 == 0 {
-                attach_session(&view.state, id, 24, 80 + round as u16).unwrap();
+                attach_session(
+                    &view.state,
+                    id,
+                    24,
+                    80 + round as u16,
+                    gitpulse_lib::terminal::OutputSink::events(view.app.handle()),
+                )
+                .unwrap();
             }
         }
         std::thread::sleep(Duration::from_millis(150));

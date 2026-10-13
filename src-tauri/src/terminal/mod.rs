@@ -10,8 +10,6 @@ use crate::engine::git_cli::{
     sandbox_join_canonical, validate_repo, RunOutcome,
 };
 use crate::harness::{guard_command, PolicyVerdict};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 mod executor;
 mod flow;
@@ -22,10 +20,13 @@ mod input;
 mod ipc;
 #[cfg(unix)]
 mod readiness;
+mod sink;
 use executor::Executor;
 use flow::{OutputFlow, Route};
 pub use ipc::{control_async, resize_async, write_async};
 use serde::{Deserialize, Serialize};
+use sink::OutputSlot;
+pub use sink::{OutputChannel, OutputSink, END_OF_OUTPUT};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -56,8 +57,8 @@ const TERMINAL_ARGV_BYTES_CAP: usize = 128 * 1024;
 /// [`TerminalSessions`]: this many until they change it.
 pub const DEFAULT_PTY_SESSIONS: usize = 32;
 /// The most a user may choose. Each session is a PTY pair, a reader thread
-/// and an output window of `flow::OUTPUT_WINDOW` (256 KiB), so this bounds
-/// those at 256 descriptors, 128 reader threads and 32 MiB — and stays well
+/// and an output window of `flow::OUTPUT_WINDOW` (512 KiB), so this bounds
+/// those at 256 descriptors, 128 reader threads and 64 MiB — and stays well
 /// inside macOS's system-wide PTY allowance (`kern.tty.ptmx_max`, 511 by
 /// default), which every other terminal on the machine shares. Threads beyond
 /// the readers are on demand and end when idle (see `executor`): at most two
@@ -179,17 +180,20 @@ pub struct TerminalSpawned {
     pub cwd: String,
 }
 
-/// Bytes one `terminal-output` event may carry, and reserve. The renderer
-/// refuses a reserved length outside `1..=OUTPUT_CHUNK_BYTES` instead of
-/// guessing one from base64. Written as a literal: the frontend's
+/// Bytes one output message may carry, and reserve. The renderer refuses a
+/// message longer than `OUTPUT_CHUNK_BYTES` (and repays its credit) instead of
+/// painting it. Written as a literal: the frontend's
 /// `MAX_TERMINAL_OUTPUT_CHUNK` is checked against this line by text.
 ///
-/// This is the size of an *event*, not of a `read`: the reader gathers what the
-/// program has printed into one event because each event is a script evaluated
-/// in the webview, and the kernel hands a macOS PTY reader at most 1 KiB at a
-/// time. Event-per-read made a flood cost one evaluation per KiB.
-pub const OUTPUT_CHUNK_BYTES: usize = 16384;
+/// This is the size of a *message*, not of a `read`: the reader gathers what
+/// the program has printed into one message because each one costs the webview
+/// a script evaluation and a fetch, and the kernel hands a macOS PTY reader at
+/// most 1 KiB at a time. A message per read made a flood cost one round trip per
+/// KiB. `flow::OUTPUT_WINDOW` holds eight of these.
+pub const OUTPUT_CHUNK_BYTES: usize = 65536;
 
+/// What an in-process listener of [`OutputSink::events`] receives per chunk.
+/// A view receives raw bytes on its channel and never this.
 #[derive(Clone, Serialize)]
 pub struct TerminalOutputPayload {
     pub id: String,
@@ -209,7 +213,7 @@ fn output_payload_names_the_reserved_length() {
     let value = serde_json::to_value(&payload).unwrap();
     assert_eq!(value["bytes"], 1);
     assert_eq!(value["data_b64"], "QQ==");
-    assert_eq!(OUTPUT_CHUNK_BYTES, 16384);
+    assert_eq!(OUTPUT_CHUNK_BYTES, 65536);
 }
 
 /// Output a live session's view will never see. The process keeps running;
@@ -243,6 +247,13 @@ const GATHER_QUIET: Duration = Duration::from_millis(2);
 /// steady trickle still reaches the view this often.
 #[cfg(unix)]
 const GATHER_MAX_HOLD: Duration = Duration::from_millis(8);
+/// The same bound for a session whose tab is not on screen. Nobody is reading
+/// it, so it is sent a few times a second rather than at frame rate; its
+/// credit is still repaid, only later, which the output window (and its 30 s
+/// stall timeout) absorbs. A session that becomes visible waits at most this
+/// long for its backlog.
+#[cfg(unix)]
+const HIDDEN_MAX_HOLD: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Serialize)]
 pub struct TerminalExitPayload {
@@ -272,6 +283,12 @@ struct SessionEntry {
     /// Times the reader returned from waiting for this session to do
     /// something: output, an exit, or a timer. An idle session adds none.
     wakeups: Arc<AtomicU64>,
+    /// Where the reader sends output: the channel of the view showing this
+    /// session, replaced when another view takes it over.
+    output: Arc<OutputSlot>,
+    /// The view reports this session's tab is not on screen, so its output is
+    /// batched harder (see `HIDDEN_MAX_HOLD`). Unreported is visible.
+    hidden: Arc<AtomicBool>,
     tracked_run: Option<String>,
     spawned: TerminalSpawned,
     /// Canonical repository root. `spawned.cwd` is where the process started,
@@ -1057,7 +1074,10 @@ fn validate_pty_options(
     Ok(())
 }
 
-/// Spawns a PTY session running an interactive shell or agent CLI in `repo_path`.
+/// Spawns a PTY session running an interactive shell or agent CLI in
+/// `repo_path`. Its output goes to `output` from the first byte; a session is
+/// never started without somewhere to send it, because a prompt printed before
+/// a view attached would be lost.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_session<R: tauri::Runtime>(
     app: &AppHandle<R>,
@@ -1068,8 +1088,11 @@ pub fn spawn_session<R: tauri::Runtime>(
     program: Option<String>,
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
+    output: OutputSink,
 ) -> Result<TerminalSpawned, String> {
-    spawn_session_in(app, state, repo_path, None, rows, cols, program, args, env)
+    spawn_session_in(
+        app, state, repo_path, None, rows, cols, program, args, env, output,
+    )
 }
 
 /// [`spawn_session`], started in `start_dir`: a path relative to the
@@ -1089,9 +1112,10 @@ pub fn spawn_session_in<R: tauri::Runtime>(
     program: Option<String>,
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
+    output: OutputSink,
 ) -> Result<TerminalSpawned, String> {
     spawn_session_inner(
-        app, state, repo_path, start_dir, rows, cols, program, args, env, None,
+        app, state, repo_path, start_dir, rows, cols, program, args, env, output, None,
     )
 }
 
@@ -1364,6 +1388,7 @@ pub fn attach_session(
     session_id: &str,
     rows: u16,
     cols: u16,
+    output: OutputSink,
 ) -> Result<TerminalSpawned, String> {
     let (spawned, master) = {
         let guard = state.lock_sessions();
@@ -1374,6 +1399,9 @@ pub fn attach_session(
         if !session.flow.attach() {
             return Err("This terminal is already shown in a tab.".into());
         }
+        // The new view's channel, before anything is sent to it: the repaint
+        // below is what it will be shown first.
+        session.output.replace(output);
         (session.spawned.clone(), session.master.clone())
     };
     repaint(&master, rows, cols);
@@ -1384,26 +1412,31 @@ pub fn attach_session(
 /// response without issuing another process. The binding is created by the
 /// PTY host, never supplied by storage.
 ///
-/// Taken over by the new view when the page that held it was reloaded; left
-/// as it is when a view still holds it (a lost launch response repaired in
-/// the same page).
+/// Taken over by the calling view's channel, whether the page that held it was
+/// reloaded or the launch response was lost in the same page.
 pub(crate) fn attach_tracked_session(
     state: &TerminalSessions,
     run_id: &str,
     rows: u16,
     cols: u16,
+    output: OutputSink,
 ) -> Option<TerminalSpawned> {
-    let (spawned, master, taken) = {
+    let (spawned, master) = {
         let guard = state.lock_sessions();
         let session = guard.values().find(|s| {
             s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire)
         })?;
-        let taken = session.flow.attach();
-        (session.spawned.clone(), session.master.clone(), taken)
+        // The caller brings its own channel, so even a session a view still
+        // holds is taken over: the channel the lost launch response went with
+        // belongs to a call that never learned this session's id, and what it
+        // was sent will never be shown or repaid. A fresh window and a repaint
+        // are what a view that starts here needs.
+        session.flow.detach();
+        session.flow.attach();
+        session.output.replace(output);
+        (session.spawned.clone(), session.master.clone())
     };
-    if taken {
-        repaint(&master, rows, cols);
-    }
+    repaint(&master, rows, cols);
     Some(spawned)
 }
 
@@ -1448,6 +1481,7 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     cols: u16,
     program: String,
     args: Vec<String>,
+    output: OutputSink,
     observer: Arc<dyn SessionObserver>,
 ) -> Result<TerminalSpawned, String> {
     let (root, start) = task_start(cwd)?;
@@ -1461,6 +1495,7 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
         Some(program),
         Some(args),
         None,
+        output,
         Some(observer),
     )
 }
@@ -1476,6 +1511,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     program: Option<String>,
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
+    output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<TerminalSpawned, String> {
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
@@ -1614,6 +1650,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let dead = Arc::new(AtomicBool::new(false));
     let output_flow = Arc::new(OutputFlow::default());
     let wakeups = Arc::new(AtomicU64::new(0));
+    let output_slot = Arc::new(OutputSlot::new(output));
+    let hidden = Arc::new(AtomicBool::new(false));
     let master = Arc::new(Mutex::new(pair.master));
     let entry = SessionEntry {
         master: master.clone(),
@@ -1622,6 +1660,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
         dead: dead.clone(),
         flow: output_flow.clone(),
         wakeups: wakeups.clone(),
+        output: output_slot.clone(),
+        hidden: hidden.clone(),
         tracked_run: observer.as_ref().map(|o| o.run_id().to_owned()),
         spawned: TerminalSpawned {
             id: session_id.clone(),
@@ -1638,7 +1678,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         guard.insert(session_id.clone(), entry);
     }
 
-    // Reader thread: streams output to the frontend via "terminal-output" event.
+    // Reader thread: streams output to the session's view through its output sink.
     let app_handle = app.clone();
     let sid_for_thread = session_id.clone();
     let sid_for_exit = session_id.clone();
@@ -1684,9 +1724,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut watcher = watcher;
             #[cfg(unix)]
             let mut readiness = readiness;
-            // One event's worth: output is gathered here until the tty has
-            // nothing more queued, or the event is full.
-            let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
+            // One message's worth: output is gathered here until the tty has
+            // nothing more queued, or the message is full.
+            let mut buf = vec![0u8; OUTPUT_CHUNK_BYTES];
             // How much of `buf` is read but not yet sent. Invariant at the top
             // of the loop: `filled < buf.len()`, so a read never has an empty
             // slice to fill (which would answer `Ok(0)`, the end of the tty).
@@ -1696,7 +1736,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut gathering_since = Instant::now();
             // Logged once per run of failures, not once per chunk.
             let mut emit_failing = false;
-            // Sends `data` to the view as one event. A reservation that fails
+            // Sends `data` to the view as one message. A reservation that fails
             // (the flow was stopped) ends the process, as before; everything
             // else (a view that is detached, behind, or whose emit failed) is
             // handled here and never ends it.
@@ -1729,11 +1769,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         Route::Resume => true,
                         Route::Deliver => false,
                     };
-                    let sent = app_handle.emit("terminal-output", TerminalOutputPayload {
-                        id: sid_for_thread.clone(),
-                        data_b64: BASE64_STANDARD.encode(data),
-                        bytes: n,
-                    });
+                    // To the view that shows this session now: a channel that
+                    // belongs to it alone, not an event every webview hears.
+                    let sent = output_slot.current().bytes(&sid_for_thread, data);
                     match sent {
                         Ok(()) => {
                             emit_failing = false;
@@ -1742,12 +1780,13 @@ fn spawn_session_inner<R: tauri::Runtime>(
                                 repaint_current(&thread_master);
                             }
                         }
-                        // A failed emit is the event loop's trouble,
-                        // not the process's; it keeps running. Shed
-                        // as after a stall (see `OutputFlow::shed`).
+                        // A failed send is the view's trouble (its page is
+                        // gone, or its event loop refused), not the
+                        // process's; it keeps running. Shed as after a stall
+                        // (see `OutputFlow::shed`).
                         Err(error) => {
                             if !std::mem::replace(&mut emit_failing, true) {
-                                log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
+                                log::warn!(target: "terminal", "{program_for_log} terminal: failed to send output to its view, skipping output: {error}");
                             }
                             if output_flow.shed(n) {
                                 if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
@@ -1806,14 +1845,27 @@ fn spawn_session_inner<R: tauri::Runtime>(
                             continue;
                         }
                         // Keep reading while the tty has more: the kernel hands
-                        // out a KiB or so per read, and an event per read is a
-                        // script evaluated in the webview per KiB. A full
-                        // event goes now; otherwise the WouldBlock arm below
-                        // sends what has been gathered once the tty is dry.
-                        // Off Unix the read blocks and never says WouldBlock,
-                        // so each read is its own event there.
+                        // out a KiB or so per read, and a message per read is
+                        // a webview round trip per KiB. A full message goes
+                        // now; otherwise the WouldBlock arm below sends what
+                        // has been gathered once the tty is dry. Off Unix the
+                        // read blocks and never says WouldBlock, so each read
+                        // is its own message there.
                         if filled == buf.len() || cfg!(not(unix)) {
                             flush!();
+                        } else {
+                            // A stream that never goes dry still reaches the
+                            // view this often: a visible one at frame rate, a
+                            // hidden one a few times a second.
+                            #[cfg(unix)]
+                            {
+                                let held = gathering_since.elapsed();
+                                if held >= GATHER_MAX_HOLD
+                                    && !(held < HIDDEN_MAX_HOLD && hidden.load(Ordering::Relaxed))
+                                {
+                                    flush!();
+                                }
+                            }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1821,11 +1873,22 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Nothing is queued. Output that looks like a stream may
                         // be only a gap in one: give it a moment, never past
-                        // `GATHER_MAX_HOLD` from the first byte.
-                        if filled >= GATHER_MIN_BYTES {
+                        // `GATHER_MAX_HOLD` from the first byte. A tab nobody
+                        // is looking at gets `HIDDEN_MAX_HOLD`, whatever it
+                        // printed, and the wait is for the rest of that hold:
+                        // any output ends it, and the hold is re-entered.
+                        if filled > 0 {
                             let held = gathering_since.elapsed();
-                            if held < GATHER_MAX_HOLD {
-                                let wait = GATHER_QUIET.min(GATHER_MAX_HOLD - held);
+                            let hidden = hidden.load(Ordering::Relaxed);
+                            let (limit, quiet) = if hidden {
+                                (HIDDEN_MAX_HOLD, HIDDEN_MAX_HOLD)
+                            } else if filled >= GATHER_MIN_BYTES {
+                                (GATHER_MAX_HOLD, GATHER_QUIET)
+                            } else {
+                                (Duration::ZERO, Duration::ZERO)
+                            };
+                            if held < limit {
+                                let wait = quiet.min(limit - held);
                                 if matches!(
                                     input::wait_for_output_within(reader_fd, wait),
                                     Ok(true)
@@ -1967,6 +2030,13 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&sid_for_exit);
+                    // After the last byte, before the exit: the page delivers
+                    // channel messages in order, but an exit is an event and
+                    // would overtake bytes still being fetched. The marker is
+                    // how the page knows every byte has arrived.
+                    if let Err(error) = output_slot.current().end(&sid_for_exit) {
+                        log::warn!(target: "terminal", "{program_for_log} terminal: could not mark the end of its output: {error}");
+                    }
                     if let Err(e) = app_handle.emit("terminal-exit", payload) {
                         log::warn!(target: "terminal", "failed to emit terminal-exit event: {e}");
                     }
@@ -2398,6 +2468,27 @@ pub fn reader_wakeups(state: &TerminalSessions, session_id: &str) -> Option<u64>
         .lock_sessions()
         .get(session_id)
         .map(|s| s.wakeups.load(Ordering::Relaxed))
+}
+
+/// Longest list of hidden sessions accepted from the view: far past the
+/// session cap, a bound on an IPC-supplied list rather than a product limit.
+const MAX_BACKGROUND_REPORT: usize = 256;
+
+/// The view reports which of its sessions are on a tab nobody is looking at.
+/// Their output is batched harder (`HIDDEN_MAX_HOLD`); every other session,
+/// including one the view has never mentioned, is treated as seen. The list
+/// is the whole truth each time, so a session that left it is visible again.
+pub fn set_background_sessions(state: &TerminalSessions, session_ids: &[String]) {
+    let hidden: std::collections::HashSet<&str> = session_ids
+        .iter()
+        .take(MAX_BACKGROUND_REPORT)
+        .map(String::as_str)
+        .collect();
+    for (id, session) in state.lock_sessions().iter() {
+        session
+            .hidden
+            .store(hidden.contains(id.as_str()), Ordering::Relaxed);
+    }
 }
 
 /// Acknowledgements release only bytes already emitted for this session.
@@ -3594,7 +3685,17 @@ pub(crate) fn validate_manvi_paths(
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+    use base64::Engine;
     use tempfile::TempDir;
+
+    const BASE64_STANDARD: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::STANDARD;
+
+    /// Somewhere to send output that the test does not look at. It is no view
+    /// and holds no app handle, so a session outlives the `App` that spawned it.
+    fn discard() -> OutputSink {
+        OutputSink::channel(tauri::ipc::Channel::new(|_| Ok(())))
+    }
 
     /// A Windows batch shim re-reads the command line through cmd.exe, so an
     /// argument that is safe for the program can still be a second command.
@@ -3772,6 +3873,7 @@ mod tests {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "touch revoked-launch-marker".into()]),
             None,
+            discard(),
             Some(observer.clone()),
         );
         assert!(result
@@ -3832,6 +3934,7 @@ mod tests {
                     ),
                 ]),
                 Some(spoof.clone()),
+                discard(),
                 observer,
             )
             .unwrap();
@@ -3874,6 +3977,7 @@ mod tests {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), script]),
             None,
+            discard(),
             None,
         )
         .unwrap();
@@ -3888,7 +3992,7 @@ mod tests {
         assert!(!wait_for(&|| marker.exists(), Duration::from_millis(1500)));
         assert!(!list_sessions(&state)[0].detached);
         assert_eq!(
-            attach_session(&state, &spawned.id, 24, 80).unwrap_err(),
+            attach_session(&state, &spawned.id, 24, 80, discard()).unwrap_err(),
             "This terminal is already shown in a tab."
         );
 
@@ -3904,11 +4008,11 @@ mod tests {
         assert_eq!(listed[0].launcher, None);
         assert_eq!(listed[0].run_id, None);
 
-        let shown = attach_session(&state, &spawned.id, 30, 100).unwrap();
+        let shown = attach_session(&state, &spawned.id, 30, 100, discard()).unwrap();
         assert_eq!(shown.id, spawned.id);
         assert!(!list_sessions(&state)[0].detached);
-        assert!(attach_session(&state, &spawned.id, 30, 100).is_err());
-        assert!(attach_session(&state, "term-missing", 30, 100).is_err());
+        assert!(attach_session(&state, &spawned.id, 30, 100, discard()).is_err());
+        assert!(attach_session(&state, "term-missing", 30, 100, discard()).is_err());
 
         kill_session(&state, &spawned.id).unwrap();
         assert!(list_sessions(&state).is_empty());
@@ -3963,6 +4067,7 @@ mod tests {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
+            discard(),
             Some(Arc::new(PanicsOnFinish)),
         )
         .unwrap();
@@ -4007,6 +4112,7 @@ mod tests {
                 format!("echo $$ > '{}'; echo hello; sleep 300", pid_file.display()),
             ]),
             None,
+            OutputSink::events(app.handle()),
             None,
         )
         .unwrap();
@@ -4136,6 +4242,7 @@ mod tests {
                 "read word; printf 'round-trip:%s:%s\\n' \"$word\" $((6 * 7))".into(),
             ]),
             None,
+            OutputSink::events(app.handle()),
             None,
         )
         .unwrap();
@@ -4190,6 +4297,7 @@ mod tests {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), script]),
             None,
+            discard(),
             None,
         )
         .unwrap();
@@ -4234,6 +4342,80 @@ mod tests {
             "the reader woke {} times in 1.5 s of idleness",
             after - before
         );
+    }
+
+    /// The view says which sessions are on a tab nobody is looking at; the rest,
+    /// and any session it has never mentioned, stay at full rate. The list is
+    /// the whole truth each time.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_sessions_the_view_names_are_batched_harder() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let a = spawn_script(&state, dir.path(), "exec cat".into());
+        let b = spawn_script(&state, dir.path(), "exec cat".into());
+        let hidden = |id: &str| {
+            state
+                .lock_sessions()
+                .get(id)
+                .unwrap()
+                .hidden
+                .load(Ordering::Relaxed)
+        };
+        assert!(!hidden(&a.id) && !hidden(&b.id), "unreported is seen");
+        set_background_sessions(&state, &[a.id.clone(), "term-unknown".into()]);
+        assert!(hidden(&a.id) && !hidden(&b.id));
+        set_background_sessions(&state, &[b.id.clone()]);
+        assert!(!hidden(&a.id) && hidden(&b.id));
+        set_background_sessions(&state, &[]);
+        assert!(!hidden(&a.id) && !hidden(&b.id));
+        kill_session(&state, &a.id).unwrap();
+        kill_session(&state, &b.id).unwrap();
+    }
+
+    /// A page that is gone (or whose event loop refused) is the view's trouble:
+    /// a failed send sheds, says so, and the process keeps running.
+    #[cfg(unix)]
+    #[test]
+    fn a_view_whose_channel_fails_is_told_and_the_process_keeps_running() {
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let losses = Arc::new(AtomicUsize::new(0));
+        let counted = losses.clone();
+        app.listen("terminal-loss", move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let failing = OutputSink::channel(tauri::ipc::Channel::new(|_| {
+            Err(tauri::Error::WebviewNotFound)
+        }));
+        let spawned = spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec![
+                "-c".into(),
+                "stty raw -echo; echo one; sleep 0.3; echo two; sleep 0.3; echo three; exec sleep 30"
+                    .into(),
+            ]),
+            None,
+            failing,
+            None,
+        )
+        .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || losses
+            .load(Ordering::SeqCst)
+            >= 1));
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(list_sessions(&state).len(), 1, "the session kept running");
+        assert!(!list_sessions(&state)[0].ending);
+        kill_session(&state, &spawned.id).unwrap();
     }
 
     /// The defect: Close signalled the tty's one foreground group and then the
@@ -4517,6 +4699,7 @@ mod tests {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), format!("touch {marker}")]),
             None,
+            discard(),
             None,
         )
     }
@@ -6308,7 +6491,7 @@ mod tests {
                 .any(|payload| payload.contains("could not reap"))
                 && payloads
                     .iter()
-                    .any(|payload| payload.contains("terminal-output"))
+                    .any(|payload| payload.contains("send output to its view"))
                 && payloads
                     .iter()
                     .any(|payload| payload.contains("could not signal")),
@@ -6872,6 +7055,7 @@ mod tests {
             Some(claude.to_string_lossy().into_owned()),
             Some(vec!["30".into()]),
             None,
+            discard(),
             None,
         )
         .unwrap();
@@ -6925,6 +7109,7 @@ mod tests {
                 crate::sysload::procscan::tests::FIXTURE_ENV.to_string(),
                 format!("sleep=30,pidfile={}", pidfile.display()),
             )])),
+            discard(),
             None,
         )
         .unwrap();

@@ -612,6 +612,23 @@
   /** The session this tab is still to take over, until its first start. */
   let attachPending: string | null = untrack(() => attachSessionId ?? null);
 
+  /**
+   * Runs a command that starts or takes over a session with that session's
+   * own output channel, opened first so nothing it prints before the id comes
+   * back is missed, and tells the bus whose channel it is once the id is known.
+   */
+  async function withOutput(run: (channel: object) => Promise<TerminalSpawned>): Promise<TerminalSpawned> {
+    const output = ptyBus.openOutput();
+    try {
+      const spawned = await run(output.channel);
+      output.bind(spawned.id);
+      return spawned;
+    } catch (error) {
+      output.release();
+      throw error;
+    }
+  }
+
   function createLifecycle() {
     return createSessionLifecycle({
       key: tabId, repoPath, ...(checkout ? { checkout } : {}), label: launcherLabel(launcher), launcher, bus: ptyBus, registry: terminalSessions,
@@ -647,12 +664,13 @@
           if (attachPending) {
             const sessionId = attachPending;
             attachPending = null;
-            return invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols });
+            return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols, onOutput }));
           }
-          if (taskRunId) return invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
+          if (taskRunId) return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
             input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),
-          });
-          return invoke<TerminalSpawned>("cmd_terminal_spawn", {
+            onOutput,
+          }));
+          return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_spawn", {
             repoPath: workPath, rows, cols,
             program: cfg.program, args: cfg.args,
             startDir: startDir ?? null,
@@ -662,7 +680,8 @@
             // this unconditionally would fail on the next ordinary launch
             // rather than wait to matter.
             acknowledged: requiresAcknowledgement(permissionMode) ? acknowledgedBypass : false,
-          });
+            onOutput,
+          }));
         },
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
         resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
@@ -719,8 +738,8 @@
           // search box. The shell can wait for focus; their word cannot.
           if (active && !isEditingElsewhere(document.activeElement, container)) reveal();
         },
-        output(b64, sessionId, reserved) {
-          const decision = planTerminalOutput(credit, b64, sessionId, reserved ?? null, {
+        output(bytes, sessionId) {
+          const decision = planTerminalOutput(credit, bytes, sessionId, {
             terminal: term !== null && !disposed,
             disposed,
           });
@@ -731,13 +750,8 @@
           } else if (decision.action === "overflow") {
             for (const owed of decision.owed) acknowledgeOutput(owed.sessionId, owed.bytes);
             lifecycle?.fail(decision.failure, true);
-          } else if (decision.action === "lost") {
-            // An unreadable frame is lost output, not a dead process. The
-            // host sheds rather than waits forever on the credit this frame
-            // could not name, so nothing here needs to end the session.
-            lifecycle?.fail(decision.failure, true);
           }
-          if (decision.action !== "lost" && !disposed) {
+          if (!disposed) {
             sessionActivity.output(sessionId);
             if (!active) onActivity();
           }

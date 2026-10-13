@@ -73,6 +73,7 @@ pub(super) fn spawn<R: tauri::Runtime>(
     terminals: &TerminalSessions,
     state: &WorkbenchState,
     launch: Launch,
+    output: terminal::OutputSink,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     // One launch of this attempt at a time, and a second one waits for the
     // first rather than failing. The claim below is single-use and the
@@ -95,9 +96,13 @@ pub(super) fn spawn<R: tauri::Runtime>(
         state.with_store(|store| query(store, "runs.get", &json!({"id":launch.id}).to_string()))?;
     let source: Source = serde_json::from_value(response["item"].clone())
         .map_err(|e| WorkbenchError::new("protocol_error", e.to_string()))?;
-    if let Some(session) =
-        terminal::attach_tracked_session(terminals, &source.id, launch.rows, launch.cols)
-    {
+    if let Some(session) = terminal::attach_tracked_session(
+        terminals,
+        &source.id,
+        launch.rows,
+        launch.cols,
+        output.clone(),
+    ) {
         return Ok(session);
     }
     if source.state != "prepared" || source.revision != launch.expected_revision {
@@ -134,7 +139,9 @@ pub(super) fn spawn<R: tauri::Runtime>(
     .inspect_err(|e| log::warn!(target: "workbench", "launch {}: refused by the CLI check after {}ms: {}", source.id, began.elapsed().as_millis(), e.code))?;
     log::info!(target: "workbench", "launch {}: checked after {}ms", source.id, began.elapsed().as_millis());
     let id = source.id.clone();
-    let outcome = start(app, terminals, state, launch, source, program, options);
+    let outcome = start(
+        app, terminals, state, launch, source, program, options, output,
+    );
     match &outcome {
         Ok(_) => {
             log::info!(target: "workbench", "launch {id}: started after {}ms", began.elapsed().as_millis())
@@ -146,6 +153,7 @@ pub(super) fn spawn<R: tauri::Runtime>(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start<R: tauri::Runtime>(
     app: &AppHandle<R>,
     terminals: &TerminalSessions,
@@ -154,6 +162,7 @@ fn start<R: tauri::Runtime>(
     source: Source,
     program: String,
     options: terminal_command::LaunchOptions<'_>,
+    output: terminal::OutputSink,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     let brief = terminal_command::BriefFile::create(&source.brief.markdown)?;
     let args = terminal_command::arguments(
@@ -200,6 +209,7 @@ fn start<R: tauri::Runtime>(
         launch.cols,
         program,
         args,
+        output,
         observer,
     )
     .map_err(|e| WorkbenchError::new("launch_error", e))
@@ -412,6 +422,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap_or_else(|e| {
             panic!(
@@ -462,7 +473,15 @@ mod tests {
         let first = state.0.terminal_launches.try_enter("run").unwrap();
         let (first_session, second) = std::thread::scope(|scope| {
             let handle = app.handle();
-            let waiter = scope.spawn(|| spawn(handle, &terminals, &state, launch()));
+            let waiter = scope.spawn(|| {
+                spawn(
+                    handle,
+                    &terminals,
+                    &state,
+                    launch(),
+                    crate::terminal::OutputSink::events(handle),
+                )
+            });
             let parked = Instant::now();
             while state.0.terminal_launches.waiting() == 0 {
                 assert!(
@@ -480,6 +499,7 @@ mod tests {
                 source(&state),
                 program,
                 super::terminal_command::LaunchOptions::default(),
+                crate::terminal::OutputSink::events(app.handle()),
             )
             .unwrap();
             drop(first);
@@ -541,6 +561,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         let running = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -550,7 +571,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(':'));
-        let replay = spawn(app.handle(), &terminals, &state, launch()).unwrap();
+        let replay = spawn(
+            app.handle(),
+            &terminals,
+            &state,
+            launch(),
+            crate::terminal::OutputSink::events(app.handle()),
+        )
+        .unwrap();
         assert_eq!(replay.id, started.id);
         assert_eq!(
             state.request("runs.get", r#"{"id":"run"}"#).unwrap(),
@@ -624,9 +652,15 @@ mod tests {
             "inbox"
         );
         assert_eq!(
-            spawn(app.handle(), &terminals, &state, launch())
-                .unwrap_err()
-                .code,
+            spawn(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                crate::terminal::OutputSink::events(app.handle()),
+            )
+            .unwrap_err()
+            .code,
             "launch_consumed"
         );
         let output = output.lock().unwrap().clone();
@@ -669,6 +703,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         state.shutdown();
@@ -714,15 +749,22 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .is_err());
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
         assert_eq!(saved["item"]["state"], "failed");
         assert!(saved["item"]["process_id"].is_null());
         assert_eq!(
-            spawn(app.handle(), &terminals, &state, launch())
-                .unwrap_err()
-                .code,
+            spawn(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                crate::terminal::OutputSink::events(app.handle()),
+            )
+            .unwrap_err()
+            .code,
             "launch_consumed"
         );
     }
@@ -748,6 +790,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .is_err());
         received.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -782,6 +825,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         write_to_session(&terminals, &session.id, "finish\n").unwrap();

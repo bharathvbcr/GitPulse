@@ -109,6 +109,18 @@ before that tag is pushed.
   and a failed one is reported once per run of failures. Deadlines count the
   time the page actually waited, so a blocked or hidden window no longer
   charges its own stall to the backend.
+- Terminal output travels on a channel of its own instead of a global event. A
+  view hands the backend a per-session `Channel` when it starts or takes over a
+  session, and the reader writes raw bytes to it: no base64, no JSON wrapper and
+  no script evaluated in every other tab's webview. The reader gathers up to
+  64 KiB per message, so a flood that was 1,024 messages per MiB is about 16,
+  and a session whose tab is not on screen is sent a few times a second rather
+  than at frame rate (`HIDDEN_MAX_HOLD`, 250 ms). The page's credit window is
+  512 KiB so the larger messages keep the reader running ahead of the paint. A
+  message longer than a read can make is now repaid in full and reported
+  instead of being dropped with its credit still owed. An exit waits for an end
+  marker sent down the channel after the last byte, so it can no longer
+  overtake output still being fetched.
 - Closing a terminal no longer skips its question when GitPulse could not tell
   what was running in it. A context read that timed out, failed or came back
   unreadable was treated as "nothing running", so a shell with a live job closed

@@ -131,6 +131,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), script]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     let job = read_pid(&pidfile, Duration::from_secs(5));
@@ -173,6 +174,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
         Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(
@@ -219,6 +221,7 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
             "trap '' HUP; printf ready; while :; do sleep 1; done".into(),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
@@ -255,6 +258,7 @@ fn quitting_closes_every_session_concurrently() {
                 format!("trap '' HUP; printf 'ready-{index};'; while :; do sleep 1; done"),
             ]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
         )
         .unwrap();
     }
@@ -294,6 +298,7 @@ fn a_session_starts_in_the_requested_directory_inside_the_repository() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "pwd -P; exit 0".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     h.exits.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -337,6 +342,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
         );
         assert!(
             result.is_err(),
@@ -354,6 +360,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exit 0".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle())
     )
     .is_err());
     // A refusal consumed no capacity and started no process.
@@ -369,6 +376,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
         )
         .unwrap();
         assert_eq!(
@@ -394,6 +402,7 @@ fn context_names_the_foreground_program_and_follows_cd() {
         Some("/bin/sh".into()),
         Some(vec!["-i".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(&h.state, &session.id, "cd docs/guide && echo moved\n").unwrap();
@@ -475,6 +484,7 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                         Some("/bin/sh".into()),
                         Some(vec!["-i".into()]),
                         None,
+                        gitpulse_lib::terminal::OutputSink::events(&handle),
                     )
                     .expect("capacity is never exhausted: THREADS is below the session cap");
                     let reader_state = state.clone();
@@ -521,6 +531,7 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                 Some("/bin/sh".into()),
                 Some(vec!["-c".into(), "sleep 30".into()]),
                 None,
+                gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
             )
             .expect("a slot leaked during the race"),
         );
@@ -548,6 +559,7 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
         Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(
@@ -567,6 +579,7 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "sleep 30".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     let mut outsider = std::process::Command::new("sleep")
@@ -628,6 +641,7 @@ fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
         Some("/bin/bash".into()),
         Some(vec!["-c".into(), script]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));

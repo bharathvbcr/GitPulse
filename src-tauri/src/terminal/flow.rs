@@ -20,7 +20,7 @@
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-pub(super) const OUTPUT_WINDOW: usize = 256 * 1024;
+pub(super) const OUTPUT_WINDOW: usize = 512 * 1024;
 /// Outstanding credit at or below which a shedding session delivers again.
 /// Half the window, so one repaid chunk does not flip it back and forth.
 const RESUME_AT: usize = OUTPUT_WINDOW / 2;

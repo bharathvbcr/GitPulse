@@ -23,7 +23,8 @@ export interface SessionTransport {
 export interface SessionHooks {
   state(status: "starting" | "running" | "exited" | "error", message?: string): void;
   started(session: TerminalSpawned): void;
-  output(data: string, id: string, reservedBytes?: number): void;
+  /** One message of output, whose length is exactly the credit Rust reserved for it. */
+  output(bytes: Uint8Array, id: string): void;
   exit(event: TerminalExitEvent): void;
   reset(): void | Promise<void>;
   warning(message: string): void;
@@ -296,12 +297,9 @@ export function createSessionLifecycle(options: {
         // leaves that credit outstanding until the stall timeout. The view
         // acknowledges what it can no longer paint. After release(), `id` is
         // null and a late chunk belongs to a session the reader has finished.
-        onOutput(data, reserved) {
+        onOutput(bytes) {
           if (id !== spawned.id) return;
-          // Omit the argument when it is absent. An explicit `undefined`
-          // would fail callers that assert the two-argument delivery.
-          if (typeof reserved === "number") hooks.output(data, spawned.id, reserved);
-          else hooks.output(data, spawned.id);
+          hooks.output(bytes, spawned.id);
         },
         // A lost chunk is not a dead shell. The notice stays up, and the
         // keyboard stays up, until the process itself exits.

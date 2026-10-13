@@ -141,6 +141,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), program_args.into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(&handle),
         )
     };
 
@@ -238,6 +239,7 @@ fn unread_flood(total: usize, budget: Duration) {
             format!("head -c {total} /dev/zero | tr '\\000' x; echo finished"),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let mut peak = rss_before;
@@ -309,6 +311,7 @@ fn invalid_utf8_and_split_multibyte_sequences_arrive_byte_exact_at_every_alignme
                 ),
             ]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         let exit = exits
@@ -345,6 +348,7 @@ fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "read go; stty size".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let started = Instant::now();
@@ -396,6 +400,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exit 0".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     exits
@@ -422,6 +427,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "sleep 300".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     kill_session(&state, &live.id).unwrap();

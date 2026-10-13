@@ -129,6 +129,7 @@ mod imp {
                 Some(program.to_owned()),
                 Some(args.iter().map(|a| (*a).to_owned()).collect()),
                 None,
+                gitpulse_lib::terminal::OutputSink::events(app.handle()),
             )
             .unwrap_or_else(|error| panic!("spawn {program}: {error}"))
             .id

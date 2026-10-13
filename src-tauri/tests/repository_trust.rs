@@ -399,6 +399,7 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "touch terminal-executed".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     );
     assert!(spawn.unwrap_err().contains(repository_trust::REQUIRED));
     assert!(!repo.path().join("terminal-executed").exists());

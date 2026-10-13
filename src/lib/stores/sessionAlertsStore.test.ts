@@ -200,6 +200,6 @@ describe("attention and attendance", () => {
     invoke.mockResolvedValue(undefined);
     store.terminalAttendance.report("b", true);
     await store.terminalAttendance.flush();
-    expect(invoke).toHaveBeenCalledWith("cmd_session_alerts_visible", { sessionIds: ["a", "b"] });
+    expect(invoke).toHaveBeenCalledWith("cmd_session_alerts_visible", { sessionIds: ["a", "b"], backgroundIds: [] });
   });
 });

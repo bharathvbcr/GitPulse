@@ -11,37 +11,20 @@
  *
  * The window size is the Rust constant. `outputCredit.test.ts` reads it.
  */
-export const OUTPUT_CREDIT_WINDOW = 256 * 1024;
+export const OUTPUT_CREDIT_WINDOW = 512 * 1024;
 
 /**
- * One `terminal-output` event. The reader coalesces what a program wrote in a
- * burst into one event (up to this many bytes) because every event is a script
- * evaluated in the webview. A reserved length outside `1..=` this is not a
- * length. Pinned to Rust's `OUTPUT_CHUNK_BYTES` by `outputCredit.test.ts`.
+ * One output message on a session's channel. The reader coalesces what a
+ * program wrote in a burst into one message (up to this many bytes) because
+ * every message costs the webview a script and a fetch. The credit Rust
+ * reserved for a message is exactly its length, so no length travels beside
+ * the bytes; one longer than this is not a message the host sends and is
+ * repaid without being painted (`planTerminalOutput`). Pinned to Rust's
+ * `OUTPUT_CHUNK_BYTES` by `outputCredit.test.ts`.
  */
-export const MAX_TERMINAL_OUTPUT_CHUNK = 16 * 1024;
+export const MAX_TERMINAL_OUTPUT_CHUNK = 64 * 1024;
 
-/** Longest base64 text an event of `MAX_TERMINAL_OUTPUT_CHUNK` bytes can carry. */
-export const MAX_TERMINAL_OUTPUT_B64 = Math.ceil(MAX_TERMINAL_OUTPUT_CHUNK / 3) * 4;
-
-/**
- * The byte count the reader reserved, or null when the event cannot name one.
- * Zero, fractions, and anything above one read are refused: acknowledging them
- * would either be rejected or would shrink the window by the wrong amount.
- */
-export function reservedTerminalBytes(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isInteger(value)) return null;
-  if (value < 1 || value > MAX_TERMINAL_OUTPUT_CHUNK) return null;
-  return value;
-}
-
-export function decodeTerminalOutput(b64: string): Uint8Array {
-  if (typeof b64 !== "string") throw new Error("Terminal output was not base64");
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
-  return bytes;
-}
+const OVERSIZE = "Terminal output chunk exceeded its limit";
 
 export interface OutputView {
   /** An emulator exists and has not been disposed. */
@@ -163,44 +146,27 @@ export type OutputPlan =
   | { action: "paint"; token: PaintToken }
   | { action: "ack"; bytes: number; failure: string | null }
   | { action: "held" }
-  | { action: "overflow"; owed: OutputAck[]; failure: string }
-  | { action: "lost"; failure: string };
+  | { action: "overflow"; owed: OutputAck[]; failure: string };
 
 /**
- * Decide what one output event does to the credit window.
+ * Decide what one output message does to the credit window.
  *
- * A chunk the emulator cannot decode still occupied `reserved` bytes in
- * `OutputFlow`. Acknowledging that count is what keeps one bad frame from
- * stalling the reader. When the event does not name a usable length, the
- * chunk is reported lost and its credit stays outstanding: the host sheds
- * output rather than wait on it forever, so the process is never ended for
- * it. Guessing the count from the base64 text would acknowledge the wrong
- * number.
+ * Rust reserved exactly `bytes.length` for this message, so that is what is
+ * owed whatever becomes of it. A message longer than a read can make is not
+ * painted: it is repaid in full and reported. Repaying is what keeps one bad
+ * message from holding the reader's window shut until its stall timeout; it
+ * was previously dropped with its credit still outstanding.
  */
 export function planTerminalOutput(
   credit: ReturnType<typeof createOutputCredit>,
-  b64: string,
+  bytes: Uint8Array,
   sessionId: string,
-  reserved: unknown,
   view: OutputView,
 ): OutputPlan {
-  const reservedBytes = reservedTerminalBytes(reserved);
-  let decoded: Uint8Array;
-  try {
-    decoded = decodeTerminalOutput(b64);
-  } catch (err) {
-    const failure = `Invalid terminal output: ${err instanceof Error ? err.message : String(err)}`;
-    if (reservedBytes !== null) return { action: "ack", bytes: reservedBytes, failure };
-    return { action: "lost", failure };
+  if (bytes.length > MAX_TERMINAL_OUTPUT_CHUNK) {
+    return { action: "ack", bytes: bytes.length, failure: OVERSIZE };
   }
-  if (reservedBytes !== null && reservedBytes !== decoded.length) {
-    return {
-      action: "ack",
-      bytes: reservedBytes,
-      failure: "Terminal output length did not match its reserved credit",
-    };
-  }
-  const decision = credit.accept(decoded, sessionId, view);
+  const decision = credit.accept(bytes, sessionId, view);
   if (decision.action === "paint") return { action: "paint", token: decision.token };
   if (decision.action === "ack") return { action: "ack", bytes: decision.bytes, failure: null };
   if (decision.action === "held") return { action: "held" };
@@ -213,7 +179,7 @@ export function planTerminalOutput(
  * more than this, so the reader always has at least three quarters of
  * `OutputFlow`'s window free and never waits on a frame that has not come.
  */
-export const ACK_FLUSH_THRESHOLD = 64 * 1024;
+export const ACK_FLUSH_THRESHOLD = OUTPUT_CREDIT_WINDOW / 4;
 
 /**
  * Upper bound on how long owed credit waits when no frame comes: a hidden

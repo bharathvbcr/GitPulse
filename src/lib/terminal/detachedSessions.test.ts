@@ -20,7 +20,7 @@ function fakeBus() {
   const bus: PtyBus = {
     prepare: async () => () => {},
     subscribe(id, session) { handlers.set(id, session); return () => { if (handlers.get(id) === session) handlers.delete(id); }; },
-    pendingCount: () => 0,
+    pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }),
   };
   return { bus, handlers };
 }

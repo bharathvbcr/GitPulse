@@ -53,7 +53,7 @@ function fixture(overrides: Partial<SessionTransport> = {}, extras: Extras = {})
   const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn(), slow: vi.fn() };
   const owner = createSessionLifecycle({
     key: "tab-a", repoPath: "/repo", label: "Shell", registry, transport, hooks, ...extras,
-    bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+    bus: { prepare: async () => () => {}, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe: () => () => {} },
   });
   return { owner, registry, transport, hooks };
 }

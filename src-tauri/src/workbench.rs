@@ -908,14 +908,16 @@ pub async fn cmd_workbench_launch_terminal(
     terminals: State<'_, crate::terminal::TerminalSessions>,
     app: tauri::AppHandle,
     input: String,
+    on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, WorkbenchError> {
     let launch = terminal_run::parse(&input)?;
     let reservation = state.reserve()?;
     let state = state.inner().clone();
     let terminals = terminals.inner().clone();
+    let output = crate::terminal::OutputSink::channel(on_output);
     tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
-        terminal_run::spawn(&app, &terminals, &state, launch)
+        terminal_run::spawn(&app, &terminals, &state, launch, output)
     })
     .await
     .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))?

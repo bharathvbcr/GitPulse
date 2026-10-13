@@ -141,11 +141,12 @@ impl Readiness {
             Backend::Kqueue { kq } => kqueue_wait(kq, timeout)?,
             #[cfg(target_os = "linux")]
             Backend::Epoll { ep, .. } => epoll_wait(ep, timeout)?,
-            Backend::Poll => super::input::wait_for_output_within(self.master, timeout)
-                .map(|output| Woke {
+            Backend::Poll => {
+                super::input::wait_for_output_within(self.master, timeout).map(|output| Woke {
                     output,
                     exited: false,
-                })?,
+                })?
+            }
         };
         // Output alone proves nothing about the child; anything else (an exit,
         // a timer, a lap, an interruption) is a reason to ask.
@@ -405,7 +406,10 @@ mod tests {
             .expect("openpty")
     }
 
-    fn shell(pair: &portable_pty::PtyPair, script: &str) -> Box<dyn portable_pty::Child + Send + Sync> {
+    fn shell(
+        pair: &portable_pty::PtyPair,
+        script: &str,
+    ) -> Box<dyn portable_pty::Child + Send + Sync> {
         let mut command = CommandBuilder::new("/bin/sh");
         command.args(["-c", script]);
         pair.slave.spawn_command(command).expect("spawn")
@@ -503,7 +507,10 @@ mod tests {
                 deaf: true,
             },
         );
-        assert!(ready.watching_exit(), "positive control: it trusts its watch");
+        assert!(
+            ready.watching_exit(),
+            "positive control: it trusts its watch"
+        );
         ready.take_exit_hint();
         let started = Instant::now();
         ready.wait().unwrap();
@@ -513,7 +520,10 @@ mod tests {
             started.elapsed()
         );
         assert!(ready.take_exit_hint());
-        assert!(child.try_wait().unwrap().is_some(), "the ask finds the exit");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the ask finds the exit"
+        );
     }
 
     /// Without a watch there is no net to trust: the lap finds the exit.

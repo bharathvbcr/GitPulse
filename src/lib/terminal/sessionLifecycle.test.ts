@@ -22,12 +22,9 @@ function fixture(overrides: Partial<SessionTransport> = {}, registry = createSes
   };
   const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
   const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks, singleAttempt, ...extras,
-    bus: { prepare, pendingCount: () => 0, subscribe(_id, h) { handlers = h; return unsubscribe; } },
+    bus: { prepare, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe(_id, h) { handlers = h; return unsubscribe; } },
   });
-  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string, reserved?: number) => {
-    if (typeof reserved === "number") handlers?.onOutput(s, reserved);
-    else handlers?.onOutput(s);
-  }, error: (message: string) => handlers?.onError?.(message), notice: (message: string) => handlers?.onNotice?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
+  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string) => handlers?.onOutput(new TextEncoder().encode(s)), error: (message: string) => handlers?.onError?.(message), notice: (message: string) => handlers?.onNotice?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
 }
 
 describe("the session record", () => {
@@ -38,7 +35,7 @@ describe("the session record", () => {
     const transport = { spawn: vi.fn(async () => ({ id: "native-l", shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}), detach: vi.fn(async () => true) };
     const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
     const owner = createSessionLifecycle({ key: "tab-l", repoPath: "/repo", label: "Claude", launcher: "claude", registry, transport, hooks,
-      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe: () => () => {} },
     });
     await owner.start();
     expect(get(registry)[0]).toMatchObject({ launcher: "claude", label: "Claude" });
@@ -283,13 +280,13 @@ describe("terminal lifecycle races", () => {
     expect(f.owner.write("should not send")).toBe(false);
     f.owner.dispose(); await flush(); expect(f.transport.kill).not.toHaveBeenCalled();
   });
-  it("forwards a reserved length and omits it when the event has none", async () => {
+  it("hands the view each message's bytes with the session they belong to", async () => {
     const f = fixture();
     await f.owner.start();
-    f.output("QQ==", 1);
-    expect(f.hooks.output).toHaveBeenCalledWith("QQ==", "native-a", 1);
-    f.output("Qg==");
-    expect(f.hooks.output).toHaveBeenLastCalledWith("Qg==", "native-a");
+    f.output("one");
+    f.output("two");
+    expect(f.hooks.output).toHaveBeenNthCalledWith(1, new TextEncoder().encode("one"), "native-a");
+    expect(f.hooks.output).toHaveBeenNthCalledWith(2, new TextEncoder().encode("two"), "native-a");
     f.owner.dispose(); await flush();
   });
   it("reports output whose credit cannot be measured as lost, and keeps the process", async () => {
@@ -313,7 +310,7 @@ describe("terminal lifecycle races", () => {
     f.owner.dispose();
     await flush();
     f.output("still-reserved");
-    expect(f.hooks.output).toHaveBeenCalledWith("still-reserved", "native-a");
+    expect(f.hooks.output).toHaveBeenCalledWith(new TextEncoder().encode("still-reserved"), "native-a");
     for (let i = 0; i < 1000; i++) f.output(`c${i}`);
     expect(f.hooks.output).toHaveBeenCalledTimes(1001);
     // The session ended while detaching: nothing is kept, and its exit
@@ -452,7 +449,7 @@ describe("a hosted session's record", () => {
     const transport = { spawn: vi.fn(async () => ({ id: "native-h", shell: "claude", cwd: "/repo/.gitpulse/worktrees/a" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}), detach: vi.fn(async () => true) };
     const owner = createSessionLifecycle({ key: "tab-h", repoPath: "/repo", checkout: "/repo/.gitpulse/worktrees/a", label: "Claude", registry, transport,
       hooks: { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() },
-      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe: () => () => {} },
     });
     await owner.start();
     expect(get(registry)[0]).toMatchObject({ repoPath: "/repo", checkout: "/repo/.gitpulse/worktrees/a" });
@@ -466,7 +463,7 @@ describe("admission to a session slot", () => {
     const state = vi.fn();
     const lifecycle = createSessionLifecycle({ key, repoPath: "/repo", label: "Claude", registry, transport,
       hooks: { state, started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn(), ...hooks },
-      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe: () => () => {} },
     });
     return { lifecycle, transport, state };
   }
