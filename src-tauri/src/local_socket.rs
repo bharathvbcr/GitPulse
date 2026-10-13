@@ -216,9 +216,97 @@ pub fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
     unsafe { libc::poll(&mut descriptor, 1, millis) > 0 }
 }
 
+/// What [`wait_readable_or_woken`] found ready.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Ready {
+    /// The listener has a connection to accept.
+    pub listener: bool,
+    /// The wake descriptor has bytes: someone asked the waiter to look again.
+    pub woken: bool,
+}
+
+/// Blocks, with no timeout, until `fd` is readable or `wake` is.
+///
+/// For a thread whose only reasons to run are a connection and being told to
+/// stop. `wake` is the read end of a pipe the stopper writes to; a timeout
+/// would only ever find the stop late. An interrupted wait returns with
+/// nothing ready, and the caller's loop asks again.
+pub fn wait_readable_or_woken(fd: RawFd, wake: RawFd) -> Ready {
+    let mut descriptors = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: two initialised `pollfd`s describing descriptors this thread
+    // holds open for the duration of the call; -1 waits indefinitely.
+    let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+    if ready <= 0 {
+        return Ready::default();
+    }
+    // POLLHUP and POLLERR count: a listener that errored must be looked at by
+    // `accept`, and a closed wake pipe means nobody can ever wake us.
+    let any = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+    Ready {
+        listener: descriptors[0].revents & any != 0,
+        woken: descriptors[1].revents & any != 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_ends_when_either_descriptor_is_readable_and_says_which() {
+        use std::io::Write;
+        let (wake_reader, mut wake_writer) = UnixStream::pair().unwrap();
+        let (listener_side, mut peer) = UnixStream::pair().unwrap();
+        let fds = (listener_side.as_raw_fd(), wake_reader.as_raw_fd());
+        wake_writer.write_all(b"w").unwrap();
+        assert_eq!(
+            wait_readable_or_woken(fds.0, fds.1),
+            Ready {
+                listener: false,
+                woken: true
+            }
+        );
+        peer.write_all(b"x").unwrap();
+        assert_eq!(
+            wait_readable_or_woken(fds.0, fds.1),
+            Ready {
+                listener: true,
+                woken: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_wait_with_nothing_ready_blocks_until_it_is_woken() {
+        use std::io::Write;
+        let (wake_reader, mut wake_writer) = UnixStream::pair().unwrap();
+        let (listener_side, _peer) = UnixStream::pair().unwrap();
+        let fds = (listener_side.as_raw_fd(), wake_reader.as_raw_fd());
+        let waiter = std::thread::spawn(move || {
+            let _keep = (&listener_side, &wake_reader);
+            let started = std::time::Instant::now();
+            (wait_readable_or_woken(fds.0, fds.1), started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        wake_writer.write_all(b"w").unwrap();
+        let (ready, waited) = waiter.join().unwrap();
+        assert!(ready.woken && !ready.listener, "{ready:?}");
+        assert!(
+            waited >= Duration::from_millis(250),
+            "returned after {waited:?} with nothing ready"
+        );
+    }
 
     #[test]
     fn a_peer_is_hung_up_silently_only_when_it_left_without_sending() {

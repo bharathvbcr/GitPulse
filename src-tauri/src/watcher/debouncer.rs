@@ -16,9 +16,29 @@ pub struct RepoFileWatcher {
     retired: Receiver<()>,
     pub receiver: Receiver<Result<Event, notify::Error>>,
     overflow: Arc<AtomicBool>,
+    /// A second sender on `receiver`, kept so that something other than the
+    /// native callback can wake whoever is blocked on it (see
+    /// [`Self::waker`]). It also means the receiver no longer disconnects when
+    /// the backend dies; [`Self::backend_alive`] is how that is noticed.
+    wake: SyncSender<Result<Event, notify::Error>>,
 }
 
 impl RepoFileWatcher {
+    /// A sender onto this watcher's event channel, for waking its reader.
+    pub(crate) fn waker(&self) -> SyncSender<Result<Event, notify::Error>> {
+        self.wake.clone()
+    }
+
+    /// False once the native backend has released its callback, which is what
+    /// the channel's disconnecting used to say before it had a second sender.
+    /// A watcher whose backend was shut down on purpose is not alive either.
+    pub(crate) fn backend_alive(&self) -> bool {
+        !matches!(
+            self.retired.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn simulate_overflow(&self) {
         self.overflow.store(true, Ordering::Release);
@@ -105,6 +125,7 @@ impl RepoFileWatcher {
         }
 
         let (tx, rx) = sync_channel(EVENT_QUEUE_CAPACITY);
+        let wake = tx.clone();
         let overflow = Arc::new(AtomicBool::new(false));
         let callback_overflow = overflow.clone();
         let (lifetime, retired) = channel::<()>();
@@ -170,6 +191,7 @@ impl RepoFileWatcher {
             retired,
             receiver: rx,
             overflow,
+            wake,
         })
     }
 }
