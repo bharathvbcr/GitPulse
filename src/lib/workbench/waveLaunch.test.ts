@@ -536,3 +536,97 @@ describe("a partial board", () => {
     expect(phases(done)).toEqual({ a: "merged" });
   });
 });
+
+describe("adversarial: merge halting and main state", () => {
+  const conflict: MergeTeardownError = { code: "conflict", message: "conflicted", paths: ["f"], total: 1, rolled_back: true, rollback_error: null };
+
+  it("adv: a mainState that rejects before a merge holds the member and merges nothing", async () => {
+    const w = world({ candidates: [[task("a")]] });
+    let calls = 0;
+    w.deps.mainState = async () => { if (calls++ >= 1) throw new Error("ipc down"); return { dirty: 0, operation: null }; };
+    const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
+    expect(w.merged).toEqual([]);
+    expect(done.members[0]!.phase).toBe("held");
+    expect(done.members[0]!.detail).toMatch(/could not be read \(ipc down\)/);
+  });
+
+  it("adv: a mainState that rejects at launch refuses the wave with nothing launched", async () => {
+    const w = world();
+    w.deps.mainState = async () => { throw new Error("ipc down"); };
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("refused");
+    expect(w.launched).toEqual([]);
+  });
+
+  it("adv: a mainState that throws a non-Error value is still a refusal, not a crash", async () => {
+    const w = world();
+    w.deps.mainState = async () => { throw { weird: true }; };
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("refused");
+    expect(w.launched).toEqual([]);
+  });
+
+  it("adv: dirty null or a malformed mainState reading is not free", async () => {
+    for (const bad of [{ dirty: null, operation: null }, { dirty: undefined, operation: null }, { dirty: NaN, operation: null }, { dirty: -1, operation: null }, {}, null] as unknown as MainState[]) {
+      const w = world();
+      w.deps.mainState = async () => bad;
+      const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+      expect(w.launched, JSON.stringify(bad)).toEqual([]);
+      expect(done.state, JSON.stringify(bad)).toBe("refused");
+    }
+  });
+
+  it("adv: two members conflicting in one batch produce one halt and exactly one merge attempt", async () => {
+    let attempts = 0;
+    const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, mergeFailure: () => { attempts += 1; return conflict; } });
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 2 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(attempts).toBe(1);
+    expect(w.merged).toEqual([]);
+  });
+
+  it("adv: a conflict whose typed object lost its paths still halts the wave", async () => {
+    // What mergeAndTeardown throws when readMergeTeardownError cannot read the
+    // object: the raw rejection. The host said conflict; the wave must stop.
+    const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] } });
+    w.deps.merge = async ({ taskId }) => {
+      if (taskId === "b") throw { code: "conflict", message: "Merging b conflicted in 1 file(s)", total: 1, rolled_back: true, rollback_error: null };
+      w.merged.push(taskId); return `Merged ${taskId}`;
+    };
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    expect(done.state, JSON.stringify(done.members.map((m) => [m.taskId, m.phase, m.detail]))).toBe("halted");
+    expect(w.merged).toEqual(["a"]);
+  });
+
+  it("adv: a wave resumed while main is parked merges nothing", async () => {
+    const first = world({ candidates: [[task("a"), task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    let reads = 0;
+    first.deps.mainState = async () => (reads++ === 0 ? { dirty: 0, operation: null } : { dirty: 0, operation: "squash merge" });
+    await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, first.deps)).finished;
+    const ready = first.persisted.find((r) => r.members.some((m) => m.phase === "ready"));
+    expect(ready).toBeTruthy();
+    const second = world({ candidates: [[task("a"), task("b")]] });
+    second.deps.mainState = async () => ({ dirty: 0, operation: "merge" });
+    const done = await (await resumeWave(structuredClone(ready!), second.deps)).finished;
+    expect(second.merged).toEqual([]);
+    expect(done.members.every((m) => m.phase !== "merged")).toBe(true);
+  });
+
+  it("adv: a wave resumed after a reload mid-merge does not merge the member behind the interrupted one", async () => {
+    const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] } });
+    const member = (id: string, phase: WaveRecord["members"][number]["phase"]) => ({ taskId: id, title: `Task ${id}`, phase, runId: `run-${id}`, requestId: `req-${id}`, cwd: `/wt/${id}`, head: "h1", detail: "", startedAt: 1 });
+    const record: WaveRecord = { v: 1, id: "w", repositoryId: "r", n: 3, batchesLeft: 0, batch: 1, state: "running", members: [member("a", "merged"), member("b", "merging"), member("c", "ready")], attempted: ["a", "b", "c"], note: "", seq: 5, acceptUnchecked: false };
+    const done = await (await resumeWave(record, w.deps)).finished;
+    expect(done.members[1]!.phase).toBe("held");
+    // b's merge may have conflicted and been rolled back before the reload;
+    // c was cut from the same base.
+    expect(w.merged, "c merged behind a member whose merge outcome is unknown").toEqual([]);
+  });
+
+  it("adv: a cleanup-pending merge is a merge: the member is merged and re-verified", async () => {
+    const w = world({ candidates: [[task("a")]], mergeSaid: () => "Merged 1 commit from x into main; cleanup pending: locked." });
+    const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
+    expect(phases(done)).toEqual({ a: "merged" });
+    expect(w.verifies.filter((v) => v === "a").length).toBeGreaterThanOrEqual(2);
+  });
+});
