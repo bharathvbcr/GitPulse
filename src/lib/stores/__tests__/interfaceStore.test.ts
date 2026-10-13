@@ -691,6 +691,30 @@ it("keeps terminal scrollback within bounds, with a smaller default for agents",
   interfaceStore.reset();
 });
 
+it("treats Option as Meta as on by default, switchable, and falls back to on for a corrupt value", async () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);
+  interfaceStore.setTerminalOptionAsMeta(false);
+  expect(get(interfaceStore).terminalOptionAsMeta).toBe(false);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);
+
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalOptionAsMeta: false }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalOptionAsMeta).toBe(false);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalOptionAsMeta: "no" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalOptionAsMeta).toBe(true);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("reads stored terminal scrollback clamped, and ignores a corrupt one", async () => {
   const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
   const storage = memoryStorage({

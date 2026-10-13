@@ -269,6 +269,13 @@ export interface InterfacePrefs {
    * by reading and rewriting the focused field still cannot act here.
    */
   terminalScreenReader: boolean;
+  /**
+   * macOS only: treat Option as Meta in terminals, so Option+B / Option+F send
+   * ESC b / ESC f (word motion) instead of composing a glyph. On by default.
+   * Turn off to type characters your layout puts on Option, such as `@` on a
+   * German keyboard. Applied to live terminals.
+   */
+  terminalOptionAsMeta: boolean;
   terminalLauncher: LauncherKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
@@ -346,6 +353,7 @@ const DEFAULTS: InterfacePrefs = {
   terminalScrollback: TERMINAL_SCROLLBACK_DEFAULT,
   terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
   terminalScreenReader: false,
+  terminalOptionAsMeta: true,
   terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
@@ -500,6 +508,7 @@ function readPrefs(): InterfacePrefs {
         TERMINAL_AGENT_SCROLLBACK_DEFAULT,
       ),
       terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
+      terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -744,6 +753,7 @@ function createInterfaceStore() {
     setTerminalAgentScrollback: (rows: number) =>
       patch({ terminalAgentScrollback: clampTerminalScrollback(rows, TERMINAL_AGENT_SCROLLBACK_DEFAULT) }),
     setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
+    setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),

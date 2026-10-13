@@ -73,10 +73,14 @@ describe("TerminalSession PTY contracts", () => {
       source.indexOf("function refitIfResized"),
     );
     expect(ensureBody).toContain("scrollback: sessionScrollback()");
-    expect(ensureBody).toContain("lineHeight: TERMINAL_LINE_HEIGHT");
-    expect(ensureBody).toContain("...macOptionOptions(");
+    expect(ensureBody).toContain("...macOptionOptions(get(hostPlatform).os, get(interfaceStore).terminalOptionAsMeta)");
     expect(ensureBody).not.toMatch(/scrollback:\s*\d/);
-    expect(ensureBody).not.toMatch(/lineHeight:\s*\d/);
+  });
+
+  it("applies the Option-as-Meta setting to live sessions", () => {
+    expect(source).toContain("$interfaceStore.terminalOptionAsMeta");
+    expect(source).toContain("term.options.macOptionIsMeta = options.macOptionIsMeta");
+    expect(source).toContain("term.options.macOptionClickForcesSelection = options.macOptionClickForcesSelection");
   });
 
   it("decouples creation from attachment: ensureTerm never opens a container", () => {

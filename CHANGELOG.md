@@ -54,13 +54,12 @@ before that tag is pushed.
     so a filled 200-column session of 5,000 rows holds 11.6 MB (about 14 MB with
     its JavaScript objects), against 2.4 MB at 1,000 rows. Changing the setting trims
     open terminals at once.
-  - On macOS, Option is Meta in the terminal (Option+B / Option+F send ESC b /
-    ESC f), and Option-click selects inside mouse-reporting programs. A layout
-    that types a character with Option, such as `@` on a German keyboard,
-    cannot type it inside a terminal.
-  - Terminal rows are now exactly one font height tall (line height 1 rather
-    than 1.15), so a row is a whole number of CSS pixels on a 2x display at every
-    text size (11px text had a 14.5px row). Text is denser than before.
+  - On macOS, Option is Meta in the terminal by default (Option+B / Option+F
+    send ESC b / ESC f), and Option-click selects inside mouse-reporting
+    programs. **Settings → Appearance → Option as Meta in terminals** turns it
+    off, for a layout that types a character with Option (such as `@` on a
+    German keyboard) and so cannot type it in a terminal while it is on. The
+    setting applies to open terminals at once and is hidden off macOS.
 - **Switching repository tabs no longer rebuilds the sidebar, the view shell
   or the status bar.** All three were keyed on the active repository's path, so
   every switch destroyed and recreated them. They now stay mounted and re-point

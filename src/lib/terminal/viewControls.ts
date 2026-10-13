@@ -53,30 +53,26 @@ export function terminalScrollbackFor(
 }
 
 /**
- * Row height as a multiple of the font's own height. A whole number, so xterm
- * does not scale a measured height by a fraction: at 1.15 the renderer
- * floors `charHeight * 1.15` to device pixels, and on a 2x display that left
- * a half-pixel CSS row (12.5, 14.5, 21.5 px at 10, 11 and 16 px text) that
- * the browser re-snaps every paint. At 1 every size measured lands on whole
- * CSS pixels (11, 13, 14, 15, 16, 19, 21, 28 for 10, 11, 12, 13, 14, 16, 18
- * and 24 px text, on a 2x display, in Chromium).
- */
-export const TERMINAL_LINE_HEIGHT = 1;
-
-/**
  * xterm's Option handling. By default macOS composes Option+key into a
  * glyph, so Option+B types "∫" instead of sending ESC b and shells and
  * agent CLIs lose word-wise motion and Alt shortcuts. Treating Option as
  * Meta sends ESC-prefixed keys; Option+click is the escape hatch that still
  * selects text when a program has mouse reporting on. Off macOS the option
  * does nothing and is left unset.
+ *
+ * `asMeta` is the user's setting (default on): the cost of Meta is that a
+ * layout which types a character with Option, such as `@` on a German
+ * keyboard, cannot type it in a terminal, so those users turn it off.
  */
-export function macOptionOptions(os: string | undefined): {
+export function macOptionOptions(
+  os: string | undefined,
+  asMeta = true,
+): {
   macOptionIsMeta: boolean;
   macOptionClickForcesSelection: boolean;
 } {
-  const mac = os === "macos";
-  return { macOptionIsMeta: mac, macOptionClickForcesSelection: mac };
+  const on = os === "macos" && asMeta;
+  return { macOptionIsMeta: on, macOptionClickForcesSelection: on };
 }
 
 export type TerminalViewChord = "find" | "zoom-in" | "zoom-out" | "zoom-reset";

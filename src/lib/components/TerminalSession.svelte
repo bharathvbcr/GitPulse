@@ -112,7 +112,7 @@
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, macOptionOptions, spawnGridSize, terminalScrollbackFor,
     terminalViewChord, terminalSearchSummary,
-    TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX, TERMINAL_LINE_HEIGHT,
+    TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
     SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
   } from "../terminal/viewControls";
 
@@ -392,8 +392,8 @@
       fontFamily:
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
       fontSize,
-      lineHeight: TERMINAL_LINE_HEIGHT,
-      ...macOptionOptions(get(hostPlatform).os),
+      lineHeight: 1.15,
+      ...macOptionOptions(get(hostPlatform).os, get(interfaceStore).terminalOptionAsMeta),
       // The official search addon uses xterm's proposed decoration API.
       allowProposedApi: true,
       cursorBlink: true,
@@ -1134,6 +1134,14 @@
   $effect(() => {
     const on = $interfaceStore.terminalScreenReader;
     if (term) term.options.screenReaderMode = on;
+  });
+
+  /** Option as Meta follows its setting on live sessions too (macOS only). */
+  $effect(() => {
+    const options = macOptionOptions(get(hostPlatform).os, $interfaceStore.terminalOptionAsMeta);
+    if (!term) return;
+    term.options.macOptionIsMeta = options.macOptionIsMeta;
+    term.options.macOptionClickForcesSelection = options.macOptionClickForcesSelection;
   });
 
   /**

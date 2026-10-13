@@ -10,7 +10,7 @@ import {
  * definition, and so the check is made once here instead of as a platform
  * conditional scattered through the modal's markup.
  */
-export type SettingRequirement = "dockHiding" | "appleIntelligence";
+export type SettingRequirement = "dockHiding" | "appleIntelligence" | "macos";
 
 export interface SettingEntry {
   readonly id: string;
@@ -104,6 +104,14 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Terminal screen reader support",
     keywords: "terminal screen reader voiceover accessibility a11y announce assistive shell console",
+  },
+  {
+    id: "terminal-option-as-meta",
+    section: "appearance",
+    label: "Option as Meta in terminals",
+    keywords:
+      "terminal option alt meta mac macos keyboard layout at sign german word motion escape b f shell console",
+    requires: "macos",
   },
   {
     id: "terminal-scrollback",

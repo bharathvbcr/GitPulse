@@ -259,11 +259,15 @@ transcript the CLI keeps itself, default lower.
 
 ## Option as Meta (macOS)
 
-On macOS, Option is Meta in the terminal: Option+B and Option+F send `ESC b` and
-`ESC f` (word motion in readline and zle) rather than composing a glyph, and
-Option-click still selects text in a program that has mouse reporting on. The
-cost is that a layout which types a character with Option (for example `@` on a
-German keyboard) cannot type it inside a terminal.
+On macOS, Option is Meta in the terminal by default: Option+B and Option+F send
+`ESC b` and `ESC f` (word motion in readline and zle) rather than composing a
+glyph, and Option-click still selects text in a program that has mouse reporting
+on. The cost is that a layout which types a character with Option (for example
+`@` on a German keyboard) cannot type it inside a terminal.
+
+**Settings → Appearance → Option as Meta in terminals** turns it off, for that
+trade-off. The change applies to terminals already open. The setting is not
+shown, and does nothing, off macOS.
 
 ## Screen reader support
 

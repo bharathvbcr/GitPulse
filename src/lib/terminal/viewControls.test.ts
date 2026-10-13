@@ -10,7 +10,6 @@ import {
   terminalSearchSummary,
   terminalViewChord,
   TERMINAL_AGENT_SCROLLBACK_DEFAULT,
-  TERMINAL_LINE_HEIGHT,
   TERMINAL_SCROLLBACK_DEFAULT,
 } from "./viewControls";
 import { initialState, openTab, terminalTabDestination } from "./tabs";
@@ -130,8 +129,13 @@ describe("terminal view controls", () => {
     }
   });
 
-  it("uses a whole-number line height", () => {
-    expect(Number.isInteger(TERMINAL_LINE_HEIGHT)).toBe(true);
+  it("leaves Option alone when the setting is off, on every host", () => {
+    for (const os of ["macos", "linux", "windows", undefined]) {
+      expect(macOptionOptions(os, false)).toEqual({ macOptionIsMeta: false, macOptionClickForcesSelection: false });
+    }
+    expect(macOptionOptions("macos", true)).toEqual({ macOptionIsMeta: true, macOptionClickForcesSelection: true });
+    // Not on macOS, the setting being on changes nothing.
+    expect(macOptionOptions("linux", true)).toEqual({ macOptionIsMeta: false, macOptionClickForcesSelection: false });
   });
 
   it("distinguishes no matches, selection, and capped results", () => {
