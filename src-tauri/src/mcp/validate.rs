@@ -18,7 +18,9 @@
 //! file would silently ignore. An unsupported keyword must never validate as
 //! if it had been checked.
 
-use serde_json::Value;
+use std::cmp::Ordering;
+
+use serde_json::{json, Number, Value};
 
 /// One violation, phrased for a language model that has to fix its own call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,24 +282,44 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
                 }
             }
         }
-        Value::Number(_) => {
-            // `as_f64` is the only accessor that answers for every JSON number
-            // shape; the bounds in this catalog are small integers, so the
-            // f64 round trip cannot lose a digit that matters here.
-            if let Some(actual) = value.as_f64() {
-                if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
-                    if actual < min {
-                        out.push(Violation::new(path, format!("must be >= {min}")));
-                    }
+        Value::Number(actual) => {
+            if let Some(min) = schema.get("minimum").and_then(Value::as_number) {
+                if order(actual, min).is_some_and(Ordering::is_lt) {
+                    out.push(Violation::new(path, format!("must be >= {}", bound(min))));
                 }
-                if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
-                    if actual > max {
-                        out.push(Violation::new(path, format!("must be <= {max}")));
-                    }
+            }
+            if let Some(max) = schema.get("maximum").and_then(Value::as_number) {
+                if order(actual, max).is_some_and(Ordering::is_gt) {
+                    out.push(Violation::new(path, format!("must be <= {}", bound(max))));
                 }
             }
         }
         _ => {}
+    }
+}
+
+fn integer_literal(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+/// How `actual` compares with a declared bound. Two integers compare as
+/// integers: through `f64`, `9223372036854775808` equals the bound
+/// `9223372036854775807` (both round to 2^63), so a value one past an `i64`
+/// maximum passed a check that existed to stop it.
+fn order(actual: &Number, bound: &Number) -> Option<Ordering> {
+    match (integer_literal(actual), integer_literal(bound)) {
+        (Some(actual), Some(bound)) => Some(actual.cmp(&bound)),
+        _ => actual.as_f64()?.partial_cmp(&bound.as_f64()?),
+    }
+}
+
+fn bound(number: &Number) -> String {
+    match integer_literal(number) {
+        Some(integer) => integer.to_string(),
+        None => number.as_f64().map(|n| n.to_string()).unwrap_or_default(),
     }
 }
 
@@ -306,7 +328,9 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
 /// `integer` is the one that has to be spelled out: JSON has a single number
 /// type, so `1.0` is an integer and `1.5` is not, and serde_json's `is_i64`
 /// answers "was it written without a decimal point", which is a different
-/// question.
+/// question. The answer is [`exact_int`]'s, so a value this accepts is a value
+/// extraction can convert: a validator that called `1e300` an integer would
+/// pass what [`FromArg`] has to refuse.
 fn type_matches(value: &Value, expected: &str) -> Option<bool> {
     Some(match expected {
         "object" => value.is_object(),
@@ -314,8 +338,8 @@ fn type_matches(value: &Value, expected: &str) -> Option<bool> {
         "string" => value.is_string(),
         "number" => value.is_number(),
         "integer" => value
-            .as_f64()
-            .is_some_and(|n| n.fract() == 0.0 && n.is_finite()),
+            .as_number()
+            .is_some_and(|number| exact_int(number).is_some()),
         "boolean" => value.is_boolean(),
         "null" => value.is_null(),
         // An unknown type keyword must not silently pass. `unsupported_keywords`
@@ -330,8 +354,10 @@ fn describe(value: &Value) -> String {
         Value::Null => "null".into(),
         Value::Bool(_) => "boolean".into(),
         Value::Number(n) => {
-            if n.as_f64().is_some_and(|f| f.fract() == 0.0) {
+            if exact_int(n).is_some() {
                 "integer".into()
+            } else if n.as_f64().is_some_and(|f| f.fract() == 0.0) {
+                "integer outside +/-(2^53 - 1)".into()
             } else {
                 "number".into()
             }
@@ -355,6 +381,577 @@ fn join(path: &str, name: &str) -> String {
     } else {
         format!("{path}.{name}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Typed arguments
+//
+// One declaration per tool produces both the advertised `inputSchema` and the
+// extraction the handler reads, so the two cannot drift: a field exists in the
+// schema if and only if it exists on the struct. `validate` still owns the
+// bounds (`minimum`, `maximum`, `minLength`, `maxLength`, `enum`) by reading the
+// schema these declarations print. Extraction owns only what a schema cannot say
+// about Rust: the JSON type, whether an integer is exact, whether it fits the
+// target width, and a byte bound.
+//
+// Serde is not used for this on purpose. It rejects `5.0` for a `u64`, which the
+// validator accepts as an integer; it stops at the first error, where a model
+// fixing its own call wants every one; and a `#[serde(default)]` field rejects
+// the explicit `null` the validator treats as absence.
+// ---------------------------------------------------------------------------
+
+/// What a length bound counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// Unicode scalar values, which is what `maxLength` means in JSON Schema.
+    Chars,
+    /// UTF-8 bytes. The schema still says `maxLength: N` (a string of N bytes
+    /// has at most N characters), and extraction enforces the byte count.
+    Bytes,
+}
+
+/// The longest string an `enum` argument is declared with.
+const ENUM_MAX_LEN: usize = 32;
+
+/// One argument's declaration: what the schema says, and what extraction
+/// checks beyond it.
+#[derive(Debug, Clone, Copy)]
+pub enum Spec {
+    Str {
+        desc: &'static str,
+        min: usize,
+        max: usize,
+        unit: Unit,
+    },
+    Enum {
+        desc: &'static str,
+        values: &'static [&'static str],
+    },
+    Int {
+        desc: &'static str,
+        min: i64,
+        max: u64,
+    },
+    Num {
+        desc: &'static str,
+        min: f64,
+        max: f64,
+    },
+    Bool {
+        desc: &'static str,
+    },
+    StrArray {
+        desc: &'static str,
+        min_items: usize,
+        max_items: usize,
+        item_min: usize,
+        item_max: usize,
+        unit: Unit,
+    },
+    ObjArray {
+        desc: &'static str,
+        min_items: usize,
+        max_items: usize,
+        item: fn() -> Value,
+    },
+}
+
+impl Spec {
+    /// A string bounded in characters.
+    pub const fn chars(desc: &'static str, min: usize, max: usize) -> Self {
+        Self::Str {
+            desc,
+            min,
+            max,
+            unit: Unit::Chars,
+        }
+    }
+
+    /// A string bounded in UTF-8 bytes.
+    pub const fn bytes(desc: &'static str, min: usize, max: usize) -> Self {
+        Self::Str {
+            desc,
+            min,
+            max,
+            unit: Unit::Bytes,
+        }
+    }
+
+    /// An array of strings, each bounded in UTF-8 bytes.
+    pub const fn bytes_array(desc: &'static str, max_items: usize, item_max: usize) -> Self {
+        Self::StrArray {
+            desc,
+            min_items: 0,
+            max_items,
+            item_min: 0,
+            item_max,
+            unit: Unit::Bytes,
+        }
+    }
+
+    /// An array of strings, each bounded in characters.
+    pub const fn chars_array(desc: &'static str, max_items: usize, item_max: usize) -> Self {
+        Self::StrArray {
+            desc,
+            min_items: 0,
+            max_items,
+            item_min: 0,
+            item_max,
+            unit: Unit::Chars,
+        }
+    }
+
+    pub const fn int(desc: &'static str, min: i64, max: u64) -> Self {
+        Self::Int { desc, min, max }
+    }
+
+    pub const fn flag(desc: &'static str) -> Self {
+        Self::Bool { desc }
+    }
+
+    pub const fn one_of(desc: &'static str, values: &'static [&'static str]) -> Self {
+        Self::Enum { desc, values }
+    }
+
+    /// The JSON Schema fragment for this argument.
+    pub fn schema(&self) -> Value {
+        match *self {
+            Self::Str {
+                desc,
+                min,
+                max,
+                unit,
+            } => {
+                let mut schema = json!({
+                    "type": "string",
+                    "description": format!("{desc} {}", bound_note(max, unit, false)),
+                    "maxLength": max
+                });
+                if min > 0 {
+                    schema["minLength"] = json!(min);
+                }
+                schema
+            }
+            Self::Enum { desc, values } => json!({
+                "type": "string",
+                "enum": values,
+                "maxLength": ENUM_MAX_LEN,
+                "description": desc
+            }),
+            Self::Int { desc, min, max } => json!({
+                "type": "integer",
+                "description": desc,
+                "minimum": min,
+                "maximum": max
+            }),
+            Self::Num { desc, min, max } => json!({
+                "type": "number",
+                "description": desc,
+                "minimum": min,
+                "maximum": max
+            }),
+            Self::Bool { desc } => json!({ "type": "boolean", "description": desc }),
+            Self::StrArray {
+                desc,
+                min_items,
+                max_items,
+                item_min,
+                item_max,
+                unit,
+            } => {
+                let mut item = json!({ "type": "string", "maxLength": item_max });
+                if item_min > 0 {
+                    item["minLength"] = json!(item_min);
+                }
+                let mut schema = json!({
+                    "type": "array",
+                    "description": format!("{desc} {}", bound_note(item_max, unit, true)),
+                    "items": item,
+                    "maxItems": max_items
+                });
+                if min_items > 0 {
+                    schema["minItems"] = json!(min_items);
+                }
+                schema
+            }
+            Self::ObjArray {
+                desc,
+                min_items,
+                max_items,
+                item,
+            } => {
+                let mut schema = json!({
+                    "type": "array",
+                    "description": desc,
+                    "items": item(),
+                    "maxItems": max_items
+                });
+                if min_items > 0 {
+                    schema["minItems"] = json!(min_items);
+                }
+                schema
+            }
+        }
+    }
+}
+
+/// The sentence fragment that says what a length bound counts. A client reading
+/// only the schema cannot otherwise tell `maxLength: 128` characters from 128
+/// bytes, and a label of 128 three-byte characters is one or the other's limit.
+fn bound_note(max: usize, unit: Unit, each_item: bool) -> String {
+    let each = if each_item { "each item " } else { "" };
+    match unit {
+        Unit::Chars => format!("({each}at most {max} characters)"),
+        Unit::Bytes => format!("({each}at most {max} bytes, UTF-8)"),
+    }
+}
+
+/// The largest integer a double holds exactly, and so the largest a float-typed
+/// JSON number is trusted to mean.
+const MAX_EXACT_FLOAT_INT: f64 = 9_007_199_254_740_991.0;
+
+/// A JSON number as an exact integer, or `None`.
+///
+/// Integer literals are exact. A float with no fractional part (`5.0`, `1e2`) is
+/// converted when it is within +/-(2^53 - 1), where every integer has exactly
+/// one double; beyond that a double stands for a range of integers and
+/// converting it would pick one of them for the caller. Everything else is not
+/// an integer.
+pub fn exact_int(number: &serde_json::Number) -> Option<i128> {
+    if let Some(signed) = number.as_i64() {
+        return Some(signed.into());
+    }
+    if let Some(unsigned) = number.as_u64() {
+        return Some(unsigned.into());
+    }
+    let float = number.as_f64()?;
+    (float.is_finite() && float.fract() == 0.0 && float.abs() <= MAX_EXACT_FLOAT_INT)
+        .then_some(float as i128)
+}
+
+/// Read one argument out of a call the schema has accepted.
+pub trait FromArg: Sized {
+    /// Whether the schema lists this argument under `required`.
+    const REQUIRED: bool;
+    fn from_arg(value: &Value, spec: &Spec, path: &str) -> Result<Self, Violation>;
+    /// The answer for a missing argument or an explicit `null`.
+    fn absent(path: &str) -> Result<Self, Violation>;
+}
+
+fn missing(path: &str) -> Violation {
+    Violation::new(path, "required argument is missing")
+}
+
+impl<T: FromArg> FromArg for Option<T> {
+    const REQUIRED: bool = false;
+
+    fn from_arg(value: &Value, spec: &Spec, path: &str) -> Result<Self, Violation> {
+        T::from_arg(value, spec, path).map(Some)
+    }
+
+    fn absent(_: &str) -> Result<Self, Violation> {
+        Ok(None)
+    }
+}
+
+fn wrong_type(path: &str, expected: &str, value: &Value) -> Violation {
+    Violation::new(
+        path,
+        format!("expected {expected}, got {}", describe(value)),
+    )
+}
+
+/// A string checked against a byte bound, when its spec declares one.
+fn within_bytes(text: &str, unit: Unit, max: usize, path: &str) -> Result<(), Violation> {
+    if unit == Unit::Bytes && text.len() > max {
+        return Err(Violation::new(
+            path,
+            format!("must be at most {max} bytes of UTF-8, got {}", text.len()),
+        ));
+    }
+    Ok(())
+}
+
+impl FromArg for String {
+    const REQUIRED: bool = true;
+
+    fn from_arg(value: &Value, spec: &Spec, path: &str) -> Result<Self, Violation> {
+        let text = value
+            .as_str()
+            .ok_or_else(|| wrong_type(path, "string", value))?;
+        if let Spec::Str { unit, max, .. } = *spec {
+            within_bytes(text, unit, max, path)?;
+        }
+        Ok(text.to_owned())
+    }
+
+    fn absent(path: &str) -> Result<Self, Violation> {
+        Err(missing(path))
+    }
+}
+
+impl FromArg for Vec<String> {
+    const REQUIRED: bool = true;
+
+    fn from_arg(value: &Value, spec: &Spec, path: &str) -> Result<Self, Violation> {
+        let items = value
+            .as_array()
+            .ok_or_else(|| wrong_type(path, "array", value))?;
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let at = format!("{path}[{index}]");
+                let text = item
+                    .as_str()
+                    .ok_or_else(|| wrong_type(&at, "string", item))?;
+                if let Spec::StrArray { unit, item_max, .. } = *spec {
+                    within_bytes(text, unit, item_max, &at)?;
+                }
+                Ok(text.to_owned())
+            })
+            .collect()
+    }
+
+    fn absent(path: &str) -> Result<Self, Violation> {
+        Err(missing(path))
+    }
+}
+
+impl FromArg for bool {
+    const REQUIRED: bool = true;
+
+    fn from_arg(value: &Value, _: &Spec, path: &str) -> Result<Self, Violation> {
+        value
+            .as_bool()
+            .ok_or_else(|| wrong_type(path, "boolean", value))
+    }
+
+    fn absent(path: &str) -> Result<Self, Violation> {
+        Err(missing(path))
+    }
+}
+
+macro_rules! integer_arg {
+    ($($int:ty),*) => {$(
+        impl FromArg for $int {
+            const REQUIRED: bool = true;
+
+            fn from_arg(value: &Value, _: &Spec, path: &str) -> Result<Self, Violation> {
+                let number = value
+                    .as_number()
+                    .ok_or_else(|| wrong_type(path, "integer", value))?;
+                let exact = exact_int(number)
+                    .ok_or_else(|| wrong_type(path, "integer", value))?;
+                <$int>::try_from(exact).map_err(|_| {
+                    Violation::new(path, format!("must fit in {}", stringify!($int)))
+                })
+            }
+
+            fn absent(path: &str) -> Result<Self, Violation> {
+                Err(missing(path))
+            }
+        }
+    )*};
+}
+
+integer_arg!(i64, u64, u32, u8, usize);
+
+impl FromArg for f32 {
+    const REQUIRED: bool = true;
+
+    fn from_arg(value: &Value, _: &Spec, path: &str) -> Result<Self, Violation> {
+        let wide = value
+            .as_f64()
+            .ok_or_else(|| wrong_type(path, "number", value))?;
+        let narrow = wide as f32;
+        if !narrow.is_finite() {
+            return Err(Violation::new(path, "must fit in f32"));
+        }
+        Ok(narrow)
+    }
+
+    fn absent(path: &str) -> Result<Self, Violation> {
+        Err(missing(path))
+    }
+}
+
+/// A closed object of arguments: one struct per tool, declared with
+/// [`tool_args!`].
+pub trait ToolArgs: Sized {
+    /// Every argument name, in declaration order.
+    const FIELDS: &'static [&'static str];
+    fn properties() -> Value;
+    fn required() -> Vec<&'static str>;
+    /// Extract every argument, reporting every violation at once. An unknown
+    /// key is a violation, and an explicit `null` is absence, as in
+    /// [`validate`].
+    fn from_args(arguments: &Value) -> Result<Self, Vec<Violation>>;
+
+    /// What was extracted, as the JSON a caller would have sent. The oracle the
+    /// property test holds extraction to.
+    #[cfg(test)]
+    fn to_value(&self) -> Value;
+
+    /// The whole `inputSchema` object.
+    fn object_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": Self::properties(),
+            "required": Self::required(),
+            "additionalProperties": false
+        })
+    }
+}
+
+/// Read `name` from `arguments` as a `T`, recording any violation.
+pub fn take<T: FromArg>(
+    arguments: &serde_json::Map<String, Value>,
+    name: &str,
+    spec: &Spec,
+    violations: &mut Vec<Violation>,
+) -> Option<T> {
+    let read = match arguments.get(name) {
+        None | Some(Value::Null) => T::absent(name),
+        Some(value) => T::from_arg(value, spec, name),
+    };
+    match read {
+        Ok(value) => Some(value),
+        Err(violation) => {
+            violations.push(violation);
+            None
+        }
+    }
+}
+
+impl<T: ToolArgs> FromArg for Vec<T> {
+    const REQUIRED: bool = true;
+
+    fn from_arg(value: &Value, _: &Spec, path: &str) -> Result<Self, Violation> {
+        let items = value
+            .as_array()
+            .ok_or_else(|| wrong_type(path, "array", value))?;
+        // The first bad element is reported; `validate` has already listed every
+        // one, so this only fires for a call that bypassed it.
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                T::from_args(item).map_err(|violations| {
+                    let at = format!("{path}[{index}]");
+                    match violations.first() {
+                        Some(violation) => {
+                            Violation::new(join(&at, &violation.path), &violation.message)
+                        }
+                        None => Violation::new(at, "invalid element"),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn absent(path: &str) -> Result<Self, Violation> {
+        Err(missing(path))
+    }
+}
+
+/// Declare a tool's arguments once.
+///
+/// ```ignore
+/// tool_args! { struct StatusArgs { repo_path: String = repo_spec() } }
+/// ```
+///
+/// A field of type `Option<T>` is optional; every other field is `required`.
+/// The macro prints the schema from the same `Spec`s that drive extraction.
+macro_rules! tool_args {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident { $($field:ident : $ty:ty = $spec:expr),+ $(,)? }) => {
+        $(#[$meta])*
+        #[cfg_attr(test, derive(serde::Serialize))]
+        $vis struct $name {
+            $($field: $ty),+
+        }
+
+        impl $crate::mcp::validate::ToolArgs for $name {
+            const FIELDS: &'static [&'static str] = &[$(stringify!($field)),+];
+
+            fn properties() -> serde_json::Value {
+                let mut properties = serde_json::Map::new();
+                $(properties.insert(stringify!($field).to_string(), $spec.schema());)+
+                serde_json::Value::Object(properties)
+            }
+
+            fn required() -> Vec<&'static str> {
+                let mut required = Vec::new();
+                $(
+                    if <$ty as $crate::mcp::validate::FromArg>::REQUIRED {
+                        required.push(stringify!($field));
+                    }
+                )+
+                required
+            }
+
+            fn from_args(
+                arguments: &serde_json::Value,
+            ) -> Result<Self, Vec<$crate::mcp::validate::Violation>> {
+                let Some(object) = arguments.as_object() else {
+                    return Err(vec![$crate::mcp::validate::not_an_object(arguments)]);
+                };
+                let mut violations = $crate::mcp::validate::unknown_arguments(object, Self::FIELDS);
+                $(
+                    let $field = $crate::mcp::validate::take::<$ty>(
+                        object,
+                        stringify!($field),
+                        &$spec,
+                        &mut violations,
+                    );
+                )+
+                match ($($field,)+) {
+                    ($(Some($field),)+) if violations.is_empty() => Ok(Self { $($field),+ }),
+                    _ => Err(violations),
+                }
+            }
+
+            #[cfg(test)]
+            fn to_value(&self) -> serde_json::Value {
+                serde_json::to_value(self).expect("arguments serialize")
+            }
+        }
+    };
+}
+
+pub(crate) use tool_args;
+
+pub fn not_an_object(arguments: &Value) -> Violation {
+    wrong_type("", "object", arguments)
+}
+
+/// A violation for each key of `arguments` that is not in `known`.
+pub fn unknown_arguments(
+    arguments: &serde_json::Map<String, Value>,
+    known: &[&str],
+) -> Vec<Violation> {
+    arguments
+        .keys()
+        .filter(|key| !known.contains(&key.as_str()))
+        .map(|key| {
+            Violation::new(
+                key.as_str(),
+                format!("unknown argument; accepted: [{}]", known.join(", ")),
+            )
+        })
+        .collect()
+}
+
+/// The refusal text for a call that failed validation or extraction.
+pub fn refusal(tool: &str, violations: &[Violation]) -> String {
+    format!(
+        "invalid arguments for {tool}: {}",
+        violations
+            .iter()
+            .map(Violation::render)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 #[cfg(test)]
@@ -546,5 +1143,195 @@ mod tests {
     #[test]
     fn a_fully_supported_schema_reports_nothing_unsupported() {
         assert!(unsupported_keywords(&schema()).is_empty());
+    }
+
+    #[test]
+    fn a_whole_float_beyond_the_exact_range_is_not_an_integer() {
+        // Past 2^53 - 1 a double stands for a range of integers; converting it
+        // would pick one for the caller. The validator and extraction answer the
+        // same question, so what passes one passes the other.
+        for beyond in [json!(9_007_199_254_740_992.0), json!(1e300)] {
+            let found = messages(json!({ "repo_path": "/tmp/x", "limit": beyond }));
+            assert_eq!(
+                found,
+                vec!["limit: expected integer, got integer outside +/-(2^53 - 1)"],
+                "{beyond}"
+            );
+        }
+        assert!(
+            messages(json!({ "repo_path": "/tmp/x", "limit": 9_007_199_254_740_991.0 }))
+                .iter()
+                .all(|m| m.contains("<="))
+        );
+    }
+
+    #[test]
+    fn integer_bounds_compare_as_integers() {
+        // Through f64, 2^63 equals the bound 2^63 - 1, so one past an i64
+        // maximum passed the check that existed to stop it.
+        let schema = json!({ "type": "integer", "maximum": i64::MAX });
+        assert!(validate(&json!(i64::MAX), &schema).is_empty());
+        let over = validate(&json!(9_223_372_036_854_775_808_u64), &schema);
+        assert_eq!(over[0].message, "must be <= 9223372036854775807");
+    }
+
+    fn number(value: Value) -> serde_json::Number {
+        match value {
+            Value::Number(number) => number,
+            other => panic!("not a number: {other}"),
+        }
+    }
+
+    #[test]
+    fn exact_int_table() {
+        for (value, expected) in [
+            (json!(0), Some(0)),
+            (json!(-7), Some(-7)),
+            (json!(i64::MIN), Some(i128::from(i64::MIN))),
+            (json!(u64::MAX), Some(i128::from(u64::MAX))),
+            (json!(5.0), Some(5)),
+            (json!(-3.0), Some(-3)),
+            (json!(-0.0), Some(0)),
+            (json!(1e2), Some(100)),
+            (json!(9_007_199_254_740_991.0), Some(9_007_199_254_740_991)),
+            (
+                json!(-9_007_199_254_740_991.0),
+                Some(-9_007_199_254_740_991),
+            ),
+            (json!(9_007_199_254_740_992.0), None),
+            (json!(9_007_199_254_740_993.0_f64), None),
+            (json!(1e300), None),
+            (json!(f64::MAX), None),
+            (json!(5.5), None),
+            (json!(-0.25), None),
+        ] {
+            assert_eq!(exact_int(&number(value.clone())), expected, "{value}");
+        }
+    }
+
+    tool_args! {
+        #[derive(Debug, PartialEq)]
+        struct Probe {
+            count: u32 = Spec::int("How many", 0, 10),
+            level: Option<u8> = Spec::int("How high", 0, 3),
+            offset: Option<i64> = Spec::int("Where", 0, i64::MAX.unsigned_abs()),
+            width: Option<usize> = Spec::int("How wide", 1, 64),
+            ratio: Option<f32> = Spec::Num { desc: "A ratio", min: 0.0, max: 1.0 },
+            label: Option<String> = Spec::bytes("A label", 1, 6),
+            tags: Option<Vec<String>> = Spec::bytes_array("Tags", 2, 3),
+            on: Option<bool> = Spec::flag("Whether"),
+        }
+    }
+
+    fn probe(arguments: Value) -> Result<Probe, Vec<String>> {
+        Probe::from_args(&arguments)
+            .map_err(|violations| violations.iter().map(Violation::render).collect())
+    }
+
+    #[test]
+    fn extraction_converts_whole_floats_and_never_falls_back() {
+        let parsed = probe(json!({ "count": 5.0, "level": 1.0, "offset": 3.0, "width": 2e1 }))
+            .expect("whole floats convert");
+        assert_eq!(
+            (parsed.count, parsed.level, parsed.offset, parsed.width),
+            (5, Some(1), Some(3), Some(20))
+        );
+        for (arguments, message) in [
+            (
+                json!({ "count": 5.5 }),
+                "count: expected integer, got number",
+            ),
+            (
+                json!({ "count": "5" }),
+                "count: expected integer, got string",
+            ),
+            (
+                json!({ "count": 4_294_967_296_u64 }),
+                "count: must fit in u32",
+            ),
+            (json!({ "count": -1 }), "count: must fit in u32"),
+            (json!({ "count": 1, "level": 256 }), "level: must fit in u8"),
+            (
+                json!({ "count": 1, "offset": 9_223_372_036_854_775_808_u64 }),
+                "offset: must fit in i64",
+            ),
+            (
+                json!({ "count": 1, "offset": 9_223_372_036_854_775_808.0 }),
+                "offset: expected integer, got integer outside +/-(2^53 - 1)",
+            ),
+            (
+                json!({ "count": 1, "ratio": "x" }),
+                "ratio: expected number, got string",
+            ),
+            (
+                json!({ "count": 1, "on": 1 }),
+                "on: expected boolean, got integer",
+            ),
+        ] {
+            assert_eq!(
+                probe(arguments.clone()),
+                Err(vec![message.to_string()]),
+                "{arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn extraction_reads_null_as_absence_and_reports_everything_at_once() {
+        let parsed = probe(json!({ "count": 1, "level": null })).expect("null is absent");
+        assert_eq!(parsed.level, None);
+        assert_eq!(
+            probe(json!({ "count": null })),
+            Err(vec!["count: required argument is missing".to_string()])
+        );
+        let found = probe(json!({ "level": "x", "stray": 1, "ratio": true })).unwrap_err();
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert!(found
+            .iter()
+            .any(|m| m.starts_with("stray: unknown argument")));
+        assert_eq!(
+            probe(json!([1])),
+            Err(vec!["expected object, got array".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_byte_bound_counts_bytes_not_characters() {
+        // Two euro signs are two characters and six bytes.
+        assert!(probe(json!({ "count": 1, "label": "\u{20ac}\u{20ac}" })).is_ok());
+        assert_eq!(
+            probe(json!({ "count": 1, "label": "\u{20ac}\u{20ac}a" })),
+            Err(vec![
+                "label: must be at most 6 bytes of UTF-8, got 7".to_string()
+            ])
+        );
+        assert_eq!(
+            probe(json!({ "count": 1, "tags": ["abc", "\u{20ac}a"] })),
+            Err(vec![
+                "tags[1]: must be at most 3 bytes of UTF-8, got 4".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_declaration_prints_the_schema_extraction_reads() {
+        assert_eq!(Probe::required(), vec!["count"]);
+        assert_eq!(
+            Probe::FIELDS,
+            ["count", "level", "offset", "width", "ratio", "label", "tags", "on"]
+        );
+        let schema = Probe::object_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        let label = &schema["properties"]["label"];
+        assert_eq!(label["maxLength"], 6);
+        assert_eq!(label["minLength"], 1);
+        assert_eq!(label["description"], "A label (at most 6 bytes, UTF-8)");
+        assert_eq!(
+            schema["properties"]["tags"]["description"],
+            "Tags (each item at most 3 bytes, UTF-8)"
+        );
+        assert_eq!(schema["properties"]["count"]["maximum"], 10);
+        assert_eq!(schema["properties"]["ratio"]["type"], "number");
+        assert!(unsupported_keywords(&schema).is_empty());
     }
 }
