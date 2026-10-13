@@ -154,16 +154,6 @@ describe("macOS material", () => {
    */
   const MAC_ONLY_WINDOW_KEYS = ["backgroundColor", "transparent", "windowEffects"];
 
-  /*
-   * Base-window keys the macOS window must NOT restate. `additionalBrowserArgs`
-   * is handed to the WebView2 builder alone: tauri-runtime-wry applies it under
-   * `#[cfg(windows)]` (framework/tauri-runtime-wry/src/lib.rs:4982-4985) and wry
-   * declares the setter only for Windows (framework/wry/src/lib.rs:1781-1782, 1876-1878).
-   * Under WKWebView it does nothing, and a Chromium GPU flag list sitting in
-   * the macOS file reads as though the GPU path were tuned.
-   */
-  const WINDOWS_ONLY_WINDOW_KEYS = ["additionalBrowserArgs"];
-
   it("restates the base window exactly, adding only the macOS-only keys", () => {
     const base = baseConf.app.windows[0];
     const mac = macConf.app.windows[0];
@@ -171,26 +161,55 @@ describe("macOS material", () => {
       [...MAC_ONLY_WINDOW_KEYS].sort(),
     );
     for (const [key, value] of Object.entries(base)) {
-      if (WINDOWS_ONLY_WINDOW_KEYS.includes(key)) continue;
       expect(mac[key], `tauri.macos.conf.json drifted from the base window at "${key}"`).toEqual(
         value,
       );
     }
   });
 
-  it("carries no WebView2-only window key, which WKWebView ignores", () => {
-    const mac = macConf.app.windows[0];
+  /*
+   * WebView2-only window keys live in `tauri.windows.conf.json` and nowhere
+   * else. `additionalBrowserArgs` is handed to the WebView2 builder alone:
+   * tauri-runtime-wry applies it under `#[cfg(windows)]`
+   * (framework/tauri-runtime-wry/src/lib.rs:4982-4985) and wry declares the
+   * setter only for Windows (framework/wry/src/lib.rs:1781-1782, 1876-1878).
+   * Under WKWebView or WebKitGTK it does nothing, and a Chromium GPU flag list
+   * in a file those builds read reads as though their GPU path were tuned.
+   * The Windows file restates the window for the same reason the macOS one
+   * does: the merge replaces arrays.
+   */
+  const WINDOWS_ONLY_WINDOW_KEYS = ["additionalBrowserArgs"];
+  const winConf = JSON.parse(
+    readFileSync(new URL("../src-tauri/tauri.windows.conf.json", import.meta.url), "utf8"),
+  );
+
+  it("keeps WebView2-only window keys out of the base and macOS configs", () => {
     for (const key of WINDOWS_ONLY_WINDOW_KEYS) {
-      expect(
-        key in mac,
-        `tauri.macos.conf.json sets "${key}", which only the Windows WebView2 builder reads`,
-      ).toBe(false);
+      for (const [name, conf] of [["tauri.conf.json", baseConf], ["tauri.macos.conf.json", macConf]] as const) {
+        expect(
+          key in conf.app.windows[0],
+          `${name} sets "${key}", which only the Windows WebView2 builder reads`,
+        ).toBe(false);
+      }
     }
-    // The base window is what Windows builds from, so the key stays there.
-    for (const key of WINDOWS_ONLY_WINDOW_KEYS) expect(baseConf.app.windows[0][key]).toBeTruthy();
-    // And the merged macOS app config, where arrays are replaced, has none either.
-    const merged = (mergePatch(baseConf, macConf) as { app: { windows: object[] } }).app.windows[0];
-    for (const key of WINDOWS_ONLY_WINDOW_KEYS) expect(key in merged).toBe(false);
+  });
+
+  it("gives the Windows window the base window plus its WebView2-only keys", () => {
+    const base = baseConf.app.windows[0];
+    const win = winConf.app.windows[0];
+    expect(winConf.app.windows).toHaveLength(1);
+    expect(Object.keys(win).filter((key) => !(key in base)).sort()).toEqual(
+      [...WINDOWS_ONLY_WINDOW_KEYS].sort(),
+    );
+    for (const [key, value] of Object.entries(base)) {
+      expect(win[key], `tauri.windows.conf.json drifted from the base window at "${key}"`).toEqual(
+        value,
+      );
+    }
+    for (const key of WINDOWS_ONLY_WINDOW_KEYS) expect(win[key]).toBeTruthy();
+    // What a Windows build sees, after the merge replaces the array.
+    const merged = (mergePatch(baseConf, winConf) as { app: { windows: object[] } }).app.windows[0];
+    expect(merged).toEqual(win);
   });
 
   /*
