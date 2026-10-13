@@ -257,6 +257,7 @@
     "allow-cmd-terminal-context",
     "allow-cmd-terminal-detach",
     "allow-cmd-terminal-export",
+    "allow-cmd-terminal-incidents",
     "allow-cmd-terminal-kill",
     "allow-cmd-terminal-resize",
     "allow-cmd-terminal-run",
