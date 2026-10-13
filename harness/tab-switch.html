@@ -426,20 +426,25 @@
           // with instant fixtures, so it isolates what this page can see, which
           // is the cost of rebuilding (or not) the window around the store.
           await switchTo(ALPHA);
-          const samples = [];
-          const rounds = Number(params.get("rounds") ?? 12);
+          const flushed = [];
+          const framed = [];
+          const rounds = Number(params.get("rounds") ?? 24);
           for (let i = 0; i < rounds; i += 1) {
             const target = i % 2 === 0 ? BETA : ALPHA;
             const started = performance.now();
             await repoStore.activateTab(tabFor(target).id);
             await tick();
+            flushed.push(performance.now() - started);
             await raf();
             await raf();
-            samples.push(performance.now() - started);
+            framed.push(performance.now() - started);
             await wait(30);
           }
-          const sorted = [...samples].sort((a, b) => a - b);
-          diagnostics = `switch settle over ${samples.length} A<->B switches: min ${sorted[0].toFixed(1)} ms, p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} ms, max ${sorted[sorted.length - 1].toFixed(1)} ms; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          const stat = (series) => {
+            const sorted = [...series].sort((a, b) => a - b);
+            return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
+          };
+          diagnostics = `${rounds} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
           report_();
         } catch (error) {
           stopped(error);
