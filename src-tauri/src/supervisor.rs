@@ -241,9 +241,33 @@ pub fn spawn_once(
     subsystem: &'static str,
     body: impl FnOnce() + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
+    spawn_once_recovering(name, subsystem, true, body)
+}
+
+/// [`spawn_once`] for a subsystem that has several instances alive at once
+/// (one writer per stream, one worker per request). A record is by subsystem
+/// name, not by thread, so a clean exit of one instance would clear the
+/// `stopped` record another instance's panic had just made: the failure was
+/// erased from Diagnostics by an unrelated thread finishing. This variant
+/// records a panic and never clears on a clean exit.
+pub fn spawn_one_of_many(
+    name: impl Into<String>,
+    subsystem: &'static str,
+    body: impl FnOnce() + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
+    spawn_once_recovering(name, subsystem, false, body)
+}
+
+fn spawn_once_recovering(
+    name: impl Into<String>,
+    subsystem: &'static str,
+    clean_exit_recovers: bool,
+    body: impl FnOnce() + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
     thread::Builder::new().name(name.into()).spawn(move || {
         match catch_unwind(AssertUnwindSafe(body)) {
-            Ok(()) => recover(subsystem),
+            Ok(()) if clean_exit_recovers => recover(subsystem),
+            Ok(()) => {}
             Err(payload) => record_with(subsystem, payload.as_ref(), true),
         }
     })
@@ -366,6 +390,25 @@ mod tests {
             .join()
             .unwrap();
         assert!(degraded().iter().all(|d| d.subsystem != NAME));
+    }
+
+    #[test]
+    fn a_clean_exit_of_one_of_many_instances_keeps_anothers_stopped_record() {
+        const NAME: &str = "supervisor-test-one-of-many";
+        spawn_one_of_many("supervisor-many-1", NAME, || panic!("instance one"))
+            .unwrap()
+            .join()
+            .unwrap();
+        spawn_one_of_many("supervisor-many-2", NAME, || {})
+            .unwrap()
+            .join()
+            .unwrap();
+        let entry = degraded()
+            .into_iter()
+            .find(|d| d.subsystem == NAME)
+            .expect("a sibling's clean exit cleared the stopped record");
+        assert!(entry.stopped && entry.reason.contains("instance one"));
+        recover(NAME);
     }
 
     #[test]

@@ -4647,6 +4647,34 @@ mod tests {
         assert_eq!(probes(), 1, "an upgraded gh is probed again");
     }
 
+    /// The flake this pins: `a_gh_probe_that_never_ran_...` clears the cache,
+    /// then asks five surfaces in turn with `gh --version` refused on its
+    /// thread. Any other test that probes `gh` meanwhile (the runs-report
+    /// tests do, before they reach the remote) leaves a `Present` answer in
+    /// the shared cache, and the next surface was answered by the real `gh`
+    /// past the refusal. A refusal forced on this thread must reach the spawn
+    /// whatever the cache holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_probe_failure_is_not_answered_from_a_warm_cache() {
+        let serial = crate::harness::sidecar::test_serial();
+        let fixture = tempfile::TempDir::new().unwrap();
+        install_fake_gh(fixture.path());
+        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        GH_PROBES.clear();
+        // Another test's probe, as it would leave the cache.
+        assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
+        let refused =
+            crate::engine::git_cli::with_forced_spawn_failure_of("--version", || probe_gh_cli());
+        assert!(
+            matches!(refused, ToolProbe::NotRun(_)),
+            "a refused `gh --version` was answered from the cache: {refused:?}"
+        );
+        // The refusal did not evict the real answer, and nothing it saw was kept.
+        assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
+    }
+
     /// A full first page (100 newest rows, all low) hides a critical alert
     /// beyond it. Ranking the fetched rows cannot find it; asking by severity
     /// does.

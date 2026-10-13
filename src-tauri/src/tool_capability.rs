@@ -147,6 +147,14 @@ impl<T: Clone> BinaryProbeCache<T> {
     /// The cached answer for `program` if the binary is unchanged, else
     /// `probe()`'s. `probe` returns the answer and whether it may be kept.
     pub(crate) fn get_or_probe(&self, program: &str, probe: impl FnOnce() -> (T, bool)) -> T {
+        // A test that forces spawns to fail on this thread must reach the
+        // spawn: the refusal is thread-local and this cache is shared, so any
+        // other test's earlier success would otherwise answer past it. What
+        // is probed under the refusal is not kept either.
+        #[cfg(test)]
+        if crate::engine::git_cli::forced_failure_active() {
+            return probe().0;
+        }
         let path = PathBuf::from(program);
         let stamp = path
             .is_absolute()
@@ -222,6 +230,38 @@ mod tests {
         assert_eq!(
             miss.get_or_probe("definitely-not-installed", || (2, true)),
             2
+        );
+    }
+
+    /// The spawn-failure seam is thread-local and this cache is shared: a
+    /// success another thread left behind must not answer for a thread that
+    /// has forced its spawns to fail, and what is probed under the refusal
+    /// must not be left behind for the next thread.
+    #[test]
+    fn a_forced_spawn_failure_reaches_the_probe_whatever_the_cache_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tool");
+        std::fs::write(&bin, "v1").unwrap();
+        let program = bin.to_str().unwrap();
+        let cache: BinaryProbeCache<&'static str> = BinaryProbeCache::new();
+        assert_eq!(cache.get_or_probe(program, || ("real", true)), "real");
+        let forced = crate::engine::git_cli::with_forced_spawn_failure(|| {
+            cache.get_or_probe(program, || ("refused", true))
+        });
+        assert_eq!(forced, "refused", "the warm entry answered past the seam");
+        assert_eq!(
+            cache.get_or_probe(program, || ("asked again", true)),
+            "real",
+            "a probe made under the refusal replaced the real answer"
+        );
+        cache.clear();
+        let _ = crate::engine::git_cli::with_forced_spawn_failure(|| {
+            cache.get_or_probe(program, || ("refused", true))
+        });
+        assert_eq!(
+            cache.get_or_probe(program, || ("real", true)),
+            "real",
+            "a probe made under the refusal was kept for other threads"
         );
     }
 
