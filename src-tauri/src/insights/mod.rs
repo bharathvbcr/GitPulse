@@ -14,11 +14,11 @@ pub use entity_collision::{
 };
 
 use crate::codeintel::{self, CodeintelStatus};
-use crate::engine::git_cli::git_text;
+use crate::engine::git_cli::{current_admission, git_text, with_admission};
 use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
-use crate::engine::worktree::{self, agent_layout, changed_paths, ScanDepth, WorktreeInfo};
+use crate::engine::worktree::{self, agent_layout, changed_paths_within, StatusRead, WorktreeInfo};
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -590,8 +590,10 @@ fn detect_operation(path: &str) -> (String, bool) {
     let Ok(repo) = validate_repo(path) else {
         return (String::new(), false);
     };
-    match repo_op::detect(&repo) {
-        Ok(Some(op)) => (format!("{:?}", op.kind), true),
+    // The kind alone: this row reports which operation is parked, and the full
+    // report's branch, incoming commit and conflict list cost a child each.
+    match repo_op::detect_kind(&repo) {
+        Ok(Some(kind)) => (format!("{kind:?}"), true),
         Ok(None) => (String::new(), true),
         Err(_) => (String::new(), false),
     }
@@ -724,18 +726,23 @@ fn changes_from_status(files: &[FileStatus], truncated: bool) -> ChangesFacet {
 
 /// Soft deadline for one whole snapshot, not per probe.
 ///
-/// The expensive half of this call is unbounded in `git` spawns: a parked-
-/// operation probe per worktree (2-5 spawns each, up to
-/// [`MAX_SNAPSHOT_WORKTREES`] of them) and then a cross-worktree collision
-/// scan. Git's own per-spawn timeout is 90 s with no ceiling above it, so a
-/// pathological tree could hold the single-threaded MCP server — which
-/// answers nothing else meanwhile — for minutes. Past the deadline those two
-/// stages are skipped and say so, exactly as [`FLEET_DEADLINE`] does for a
-/// workspace sweep.
+/// The expensive half of this call is one `git status` per worktree, up to
+/// [`MAX_SNAPSHOT_WORKTREES`] of them, which feeds both the worktree rows and
+/// the cross-worktree collision scan. Git's own per-spawn timeout is 90 s with
+/// no ceiling above it, so a pathological tree could hold the single-threaded
+/// MCP server — which answers nothing else meanwhile — for minutes. One
+/// [`worktree::ScanDeadline`] is handed to that read: no wave of statuses
+/// starts after it, one already running is given only the time left, and the
+/// worktrees it did not reach are reported unknown in the rows and unscanned in
+/// the collision facet (`ok: false`, with the reason), exactly as
+/// [`FLEET_DEADLINE`] does for a workspace sweep.
 ///
-/// The fixed-cost stages — one worktree listing, one `git status`, two local
-/// store reads — always run. Cutting them would leave a snapshot with nothing
-/// in it, and their cost does not grow with the number of worktrees.
+/// The fixed-cost stages — one worktree listing, one `git status` of the main
+/// checkout, two local store reads — always run. Cutting them would leave a
+/// snapshot with nothing in it, and their cost does not grow with the number of
+/// worktrees. The parked-operation probe reads control files and starts no
+/// process, so it is bounded by the worktree count; the clock still ends it
+/// early.
 const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One-shot read of everything an agent needs to see the repository as the
@@ -767,7 +774,11 @@ fn snapshot_observed(
     observation: &live_sessions::Observation,
 ) -> InsightsSnapshot {
     let started = Instant::now();
-    let listed = worktree::list_worktrees_scanned(repo_path, ScanDepth::Dirty);
+    // One clock for the whole pass, handed to every stage that can run long.
+    let clock = worktree::ScanDeadline::after(started, deadline);
+    // The listing alone: one process. The per-worktree status read is made
+    // below, once, for the worktree rows and the collision scan together.
+    let mut listed = worktree::list_worktrees_lite(repo_path);
     let mut deadline_expired = false;
     // Attributed over the whole listing, not the capped summaries: a session
     // in the 65th worktree is still a session in this repository.
@@ -775,6 +786,27 @@ fn snapshot_observed(
         Ok(list) => live_in(observation, list),
         Err(error) => live_sessions::unattributed(error),
     };
+
+    let changes = match GitReader::get_status(repo_path) {
+        // The facet carries counts, not rows, and the whole status is already
+        // in memory: count every file. Counting only the first
+        // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
+        Ok(files) => changes_from_status(&files, false),
+        Err(error) => empty_changes(error),
+    };
+
+    // The only `git status` of each worktree this snapshot makes, and the last
+    // git read it makes: the rows' dirty counts and the collision scan's paths
+    // come out of it together, so the two facets describe the same moment, and
+    // an edit made before a worktree is read is in both. The read is bounded by
+    // the same clock as everything else; a worktree it did not reach stays
+    // unknown in both facets rather than reading as clean in either.
+    if let Ok(list) = &mut listed {
+        if worktree::read_dirty(list, &clock) > 0 {
+            deadline_expired = true;
+        }
+    }
+
     let (worktrees, agents) = match &listed {
         Ok(list) => {
             let truncated = list.len() > max_worktrees;
@@ -782,11 +814,11 @@ fn snapshot_observed(
                 .iter()
                 .take(max_worktrees)
                 .map(|info| {
-                    // Sequential on purpose: `repo_op::detect` spawns several
-                    // git processes for each worktree parked mid-operation,
-                    // and 64 of those at once is the spawn storm this
-                    // deadline exists to bound.
-                    if started.elapsed() >= deadline {
+                    // `detect_operation` reads control files and starts no
+                    // process, so this stage's cost is bounded by the number of
+                    // worktrees; the clock still ends it early on a host too
+                    // slow to read even those.
+                    if clock.expired() {
                         deadline_expired = true;
                         return summarise_worktree(info, String::new(), false);
                     }
@@ -804,24 +836,16 @@ fn snapshot_observed(
         Err(error) => (empty_worktrees(error.clone()), unknown_agents(error)),
     };
 
-    let changes = match GitReader::get_status(repo_path) {
-        // The facet carries counts, not rows, and the whole status is already
-        // in memory: count every file. Counting only the first
-        // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
-        Ok(files) => changes_from_status(&files, false),
-        Err(error) => empty_changes(error),
-    };
-
     let collisions = match &listed {
         Ok(list) => {
-            if started.elapsed() >= deadline {
+            if clock.expired() {
                 deadline_expired = true;
-                // A scan that never started is a failed facet, not an empty
-                // one: `ok: false` with a reason, never `overlapping_files: 0`.
-                empty_collisions("the snapshot ran out of time before the collision scan")
-            } else {
-                collision_from_list(list, &live)
             }
+            // Past the clock the scan spawns nothing: it uses the statuses
+            // already read and counts every worktree it has none for as
+            // unscanned, with `ok: false` and the reason — never
+            // `overlapping_files: 0` for a scan that did not look.
+            collision_from_list(list, &live, Some(&clock))
         }
         Err(error) => empty_collisions(error.clone()),
     };
@@ -1397,7 +1421,20 @@ fn shared_paths(live: &LiveSessionFacet) -> HashSet<&str> {
         .collect()
 }
 
-fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> CollisionRisk {
+/// Overlapping dirty files across `list`'s worktrees, and the dirty files of
+/// any worktree two live sessions share.
+///
+/// A worktree whose status the listing already read ([`StatusRead`]) costs
+/// nothing here: its paths are used as read, once, rather than read again. One
+/// that was never read is read now, on rayon's pool but in the caller's
+/// admission class, for at most [`MAX_COLLISION_SCANS`] of them. With a
+/// `deadline`, none is read once it has passed: those worktrees are counted as
+/// unscanned and the facet says `ok: false` and why.
+fn collision_from_list(
+    list: &[WorktreeInfo],
+    live: &LiveSessionFacet,
+    deadline: Option<&worktree::ScanDeadline>,
+) -> CollisionRisk {
     let shared = shared_paths(live);
     // A worktree that two sessions share is scanned ahead of the cap: it is
     // the one place a collision is already known to be possible.
@@ -1405,21 +1442,45 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
         .iter()
         .filter(|w| !w.is_bare)
         .partition(|w| shared.contains(w.path.as_str()));
-    let scan_targets: Vec<&WorktreeInfo> = first
-        .into_iter()
-        .chain(rest)
-        .take(MAX_COLLISION_SCANS)
-        .collect();
-    let unscanned = list
-        .iter()
-        .filter(|w| !w.is_bare)
-        .count()
-        .saturating_sub(scan_targets.len());
 
-    let scans: Vec<_> = scan_targets
+    type Read = Result<(Vec<String>, bool), String>;
+    let mut scans: Vec<(&WorktreeInfo, Option<Read>)> = Vec::new();
+    let mut pending: Vec<usize> = Vec::new();
+    let mut fresh_reads_left = MAX_COLLISION_SCANS;
+    let mut over_the_cap = 0usize;
+    let mut cut_off = 0usize;
+    for wt in first.into_iter().chain(rest) {
+        match &wt.status_read {
+            StatusRead::Read { paths, truncated } => {
+                scans.push((wt, Some(Ok((paths.clone(), *truncated)))));
+            }
+            // Already tried inside this pass; trying again would repeat the
+            // refusal and spend the time twice.
+            StatusRead::Failed(reason) => scans.push((wt, Some(Err(reason.clone())))),
+            StatusRead::NotRead if deadline.is_some_and(worktree::ScanDeadline::expired) => {
+                cut_off += 1;
+            }
+            StatusRead::NotRead if fresh_reads_left > 0 => {
+                fresh_reads_left -= 1;
+                pending.push(scans.len());
+                scans.push((wt, None));
+            }
+            StatusRead::NotRead => over_the_cap += 1,
+        }
+    }
+    let unscanned = over_the_cap + cut_off;
+
+    // The pool's threads start in the default admission class, so the class
+    // the caller asked under travels in explicitly.
+    let class = current_admission();
+    let to_read: Vec<&WorktreeInfo> = pending.iter().map(|&at| scans[at].0).collect();
+    let fresh: Vec<Read> = to_read
         .into_par_iter()
-        .map(|wt| (wt, changed_paths(&wt.path)))
+        .map(|wt| with_admission(class, || changed_paths_within(&wt.path, deadline)))
         .collect();
+    for (at, read) in pending.into_iter().zip(fresh) {
+        scans[at].1 = Some(read);
+    }
 
     let mut by_path: HashMap<String, Vec<CollisionParty>> = HashMap::new();
     let mut scan_error = String::new();
@@ -1428,7 +1489,7 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
     let mut paths_truncated = false;
     let mut shared_scans: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
     for (wt, result) in scans {
-        match result {
+        match result.unwrap_or_else(|| Err("the worktree was not read".to_string())) {
             Ok((paths, truncated)) => {
                 scanned += 1;
                 paths_truncated |= truncated;
@@ -1455,6 +1516,16 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
                 }
             }
         }
+    }
+
+    if cut_off > 0 {
+        let reason =
+            format!("{cut_off} worktree(s) were not read before the snapshot ran out of time");
+        scan_error = if scan_error.is_empty() {
+            reason
+        } else {
+            format!("{scan_error}; {reason}")
+        };
     }
 
     let mut items: Vec<CollisionItem> = by_path
@@ -1515,7 +1586,11 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
         // `truncated` already report a short scan, and folding that in here
         // would make one field mean both "cut short" and "broken", the same
         // conflation `fleet_snapshot::truncated` is documented to avoid.
-        ok: failed == 0,
+        //
+        // The deadline does: a worktree skipped because the clock ran out is
+        // one the caller asked about and did not get an answer for, not one
+        // it declined to ask about.
+        ok: failed == 0 && cut_off == 0,
         error: scan_error,
         overlapping_files,
         worktrees_involved: involved.len() as u32,
@@ -1555,7 +1630,7 @@ fn collision_risk_observed(
 ) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
         Ok(list) => entity_collision::enrich_item(
-            collision_from_list(&list, &live_in(observation, &list)),
+            collision_from_list(&list, &live_in(observation, &list), None),
             focus,
         ),
         Err(error) => empty_collisions(error),
@@ -1706,6 +1781,7 @@ fn unlisted_info(target: &str) -> WorktreeInfo {
         main_divergence: None,
         active_routes: Vec::new(),
         scan_note: None,
+        status_read: worktree::StatusRead::NotRead,
     }
 }
 
@@ -2173,6 +2249,7 @@ mod tests {
             main_divergence: None,
             active_routes: Vec::new(),
             scan_note: None,
+            status_read: worktree::StatusRead::NotRead,
         }
     }
 
@@ -2447,7 +2524,7 @@ mod tests {
         fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
 
         let list = worktree::list_worktrees(repo).expect("list");
-        let scanned = collision_from_list(&list, &live_in(&Vec::new(), &list));
+        let scanned = collision_from_list(&list, &live_in(&Vec::new(), &list), None);
         assert!(
             scanned.items.iter().all(|item| item.entity.is_none()),
             "porcelain scan must leave entity unset: {scanned:?}"
@@ -3213,6 +3290,7 @@ mod tests {
             main_divergence: None,
             active_routes: Vec::new(),
             scan_note: None,
+            status_read: worktree::StatusRead::NotRead,
         };
         let items: Vec<WorktreeSummary> = [
             info("/repo", true),
@@ -3806,5 +3884,295 @@ mod tests {
             .iter()
             .all(|w| w.dirty_files.is_some()));
         assert_eq!(measured(&cwds), 0, "snapshot");
+    }
+
+    /// A repository with `linked` extra worktrees, all trusted. Returns the
+    /// main checkout, the directory holding the linked ones, and their
+    /// canonical paths.
+    fn repo_with_linked_worktrees(
+        linked: usize,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Vec<std::path::PathBuf>,
+    ) {
+        let main = init_repo();
+        let parent = tempfile::TempDir::new().unwrap();
+        let paths = (0..linked)
+            .map(|i| {
+                let path = parent.path().join(format!("wt-{i:02}"));
+                git_in(
+                    main.path(),
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        &format!("agent/{i:02}"),
+                        path.to_str().unwrap(),
+                    ],
+                );
+                crate::test_support::trust_repo(&path);
+                path.canonicalize().unwrap()
+            })
+            .collect();
+        (main, parent, paths)
+    }
+
+    /// Children that ran `git status` in `dir`, whichever way the path was
+    /// spelled to the spawn.
+    fn status_spawns_in(
+        dir: &std::path::Path,
+    ) -> Vec<(Vec<String>, crate::engine::git_cli::Admission)> {
+        crate::engine::git_cli::spawn_log::classed_spawns_in(dir)
+            .into_iter()
+            .filter(|(argv, _)| argv.iter().any(|arg| arg == "status"))
+            .collect()
+    }
+
+    /// One `git status` per worktree, shared by the worktree rows and the
+    /// collision scan. The collision scan used to re-run the status the
+    /// listing had already read, in every worktree it covered.
+    #[test]
+    fn a_snapshot_reads_each_worktrees_status_once() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(17);
+        let root = main.path().canonicalize().unwrap();
+        // Two worktrees dirty the same file, so the collision scan has a real
+        // overlap to find from the statuses it is given.
+        fs::write(linked[0].join("shared.txt"), "first").unwrap();
+        fs::write(linked[1].join("shared.txt"), "second").unwrap();
+
+        let snap = snapshot(root.to_str().unwrap());
+        assert_eq!(snap.worktrees.count, 18, "{:?}", snap.worktrees);
+        assert!(snap.collisions.ok, "{:?}", snap.collisions);
+        assert_eq!(
+            snap.collisions.overlapping_files, 1,
+            "{:?}",
+            snap.collisions
+        );
+
+        for dir in &linked {
+            assert_eq!(
+                status_spawns_in(dir).len(),
+                1,
+                "{} was read more than once",
+                dir.display()
+            );
+        }
+        // The main checkout is read by the listing and once more by
+        // `get_status`, which needs per-file untracked rows (`-u`) and churn
+        // the listing's count does not: the O(1) beside the N statuses.
+        assert!(
+            status_spawns_in(&root).len() <= 2,
+            "{:?}",
+            status_spawns_in(&root)
+        );
+    }
+
+    /// The collision scan runs on rayon's pool, whose threads start in the
+    /// default class. Under a caller that asked for background work, its
+    /// statuses competed as refresh traffic.
+    #[test]
+    fn the_collision_scan_keeps_the_callers_admission_class() {
+        use crate::engine::git_cli::{with_admission, Admission};
+        let (main, _parent, linked) = repo_with_linked_worktrees(10);
+        let root = main.path().canonicalize().unwrap();
+        let risk = with_admission(Admission::Background, || {
+            collision_risk(root.to_str().unwrap())
+        });
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.scanned_worktrees, 11, "{risk:?}");
+
+        let mut checked = 0;
+        let mut escaped = Vec::new();
+        for dir in linked.iter().chain(std::iter::once(&root)) {
+            for (argv, class) in status_spawns_in(dir) {
+                checked += 1;
+                if class != Admission::Background {
+                    escaped.push((dir.clone(), argv, class));
+                }
+            }
+        }
+        assert_eq!(checked, 11, "every worktree was read once");
+        assert!(
+            escaped.is_empty(),
+            "{} of {checked} status reads left the caller's class: {escaped:?}",
+            escaped.len()
+        );
+    }
+
+    /// The snapshot reports which operation is parked and nothing else about
+    /// it, so reading the parked state is a look at control files. The full
+    /// report also resolves the branch, describes the incoming commit and
+    /// lists conflicts: three more children per parked worktree, run one
+    /// worktree after another inside the deadline-bounded stage.
+    #[test]
+    fn a_parked_operation_is_named_without_starting_a_process() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(2);
+        let root = main.path().canonicalize().unwrap();
+        let parked = &linked[0];
+        let head = git_text(parked, &["rev-parse", "HEAD"]).unwrap();
+        let git_dir = fs::read_to_string(parked.join(".git")).unwrap();
+        let git_dir = std::path::PathBuf::from(git_dir.trim().trim_start_matches("gitdir: "));
+        fs::write(git_dir.join("MERGE_HEAD"), head).unwrap();
+        let before = crate::engine::git_cli::spawn_log::spawns_in(parked).len();
+
+        let snap = snapshot(root.to_str().unwrap());
+        let row = snap
+            .worktrees
+            .items
+            .iter()
+            .find(|w| same_path(&w.path, parked.to_str().unwrap()))
+            .expect("the parked worktree is listed");
+        assert_eq!(row.operation_kind, "Merge", "{row:?}");
+        assert!(row.operation_ok, "{row:?}");
+        assert_eq!(snap.worktrees.blocked, 1, "{:?}", snap.worktrees);
+
+        let beyond_status: Vec<_> = crate::engine::git_cli::spawn_log::spawns_in(parked)
+            .into_iter()
+            .skip(before)
+            .filter(|argv| !argv.iter().any(|arg| arg == "status"))
+            .collect();
+        assert!(
+            beyond_status.is_empty(),
+            "probing the parked operation started: {beyond_status:?}"
+        );
+    }
+
+    /// The deadline bounds the work, not only the gaps between stages: the
+    /// worktree status reads ran to completion whatever it said, and the
+    /// snapshot returned when they finished.
+    #[test]
+    fn a_snapshot_returns_within_its_deadline_when_every_status_is_slow() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(17);
+        let root = main.path().canonicalize().unwrap();
+        let mut everywhere = linked.clone();
+        everywhere.push(root.clone());
+        let deadline = Duration::from_secs(1);
+
+        let started = Instant::now();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            &everywhere,
+            |_| std::thread::sleep(Duration::from_millis(500)),
+            || snapshot_within(root.to_str().unwrap(), deadline, MAX_SNAPSHOT_WORKTREES),
+        );
+        let took = started.elapsed();
+
+        assert!(
+            took < deadline + Duration::from_secs(1),
+            "a 1 s deadline returned after {took:?} (the snapshot reports {} ms)",
+            snap.duration_ms
+        );
+        assert!(snap.deadline_expired, "{snap:?}");
+        // The reads that did not happen are unknown, never clean.
+        assert_eq!(snap.worktrees.count, 18, "{:?}", snap.worktrees);
+        assert!(snap.worktrees.dirty_unknown > 0, "{:?}", snap.worktrees);
+        assert!(snap.worktrees.scanned < 18, "{:?}", snap.worktrees);
+        assert!(!snap.collisions.ok, "{:?}", snap.collisions);
+        assert!(snap.collisions.truncated, "{:?}", snap.collisions);
+        assert!(
+            snap.collisions.scanned_worktrees
+                + snap.collisions.failed_worktrees
+                + snap.collisions.unscanned_worktrees
+                >= 18,
+            "{:?}",
+            snap.collisions
+        );
+    }
+
+    fn row<'a>(snap: &'a InsightsSnapshot, dir: &std::path::Path) -> &'a WorktreeSummary {
+        snap.worktrees
+            .items
+            .iter()
+            .find(|w| same_path(&w.path, dir.to_str().unwrap()))
+            .expect("the worktree is listed")
+    }
+
+    /// An edit made while the snapshot is running is reported when it lands
+    /// before that worktree is read: the read is the last git stage, after the
+    /// listing and the main checkout's status, and the rows and the collision
+    /// scan both come out of it.
+    #[test]
+    fn an_edit_made_mid_snapshot_before_its_worktrees_read_is_reported() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(9);
+        let root = main.path().canonicalize().unwrap();
+        let first = linked.first().unwrap().clone();
+        let last = linked.last().unwrap().clone();
+        fs::write(first.join("shared.txt"), "first").unwrap();
+
+        // The main checkout is in the first wave and the last worktree in the
+        // third: the edit lands after the snapshot began and before the last
+        // worktree's turn. Relies on a fan-out of 4: with 10 worktrees, main is
+        // read in wave 1 and the last in wave 3, so a change to
+        // DIRTY_SCAN_FAN_OUT that put them in one wave would make this vacuous.
+        let edited = last.clone();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            std::slice::from_ref(&root),
+            move |_| fs::write(edited.join("shared.txt"), "mid-snapshot").unwrap(),
+            || snapshot(root.to_str().unwrap()),
+        );
+
+        assert!(snap.collisions.ok, "{:?}", snap.collisions);
+        assert_eq!(
+            snap.collisions.overlapping_files, 1,
+            "{:?}",
+            snap.collisions
+        );
+        assert_eq!(snap.collisions.items[0].path, "shared.txt");
+        assert_eq!(
+            row(&snap, &last).dirty_files,
+            Some(1),
+            "{:?}",
+            snap.worktrees
+        );
+    }
+
+    /// One read per worktree means the rows and the collision scan can only
+    /// disagree about a worktree if they read it at different moments. An edit
+    /// that lands after a worktree was read is in neither facet of that
+    /// snapshot, and in both of the next one: the snapshot is a point-in-time
+    /// read of each worktree, bounded by its own `duration_ms`, and says the
+    /// same thing in both places. Before, the listing said "clean" and the
+    /// collision scan, reading again later, said "dirty".
+    #[test]
+    fn the_rows_and_the_collision_scan_describe_one_read_of_each_worktree() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(9);
+        let root = main.path().canonicalize().unwrap();
+        let last = linked.last().unwrap().clone();
+        fs::write(linked[0].join("late.txt"), "first").unwrap();
+
+        // The last worktree is read in the third wave; the main checkout, read
+        // in the first, is edited just before it. Relies on the same fan-out of 4
+        // as the test above.
+        let edited = root.clone();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            std::slice::from_ref(&last),
+            move |_| fs::write(edited.join("late.txt"), "after main was read").unwrap(),
+            || snapshot(root.to_str().unwrap()),
+        );
+        assert_eq!(
+            row(&snap, &root).dirty_files,
+            Some(0),
+            "{:?}",
+            snap.worktrees
+        );
+        assert_eq!(
+            snap.collisions.overlapping_files, 0,
+            "the collision scan saw an edit the row did not: {:?}",
+            snap.collisions
+        );
+
+        let next = snapshot(root.to_str().unwrap());
+        assert_eq!(
+            row(&next, &root).dirty_files,
+            Some(1),
+            "{:?}",
+            next.worktrees
+        );
+        assert_eq!(
+            next.collisions.overlapping_files, 1,
+            "{:?}",
+            next.collisions
+        );
     }
 }
