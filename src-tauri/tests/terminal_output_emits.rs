@@ -548,4 +548,378 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
 }
 
+/// When each `#` a session printed was heard, per session, acknowledging
+/// every event as the view does.
+type Arrivals = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
+
+fn hearing_marks(app: &tauri::App<tauri::test::MockRuntime>, state: &TerminalSessions) -> Arrivals {
+    let arrivals: Arrivals = Arc::default();
+    let record = arrivals.clone();
+    let ack = state.clone();
+    app.listen("terminal-output", move |event| {
+        let heard = Instant::now();
+        let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+        let id = data["id"].as_str().unwrap().to_owned();
+        let marks = bytes.iter().filter(|b| **b == b'#').count();
+        if marks > 0 {
+            record
+                .lock()
+                .unwrap()
+                .entry(id.clone())
+                .or_default()
+                .extend(std::iter::repeat_n(heard, marks));
+        }
+        let _ = acknowledge_output(&ack, &id, bytes.len());
+    });
+    arrivals
+}
+
+fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+/// Types `keys` single `#` keystrokes into `id`, each once the last echo came
+/// back, and returns how long each echo took to be emitted, sorted.
+fn echo_latencies(
+    state: &TerminalSessions,
+    arrivals: &Arrivals,
+    id: &str,
+    keys: usize,
+) -> Vec<Duration> {
+    let mut took = Vec::with_capacity(keys);
+    // Echoes already heard from this session belong to an earlier run.
+    let before = arrivals.lock().unwrap().get(id).map_or(0, Vec::len);
+    for k in before..before + keys {
+        let sent = Instant::now();
+        write_to_session(state, id, "#").unwrap();
+        let echoed = wait_for(Duration::from_secs(10), || {
+            arrivals
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.len() > k)
+        });
+        assert!(echoed, "keystroke {k} was never echoed");
+        let heard = arrivals.lock().unwrap()[id][k];
+        assert!(heard >= sent, "echo {k} was heard before it was typed");
+        took.push(heard - sent);
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    took.sort();
+    took
+}
+
+/// A typed key's echo is a write under the gather threshold, so it is sent at
+/// once: a flood on another session does not hold it at all (each session has
+/// its own reader), and a flood on the same session holds it at most for the
+/// gather bound, never for the flood.
+#[test]
+fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
+    const KEYS: usize = 60;
+    let _serial = serial();
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let arrivals = hearing_marks(&app, &state);
+    let dir = repo();
+    // `cat` echoes each key back; the tty itself echoes nothing.
+    let echo = || {
+        spawn(
+            &app,
+            &state,
+            &dir,
+            vec!["-c".into(), "stty raw -echo; exec cat".into()],
+        )
+    };
+    let quiet = echo();
+    std::thread::sleep(Duration::from_millis(300));
+    let idle = echo_latencies(&state, &arrivals, &quiet, KEYS);
+
+    // Another session prints a mebibyte at a time, over and over.
+    let flood = spawn(
+        &app,
+        &state,
+        &dir,
+        vec![
+            "-c".into(),
+            "stty raw -echo; while :; do head -c 1048576 /dev/zero | tr '\\0' 'f'; done".into(),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let beside = echo_latencies(&state, &arrivals, &quiet, KEYS);
+    gitpulse_lib::terminal::kill_session(&state, &flood).unwrap();
+
+    // The same session floods while it echoes.
+    let own = spawn(
+        &app,
+        &state,
+        &dir,
+        vec![
+            "-c".into(),
+            "stty raw -echo; (while :; do head -c 1048576 /dev/zero | tr '\\0' 'f'; done) & exec cat"
+                .into(),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let within = echo_latencies(&state, &arrivals, &own, KEYS);
+
+    for (name, took) in [
+        ("idle", &idle),
+        ("beside a flood", &beside),
+        ("inside a flood", &within),
+    ] {
+        println!(
+            "echo {name}: min {:?} median {:?} p90 {:?} max {:?} over {KEYS} keys",
+            took[0],
+            percentile(took, 0.5),
+            percentile(took, 0.9),
+            took[took.len() - 1]
+        );
+    }
+    let bound = |d: Duration| common::env::coverage_relaxed(d);
+    // A key beside a flood is as quick as a key on an idle host: its reader is
+    // not the flood's. Loose bounds, a loaded host is the point.
+    assert!(
+        percentile(&beside, 0.5) < bound(Duration::from_millis(30)),
+        "the median echo beside a flood took {:?}",
+        percentile(&beside, 0.5)
+    );
+    // Inside a flood the echo shares one reader with it, which sends at most
+    // every 8 ms while it gathers, plus a 16 KiB emit. Still nowhere near the
+    // flood's length.
+    assert!(
+        percentile(&within, 0.5) < bound(Duration::from_millis(50)),
+        "the median echo inside a flood took {:?}",
+        percentile(&within, 0.5)
+    );
+    assert!(
+        within[within.len() - 1] < bound(Duration::from_secs(1)),
+        "an echo inside a flood took {:?}",
+        within[within.len() - 1]
+    );
+    gitpulse_lib::terminal::kill_session(&state, &own).unwrap();
+    gitpulse_lib::terminal::kill_session(&state, &quiet).unwrap();
+}
+
+/// Gathering puts event boundaries wherever 16 KiB falls, which is inside a
+/// UTF-8 character or an escape sequence as often as not. The bytes must
+/// still arrive exactly, each event within its bound, and the boundaries must
+/// really have fallen inside characters and sequences for this to mean
+/// anything.
+#[test]
+fn characters_and_escape_sequences_split_across_events_arrive_byte_exact() {
+    let _serial = serial();
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let boundaries: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let tallies = counting(&app, &state);
+    let mark = boundaries.clone();
+    let sizes = tallies.clone();
+    app.listen("terminal-output", move |_| {
+        // After `counting`'s listener: the content so far ends at a boundary.
+        if let Some(t) = sizes.lock().unwrap().values().next() {
+            mark.lock().unwrap().push(t.content.len());
+        }
+    });
+    let dir = repo();
+    // 2-, 3- and 4-byte characters and CSI/OSC sequences, 7 bytes apart from
+    // a multiple of 16 KiB per repetition so boundaries walk through them.
+    let unit = "é世🚀\u{1b}[38;5;196mX\u{1b}[0m\u{1b}]0;t\u{7}ab";
+    let reps = 20_000usize;
+    let want: Vec<u8> = unit.repeat(reps).into_bytes();
+    let id = spawn(
+        &app,
+        &state,
+        &dir,
+        vec![
+            "-c".into(),
+            format!(
+                "stty raw -echo; perl -CS -e 'binmode STDOUT, \":utf8\"; print \"\\x{{e9}}\\x{{4e16}}\\x{{1f680}}\\e[38;5;196mX\\e[0m\\e]0;t\\aab\" x {reps}'; sleep 30"
+            ),
+        ],
+    );
+    assert!(
+        wait_for(Duration::from_secs(60), || tallies
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|t| t.content.ends_with(&want))),
+        "the stream never arrived whole: {} of {} bytes",
+        tallies
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map_or(0, |t| t.content.len()),
+        want.len()
+    );
+    let tally = tallies.lock().unwrap().get(&id).cloned().unwrap();
+    assert!(
+        tally.content.len() < want.len() + 64,
+        "output was duplicated: {} bytes for {}",
+        tally.content.len(),
+        want.len()
+    );
+    let start = tally.content.len() - want.len();
+    let ends: Vec<usize> = boundaries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|end| **end > start && **end < tally.content.len())
+        .map(|end| end - start)
+        .collect();
+    let inside_char = ends
+        .iter()
+        .filter(|end| (want[**end] & 0xC0) == 0x80)
+        .count();
+    // A boundary at `at` splits the sequence that starts before it and ends
+    // after it: its ESC went in one event, the rest in the next.
+    let sequences: Vec<(usize, usize)> = ["\u{1b}[38;5;196m", "\u{1b}[0m", "\u{1b}]0;t\u{7}"]
+        .iter()
+        .map(|seq| (unit.find(seq).unwrap(), seq.len()))
+        .collect();
+    let escape_at = |offset: usize| {
+        let at = offset % unit.len();
+        sequences
+            .iter()
+            .any(|(begin, len)| at > *begin && at < begin + len)
+    };
+    let inside_escape = ends.iter().filter(|end| escape_at(**end)).count();
+    println!(
+        "{} events for {} bytes; {} boundaries inside a UTF-8 character, {} inside an escape sequence",
+        tally.emits,
+        want.len(),
+        inside_char,
+        inside_escape
+    );
+    assert!(inside_char > 0, "no event boundary fell inside a character");
+    assert!(
+        inside_escape > 0,
+        "no event boundary fell inside an escape sequence"
+    );
+    assert!(
+        acknowledge_output(&state, &id, 1).is_err(),
+        "credit accounting drifted from what was emitted"
+    );
+    gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
+}
+
+/// The view repays late and in batches, as its ack coalescer does: one
+/// acknowledgement for many events, sent on a timer. It stalls long enough to
+/// be shed, then repays everything it held. Every acknowledgement is accepted,
+/// nothing is owed at the end, and delivery resumes.
+#[test]
+fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
+    let _serial = serial();
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    state.set_output_stall_timeout(Duration::from_millis(50));
+    let owed: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let tail: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let largest = Arc::new(Mutex::new(0usize));
+    {
+        let (owed, tail, largest) = (owed.clone(), tail.clone(), largest.clone());
+        app.listen("terminal-output", move |event| {
+            let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+            let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+            let reserved = data["bytes"].as_u64().unwrap() as usize;
+            assert_eq!(reserved, bytes.len());
+            let mut big = largest.lock().unwrap();
+            *big = (*big).max(reserved);
+            *owed
+                .lock()
+                .unwrap()
+                .entry(data["id"].as_str().unwrap().to_owned())
+                .or_default() += reserved;
+            let mut tail = tail.lock().unwrap();
+            tail.extend_from_slice(&bytes);
+            let keep = tail.len().saturating_sub(64);
+            tail.drain(..keep);
+        });
+    }
+    let losses = Arc::new(Mutex::new(0usize));
+    {
+        let losses = losses.clone();
+        app.listen("terminal-loss", move |_| *losses.lock().unwrap() += 1);
+    }
+    let dir = repo();
+    let id = spawn(
+        &app,
+        &state,
+        &dir,
+        burst_command_then(3 * 1024 * 1024, "read line; printf RESUMED-OK; sleep 30"),
+    );
+    let refused = Arc::new(Mutex::new(Vec::<String>::new()));
+    let acker = {
+        let (state, owed, refused) = (state.clone(), owed.clone(), refused.clone());
+        let losses = losses.clone();
+        std::thread::spawn(move || {
+            let mut stalled = false;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                // One stall, long enough to be shed, once the stream is going.
+                if !stalled && owed.lock().unwrap().values().sum::<usize>() > 64 * 1024 {
+                    stalled = true;
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
+                for (session, bytes) in batch {
+                    if let Err(error) = acknowledge_output(&state, &session, bytes) {
+                        refused.lock().unwrap().push(error);
+                    }
+                }
+                if stalled && *losses.lock().unwrap() > 0 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+        })
+    };
+    acker.join().unwrap();
+    assert!(
+        *losses.lock().unwrap() > 0,
+        "the stalled view was never shed"
+    );
+    // Keep repaying, coalesced, until the shell is asked to show it is alive.
+    write_to_session(&state, &id, "go\n").unwrap();
+    let resumed = wait_for(Duration::from_secs(30), || {
+        let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
+        for (session, bytes) in batch {
+            if let Err(error) = acknowledge_output(&state, &session, bytes) {
+                refused.lock().unwrap().push(error);
+            }
+        }
+        tail.lock().unwrap().windows(10).any(|w| w == b"RESUMED-OK")
+    });
+    assert!(resumed, "delivery never resumed after the view repaid");
+    std::thread::sleep(Duration::from_millis(100));
+    let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
+    for (session, bytes) in batch {
+        if let Err(error) = acknowledge_output(&state, &session, bytes) {
+            refused.lock().unwrap().push(error);
+        }
+    }
+    let refused = refused.lock().unwrap().clone();
+    assert!(refused.is_empty(), "acknowledgements refused: {refused:?}");
+    assert!(
+        acknowledge_output(&state, &id, 1).is_err(),
+        "credit accounting drifted: more was acknowledged than emitted, or the reverse"
+    );
+    println!(
+        "{} loss notice(s); largest event {} bytes",
+        *losses.lock().unwrap(),
+        *largest.lock().unwrap()
+    );
+    assert!(*largest.lock().unwrap() <= OUTPUT_CHUNK_BYTES);
+    gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
+}
+
 mod common;
