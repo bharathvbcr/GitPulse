@@ -1009,3 +1009,78 @@ fn a_cache_sync_into_a_linked_worktree_copies_and_scans_nothing() {
     assert!(linked.join("node_modules/pkg/index.js").is_file());
     assert_eq!(spawns_naming(&dirs, "status"), status_before);
 }
+
+/// Background work (the live index, a docs refresh from a watcher) was
+/// admitted to the command runner like any other command, so a repository
+/// burst could put every blocking-pool thread to sleep on background child
+/// processes. At most two of them hold a pool thread at once; the rest wait
+/// without one.
+#[test]
+fn background_commands_hold_at_most_two_pool_threads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let jobs: Vec<_> = (0..5)
+        .map(|_| {
+            let (running, peak, finished) = (running.clone(), peak.clone(), finished.clone());
+            tauri::async_runtime::spawn(off_thread_background(move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                running.fetch_sub(1, Ordering::SeqCst);
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        })
+        .collect();
+    for job in jobs {
+        tauri::async_runtime::block_on(job)
+            .expect("joined")
+            .expect("job result");
+    }
+    assert_eq!(finished.load(Ordering::SeqCst), 5, "every job still runs");
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        2,
+        "background jobs overlapped beyond the limit"
+    );
+}
+
+/// A third background job waits for a permit rather than a thread.
+#[test]
+fn a_third_background_job_waits_until_one_of_the_first_two_ends() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let release = Arc::new(AtomicBool::new(false));
+    let third_started = Arc::new(AtomicBool::new(false));
+    let hold = |release: Arc<AtomicBool>| {
+        tauri::async_runtime::spawn(off_thread_background(move || {
+            while !release.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(())
+        }))
+    };
+    let first = hold(release.clone());
+    let second = hold(release.clone());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let flag = third_started.clone();
+    let third = tauri::async_runtime::spawn(off_thread_background(move || {
+        flag.store(true, Ordering::SeqCst);
+        Ok(())
+    }));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !third_started.load(Ordering::SeqCst),
+        "a third background job ran while two were in flight"
+    );
+    release.store(true, Ordering::SeqCst);
+    for job in [first, second, third] {
+        tauri::async_runtime::block_on(job)
+            .expect("joined")
+            .expect("job result");
+    }
+    assert!(third_started.load(Ordering::SeqCst));
+}

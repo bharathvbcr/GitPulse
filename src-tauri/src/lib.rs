@@ -32,6 +32,7 @@ pub mod mcp;
 pub mod ndjson;
 pub mod ops;
 pub mod output;
+mod pools;
 pub mod procguard;
 pub mod repository_trust;
 pub mod secrets;
@@ -100,10 +101,16 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First: tauri builds its default async runtime on the first use of any
+    // `async_runtime` function, after which this cannot replace it.
+    let pool_notes = [pools::install_async_runtime(), pools::install_rayon_pool()];
     // Only the app keeps branch churn on disk; agent servers, hooks and test
     // processes, which never reach `run()`, keep it in memory.
     engine::churn_store::persist_in_this_process();
     logging::init();
+    for note in pool_notes.into_iter().flatten() {
+        log::warn!(target: "setup", "{note}");
+    }
     #[cfg(not(test))]
     logging::install_panic_hook();
     // Before anything else is built. LaunchServices starts a second copy of
@@ -289,6 +296,7 @@ pub fn run() {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
+                    workbench::external_changes::note_main_window_on_screen(false);
                 }
                 #[cfg(target_os = "macos")]
                 {
