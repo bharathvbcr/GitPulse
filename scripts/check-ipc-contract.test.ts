@@ -304,11 +304,12 @@ describe("annotated but unregistered commands", () => {
     // the verify-status commands (cmd_verify_status_enabled,
     // cmd_verify_status_save, cmd_verify_status_post), and 278 with the
     // host-load commands (cmd_host_load_status, cmd_host_load_terminate_orphan,
-    // cmd_host_load_settings, cmd_host_load_settings_save);
-    // `bun run check:ipc`
+    // cmd_host_load_settings, cmd_host_load_settings_save), and 279 with
+    // cmd_terminal_incidents; `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(278);
+    expect(found.size).toBe(279);
+    expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

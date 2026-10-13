@@ -1,12 +1,23 @@
 import type { createHostedClaudeStore, createResumers } from "./hostedClaude";
 
 /**
- * A burst of hosted sessions ended by the same signal, as the backend reports
- * it on the `terminal-incident` event. The one place this wire shape is
- * written down: the backend emits exactly this and the frontend reads
- * exactly this.
+ * A process the unified log names as a signal's sender
+ * (`terminal/incident.rs::Sender`). Named as Rust names it, which is how
+ * `check:types` pairs the two sides.
  */
-export interface TerminalIncident {
+export interface Sender {
+  pid: number;
+  name: string;
+}
+
+/**
+ * A burst of hosted sessions ended by the same signal, as the backend reports
+ * it on the `terminal-incident` event and in `cmd_terminal_incidents`. The one
+ * place this wire shape is written down: the backend emits exactly this and
+ * the frontend reads exactly this. Held to Rust's `TerminalIncidentPayload`
+ * field for field by `check:types` (the `terminal-incident` contract).
+ */
+export interface TerminalIncidentPayload {
   /** Stable for one incident; a repeated event carries the same id. */
   id: string;
   /** The signal that ended them, as the exit event names it. */
@@ -16,10 +27,13 @@ export interface TerminalIncident {
   /** The backend's terminal session ids (`terminal-exit` `id`), not Claude's. */
   session_ids: string[];
   /** Who sent it, when the platform said; null when it did not. */
-  sender: { pid: number; name: string } | null;
+  sender: Sender | null;
   /** What is known about the sender, in words, including "sender unknown". */
   sender_note: string;
 }
+
+/** The name the panels use for the payload above. */
+export type TerminalIncident = TerminalIncidentPayload;
 
 export const INCIDENT_EVENT = "terminal-incident";
 
