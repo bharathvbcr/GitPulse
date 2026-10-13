@@ -1278,33 +1278,51 @@ pub(crate) struct TranscriptProgress {
     pub baseline: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn transcript_progress(
     repo_path: &str,
     worktree_path: &str,
 ) -> Result<TranscriptProgress, LedgerError> {
-    let worktree = transcript_key(Path::new(worktree_path));
+    transcript_progress_many(repo_path, &[worktree_path])?
+        .pop()
+        .ok_or_else(|| LedgerError::new("query_failed", "no transcript progress was returned"))
+}
+
+/// [`transcript_progress`] for several worktrees of one repository under one
+/// lock and one pass over the ledger connection, in the order asked.
+pub(crate) fn transcript_progress_many(
+    repo_path: &str,
+    worktree_paths: &[&str],
+) -> Result<Vec<TranscriptProgress>, LedgerError> {
+    let keys: Vec<String> = worktree_paths
+        .iter()
+        .map(|path| transcript_key(Path::new(path)))
+        .collect();
     with_conn(repo_path, |conn| {
         let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
-        let baseline = conn
-            .query_row(
-                "SELECT since_utc FROM transcript_baselines WHERE worktree_key = ?1",
-                params![worktree],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
+        let mut baseline_stmt = conn
+            .prepare("SELECT since_utc FROM transcript_baselines WHERE worktree_key = ?1")
             .map_err(failed)?;
-        let mut stmt = conn
+        let mut offsets_stmt = conn
             .prepare("SELECT file_key, byte_offset FROM transcript_cursors WHERE worktree_key = ?1")
             .map_err(failed)?;
-        let offsets = stmt
-            .query_map(params![worktree], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        keys.iter()
+            .map(|worktree| {
+                let baseline = baseline_stmt
+                    .query_row(params![worktree], |row| row.get::<_, String>(0))
+                    .optional()
+                    .map_err(failed)?;
+                let offsets = offsets_stmt
+                    .query_map(params![worktree], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(failed)?
+                    .map(|row| row.map(|(key, offset)| (key, u64::try_from(offset).unwrap_or(0))))
+                    .collect::<Result<HashMap<_, _>, _>>()
+                    .map_err(failed)?;
+                Ok(TranscriptProgress { offsets, baseline })
             })
-            .map_err(failed)?
-            .map(|row| row.map(|(key, offset)| (key, u64::try_from(offset).unwrap_or(0))))
-            .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(failed)?;
-        Ok(TranscriptProgress { offsets, baseline })
+            .collect()
     })
 }
 
@@ -1354,16 +1372,36 @@ pub(crate) struct TranscriptAdvance {
 /// catch up), and is dropped whole — its events are the other pass's to
 /// record, and recording them here too would duplicate them. Returns the
 /// number of events recorded.
+#[cfg(test)]
 pub(crate) fn advance_transcripts(
     repo_path: &str,
     worktree_path: &str,
     advances: Vec<TranscriptAdvance>,
 ) -> Result<i64, LedgerError> {
-    let worktree = transcript_key(Path::new(worktree_path));
+    advance_transcripts_family(repo_path, vec![(worktree_path, advances)])
+}
+
+/// [`advance_transcripts`] for several worktrees of one repository at once:
+/// every worktree's events and cursor move in a single transaction, so a pass
+/// that read one transcript for all of them cannot leave some advanced and
+/// some not. The compare-and-set is per worktree and per transcript.
+pub(crate) fn advance_transcripts_family(
+    repo_path: &str,
+    advances: Vec<(&str, Vec<TranscriptAdvance>)>,
+) -> Result<i64, LedgerError> {
+    let advances: Vec<(String, Vec<TranscriptAdvance>)> = advances
+        .into_iter()
+        .map(|(path, advances)| (transcript_key(Path::new(path)), advances))
+        .collect();
     let prepared = advances
         .iter()
-        .map(|advance| advance.drafts.iter().map(prepare).collect())
-        .collect::<Result<Vec<Vec<Prepared>>, _>>()?;
+        .map(|(_, advances)| {
+            advances
+                .iter()
+                .map(|advance| advance.drafts.iter().map(prepare).collect())
+                .collect::<Result<Vec<Vec<Prepared>>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let result = with_conn(repo_path, |conn| {
         let failed = |e: rusqlite::Error| LedgerError::new("insert_failed", e.to_string());
         // IMMEDIATE takes the write lock before the offset is read, so a
@@ -1371,36 +1409,38 @@ pub(crate) fn advance_transcripts(
         let tx = write_tx(conn).map_err(failed)?;
         let mut recorded = 0i64;
         let mut newest = None;
-        for (advance, events) in advances.iter().zip(&prepared) {
-            let stored = tx
-                .query_row(
-                    "SELECT byte_offset FROM transcript_cursors
-                     WHERE worktree_key = ?1 AND file_key = ?2",
-                    params![worktree, advance.file_key],
-                    |row| row.get::<_, i64>(0),
+        for ((worktree, advances), prepared) in advances.iter().zip(&prepared) {
+            for (advance, events) in advances.iter().zip(prepared) {
+                let stored = tx
+                    .query_row(
+                        "SELECT byte_offset FROM transcript_cursors
+                         WHERE worktree_key = ?1 AND file_key = ?2",
+                        params![worktree, advance.file_key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(failed)?
+                    .map(|offset| u64::try_from(offset).unwrap_or(0));
+                if stored != advance.from {
+                    continue;
+                }
+                for event in events {
+                    newest = Some(insert(&tx, event)?);
+                    recorded += 1;
+                }
+                tx.execute(
+                    "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(worktree_key, file_key) DO UPDATE SET
+                        byte_offset = excluded.byte_offset",
+                    params![
+                        worktree,
+                        advance.file_key,
+                        i64::try_from(advance.to).unwrap_or(i64::MAX)
+                    ],
                 )
-                .optional()
-                .map_err(failed)?
-                .map(|offset| u64::try_from(offset).unwrap_or(0));
-            if stored != advance.from {
-                continue;
+                .map_err(failed)?;
             }
-            for event in events {
-                newest = Some(insert(&tx, event)?);
-                recorded += 1;
-            }
-            tx.execute(
-                "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(worktree_key, file_key) DO UPDATE SET
-                    byte_offset = excluded.byte_offset",
-                params![
-                    worktree,
-                    advance.file_key,
-                    i64::try_from(advance.to).unwrap_or(i64::MAX)
-                ],
-            )
-            .map_err(failed)?;
         }
         tx.commit().map_err(failed)?;
         Ok((recorded, newest))
@@ -1413,7 +1453,7 @@ pub(crate) fn advance_transcripts(
             Ok(recorded)
         }
         Err(e) => {
-            for _ in prepared.iter().flatten() {
+            for _ in prepared.iter().flatten().flatten() {
                 record_dropped_append(repo_path);
             }
             Err(e)
@@ -1971,12 +2011,7 @@ pub(crate) fn consolidate_worktree_ledgers(
             continue;
         }
         imported_total += import_source(&anchor_path, &anchor, source, &source_db, members)?;
-        consolidated::record(
-            &anchor_path,
-            file_id(&ledger_path(&anchor)),
-            source,
-            stamp,
-        );
+        consolidated::record(&anchor_path, file_id(&ledger_path(&anchor)), source, stamp);
     }
 
     Ok(imported_total)
@@ -1994,17 +2029,17 @@ fn import_source(
     {
         let source_name = source.to_string_lossy().into_owned();
         let source_key = family_source_key(anchor_path, &source_name)?;
-        let mut cursor = family_import_cursor(&anchor, &source_key)?;
+        let mut cursor = family_import_cursor(anchor, &source_key)?;
         #[cfg(test)]
         tests::LEDGER_SIBLING_OPENS.with(|opens| opens.set(opens.get() + 1));
-        let source_conn = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        let source_conn = Connection::open_with_flags(source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
                 LedgerError::new(
                     "legacy_read_failed",
                     format!("could not open {}: {error}", source_db.display()),
                 )
             })?;
-        checked_state_file_metadata(&source_db, Some(source))?.ok_or_else(|| {
+        checked_state_file_metadata(source_db, Some(source))?.ok_or_else(|| {
             LedgerError::new(
                 "state_path_changed",
                 format!(
@@ -2063,10 +2098,10 @@ fn import_source(
             cursor = source_page.last().map(|event| event.id).unwrap_or(cursor);
             let normalized = source_page
                 .into_iter()
-                .map(|event| normalize_legacy_event(event, &anchor_path, source, members))
+                .map(|event| normalize_legacy_event(event, anchor_path, source, members))
                 .collect::<Result<Vec<_>, _>>()?;
             let (imported, newest_cursor) =
-                import_legacy_page(&anchor, &source_key, &source_name, &normalized, cursor)?;
+                import_legacy_page(anchor, &source_key, &source_name, &normalized, cursor)?;
             imported_total += imported;
             if let Some(newest_cursor) = newest_cursor {
                 announce(anchor, newest_cursor);

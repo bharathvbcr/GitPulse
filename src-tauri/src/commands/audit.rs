@@ -144,17 +144,17 @@ pub async fn cmd_worktree_task(
 /// Two sources, both observed rather than self-reported: git's reflog, which is
 /// authoritative for ref movements and survives GitPulse being uninstalled, and
 /// agent transcripts, which attribute file edits and commands to a session.
-/// Both replays are idempotent, so this is safe to run on every repo open.
+/// Both replays are idempotent, so this is safe to run on every repo open. The
+/// call is bounded by the catch-up budget however a phase stalls, and repeated
+/// calls inside a minute share one pass.
 #[tauri::command(async)]
 pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, String> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
-        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
-            .map_err(|e| e.to_string())?;
-        Ok(crate::ingest::catch_up_into(
-            &address.anchor,
-            &address.worktree,
-        ))
+        // Resolving the repository's family happens inside the pass's budget,
+        // and a pass that finished moments ago answers for this one: the app
+        // asks on every repository change.
+        Ok(crate::ingest::catch_up_coalesced(&repo.to_string_lossy()))
     })
     .await
 }

@@ -1617,6 +1617,26 @@ mod family_cost_tests {
         );
     }
 
+    /// Remembering the family must not turn a forged checkout into a member: a
+    /// directory whose gitfile points at the repository's git dir is not in the
+    /// registry, warm cache or not.
+    #[test]
+    fn a_forged_checkout_is_refused_after_a_warm_read() {
+        let (dir, repo, _siblings) = family_with_legacy_ledgers(1);
+        repository_address(&repo).expect("warm address");
+        let impostor = tempfile::tempdir().expect("impostor directory");
+        std::fs::write(
+            impostor.path().join(".git"),
+            format!("gitdir: {}\n", dir.path().join(".git").display()),
+        )
+        .expect("impostor gitfile");
+        crate::test_support::trust_repo(impostor.path());
+
+        let error = bind(&repo, &canonical(impostor.path()), "TASK-1")
+            .expect_err("a forged checkout must not resolve");
+        assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+
     /// A worktree removed after a warm read leaves the family: it can no longer
     /// be addressed, and the cached member list must not authenticate it.
     #[test]
