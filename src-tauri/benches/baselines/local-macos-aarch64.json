@@ -1,0 +1,420 @@
+{
+  "schema": 1,
+  "runner_class": "local-macos-aarch64",
+  "os": "macos",
+  "arch": "aarch64",
+  "benches": {
+    "command_timings": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 37.908203125,
+      "rows": {
+        "catch_up cold": {
+          "n": 5,
+          "time_gated": true,
+          "min_ns": 76185834,
+          "counters": {
+            "recorded": 485,
+            "reflog_entries": 5,
+            "skipped_lines": 0,
+            "transcripts": 60
+          }
+        },
+        "catch_up steady": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 35763125,
+          "counters": {
+            "recorded": 0,
+            "reflog_entries": 0,
+            "skipped_lines": 0,
+            "transcripts": 0
+          }
+        },
+        "commit details": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 16107500,
+          "counters": {
+            "git_processes": 2,
+            "parents": 1
+          }
+        },
+        "docs refresh": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 11388000,
+          "counters": {
+            "notes": 75
+          }
+        },
+        "insights snapshot": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 485043750,
+          "counters": {
+            "facets_ok": 7,
+            "git_processes": 37,
+            "worktrees": 18
+          }
+        },
+        "language stats": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 55363166,
+          "counters": {
+            "candidate_files": 600,
+            "git_processes": 1,
+            "languages": 8,
+            "scanned_files": 600
+          }
+        },
+        "list_worktrees": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 541627083,
+          "counters": {
+            "git_processes": 39,
+            "worktrees": 18
+          }
+        }
+      }
+    },
+    "graph_diff": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 43.728515625,
+      "rows": {
+        "lane_solver linear 100k": {
+          "n": 7,
+          "time_gated": true,
+          "min_ns": 41073166,
+          "counters": {
+            "connections": 99999,
+            "merges": 0,
+            "rows": 100000,
+            "width": 1
+          }
+        },
+        "lane_solver linear 10k": {
+          "n": 30,
+          "time_gated": true,
+          "min_ns": 2447250,
+          "counters": {
+            "connections": 9999,
+            "merges": 0,
+            "rows": 10000,
+            "width": 1
+          }
+        },
+        "lane_solver merge-heavy 100k": {
+          "n": 7,
+          "time_gated": true,
+          "min_ns": 24829000,
+          "counters": {
+            "connections": 83000,
+            "merges": 16600,
+            "rows": 99601,
+            "width": 4
+          }
+        },
+        "lane_solver merge-heavy 10k": {
+          "n": 30,
+          "time_gated": true,
+          "min_ns": 1878166,
+          "counters": {
+            "connections": 8330,
+            "merges": 1666,
+            "rows": 9997,
+            "width": 4
+          }
+        },
+        "word_diff 100 chars": {
+          "n": 100,
+          "time_gated": true,
+          "min_ns": 3833,
+          "counters": {
+            "changed_segments": 4,
+            "input_bytes": 210,
+            "modified_segments": 5,
+            "original_segments": 5
+          }
+        },
+        "word_diff 10000 chars": {
+          "n": 100,
+          "time_gated": true,
+          "min_ns": 374584,
+          "counters": {
+            "changed_segments": 74,
+            "input_bytes": 20477,
+            "modified_segments": 74,
+            "original_segments": 74
+          }
+        },
+        "word_diff 60000 chars": {
+          "n": 100,
+          "time_gated": true,
+          "min_ns": 1625,
+          "counters": {
+            "changed_segments": 2,
+            "input_bytes": 122619,
+            "modified_segments": 1,
+            "original_segments": 1
+          }
+        }
+      }
+    },
+    "idle_wakeups": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 30.3671875,
+      "rows": {
+        "idle 0 sessions": {
+          "n": 3,
+          "time_gated": false,
+          "min_ns": 5004627250,
+          "counters": {
+            "sessions": 0
+          }
+        },
+        "idle 1 sessions": {
+          "n": 3,
+          "time_gated": false,
+          "min_ns": 5001325042,
+          "counters": {
+            "sessions": 1
+          }
+        },
+        "idle 32 sessions": {
+          "n": 3,
+          "time_gated": false,
+          "min_ns": 5000036917,
+          "counters": {
+            "sessions": 32
+          }
+        },
+        "idle 8 sessions": {
+          "n": 3,
+          "time_gated": false,
+          "min_ns": 5000166625,
+          "counters": {
+            "sessions": 8
+          }
+        }
+      }
+    },
+    "live_index": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 24.0341796875,
+      "rows": {
+        "edit storm 40 ticks": {
+          "n": 3,
+          "time_gated": false,
+          "min_ns": 13555360333,
+          "counters": {
+            "ticks": 40
+          }
+        }
+      }
+    },
+    "mcp_protocol": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 39.146484375,
+      "rows": {
+        "codeintel status": {
+          "n": 30,
+          "time_gated": true,
+          "min_ns": 69273000,
+          "counters": {
+            "facets_ok": 1
+          }
+        },
+        "completion/complete": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 2000,
+          "counters": {}
+        },
+        "prompts/list": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 7125,
+          "counters": {}
+        },
+        "resources/list": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 3708,
+          "counters": {}
+        },
+        "resources/read server/manifest": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 605792,
+          "counters": {}
+        },
+        "resources/templates/list": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 10208,
+          "counters": {}
+        },
+        "server/discover": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 3333,
+          "counters": {}
+        },
+        "tools/call collision_risk": {
+          "n": 30,
+          "time_gated": true,
+          "min_ns": 36021708,
+          "counters": {
+            "facets_ok": 1
+          }
+        },
+        "tools/call insights": {
+          "n": 30,
+          "time_gated": true,
+          "min_ns": 118761958,
+          "counters": {
+            "facets_ok": 7,
+            "git_processes": 11
+          }
+        },
+        "tools/call rejected argument": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 2750,
+          "counters": {}
+        },
+        "tools/list": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 349833,
+          "counters": {}
+        },
+        "validate (accepting)": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 375,
+          "counters": {
+            "violations": 0
+          }
+        },
+        "validate (rejecting)": {
+          "n": 200,
+          "time_gated": true,
+          "min_ns": 833,
+          "counters": {
+            "violations": 4
+          }
+        }
+      }
+    },
+    "repo_read": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 36.1650390625,
+      "rows": {
+        "get_status 10k files clean": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 31219375,
+          "counters": {
+            "git_processes": 1,
+            "rows": 0
+          }
+        },
+        "get_status 10k files dirty": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 96643834,
+          "counters": {
+            "git_processes": 2,
+            "rows": 500
+          }
+        },
+        "get_status 1k files clean": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 11631208,
+          "counters": {
+            "git_processes": 1,
+            "rows": 0
+          }
+        },
+        "get_status 1k files dirty": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 34118375,
+          "counters": {
+            "git_processes": 2,
+            "rows": 50
+          }
+        }
+      }
+    },
+    "terminal_pty": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 35.76806640625,
+      "rows": {
+        "echo during flood": {
+          "n": 9,
+          "time_gated": false,
+          "min_ns": 15167,
+          "counters": {
+            "keystrokes": 12
+          }
+        },
+        "echo idle": {
+          "n": 9,
+          "time_gated": false,
+          "min_ns": 29000,
+          "counters": {
+            "keystrokes": 12
+          }
+        },
+        "flood 16 MiB": {
+          "n": 9,
+          "time_gated": false,
+          "min_ns": 548649500,
+          "counters": {
+            "bytes_received": 16777216
+          }
+        }
+      }
+    },
+    "watcher": {
+      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 44.79931640625,
+      "rows": {
+        "record_event_signal 10000-event burst": {
+          "n": 60,
+          "time_gated": true,
+          "min_ns": 15135875,
+          "counters": {
+            "admitted": 7000,
+            "dropped": 3000,
+            "events": 10000,
+            "kinds": 3,
+            "paths_recorded": 64,
+            "truncated": 1
+          }
+        }
+      }
+    }
+  }
+}

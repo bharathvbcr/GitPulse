@@ -720,3 +720,205 @@ with the hook's own for 8 commands across a bound, an unbound and a
 repository-free directory (a mutation making the app answer `bound: false`
 fails it), and feeds the hook seven kinds of wrong answer plus a control
 (`a_peer_that_answers_wrongly_is_not_believed`).
+
+## 2026-10-12: benchmark harness and the loaded-host baseline (ft-c0d9313f)
+
+The audit's perf cards need a number to be measured against. Before this there
+were three hand-run benches that printed prose, no machine-readable output, no
+baseline and no scheduled run. Every bench in `src-tauri/benches` that is listed
+below now runs on one harness (`benches/common`) and is run, compared and
+uploaded by `.github/workflows/benches.yml` (nightly 05:37 UTC and
+`workflow_dispatch`; never on a pull request).
+
+### The harness
+
+`cargo bench --manifest-path src-tauri/Cargo.toml --bench <name> -- [--smoke] [--json <path>]`
+
+* **Hermetic.** Each bench includes `src/test_support/env.rs`, so `HOME`, the XDG
+  roots, the git config and the trust store are a per-process temp directory
+  before `main`. The developer's `~/.gitconfig`, `~/.claude` sessions and trust
+  store are never read, and nothing is written to them. Fixtures are generated
+  once per run (`common/fixture.rs`) with fixed content, names, dates and
+  identities. `GITPULSE_BENCH_REPO=<path>` points `mcp_protocol` at a real
+  checkout instead, explicitly, and the report says so.
+* **Interleaved, min-of-N.** `interleave` runs one sample of every case per
+  round and rotates which goes first, so drift in host load lands on every case
+  alike. `min` is the figure to compare between builds; p50, p95 and max are
+  reported because they are what a user feels. An A/B between two *builds* is two
+  JSON files from two binaries run back to back (A B A B) and compared with
+  `scripts/bench-compare.mjs`: one process cannot hold two builds of the library.
+* **Work counters vs metrics.** A counter (rows laid out, segments emitted, git
+  processes started, events admitted, bytes received) is deterministic for a
+  fixed fixture and is asserted equal across every sample of a row; a quantity
+  that legitimately varies (bytes with a duration in them, MB/s, wakeups/s,
+  messages under a race) is a *metric*: reported, never gated. Git process
+  counts come from git's own `trace2` (`trace2.eventTarget` in the hermetic global
+  config; `GIT_TRACE*` is stripped from every child GitPulse starts, the config
+  key is not), in a separate untimed pass, because the log append would add to
+  every process.
+* **Host-load snapshot with every run.** `host.start` and `host.end` are the
+  repo's own `sysload` sensor (load average, cores, memory pressure, thermal,
+  power), plus `cpu_count`, `commit`, `dirty`, `os`, `arch`, `runner_class`, and
+  `smoke`. The table header prints the load ratio and says when it is above 1.
+  `--smoke` cuts every row to 3 samples; fixtures keep their size, so counters
+  are identical to a full run's. The `--json` path is relative to `src-tauri`
+  (cargo runs a bench from the package root); the workflow passes an absolute
+  `GITPULSE_BENCH_JSON_DIR`.
+* **A degraded answer is never timed.** `mcp_protocol`, `command_timings` abort,
+  naming the tool and the facet path, on `isError`, on any `"ok": false` object
+  in a payload, on a deadline-expired insights snapshot, a truncated language
+  scan, a partial docs vault or a truncated `catch_up`. The language scan runs
+  unbounded (`get_repo_language_stats_bounded(.., None)`): the production 10 s
+  deadline is a property of the host's load, and a scan it cut short would be
+  timed as if it were the whole work. Facets that report unavailability without an
+  `ok` flag (`codeintel.available`, `ledger.error`) are printed, not gated;
+  `agents.live` reads the host's real process table whatever `HOME` is.
+* **`mcp_protocol` runs unthrottled** (`run_process_with_unlimited_spawn_rate`
+  first in `main`, as the stress tests do). Before, 220 git-spawning samples spent
+  the production gate's 192-spawn burst and then refilled at 8/s, so the
+  repository rows could time the rate limiter or a deferred snapshot.
+
+### The gate
+
+`scripts/bench-compare.mjs --results <dir> --baseline src-tauri/benches/baselines/<runner class>.json`
+(self-test: `scripts/bench-compare.test.ts`, run by `npx vitest run scripts/bench-compare.test.ts`):
+
+* any **work counter** that changed (or appeared or vanished) fails;
+* a row whose **min-of-N exceeds the baseline's by more than 1.5x and by more
+  than 50 us** fails (the floor keeps a sub-microsecond row from failing on
+  scheduler jitter); rows marked `time_gated: false` (the PTY and wakeup rows,
+  whose time is a property of the OS scheduler) keep their counters in the gate
+  and their wall clock out of it;
+* a baselined bench or row missing from the run fails;
+* a run from another runner class is refused (exit 2), never compared; times are
+  only comparable within one class;
+* **no baseline for the class is exit 2, never 0**: a check that could not run is
+  not a check that passed. Seed a class by running `benches.yml` by hand,
+  downloading the `bench-<runner>` artifact and
+  `node scripts/bench-compare.mjs --results <dir> --write-baseline src-tauri/benches/baselines/<runner>.json`.
+
+Exit codes: 0 no regression, 1 a regression, 2 the comparison could not run. The
+report prints the host-load ratio next to every bench; **a time failure on a host
+the JSON shows loaded (ratio above 1) is a reason to re-run, not a finding**.
+Counter failures are not load-dependent.
+
+Committed baselines: `local-macos-aarch64` (below). `ubuntu-latest` and
+`macos-latest` have **no committed baseline yet**; until the first
+`workflow_dispatch` seeds them, the scheduled job fails loudly on those classes.
+
+### What each bench measures, and the audit card it is the baseline for
+
+| bench | rows | baseline for |
+| --- | --- | --- |
+| `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07 (protocol overhead only; the codeintel deadline overhead needs a DevMap store and is not measured) |
+| `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
+| `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
+| `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
+| `command_timings` | insights snapshot, `list_worktrees`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards |
+| `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
+| `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
+| `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
+
+`src/watcher/bench_seam.rs` is a `#[doc(hidden)]` module that builds the same
+`IgnoreRules` (through the same `parse_ignored_directories`) and calls the same
+`record_event_signal` the watch loop calls. It was needed because both are
+private and a bench is a separate crate; it adds no logic and no behaviour.
+
+**Not measured, and why.** Tab-switch settle (warm and cold) and the compositing
+A/B (GPU-process CPU and frame time) need the installed app and its webview; they
+cannot be reproduced from `cargo bench` and are left to the installed-app
+qualification (ft-9167572a) rather than faked. `decode_xml_entities` on an 8 MiB
+artifact (E-integrations-01), transcript ingest over 400 MB (E-integrations-10), a
+devmap preview via a stub binary other than the live-index stub, one task search
+over 100k tasks, and the hook command gate (`tests/hook_gate_bench.rs`, still a
+hand-run `#[ignore]`d test) have no bench here. The echo rows measure a keystroke
+in a session *beside* a flooding one, not in the flooded session itself. The
+wakeup counter is per process, so the per-session cost is the slope across the
+four rows, and a thread class not tied to a session (host sampler, watcher,
+live-index poller) is in the app process and not started by the library from a
+bench. Spawns for rows other than the ones listed come from `trace2` and exist
+only where a row lists `git_processes`.
+
+### Baseline, `local-macos-aarch64`, loaded host
+
+Machine: Apple M5 Pro (Mac17,8), 18 logical CPUs, 64 GiB, macOS 27.0.1, rustc
+1.99.0, git 2.56.0, release profile (`cargo bench`). Library code is main
+`a92e40fb` plus the watcher seam; benches at `9789a8e6` with the fixture and
+format fixes made afterwards (the JSON says `dirty: true`; they are committed
+as `6a24c3b1`, and change no counter or measured path). A `--smoke` run
+(N = 3) compared against this full-mode baseline on the same loaded host passed
+every counter and failed 3 of 40 time rows (`catch_up steady`, `commit details`,
+`docs refresh`, 1.7x to 2.3x): min-of-3 against min-of-15 under load. CI classes
+should therefore be seeded from the workflow's own smoke artifact, so the
+baseline and the run have the same N.
+
+**The host was not quiet.** Other repositories' builds and agents were running:
+the one-minute load average was 43.7 at the start of the run and 24.0 at the end
+(2.4x down to 1.3x of 18 CPUs), and was above 300 during the first compile. Every
+time below is a loaded-host time; min-of-N is the least inflated statistic but is
+still inflated. Treat the *counters* as exact and the *times* as an upper bound
+for this machine, and re-seed this class from a quiet run when one is available.
+N is the sample count per row (full mode, not `--smoke`).
+
+`graph_diff` (N = 100 word diff, 30 lane solver 10k, 7 lane solver 100k):
+
+| row | min | p50 | p95 | counters |
+| --- | --- | --- | --- | --- |
+| word_diff 100 chars | 3.83 us | 4.88 us | 9.79 us | 5 / 5 segments, 4 changed |
+| word_diff 10,000 chars | 374.6 us | 465.5 us | 560.3 us | 74 / 74 segments (500-token cap) |
+| word_diff 60,000 chars | 1.62 us | 2.92 us | 5.21 us | 1 / 1 segment (past the 50,000-byte guard) |
+| lane_solver linear 10k | 2.45 ms | 2.89 ms | 3.34 ms | 10,000 rows, 9,999 connections, width 1 |
+| lane_solver merge-heavy 10k | 1.88 ms | 2.33 ms | 2.81 ms | 9,997 rows, 8,330 connections, 1,666 merges, width 4 |
+| lane_solver linear 100k | 41.07 ms | 43.12 ms | 45.32 ms | 100,000 rows, 99,999 connections |
+| lane_solver merge-heavy 100k | 24.83 ms | 25.82 ms | 29.00 ms | 99,601 rows, 83,000 connections, 16,600 merges, width 4 |
+
+`watcher` (N = 60): `record_event_signal` over 10,000 events: min 15.14 ms, p50
+18.21 ms, p95 20.17 ms; 549k events/s at p50-ish (metric); 7,000 admitted, 3,000
+dropped, 64 paths recorded (the window's bound; `truncated`), 3 change classes.
+
+`repo_read` (N = 15):
+
+| row | min | p50 | p95 | rows | git processes |
+| --- | --- | --- | --- | --- | --- |
+| get_status 1k files clean | 11.63 ms | 14.54 ms | 31.51 ms | 0 | 1 |
+| get_status 1k files dirty (50) | 34.12 ms | 49.69 ms | 67.98 ms | 50 | 2 |
+| get_status 10k files clean | 31.22 ms | 36.52 ms | 42.20 ms | 0 | 1 |
+| get_status 10k files dirty (500) | 96.64 ms | 110.10 ms | 145.72 ms | 500 | 2 |
+
+`command_timings` (N = 15, cold N = 5; 600 files, 61 commits, 18 worktrees, 17
+dirty):
+
+| row | min | p50 | p95 | counters |
+| --- | --- | --- | --- | --- |
+| insights snapshot | 485.0 ms | 547.2 ms | 613.6 ms | 18 worktrees, 7 facets ok, 37 git processes |
+| list_worktrees | 541.6 ms | 579.7 ms | 642.0 ms | 18 worktrees, 39 git processes |
+| language stats | 55.4 ms | 75.7 ms | 86.2 ms | 600 of 600 files, 8 languages, 1 git process |
+| docs refresh | 11.4 ms | 20.4 ms | 23.1 ms | 75 notes |
+| catch_up steady | 35.8 ms | 69.7 ms | 86.6 ms | 0 recorded, 0 transcripts (watermark) |
+| catch_up cold | 76.2 ms | 97.5 ms | 112.1 ms | 485 recorded, 60 transcripts, 5 reflog entries |
+| commit details | 16.1 ms | 40.8 ms | 50.4 ms | 1 parent, 2 git processes |
+
+`mcp_protocol` (N = 200 protocol rows, 30 work rows): `tools/list` min 349.8 us
+(55.6 KB), `server/discover` 3.3 us, `resources/read server/manifest` 605.8 us
+(120.7 KB), validation 0.4 to 0.8 us; `gitpulse_status` min 69.3 ms,
+`collision_risk` 36.0 ms, `insights` 118.8 ms with 11 git processes and 7 facets
+ok. `tools/list` is 339x cheaper than one insights call.
+
+`terminal_pty` (N = 9, not time-gated): 16 MiB flood in min 548.7 ms, **25.6
+MB/s**, **1,024 IPC messages per MiB** (16,384 for the flood; one message per
+1 KiB read); keystroke echo p50 of a 12-key sample **29.0 us idle** (min) and
+**15.2 us beside a flood** in another session (2.5 MiB flowing during the
+keystrokes), worst key 0.05 ms: a flood in one session did not delay another
+session's echo on this host.
+
+`idle_wakeups` (N = 3 windows of 5 s, not time-gated), `ri_interrupt_wkups`:
+**2.2/s with no sessions, 12.2/s with 1, 80.9/s with 8, 317.0/s with 32: about
+9.8 wakeups per second per idle session** (the reader's poll). `ri_pkg_idle_wkups`
+read 0 throughout.
+
+`live_index` (N = 3 storms of 40 ticks, 250 ms apart, stub build 300 ms): **duty
+cycle 1.00, 40 builds started for 40 ticks**, 40 status probes. On main, every
+`repo-changed` tick of a storm starts a build, so the indexer is busy for the
+whole storm. This is the figure the live-index governor (lane
+`hx/lag1-live-index`) should bring down; the bench goes through the public
+`devmap::live::maybe_refresh` only.
