@@ -434,6 +434,10 @@ fn output_gathered_when_the_process_exits_is_delivered_before_the_exit() {
     }
 }
 
+/// Events a view has been sent and not yet repaid: session, reserved length,
+/// the bytes.
+type Unrepaid = Arc<Mutex<Vec<(String, usize, Vec<u8>)>>>;
+
 /// The view that never acknowledges is sent at most its window, told once, and
 /// the process keeps running. Once it repays, delivery resumes.
 #[test]
@@ -446,7 +450,7 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
     let state = TerminalSessions::default();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_output_stall_timeout(Duration::from_millis(20));
-    let held: Arc<Mutex<Vec<(String, usize, Vec<u8>)>>> = Arc::default();
+    let held: Unrepaid = Arc::default();
     let keep = held.clone();
     app.listen("terminal-output", move |event| {
         let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
