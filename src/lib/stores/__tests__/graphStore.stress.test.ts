@@ -77,7 +77,6 @@ function detailsFor(commitId: string): CommitDetails {
     committer_date: "2026-01-01T00:00:00Z",
     summary: `details:${commitId}`,
     body: "",
-    gpg_status: "N",
     co_authors: [],
     changed_files: [],
     total_additions: 0,

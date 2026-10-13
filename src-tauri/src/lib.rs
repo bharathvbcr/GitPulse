@@ -352,6 +352,7 @@ pub fn run() {
             cmd_get_range_diff,
             cmd_get_commit_files,
             cmd_get_commit_details,
+            cmd_verify_commit_signature,
             cmd_get_head_id,
             cmd_get_file_content,
             cmd_get_file_blob,

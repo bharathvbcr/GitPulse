@@ -190,6 +190,33 @@ pub(crate) fn assess_for_clone(preflight: &GitPreflight, submodules: bool) -> Re
     }
 }
 
+/// Oldest git whose `rev-list`/`log` accept `--since-as-filter`: the date
+/// bound that filters commits instead of ending the walk at the first old
+/// committer date. A feature floor, not the app's: [`MIN_GIT_VERSION`] stays
+/// where it is, and a caller below this one walks by count instead.
+///
+/// The per-feature capability table that ft-45b8099a plans owns this row; it is
+/// kept beside the probe until that table exists, so the two are one move.
+pub(crate) const SINCE_AS_FILTER: (u32, u32, u32) = (2, 37, 0);
+
+/// Whether `preflight`'s git is at least `min`. Fails closed: a git that was
+/// not probed (`Unchecked`), is missing or broken, or whose version line cannot
+/// be read is not "new enough", so the caller takes its fallback rather than
+/// passing a flag the git may reject.
+pub(crate) fn supports(preflight: &GitPreflight, min: (u32, u32, u32)) -> bool {
+    preflight.status == GitPreflightStatus::Ok
+        && preflight
+            .version
+            .as_deref()
+            .and_then(parse_git_version)
+            .is_some_and(|found| found >= min)
+}
+
+/// [`supports`] against the git this app drives.
+pub(crate) fn git_supports(min: (u32, u32, u32)) -> bool {
+    supports(&git_preflight(), min)
+}
+
 /// [`assess_for_clone`] against the git this app drives.
 pub fn require_git_for_clone(submodules: bool) -> Result<(), String> {
     assess_for_clone(&git_preflight(), submodules)
@@ -259,6 +286,50 @@ mod tests {
 
     fn preflight_of(line: &str) -> GitPreflight {
         assess(ToolProbe::Present(line.to_string()))
+    }
+
+    /// A feature floor is inclusive, reads Apple's and Windows' version
+    /// strings, and fails closed for every probe that did not end in a
+    /// readable passing version.
+    #[test]
+    fn a_feature_floor_is_inclusive_and_fails_closed() {
+        let says = |line: &str| supports(&preflight_of(line), SINCE_AS_FILTER);
+        assert!(!says("git version 2.36.9"));
+        assert!(says("git version 2.37.0"));
+        assert!(says("git version 2.39.3 (Apple Git-146)"));
+        assert!(says("git version 2.45.1.windows.1"));
+        assert!(!says("git version 2.30.2"));
+
+        let not_passing = |status, version: Option<&str>| GitPreflight {
+            status,
+            version: version.map(str::to_string),
+            message: Some("no".into()),
+        };
+        for status in [
+            GitPreflightStatus::Unchecked,
+            GitPreflightStatus::Broken,
+            GitPreflightStatus::Missing,
+            GitPreflightStatus::Outdated,
+        ] {
+            assert!(
+                !supports(
+                    &not_passing(status, Some("git version 2.50.0")),
+                    SINCE_AS_FILTER
+                ),
+                "{status:?} must not read as a capable git, whatever version it carries"
+            );
+        }
+        assert!(
+            !supports(&not_passing(GitPreflightStatus::Ok, None), SINCE_AS_FILTER),
+            "a passing probe with no version line proves nothing"
+        );
+        assert!(
+            !supports(
+                &not_passing(GitPreflightStatus::Ok, Some("git version unknown")),
+                SINCE_AS_FILTER
+            ),
+            "an unreadable version is not a capable one"
+        );
     }
 
     #[test]

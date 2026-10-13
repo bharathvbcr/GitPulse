@@ -755,7 +755,14 @@ fn test_open_repo_history_status_and_details() {
 
     let details = GitReader::get_commit_details(&path, &history[0].id).expect("details");
     assert_eq!(details.summary, history[0].summary);
-    assert_eq!(details.gpg_status, "N");
+    let verdict =
+        gitpulse_lib::engine::commit_signature::verify_commit_signature(&path, &history[0].id)
+            .expect("verify an unsigned commit");
+    assert_eq!(
+        verdict.signature,
+        gitpulse_lib::engine::CommitSignature::None
+    );
+    assert_eq!(verdict.status, gitpulse_lib::engine::SignatureStatus::None);
 
     let stats = GitReader::get_repo_language_stats(&path)
         .expect("stats")
@@ -2694,15 +2701,15 @@ fn run_git_with_identities(cwd: &Path, args: &[&str]) {
     );
 }
 
-/// `get_commit_details` reads eleven NUL-separated fields out of one
-/// `--format` string by position: %H %P %an %ae %ad %cn %ce %cd %G? %s %b.
+/// `get_commit_details` reads ten NUL-separated fields out of one
+/// `--format` string by position: %H %P %an %ae %ad %cn %ce %cd %s %b.
 /// The format string and the indices that read it sit in different places, so
 /// reordering two placeholders assigns one field's value to another — no
 /// error, no panic, just an author's email rendered as their commit date.
 ///
 /// Every other test in this suite commits with the same name and address for
 /// author and committer, which makes exactly that swap invisible. This one
-/// gives all eleven fields distinguishable values.
+/// gives all ten fields distinguishable values.
 #[test]
 fn commit_details_assigns_every_format_field_to_its_own_slot() {
     let repo = TestRepo::init();
@@ -2748,7 +2755,6 @@ fn commit_details_assigns_every_format_field_to_its_own_slot() {
         details.committer_date
     );
 
-    assert_eq!(details.gpg_status, "N", "%G? with no signature");
     assert_eq!(details.summary, "subject stays on its own line", "%s");
     assert!(
         details.body.contains("body first paragraph")

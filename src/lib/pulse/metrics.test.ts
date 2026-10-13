@@ -22,7 +22,7 @@ function createMockCommit(overrides: Partial<PulseCommitSummary> = {}): PulseCom
     summary: "feat(core): implement pulse metrics",
     author_name: "Alice Dev",
     author_email: "alice@example.com",
-    gpg_status: "G",
+    signature: "pgp",
     additions: 20,
     deletions: 5,
     files_changed: 3,
@@ -224,21 +224,21 @@ describe("computeHygiene", () => {
     const commits = [
       createMockCommit({
         summary: "feat: add feature\n\nCo-authored-by: Bob <bob@example.com>",
-        gpg_status: "G",
+        signature: "pgp",
         additions: 10,
         deletions: 0,
         is_merge: false,
       }),
       createMockCommit({
         summary: "Merge branch 'main'",
-        gpg_status: "N",
+        signature: "none",
         additions: 0,
         deletions: 0,
         is_merge: true,
       }),
       createMockCommit({
         summary: "revert: fix bug",
-        gpg_status: "U",
+        signature: "ssh",
         additions: 5,
         deletions: 5,
         is_revert: true,
@@ -248,13 +248,46 @@ describe("computeHygiene", () => {
     const hygiene = computeHygiene(commits);
     expect(hygiene.totalCommits).toBe(3);
     expect(hygiene.conventionalCount).toBe(2); // "feat:" and "revert:"
-    expect(hygiene.signedCount).toBe(2); // "G" and "U"
+    expect(hygiene.signedCount).toBe(2); // "pgp" and "ssh"
     expect(hygiene.signedPercentage).toBe(67);
     expect(hygiene.mergeCount).toBe(1);
     expect(hygiene.mergePercentage).toBe(33);
     expect(hygiene.revertCount).toBe(1);
     expect(hygiene.coAuthorCount).toBe(0);
     expect(hygiene.medianChurn).toBe(10);
+  });
+
+  it("counts every signature format as signed and never reads one as unsigned", () => {
+    const commits = (["pgp", "ssh", "x509", "other", "none"] as const).map((signature) =>
+      createMockCommit({ signature })
+    );
+    const hygiene = computeHygiene(commits);
+    expect(hygiene.signedCount).toBe(4);
+    expect(hygiene.signedPercentage).toBe(80);
+    expect(hygiene.signatureUnknownCount).toBe(0);
+  });
+
+  it("leaves commits whose signature could not be read out of the share and reports them", () => {
+    // 2 signed, 1 unsigned, 2 unread: the share is over the 3 that are known,
+    // not 2 of 5 (which would call the unread ones unsigned).
+    const commits = (["pgp", "ssh", "none", "unknown", "unknown"] as const).map((signature) =>
+      createMockCommit({ signature })
+    );
+    const hygiene = computeHygiene(commits);
+    expect(hygiene.totalCommits).toBe(5);
+    expect(hygiene.signedCount).toBe(2);
+    expect(hygiene.signedPercentage).toBe(67);
+    expect(hygiene.signatureUnknownCount).toBe(2);
+  });
+
+  it("states no share when no commit's signature could be read", () => {
+    const hygiene = computeHygiene([
+      createMockCommit({ signature: "unknown" }),
+      createMockCommit({ signature: "unknown" }),
+    ]);
+    expect(hygiene.signedCount).toBe(0);
+    expect(hygiene.signedPercentage).toBe(0);
+    expect(hygiene.signatureUnknownCount).toBe(2);
   });
 
   it("counts co-authors from the trailer field, never the subject", () => {

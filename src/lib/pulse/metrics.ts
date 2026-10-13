@@ -454,7 +454,20 @@ export function computeLocTrend(
 }
 
 /**
- * Computes commit hygiene and quality indicators.
+ * Share of commits that carry a signature, over the commits whose signature
+ * state is known. A commit the backend could not read ("unknown") is neither
+ * signed nor unsigned, so it stays out of the denominator rather than diluting
+ * the share as if it had been found unsigned; it is reported beside the share
+ * as `signatureUnknownCount`. With nothing known there is no share to state.
+ */
+function signedPercentageOf(signed: number, known: number): number {
+  return known > 0 ? Math.round((signed / known) * 100) : 0;
+}
+
+/**
+ * Computes commit hygiene and quality indicators. "Signed" means the commit
+ * carries a signature, read from the commit object: it says nothing about
+ * whether the signature verifies, which the walk never asks.
  */
 export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneStats {
   if (!commits || commits.length === 0) {
@@ -464,6 +477,7 @@ export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneS
       conventionalPercentage: 0,
       signedCount: 0,
       signedPercentage: 0,
+      signatureUnknownCount: 0,
       mergeCount: 0,
       mergePercentage: 0,
       revertCount: 0,
@@ -475,6 +489,7 @@ export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneS
 
   let conventionalCount = 0;
   let signedCount = 0;
+  let signatureUnknownCount = 0;
   let mergeCount = 0;
   let revertCount = 0;
   let coAuthorCount = 0;
@@ -482,7 +497,8 @@ export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneS
 
   for (const c of commits) {
     if (isConventionalCommit(c.summary)) conventionalCount++;
-    if (c.gpg_status === "G" || c.gpg_status === "U") signedCount++;
+    if (c.signature === "unknown") signatureUnknownCount++;
+    else if (c.signature !== "none") signedCount++;
     if (c.is_merge) mergeCount++;
     if (c.is_revert) revertCount++;
     if (c.co_authors.length > 0) coAuthorCount++;
@@ -509,7 +525,8 @@ export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneS
     conventionalCount,
     conventionalPercentage: pct(conventionalCount),
     signedCount,
-    signedPercentage: pct(signedCount),
+    signedPercentage: signedPercentageOf(signedCount, total - signatureUnknownCount),
+    signatureUnknownCount,
     mergeCount,
     mergePercentage: pct(mergeCount),
     revertCount,

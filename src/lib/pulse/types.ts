@@ -2,6 +2,32 @@
  * Type definitions for repository Pulse metrics, IPC reports, and derived calculations.
  */
 
+/**
+ * How a commit is signed, read from its object without running a verifier
+ * (mirrors the Rust `CommitSignature`, snake_case). `unknown` means the commit
+ * could not be read, which is not the same as `none`.
+ */
+export type CommitSignature = "none" | "pgp" | "ssh" | "x509" | "other" | "unknown";
+
+/** What git's `%G?` said about one signed commit (mirrors Rust `SignatureStatus`). */
+export type SignatureStatus =
+  | "good"
+  | "bad"
+  | "good_unknown_validity"
+  | "expired"
+  | "expired_key"
+  | "revoked"
+  | "cannot_check"
+  | "none";
+
+/** Wire shape of `cmd_verify_commit_signature`. */
+export interface CommitSignatureCheck {
+  signature: CommitSignature;
+  status: SignatureStatus;
+  key: string;
+  signer: string;
+}
+
 export interface PulseCommitSummary {
   sha: string;
   parents: string[];
@@ -9,7 +35,8 @@ export interface PulseCommitSummary {
   summary: string;
   author_name: string;
   author_email: string;
-  gpg_status: string;
+  /** Carries a signature (signed, not verified); never a verification verdict. */
+  signature: CommitSignature;
   additions: number;
   deletions: number;
   files_changed: number;
@@ -120,6 +147,8 @@ export interface HygieneStats {
   readonly conventionalPercentage: number;
   readonly signedCount: number;
   readonly signedPercentage: number;
+  /** Commits whose signature state could not be read; excluded from the share. */
+  readonly signatureUnknownCount: number;
   readonly mergeCount: number;
   readonly mergePercentage: number;
   readonly revertCount: number;

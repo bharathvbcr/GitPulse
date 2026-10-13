@@ -11,7 +11,8 @@
 //! that [`crate::limits`] and the gate exist to prevent.
 
 use crate::engine::git_cli::{
-    git, git_captured, git_captured_with_stdin, validate_repo, BoundedRun,
+    git, git_captured, git_captured_with_stdin, read_objects_batch, validate_repo, BatchObject,
+    BoundedRun, MAX_OUTPUT_BYTES,
 };
 use crate::engine::{git_reader, ref_cache};
 use serde::de::DeserializeOwned;
@@ -152,151 +153,18 @@ fn decode_note<T: DeserializeOwned>(
         .map_err(|e| format!("the note on {notes_ref} for {commit_sha} did not decode: {e}"))
 }
 
+/// What [`read_note_blobs`] expects at each id it is asked for.
+const NOTE_BLOB: BatchObject = BatchObject {
+    kind: "blob",
+    noun: "note blob",
+};
+
 /// Reads note blobs in one `git cat-file --batch`, where each noted commit used
-/// to cost a `git notes show`.
-///
-/// Every answer is taken by the size git declares, never by lines: a note may
-/// hold any byte, newlines included. A blob git reports missing, an answer that
-/// names another object, and a stream that stops short are each an `Err` for
-/// the blobs they leave unread, never an empty note.
+/// to cost a `git notes show`. The framing, the by-size reading and every
+/// failure shape belong to [`read_objects_batch`], which the commit-signature
+/// reader shares; this only says what a note blob is.
 fn read_note_blobs(repo: &Path, oids: &[String]) -> HashMap<String, Result<Vec<u8>, String>> {
-    let mut answers: HashMap<String, Result<Vec<u8>, String>> = HashMap::new();
-    let mut sent: Vec<&str> = Vec::new();
-    let mut query = String::new();
-    for oid in oids {
-        if answers.contains_key(oid) || sent.contains(&oid.as_str()) {
-            continue;
-        }
-        let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
-        if !shaped {
-            answers.insert(oid.clone(), Err(format!("{oid:?} is not a note blob id")));
-            continue;
-        }
-        query.push_str(oid);
-        query.push('\n');
-        sent.push(oid);
-    }
-    if sent.is_empty() {
-        return answers;
-    }
-    let run = match git_captured_with_stdin(repo, &["cat-file", "--batch"], query.as_bytes()) {
-        Ok(run) => run,
-        Err(e) => {
-            unread(
-                &mut answers,
-                &sent,
-                &format!("could not run git cat-file: {e}"),
-            );
-            return answers;
-        }
-    };
-    if !run.success {
-        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
-        unread(
-            &mut answers,
-            &sent,
-            &format!("git cat-file --batch failed: {stderr}"),
-        );
-        return answers;
-    }
-    if let Some(reason) = &run.incomplete {
-        unread(
-            &mut answers,
-            &sent,
-            &format!("git cat-file {}", reason.describe()),
-        );
-        return answers;
-    }
-
-    read_batch_answers(&run.stdout, &sent, &mut answers);
-    answers
-}
-
-/// Where a body of the declared `size` starting at `pos` ends, if the stream
-/// holds all of it and the newline git writes after it. A size is the
-/// stream's own claim, so it is never trusted to fit in `usize` arithmetic.
-fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
-    let end = pos.checked_add(size.parse::<usize>().ok()?)?;
-    (out.get(end) == Some(&b'\n')).then_some(end)
-}
-
-/// Marks every blob in `rest` unread for the same reason.
-fn unread(answers: &mut HashMap<String, Result<Vec<u8>, String>>, rest: &[&str], why: &str) {
-    for oid in rest {
-        answers.insert((*oid).to_string(), Err(why.to_string()));
-    }
-}
-
-/// Splits a `cat-file --batch` stream into the answers to `sent`, in order.
-/// Once the stream is out of step with its questions, nothing after that
-/// point is attributed to any of them.
-fn read_batch_answers(
-    out: &[u8],
-    sent: &[&str],
-    answers: &mut HashMap<String, Result<Vec<u8>, String>>,
-) {
-    let mut pos = 0usize;
-    for (index, oid) in sent.iter().enumerate() {
-        let Some(end) = out[pos..].iter().position(|&b| b == b'\n') else {
-            unread(
-                answers,
-                &sent[index..],
-                "git cat-file answered nothing for this note",
-            );
-            return;
-        };
-        let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
-        pos += end + 1;
-        let fields: Vec<&str> = header.split(' ').collect();
-        if fields.first() != Some(oid) {
-            // Every later answer is now out of step with its question.
-            unread(
-                answers,
-                &sent[index..],
-                &format!("git cat-file answered {header:?} for note blob {oid}"),
-            );
-            return;
-        }
-        let answer = match fields.as_slice() {
-            [_, "blob", size] => match body_end(out, pos, size) {
-                Some(end) => {
-                    let content = out[pos..end].to_vec();
-                    pos = end + 1;
-                    Ok(content)
-                }
-                None => {
-                    unread(
-                        answers,
-                        &sent[index..],
-                        &format!("git cat-file cut the note blob {oid} short"),
-                    );
-                    return;
-                }
-            },
-            [_, "missing"] => Err(format!(
-                "the note blob {oid} is missing from this repository"
-            )),
-            [_, kind, size] => match body_end(out, pos, size) {
-                // Skipped by its size so the next answer stays in step.
-                Some(end) => {
-                    pos = end + 1;
-                    Err(format!("{oid} is a {kind}, not a note blob"))
-                }
-                None => {
-                    unread(
-                        answers,
-                        &sent[index..],
-                        &format!("git cat-file answered {header:?}"),
-                    );
-                    return;
-                }
-            },
-            _ => Err(format!(
-                "git cat-file answered {header:?} for note blob {oid}"
-            )),
-        };
-        answers.insert((*oid).to_string(), answer);
-    }
+    read_objects_batch(repo, oids, NOTE_BLOB, MAX_OUTPUT_BYTES, &<[u8]>::to_vec)
 }
 
 /// Appends or replaces a verification note for a commit.
@@ -1822,7 +1690,14 @@ mod batch_tests {
         let sent = [a.as_str(), b.as_str(), c.as_str()];
         let read = |stream: &[u8]| {
             let mut answers = HashMap::new();
-            read_batch_answers(stream, &sent, &mut answers);
+            crate::engine::git_cli::read_batch_answers(
+                stream,
+                &sent,
+                NOTE_BLOB,
+                &<[u8]>::to_vec,
+                None,
+                &mut answers,
+            );
             assert_eq!(answers.len(), 3, "every blob is answered");
             answers
         };

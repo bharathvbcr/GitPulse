@@ -91,6 +91,162 @@ fn catch_up_sample(root: &Path, repo: &str) -> (Sample, std::time::Duration) {
     )
 }
 
+/// Commits in each `pulse signed` chain.
+const PULSE_COMMITS: usize = 500;
+
+/// How long the stand-in signing program sleeps per call, the cost of a real
+/// verifier (a PGP commit measured ten seconds) scaled down to bench size.
+const VERIFIER_DELAY_MS: u32 = 20;
+
+/// Set to time a build that still verifies in the bulk walk. Without it a
+/// walk that starts the signing program at all aborts the run: the row would
+/// otherwise time the verifier instead of the walk.
+const ALLOW_VERIFIER_ENV: &str = "GITPULSE_BENCH_ALLOW_VERIFIER";
+
+/// Writes one object of `kind` and returns its id.
+#[cfg(unix)]
+fn hash_object(repo: &Path, kind: &str, content: &[u8]) -> String {
+    use gitpulse_lib::procguard::LockedSpawn;
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["hash-object", "-t", kind, "-w", "--stdin"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn git hash-object");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(content)
+        .expect("write object");
+    let out = child.wait_with_output().expect("wait for hash-object");
+    assert!(
+        out.status.success(),
+        "hash-object failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("object id")
+        .trim()
+        .to_string()
+}
+
+/// A chain of [`PULSE_COMMITS`] commits of which `signed` carry a signature
+/// header (evenly spread), with every signing program set to `verifier`.
+/// Commits are written by hand, so no key and no signing program is involved
+/// in building it.
+#[cfg(unix)]
+fn signed_chain(root: &Path, signed: usize, verifier: &Path) -> String {
+    use common::fixture::{git, trust_repo};
+    let dir = root.join(format!("signed-{signed}"));
+    std::fs::create_dir_all(&dir).expect("create chain dir");
+    git(&dir, &["init", "-q", "-b", "main"]);
+    for key in ["gpg.program", "gpg.ssh.program", "gpg.x509.program"] {
+        git(&dir, &["config", key, verifier.to_str().expect("utf-8")]);
+    }
+    let tree = hash_object(&dir, "tree", b"");
+    let every = (signed > 0).then(|| PULSE_COMMITS / signed);
+    let mut parent: Option<String> = None;
+    for n in 0..PULSE_COMMITS {
+        let mut body = format!("tree {tree}\n");
+        if let Some(parent) = &parent {
+            body.push_str(&format!("parent {parent}\n"));
+        }
+        let who = format!("Bench <bench@example.com> {} +0000", 1_700_000_000 + n);
+        body.push_str(&format!("author {who}\ncommitter {who}\n"));
+        if every.is_some_and(|every| n % every == 0) {
+            body.push_str(
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n \n bm90IGEgcmVhbCBzaWduYXR1cmU=\n -----END PGP SIGNATURE-----\n",
+            );
+        }
+        body.push_str(&format!("\nfeat: change {n}\n"));
+        parent = Some(hash_object(&dir, "commit", body.as_bytes()));
+    }
+    git(
+        &dir,
+        &["update-ref", "refs/heads/main", &parent.expect("a chain")],
+    );
+    trust_repo(&dir);
+    let raw = git(&dir, &["log", "--format=raw"]);
+    let carrying = raw
+        .lines()
+        .filter(|line| line.starts_with("gpgsig "))
+        .count();
+    assert_eq!(carrying, signed, "the fixture carries {signed} signatures");
+    dir.to_str().expect("utf-8").to_string()
+}
+
+/// The `pulse signed 0|50|500` rows. Empty off unix, where the stand-in
+/// signing program is a shell script.
+#[cfg(unix)]
+fn pulse_signed_cases(root: &Path) -> Vec<Case<'static>> {
+    use std::os::unix::fs::PermissionsExt;
+    let stub_dir = root.join("verifier");
+    std::fs::create_dir_all(&stub_dir).expect("create stub dir");
+    let verifier = stub_dir.join("verifier");
+    std::fs::write(
+        &verifier,
+        format!(
+            "#!/bin/sh\necho x >> \"$(dirname \"$0\")/count\"\nsleep {:.3}\ncat >/dev/null\nexit 2\n",
+            f64::from(VERIFIER_DELAY_MS) / 1000.0
+        ),
+    )
+    .expect("write verifier stub");
+    std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o755))
+        .expect("stub executable");
+    let allow_verifier = std::env::var_os(ALLOW_VERIFIER_ENV).is_some();
+    let count_file = stub_dir.join("count");
+
+    [0usize, 50, PULSE_COMMITS]
+        .into_iter()
+        .map(|signed| {
+            let path = signed_chain(root, signed, &verifier);
+            let count_file = count_file.clone();
+            let walk = {
+                let path = path.clone();
+                move || {
+                    GitReader::pulse_report(&path, None)
+                        .unwrap_or_else(|error| panic!("pulse report failed: {error}"))
+                }
+            };
+            let _ = std::fs::remove_file(&count_file);
+            let (report, git_processes) = count_git_processes(&walk);
+            assert_eq!(
+                report.commits.len(),
+                PULSE_COMMITS,
+                "the pulse walk did not read the whole chain, so this run would time a partial walk"
+            );
+            Case::new(format!("pulse signed {signed}"), move || {
+                let _ = std::fs::remove_file(&count_file);
+                let started = std::time::Instant::now();
+                let report = walk();
+                let elapsed = started.elapsed();
+                let verifier_spawns = std::fs::read_to_string(&count_file)
+                    .map_or(0, |text| text.lines().count() as u64);
+                assert!(
+                    allow_verifier || verifier_spawns == 0,
+                    "the pulse walk started the signing program {verifier_spawns} times; \
+                     set {ALLOW_VERIFIER_ENV} to time a build that does"
+                );
+                std::hint::black_box(&report);
+                Sample::default()
+                    .counter("commits", report.commits.len() as u64)
+                    .counter("verifier_spawns", verifier_spawns)
+                    .counter("git_processes", git_processes)
+                    .elapsed(elapsed)
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn pulse_signed_cases(_root: &Path) -> Vec<Case<'static>> {
+    Vec::new()
+}
+
 fn head(repo: &Repo) -> String {
     common::fixture::git(&repo.main, &["rev-parse", "HEAD"])
         .trim()
@@ -246,6 +402,24 @@ fn main() {
         sample.elapsed(elapsed)
     });
     rows.extend(interleave(vec![cold], report.opts.samples(5), 0));
+
+    // The pulse walk over histories that differ only in how many commits are
+    // signed. The fixtures are built here, outside every timed span.
+    let signed_root = temp.path().join("pulse-signed");
+    let signed_cases = pulse_signed_cases(&signed_root);
+    if !signed_cases.is_empty() {
+        report.note(format!(
+            "pulse signed: {PULSE_COMMITS}-commit chains of hand-written commits carrying 0, 50 and \
+             {PULSE_COMMITS} fake signatures, a signing program that counts its calls and sleeps \
+             {} ms per call; `verifier_spawns` is how many times it ran during one walk",
+            VERIFIER_DELAY_MS
+        ));
+        rows.extend(interleave(
+            signed_cases,
+            report.opts.samples(5),
+            report.opts.warmup(1),
+        ));
+    }
 
     report.extend(rows);
     report.finish();

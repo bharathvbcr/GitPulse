@@ -17,6 +17,9 @@ function deferred<T>() {
 }
 
 
+/** The verdict for a commit with no signature, for mocks that do not care about signing. */
+const NO_SIGNATURE = { signature: "none", status: "none", key: "", signer: "" } as const;
+
 function grow(id: string, overrides: Partial<VisualCommitRow> = {}): VisualCommitRow {
   return {
     id,
@@ -202,6 +205,7 @@ describe("graphStore generation", () => {
         if (cmd === "cmd_get_commit_graph") return withWarnings as never;
         if (cmd === "cmd_get_commit_details")
           return { id: "x", summary: "d", changed_files: [] } as never;
+        if (cmd === "cmd_verify_commit_signature") return NO_SIGNATURE as never;
         throw new Error(cmd);
       };
       const store = createGraphStore({
@@ -715,6 +719,7 @@ describe("graph warning breadcrumbs", () => {
       if (cmd === "cmd_get_commit_details") {
         return { id: args?.commitId, changed_files: [] } as never;
       }
+      if (cmd === "cmd_verify_commit_signature") return NO_SIGNATURE as never;
       throw new Error(cmd);
     };
     const store = createGraphStore({
@@ -778,5 +783,66 @@ describe("graph warning breadcrumbs", () => {
     current = ["flaky degradation"];
     await store.loadGraph("/r/a");
     expect(warned).toEqual(["/r/a: flaky degradation", "/r/a: flaky degradation"]);
+  });
+});
+
+describe("graphStore signature verification", () => {
+  const check = { signature: "ssh", status: "none", key: "", signer: "" } as const;
+
+  async function selecting(verify: (commitId: string) => Promise<unknown>, log: string[] = []) {
+    const invoke: InvokeFn = async (cmd, args) => {
+      log.push(cmd);
+      if (cmd === "cmd_get_commit_graph") return payload("c1") as never;
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, summary: "s", changed_files: [] } as never;
+      }
+      if (cmd === "cmd_verify_commit_signature") return verify(String(args?.commitId)) as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const row = { ...get(store).rows[0], id: "c1" };
+    return { store, row, log };
+  }
+
+  it("shows the details before the verifier answers, then attaches the verdict", async () => {
+    const gate = deferred<typeof check>();
+    const { store, row, log } = await selecting(() => gate.promise);
+    await store.selectCommit(row, "/r/a");
+    // The details are in place while the verification is still running.
+    expect(get(store).selectedCommitDetails?.summary).toBe("s");
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+    gate.resolve(check);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.signature_check).toEqual(check);
+    // One verification per details fetch, never one per render or publish.
+    const count = (name: string) => log.filter((cmd) => cmd === name).length;
+    expect(count("cmd_verify_commit_signature")).toBe(count("cmd_get_commit_details"));
+  });
+
+  it("records a verification that could not run as not checked, never as unsigned", async () => {
+    const { store, row } = await selecting(async () => {
+      throw new Error("signing program timed out");
+    });
+    await store.selectCommit(row, "/r/a");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeNull();
+  });
+
+  it("drops a verdict that arrives after another commit was selected", async () => {
+    const slow = deferred<typeof check>();
+    const { store, row } = await selecting((id) =>
+      id === "c1" ? slow.promise : new Promise(() => {})
+    );
+    await store.selectCommit(row, "/r/a");
+    await store.selectCommit({ ...row, id: "c2" }, "/r/a");
+    slow.resolve(check);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.id).toBe("c2");
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
   });
 });

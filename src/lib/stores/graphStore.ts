@@ -11,6 +11,7 @@ import {
 import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
 import { isRefScope, type RefScope } from "../graph/refScope";
 import { interfaceStore } from "./interfaceStore";
+import type { CommitSignatureCheck } from "../pulse/types";
 
 export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -32,7 +33,6 @@ export interface CommitDetails {
   committer_date: string;
   summary: string;
   body: string;
-  gpg_status: string;
   co_authors: string[];
   changed_files: CommitFileChange[];
   total_additions: number;
@@ -51,6 +51,18 @@ export interface CommitDetails {
    */
   numstat_truncation_reason?: string;
 }
+
+/**
+ * The details as the panes hold them: the wire payload plus the verdict of the
+ * one-commit signature check, which the store attaches after the details land
+ * (the verifier can take seconds, so it never gates them). `signature_check` is
+ * absent while it runs and `null` when it could not be run. The details
+ * themselves carry no signature verdict, which is why this is not part of the
+ * wire `CommitDetails` above.
+ */
+export type SelectedCommitDetails = CommitDetails & {
+  signature_check?: CommitSignatureCheck | null;
+};
 
 /** A file left out of a truncated commit diff, stats only. */
 export interface SkippedFileStat {
@@ -201,7 +213,7 @@ export interface GraphState {
   refs: RefDecoration[];
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
-  selectedCommitDetails: CommitDetails | null;
+  selectedCommitDetails: SelectedCommitDetails | null;
   isLoading: boolean;
   maxCommits: number;
   visiblePath: string | null;
@@ -246,7 +258,7 @@ interface CachedGraph {
   refs: RefDecoration[];
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
-  selectedCommitDetails: CommitDetails | null;
+  selectedCommitDetails: SelectedCommitDetails | null;
   query: string;
   revision: string | null;
   /**
@@ -535,6 +547,49 @@ export function createGraphStore(
       // failure only costs the lower pane's content — but it must still
       // leave a breadcrumb instead of looking like an eternal blank.
       reportFailure("graph-details", `${repoPath}/${commitId}: ${formatError(err)}`);
+      return;
+    }
+    // After the details are on screen and not awaited by anything that gates
+    // them: verifying runs the person's signing program, which has taken ten
+    // seconds for one PGP commit. The backend caches it, so selecting the same
+    // commit again answers at once.
+    void verifySignature(repoPath, token, commitId, seq);
+  }
+
+  /** Attaches the selected commit's signature verification to its details. */
+  async function verifySignature(
+    repoPath: string,
+    token: number,
+    commitId: string,
+    seq?: number
+  ) {
+    let check: CommitSignatureCheck | null;
+    try {
+      check = await invokeFn<CommitSignatureCheck>("cmd_verify_commit_signature", {
+        repoPath,
+        commitId,
+      });
+    } catch (err) {
+      // Not a verdict: the pane says the signature was not checked, never
+      // that the commit is unsigned.
+      reportFailure("graph-signature", `${repoPath}/${commitId}: ${formatError(err)}`);
+      check = null;
+    }
+    if (check === undefined) return;
+    if (!isCurrent(repoPath, token)) return;
+    if (seq !== undefined && !selectionCurrent(repoPath, seq)) return;
+    const attach = (details: SelectedCommitDetails | null): SelectedCommitDetails | null =>
+      details?.id === commitId ? { ...details, signature_check: check } : details;
+    const cachedNow = cache.get(repoPath);
+    if (cachedNow && cachedNow.selectedCommit?.id === commitId) {
+      cachedNow.selectedCommitDetails = attach(cachedNow.selectedCommitDetails);
+    }
+    if (visiblePath === repoPath) {
+      update((s) =>
+        s.selectedCommit?.id === commitId
+          ? { ...s, selectedCommitDetails: attach(s.selectedCommitDetails) }
+          : s
+      );
     }
   }
 

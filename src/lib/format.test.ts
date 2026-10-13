@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { formatDate, formatRelativeTime, shortHash } from "./format";
+import { formatDate, formatRelativeTime, shortHash, signatureLabel } from "./format";
+import type { CommitSignatureCheck } from "./pulse/types";
 
 describe("formatRelativeTime", () => {
   const NOW = 1_700_000_100;
@@ -84,6 +85,40 @@ describe("shortHash", () => {
     expect(shortHash(undefined)).toBe("");
     expect(shortHash(null)).toBe("");
     expect(shortHash(undefined, 8)).toBe("");
+  });
+});
+
+describe("signatureLabel", () => {
+  const check = (
+    signature: CommitSignatureCheck["signature"],
+    status: CommitSignatureCheck["status"]
+  ): CommitSignatureCheck => ({ signature, status, key: "", signer: "" });
+
+  it("never calls a commit that carries a signature unsigned because the verifier could not run", () => {
+    for (const signature of ["pgp", "ssh", "x509", "other"] as const) {
+      for (const status of ["none", "cannot_check"] as const) {
+        const label = signatureLabel(check(signature, status));
+        expect(label.text).toBe("Signed, could not verify");
+        expect(label.ok).toBe(false);
+      }
+    }
+  });
+
+  it("calls only a commit with no signature header unsigned", () => {
+    expect(signatureLabel(check("none", "none")).text).toBe("Unsigned");
+  });
+
+  it("says a check still running, or one that failed, is not a verdict", () => {
+    expect(signatureLabel(undefined).text).toBe("Checking signature…");
+    expect(signatureLabel(null).text).toBe("Signature not checked");
+    expect(signatureLabel(check("unknown", "none")).text).toBe("Signature state unknown");
+  });
+
+  it("passes only a good signature", () => {
+    expect(signatureLabel(check("ssh", "good"))).toEqual({ text: "Verified", ok: true });
+    for (const status of ["bad", "good_unknown_validity", "expired", "expired_key", "revoked"] as const) {
+      expect(signatureLabel(check("pgp", status)).ok).toBe(false);
+    }
   });
 });
 

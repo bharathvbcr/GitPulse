@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -37,6 +37,7 @@ pub use preflight::{
     git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
     MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
 };
+pub(crate) use preflight::{git_supports, SINCE_AS_FILTER};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -388,6 +389,14 @@ const PINNED_GIT_CONFIG: &[&str] = &[
 /// no `-c` can blank) would run a program instead of git's own diff.
 const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
 
+/// The patch subcommands that can run the signature verifier for a header
+/// (`log.showSignature`, a `--show-signature` alias, `--pretty=` presets).
+/// `--no-show-signature` rides every one of them from here, so no read has to
+/// remember it; `diff` is left out because it rejects the flag. It does not
+/// touch the `%G*` placeholders, which always verify: those are kept out of
+/// every bulk format string by a source-scan test.
+const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
+
 /// The one place the environment of a git child is decided. Both spawn
 /// builders ([`git_command_with_env`] for git itself and
 /// [`build_capture_command_in`] for tools that shell out to git, such as `gh`)
@@ -471,10 +480,13 @@ fn git_command_with_env(
         cmd.args(["-c", pin]);
     }
     match subcommand_index(args) {
-        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => cmd
-            .args(&args[..=at])
-            .arg("--no-ext-diff")
-            .args(&args[at + 1..]),
+        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => {
+            cmd.args(&args[..=at]).arg("--no-ext-diff");
+            if SIGNATURE_PRINTING_SUBCOMMANDS.contains(&args[at]) {
+                cmd.arg("--no-show-signature");
+            }
+            cmd.args(&args[at + 1..])
+        }
         _ => cmd.args(args),
     };
     pin_git_environment(&mut cmd);
@@ -573,7 +585,7 @@ pub fn git_bytes_capped(
 /// `Err(String)`, and a caller that cannot tell them apart ends up reporting a
 /// commit it could not look at as a commit it looked at and found nothing on.
 pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, None)
+    git_captured_inner(repo, args, None, MAX_OUTPUT_BYTES)
 }
 
 /// [`git_captured`] with `stdin_bytes` fed to the child, for git's `--batch`
@@ -583,21 +595,218 @@ pub(crate) fn git_captured_with_stdin(
     args: &[&str],
     stdin_bytes: &[u8],
 ) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, Some(stdin_bytes))
+    git_captured_inner(repo, args, Some(stdin_bytes), MAX_OUTPUT_BYTES)
+}
+
+/// What a [`read_objects_batch`] caller expects to find at each id: the object
+/// type git must report, and the noun its error messages use for it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchObject {
+    pub kind: &'static str,
+    pub noun: &'static str,
+}
+
+/// Ids more than this many in one `cat-file --batch` question. A caller
+/// already bounds its list (the pulse walk by `MAX_PULSE_COMMITS`); this is
+/// the reader's own ceiling, so no caller can hand it an unbounded stdin.
+const MAX_BATCH_OBJECTS: usize = 100_000;
+
+/// Reads objects in one `git cat-file --batch`, where each used to cost its
+/// own process, and maps each one's bytes through `extract`.
+///
+/// Every answer is taken by the size git declares, never by lines: an object
+/// may hold any byte, newlines included. A missing object, one of another
+/// type, an answer that names another id, and a stream that stops short are
+/// each an `Err` for the objects they leave unread, never an empty value. A
+/// stream cut at `budget` (or by the deadline) is read as far as it is whole:
+/// the objects before the cut keep their answers, and every later one is an
+/// `Err` that says the output was cut.
+pub(crate) fn read_objects_batch<T>(
+    repo: &Path,
+    oids: &[String],
+    object: BatchObject,
+    budget: usize,
+    extract: &dyn Fn(&[u8]) -> T,
+) -> HashMap<String, Result<T, String>> {
+    let mut answers: HashMap<String, Result<T, String>> = HashMap::new();
+    let mut asked: HashSet<&str> = HashSet::new();
+    let mut sent: Vec<&str> = Vec::new();
+    let mut query = String::new();
+    for oid in oids {
+        if answers.contains_key(oid) || !asked.insert(oid.as_str()) {
+            continue;
+        }
+        let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
+        if !shaped {
+            asked.remove(oid.as_str());
+            answers.insert(
+                oid.clone(),
+                Err(format!("{oid:?} is not a {} id", object.noun)),
+            );
+            continue;
+        }
+        if sent.len() == MAX_BATCH_OBJECTS {
+            answers.insert(
+                oid.clone(),
+                Err(format!(
+                    "more than {MAX_BATCH_OBJECTS} objects were asked for at once"
+                )),
+            );
+            continue;
+        }
+        query.push_str(oid);
+        query.push('\n');
+        sent.push(oid);
+    }
+    if sent.is_empty() {
+        return answers;
+    }
+    let run = git_captured_inner(
+        repo,
+        &["cat-file", "--batch"],
+        Some(query.as_bytes()),
+        budget,
+    );
+    let run = match run {
+        Ok(run) => run,
+        Err(e) => {
+            mark_unread(
+                &mut answers,
+                &sent,
+                &format!("could not run git cat-file: {e}"),
+            );
+            return answers;
+        }
+    };
+    // A stream cut at the budget or the deadline is a prefix whose child was
+    // stopped, so it exits unsuccessfully: it is read as far as it is whole
+    // instead of being discarded as a failed run.
+    if !run.success && run.incomplete.is_none() {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        mark_unread(
+            &mut answers,
+            &sent,
+            &format!("git cat-file --batch failed: {stderr}"),
+        );
+        return answers;
+    }
+    let cut = run
+        .incomplete
+        .as_ref()
+        .map(|reason| format!("git cat-file {}", reason.describe()));
+    read_batch_answers(
+        &run.stdout,
+        &sent,
+        object,
+        extract,
+        cut.as_deref(),
+        &mut answers,
+    );
+    answers
+}
+
+/// Where a body of the declared `size` starting at `pos` ends, if the stream
+/// holds all of it and the newline git writes after it. A size is the
+/// stream's own claim, so it is never trusted to fit in `usize` arithmetic.
+fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
+    let end = pos.checked_add(size.parse::<usize>().ok()?)?;
+    (out.get(end) == Some(&b'\n')).then_some(end)
+}
+
+/// Marks every object in `rest` unread for the same reason.
+fn mark_unread<T>(answers: &mut HashMap<String, Result<T, String>>, rest: &[&str], why: &str) {
+    for oid in rest {
+        answers.insert((*oid).to_string(), Err(why.to_string()));
+    }
+}
+
+/// Splits a `cat-file --batch` stream into the answers to `sent`, in order.
+/// Once the stream is out of step with its questions, nothing after that
+/// point is attributed to any of them. `cut` is why the stream ended early,
+/// when it did, and is what a question left unanswered by it reports.
+pub(crate) fn read_batch_answers<T>(
+    out: &[u8],
+    sent: &[&str],
+    object: BatchObject,
+    extract: &dyn Fn(&[u8]) -> T,
+    cut: Option<&str>,
+    answers: &mut HashMap<String, Result<T, String>>,
+) {
+    let noun = object.noun;
+    let mut pos = 0usize;
+    for (index, oid) in sent.iter().enumerate() {
+        let Some(end) = out[pos..].iter().position(|&b| b == b'\n') else {
+            let why = cut.map_or_else(
+                || format!("git cat-file answered nothing for this {noun}"),
+                |cut| format!("{cut} before this {noun} was read"),
+            );
+            mark_unread(answers, &sent[index..], &why);
+            return;
+        };
+        let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
+        pos += end + 1;
+        let fields: Vec<&str> = header.split(' ').collect();
+        if fields.first() != Some(oid) {
+            // Every later answer is now out of step with its question.
+            mark_unread(
+                answers,
+                &sent[index..],
+                &format!("git cat-file answered {header:?} for {noun} {oid}"),
+            );
+            return;
+        }
+        let answer = match fields.as_slice() {
+            [_, kind, size] if *kind == object.kind => match body_end(out, pos, size) {
+                Some(end) => {
+                    let content = extract(&out[pos..end]);
+                    pos = end + 1;
+                    Ok(content)
+                }
+                None => {
+                    let why = cut.map_or_else(
+                        || format!("git cat-file cut the {noun} {oid} short"),
+                        |cut| format!("{cut} inside the {noun} {oid}"),
+                    );
+                    mark_unread(answers, &sent[index..], &why);
+                    return;
+                }
+            },
+            [_, "missing"] => Err(format!("the {noun} {oid} is missing from this repository")),
+            [_, kind, size] => match body_end(out, pos, size) {
+                // Skipped by its size so the next answer stays in step.
+                Some(end) => {
+                    pos = end + 1;
+                    Err(format!("{oid} is a {kind}, not a {noun}"))
+                }
+                None => {
+                    mark_unread(
+                        answers,
+                        &sent[index..],
+                        &format!("git cat-file answered {header:?}"),
+                    );
+                    return;
+                }
+            },
+            _ => Err(format!("git cat-file answered {header:?} for {noun} {oid}")),
+        };
+        answers.insert((*oid).to_string(), answer);
+    }
 }
 
 fn git_captured_inner(
     repo: &Path,
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
 ) -> Result<BoundedRun, String> {
     crate::repository_trust::require(repo)?;
     let label = format!("git {}", subcommand(args));
-    run_bounded(
+    run_bounded_capped(
         git_command(Some(repo), args),
         &label,
         DEFAULT_TIMEOUT,
         stdin_bytes,
+        stdout_cap,
     )
 }
 
@@ -7225,8 +7434,24 @@ mod tests {
             let args = argv(&[patch, "HEAD"]);
             let at = args.iter().position(|a| a == patch).expect("subcommand");
             assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
-            assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+            // `diff` rejects `--no-show-signature`; `show` and `log` carry it
+            // so a user's `--show-signature` alias never runs the verifier.
+            if patch == "diff" {
+                assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+            } else {
+                assert_eq!(args[at + 2], "--no-show-signature", "{patch}: {args:?}");
+                assert_eq!(args[at + 3], "HEAD", "{patch}: {args:?}");
+            }
         }
+        let notes_log = argv(&["-c", "x.y=z", "log", "-n1"]);
+        let at = notes_log.iter().position(|a| a == "log").unwrap();
+        assert_eq!(notes_log[at + 2], "--no-show-signature", "{notes_log:?}");
+        assert!(
+            !argv(&["diff", "--cached"])
+                .iter()
+                .any(|a| a == "--no-show-signature"),
+            "diff must not receive a flag it rejects"
+        );
         // A global option with a value before the subcommand does not hide it,
         // and a command that prints no patch is left alone.
         let notes = argv(&["-c", "x.y=z", "notes", "show", "HEAD"]);
@@ -7234,6 +7459,43 @@ mod tests {
         let global = argv(&["-C", "/tmp", "diff", "--cached"]);
         let at = global.iter().position(|a| a == "diff").unwrap();
         assert_eq!(global[at + 1], "--no-ext-diff", "{global:?}");
+    }
+
+    /// A batch stream that ends because its budget or deadline did keeps the
+    /// answers that are whole and says, for each one it lost, that the output
+    /// was cut: not "answered nothing", which would blame git for the cap.
+    #[test]
+    fn a_cut_batch_keeps_its_whole_answers_and_names_the_cut_for_the_rest() {
+        const OBJECT: BatchObject = BatchObject {
+            kind: "commit",
+            noun: "commit",
+        };
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let sent = [a.as_str(), b.as_str(), c.as_str()];
+        let run = |stream: &[u8]| {
+            let mut answers: HashMap<String, Result<usize, String>> = HashMap::new();
+            read_batch_answers(
+                stream,
+                &sent,
+                OBJECT,
+                &<[u8]>::len,
+                Some("git cat-file output exceeded 64 bytes"),
+                &mut answers,
+            );
+            answers
+        };
+        // The stream stops between answers: `c` was never started.
+        let between = run(format!("{a} commit 2\nhi\n{b} commit 3\nabc\n").as_bytes());
+        assert_eq!(between[&a], Ok(2));
+        assert_eq!(between[&b], Ok(3));
+        assert!(between[&c].as_ref().unwrap_err().contains("exceeded 64"));
+        // The stream stops inside `b`'s body: `a` stays, `b` and `c` are cut.
+        let inside = run(format!("{a} commit 2\nhi\n{b} commit 30\nabc").as_bytes());
+        assert_eq!(inside[&a], Ok(2));
+        for oid in [&b, &c] {
+            let err = inside[oid].as_ref().unwrap_err();
+            assert!(err.contains("exceeded 64") && err.contains(&b), "{err}");
+        }
     }
 
     /// The editor variables are PINNED rather than removed, and the difference
