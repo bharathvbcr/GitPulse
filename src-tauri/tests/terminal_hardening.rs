@@ -263,7 +263,7 @@ fn unread_flood(total: usize, budget: Duration) {
     );
     assert!(
         delivered.load(Ordering::SeqCst) < 4 * 1024 * 1024,
-        "an unacknowledged view was sent {} bytes; the window is 256 KiB",
+        "an unacknowledged view was sent {} bytes; the window is 512 KiB",
         delivered.load(Ordering::SeqCst)
     );
     assert!(list_sessions(&state).iter().all(|s| s.id != spawned.id));

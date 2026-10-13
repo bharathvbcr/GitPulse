@@ -46,7 +46,7 @@ and closes still in flight, is **Settings → Agents → Terminal sessions open 
 once**: 32 until you change it, up to 128. The toolbar's session count shows
 it (`12/32`). A change applies to the next session; lowering it closes
 nothing, and new sessions wait until enough close. The ceiling bounds each
-session's PTY pair, reader thread and 256 KiB output window, and stays well
+session's PTY pair, reader thread and 512 KiB output window, and stays well
 inside macOS's system-wide PTY allowance, which other terminals share.
 
 Use **Terminal tab options** to rename a tab, move it left or right, copy selected
@@ -194,7 +194,7 @@ message. Invalid Unicode is also refused before any portion is sent. Failed or
 timed-out writes are not retried, since part of a command may already have arrived;
 restart the session before entering more input.
 
-The native PTY pauses after 256 KiB of output awaiting renderer acknowledgements.
+The native PTY pauses after 512 KiB of output awaiting renderer acknowledgements.
 If the renderer stops acknowledging for 30 seconds, the session closes with a
 delivery error. This bounds output in transit; retained history is limited
 to the session's scrollback (5,000 lines for a shell and 1,000 for an agent by
