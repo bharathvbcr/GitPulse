@@ -1374,3 +1374,6 @@ mod watermark_tests {
         assert!(modified_since(&f, now - 60_000));
     }
 }
+
+#[cfg(test)]
+mod family_tests;
