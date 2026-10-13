@@ -514,39 +514,92 @@ fn test_ref_name_injection_adversarial_suite() {
         validate_oid, validate_oid_or_revision, validate_ref_name,
     };
 
-    let malicious_refs = vec![
+    // Names git itself refuses (`git help check-ref-format`), plus the two
+    // rules this app keeps stricter than git: a leading `-` and the C1
+    // controls U+0080-U+009F. Every one must stay rejected.
+    let rejected_refs = vec![
+        // A leading '-' would be read as an option.
         "-u",
+        "-",
+        "--",
         "--upload-pack=echo pwned",
         "--exec=calc",
+        // Empty, and path components git cannot store.
+        "",
         "refs/heads/../../etc/passwd",
         "foo..bar",
+        "..",
         "foo//bar",
-        "branch.lock",
+        "/foo",
         "branch/",
+        "branch.lock",
+        "a/b.lock/c",
         ".hidden",
+        "a/.hidden",
+        "foo.",
+        "foo/bar.",
+        // '@' forms.
         "@",
         "HEAD@{1}",
+        "a@{b",
+        "@{",
+        // Control characters, whitespace, DEL and C1.
         "foo\0bar",
         "foo\nbar",
+        "foo\tbar",
+        "foo\u{1}bar",
+        "foo\u{7f}bar",
+        "foo\u{85}bar",
+        "foo\u{9b}bar",
+        "foo bar",
         "foo; rm -rf /",
-        "foo`calc`",
-        "foo$BAR",
-        "foo|bar",
-        "foo&bar",
+        // The glob and revision-syntax characters git forbids.
         "foo*bar",
         "foo?bar",
         "foo[bar]",
+        "foo[",
         "foo:bar",
         "foo^bar",
         "foo~bar",
         "foo\\bar",
     ];
 
-    for bad_ref in malicious_refs {
+    for bad_ref in rejected_refs {
         assert!(
             validate_ref_name(bad_ref).is_err(),
-            "Expected bad ref '{}' to fail validation",
+            "Expected bad ref {:?} to fail validation",
             bad_ref
+        );
+    }
+
+    // Shell-dangerous but legal to git. These were on the old reject list;
+    // git is exec'd with an argv and no shell, so refusing them bought
+    // nothing and made real branches (`fix/a&b`) unusable. That they are inert
+    // is proved by execution in
+    // `shell_metacharacter_ref_names_are_inert_through_the_git_writer`.
+    let accepted_shell_dangerous_refs = vec![
+        "foo`calc`",
+        "foo$BAR",
+        "foo|bar",
+        "foo&bar",
+        "foo;bar",
+        "fix/a&b",
+        "a(b)",
+        "x=y",
+        "a<b>c",
+        "a!b",
+        "a'b",
+        "a\"b",
+        "a{b}",
+        "a]b",
+        "$(touch${IFS}PWNED)",
+    ];
+
+    for dangerous_ref in accepted_shell_dangerous_refs {
+        assert!(
+            validate_ref_name(dangerous_ref).is_ok(),
+            "Expected {:?} to pass validation: git allows it and there is no shell",
+            dangerous_ref
         );
     }
 
@@ -578,6 +631,147 @@ fn test_ref_name_injection_adversarial_suite() {
     assert!(validate_oid_or_revision("main").is_ok());
     assert!(validate_oid_or_revision("-u").is_err());
     assert!(validate_oid_or_revision("HEAD; rm -rf").is_err());
+}
+
+/// Every entry named `name` anywhere under `root`, `.git` included.
+fn entries_named(root: &std::path::Path, name: &str, found: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(root).expect("read_dir").flatten() {
+        let path = entry.path();
+        if entry.file_name() == name {
+            found.push(path.clone());
+        }
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            entries_named(&path, name, found);
+        }
+    }
+}
+
+/// The injection guarantee for ref names, proved by execution rather than by a
+/// reject list. `validate_ref_name` follows git's own rules, so a name made of
+/// shell syntax is legal; what keeps it harmless is that every writer hands it
+/// to git as one argv element and no shell reads it. Here each such name is
+/// made, checked out, renamed, tagged and deleted through the real
+/// `GitWriter`, with a command in the name that would drop a `PWNED` file if
+/// any layer ever ran it through a shell.
+#[test]
+fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
+    let repo = init_repo_with_base_file();
+    let path = repo
+        .path()
+        .to_str()
+        .expect("utf-8 fixture path")
+        .to_string();
+    let canary = "PWNED";
+    // A shell started by git would run in the repository, but a layer that
+    // forgot the working directory would run in ours; watch both.
+    let process_dir = std::env::current_dir().expect("cwd");
+    assert!(
+        !process_dir.join(canary).exists(),
+        "{canary} already exists in the process directory, so it cannot witness anything"
+    );
+
+    // `${IFS}` stands in for the space git forbids in a ref name.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut names = vec![
+        "x;touch${IFS}PWNED",
+        "`touch${IFS}PWNED`",
+        "$(touch${IFS}PWNED)",
+        "a&&touch${IFS}PWNED",
+        "a&touch${IFS}PWNED&",
+        "fix/a&b",
+        "feat(ui)=x",
+    ];
+    // Legal on every platform git runs on, but not as file names on Windows,
+    // where a ref is a file under .git/refs.
+    #[cfg(unix)]
+    names.extend(["a|touch${IFS}PWNED", "x>PWNED", "a\"b", "a<b>c"]);
+
+    // A control that can fail: the same text IS dangerous when a shell reads
+    // it, so an absent canary below means something.
+    #[cfg(unix)]
+    {
+        let control = tempfile::TempDir::new().expect("tempdir");
+        let status = StdCommand::new("sh")
+            .arg("-c")
+            .arg(format!("true {}", names[0]))
+            .current_dir(control.path())
+            .status_locked()
+            .expect("sh");
+        assert!(status.success());
+        assert!(
+            control.path().join(canary).exists(),
+            "the canary command is not dangerous under a shell, so this test proves nothing"
+        );
+    }
+
+    let git_text = |args: &[&str]| -> String {
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output_locked()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let branches = || -> Vec<String> {
+        git_text(&["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let tags = || -> Vec<String> {
+        git_text(&["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    for name in names {
+        GitWriter::create_branch(&path, name, None)
+            .unwrap_or_else(|e| panic!("create {name:?}: {e}"));
+        assert!(
+            branches().iter().any(|b| b == name),
+            "{name:?} not created as named"
+        );
+
+        GitWriter::checkout_branch(&path, name)
+            .unwrap_or_else(|e| panic!("checkout {name:?}: {e}"));
+        assert_eq!(git_text(&["symbolic-ref", "--short", "HEAD"]).trim(), name);
+
+        GitWriter::checkout_branch(&path, "main").expect("back to main");
+        let renamed = format!("{name}-renamed");
+        GitWriter::rename_branch(&path, name, &renamed)
+            .unwrap_or_else(|e| panic!("rename {name:?}: {e}"));
+        let listed = branches();
+        assert!(
+            listed.iter().any(|b| *b == renamed),
+            "{renamed:?} missing: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|b| b == name),
+            "{name:?} should be gone: {listed:?}"
+        );
+        GitWriter::delete_branch(&path, &renamed, false)
+            .unwrap_or_else(|e| panic!("delete {renamed:?}: {e}"));
+        assert!(!branches().iter().any(|b| *b == renamed));
+
+        GitWriter::create_tag(&path, name, None, None)
+            .unwrap_or_else(|e| panic!("tag {name:?}: {e}"));
+        assert!(
+            tags().iter().any(|t| t == name),
+            "tag {name:?} not created as named"
+        );
+        GitWriter::delete_tag(&path, name).unwrap_or_else(|e| panic!("untag {name:?}: {e}"));
+        assert!(!tags().iter().any(|t| t == name));
+    }
+
+    let mut found = Vec::new();
+    entries_named(repo.path(), canary, &mut found);
+    assert!(found.is_empty(), "a ref name was executed: {found:?}");
+    assert!(
+        !process_dir.join(canary).exists(),
+        "a ref name was executed in the process directory"
+    );
 }
 
 #[test]

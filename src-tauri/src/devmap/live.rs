@@ -1930,7 +1930,7 @@ exit 2
         );
         assert!(started.build.is_none());
         assert!(
-            asked.elapsed() < Duration::from_secs(2),
+            asked.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "the command waited {:?} on a build that has not finished",
             asked.elapsed()
         );

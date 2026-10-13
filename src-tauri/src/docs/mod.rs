@@ -912,7 +912,7 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&first, &after));
         assert!(
-            elapsed < Duration::from_millis(100),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(100)),
             "no-change refresh took {elapsed:?}"
         );
     }
