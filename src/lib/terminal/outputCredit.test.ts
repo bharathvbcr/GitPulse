@@ -217,13 +217,16 @@ describe("acknowledgement coalescing", () => {
 
   it("sends one acknowledgement per session per frame for many chunks", () => {
     const h = harness();
-    for (let i = 0; i < 10; i++) h.acks.add("a", MAX_TERMINAL_OUTPUT_CHUNK);
+    // Small chunks: ten of them stay under the flush threshold, which is what
+    // makes them wait for the frame (ten maximum events would not).
+    const small = 1024;
+    for (let i = 0; i < 10; i++) h.acks.add("a", small);
     h.acks.add("b", 3);
     expect(h.sent, "nothing goes out before the frame").toEqual([]);
     expect(h.scheduled(), "one frame is asked for, not one per chunk").toBe(1);
     h.frame();
     expect(h.sent).toEqual([
-      ["a", 10 * MAX_TERMINAL_OUTPUT_CHUNK],
+      ["a", 10 * small],
       ["b", 3],
     ]);
     expect(h.acks.owed()).toBe(0);
