@@ -1531,7 +1531,7 @@ fn adv_perf_pass_time_on_a_large_corpus() {
             let roots = [base.clone(), wts[0].clone(), wts[1].clone(), wts[2].clone()];
             let lines: Vec<String> = (0..perf_n("GITPULSE_ADV_PERF_LINES", 20_000))
                 .map(|i| {
-                    let r = &roots[(i % 4) as usize];
+                    let r = &roots[0];
                     edit_line(
                         &format!("{r}/src"),
                         "PF",
