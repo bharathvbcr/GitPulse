@@ -84,8 +84,17 @@ export interface MetricDefinition<T> {
   measure: (repoPath: string) => Promise<T>;
   /** Coalescing window for change events. */
   debounceMs: number;
-  /** Floor between two completed refreshes of the same repository. */
+  /**
+   * Floor between two completed refreshes of the same repository. With
+   * {@link costFloor} it is the *base*: the floor never drops below it.
+   */
   minIntervalMs: number;
+  /**
+   * Derive the floor from what this repository's measurement actually costs,
+   * so a scan that takes 10 s cannot be restarted 20 s later whatever the
+   * fixed number said. Omitted: the floor is `minIntervalMs`.
+   */
+  costFloor?: CostFloor;
   /**
    * Lets a metric declare its own result incomplete — a truncated storage scan
    * or a coverage report that hit a cap. Reported as `stale: "partial"`, since
@@ -120,6 +129,68 @@ export interface MetricDefinition<T> {
    */
   onFailure?: (repoPath: string, message: string) => void;
 }
+
+/**
+ * A measured-cost floor: `clamp(factor * EWMA(recent durations), base, maxMs)`.
+ *
+ * The floor runs from a refresh's *completion* to the next one's start, so the
+ * duty cycle is `1 / (1 + factor)`; 10 keeps a metric busy at most about 9% of
+ * the time however slow the repository makes it. When the measurement gets
+ * cheap the average decays and the floor returns to the base by itself.
+ */
+export interface CostFloor {
+  /** Multiple of the average duration to wait after a refresh completes. */
+  factor: number;
+  /** Ceiling, so one pathological run cannot silence a metric for hours. */
+  maxMs: number;
+  /** Weight of the newest duration in the average (0..1]. Default 0.3. */
+  alpha?: number;
+  /** Where the average survives a reload. Default: browser local storage. */
+  store?: CostStore;
+}
+
+/** Persistence for a metric's per-repository average duration. */
+export interface CostStore {
+  load(metric: string, repoPath: string): number | null;
+  save(metric: string, repoPath: string, ewmaMs: number): void;
+}
+
+const COST_KEY_PREFIX = "gitpulse.metricCostMs.v1:";
+/** Repositories remembered per metric; the oldest are forgotten first. */
+const COST_MAX_REPOS = 64;
+
+function readCostMap(metric: string): Record<string, number> {
+  try {
+    const raw = globalThis.localStorage?.getItem(COST_KEY_PREFIX + metric);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, number>;
+    }
+  } catch {
+    // Storage can be missing, blocked or corrupt; the floor then starts at base.
+  }
+  return {};
+}
+
+/** The default {@link CostStore}: one JSON object per metric in local storage. */
+export const localCostStore: CostStore = {
+  load(metric, repoPath) {
+    const value = readCostMap(metric)[repoPath];
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  },
+  save(metric, repoPath, ewmaMs) {
+    try {
+      const map = readCostMap(metric);
+      delete map[repoPath];
+      map[repoPath] = ewmaMs;
+      const keys = Object.keys(map);
+      for (const stale of keys.slice(0, Math.max(0, keys.length - COST_MAX_REPOS))) delete map[stale];
+      globalThis.localStorage?.setItem(COST_KEY_PREFIX + metric, JSON.stringify(map));
+    } catch {
+      // Not persisted this time; the in-memory average still applies.
+    }
+  },
+};
 
 /** Injection seam so tests drive time and timers rather than waiting. */
 export interface MetricClock {
@@ -180,6 +251,8 @@ interface Cell<T> {
   timer: unknown | null;
   /** Completion time of the last measurement attempt, success or failure. */
   lastAttemptAt: number | null;
+  /** EWMA of recent attempt durations; null until one is known. */
+  costEwmaMs: number | null;
   /** A change arrived while a measurement was running or throttled. */
   pending: boolean;
   /** Explicit refreshes still run when no panel is subscribed. */
@@ -217,10 +290,46 @@ export function createMetric<T>(
   const maxRepos = Math.max(1, definition.maxRepos ?? 8);
   const debounceMs = Math.max(0, definition.debounceMs);
   const minIntervalMs = Math.max(0, definition.minIntervalMs);
+  const costFloor = definition.costFloor;
+  const costStore = costFloor ? (costFloor.store ?? localCostStore) : null;
+  const costAlpha = Math.min(1, Math.max(0.01, costFloor?.alpha ?? 0.3));
   // Insertion-ordered, so the head is the least recently touched repository.
   const cells = new Map<string, Cell<T>>();
   let disposed = false;
   let scope: BackgroundScope | null = null;
+
+  /**
+   * The floor between two completed refreshes of this cell: the base, raised
+   * to `factor` times the repository's measured cost, never above `maxMs`.
+   */
+  function floorMs(cell: Cell<T>): number {
+    if (!costFloor || cell.costEwmaMs === null) return minIntervalMs;
+    const ceiling = Math.max(minIntervalMs, costFloor.maxMs);
+    return Math.min(ceiling, Math.max(minIntervalMs, costFloor.factor * cell.costEwmaMs));
+  }
+
+  function recordCost(repoPath: string, cell: Cell<T>, durationMs: number): void {
+    if (!costFloor || !costStore || !Number.isFinite(durationMs) || durationMs < 0) return;
+    cell.costEwmaMs =
+      cell.costEwmaMs === null
+        ? durationMs
+        : costAlpha * durationMs + (1 - costAlpha) * cell.costEwmaMs;
+    try {
+      costStore.save(definition.name, repoPath, cell.costEwmaMs);
+    } catch {
+      // A broken store must not break the measurement.
+    }
+  }
+
+  function loadCost(repoPath: string): number | null {
+    if (!costStore) return null;
+    try {
+      const value = costStore.load(definition.name, repoPath);
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+    } catch {
+      return null;
+    }
+  }
 
   function canMeasureAutomatically(repoPath: string, cell: Cell<T>): boolean {
     return cell.listeners.size > 0 && (scope === null ||
@@ -242,6 +351,7 @@ export function createMetric<T>(
       queuedRefresh: null,
       timer: null,
       lastAttemptAt: null,
+      costEwmaMs: loadCost(repoPath),
       pending: false,
       pendingManual: false,
     };
@@ -313,6 +423,7 @@ export function createMetric<T>(
     const run = new Promise<void>((resolve) => { complete = resolve; });
     cell.inflight = run;
     publish(repoPath, cell, { ...cell.snapshot, state: "loading" });
+    const startedAt = clock.now();
 
     void (async () => {
       try {
@@ -344,6 +455,9 @@ export function createMetric<T>(
           error: message,
         });
       } finally {
+        // Success or failure, the attempt cost this much, and the next one's
+        // floor is derived from it before anything is rescheduled.
+        recordCost(repoPath, cell, clock.now() - startedAt);
         if (!disposed && generation === cell.generation) {
           cell.inflight = null;
           cell.lastAttemptAt = clock.now();
@@ -375,7 +489,7 @@ export function createMetric<T>(
     // second timer here would only race it.
     if (cell.inflight) return;
     const sinceLast = cell.lastAttemptAt === null ? Infinity : clock.now() - cell.lastAttemptAt;
-    const throttleWait = Math.max(0, minIntervalMs - sinceLast);
+    const throttleWait = Math.max(0, floorMs(cell) - sinceLast);
     const wait = Math.max(debounceMs, throttleWait);
     cancelTimer(cell);
     cell.timer = clock.setTimeout(() => {
@@ -443,7 +557,7 @@ export function createMetric<T>(
       if (cell.inflight && !options?.force) return cell.inflight;
       if (!options?.force && cell.lastAttemptAt !== null) {
         const sinceLast = clock.now() - cell.lastAttemptAt;
-        if (sinceLast < minIntervalMs) {
+        if (sinceLast < floorMs(cell)) {
           schedule(repoPath, cell, true);
           return;
         }
