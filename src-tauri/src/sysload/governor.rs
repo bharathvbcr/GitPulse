@@ -399,8 +399,13 @@ pub struct Governor {
     held: Tier,
     binding: Option<Binding>,
     up_streak: u32,
-    up_tier: Tier,
+    /// The lowest tier, and its binding, of the current run above the held
+    /// one: what the run enters.
+    up: (Tier, Option<Binding>),
     down_streak: u32,
+    /// The highest tier, and its binding, of the current run below the held
+    /// one: what the run leaves to.
+    down: (Tier, Option<Binding>),
     last: Option<(Instant, Input)>,
     refusing_since: Option<Instant>,
     noticed: bool,
@@ -413,8 +418,9 @@ impl Default for Governor {
             held: Tier::Clear,
             binding: None,
             up_streak: 0,
-            up_tier: Tier::Severe,
+            up: (Tier::Severe, None),
             down_streak: 0,
+            down: (Tier::Clear, None),
             last: None,
             refusing_since: None,
             noticed: false,
@@ -449,6 +455,18 @@ impl Governor {
     /// the previous observation is treated as equal to it, so a clock that
     /// steps back can neither shorten nor lengthen a run.
     pub fn observe(&mut self, now: Instant, input: Input) -> Observation {
+        self.observe_counting(now, input, true)
+    }
+
+    /// A tick that read the same snapshot as the last one: a reader whose
+    /// writer has not published since. The reading ages and the refusal clock
+    /// runs, but nothing is counted, so one sample read three times can never
+    /// enter a tier that needs three samples.
+    pub fn observe_repeat(&mut self, now: Instant, input: Input) -> Observation {
+        self.observe_counting(now, input, false)
+    }
+
+    fn observe_counting(&mut self, now: Instant, input: Input, counts: bool) -> Observation {
         let now = self.last.as_ref().map_or(now, |(at, _)| now.max(*at));
         match sample(&input) {
             // Nothing to govern on: forget the run rather than carry a trip
@@ -459,7 +477,8 @@ impl Governor {
                 self.up_streak = 0;
                 self.down_streak = 0;
             }
-            Some((tier, binding)) => self.count(tier, binding),
+            Some((tier, binding)) if counts => self.count(tier, binding),
+            Some(_) => {}
         }
         self.last = Some((now, input));
         let verdict = self.verdict(now);
@@ -485,24 +504,26 @@ impl Governor {
         match tier.cmp(&self.held) {
             Ordering::Greater => {
                 self.down_streak = 0;
-                self.up_tier = if self.up_streak == 0 {
-                    tier
-                } else {
-                    self.up_tier.min(tier)
-                };
+                if self.up_streak == 0 || tier < self.up.0 {
+                    self.up = (tier, binding);
+                }
                 self.up_streak += 1;
                 if self.up_streak >= ENTER_SAMPLES {
-                    self.held = self.up_tier;
-                    self.binding = binding;
+                    (self.held, self.binding) = self.up;
                     self.up_streak = 0;
                 }
             }
             Ordering::Less => {
                 self.up_streak = 0;
+                // The run leaves to the highest tier it held throughout, as
+                // it enters the lowest: four warn samples and one clear leave
+                // severe for elevated, not for clear.
+                if self.down_streak == 0 || tier > self.down.0 {
+                    self.down = (tier, binding);
+                }
                 self.down_streak += 1;
                 if self.down_streak >= EXIT_SAMPLES {
-                    self.held = tier;
-                    self.binding = binding;
+                    (self.held, self.binding) = self.down;
                     self.down_streak = 0;
                 }
             }
@@ -564,13 +585,19 @@ impl Governor {
     /// Everything a surface shows: the verdict, how long refusal has run,
     /// whether the person has been told, and a live override.
     pub fn report(&self, now: Instant) -> GovernorReport {
+        let verdict = self.verdict(now);
+        // The refusal clock is advanced by ticks; a sampler that stopped
+        // ticking ages the verdict out of refusing, and the run ends with it
+        // rather than reading "refusing for an hour" beside an admit.
+        let refusing = verdict.reason == Reason::Pressure;
         let refusing_for = self
             .refusing_since
+            .filter(|_| refusing)
             .map(|since| now.saturating_duration_since(since));
         GovernorReport {
-            verdict: self.verdict(now),
+            verdict,
             refusing_for_s: refusing_for.map(|d| d.as_secs()),
-            notice: self.noticed,
+            notice: self.noticed && refusing,
             largest_foreign: self
                 .last
                 .as_ref()

@@ -332,6 +332,31 @@ fn fill(
     snap.orphans = u32::try_from(view.orphans.len()).unwrap_or(u32::MAX);
 }
 
+/// What tells one published sample from another: the writer's boot, its
+/// sequence number and when it wrote.
+type SampleKey = (u64, u64, u64);
+
+/// Whether `snapshot` is a sample the governor has not counted yet, noting it
+/// in `last` when it is. A reader ticks on its own clock and rereads its
+/// writer's last record until the next one lands; counting each reread as a
+/// sample would let one reading from a stalled writer trip the hysteresis.
+/// No snapshot is never a new sample: there is nothing to count.
+fn new_sample(last: &mut Option<SampleKey>, snapshot: Option<&Snapshot>) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    let key = (
+        snapshot.written.boot_id,
+        snapshot.seq,
+        snapshot.written.mono_ns,
+    );
+    if *last == Some(key) {
+        return false;
+    }
+    *last = Some(key);
+    true
+}
+
 /// The supervised thread's name and its Diagnostics subsystem.
 const SUBSYSTEM: &str = "host-load-sampler";
 
@@ -357,6 +382,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let cpu_origin = super::probe::thread_cpu_ns();
     let mut slot: u64 = 0;
     let mut tick = TickStats::default();
+    let mut last_sample = None;
 
     while !shared.stop.load(Ordering::Acquire) {
         let began = Instant::now();
@@ -401,10 +427,13 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 .governor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let observation = governor.observe(
-                Instant::now(),
-                Input::from_report(&status.sensor, status.snapshot.as_ref(), govern_launches),
-            );
+            let input =
+                Input::from_report(&status.sensor, status.snapshot.as_ref(), govern_launches);
+            let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
+                governor.observe(Instant::now(), input)
+            } else {
+                governor.observe_repeat(Instant::now(), input)
+            };
             if observation.notice_raised {
                 log::warn!(
                     target: "host_load",
@@ -464,6 +493,31 @@ fn run(shared: &Shared, options: &SamplerOptions) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader rereads its writer's last record until the next one lands:
+    /// the reread is not a new sample, a new sequence or a new boot is.
+    #[test]
+    fn a_reread_record_is_not_a_new_sample() {
+        let clock = |mono_ns, boot_id| Clock {
+            wall_ms: 1_700_000_000_000,
+            mono_ns,
+            boot_id,
+        };
+        let record = |seq, mono_ns, boot_id| {
+            let mut snap = Snapshot::empty(clock(mono_ns, boot_id), own_identity(), true);
+            snap.seq = seq;
+            snap
+        };
+        let mut last = None;
+        assert!(!new_sample(&mut last, None), "no record, nothing to count");
+        assert!(new_sample(&mut last, Some(&record(7, 100, 1))));
+        assert!(!new_sample(&mut last, Some(&record(7, 100, 1))), "a reread");
+        assert!(!new_sample(&mut last, Some(&record(7, 100, 1))), "a reread");
+        assert!(new_sample(&mut last, Some(&record(8, 200, 1))));
+        // A new writer that restarted its sequence, or a new boot.
+        assert!(new_sample(&mut last, Some(&record(8, 300, 1))));
+        assert!(new_sample(&mut last, Some(&record(8, 300, 2))));
+    }
 
     fn report(state: SensorState, level: Option<Level>, enabled: bool) -> SensorReport {
         SensorReport {
