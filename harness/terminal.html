@@ -7,8 +7,7 @@
     <button id="checks" disabled style="position:fixed;top:4px;right:4px;z-index:100">Run terminal checks</button>
     <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;z-index:100;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
     <script type="module">
-      import { mockIPCWithEvents } from "./tauriMocks";
-      import { emit } from "@tauri-apps/api/event";
+      import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
       import { createChecks } from "./checks.ts";
       import "../src/app.css";
 
@@ -43,7 +42,8 @@
         const bytes = new TextEncoder().encode(text);
         for (let i = 0; i < bytes.length; i += 4096) {
           const slice = bytes.subarray(i, i + 4096);
-          await emit("terminal-output", { id, data_b64: btoa(String.fromCharCode(...slice)), bytes: slice.length });
+          pushOutput(id, slice);
+          await Promise.resolve();
         }
       };
       /** One line carrying every span class the linkifier must judge: an
@@ -57,6 +57,7 @@
           case "cmd_terminal_run": consoleRuns.push(args); return consoleReplies.shift() ?? { exit_code: 0, timed_out: false, stdout_tail: "", stderr_tail: "", truncated: false, truncation_reason: null, policy: null };
           case "cmd_terminal_spawn": {
             const id = `fixture-${++report.spawned}`;
+            adoptOutput(id, args);
             sessions.set(id, args.repoPath);
             startDirs.push(args.startDir ?? null);
             if (earlyLoss) {
@@ -64,8 +65,8 @@
               // Listeners are already attached. These bytes have to land before
               // the id returns, which is the only moment the bus can lose them.
               return (async () => {
-                for (let i = 0; i < 129; i++) await emit("terminal-output", { id, data_b64: "QQ==", bytes: 1 });
-                await emit("terminal-exit", { id, exit_code: 0, signal: "", error: null, reaped: true });
+                for (let i = 0; i < 129; i++) pushOutput(id, "A");
+                await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true });
                 showReport();
                 return { id, cwd: args.repoPath, shell: "/bin/zsh" };
               })();
@@ -123,6 +124,7 @@
               ...[...sessions].filter(([id]) => id !== "fixture-detached").map(([id, root]) => ({ id, shell: "/bin/zsh", cwd: root, repo: root, launcher: null, run_id: null, detached: detachedIds.has(id) })),
             ];
           case "cmd_terminal_attach": {
+            adoptOutput(args.sessionId, args);
             report.attaches = [...(report.attaches ?? []), { sessionId: args.sessionId, rows: args.rows, cols: args.cols }];
             sessions.set(args.sessionId, "/fixture/GitPulse");
             setTimeout(() => void output(args.sessionId, "\r\n/fixture/GitPulse $ "), 50);
@@ -857,12 +859,15 @@
           if (!lastWriteId) throw new Error("no session received the typed text");
           const ackMark = acks.length;
           const killedBeforeCorrupt = report.killed;
-          await emit("terminal-output", { id: lastWriteId, data_b64: "!!!!", bytes: 4 });
+          // One message longer than a read can make. Rust reserved its length,
+          // so it is repaid in full and never painted; the process is not killed.
+          const OVERSIZE = 64 * 1024 + 1;
+          pushOutput(lastWriteId, new Uint8Array(OVERSIZE).fill(65));
           const corruptDeadline = performance.now() + 2000;
-          while (performance.now() < corruptDeadline && !acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4)) await wait(20);
-          check("a corrupt chunk acknowledges its reserved length", () =>
-            acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4) && report.killed === killedBeforeCorrupt);
-          await emit("terminal-output", { id: lastWriteId, data_b64: "A".repeat(21849) });
+          const repaid = () => acks.slice(ackMark).filter((row) => row.sessionId === lastWriteId).reduce((sum, row) => sum + row.bytes, 0);
+          while (performance.now() < corruptDeadline && repaid() < OVERSIZE) await wait(20);
+          check("an oversize message is repaid in full and the process kept", () =>
+            repaid() === OVERSIZE && report.killed === killedBeforeCorrupt);
           const liveDeadline = performance.now() + 2000;
           let liveStatus = "";
           while (performance.now() < liveDeadline) {

@@ -258,6 +258,7 @@ fn start(
         Some("/bin/sh".into()),
         args,
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     assert!(
@@ -1102,11 +1103,18 @@ fn attach_and_detach_while_writes_are_queued_keep_every_byte_in_order() {
                 }
             });
         }
-        let (state, id) = (&state, &id);
+        let (state, id, handle) = (&state, &id, &handle);
         scope.spawn(move || {
             for round in 0..30u16 {
                 let _ = gitpulse_lib::terminal::detach_session(state, id).unwrap();
-                gitpulse_lib::terminal::attach_session(state, id, 20 + round, 80).unwrap();
+                gitpulse_lib::terminal::attach_session(
+                    state,
+                    id,
+                    20 + round,
+                    80,
+                    gitpulse_lib::terminal::OutputSink::events(handle),
+                )
+                .unwrap();
                 std::thread::sleep(Duration::from_millis(20));
             }
         });

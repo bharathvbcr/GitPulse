@@ -9,10 +9,11 @@ const app = readFileSync(join(here, "..", "..", "App.svelte"), "utf8");
 
 describe("TerminalPanel lifecycle hygiene", () => {
   it("owns no event subscription of its own", () => {
-    // `terminal-output`/`terminal-exit` are process-wide events carrying a
-    // session id. One listener per tab would decode every chunk once per open
-    // tab; ptyBus subscribes once and routes by id, and its own tests cover
-    // the late-resolving-listen race this panel used a tracker for.
+    // `terminal-exit` and `terminal-loss` are process-wide events carrying a
+    // session id (output travels on each session's own channel). One listener
+    // per tab would inspect every event once per open tab; ptyBus subscribes
+    // once and routes by id, and its own tests cover the late-resolving-listen
+    // race this panel used a tracker for.
     expect(source).not.toContain('from "@tauri-apps/api/event"');
     expect(source).not.toContain("createListenerTracker");
   });

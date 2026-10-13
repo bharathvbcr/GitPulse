@@ -220,7 +220,7 @@ async function simulate(seed: number): Promise<{ violations: string[]; stats: St
     const registry = createSessionRegistry();
     const owner = createSessionLifecycle({
       key: `fuzz-${seed}`, repoPath: "/repo", label: "Shell", registry, transport, hooks,
-      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe: () => () => {} },
     });
     await owner.start();
 

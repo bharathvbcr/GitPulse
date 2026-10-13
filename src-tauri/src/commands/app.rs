@@ -373,9 +373,20 @@ pub async fn cmd_review_gate_save(repo_path: String, enabled: bool) -> Result<()
 /// which tabs are on screen; whether the *window* has focus is read natively
 /// at decision time, so a renderer that stops running — the case in which a
 /// notification matters most — cannot leave a session looking attended.
+///
+/// `background_ids` names the sessions whose tab is open but not on screen.
+/// The same fact answers a second question: a session nobody is looking at has
+/// its output delivered in larger, rarer batches. Absent means no session is
+/// known to be in the background. Only a session named here is batched harder;
+/// one the view never mentioned is shown at full rate.
 #[tauri::command(async)]
-pub async fn cmd_session_alerts_visible(session_ids: Vec<String>) -> Result<(), String> {
+pub async fn cmd_session_alerts_visible(
+    terminals: State<'_, crate::terminal::TerminalSessions>,
+    session_ids: Vec<String>,
+    background_ids: Option<Vec<String>>,
+) -> Result<(), String> {
     crate::alerts::set_visible_sessions(session_ids);
+    crate::terminal::set_background_sessions(&terminals, &background_ids.unwrap_or_default());
     Ok(())
 }
 

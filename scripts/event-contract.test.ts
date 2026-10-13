@@ -45,8 +45,28 @@ function emittedEvents(): string[] {
   return [...names].sort();
 }
 
+/**
+ * Events Rust emits for a listener in the same process, never the frontend.
+ * Each names the one file allowed to emit it, so an allowance cannot quietly
+ * become a production emit nobody hears.
+ */
+const PROCESS_LOCAL: Record<string, string> = {
+  // Session output travels on a per-session Channel. `OutputSink::events` re-emits
+  // it as this event so the tests and benches that count messages can listen.
+  "terminal-output": "src-tauri/src/terminal/sink.rs",
+};
+
 describe("cross-language event contract", () => {
   const emitted = emittedEvents();
+
+  for (const [event, owner] of Object.entries(PROCESS_LOCAL)) {
+    it(`"${event}" is emitted only by ${owner}`, () => {
+      const emitters = filesUnder(path.join(ROOT, "src-tauri", "src"), [".rs"])
+        .filter((f) => new RegExp(`\\.emit(?:_to)?\\(\\s*"${event}"`).test(readFileSync(f, "utf8")))
+        .map((f) => path.relative(ROOT, f).split(path.sep).join("/"));
+      expect(emitters).toEqual([owner]);
+    });
+  }
 
   it("found the events to check", () => {
     // A regex that silently matched nothing would make this suite vacuous.
@@ -54,7 +74,7 @@ describe("cross-language event contract", () => {
     expect(emitted).toContain("repo-changed");
   });
 
-  for (const event of emitted) {
+  for (const event of emitted.filter((name) => !(name in PROCESS_LOCAL))) {
     it(`"${event}" is listened for somewhere in the frontend`, () => {
       expect(
         frontendSource.includes(`"${event}"`),

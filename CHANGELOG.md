@@ -79,6 +79,14 @@ before that tag is pushed.
   - Measured with `idle_wakeups` (interrupt wakeups per second, process-wide):
     an idle mailbox went from 4.7 to the 2.7 floor, 8 idle watches from 39.9
     to 2.7, and 24 idle watches from 117.3 to 2.7.
+- **An idle terminal no longer wakes its reader ten times a second.** Each
+  session's reader polled its PTY every 100 ms and asked `waitpid` whether the
+  shell had exited, about 860,000 wakeups a day per idle session, which also
+  kept the Mac out of App Nap. It now sleeps in one kernel wait (kqueue on
+  macOS, epoll and a pidfd on Linux) that ends on output, a hangup or the
+  shell's exit. Whether the shell exited is still decided by asking it, and a
+  missed exit notification is caught by a five-minute safety net (or, where
+  exits cannot be watched, by the old 100 ms lap).
 - **Switching repository tabs no longer rebuilds the sidebar, the view shell
   or the status bar.** All three were keyed on the active repository's path, so
   every switch destroyed and recreated them. They now stay mounted and re-point
@@ -177,6 +185,33 @@ before that tag is pushed.
   and a failed one is reported once per run of failures. Deadlines count the
   time the page actually waited, so a blocked or hidden window no longer
   charges its own stall to the backend.
+- Terminal output travels on a channel of its own instead of a global event. A
+  view hands the backend a per-session `Channel` when it starts or takes over a
+  session, and the reader writes raw bytes to it: no base64, no JSON wrapper and
+  no script evaluated in every other tab's webview. The reader gathers up to
+  64 KiB per message, so a flood that was 1,024 messages per MiB is about 16,
+  and a session whose tab is not on screen is sent a few times a second rather
+  than at frame rate (`HIDDEN_MAX_HOLD`, 250 ms). The page's credit window is
+  512 KiB so the larger messages keep the reader running ahead of the paint. A
+  message longer than a read can make is now repaid in full and reported
+  instead of being dropped with its credit still owed. An exit waits for an end
+  marker sent down the channel after the last byte, so it can no longer
+  overtake output still being fetched.
+- Typing no longer wakes the still-running watchdog once per key. Every
+  command registers with a watchdog thread that reports calls stuck past five
+  seconds, and registering notified it each time, so a burst of 50 keystrokes
+  woke it 50 times. It is now notified only when it is asleep with no deadline;
+  awake, it finds the call at its next one-second sweep, and a call that stays
+  in flight is still reported on the same schedule.
+- Closing a terminal waits for its jobs by sleeping on their exit, not by
+  reading the whole process table every 20 ms. A cleanup that takes 0.8 s read
+  the table 32 times and now reads it twice; jobs that obey the hangup end the
+  wait in about a millisecond instead of a lap. The shell's lock is no longer
+  held for the grace (up to 2.5 s), so the unmount check's context read and a
+  second close are not stuck behind a job that ignores the hangup: a read made
+  during a close reports nothing known and answers at once, where it used to
+  wait out the grace. A job that ignores the hangup is still killed when the
+  grace ends, and the groups signalled are the same ones as before.
 - Closing a terminal no longer skips its question when GitPulse could not tell
   what was running in it. A context read that timed out, failed or came back
   unreadable was treated as "nothing running", so a shell with a live job closed

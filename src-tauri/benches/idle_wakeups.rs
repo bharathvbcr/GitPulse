@@ -138,6 +138,7 @@ mod imp {
                         Some("/bin/cat".into()),
                         Some(Vec::new()),
                         None,
+                        gitpulse_lib::terminal::OutputSink::events(app.handle()),
                     )
                     .unwrap_or_else(|error| panic!("spawn cat: {error}"))
                     .id

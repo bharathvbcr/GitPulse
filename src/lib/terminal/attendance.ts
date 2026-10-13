@@ -25,6 +25,8 @@ export interface Attendance {
   forget(sessionId: string): void;
   /** The list as it stands, in insertion order. */
   visible(): string[];
+  /** Sessions reported off screen, in insertion order. */
+  background(): string[];
   /** Sends the current list now, bypassing the coalescing turn. */
   flush(): Promise<void>;
 }
@@ -35,8 +37,11 @@ export interface Attendance {
  */
 export const MAX_VISIBLE_SESSIONS = 8;
 
+/** The upper bound on the background list; the host applies the same one. */
+export const MAX_BACKGROUND_SESSIONS = 256;
+
 export function createAttendance(
-  push: (sessionIds: string[]) => Promise<void>,
+  push: (visible: string[], background: string[]) => Promise<void>,
   schedule: (run: () => void) => void = queueMicrotask,
 ): Attendance {
   const onscreen = new Map<string, boolean>();
@@ -54,16 +59,28 @@ export function createAttendance(
       .map(([id]) => id)
       .slice(0, MAX_VISIBLE_SESSIONS);
 
+  /**
+   * Sessions reported not on screen. The host batches their output harder: a
+   * tab nobody is looking at is sent a few times a second, not at frame rate.
+   * Only a session that said so is named; one never reported is shown.
+   */
+  const background = () =>
+    [...onscreen.entries()]
+      .filter(([, on]) => !on)
+      .map(([id]) => id)
+      .slice(0, MAX_BACKGROUND_SESSIONS);
+
   const send = async () => {
     const list = visible();
-    const key = JSON.stringify(list);
+    const hidden = background();
+    const key = JSON.stringify([list, hidden]);
     if (key === sent) return;
     // Recorded before awaiting, so two flushes in the same turn cannot both
     // decide they are the first. A failed push clears it so the next attempt
     // retries rather than assuming the backend agrees with us.
     sent = key;
     try {
-      await push(list);
+      await push(list, hidden);
     } catch {
       sent = null;
     }
@@ -90,6 +107,7 @@ export function createAttendance(
       later();
     },
     visible,
+    background,
     flush: send,
   };
 }

@@ -11,8 +11,10 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// Spawns an interactive shell in the open repository inside a real PTY.
-/// Output streams back as `terminal-output` events; exit lands as
-/// `terminal-exit`, both keyed by the returned session id.
+/// Output streams back on `on_output`, a channel of raw bytes that belongs to
+/// this session alone and is open before the shell starts, so its first prompt
+/// cannot be missed; exit lands as a `terminal-exit` event keyed by the
+/// returned session id, after the channel's last message.
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_terminal_spawn(
@@ -27,6 +29,7 @@ pub async fn cmd_terminal_spawn(
     permission_mode: Option<String>,
     acknowledged: Option<bool>,
     start_dir: Option<String>,
+    on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
     let state = state.inner().clone();
     off_thread(move || {
@@ -76,6 +79,7 @@ pub async fn cmd_terminal_spawn(
             program,
             args,
             env,
+            crate::terminal::OutputSink::channel(on_output),
         )
     })
     .await
@@ -115,17 +119,24 @@ pub async fn cmd_terminal_sessions(
     .await
 }
 
-/// Shows a session a reloaded page left running in a new tab. Refused for a
-/// session a tab still holds.
+/// Shows a session a reloaded page left running in a new tab, from now on on
+/// `on_output`. Refused for a session a tab still holds.
 #[tauri::command(async)]
 pub async fn cmd_terminal_attach(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
     rows: u16,
     cols: u16,
+    on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
     crate::terminal::control_async(&state, "terminal_attach", move |state| {
-        crate::terminal::attach_session(state, &session_id, rows, cols)
+        crate::terminal::attach_session(
+            state,
+            &session_id,
+            rows,
+            cols,
+            crate::terminal::OutputSink::channel(on_output),
+        )
     })
     .await
 }

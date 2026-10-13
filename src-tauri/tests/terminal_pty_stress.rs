@@ -83,6 +83,7 @@ fn immediate_output_and_exit_status_survive_spawn() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "printf '世界 hello'; exit 37".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let exit: serde_json::Value =
@@ -126,6 +127,7 @@ fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
             // Core dumps off, so a crashing shell leaves nothing behind.
             Some(vec!["-c".into(), format!("ulimit -c 0; kill -{signal} $$")]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         let exit: serde_json::Value =
@@ -160,7 +162,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
     });
     let dir = repo();
     let spawned = spawn_session(app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
-        Some("/bin/sh".into()), Some(vec!["-c".into(), "i=0; while [ $i -lt 32768 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i+1)); done".into()]), None).unwrap();
+        Some("/bin/sh".into()), Some(vec!["-c".into(), "i=0; while [ $i -lt 32768 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i+1)); done".into()]), None, gitpulse_lib::terminal::OutputSink::events(app.handle())).unwrap();
     // Receive without acknowledging until the stream goes quiet. Quiet after
     // the producer demonstrably ran is the observable "blocked on flow
     // control"; a producer that ignored backpressure would instead deliver
@@ -233,8 +235,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
         app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "stty -echo; i=0; while [ $i -lt 512 ]; do printf .; read -r line || exit 91; i=$((i+1)); done".into()]),
-        None,
-    ).unwrap();
+        None, gitpulse_lib::terminal::OutputSink::events(app.handle())).unwrap();
     let started = Instant::now();
     for round in 0..512 {
         let (_id, bytes) = take_output(&receive.recv_timeout(Duration::from_secs(3)).unwrap());
@@ -277,6 +278,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
         Some("/bin/sh".into()),
         args.clone(),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -300,6 +302,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
         Some("/bin/sh".into()),
         args,
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     resize_session(&state, &b.id, 40, 120).unwrap();
@@ -337,6 +340,7 @@ fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
             "stty -echo -icanon; printf ready; sleep 30".into(),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     ready_receive.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -382,6 +386,7 @@ fn close_terminates_a_hup_ignoring_foreground_process_and_is_idempotent() {
             "trap '' HUP TERM; printf ready; while :; do sleep 1; done".into(),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -408,6 +413,7 @@ fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "sleep 30".into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(app.handle()),
         )
     };
     let mut sessions = Vec::new();
@@ -445,6 +451,7 @@ fn closing_after_stdio_eof_still_reaps_the_live_child() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exec 0<&- 1>&- 2>&-; sleep 30".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(100));
@@ -481,6 +488,7 @@ fn binary_mouse_input_reaches_the_pty_without_utf8_reencoding() {
             "stty raw -echo; printf ready; dd bs=1 count=5 2>/dev/null | od -An -tx1".into(),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     let mut output = Vec::new();
@@ -522,7 +530,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     let dir = repo();
     // The window is full when the next event no longer fits, which leaves
     // up to one event unused: an event is up to `OUTPUT_CHUNK_BYTES`.
-    const NEAR_FULL: usize = 256 * 1024 - gitpulse_lib::terminal::OUTPUT_CHUNK_BYTES;
+    const NEAR_FULL: usize = 512 * 1024 - gitpulse_lib::terminal::OUTPUT_CHUNK_BYTES;
     let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let received = total.clone();
     let (send, receive) = mpsc::channel();
@@ -546,6 +554,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
             "while :; do printf 0123456789abcdef; done".into(),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     // Setup, not the assertion: this only waits for the window to reach its
@@ -561,7 +570,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
         .expect("the output window never reached its limit");
     std::thread::sleep(Duration::from_millis(50));
     let pending = total.load(std::sync::atomic::Ordering::SeqCst);
-    assert!((NEAR_FULL..=256 * 1024).contains(&pending));
+    assert!((NEAR_FULL..=512 * 1024).contains(&pending));
     kill_session(&state, &session.id).unwrap();
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAttendance, MAX_VISIBLE_SESSIONS } from "./attendance";
+import { createAttendance, MAX_BACKGROUND_SESSIONS, MAX_VISIBLE_SESSIONS } from "./attendance";
 
 /** Runs scheduled work when the test says so, rather than on a microtask. */
 function manual() {
@@ -18,11 +18,13 @@ function manual() {
 
 function harness() {
   const sent: string[][] = [];
+  const sentBackground: string[][] = [];
   const clock = manual();
-  const attendance = createAttendance(async (ids) => {
+  const attendance = createAttendance(async (ids, background) => {
     sent.push(ids);
+    sentBackground.push(background);
   }, clock.schedule);
-  return { attendance, sent, clock };
+  return { attendance, sent, sentBackground, clock };
 }
 
 describe("terminal attendance", () => {
@@ -123,5 +125,66 @@ describe("terminal attendance", () => {
     clock.run();
     await Promise.resolve();
     expect(sent[0]).toHaveLength(MAX_VISIBLE_SESSIONS);
+  });
+});
+
+describe("terminal attendance, off-screen sessions", () => {
+  // The host batches a hidden session's output harder than a visible one's,
+  // so it has to be told which sessions are hidden. A session never reported
+  // is not hidden: it is simply unknown, and stays at full rate.
+  it("names a session reported off screen, and only that one", async () => {
+    const { attendance, sent, sentBackground, clock } = harness();
+    attendance.report("shown", true);
+    attendance.report("hidden", false);
+    clock.run();
+    await Promise.resolve();
+    expect(sent).toEqual([["shown"]]);
+    expect(sentBackground).toEqual([["hidden"]]);
+    expect(attendance.background()).toEqual(["hidden"]);
+  });
+
+  it("moves a session out of the background list when it comes back on screen", async () => {
+    const { attendance, sent, sentBackground, clock } = harness();
+    attendance.report("tab", false);
+    clock.run();
+    await Promise.resolve();
+    attendance.report("tab", true);
+    clock.run();
+    await Promise.resolve();
+    expect(sent).toEqual([[], ["tab"]]);
+    expect(sentBackground).toEqual([["tab"], []]);
+  });
+
+  it("sends again when only the background list changed", async () => {
+    // The visible list is identical in both pushes; skipping the second would
+    // leave the host treating a tab that just went off screen as watched.
+    const { attendance, sentBackground, clock } = harness();
+    attendance.report("a", true);
+    attendance.report("b", true);
+    clock.run();
+    await Promise.resolve();
+    attendance.report("b", false);
+    clock.run();
+    await Promise.resolve();
+    expect(sentBackground).toEqual([[], ["b"]]);
+  });
+
+  it("forgets a closed session from the background list", async () => {
+    const { attendance, sentBackground, clock } = harness();
+    attendance.report("gone", false);
+    clock.run();
+    await Promise.resolve();
+    attendance.forget("gone");
+    clock.run();
+    await Promise.resolve();
+    expect(sentBackground.at(-1)).toEqual([]);
+  });
+
+  it("never sends more background sessions than the host accepts", async () => {
+    const { attendance, sentBackground, clock } = harness();
+    for (let index = 0; index < MAX_BACKGROUND_SESSIONS + 20; index += 1) attendance.report(`term-${index}`, false);
+    clock.run();
+    await Promise.resolve();
+    expect(sentBackground[0]).toHaveLength(MAX_BACKGROUND_SESSIONS);
   });
 });

@@ -147,6 +147,7 @@ fn spawn(
         Some("/bin/sh".into()),
         Some(args),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap()
     .id
@@ -403,7 +404,9 @@ fn output_gathered_when_the_process_exits_is_delivered_before_the_exit() {
     let tallies = counting(&app, &state);
     let exited = exits(&app);
     let dir = repo();
-    for size in [1usize, 511, 512, 700, 4096, 16383, 16384, 16385, 40000] {
+    for size in [
+        1usize, 511, 512, 700, 4096, 16383, 16384, 16385, 40000, 65535, 65536, 65537, 150000,
+    ] {
         let id = spawn(
             &app,
             &state,
@@ -443,7 +446,7 @@ type Unrepaid = Arc<Mutex<Vec<(String, usize, Vec<u8>)>>>;
 #[test]
 fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes() {
     let _serial = serial();
-    const WINDOW: usize = 256 * 1024;
+    const WINDOW: usize = 512 * 1024;
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
@@ -524,7 +527,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     );
     assert!(
         wait_for(Duration::from_secs(20), || received(&tallies, &id)
-            > 256 * 1024),
+            > 512 * 1024),
         "the stream never got going"
     );
     assert!(gitpulse_lib::terminal::detach_session(&state, &id).unwrap());
@@ -543,10 +546,17 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
             .any(|s| s.id == id && s.detached),
         "the process must still be running, detached"
     );
-    gitpulse_lib::terminal::attach_session(&state, &id, 24, 80).unwrap();
+    gitpulse_lib::terminal::attach_session(
+        &state,
+        &id,
+        24,
+        80,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
+    )
+    .unwrap();
     assert!(
         wait_for(Duration::from_secs(20), || received(&tallies, &id)
-            > settled + 256 * 1024),
+            > settled + 512 * 1024),
         "a reattached session never streamed again"
     );
     gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
@@ -692,7 +702,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
         percentile(&beside, 0.5)
     );
     // Inside a flood the echo shares one reader with it, which sends at most
-    // every 8 ms while it gathers, plus a 16 KiB emit. Still nowhere near the
+    // every 8 ms while it gathers, plus a 64 KiB message. Still nowhere near the
     // flood's length.
     assert!(
         percentile(&within, 0.5) < bound(Duration::from_millis(50)),
@@ -708,7 +718,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
     gitpulse_lib::terminal::kill_session(&state, &quiet).unwrap();
 }
 
-/// Gathering puts event boundaries wherever 16 KiB falls, which is inside a
+/// Gathering puts event boundaries wherever 64 KiB falls, which is inside a
 /// UTF-8 character or an escape sequence as often as not. The bytes must
 /// still arrive exactly, each event within its bound, and the boundaries must
 /// really have fallen inside characters and sequences for this to mean
@@ -732,10 +742,10 @@ fn characters_and_escape_sequences_split_across_events_arrive_byte_exact() {
         }
     });
     let dir = repo();
-    // 2-, 3- and 4-byte characters and CSI/OSC sequences, 7 bytes apart from
-    // a multiple of 16 KiB per repetition so boundaries walk through them.
+    // 2-, 3- and 4-byte characters and CSI/OSC sequences, 2 bytes short of
+    // a multiple of 64 KiB per repetition so boundaries walk through them.
     let unit = "é世🚀\u{1b}[38;5;196mX\u{1b}[0m\u{1b}]0;t\u{7}ab";
-    let reps = 20_000usize;
+    let reps = 100_000usize;
     let want: Vec<u8> = unit.repeat(reps).into_bytes();
     let id = spawn(
         &app,
@@ -924,6 +934,313 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
     );
     assert!(*largest.lock().unwrap() <= OUTPUT_CHUNK_BYTES);
     gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The production path: a view's channel of raw bytes (`OutputSink::channel`).
+//
+// Everything above counts events through `OutputSink::events`, which re-emits a
+// chunk as a `terminal-output` event for an in-process listener. What a real
+// view receives is a `tauri::ipc::Channel`: raw bytes, one message per chunk,
+// then one end marker before the exit event. These tests are that view.
+// ---------------------------------------------------------------------------
+
+use gitpulse_lib::terminal::{OutputSink, END_OF_OUTPUT};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tauri::ipc::{Channel, InvokeResponseBody};
+
+/// What one channel was sent.
+#[derive(Default)]
+struct Received {
+    bytes: Vec<u8>,
+    /// Length of each raw message, in order.
+    messages: Vec<usize>,
+    /// Index into `messages` at which the end marker arrived.
+    ended_after: Option<usize>,
+    /// Raw messages that arrived after the end marker.
+    after_end: usize,
+}
+
+/// A view of one session: its channel, and an acknowledger that repays what
+/// the channel was sent as a real view does once it has painted.
+struct Viewer {
+    received: Arc<Mutex<Received>>,
+    owed: Arc<AtomicUsize>,
+    id: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+    acker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Viewer {
+    fn new(state: &TerminalSessions, acking: bool) -> (Self, OutputSink) {
+        let received: Arc<Mutex<Received>> = Arc::default();
+        let owed = Arc::new(AtomicUsize::new(0));
+        let (record, count) = (received.clone(), owed.clone());
+        let channel = Channel::new(move |body| {
+            let mut seen = record.lock().unwrap();
+            match body {
+                InvokeResponseBody::Raw(bytes) => {
+                    if seen.ended_after.is_some() {
+                        seen.after_end += 1;
+                    }
+                    count.fetch_add(bytes.len(), Ordering::SeqCst);
+                    seen.messages.push(bytes.len());
+                    seen.bytes.extend_from_slice(&bytes);
+                }
+                InvokeResponseBody::Json(json) => {
+                    assert_eq!(json, END_OF_OUTPUT, "the only JSON a channel carries");
+                    assert!(seen.ended_after.is_none(), "the end marker came twice");
+                    seen.ended_after = Some(seen.messages.len());
+                }
+            }
+            Ok(())
+        });
+        let id: Arc<Mutex<Option<String>>> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let acker = acking.then(|| {
+            let (state, owed, id, stop) = (state.clone(), owed.clone(), id.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let session = id.lock().unwrap().clone();
+                    if let Some(session) = session {
+                        let bytes = owed.swap(0, Ordering::SeqCst);
+                        if bytes > 0 {
+                            let _ = acknowledge_output(&state, &session, bytes);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        });
+        (
+            Self {
+                received,
+                owed,
+                id,
+                stop,
+                acker,
+            },
+            OutputSink::channel(channel),
+        )
+    }
+
+    fn bind(&self, session: &str) {
+        *self.id.lock().unwrap() = Some(session.to_owned());
+    }
+
+    fn bytes(&self) -> usize {
+        self.received.lock().unwrap().bytes.len()
+    }
+
+    fn messages(&self) -> usize {
+        self.received.lock().unwrap().messages.len()
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(acker) = self.acker.take() {
+            let _ = acker.join();
+        }
+        let _ = &self.owed;
+    }
+}
+
+fn spawn_for(
+    app: &tauri::App<tauri::test::MockRuntime>,
+    state: &TerminalSessions,
+    dir: &tempfile::TempDir,
+    script: String,
+    sink: OutputSink,
+) -> String {
+    spawn_session(
+        app.handle(),
+        state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/sh".into()),
+        Some(vec!["-c".into(), script]),
+        None,
+        sink,
+    )
+    .unwrap()
+    .id
+}
+
+/// The defect: output reached a view as a global event per read, base64
+/// encoded, and the end of a session was an event that could overtake bytes
+/// still being fetched. A view's channel gets the raw bytes in order, in
+/// messages of up to `OUTPUT_CHUNK_BYTES`, and a marker after the last byte
+/// that arrives before the exit event does.
+#[test]
+fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit() {
+    let _serial = serial();
+    const TOTAL: usize = 2 * 1024 * 1024;
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let dir = repo();
+    let (viewer, sink) = Viewer::new(&state, true);
+    let ended_before_exit = Arc::new(AtomicBool::new(false));
+    {
+        let (seen, flag) = (viewer.received.clone(), ended_before_exit.clone());
+        app.listen("terminal-exit", move |_| {
+            flag.store(seen.lock().unwrap().ended_after.is_some(), Ordering::SeqCst);
+        });
+    }
+    let exited = exits(&app);
+    let script = burst_command_then(TOTAL, "exit 0").pop().unwrap();
+    let id = spawn_for(&app, &state, &dir, script, sink);
+    viewer.bind(&id);
+    exited.recv_timeout(Duration::from_secs(60)).expect("exit");
+    let seen = viewer.received.lock().unwrap();
+    let want = pattern(TOTAL);
+    assert!(
+        seen.bytes.ends_with(&want),
+        "the burst did not arrive whole and in order: {} bytes",
+        seen.bytes.len()
+    );
+    assert!(seen.bytes.len() < TOTAL + 4096, "output was duplicated");
+    assert!(
+        seen.messages
+            .iter()
+            .all(|n| (1..=OUTPUT_CHUNK_BYTES).contains(n)),
+        "a message was empty or longer than {OUTPUT_CHUNK_BYTES}: largest {:?}",
+        seen.messages.iter().max()
+    );
+    assert_eq!(
+        seen.ended_after,
+        Some(seen.messages.len()),
+        "the end marker is the last message"
+    );
+    assert_eq!(seen.after_end, 0);
+    assert!(
+        ended_before_exit.load(Ordering::SeqCst),
+        "the exit event overtook the end of the output"
+    );
+    println!(
+        "{} messages for {} bytes: mean {} B, per MiB {:.1}",
+        seen.messages.len(),
+        seen.bytes.len(),
+        seen.bytes.len() / seen.messages.len().max(1),
+        seen.messages.len() as f64 / (seen.bytes.len() as f64 / (1024.0 * 1024.0))
+    );
+    // One message per 64 KiB is 16 per MiB; the slack is for the gaps a loaded
+    // reader leaves, each of which flushes what has been gathered. The
+    // baseline this replaced was 1,024 per MiB (a message per 1 KiB read).
+    let per_mib = seen.messages.len() as f64 / (seen.bytes.len() as f64 / (1024.0 * 1024.0));
+    assert!(
+        per_mib <= 24.0,
+        "{per_mib:.1} messages per MiB: a flood is sent in messages of up to 64 KiB"
+    );
+    drop(seen);
+    // Everything sent was repaid, and the session has left nothing to repay.
+    assert!(
+        wait_for(Duration::from_secs(5), || viewer
+            .owed
+            .load(Ordering::SeqCst)
+            == 0),
+        "credit was left outstanding"
+    );
+}
+
+/// A reloaded page's replacement brings a channel of its own. Output goes to
+/// it from the attach on; the channel of the page that went away is not sent
+/// to again (its messages would run in a page that no longer has the callback).
+#[test]
+fn attaching_a_view_moves_the_output_to_its_channel() {
+    let _serial = serial();
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let dir = repo();
+    let (first, first_sink) = Viewer::new(&state, true);
+    let id = spawn_for(
+        &app,
+        &state,
+        &dir,
+        "stty raw -echo; exec cat".into(),
+        first_sink,
+    );
+    first.bind(&id);
+    write_to_session(&state, &id, "ping").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || first.bytes() >= 4),
+        "the first view never saw its echo"
+    );
+    assert!(gitpulse_lib::terminal::detach_session(&state, &id).unwrap());
+    let before = first.bytes();
+    let (second, second_sink) = Viewer::new(&state, true);
+    gitpulse_lib::terminal::attach_session(&state, &id, 24, 80, second_sink).unwrap();
+    second.bind(&id);
+    write_to_session(&state, &id, "pong").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            String::from_utf8_lossy(&second.received.lock().unwrap().bytes).contains("pong")
+        }),
+        "the new view never saw its echo"
+    );
+    assert_eq!(
+        first.bytes(),
+        before,
+        "the first view's channel was sent to after the second took over"
+    );
+}
+
+/// A5. A session on a tab nobody is looking at is sent a few times a second
+/// instead of at frame rate, with every byte still delivered and no notice
+/// that anything was skipped: its credit is repaid, only later.
+#[test]
+fn a_hidden_sessions_output_is_batched_at_least_ten_times_harder_and_still_whole() {
+    let _serial = serial();
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let losses = Arc::new(AtomicUsize::new(0));
+    {
+        let losses = losses.clone();
+        app.listen("terminal-loss", move |_| {
+            losses.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    let dir = repo();
+    // 150 bursts of 2 KiB, 10 ms apart: a stream that is nowhere near full.
+    let script = "stty raw -echo; perl -e '$|=1; select(undef,undef,undef,0.4); for (1..150) { syswrite(STDOUT, \"s\" x 2048); select(undef,undef,undef,0.01) }'; sleep 30".to_string();
+    let (seen, seen_sink) = Viewer::new(&state, true);
+    let (hidden, hidden_sink) = Viewer::new(&state, true);
+    let visible_id = spawn_for(&app, &state, &dir, script.clone(), seen_sink);
+    seen.bind(&visible_id);
+    let hidden_id = spawn_for(&app, &state, &dir, script, hidden_sink);
+    hidden.bind(&hidden_id);
+    gitpulse_lib::terminal::set_background_sessions(&state, std::slice::from_ref(&hidden_id));
+    let total = 150 * 2048;
+    assert!(
+        wait_for(Duration::from_secs(30), || seen.bytes() >= total
+            && hidden.bytes() >= total),
+        "the streams did not both arrive: visible {} hidden {} of {total}",
+        seen.bytes(),
+        hidden.bytes()
+    );
+    let (visible_messages, hidden_messages) = (seen.messages(), hidden.messages());
+    println!("visible {visible_messages} messages, hidden {hidden_messages}");
+    assert!(
+        hidden_messages * 10 <= visible_messages,
+        "hidden {hidden_messages} messages vs visible {visible_messages}: not 10x fewer"
+    );
+    assert_eq!(
+        hidden.bytes(),
+        seen.bytes(),
+        "the hidden session lost bytes"
+    );
+    assert_eq!(losses.load(Ordering::SeqCst), 0, "a loss notice was raised");
 }
 
 mod common;

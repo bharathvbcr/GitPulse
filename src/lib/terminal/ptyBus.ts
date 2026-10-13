@@ -1,26 +1,54 @@
 /**
- * One owner of the PTY event wiring, shared by every terminal tab.
+ * One owner of the PTY wiring, shared by every terminal tab.
  *
- * `terminal-output` and `terminal-exit` are process-wide events carrying a
- * session id. With one terminal that was a listener with an `if`; with N tabs
- * it would have become N listeners each rejecting N-1 of every chunk — every
- * byte of a `yes` flood decoded once per open tab. This subscribes once and
- * routes by id instead, so cost is O(1) in the number of tabs.
+ * Output arrives on a channel of raw bytes that belongs to one session
+ * (`openOutput`, handed to the spawn or attach command), not as a process-wide
+ * event every tab would have to reject N-1 of. `terminal-exit` and
+ * `terminal-loss` are still process-wide events carrying a session id, and are
+ * routed by id from one subscription each, so cost is O(1) in the number of
+ * tabs.
  *
  * It also owns the race that used to live in TerminalPanel: output can arrive
  * between the spawn IPC being sent and its id coming back, so a session cannot
- * subscribe until after its first bytes may already exist. Chunks for an id
- * nobody has claimed are held, bounded, and replayed the moment it subscribes.
+ * subscribe until after its first bytes may already exist. A channel holds
+ * what arrives before it learns its session's id; bytes for an id nobody has
+ * claimed are then held, bounded, and replayed the moment it subscribes.
+ *
+ * And the order of the end: an exit is an event, and an event overtakes
+ * channel messages still being fetched. The host sends a marker down the
+ * channel after the last byte, and an exit for a session with a channel waits
+ * for it (`EXIT_FENCE_MS` at most).
  */
 
-import { MAX_TERMINAL_OUTPUT_B64, reservedTerminalBytes } from "./outputCredit";
-import type { TerminalOutputPayload, TerminalExitPayload } from "./runResult";
-export type TerminalOutputEvent = TerminalOutputPayload;
+import type { TerminalExitPayload } from "./runResult";
 export type TerminalExitEvent = TerminalExitPayload;
 
+/** What a session's channel delivers: raw bytes, or the marker `"end"` after the last. */
+export type OutputMessage = ArrayBuffer | ArrayBufferView | string;
+const END_OF_OUTPUT = "end";
+
+/** Longest an exit waits for the end of the session's output before it is delivered anyway. */
+export const EXIT_FENCE_MS = 3000;
+
+/** Channel messages held for a session whose id has not come back yet. */
+export const MAX_EARLY_MESSAGES = 128;
+
+/** Creates the channel object handed to a command; `onmessage` receives its messages. */
+export type ChannelFactory = (onmessage: (message: OutputMessage) => void) => object;
+
+/** One session's output channel, from `PtyBus.openOutput`. */
+export interface PtyOutput {
+  /** Pass this to the spawn or attach command as `onOutput`. */
+  readonly channel: object;
+  /** The command returned: this channel is `id`'s. Bytes that came first are delivered. */
+  bind(id: string): void;
+  /** The command failed: nothing will come, nothing is held. */
+  release(): void;
+}
+
 export interface PtySessionHandlers {
-  /** `reservedBytes` is omitted when the event did not name a usable length. */
-  onOutput: (dataB64: string, reservedBytes?: number) => void;
+  /** The bytes of one output message. The credit Rust reserved for it is exactly their count. */
+  onOutput: (bytes: Uint8Array) => void;
   onExit: (event: TerminalExitEvent) => void;
   onError?: (message: string) => void;
   /**
@@ -61,7 +89,6 @@ export const MAX_FORGOTTEN_SESSIONS = MAX_PENDING_IDS * 32;
 
 const CHUNK_LIMIT = "Terminal output is incomplete: early output exceeded its buffer limit";
 const DISCARDED = "Terminal output is incomplete: early output was discarded before the session was ready";
-const OVERSIZE = "Terminal output chunk exceeded its limit";
 const FORGOTTEN_EXIT = "Terminal exit was discarded before the session was ready";
 
 /** Keep every distinct loss. A later exit must not replace an earlier one. */
@@ -80,9 +107,8 @@ function withNotice(event: TerminalExitEvent, notice: string | null): TerminalEx
 }
 
 interface HeldChunk {
-  data: string;
-  /** Null when the event did not carry a length the renderer can acknowledge. */
-  bytes: number | null;
+  /** Held, not acknowledged: Rust reserved exactly `bytes.length` for it. */
+  bytes: Uint8Array;
 }
 
 interface Pending {
@@ -113,9 +139,14 @@ export interface PtyBus {
   subscribe(id: string, handlers: PtySessionHandlers): () => void;
   /** Held-chunk count for an unclaimed id — for tests and diagnostics. */
   pendingCount(id: string): number;
+  /**
+   * A channel for one session's output, opened before the command that
+   * starts or takes over the session so its first bytes cannot be missed.
+   */
+  openOutput(): PtyOutput;
 }
 
-export function createPtyBus(listen: EventListen): PtyBus {
+export function createPtyBus(listen: EventListen, makeChannel: ChannelFactory): PtyBus {
   const handlers = new Map<string, PtySessionHandlers>();
   const pending = new Map<string, Pending>();
   const tombstones = new Map<string, Tombstone>();
@@ -198,8 +229,7 @@ export function createPtyBus(listen: EventListen): PtyBus {
   }
 
   function deliverChunk(target: PtySessionHandlers, chunk: HeldChunk) {
-    if (chunk.bytes === null) target.onOutput(chunk.data);
-    else target.onOutput(chunk.data, chunk.bytes);
+    target.onOutput(chunk.bytes);
   }
 
   function pendingFor(id: string): Pending {
@@ -211,34 +241,36 @@ export function createPtyBus(listen: EventListen): PtyBus {
     return fresh;
   }
 
-  function handleOutput(payload: TerminalOutputEvent) {
-    if (!payload || typeof payload.id !== "string" || typeof payload.data_b64 !== "string") {
-      report("Invalid terminal output event");
-      return;
-    }
-    if (payload.data_b64.length > MAX_TERMINAL_OUTPUT_B64) {
-      const target = handlers.get(payload.id);
-      if (target) {
-        noteLive(payload.id, OVERSIZE);
-        target.onError?.(OVERSIZE);
-        return;
-      }
-      const held = pendingFor(payload.id);
-      held.loss = mergeTerminalNotice(held.loss, OVERSIZE);
-      return;
-    }
-    const chunk = { data: payload.data_b64, bytes: reservedTerminalBytes(payload.bytes) };
-    const target = handlers.get(payload.id);
+  /** One message's bytes for session `id`: to its view, or held until one subscribes. */
+  function handleOutput(id: string, bytes: Uint8Array) {
+    const target = handlers.get(id);
     if (target) {
-      deliverChunk(target, chunk);
+      deliverChunk(target, { bytes });
       return;
     }
-    const held = pendingFor(payload.id);
-    held.chunks.push(chunk);
+    const held = pendingFor(id);
+    held.chunks.push({ bytes });
     if (held.chunks.length > MAX_PENDING_CHUNKS_PER_ID) {
       held.chunks.shift();
       held.incomplete = true;
     }
+  }
+
+  /**
+   * Sessions whose channel is bound and has not yet delivered its end marker.
+   * Their exit is held until it does: the marker follows the last byte on the
+   * same ordered channel, the exit is an event that does not.
+   */
+  const unfinished = new Set<string>();
+  const heldExits = new Map<string, { event: TerminalExitEvent; timer: ReturnType<typeof setTimeout> }>();
+
+  function outputFinished(id: string) {
+    unfinished.delete(id);
+    const held = heldExits.get(id);
+    if (!held) return;
+    clearTimeout(held.timer);
+    heldExits.delete(id);
+    deliverExit(held.event);
   }
 
   function handleExit(payload: TerminalExitEvent) {
@@ -249,6 +281,25 @@ export function createPtyBus(listen: EventListen): PtyBus {
       report("Invalid terminal exit event");
       return;
     }
+    const waiting = heldExits.get(payload.id);
+    if (waiting) {
+      // A second exit must not replace the first; a later error is added to it.
+      waiting.event = withNotice(waiting.event, payload.error);
+      return;
+    }
+    if (unfinished.has(payload.id)) {
+      // Bytes sent before this exit are still on their way. A bound channel
+      // that never delivers its marker (a page that lost it) must not hold
+      // the exit for good.
+      const id = payload.id;
+      heldExits.set(id, { event: payload, timer: setTimeout(() => outputFinished(id), EXIT_FENCE_MS) });
+      return;
+    }
+    deliverExit(payload);
+  }
+
+  function deliverExit(payload: TerminalExitEvent) {
+    unfinished.delete(payload.id);
     const target = handlers.get(payload.id);
     if (target) {
       // Every loss already shown has to ride on the exit. A clean exit would
@@ -281,7 +332,6 @@ export function createPtyBus(listen: EventListen): PtyBus {
     if (unlisteners.length > 0) return Promise.resolve();
     if (attaching) return attaching;
     const attempt = Promise.allSettled([
-      boundedListen<TerminalOutputEvent>("terminal-output", (e) => handleOutput(e.payload)),
       boundedListen<TerminalExitEvent>("terminal-exit", (e) => handleExit(e.payload)),
       boundedListen<TerminalLossEvent>("terminal-loss", (e) => handleLoss(e.payload)),
     ]).then((results) => {
@@ -305,9 +355,57 @@ export function createPtyBus(listen: EventListen): PtyBus {
     tombstones.clear();
     forgotten.clear();
     liveLoss.clear();
+    unfinished.clear();
+    for (const held of heldExits.values()) clearTimeout(held.timer);
+    heldExits.clear();
+  }
+
+  function openOutput(): PtyOutput {
+    let id: string | null = null;
+    let released = false;
+    let ended = false;
+    /** What arrived before the session's id did, oldest first, bounded. */
+    let early: Uint8Array[] = [];
+    let lostEarly = false;
+    const channel = makeChannel((message) => {
+      if (released && id === null) return;
+      if (typeof message === "string") {
+        if (message !== END_OF_OUTPUT) return;
+        ended = true;
+        if (id !== null) outputFinished(id);
+        return;
+      }
+      const bytes = message instanceof ArrayBuffer
+        ? new Uint8Array(message)
+        : ArrayBuffer.isView(message)
+          ? new Uint8Array(message.buffer, message.byteOffset, message.byteLength)
+          : null;
+      if (!bytes) return;
+      if (id !== null) { handleOutput(id, bytes); return; }
+      early.push(bytes);
+      if (early.length > MAX_EARLY_MESSAGES) { early.shift(); lostEarly = true; }
+    });
+    return {
+      channel,
+      bind(session) {
+        if (released || id !== null) return;
+        id = session;
+        if (!ended) unfinished.add(session);
+        const held = early;
+        early = [];
+        for (const bytes of held) handleOutput(session, bytes);
+        if (lostEarly) pendingFor(session).incomplete = true;
+      },
+      release() {
+        released = true;
+        early = [];
+        if (id !== null) unfinished.delete(id);
+      },
+    };
   }
 
   return {
+    openOutput,
     async prepare() {
       preparing += 1;
       let released = false;

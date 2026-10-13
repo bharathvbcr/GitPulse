@@ -899,12 +899,15 @@ Other benches:
   - word_diff: 10,000 chars in 356.6 us.
 - **`watcher`**: 10,000 events in 13.1 ms.
 - **`terminal_pty`**: the cards that change these numbers are terminal cards 11
-  and 12, which have not landed.
+  and 12. They landed after this baseline was taken (the `hx/lag3-terminal`
+  merge), so these numbers are from before them; the baseline has not been
+  re-seeded.
   - Flood: 30.5 MB/s, still 1,024 IPC messages per MiB.
   - Echo: 20.8 us idle and 7.6 us beside a flood.
 - **`idle_wakeups`**: 2.2/s with no sessions, 12.2/s with 1, 80.8/s with 8 and
   315.4/s with 32. That is still about 9.8 wake-ups per second for each idle
-  session, the reader's poll. Card 12, the kqueue reader, is what brings it down.
+  session, the reader's poll. Card 12, the kqueue reader, is what brings it
+  down; it landed after this baseline, which has not been re-measured.
 
 ### Pre-fix baseline (`a92e40fb`, loaded host), superseded
 

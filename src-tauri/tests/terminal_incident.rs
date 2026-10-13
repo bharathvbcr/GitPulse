@@ -82,6 +82,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exec sleep 600".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
     kill_session(&state, &warm.id).unwrap();
@@ -103,6 +104,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), script]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         ids.push(spawned.id);
@@ -192,6 +194,7 @@ fn sessions_closed_through_gitpulse_are_never_an_incident() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exec sleep 600".into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         ids.push(spawned.id);
