@@ -156,18 +156,17 @@ impl Executor {
             // A dropped receiver is a cancelled caller; the result has no one.
             let _ = reply.try_send(result);
         }))?;
-        answer.recv().await.unwrap_or_else(|| {
-            Err(format!(
-                "{operation} was dropped before it ran (the terminal is shutting down)"
-            ))
-        })
+        answer
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(dropped_unrun(operation)))
     }
 
     fn submit(&self, job: Job) -> Result<(), String> {
         let shared = &self.handle.shared;
         let mut state = shared.lock();
         if state.closed {
-            return Err(format!("The terminal {} has shut down", shared.name));
+            return Err(shut_down(shared.name));
         }
         if state.jobs.len() >= shared.capacity {
             return Err(format!(
@@ -190,10 +189,7 @@ impl Executor {
                 Err(error) if state.threads == 0 => {
                     // Nothing could ever serve it.
                     state.jobs.pop_back();
-                    return Err(format!(
-                        "Could not start a terminal {} thread: {error}",
-                        shared.name
-                    ));
+                    return Err(no_thread(shared.name, &error));
                 }
                 // An existing worker will get to it.
                 Err(_) => {}
@@ -215,6 +211,26 @@ impl Executor {
     pub(crate) fn workers(&self) -> usize {
         self.handle.shared.lock().threads
     }
+}
+
+// The two answers below come only from a lane whose session has left the map
+// (a lane closes when its entry and every caller have let go, and a job goes
+// unrun only when its lane has ended), so they say so in the words the
+// frontend ends a tab's input on (`SESSION_GONE_MARKERS`). Neither is
+// reachable through `run` while a caller holds the lane, which is every call;
+// they are worded for the day that changes, not left to read as a dropped
+// chunk of a live session. The other refusals must not carry those words.
+
+fn shut_down(name: &str) -> String {
+    format!("The terminal {name} has shut down: the terminal session is closed")
+}
+
+fn dropped_unrun(operation: &str) -> String {
+    format!("{operation} was dropped before it ran: the terminal session is closed")
+}
+
+fn no_thread(name: &str, error: &std::io::Error) -> String {
+    format!("Could not start a terminal {name} thread: {error}")
 }
 
 fn work(shared: &Shared) {
@@ -412,6 +428,57 @@ mod tests {
         assert_eq!(shared.lock().threads, 1);
         drop(lane);
         assert!(wait_until(Duration::from_secs(5), || shared.lock().threads == 0));
+    }
+
+    /// A closed lane is one whose session entry and every caller are gone, so
+    /// its refusal must read as a gone session to the frontend
+    /// (`SESSION_GONE_MARKERS`), and the refusals of a live lane must not: a
+    /// full queue, a panic or a thread that would not start drop one chunk of
+    /// a session that is still there.
+    #[test]
+    fn refusals_say_whether_the_session_is_gone() {
+        let gone = |message: &str| crate::terminal::reads_as_session_gone(message);
+
+        let lane = Executor::new("input", 1, 1, Duration::from_secs(5));
+        lane.handle.shared.lock().closed = true;
+        let closed = lane.submit(Box::new(|| {})).unwrap_err();
+        assert!(gone(&closed), "{closed}");
+        assert!(gone(&dropped_unrun("terminal_write")));
+        lane.handle.shared.lock().closed = false;
+
+        let (gate, hold) = mpsc::channel::<()>();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut busy = Box::pin({
+            let lane = lane.clone();
+            async move {
+                lane.run("terminal_write", move || {
+                    let _ = hold.recv();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        assert!(std::future::Future::poll(busy.as_mut(), &mut cx).is_pending());
+        assert!(wait_until(Duration::from_secs(5), || lane.waiting() == 0));
+        let mut queued = Box::pin({
+            let lane = lane.clone();
+            async move { lane.run("terminal_write", || Ok(())).await }
+        });
+        assert!(std::future::Future::poll(queued.as_mut(), &mut cx).is_pending());
+        let full = block_on(lane.run("terminal_write", || Ok(()))).unwrap_err();
+        assert!(full.contains("queue is full") && !gone(&full), "{full}");
+        drop(gate);
+        block_on(busy).unwrap();
+        block_on(queued).unwrap();
+
+        let panicked =
+            block_on(lane.run::<(), _>("terminal_write", || panic!("injected"))).unwrap_err();
+        assert!(!gone(&panicked), "{panicked}");
+        let no_thread = no_thread(
+            "input",
+            &std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+        );
+        assert!(!gone(&no_thread), "{no_thread}");
     }
 
     #[test]

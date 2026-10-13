@@ -76,6 +76,53 @@ const CONTROL_QUEUE_CAPACITY: usize = 256;
 const LANE_IDLE: Duration = Duration::from_secs(30);
 /// How long a control-pool thread outlives its last job.
 const CONTROL_IDLE: Duration = Duration::from_secs(5);
+/// Words that mark an answer as "there is no session any more". The frontend
+/// ends a tab's input on an answer carrying one (`inputQueue.ts::sessionIsGone`,
+/// matched as whole words, ignoring case) and on nothing else a backend says;
+/// every other refusal drops one chunk of a session that is still there. Its
+/// `SESSION_GONE_MARKERS` is checked against this line by text, so a message
+/// that means "gone" must carry one of these, and one that does not must not.
+pub const SESSION_GONE_MARKERS: [&str; 3] = ["not found", "session is closed", "Terminal closed"];
+
+/// Whether the frontend reads `message` as a session that is gone: the same
+/// rule as `sessionIsGone`, for tests that hold a backend answer to it.
+#[doc(hidden)]
+pub fn reads_as_session_gone(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    SESSION_GONE_MARKERS.iter().any(|marker| {
+        let marker = marker.to_lowercase();
+        lower.match_indices(&marker).any(|(at, _)| {
+            !word(lower[..at].chars().next_back())
+                && !word(lower[at + marker.len()..].chars().next())
+        })
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn reads_as_session_gone_matches_whole_words_ignoring_case() {
+    for gone in [
+        "Terminal session 'term-1' not found",
+        "Terminal session is closed",
+        "terminal closed after writing 0 of 9 input bytes",
+        "x: NOT FOUND.",
+    ] {
+        assert!(reads_as_session_gone(gone), "{gone}");
+    }
+    for live in [
+        "The terminal input queue is full (64 waiting); try again in a moment",
+        "Terminal is busy; the resize gave up after 2000ms",
+        "Terminal input timed out after writing 3 of 6 bytes; input was not retried",
+        "cannot_found",
+        "xnot found",
+        "not foundry",
+        "Terminal closedown",
+    ] {
+        assert!(!reads_as_session_gone(live), "{live}");
+    }
+}
+
 /// How long a resize waits for the master lock before it answers "busy".
 const MASTER_LOCK_BUDGET: Duration = Duration::from_secs(2);
 const MAX_PTY_ROWS: u16 = 1_000;

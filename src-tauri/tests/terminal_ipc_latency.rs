@@ -525,6 +525,108 @@ fn a_write_or_resize_to_a_missing_session_is_refused_by_name() {
     assert!(resize.contains("not found"), "{resize}");
 }
 
+/// A child that never reads its input, so a large write spins on a full tty
+/// for its two-second budget, and that exits by itself after `exit_after`.
+fn deaf_args(exit_after: &str) -> Option<Vec<String>> {
+    Some(vec![
+        "-c".into(),
+        format!("stty raw -echo; echo READY; sleep {exit_after}"),
+    ])
+}
+
+/// How a session can end under a write.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The user's Close.
+    Kill,
+    /// Application exit.
+    Shutdown,
+    /// The program exits on its own (an agent finishing, `exit` typed).
+    SelfExit,
+}
+
+/// A write in flight and writes queued behind it on the same input lane, when
+/// the session ends, are each answered with a message the frontend reads as
+/// "the session is gone" (`reads_as_session_gone`, the rule `sessionIsGone`
+/// applies), never as a dropped chunk of a live session — which the frontend
+/// reports as "Some input was not delivered and was dropped".
+///
+/// The child never reads, so the first (64 KiB) write is spinning on a full
+/// tty when the session ends and the others are queued behind it on the lane.
+#[test]
+fn writes_queued_or_in_flight_when_a_session_ends_are_answered_as_gone() {
+    let _serial = serial();
+    for ending in [Ending::Kill, Ending::Shutdown, Ending::SelfExit] {
+        let state = TerminalSessions::default();
+        let app = mock_app(&state);
+        let _cleanup = TerminalCleanup(state.clone());
+        let output = collecting(&app, &state);
+        let dir = repo();
+        let exit_after = match ending {
+            Ending::SelfExit => "1",
+            _ => "600",
+        };
+        let id = start(&app, &state, &output, dir.path(), deaf_args(exit_after));
+        let handle = app.handle().clone();
+        let big = "x".repeat(60 * 1024);
+        let mut answers = Vec::new();
+        for n in 0..4 {
+            let (done, answered) = mpsc::channel();
+            let (handle, id) = (handle.clone(), id.clone());
+            let data = if n == 0 {
+                big.clone()
+            } else {
+                format!("queued-{n};")
+            };
+            std::thread::spawn(move || {
+                let state = handle.state::<TerminalSessions>();
+                let result =
+                    tauri::async_runtime::block_on(cmd_terminal_write(state, id, data, None));
+                let _ = done.send(result);
+            });
+            // In order on the lane: each call queues before the next starts.
+            std::thread::sleep(Duration::from_millis(if n == 0 { 300 } else { 30 }));
+            answers.push(answered);
+        }
+        // A close must not wait out the stuck write's two seconds, nor the
+        // writes queued behind it: it is bounded by its own cleanup wait.
+        let closing = Instant::now();
+        match ending {
+            Ending::Kill => kill_session(&state, &id).unwrap(),
+            Ending::Shutdown => gitpulse_lib::terminal::shutdown_sessions(&state).unwrap(),
+            Ending::SelfExit => {}
+        }
+        let closed_in = closing.elapsed();
+        println!("{ending:?}: closed in {closed_in:?} under a stuck write");
+        assert!(
+            closed_in < common::env::coverage_relaxed(Duration::from_secs(5)),
+            "{ending:?}: closing took {closed_in:?} with a write stuck on the lane"
+        );
+        let mut seen = Vec::new();
+        for (n, answered) in answers.into_iter().enumerate() {
+            let result = answered
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{ending:?}: write {n} never answered"));
+            println!("{ending:?}: write {n} -> {result:?}");
+            seen.push((n, result));
+        }
+        // The first write cannot have finished: nothing read its 60 KiB.
+        for (n, result) in &seen {
+            if let Err(message) = result {
+                assert!(
+                    gitpulse_lib::terminal::reads_as_session_gone(message),
+                    "{ending:?}: write {n} was answered {message:?}, which the frontend \
+                     reads as a dropped chunk of a live session, not a session that ended"
+                );
+            }
+        }
+        assert!(
+            seen[0].1.is_err(),
+            "{ending:?}: a 60 KiB write to a child that never reads cannot have succeeded"
+        );
+    }
+}
+
 /// Counts one worker down when it ends, however it ends.
 struct Decrement<'a>(&'a AtomicUsize);
 impl Drop for Decrement<'_> {

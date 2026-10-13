@@ -97,9 +97,17 @@ export function terminalDeadline<T>(work: Promise<T>, ms: number, label: string,
   });
 }
 
+/**
+ * Words that mark a backend answer as "there is no session any more". Pinned to
+ * Rust's `SESSION_GONE_MARKERS` (`terminal/mod.rs`) by `inputQueue.test.ts`,
+ * which also holds every answer the write and resize paths can give to this rule.
+ */
+export const SESSION_GONE_MARKERS = ["not found", "session is closed", "Terminal closed"] as const;
+const SESSION_GONE = new RegExp(SESSION_GONE_MARKERS.map((marker) => `\\b${marker}\\b`).join("|"), "i");
+
 /** The backend says there is no session to type into. */
 export function sessionIsGone(error: unknown): boolean {
-  return /\bnot found\b|\bsession is closed\b|\bTerminal closed\b/i.test(String(error));
+  return SESSION_GONE.test(String(error));
 }
 
 /**

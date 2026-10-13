@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { createTerminalInput } from "./inputQueue";
+import { SESSION_GONE_MARKERS, createTerminalInput, inputIsDead, sessionIsGone } from "./inputQueue";
 
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
@@ -303,4 +306,68 @@ it("preserves legacy mouse bytes in order alongside UTF-8 typing", async () => {
   queue.write("界"); queue.write("\x1b[M\x80\xff", true); queue.write("after");
   await queue.idle();
   expect(sent).toEqual([{data:"界",binary:false},{data:"\x1b[M\x80\xff",binary:true},{data:"after",binary:false}]);
+});
+
+/**
+ * Which backend answers end a tab's input is decided here by text, and the
+ * text is written in Rust. Both sides are pinned: the markers are read out of
+ * `terminal/mod.rs`, and every answer the terminal lanes and the write and
+ * resize paths can give is looked up in its Rust source, so a reworded message
+ * fails this test instead of quietly changing which way the frontend reads it.
+ */
+describe("backend answers the input queue reads as a session that is gone", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const rust = (file: string) => readFileSync(join(repoRoot, "src-tauri", "src", "terminal", file), "utf8");
+
+  it("uses Rust's SESSION_GONE_MARKERS, word for word", () => {
+    const declared = rust("mod.rs").match(/pub const SESSION_GONE_MARKERS:\s*\[&str;\s*\d+\]\s*=\s*\[([^\]]*)\]/);
+    expect(declared, "SESSION_GONE_MARKERS declaration not found").not.toBeNull();
+    const markers = [...(declared?.[1] ?? "").matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+    expect(markers.length).toBeGreaterThan(0);
+    expect([...SESSION_GONE_MARKERS]).toEqual(markers);
+  });
+
+  // [file, literal as written in Rust, the session is gone]
+  const ANSWERS: Array<[string, string, boolean]> = [
+    ["mod.rs", "Terminal session '{session_id}' not found", true],
+    ["mod.rs", "Terminal session is closed", true],
+    ["input.rs", "Terminal closed after writing {written} of {} input bytes", true],
+    ["executor.rs", "The terminal {name} has shut down: the terminal session is closed", true],
+    ["executor.rs", "{operation} was dropped before it ran: the terminal session is closed", true],
+    ["executor.rs", "The terminal {} queue is full ({} waiting); try again in a moment", false],
+    ["executor.rs", "{operation} panicked: {}", false],
+    ["executor.rs", "Could not start a terminal {name} thread: {error}", false],
+    ["input.rs", "Terminal input timed out after writing {written} of {} bytes; input was not retried", false],
+    ["input.rs", "Terminal input made no progress after {written} of {} bytes", false],
+    ["input.rs", "Terminal input failed after {written} of {} bytes: {e}", false],
+    ["mod.rs", "Terminal input is {} bytes; the per-write limit is {MAX_PTY_INPUT_BYTES}", false],
+    ["mod.rs", "Terminal is busy; the resize gave up after {}ms", false],
+    ["mod.rs", "Failed to resize terminal: {e}", false],
+  ];
+  for (const [file, literal, gone] of ANSWERS) {
+    it(`${gone ? "gone" : "not gone"}: ${literal}`, () => {
+      expect(rust(file), `${file} no longer says this; reclassify it here`).toContain(`"${literal}"`);
+      expect(sessionIsGone(literal)).toBe(gone);
+      expect(sessionIsGone(new Error(literal))).toBe(gone);
+      // Only the hard bound, never a backend answer, is fatal without being gone.
+      expect(inputIsDead(literal)).toBe(gone);
+    });
+  }
+
+  it("a full lane queue is reported and the next keystroke still goes out, in order", async () => {
+    const sent: string[] = [];
+    const onError = vi.fn();
+    let first = true;
+    const queue = createTerminalInput(async (data) => {
+      if (first) { first = false; throw new Error("The terminal input queue is full (64 waiting); try again in a moment"); }
+      sent.push(data);
+    }, onError);
+    queue.write("lost");
+    await queue.idle();
+    expect(onError).toHaveBeenCalledWith(expect.stringMatching(/^Some input was not delivered and was dropped\. .*queue is full/), false);
+    expect(queue.write("next")).toBe(true);
+    queue.write("after");
+    await queue.idle();
+    expect(sent.join("")).toBe("nextafter");
+  });
 });
