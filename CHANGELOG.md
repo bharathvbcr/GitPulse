@@ -70,6 +70,15 @@ before that tag is pushed.
   window is closed. A session that has finished is shown and is not counted.
 
 ### Changed
+- **Switching repository tabs no longer rebuilds the sidebar, the view shell
+  or the status bar.** All three were keyed on the active repository's path, so
+  every switch destroyed and recreated them. They now stay mounted and re-point
+  at the new repository; each part that holds state of its own (filters, open
+  menus, drafts, scroll offsets, worktree rows) resets it on the switch, and an
+  answer still in flight for the repository you left no longer lands in the one
+  you are looking at. The contents of each view panel are still rebuilt per
+  repository. One visible difference: the view's entrance fade no longer replays
+  on a switch.
 - **More than 24 repositories can be open at once.** Opening a twenty-fifth
   used to be refused with "Too many open repositories (max 24)", because every
   tab held one of 24 native file watches. Tabs and watches are now separate:
@@ -103,6 +112,10 @@ before that tag is pushed.
 
 ### Fixed
 
+- **A commit that finished after you switched repository tabs cleared the other
+  repository's message.** The commit box wiped the draft and the amend flag of
+  whichever repository was showing when the commit returned, not the one it ran
+  in. It now leaves the repository you are looking at alone.
 - **Black rectangles over the title bar and repository tab strip on macOS, staying until the pointer passed over them.** The WKWebView has a backdrop of its own between the page and the window's material, `underPageBackgroundColor`, and wry clears it only when a background colour is configured — `transparent: true` never reaches it. It stayed WebKit's opaque default (alpha 1.0, read off the live webview), so every region the page had not painted showed near-black instead of glass: tiles discarded while the window was inactive, occluded or on another Space, and the edge an elastic root dragged into view on a vertical swipe over the chrome. Both transparent windows now set a fully clear background colour, and the root no longer rubber-bands. The native material test reads the backdrop's alpha off the main and status webviews and fails against the old config.
 - **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
   Intelligence suggestion made every way off the task — another card, a tab,

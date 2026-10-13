@@ -93,7 +93,11 @@ describe("BranchList create-form safety", () => {
   it("bails out of suggestName when the repo changed mid-flight (race)", () => {
     const fn = source.slice(source.indexOf("async function suggestName"), source.indexOf("function openBranchMenu"));
     expect(fn).toContain("const repo = $repoStore.currentPath");
-    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBeGreaterThanOrEqual(2);
+    // The guard counts switches rather than comparing the endpoints: a path
+    // comparison lets A -> B -> A through, and BranchList outlives the switch.
+    expect(fn).toContain("const epoch = tabScope.epoch");
+    expect(fn.match(/!tabScope\.isCurrent\(epoch\)/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(fn).not.toMatch(/\$repoStore\.currentPath !== repo/);
   });
 });
 

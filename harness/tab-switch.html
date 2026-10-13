@@ -279,12 +279,17 @@
 
           // ---- 1. mount counts: the shell survives A -> B -> A -> B -------------
           const applePerSwitch = [];
+          const ipcPerSwitch = [];
           const sequence = [BETA, ALPHA, BETA];
           let lastProbes = first;
           for (const [i, target] of sequence.entries()) {
             const mark = calls.length;
             await switchTo(target);
-            applePerSwitch.push(calls.slice(mark).filter((c) => c.cmd === "cmd_apple_intelligence_status").length);
+            const issued = calls.slice(mark);
+            applePerSwitch.push(issued.filter((c) => c.cmd === "cmd_apple_intelligence_status").length);
+            const tally = {};
+            for (const call of issued) tally[call.cmd] = (tally[call.cmd] ?? 0) + 1;
+            ipcPerSwitch.push(`${issued.length} calls: ${Object.entries(tally).sort().map(([cmd, n]) => `${cmd.replace(/^cmd_/, "")}x${n}`).join(" ")}`);
             const now = probes();
             const label = `switch ${i + 1} (-> ${target.split("/").pop()})`;
             for (const key of PROBE_KEYS) {
@@ -367,6 +372,17 @@
           check("B -> A: alpha's draft is back (it is the session's), local filters are not", () =>
             textarea().value === "alpha draft" && fileFilter().value === "" && branchFilter().value === "");
 
+          // Which sections and folders are open is the list's own state, keyed by
+          // ids that two repositories share ("local"), so it must not follow.
+          const localHeader = () => $$("button", branchList()).find((b) => !b.closest(".chip-strip") && /^Local\s*\(/.test(text(b)));
+          localHeader()?.click();
+          await settle();
+          check("branches (alpha): collapsing the Local section hides its rows", () => !text(branchList()).includes("alpha-only"));
+          await switchTo(BETA);
+          check("branches: alpha's collapsed Local section does not hide beta's rows", () => text(branchList()).includes("beta-only"));
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+
           // ---- 4. an answer in flight for the repository left does not land -----
           const releaseGenerate = hold("cmd_ai_generate_commit_message", ALPHA);
           generateBtn().click();
@@ -423,7 +439,7 @@
             await wait(30);
           }
           const sorted = [...samples].sort((a, b) => a - b);
-          diagnostics = `switch settle over ${samples.length} A<->B switches: min ${sorted[0].toFixed(1)} ms, p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} ms, max ${sorted[sorted.length - 1].toFixed(1)} ms; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}`;
+          diagnostics = `switch settle over ${samples.length} A<->B switches: min ${sorted[0].toFixed(1)} ms, p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} ms, max ${sorted[sorted.length - 1].toFixed(1)} ms; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
           report_();
         } catch (error) {
           stopped(error);

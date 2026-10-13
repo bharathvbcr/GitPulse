@@ -84,7 +84,7 @@ There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/rep
 
 ## Why Fleet is not a view
 
-A `ViewTab` is stored on the **active repository's** session and its pane lives inside `{#key currentPath}`. Fleet answers a question about the **workspace**. If it were a view it would be scoped wrong and destroyed on every repo switch — taking the live terminal PTY with it.
+A `ViewTab` is stored on the **active repository's** session and its panel content is keyed on `currentPath` (in `ViewSectionPanel`). Fleet answers a question about the **workspace**. If it were a view it would be scoped wrong and destroyed on every repo switch — taking the live terminal PTY with it.
 
 Fleet is swapped by **hiding, never unmounting**. Open state is a UI preference, not part of the persisted workspace blob.
 
