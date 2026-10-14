@@ -190,3 +190,134 @@ pub async fn cmd_delete_path(
     })
     .await
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::harness::sidecar::{bind_test_binary, test_serial};
+    use crate::test_support::{git_in, git_repo, write};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A `manvi serve` stand-in that records every request after the handshake
+    /// and denies a file check for exactly one path.
+    const FAKE_DENY_ONE_PATH: &str = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "@REQUESTS@"
+  case "$line" in
+    *'"path":"@DENIED@"'*)
+      reply "$line" '{"action":"deny","rule":"scope.forbidden","severity":"hard","reason":"forbidden by the task","target":"@DENIED@","task_id":"TASK-DOC","demoted":"","degraded":[]}';;
+    *)
+      reply "$line" '{"action":"allow","rule":"","severity":"","reason":"","target":"","task_id":"","demoted":"","degraded":[]}';;
+  esac
+done
+"#;
+
+    /// A bound repository whose task forbids `docs/Guide.md`, behind a sidecar
+    /// that denies a write to `denied`.
+    fn bound_doc_repo(denied: &str) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        let dir = git_repo();
+        write(dir.path(), "docs/Guide.md", "# Guide\n\n[r](Roadmap.md)\n");
+        write(dir.path(), "docs/Roadmap.md", "# Roadmap\n");
+        write(dir.path(), "README.md", "[r](docs/Roadmap.md)\n");
+        git_in(dir.path(), &["add", "docs", "README.md"]);
+        git_in(dir.path(), &["commit", "-qm", "docs"]);
+        let repo = dir
+            .path()
+            .canonicalize()
+            .expect("canonical repository")
+            .to_str()
+            .expect("utf8")
+            .to_string();
+
+        let db = crate::tasks::store_path(&repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        dc_store::Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json,
+                     forbidden_changes_json, status)
+                 VALUES ('TASK-DOC', 'Docs', '',
+                     '[{\"path\":\"README.md\",\"allowed_change\":\"modify\"},
+                       {\"path\":\"docs/Roadmap.md\",\"allowed_change\":\"modify\"}]',
+                     '[\"docs/Guide.md\"]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        crate::ledger::bindings::bind(&repo, &repo, "TASK-DOC").expect("bind");
+
+        let requests = dir.path().join("requests.ndjson");
+        let script = dir.path().join("deny-one-manvi");
+        let body = FAKE_DENY_ONE_PATH
+            .replace("@REQUESTS@", &requests.display().to_string())
+            .replace("@DENIED@", denied);
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, repo, script)
+    }
+
+    fn file_requests(requests: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(requests)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|request| request["op"] == "policy.check.file")
+            .collect()
+    }
+
+    #[test]
+    fn a_forbidden_rewrite_path_refuses_the_rename_before_the_move() {
+        let (dir, repo, script) = bound_doc_repo("docs/Guide.md");
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let refused = docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md");
+        assert!(refused.is_err(), "a denied rewrite must refuse the rename");
+
+        // The judgement was made on the declared scope, for the file itself.
+        let asked = file_requests(&dir.path().join("requests.ndjson"));
+        let guide = asked
+            .iter()
+            .find(|request| request["params"]["path"] == "docs/Guide.md")
+            .unwrap_or_else(|| panic!("no file check for docs/Guide.md: {asked:?}"));
+        assert_eq!(guide["params"]["op"], "modify");
+        assert_eq!(guide["params"]["scope"]["task_id"], "TASK-DOC");
+        assert_eq!(guide["params"]["scope"]["forbidden_changes"][0], "docs/Guide.md");
+
+        // Nothing moved, nothing was written, nothing was staged.
+        assert!(dir.path().join("docs/Roadmap.md").exists());
+        assert!(!dir.path().join("plans").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("docs/Guide.md")).unwrap(),
+            "# Guide\n\n[r](Roadmap.md)\n"
+        );
+        let staged = crate::engine::git_cli::git_text(dir.path(), &["diff", "--cached", "--name-only"])
+            .unwrap();
+        assert_eq!(staged, "");
+    }
+
+    #[test]
+    fn an_allowed_rename_judges_the_move_and_each_path_it_writes() {
+        let (dir, repo, script) = bound_doc_repo("nothing/is/denied.md");
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let guarded =
+            docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md").expect("rename");
+        assert!(guarded.output.complete, "{:?}", guarded.output);
+
+        let asked: Vec<String> = file_requests(&dir.path().join("requests.ndjson"))
+            .iter()
+            .filter_map(|request| request["params"]["path"].as_str().map(String::from))
+            .collect();
+        for path in ["README.md", "docs/Guide.md"] {
+            assert!(asked.iter().any(|p| p == path), "{path} was not judged: {asked:?}");
+        }
+    }
+}
