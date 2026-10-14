@@ -25,6 +25,8 @@
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
 mod budget;
+#[cfg(test)]
+mod adversarial_tests;
 pub mod complete;
 pub mod devmap_parity;
 pub mod page;

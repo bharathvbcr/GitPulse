@@ -964,3 +964,70 @@ fn an_idle_server_does_not_wake_on_a_timer() {
     let (responses, _) = server.finish();
     assert!(responses.is_empty(), "nothing was asked: {responses:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial review of card 10: concurrency and a reader that vanishes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_oversized_responses_and_notifications_each_get_one_whole_line() {
+    let mut server = Server::start(&[("GITPULSE_MCP_MAX_RESPONSE_BYTES", "16384")]);
+    let mut input = String::new();
+    for n in 0..16 {
+        input.push_str(&request(json!(format!("big{n}")), "tools/list", json!({})));
+        input.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+        input.push_str(&request(
+            json!(format!("small{n}")),
+            "server/discover",
+            json!({}),
+        ));
+        input.push_str(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"nope\"}}\n",
+        );
+    }
+    server.write(input.as_bytes());
+    let (responses, status) = server.finish();
+    assert_eq!(status, Some(0));
+    for n in 0..16 {
+        let big = by_id(&responses, &json!(format!("big{n}")));
+        assert_eq!(big.len(), 1, "big{n} answered {} times", big.len());
+        assert_eq!(error_code(&big[0]), -32603, "{:?}", big[0]);
+        let small = by_id(&responses, &json!(format!("small{n}")));
+        assert_eq!(small.len(), 1, "small{n} answered {} times", small.len());
+    }
+}
+
+#[test]
+fn a_reader_that_closes_mid_frame_ends_the_server_promptly() {
+    let (_dir, repo) = repository_with_a_heavy_ledger();
+    let (mut server, mut stdout) = Server::start_undrained(&[]);
+    server.write(
+        request(
+            json!("page"),
+            "tools/call",
+            json!({
+                "name": "gitpulse_ledger_events",
+                "arguments": { "repo_path": repo, "limit": 1000 }
+            }),
+        )
+        .as_bytes(),
+    );
+    let mut head = [0u8; 100];
+    stdout.read_exact(&mut head).expect("the start of the frame");
+    drop(stdout);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = server.child.try_wait() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+    assert!(
+        exited,
+        "the server kept running after its reader closed mid-frame"
+    );
+}

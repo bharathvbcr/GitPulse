@@ -5113,3 +5113,6 @@ mod stamp_tests;
 
 #[cfg(test)]
 mod object_cap_tests;
+
+#[cfg(test)]
+mod adversarial_cap_tests;

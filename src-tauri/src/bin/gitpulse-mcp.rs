@@ -998,6 +998,158 @@ mod tests {
         assert!(!wire.broken.load(Ordering::Acquire));
     }
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Runs `probe` with `name` set to each of `values`, then restores it.
+    fn with_env(name: &str, values: &[&str], mut probe: impl FnMut(&str)) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = std::env::var(name).ok();
+        for value in values {
+            std::env::set_var(name, value);
+            probe(value);
+        }
+        match before {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    /// Attack 3: the test-only cap may only lower the cap.
+    #[test]
+    fn the_test_only_response_cap_can_never_raise_the_cap() {
+        with_env(
+            MAX_RESPONSE_ENV,
+            &[
+                "4194305",
+                "99999999999999",
+                "18446744073709551615",
+                "18446744073709551616",
+                "+99999999",
+                "-1",
+                "0",
+                "abc",
+                " 1",
+                "1e9",
+                "",
+            ],
+            |value| {
+                assert!(
+                    response_cap() <= MAX_FRAME_BYTES,
+                    "{value:?} raised the cap to {}",
+                    response_cap()
+                );
+            },
+        );
+    }
+
+    /// Attack 3: an unbounded write window is a hung session. 0 and garbage fall
+    /// back to the default; a huge value must be clamped, not honoured.
+    #[test]
+    fn the_write_timeout_is_bounded_whatever_the_environment_says() {
+        const CEILING: Duration = Duration::from_secs(10 * 60);
+        with_env(
+            WRITE_TIMEOUT_ENV,
+            &["0", "-1", "abc", "", "600000", "86400000", "99999999999", "18446744073709551615"],
+            |value| {
+                let window = write_timeout();
+                assert!(!window.is_zero(), "{value:?} gave a zero write window");
+                assert!(
+                    window <= CEILING,
+                    "{value:?} gave a {window:?} write window: a reader that stops reading hangs the session that long"
+                );
+            },
+        );
+    }
+
+    /// Attack 3, same helper: the per-request deadline is unbounded too.
+    #[test]
+    fn the_call_budget_is_bounded_whatever_the_environment_says() {
+        const CEILING: Duration = Duration::from_secs(60 * 60);
+        with_env(CALL_BUDGET_ENV, &["86400000", "18446744073709551615"], |value| {
+            let window = call_budget();
+            assert!(
+                window <= CEILING,
+                "{value:?} gave a {window:?} request deadline"
+            );
+        });
+    }
+
+    /// Attack 1: cap-1, cap and cap+1 on the whole line, newline included.
+    #[test]
+    fn the_whole_line_is_measured_at_cap_minus_one_cap_and_cap_plus_one() {
+        let response = result_of(json!(1), json!({ "blob": "x".repeat(600) }));
+        let size = serde_json::to_string(&response).unwrap().len() + 1;
+        for (cap, written) in [(size + 1, true), (size, true), (size - 1, false)] {
+            let sink = Captured::default();
+            let wire = Wire::with_limits(sink.clone(), cap, Duration::from_secs(1));
+            assert!(wire.send(&response), "cap {cap}");
+            let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+            assert!(text.ends_with('\n') && text.lines().count() == 1, "cap {cap}");
+            assert!(text.len() <= cap, "cap {cap}: wrote {} bytes", text.len());
+            let line: Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(line.get("result").is_some(), written, "cap {cap}: {line:.120}");
+            if !written {
+                assert_eq!(line["error"]["data"]["bytes"], size);
+            }
+        }
+    }
+
+    /// Attack 4: a reader that closes mid-frame ends the session, and nothing is
+    /// written after the failure.
+    #[test]
+    fn a_reader_that_closes_mid_frame_ends_the_session_and_nothing_more_is_written() {
+        struct Breaks(Arc<Mutex<usize>>);
+        impl io::Write for Breaks {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut written = self.0.lock().unwrap();
+                if *written >= 10 {
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                let take = bytes.len().min(10 - *written);
+                *written += take;
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let count = Arc::new(Mutex::new(0));
+        let wire = Wire::with_limits(Breaks(count.clone()), 4096, Duration::from_secs(1));
+        assert!(!wire.send(&result_of(json!(1), json!({ "a": "b".repeat(200) }))));
+        assert!(wire.broken.load(Ordering::Acquire));
+        assert!(!wire.send(&result_of(json!(2), json!({}))));
+        assert_eq!(*count.lock().unwrap(), 10);
+    }
+
+    /// Attack 4: a reader that takes one byte per interval is judged stalled once
+    /// the window passes, the session ends promptly, and the detached writer
+    /// finishes its line without a second frame ever following it.
+    #[test]
+    fn a_one_byte_at_a_time_reader_is_judged_stalled_and_no_second_frame_follows() {
+        #[derive(Clone, Default)]
+        struct Trickle(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Trickle {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(40));
+                self.0.lock().unwrap().push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Trickle::default();
+        let wire = Wire::with_limits(sink.clone(), 4096, Duration::from_millis(200));
+        let started = Instant::now();
+        assert!(!wire.send(&result_of(json!(1), json!({ "a": "b".repeat(60) }))));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(!wire.send(&result_of(json!(2), json!({ "second": true }))));
+        std::thread::sleep(Duration::from_secs(5));
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(!text.contains("second"));
+    }
+
     #[test]
     fn a_writer_that_stalls_past_the_write_window_ends_the_session() {
         struct Stalled;
