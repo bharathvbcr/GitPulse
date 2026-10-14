@@ -913,101 +913,122 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// part-way (a conflict, a timeout), so the next merge does not find it
     /// parked. It undoes only state this call created: the caller has proved,
     /// under the lock and before merging, that the checkout had no operation
-    /// and no unmerged entry, so a `MERGE_HEAD` or `SQUASH_MSG` that is there
-    /// now is this merge's. `merge --abort` for a merge, falling back to
+    /// and no unmerged entry, and `merged_tip` is the commit it merged, so a
+    /// `MERGE_HEAD` that names anything else is somebody else's merge and is
+    /// never aborted. `merge --abort` for a merge, falling back to
     /// `reset --merge`; `reset --merge` for a squash, which has no
     /// `MERGE_HEAD`. Unmerged entries with no marker are not this merge's (git
     /// writes a marker before it leaves any), so they are left alone and
     /// reported, never reset away. Other local changes survive either command.
     ///
-    /// Each command is put to `gate` first. A refusal does not stop it, since
-    /// leaving the checkout parked is worse and the gate allowed the merge this
-    /// undoes; the refusal is returned in the note (and in the error) so the
-    /// policy that said no is told what ran. Returns `Ok` only after
-    /// re-reading the repository and finding no operation and no unmerged
-    /// entry. Caller MUST hold the repository mutation lock.
+    /// Each command is put to `gate` first, and a refusal is honoured: it is
+    /// not run, and the refusal is the error, so what the audit trail records
+    /// as blocked did not run. The checkout is then left parked for a person.
+    /// Returns `Ok` only after re-reading the repository and finding no
+    /// operation and no unmerged entry. Caller MUST hold the repository
+    /// mutation lock.
     pub(crate) fn rollback_failed_merge_gated(
         repo: &Path,
+        merged_tip: &str,
         gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-    ) -> Result<Option<String>, String> {
-        Self::rollback_inner(repo, gate)
+    ) -> Result<(), String> {
+        Self::rollback_inner(repo, Some(merged_tip), gate)
     }
 
-    /// [`Self::rollback_failed_merge_gated`] with every command allowed.
+    /// [`Self::rollback_failed_merge_gated`] with every command allowed and
+    /// whatever `MERGE_HEAD` is there taken as this merge's.
     #[cfg(test)]
     pub(crate) fn rollback_failed_merge_locked(repo: &Path) -> Result<(), String> {
-        Self::rollback_inner(repo, &mut |_| Ok(())).map(drop)
+        Self::rollback_inner(repo, None, &mut |_| Ok(()))
     }
 
     fn rollback_inner(
         repo: &Path,
+        merged_tip: Option<&str>,
         gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<(), String> {
         use crate::engine::repo_op::{detect_kind, OperationKind};
-        let mut overruled: Vec<String> = Vec::new();
         let mut run = |args: &[&str]| -> Result<String, String> {
-            if let Err(reason) = gate(args) {
-                overruled.push(format!(
-                    "the gate refused `git {}` ({reason}), and it was run anyway to unpark the checkout",
+            gate(args).map_err(|reason| {
+                format!(
+                    "the gate refused `git {}`, so it was not run: {reason}",
                     args.join(" ")
-                ));
-            }
+                )
+            })?;
             git_text(repo, args)
         };
-        let outcome = (|| -> Result<(), String> {
-            match detect_kind(repo)? {
-                Some(OperationKind::Merge) => {
-                    if let Err(abort) = run(&["merge", "--abort"]) {
-                        run(&["reset", "--merge"]).map_err(|reset| {
+        // A refusal by the gate is final; any other failure may fall back.
+        let refused = |e: &str| e.starts_with("the gate refused");
+        match detect_kind(repo)? {
+            Some(OperationKind::Merge) => {
+                if let Some(tip) = merged_tip {
+                    let head = std::fs::read_to_string(
+                        crate::engine::git_cli::resolve_git_dir(repo)?.join("MERGE_HEAD"),
+                    )
+                    .map_err(|e| format!("could not read MERGE_HEAD: {e}"))?;
+                    if !head.trim().eq_ignore_ascii_case(tip) {
+                        return Err(format!(
+                            "the merge parked in the checkout is of {}, not of the {tip} this call merged, so it is not this call's and was left alone",
+                            head.trim()
+                        ));
+                    }
+                }
+                if let Err(abort) = run(&["merge", "--abort"]) {
+                    if refused(&abort) {
+                        return Err(abort);
+                    }
+                    run(&["reset", "--merge"]).map_err(|reset| {
+                        if refused(&reset) {
+                            reset
+                        } else {
                             format!(
                                 "`git merge --abort` failed ({abort}) and so did `git reset --merge` ({reset})"
                             )
-                        })?;
+                        }
+                    })?;
+                }
+            }
+            Some(OperationKind::SquashMerge) => {
+                run(&["reset", "--merge"]).map_err(|e| {
+                    if refused(&e) {
+                        e
+                    } else {
+                        format!("`git reset --merge` failed: {e}")
                     }
-                }
-                Some(OperationKind::SquashMerge) => {
-                    run(&["reset", "--merge"])
-                        .map_err(|e| format!("`git reset --merge` failed: {e}"))?;
-                }
-                Some(other) => {
-                    return Err(format!(
-                        "a {} is parked in the checkout, which this merge did not start; it was left alone",
-                        other.label()
-                    ));
-                }
-                None => {
-                    if !git_text(repo, &["ls-files", "--unmerged"])?
-                        .trim()
-                        .is_empty()
-                    {
-                        return Err("unmerged entries are in the index with no merge in progress, so they are not from this merge; they were left alone".into());
-                    }
+                })?;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "a {} is parked in the checkout, which this merge did not start; it was left alone",
+                    other.label()
+                ));
+            }
+            None => {
+                if !git_text(repo, &["ls-files", "--unmerged"])?
+                    .trim()
+                    .is_empty()
+                {
+                    return Err("unmerged entries are in the index with no merge in progress, so they are not from this merge; they were left alone".into());
                 }
             }
-            let mut left = Vec::new();
-            if let Some(kind) = detect_kind(repo)? {
-                left.push(format!("a {} is still in progress", kind.label()));
-            }
-            if !git_text(repo, &["ls-files", "--unmerged"])?
-                .trim()
-                .is_empty()
-            {
-                left.push("unmerged entries remain in the index".to_string());
-            }
-            if left.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "the checkout was not restored: {}",
-                    left.join("; ")
-                ))
-            }
-        })();
-        let note = (!overruled.is_empty()).then(|| overruled.join("; "));
-        match (outcome, note) {
-            (Ok(()), note) => Ok(note),
-            (Err(e), None) => Err(e),
-            (Err(e), Some(note)) => Err(format!("{e} ({note})")),
+        }
+        let mut left = Vec::new();
+        if let Some(kind) = detect_kind(repo)? {
+            left.push(format!("a {} is still in progress", kind.label()));
+        }
+        if !git_text(repo, &["ls-files", "--unmerged"])?
+            .trim()
+            .is_empty()
+        {
+            left.push("unmerged entries remain in the index".to_string());
+        }
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the checkout was not restored: {}",
+                left.join("; ")
+            ))
         }
     }
 
@@ -2775,6 +2796,13 @@ pub fn validate_oid(oid: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// True for a full-length object id: exactly 40 (SHA-1) or 64 (SHA-256) hex
+/// digits, the only form that names one commit for good. [`validate_oid`]
+/// accepts any 1 to 64 hex digits, abbreviations included; this does not.
+pub fn is_full_oid(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Validates a single revision argument supplied by the UI.
 ///
 /// Caller audit (all four call sites pass exactly one commit-ish each,
@@ -3087,10 +3115,11 @@ mod tests {
         assert!(!git_stdout(repo, &["ls-files", "--unmerged"]).is_empty());
     }
 
-    /// A gate that refuses the rollback is told it ran anyway, and the
-    /// checkout is still unparked.
+    /// A gate that refuses the rollback is honoured: asked once, the command
+    /// never runs (no fallback to `reset --merge` either), and the refusal is
+    /// the error. The conflict stays in the checkout.
     #[test]
-    fn rollback_runs_after_a_gate_refusal_and_says_so() {
+    fn rollback_is_not_run_when_the_gate_refuses_it() {
         let dir = conflicting_checkout();
         let repo = dir.path();
         assert!(
@@ -3099,17 +3128,58 @@ mod tests {
                 .success
         );
         let mut asked = Vec::new();
-        let note = GitWriter::rollback_failed_merge_gated(repo, &mut |argv: &[&str]| {
-            asked.push(argv.join(" "));
-            Err("policy: no resets".into())
-        })
-        .unwrap()
-        .expect("the refusal is recorded");
+        let refused = GitWriter::rollback_failed_merge_gated(
+            repo,
+            &git_stdout(repo, &["rev-parse", "side"]),
+            &mut |argv: &[&str]| {
+                asked.push(argv.join(" "));
+                Err("policy: no resets".into())
+            },
+        )
+        .unwrap_err();
         assert_eq!(asked, ["merge --abort"]);
         assert!(
-            note.contains("merge --abort") && note.contains("no resets"),
-            "{note}"
+            refused.contains("merge --abort")
+                && refused.contains("not run")
+                && refused.contains("no resets"),
+            "{refused}"
         );
+        assert!(repo.join(".git/MERGE_HEAD").exists());
+        assert!(!git_stdout(repo, &["ls-files", "--unmerged"]).is_empty());
+    }
+
+    /// A `MERGE_HEAD` that is not the commit this call merged is somebody
+    /// else's merge (it landed between our merge and the rollback). It is
+    /// named, and never aborted.
+    #[test]
+    fn rollback_never_aborts_a_merge_it_did_not_start() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["merge", "--no-edit", "side"])
+                .unwrap()
+                .success
+        );
+        let foreign = "b".repeat(40);
+        let mut asked = Vec::new();
+        let refused =
+            GitWriter::rollback_failed_merge_gated(repo, &foreign, &mut |argv: &[&str]| {
+                asked.push(argv.join(" "));
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            refused.contains("not of the") && refused.contains(&foreign),
+            "{refused}"
+        );
+        assert!(
+            asked.is_empty(),
+            "a foreign merge was put to the gate: {asked:?}"
+        );
+        assert!(repo.join(".git/MERGE_HEAD").exists());
+        // The tip it did merge is aborted.
+        let side = git_stdout(repo, &["rev-parse", "side"]);
+        GitWriter::rollback_failed_merge_gated(repo, &side, &mut |_| Ok(())).unwrap();
         checkout_is_clean(repo);
     }
 

@@ -11,7 +11,7 @@ use crate::engine::git_cli::{
     git_text, git_text_with_timeout, plain_path_text, resolve_git_common_dir, resolve_git_dir,
     validate_repo,
 };
-use crate::engine::git_writer::validate_oid;
+use crate::engine::git_writer::is_full_oid;
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
@@ -1909,8 +1909,7 @@ pub const BASE_RECORD: &str = "gitpulse-base";
 /// state, never in its files where `git status` would show it.
 pub fn write_base_record(worktree: &Path, branch: &str, oid: &str) -> Result<(), String> {
     validate_ref_name(branch)?;
-    validate_oid(oid)?;
-    if !matches!(oid.len(), 40 | 64) {
+    if !is_full_oid(oid) {
         return Err(format!(
             "{oid} is not a full commit id, so it is not recorded as a base"
         ));
@@ -1946,7 +1945,7 @@ fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, String>
     };
     validate_ref_name(branch).map_err(|e| corrupt(&e))?;
     // A full id only: an abbreviation is whatever git resolves it to today.
-    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_full_oid(oid) {
         return Err(corrupt(
             "the commit id is not a full 40 or 64 character hex id",
         ));
@@ -1970,8 +1969,11 @@ const REMOVE_BACKOFF: [Duration; MAX_REMOVE_ATTEMPTS - 1] =
 /// branch deletion. The caller used to ask once, up front, about
 /// `merge --ff-only <target>` — a command this never ran, and spelled without
 /// the program, so it was judged as a program named `merge` — and the three
-/// later mutations were not asked about at all. The restoring of a merge that
-/// conflicted is not asked about: it undoes what the gate had just allowed.
+/// later mutations were not asked about at all. Restoring a merge that
+/// conflicted is asked about too (`merge --abort`, or `reset --merge` for a
+/// squash). A refusal is honoured: nothing is run, and the error is a
+/// `Conflict` with `rolled_back: false` carrying the gate's reason, leaving
+/// the checkout parked for a person.
 ///
 /// `expected_tip` is the commit the caller verified the branch at. When it is
 /// given and the branch is anywhere else under the lock, nothing is merged.
@@ -2013,7 +2015,7 @@ fn merge_and_teardown_with(
     // The tip comes from the webview; it is a commit id or it is refused.
     let expected_tip = match expected_tip.map(str::trim) {
         None => None,
-        Some(tip) if tip.len() >= 40 && validate_oid(tip).is_ok() => Some(tip.to_ascii_lowercase()),
+        Some(tip) if is_full_oid(tip) => Some(tip.to_ascii_lowercase()),
         Some(tip) => {
             return Err(format!(
                 "The expected branch tip '{tip}' is not a full commit id; nothing was merged."
@@ -2105,6 +2107,21 @@ fn merge_and_teardown_with(
     // unfinished work. Merging over it would tangle the two, and rolling a
     // failure back would undo theirs.
     if let Some(kind) = crate::engine::repo_op::detect_kind(&repo)? {
+        // A squash probe that could not read the index says so; that is a
+        // read failure to report, not a squash known to be parked.
+        if kind == crate::engine::repo_op::OperationKind::SquashMerge {
+            let unread = crate::engine::repo_op::detect(&repo)?.and_then(|op| {
+                op.warnings
+                    .into_iter()
+                    .find(|w| w.starts_with(crate::engine::repo_op::SQUASH_READ_FAILURE))
+            });
+            if let Some(why) = unread {
+                return Err(format!(
+                    "The main checkout's index could not be read ({why}), so it cannot be shown free of a parked squash; nothing was merged."
+                )
+                .into());
+            }
+        }
         return Err(
             if kind == crate::engine::repo_op::OperationKind::SquashMerge {
                 MergeTeardownError::SquashParked {
@@ -2255,7 +2272,9 @@ fn merge_and_teardown_with(
         // force-deleted the branch whose work was never committed.
         GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(|failure| match failure {
             SquashFailure::Merge(e) => MergeTeardownError::Refused { message: e },
-            SquashFailure::Conflict(e) => failed_merge_error(gate, &repo, &branch, target, e),
+            SquashFailure::Conflict(e) => {
+                failed_merge_error(gate, &repo, &branch, target, &merged_tip, e)
+            }
             // Staged, not rolled back: `git reset --merge` is the user's call.
             SquashFailure::Commit(e) => MergeTeardownError::SquashParked {
                 message: format!("{e} The worktree and the branch {branch} were kept on {target}."),
@@ -2284,6 +2303,7 @@ fn merge_and_teardown_with(
                     &repo,
                     &branch,
                     target,
+                    &merged_tip,
                     format!("Merge failed (ff error: {ff_err}): {e}"),
                 ));
             }
@@ -2407,6 +2427,7 @@ fn failed_merge_error(
     repo: &Path,
     branch: &str,
     target: &str,
+    merged_tip: &str,
     cause: String,
 ) -> MergeTeardownError {
     let (paths, total, listing_error) = match crate::engine::repo_op::conflicted_paths(repo) {
@@ -2419,7 +2440,7 @@ fn failed_merge_error(
     let started = listing_error.is_some()
         || total > 0
         || !matches!(crate::engine::repo_op::detect_kind(repo), Ok(None));
-    let rollback = GitWriter::rollback_failed_merge_gated(repo, gate);
+    let rollback = GitWriter::rollback_failed_merge_gated(repo, merged_tip, gate);
     if !started && rollback.is_ok() {
         return MergeTeardownError::Refused {
             message: format!("Merging {branch} into {target} failed; nothing was changed: {cause}"),
@@ -2436,17 +2457,13 @@ fn failed_merge_error(
     } else {
         format!("failed part-way: {cause}")
     };
-    let (rolled_back, rollback_error, gate_note) = match rollback {
-        Ok(note) => (true, None, note),
-        Err(e) => (false, Some(e), None),
+    let (rolled_back, rollback_error) = match rollback {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
     };
     let outcome = match &rollback_error {
-        None => format!(
-            "It was rolled back; nothing was merged and the worktree and the branch were kept.{}",
-            gate_note
-                .map(|note| format!(" Note: {note}."))
-                .unwrap_or_default()
-        ),
+        None => "It was rolled back; nothing was merged and the worktree and the branch were kept."
+            .to_string(),
         Some(e) => format!(
             "It could not be rolled back ({e}): the main checkout is left in the middle of it. \
              Abort the merge there before merging anything else."
@@ -4883,6 +4900,30 @@ some-future-field whatever
         }
     }
 
+    /// A leftover `SQUASH_MSG` over an index that cannot be read is a read
+    /// failure to report, not a squash known to be parked.
+    #[test]
+    fn an_unreadable_index_under_a_squash_message_is_reported_as_unreadable() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        std::fs::write(
+            repo.join(".git/SQUASH_MSG"),
+            "Squashed commit of the following:\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".git/index"), b"not an index").unwrap();
+        let refused = teardown(&dir, &wt, false, None).unwrap_err();
+        let MergeTeardownError::Refused { message } = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            message.contains("could not be read")
+                && message.contains("could not tell whether a squash is staged"),
+            "{message}"
+        );
+        assert!(!message.contains("is parked"), "{message}");
+    }
+
     fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {
         cwds.iter()
             .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
@@ -5500,6 +5541,9 @@ some-future-field whatever
         let long65 = "a".repeat(65);
         let hex64 = "a".repeat(64);
         let hex41 = "a".repeat(41);
+        // Only a full id (exactly 40 or 64 hex digits) names a commit for good,
+        // so an odd length is refused as not-an-id, where it used to pass as an
+        // id that happened never to match and come back "Moved".
         for bad in [
             tip[..7].to_string(),
             tip[..39].to_string(),
@@ -5511,21 +5555,20 @@ some-future-field whatever
             format!("{tip}\n{tip}"),
             format!("{tip}\0"),
             long65,
+            hex41,
         ] {
             let r = teardown(&dir, &wt, false, Some(&bad));
             assert!(r.is_err(), "tip {bad:?} merged: {r:?}");
             assert_eq!(rev(repo, "main"), before, "tip {bad:?} moved main");
             assert!(wt.path().exists() && branch_exists(repo, "feature-x"));
         }
-        // 41..64 hex and 64 hex: not a sha1, never equal, so Moved, nothing merged.
-        for odd in [hex64, hex41] {
-            let r = teardown(&dir, &wt, false, Some(&odd));
-            assert!(
-                matches!(r, Err(MergeTeardownError::Moved { .. })),
-                "odd-length tip {odd}: {r:?}"
-            );
-            assert_eq!(rev(repo, "main"), before);
-        }
+        // 64 hex is a well-formed id, just not a sha1 tip: never equal, so Moved.
+        let r = teardown(&dir, &wt, false, Some(&hex64));
+        assert!(
+            matches!(r, Err(MergeTeardownError::Moved { .. })),
+            "64-hex tip: {r:?}"
+        );
+        assert_eq!(rev(repo, "main"), before);
         // Uppercase of the right tip is accepted (normalised).
         let r = teardown(&dir, &wt, false, Some(&tip.to_ascii_uppercase()));
         assert!(r.is_ok(), "uppercase tip refused: {r:?}");
@@ -6269,8 +6312,10 @@ some-future-field whatever
     /// Originally `adv_the_rollback_runs_commands_the_gate_never_saw`, which
     /// recorded the bypass: the rollback's `merge --abort` / `reset --merge`
     /// ran without the gate being asked. It flipped when the rollback was put
-    /// to the gate. A refusal does not stop the rollback (leaving main parked
-    /// is worse, and the gate allowed the merge it undoes); it is recorded.
+    /// to the gate, and then flipped again on review: a refusal is honoured,
+    /// not overruled, because running a command the ledger recorded as
+    /// blocked makes the audit trail false. Main is left parked, the wave
+    /// halts on the `conflict` code, and the error carries the gate's reason.
     #[test]
     fn adv_the_rollback_is_shown_to_the_gate() {
         let (dir, wt) = conflicting_fixture();
@@ -6296,46 +6341,68 @@ some-future-field whatever
         );
         main_checkout_is_idle(repo);
 
-        // A gate that refuses the rollback is overruled, and says so.
-        let (dir, wt) = conflicting_fixture();
-        let repo = dir.path();
-        let refused = merge_and_teardown_worktree(
-            repo.to_str().unwrap(),
-            wt.path().to_str().unwrap(),
-            Some("main"),
-            false,
-            None,
-            &mut |argv: &[&str]| {
-                if argv.contains(&"--abort") || argv.contains(&"reset") {
-                    Err("policy: no aborts".into())
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .unwrap_err();
-        let MergeTeardownError::Conflict {
-            message,
-            rolled_back,
-            ..
-        } = refused
-        else {
-            panic!("{refused:?}");
-        };
-        assert!(rolled_back, "{message}");
-        assert!(
-            message.contains("the gate refused") && message.contains("no aborts"),
-            "{message}"
-        );
-        main_checkout_is_idle(repo);
+        // A gate that refuses the rollback is honoured: the command is asked
+        // about, never run, and the error says why. Main stays parked.
+        for squash in [false, true] {
+            let (dir, wt) = conflicting_fixture();
+            let repo = dir.path();
+            let mut asked: Vec<String> = Vec::new();
+            let refused = merge_and_teardown_worktree(
+                repo.to_str().unwrap(),
+                wt.path().to_str().unwrap(),
+                Some("main"),
+                squash,
+                None,
+                &mut |argv: &[&str]| {
+                    asked.push(argv.join(" "));
+                    if argv.contains(&"--abort") || argv.contains(&"reset") {
+                        Err("policy: no aborts".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            let MergeTeardownError::Conflict {
+                message,
+                rolled_back,
+                rollback_error,
+                ..
+            } = refused
+            else {
+                panic!("{refused:?}");
+            };
+            assert!(!rolled_back, "squash={squash}: {message}");
+            let reason = rollback_error.expect("the refusal is the rollback error");
+            assert!(
+                reason.contains("the gate refused") && reason.contains("no aborts"),
+                "{reason}"
+            );
+            assert!(
+                asked
+                    .iter()
+                    .any(|a| a == "merge --abort" || a == "reset --merge"),
+                "squash={squash}: the rollback was never put to the gate: {asked:?}"
+            );
+            // Nothing ran: the conflict is still in the checkout.
+            assert!(
+                crate::engine::repo_op::detect_kind(repo).unwrap().is_some(),
+                "squash={squash}: the refused rollback ran anyway"
+            );
+            assert!(!git_text(repo, &["ls-files", "--unmerged"])
+                .unwrap()
+                .trim()
+                .is_empty());
+        }
     }
 
-    /// A gate that refuses `reset` (a policy where reset is denied) cannot
-    /// stop the no-marker rollback from running `reset --merge` on a user's
-    /// unmerged index. The merge itself is refused by git first, so the only
-    /// way to get there is through the stash-pop state.
+    /// Originally `adv_a_gate_that_denies_reset_still_sees_a_reset_run`: with
+    /// the user's own unmerged index (a conflicted stash pop) in the main
+    /// checkout, a marker-less rollback used to `reset --merge` it away even
+    /// under a gate that denies reset. The merge is now refused up front, so
+    /// no reset is ever asked for or run, whatever the gate says.
     #[test]
-    fn adv_a_gate_that_denies_reset_still_sees_a_reset_run() {
+    fn adv_a_denied_reset_never_runs_on_a_users_unmerged_index() {
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
         std::fs::write(repo.join("README.md"), "stashed side\n").unwrap();

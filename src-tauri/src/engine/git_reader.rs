@@ -1534,7 +1534,7 @@ impl GitReader {
             COMMIT_SHOW_FORMAT,
             commit_id,
         ];
-        let (stdout, cut) = if is_full_oid(commit_id) {
+        let (stdout, cut) = if crate::engine::git_writer::is_full_oid(commit_id) {
             ref_cache::git_text_capped(&repo, &[], &args, cap)?
         } else {
             git_text_capped(&repo, &args, cap)?
@@ -4674,12 +4674,6 @@ const COMMIT_SHOW_FORMAT: &str =
 
 /// Fields in [`COMMIT_SHOW_FORMAT`].
 const COMMIT_SHOW_FIELDS: usize = 11;
-
-/// True for a full-length object id (SHA-1 or SHA-256): the only form that
-/// names one commit for good. `validate_oid` has already vouched for the hex.
-fn is_full_oid(oid: &str) -> bool {
-    matches!(oid.len(), 40 | 64)
-}
 
 /// Splits `git show --numstat -z` output, metadata then records, into the
 /// commit payload.

@@ -22,6 +22,7 @@
  */
 
 import { MergeTeardownFailure } from "../branches/mergeTeardown";
+import { formatError } from "../ui/formatError";
 
 export const DEFAULT_WAVE_SIZE = 3;
 export const MAX_WAVE_SIZE = 5;
@@ -389,14 +390,8 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   };
 }
 
+/** What the person reads in a member's detail: the canonical rendering of a failure (`formatError`, which reads a typed `{code, message}` rejection), bounded. */
 function message(cause: unknown): string {
-  let text: string;
-  if (cause instanceof Error) text = cause.message;
-  else if (cause !== null && typeof cause === "object") {
-    // A typed host rejection is `{code, message, ...}`; never "[object Object]".
-    const said = (cause as { message?: unknown }).message;
-    if (typeof said === "string" && said) text = said;
-    else { try { text = JSON.stringify(cause) ?? String(cause); } catch { text = Object.prototype.toString.call(cause); } }
-  } else text = String(cause);
+  const text = formatError(cause);
   return text.length > 400 ? `${text.slice(0, 399)}…` : text;
 }

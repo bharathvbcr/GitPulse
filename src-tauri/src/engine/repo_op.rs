@@ -309,6 +309,10 @@ fn classify<'a>(
     Ok(None)
 }
 
+/// The warning a squash probe leaves when it could not read the index, so a
+/// caller can tell "a squash is parked" from "could not tell".
+pub(crate) const SQUASH_READ_FAILURE: &str = "could not tell whether a squash is staged";
+
 /// Whether the index differs from HEAD, which is what makes a `SQUASH_MSG` a
 /// squash waiting to be committed. A read that could not be made counts as
 /// staged, with a warning: an unreadable index must not read as idle.
@@ -318,14 +322,14 @@ fn squash_is_staged(repo: &Path, warnings: &mut Vec<String>) -> bool {
         Ok(run) if run.status_code == 1 => true,
         Ok(run) => {
             warnings.push(format!(
-                "could not tell whether a squash is staged (git exit {}): {}",
+                "{SQUASH_READ_FAILURE} (git exit {}): {}",
                 run.status_code,
                 String::from_utf8_lossy(&run.stderr).trim()
             ));
             true
         }
         Err(err) => {
-            warnings.push(format!("could not tell whether a squash is staged: {err}"));
+            warnings.push(format!("{SQUASH_READ_FAILURE}: {err}"));
             true
         }
     }
