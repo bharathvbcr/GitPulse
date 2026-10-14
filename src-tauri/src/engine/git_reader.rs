@@ -1,6 +1,7 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
+use crate::engine::commit_signature::{read_walk_signatures, CommitSignature, WalkSignatures};
 use crate::engine::git_cli::{
     self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
     sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
@@ -240,7 +241,6 @@ pub struct CommitDetails {
     pub committer_date: String,
     pub summary: String,
     pub body: String,
-    pub gpg_status: String,
     pub co_authors: Vec<String>,
     pub changed_files: Vec<CommitFileChange>,
     pub total_additions: usize,
@@ -359,8 +359,8 @@ pub const MAX_PULSE_COMMITS: usize = 25_000;
 /// this repository alone puts 532 commits in the default 90 days and 216 in
 /// *seven*, so the rate was quoted over the most recent 38% of the window with
 /// nothing saying so. The cap bought nothing — measured over a 25,000-commit
-/// history with every commit in the window, `git log --since --format=%s%x00%ct`
-/// costs 0.01s at `-n 200` and 0.07s uncapped, against the 0.32s the lead-time
+/// history with every commit in the window, a date-bounded
+/// `git log --format=%s%x00%ct` costs 0.01s at `-n 200` and 0.07s uncapped, against the 0.32s the lead-time
 /// loop already spends spawning `git describe --tags --contains` thirty times.
 /// Matching [`MAX_PULSE_COMMITS`] keeps a real bound on pathological histories
 /// while covering every repository anyone is likely to open, and the scan still
@@ -376,7 +376,11 @@ pub struct PulseCommitSummary {
     pub summary: String,
     pub author_name: String,
     pub author_email: String,
-    pub gpg_status: String,
+    /// Whether the commit carries a signature, read from its object: "signed
+    /// (not verified)". Verification runs the user's signing program, which
+    /// a walk over thousands of commits must never do; the selected commit's
+    /// verdict comes from `cmd_verify_commit_signature`.
+    pub signature: CommitSignature,
     pub additions: usize,
     pub deletions: usize,
     pub files_changed: usize,
@@ -1723,7 +1727,6 @@ impl GitReader {
             &[
                 "log",
                 limit.as_str(),
-                "--no-show-signature",
                 "--format=%H%x00%ct%x00%an%x00%s",
                 &head,
                 &not_target,
@@ -1910,7 +1913,7 @@ impl GitReader {
             "--numstat",
             // `%b` is required: Co-authored-by trailers live in the body, never
             // in `%s`. A metric that can only ever be zero is not a metric.
-            "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%G?%x00%s%x00%aN%x00%aE%x00%b%x00",
+            "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%s%x00%aN%x00%aE%x00%b%x00",
         ];
         // The same named ref set the graph walks. Contributor counts and churn
         // are claims about what people did; a `--all` walk credits them with
@@ -1918,28 +1921,53 @@ impl GitReader {
         // which is a metric measuring the tooling rather than the team.
         args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
 
-        let (stdout, payload_incomplete) =
-            match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
-                Ok(out) => out,
-                Err(e) => {
-                    if is_unborn_head_error(&e) {
-                        return Ok(PulseReport {
-                            commits: Vec::new(),
-                            top_files_by_churn: Vec::new(),
-                            extensions: Vec::new(),
-                            has_mailmap,
-                            total_commits_scanned: 0,
-                            truncated: false,
-                            payload_truncated: false,
-                            payload_truncation_reason: None,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                        });
-                    }
-                    return Err(e);
+        // Signature presence comes from the commit objects' own headers, read
+        // by a `rev-list --header` over the same refs that runs beside the log
+        // instead of after it (a `cat-file --batch` fed the log's ids cost a
+        // whole extra process on the critical path). No `%G` placeholder can
+        // say "signed" without running the verifier, and `--pretty=raw` skips
+        // `--use-mailmap`, so the log keeps its own format.
+        let mut header_args = vec!["rev-list", count_arg.as_str(), "--topo-order", "--header"];
+        header_args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
+        let admission = git_cli::current_admission();
+        let (log, signatures) = std::thread::scope(|scope| {
+            let headers = scope.spawn(|| {
+                git_cli::with_admission(admission, || read_walk_signatures(&repo, &header_args))
+            });
+            let log = git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES);
+            // A reader that panicked is a walk with no signatures read: every
+            // commit is `Unknown`, never `None`.
+            let signatures = headers.join().unwrap_or_else(|_| WalkSignatures {
+                signatures: HashMap::new(),
+                failure: Some("the signature reader panicked".into()),
+            });
+            (log, signatures)
+        });
+        if let Some(why) = &signatures.failure {
+            log::warn!(target: "pulse", "pulse signatures for {}: {why}", repo.display());
+        }
+        let (stdout, payload_incomplete) = match log {
+            Ok(out) => out,
+            Err(e) => {
+                if is_unborn_head_error(&e) {
+                    return Ok(PulseReport {
+                        commits: Vec::new(),
+                        top_files_by_churn: Vec::new(),
+                        extensions: Vec::new(),
+                        has_mailmap,
+                        total_commits_scanned: 0,
+                        truncated: false,
+                        payload_truncated: false,
+                        payload_truncation_reason: None,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
                 }
-            };
+                return Err(e);
+            }
+        };
 
-        let captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
+        let mut captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
+        apply_signatures(&mut captured.commits, signatures.signatures);
         Ok(PulseReport {
             commits: captured.commits,
             top_files_by_churn: captured.top_files,
@@ -2207,29 +2235,41 @@ impl GitReader {
     }
 
     pub fn dora_report(repo_path: &str, window_days: Option<u32>) -> Result<DoraReport, String> {
-        Self::dora_report_scanning(repo_path, window_days, MAX_DORA_SCAN_COMMITS)
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Self::dora_report_scanning(
+            repo_path,
+            window_days,
+            MAX_DORA_SCAN_COMMITS,
+            now_secs,
+            DateWalk::from_preflight(),
+        )
     }
 
-    /// [`Self::dora_report`] with the commit-scan cap injected.
+    /// [`Self::dora_report`] with the commit-scan cap, "now" and the date-walk
+    /// strategy injected.
     ///
     /// The cap exists to bound a pathological history, so in production it sits
     /// far above any real window — which would leave the truncation signal
     /// untestable, because no fixture repository can reach 25,000 commits. A
     /// signal whose reporting path never runs in a test is the same unexamined
     /// -reads-as-verified failure it was added to prevent, so the cap is a
-    /// parameter and the tests drive the real scan with a small one.
+    /// parameter and the tests drive the real scan with a small one. `now_secs`
+    /// is one clock for the tag window and the commit window alike (git's own
+    /// `--since=N.days` read a second one), and `walk` lets a test take the
+    /// path an old git would, on a git that has both.
     fn dora_report_scanning(
         repo_path: &str,
         window_days: Option<u32>,
         max_scan_commits: usize,
+        now_secs: i64,
+        walk: DateWalk,
     ) -> Result<DoraReport, String> {
         let repo = validate_repo(repo_path)?;
         let started = Instant::now();
         let window = window_days.unwrap_or(90).clamp(7, 365);
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         let since_secs = now_secs.saturating_sub((window as i64) * 86400);
 
         let stdout = match git_text(
@@ -2372,43 +2412,33 @@ impl GitReader {
             "Low".to_string()
         };
 
-        let since_arg = format!("--since={window}.days");
-        let scan_limit = max_scan_commits.to_string();
-        let log_stdout = dora_git(
-            &repo,
-            started,
-            &["log", "-n", &scan_limit, &since_arg, "--format=%s%x00%ct"],
-            "the commit scan",
-        )?;
+        let scan = dora_commit_scan(&repo, started, walk, since_secs, max_scan_commits)?;
 
         let mut total_commits = 0usize;
         let mut revert_or_fix_commits = 0usize;
         let mut restore_times_hours: Vec<f64> = Vec::new();
         let mut prev_time: Option<i64> = None;
 
-        for line in log_stdout.lines() {
-            let parts: Vec<&str> = line.split('\0').collect();
-            if parts.len() >= 2 {
-                total_commits += 1;
-                let subject = parts[0].to_lowercase();
-                let commit_ts: i64 = parts[1].parse().unwrap_or(0);
+        for (subject, commit_ts) in &scan.rows {
+            total_commits += 1;
+            let subject = subject.to_lowercase();
+            let commit_ts = *commit_ts;
 
-                let is_failure_remedy = subject.starts_with("revert")
-                    || subject.contains("hotfix")
-                    || subject.starts_with("fix:")
-                    || subject.starts_with("fix(");
+            let is_failure_remedy = subject.starts_with("revert")
+                || subject.contains("hotfix")
+                || subject.starts_with("fix:")
+                || subject.starts_with("fix(");
 
-                if is_failure_remedy {
-                    revert_or_fix_commits += 1;
-                    if let Some(prev) = prev_time {
-                        let diff_h = ((prev - commit_ts).abs() as f64) / 3600.0;
-                        if diff_h > 0.0 && diff_h < 720.0 {
-                            restore_times_hours.push(diff_h);
-                        }
+            if is_failure_remedy {
+                revert_or_fix_commits += 1;
+                if let Some(prev) = prev_time {
+                    let diff_h = ((prev - commit_ts).abs() as f64) / 3600.0;
+                    if diff_h > 0.0 && diff_h < 720.0 {
+                        restore_times_hours.push(diff_h);
                     }
                 }
-                prev_time = Some(commit_ts);
             }
+            prev_time = Some(commit_ts);
         }
 
         let cfr_pct = if total_commits > 0 {
@@ -2420,25 +2450,8 @@ impl GitReader {
             0.0
         };
 
-        // Only a scan that reached the cap can have been cut, so the second git
-        // call is paid for only then; every repository under the cap — which is
-        // all but the pathological ones — costs nothing. `rev-list --count` and
-        // `log` are given the same `--since`, so they prune the walk the same
-        // way and their counts describe one population; comparing a differently
-        // filtered total against this sample would invent truncation.
-        let reached_cap = total_commits >= max_scan_commits;
-        let window_commits = if reached_cap {
-            git_text(&repo, &["rev-list", "--count", &since_arg, "HEAD"])
-                .ok()
-                .and_then(|out| out.trim().parse::<usize>().ok())
-        } else {
-            None
-        };
-        // A count that could not be read must not report the scan complete:
-        // reaching the cap is itself evidence the walk stopped early.
-        let commit_scan_truncated =
-            window_commits.map_or(reached_cap, |total| total > total_commits);
-        let commit_scan_window_commits = commit_scan_truncated.then_some(window_commits).flatten();
+        let commit_scan_truncated = scan.truncated;
+        let commit_scan_window_commits = scan.window_commits;
 
         restore_times_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mttr_hours = if !restore_times_hours.is_empty() {
@@ -2475,6 +2488,128 @@ fn is_unborn_head_error(error: &str) -> bool {
         || msg.contains("bad default revision 'head'")
         || msg.contains("fatal: your current branch")
         || msg.contains("fatal: needed a single revision")
+}
+
+/// How the DORA commit scan bounds itself by date.
+///
+/// Plain `--since` is not an option for either: it ends the walk at the first
+/// commit older than the cutoff, so one commit with an inverted committer date
+/// (`--committer-date-is-author-date`, imported or rewritten history, a skewed
+/// clock) hides every in-window commit behind it, and the truncation probe,
+/// given the same flag, prunes identically and reports the short answer as
+/// complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateWalk {
+    /// `--since-as-filter=<epoch>` (git 2.37): the walk continues past old
+    /// commits and only filters them from the output, so `-n` counts in-window
+    /// commits and a separate `rev-list --count` gives the true window size.
+    SinceAsFilter,
+    /// An older git has no such flag. The walk is bounded by count alone
+    /// (`-n cap+1`, no date flag) and the window is applied here, to the
+    /// committer dates git printed. The sample is the in-window rows among the
+    /// first `cap`; any further row is reported as a possibly-cut window (the
+    /// walk has no date bound to say nothing in the window lies behind it); the true window
+    /// size is not known and is not claimed.
+    CountBounded,
+}
+
+impl DateWalk {
+    /// The strategy the git this app drives supports. Fails closed to
+    /// [`Self::CountBounded`]: a git that could not be probed is not assumed
+    /// to know the flag.
+    fn from_preflight() -> Self {
+        if git_cli::git_supports(git_cli::SINCE_AS_FILTER) {
+            Self::SinceAsFilter
+        } else {
+            Self::CountBounded
+        }
+    }
+}
+
+/// The commits of a DORA window as `(subject, committer epoch)` rows, newest
+/// walk-order first, and what is known about the rows the cap cut.
+struct DoraCommitScan {
+    rows: Vec<(String, i64)>,
+    truncated: bool,
+    /// The true count of commits in the window, only when it was read and the
+    /// scan was cut short of it.
+    window_commits: Option<usize>,
+}
+
+/// Reads the commits at or after `since_secs`, at most `cap` of them.
+///
+/// A scan that reached the cap can have been cut, so the second git call (the
+/// window's true size) is paid for only then. The count and the log are given
+/// the same date flag so they describe one population; comparing a
+/// differently filtered total against the sample would invent truncation.
+fn dora_commit_scan(
+    repo: &Path,
+    started: Instant,
+    walk: DateWalk,
+    since_secs: i64,
+    cap: usize,
+) -> Result<DoraCommitScan, String> {
+    let parse = |stdout: &str| -> Vec<(String, i64)> {
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let (subject, ts) = line.split_once('\0')?;
+                Some((subject.to_string(), ts.trim().parse().unwrap_or(0)))
+            })
+            .collect()
+    };
+    match walk {
+        DateWalk::SinceAsFilter => {
+            let since_arg = format!("--since-as-filter={since_secs}");
+            let limit = cap.to_string();
+            let stdout = dora_git(
+                repo,
+                started,
+                &["log", "-n", &limit, &since_arg, "--format=%s%x00%ct"],
+                "the commit scan",
+            )?;
+            let rows = parse(&stdout);
+            let reached_cap = rows.len() >= cap;
+            let window_commits = if reached_cap {
+                git_text(repo, &["rev-list", "--count", &since_arg, "HEAD"])
+                    .ok()
+                    .and_then(|out| out.trim().parse::<usize>().ok())
+            } else {
+                None
+            };
+            // A count that could not be read must not report the scan
+            // complete: reaching the cap is itself evidence the walk stopped
+            // early.
+            let truncated = window_commits.map_or(reached_cap, |total| total > rows.len());
+            Ok(DoraCommitScan {
+                window_commits: truncated.then_some(window_commits).flatten(),
+                truncated,
+                rows,
+            })
+        }
+        DateWalk::CountBounded => {
+            let limit = cap.saturating_add(1).to_string();
+            let stdout = dora_git(
+                repo,
+                started,
+                &["log", "-n", &limit, "--format=%s%x00%ct"],
+                "the commit scan",
+            )?;
+            let mut rows = parse(&stdout);
+            // A row past the cap means the walk stopped before the end of history, and
+            // without a date bound it cannot be said that nothing in the window lies
+            // behind it (an inverted date can put one anywhere): "possibly cut" is
+            // reported as cut, never as complete.
+            let truncated = rows.len() > cap;
+            rows.truncate(cap);
+            rows.retain(|(_, ts)| *ts >= since_secs);
+            Ok(DoraCommitScan {
+                rows,
+                truncated,
+                window_commits: None,
+            })
+        }
+    }
 }
 
 /// Wall-clock budget for one DORA report across all of its git reads.
@@ -2540,6 +2675,22 @@ fn extract_extension(path: &str) -> String {
             }
             "other".to_string()
         })
+}
+
+/// Stamps each pulse row with the signature the header read found for it.
+///
+/// The log and the header read are two walks over the same refs, so the refs
+/// can move between them: a row the header read did not see is `Unknown`, never
+/// `None`, and a header entry for a commit the log did not return is ignored.
+fn apply_signatures(
+    commits: &mut [PulseCommitSummary],
+    mut found: HashMap<String, CommitSignature>,
+) {
+    for commit in commits {
+        commit.signature = found
+            .remove(&commit.sha)
+            .unwrap_or(CommitSignature::Unknown);
+    }
 }
 
 #[derive(Debug)]
@@ -2611,7 +2762,7 @@ pub(crate) fn parse_pulse_stream(
             continue;
         }
 
-        let mut fields = chunk.splitn(9, '\0');
+        let mut fields = chunk.splitn(8, '\0');
         let sha = match fields.next().map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
             None => continue,
@@ -2622,7 +2773,6 @@ pub(crate) fn parse_pulse_stream(
             .next()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
-        let gpg_status = fields.next().unwrap_or("N").trim().to_string();
         let summary = fields.next().unwrap_or("").trim().to_string();
         let author_name = fields.next().unwrap_or("").trim().to_string();
         let author_email = fields.next().unwrap_or("").trim().to_string();
@@ -2686,7 +2836,8 @@ pub(crate) fn parse_pulse_stream(
             summary,
             author_name,
             author_email,
-            gpg_status,
+            // Not in the log stream: `pulse_report` fills it from the objects.
+            signature: CommitSignature::Unknown,
             additions: commit_adds,
             deletions: commit_dels,
             files_changed: commit_files,
@@ -4670,10 +4821,10 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
 /// The body is last and free text, but git cannot put a NUL in a message, so
 /// the Nth NUL is always the end of field N.
 const COMMIT_SHOW_FORMAT: &str =
-    "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%G?%x00%s%x00%b";
+    "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%s%x00%b";
 
 /// Fields in [`COMMIT_SHOW_FORMAT`].
-const COMMIT_SHOW_FIELDS: usize = 11;
+const COMMIT_SHOW_FIELDS: usize = 10;
 
 /// Splits `git show --numstat -z` output, metadata then records, into the
 /// commit payload.
@@ -4703,7 +4854,7 @@ fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDet
     } else {
         records
     };
-    let body = fields[10].trim().to_string();
+    let body = fields[9].trim().to_string();
     let mut changed_files = parse_numstat_files(records);
     // Summed over the full list, before the cap below cuts it: summing the
     // truncated slice would understate a huge commit's churn silently.
@@ -4727,8 +4878,7 @@ fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDet
         committer_name: fields[5].to_string(),
         committer_email: fields[6].to_string(),
         committer_date: fields[7].to_string(),
-        gpg_status: fields[8].to_string(),
-        summary: fields[9].to_string(),
+        summary: fields[8].to_string(),
         co_authors: parse_co_authors(&body),
         body,
         changed_files,
@@ -8802,7 +8952,7 @@ mod tests {
     #[test]
     fn parse_pulse_stream_extracts_commits_and_churn() {
         let sample = "\
-__GP_PULSE__\0abc123\0def456 789012\x001700000000\0G\0feat: initial pulse\0Alice Dev\0alice@example.com\0\
+__GP_PULSE__\0abc123\0def456 789012\x001700000000\0feat: initial pulse\0Alice Dev\0alice@example.com\0\
 Signed-off-by: Alice Dev <alice@example.com>\n\
 Co-authored-by: Bob Coder <bob@example.com>\n\
 Co-authored-by: Cara <cara@example.com>\0\
@@ -8810,11 +8960,11 @@ Co-authored-by: Cara <cara@example.com>\0\
 5\t0\tREADME.md\n\
 -\t-\tlogo.png\n\
 \n\
-__GP_PULSE__\0def456\0\x001699990000\0N\0Revert \"bad commit\"\0Bob Coder\0bob@example.com\0\0\
+__GP_PULSE__\0def456\0\x001699990000\0Revert \"bad commit\"\0Bob Coder\0bob@example.com\0\0\
 3\t8\tsrc/lib/util.ts\n\
 1\t1\tconfig.json => config.dist.json\n\
 \n\
-__GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\0cara@example.com\0\0\
+__GP_PULSE__\0aaa111\0bbb222\x001699980000\0revert(api): drop the flag\0Cara\0cara@example.com\0\0\
 -\t-\tassets/icon.bin\n\
 ";
         let (commits, top_files, extensions) = parse_pulse_stream(sample);
@@ -8827,7 +8977,11 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
         assert!(c1.is_merge);
         assert!(!c1.is_revert);
         assert_eq!(c1.timestamp, 1700000000);
-        assert_eq!(c1.gpg_status, "G");
+        assert_eq!(
+            c1.signature,
+            CommitSignature::Unknown,
+            "the log stream carries no signature field; pulse_report fills it from the objects"
+        );
         assert_eq!(c1.summary, "feat: initial pulse");
         assert_eq!(c1.author_name, "Alice Dev");
         assert_eq!(c1.author_email, "alice@example.com");
@@ -8849,7 +9003,6 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
         assert!(c2.parents.is_empty());
         assert!(!c2.is_merge);
         assert!(c2.is_revert);
-        assert_eq!(c2.gpg_status, "N");
         assert_eq!(c2.additions, 4);
         assert_eq!(c2.deletions, 9);
         assert_eq!(c2.files_changed, 2);
@@ -8899,10 +9052,10 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
 
     fn two_commit_pulse_log() -> String {
         "\
-__GP_PULSE__\0abc123\0\x001700000000\0N\0first\0Ada\0ada@example.com\0\0\
+__GP_PULSE__\0abc123\0\x001700000000\0first\0Ada\0ada@example.com\0\0\
 1\t0\ta.rs\n\
 \n\
-__GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
+__GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 2\t0\tb.rs\n\
 "
         .to_string()
@@ -9248,7 +9401,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(12);
         let path = dir.path().to_str().unwrap();
 
-        let report = GitReader::dora_report_scanning(path, Some(90), 4)
+        let report = dora_scanning(path, Some(90), 4)
             .expect("dora_report should succeed on a seeded repository");
 
         assert_eq!(
@@ -9280,7 +9433,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(5);
         let path = dir.path().to_str().unwrap();
 
-        let report = GitReader::dora_report_scanning(path, Some(90), 4_096)
+        let report = dora_scanning(path, Some(90), 4_096)
             .expect("dora_report should succeed on a seeded repository");
 
         assert_eq!(report.cfr_sample_commits, 6, "seed plus five commits");
@@ -9304,7 +9457,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(5);
         let path = dir.path().to_str().unwrap();
 
-        let report = GitReader::dora_report_scanning(path, Some(90), 6)
+        let report = dora_scanning(path, Some(90), 6)
             .expect("dora_report should succeed on a seeded repository");
 
         assert_eq!(report.cfr_sample_commits, 6);
@@ -9325,10 +9478,8 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(12);
         let path = dir.path().to_str().unwrap();
 
-        let capped =
-            GitReader::dora_report_scanning(path, Some(90), 4).expect("capped scan should succeed");
-        let full = GitReader::dora_report_scanning(path, Some(90), 4_096)
-            .expect("full scan should succeed");
+        let capped = dora_scanning(path, Some(90), 4).expect("capped scan should succeed");
+        let full = dora_scanning(path, Some(90), 4_096).expect("full scan should succeed");
 
         assert!(capped.commit_scan_truncated);
         assert!(!full.commit_scan_truncated);
@@ -9889,5 +10040,594 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(parsed["checkout.defaultremote"], "b");
         assert_eq!(parsed["flag.only"], "");
         assert_eq!(configured_remotes(&parsed), vec!["a.b.c".to_string()]);
+    }
+
+    fn head_of(dir: &Path) -> String {
+        git_text(dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn system_now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// [`GitReader::dora_report_scanning`] at the real clock on the git this
+    /// machine has, for the tests whose commits are made "now".
+    fn dora_scanning(path: &str, window: Option<u32>, cap: usize) -> Result<DoraReport, String> {
+        GitReader::dora_report_scanning(path, window, cap, system_now(), DateWalk::from_preflight())
+    }
+
+    /// The pulse row for `sha`.
+    fn signature_of(report: &PulseReport, sha: &str) -> CommitSignature {
+        report
+            .commits
+            .iter()
+            .find(|c| c.sha == sha)
+            .unwrap_or_else(|| panic!("{sha} is not in the report"))
+            .signature
+    }
+
+    /// Every way a commit can carry (or not carry) a signature header, on one
+    /// history, with a signing program that counts and fails when started.
+    #[cfg(unix)]
+    #[test]
+    fn pulse_report_labels_signature_presence_and_never_starts_a_verifier() {
+        use crate::test_support::{
+            counting_verifier, fake_signature_header as sig, raw_commit, use_verifier,
+            verifier_spawns,
+        };
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path();
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(path, &script);
+        let base = head_of(path);
+
+        let pgp = raw_commit(
+            path,
+            &[&base],
+            &sig("gpgsig", "PGP SIGNATURE"),
+            "pgp",
+            1_700_000_001,
+        );
+        let ssh = raw_commit(
+            path,
+            &[&pgp],
+            &sig("gpgsig", "SSH SIGNATURE"),
+            "ssh",
+            1_700_000_002,
+        );
+        let x509 = raw_commit(
+            path,
+            &[&ssh],
+            &sig("gpgsig", "SIGNED MESSAGE"),
+            "x509",
+            1_700_000_003,
+        );
+        let other = raw_commit(
+            path,
+            &[&x509],
+            &sig("gpgsig", "SOMETHING ELSE"),
+            "other",
+            1_700_000_004,
+        );
+        let sha256 = raw_commit(
+            path,
+            &[&other],
+            &sig("gpgsig-sha256", "PGP SIGNATURE"),
+            "sha256",
+            1_700_000_005,
+        );
+        let unsigned = raw_commit(path, &[&sha256], "", "unsigned", 1_700_000_006);
+        // A merge of a signed tag carries the tag's signature as `mergetag`,
+        // which does not make the merge commit itself signed.
+        let side = raw_commit(path, &[&base], "", "side", 1_700_000_007);
+        let mergetag = "mergetag object 0000000000000000000000000000000000000000\n type commit\n tag v1\n tagger T <t@test.local> 1 +0000\n \n tag message\n -----BEGIN PGP SIGNATURE-----\n \n c2ln\n -----END PGP SIGNATURE-----\n";
+        let tag_merge = raw_commit(
+            path,
+            &[&unsigned, &side],
+            mergetag,
+            "tag merge",
+            1_700_000_008,
+        );
+        let side2 = raw_commit(path, &[&base], "", "side two", 1_700_000_009);
+        let signed_merge = raw_commit(
+            path,
+            &[&tag_merge, &side2],
+            &format!("{mergetag}{}", sig("gpgsig", "SSH SIGNATURE")),
+            "signed merge",
+            1_700_000_010,
+        );
+        git_in(path, &["update-ref", "refs/heads/main", &signed_merge]);
+
+        let report = GitReader::pulse_report(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(report.commits.len(), 11);
+        for (sha, expected) in [
+            (&base, CommitSignature::None),
+            (&pgp, CommitSignature::Pgp),
+            (&ssh, CommitSignature::Ssh),
+            (&x509, CommitSignature::X509),
+            (&other, CommitSignature::Other),
+            // A `gpgsig-sha256` header in a SHA-1 repository is an unknown header to
+            // git, which does not verify it, so it is not signed here either.
+            (&sha256, CommitSignature::None),
+            (&unsigned, CommitSignature::None),
+            (&tag_merge, CommitSignature::None),
+            (&signed_merge, CommitSignature::Ssh),
+        ] {
+            assert_eq!(signature_of(&report, sha), expected, "{sha}");
+        }
+        assert_eq!(
+            verifier_spawns(&stub),
+            0,
+            "a bulk walk must not start any signing program"
+        );
+    }
+
+    /// The log and the header read are two walks over refs that can move
+    /// between them: a row the header read missed is `Unknown` (never `None`),
+    /// and a header entry for a commit the log did not return is ignored.
+    #[test]
+    fn a_pulse_row_the_header_read_missed_is_unknown_and_extra_entries_are_ignored() {
+        let row = |sha: &str| PulseCommitSummary {
+            sha: sha.to_string(),
+            parents: Vec::new(),
+            timestamp: 0,
+            summary: String::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            signature: CommitSignature::Unknown,
+            additions: 0,
+            deletions: 0,
+            files_changed: 0,
+            is_merge: false,
+            is_revert: false,
+            co_authors: Vec::new(),
+            binary_files: 0,
+        };
+        let mut commits = vec![row("aaa"), row("bbb"), row("ccc")];
+        let found = HashMap::from([
+            ("aaa".to_string(), CommitSignature::Ssh),
+            ("ccc".to_string(), CommitSignature::None),
+            // The refs moved: the header read saw a commit the log did not.
+            ("zzz".to_string(), CommitSignature::Pgp),
+        ]);
+        apply_signatures(&mut commits, found);
+        let kinds: Vec<_> = commits.iter().map(|c| c.signature).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CommitSignature::Ssh,
+                CommitSignature::Unknown,
+                CommitSignature::None
+            ]
+        );
+        assert_eq!(commits.len(), 3, "an extra header entry adds no row");
+    }
+
+    /// The pulse walk's own git processes: the log, and one header read for
+    /// every signature however many commits are signed.
+    #[test]
+    fn pulse_report_reads_every_signature_in_one_header_read() {
+        use crate::test_support::{fake_signature_header as sig, raw_commit};
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path();
+        let mut parent = head_of(path);
+        for n in 0..30 {
+            parent = raw_commit(
+                path,
+                &[&parent],
+                &sig("gpgsig", "PGP SIGNATURE"),
+                &format!("c{n}"),
+                1_700_000_000 + n,
+            );
+        }
+        git_in(path, &["update-ref", "refs/heads/main", &parent]);
+        let root = path.canonicalize().unwrap();
+        let before = git_cli::spawn_log::spawns_in(&root).len();
+        let report = GitReader::pulse_report(path.to_str().unwrap(), None).unwrap();
+        let used = git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        assert_eq!(report.commits.len(), 31);
+        assert!(
+            report
+                .commits
+                .iter()
+                .filter(|c| c.signature.is_signed())
+                .count()
+                == 30
+        );
+        let header_reads = used
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "--header"))
+            .count();
+        assert_eq!(header_reads, 1, "{used:?}");
+        assert!(
+            used.iter().all(|argv| !argv.iter().any(|a| a == "--batch")),
+            "no cat-file batch on the walk's critical path: {used:?}"
+        );
+        assert!(
+            used.len() <= 3,
+            "log, one header read and at most the mailmap probe: {used:?}"
+        );
+    }
+
+    /// The first fact the design rests on: asking git for `%G?` of a commit
+    /// with no signature starts no verifier, so the one-commit verify may ask
+    /// about any commit and pays only for signed ones.
+    #[cfg(unix)]
+    #[test]
+    fn git_asks_no_verifier_about_an_unsigned_commit() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        let dir = init_repo_with_remotes(&[], "main");
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(dir.path(), &script);
+        // Built from parts so the source scan below does not mistake this pin
+        // of git's behaviour for a format string the app runs.
+        let format = format!("--format={}G?", '%');
+        let out = git_text(
+            dir.path(),
+            &["log", "-1", "--no-walk", format.as_str(), "HEAD"],
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "N");
+        assert_eq!(verifier_spawns(&stub), 0);
+    }
+
+    /// `src-tauri/src` files and their non-comment lines, for the source-scan
+    /// tests below.
+    fn source_lines() -> Vec<(String, usize, String)> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut lines = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let name = file.strip_prefix(&root).unwrap().display().to_string();
+            for (at, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") {
+                    lines.push((name.clone(), at + 1, line.to_string()));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Every `%G*` placeholder runs the signature verifier. The single place
+    /// that may is the one-commit verify; a second one in a format string is
+    /// a walk that costs seconds per signed commit.
+    #[test]
+    fn no_format_string_outside_the_one_commit_verify_runs_the_verifier() {
+        let needle = format!("{}G", '%');
+        let found: Vec<_> = source_lines()
+            .into_iter()
+            .filter(|(_, _, line)| line.contains(&needle))
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (file, _, line) = &found[0];
+        assert!(file.ends_with("commit_signature.rs"), "{found:?}");
+        assert!(line.contains("--format="), "{found:?}");
+    }
+
+    /// Plain `--since` ends a walk at the first old committer date. Both DORA
+    /// reads, and anything added later, take a date bound that filters instead.
+    #[test]
+    fn no_git_argument_bounds_a_walk_with_plain_since() {
+        let needle = format!("--since{}", '=');
+        let found: Vec<_> = source_lines()
+            .into_iter()
+            .filter(|(_, _, line)| line.contains(&needle))
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The fixture of `insights`' regression for the same defect: one commit
+    /// with a committer date 200 days old sits among in-window commits.
+    fn inverted_date_repo(anchor: i64) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for (message, age) in [
+            ("d40", 40 * 86_400),
+            ("inverted", 200 * 86_400),
+            ("d30", 30 * 86_400),
+            ("d3", 3 * 86_400),
+            ("today", 100),
+        ] {
+            crate::test_support::commit_at(dir.path(), message, anchor - age, "one@example.com");
+        }
+        dir
+    }
+
+    #[test]
+    fn dora_counts_every_in_window_commit_behind_an_inverted_date_on_both_walks() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let path = dir.path().to_str().unwrap();
+        for walk in [DateWalk::SinceAsFilter, DateWalk::CountBounded] {
+            let report =
+                GitReader::dora_report_scanning(path, Some(90), 4_096, anchor, walk).unwrap();
+            assert_eq!(report.cfr_sample_commits, 4, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+            assert_eq!(report.commit_scan_window_commits, None, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_cap_below_the_window_is_truncated_with_the_true_count_where_one_is_known() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let path = dir.path().to_str().unwrap();
+        let filtered =
+            GitReader::dora_report_scanning(path, Some(90), 2, anchor, DateWalk::SinceAsFilter)
+                .unwrap();
+        assert_eq!(filtered.cfr_sample_commits, 2);
+        assert!(filtered.commit_scan_truncated);
+        assert_eq!(
+            filtered.commit_scan_window_commits,
+            Some(4),
+            "the window's true size, past the inverted commit"
+        );
+        let bounded =
+            GitReader::dora_report_scanning(path, Some(90), 2, anchor, DateWalk::CountBounded)
+                .unwrap();
+        assert_eq!(bounded.cfr_sample_commits, 2);
+        assert!(bounded.commit_scan_truncated);
+        assert_eq!(
+            bounded.commit_scan_window_commits, None,
+            "a count-bounded walk does not know the window's size and says so"
+        );
+    }
+
+    /// At exactly the cap, neither walk claims the window was cut. The cap
+    /// counts what each walk reads: in-window commits for the filtered walk
+    /// (4), every commit it passes for the count-bounded one (5, the inverted
+    /// commit among them), so each is given the cap that is exactly full.
+    #[test]
+    fn dora_does_not_claim_truncation_when_the_cap_equals_the_window() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let path = dir.path().to_str().unwrap();
+        for (walk, cap) in [(DateWalk::SinceAsFilter, 4), (DateWalk::CountBounded, 5)] {
+            let report =
+                GitReader::dora_report_scanning(path, Some(90), cap, anchor, walk).unwrap();
+            assert_eq!(report.cfr_sample_commits, 4, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    /// A committer date in the future is inside any window ending at "now" on
+    /// both walks, so the two cannot disagree about it.
+    #[test]
+    fn both_dora_walks_count_a_commit_dated_in_the_future() {
+        let anchor = 1_800_000_000i64;
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        crate::test_support::commit_at(dir.path(), "past", anchor - 86_400, "a@example.com");
+        crate::test_support::commit_at(dir.path(), "future", anchor + 30 * 86_400, "a@example.com");
+        let path = dir.path().to_str().unwrap();
+        for walk in [DateWalk::SinceAsFilter, DateWalk::CountBounded] {
+            let report =
+                GitReader::dora_report_scanning(path, Some(90), 4_096, anchor, walk).unwrap();
+            assert_eq!(report.cfr_sample_commits, 2, "{walk:?}");
+        }
+    }
+
+    /// The third fact the design rests on: `--since-as-filter` takes a bare
+    /// epoch, which is what lets the walk and the tag window share one clock.
+    #[test]
+    fn since_as_filter_accepts_a_bare_epoch() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let since = format!("--since-as-filter={}", anchor - 90 * 86_400);
+        let counted = git_text(dir.path(), &["rev-list", "--count", &since, "HEAD"]).unwrap();
+        assert_eq!(counted.trim(), "4");
+    }
+
+    // ------------------------------------------------------------------
+    // Adversarial DORA cases (CARD 16): inputs chosen to break the two walks,
+    // each pinning the behavior that held or the fix that closed the break.
+    // ------------------------------------------------------------------
+
+    const ADV_DAY: i64 = 86_400;
+    const ADV_ANCHOR: i64 = 1_800_000_000;
+    const ADV_WALKS: [DateWalk; 2] = [DateWalk::SinceAsFilter, DateWalk::CountBounded];
+
+    /// A linear history, oldest first, one commit per committer date.
+    fn adv_repo_with_dates(dates: &[i64]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for (n, date) in dates.iter().enumerate() {
+            crate::test_support::commit_at(dir.path(), &format!("c{n}"), *date, "a@example.com");
+        }
+        dir
+    }
+
+    fn adv_scan(
+        dir: &tempfile::TempDir,
+        window: Option<u32>,
+        cap: usize,
+        now: i64,
+        walk: DateWalk,
+    ) -> DoraReport {
+        GitReader::dora_report_scanning(dir.path().to_str().unwrap(), window, cap, now, walk)
+            .unwrap()
+    }
+
+    /// A window of 0 days is clamped to 7 and a huge one to 365, the same on
+    /// both walks, with the cutoffs landing where the clamp says.
+    #[test]
+    fn dora_window_zero_and_huge_clamp_identically_on_both_walks() {
+        let dir = adv_repo_with_dates(&[
+            ADV_ANCHOR - 366 * ADV_DAY,
+            ADV_ANCHOR - 364 * ADV_DAY,
+            ADV_ANCHOR - 8 * ADV_DAY,
+            ADV_ANCHOR - 6 * ADV_DAY,
+        ]);
+        for walk in ADV_WALKS {
+            let zero = adv_scan(&dir, Some(0), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(zero.cfr_sample_commits, 1, "0 days reads as 7: {walk:?}");
+            let huge = adv_scan(&dir, Some(u32::MAX), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(
+                huge.cfr_sample_commits, 3,
+                "u32::MAX reads as 365: {walk:?}"
+            );
+            let none = adv_scan(&dir, None, 4_096, ADV_ANCHOR, walk);
+            assert_eq!(none.cfr_sample_commits, 2, "default 90 days: {walk:?}");
+        }
+    }
+
+    /// A commit exactly at the cutoff second is inside, one second older is
+    /// outside, on both walks, so the two can never disagree about it.
+    #[test]
+    fn dora_cutoff_second_is_inclusive_and_identical_on_both_walks() {
+        let since = ADV_ANCHOR - 90 * ADV_DAY;
+        let dir = adv_repo_with_dates(&[since - 1, since, since + 1]);
+        for walk in ADV_WALKS {
+            let report = adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(report.cfr_sample_commits, 2, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_on_an_unborn_head_is_an_empty_answer_on_both_walks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for walk in ADV_WALKS {
+            let report = adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(report.cfr_sample_commits, 0, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_on_a_shallow_clone_counts_what_is_there_on_both_walks() {
+        let source = adv_repo_with_dates(&[
+            ADV_ANCHOR - 30 * ADV_DAY,
+            ADV_ANCHOR - 20 * ADV_DAY,
+            ADV_ANCHOR - 10 * ADV_DAY,
+        ]);
+        let parent = tempfile::TempDir::new().unwrap();
+        git_in(
+            parent.path(),
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &format!("file://{}", source.path().display()),
+                "shallow",
+            ],
+        );
+        let shallow = parent.path().join("shallow");
+        crate::test_support::trust_repo(&shallow);
+        assert!(
+            shallow.join(".git/shallow").is_file(),
+            "fixture: a shallow clone"
+        );
+        for walk in ADV_WALKS {
+            let report = GitReader::dora_report_scanning(
+                shallow.to_str().unwrap(),
+                Some(90),
+                4_096,
+                ADV_ANCHOR,
+                walk,
+            )
+            .unwrap();
+            assert_eq!(report.cfr_sample_commits, 1, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    /// Cap 1 and cap 0 never panic and always claim the cut when in-window
+    /// commits were left behind; the true count appears only where it is known.
+    #[test]
+    fn dora_caps_of_one_and_zero_report_a_cut_and_do_not_panic() {
+        let dir = adv_repo_with_dates(&[
+            ADV_ANCHOR - 40 * ADV_DAY,
+            ADV_ANCHOR - 30 * ADV_DAY,
+            ADV_ANCHOR - 3 * ADV_DAY,
+            ADV_ANCHOR - 100,
+        ]);
+        for walk in ADV_WALKS {
+            let one = adv_scan(&dir, Some(90), 1, ADV_ANCHOR, walk);
+            assert_eq!(one.cfr_sample_commits, 1, "{walk:?}");
+            assert!(one.commit_scan_truncated, "{walk:?}");
+            let zero = adv_scan(&dir, Some(90), 0, ADV_ANCHOR, walk);
+            assert_eq!(zero.cfr_sample_commits, 0, "{walk:?}");
+            assert!(zero.commit_scan_truncated, "{walk:?}");
+            let exact = adv_scan(&dir, Some(90), 4, ADV_ANCHOR, walk);
+            assert!(
+                !exact.commit_scan_truncated,
+                "cap equal to the window: {walk:?}"
+            );
+        }
+        let known = adv_scan(&dir, Some(90), 1, ADV_ANCHOR, DateWalk::SinceAsFilter);
+        assert_eq!(known.commit_scan_window_commits, Some(4));
+    }
+
+    /// The fallback once judged truncation by the row just past the cap alone.
+    /// When that row is the inverted-date commit (old), in-window commits behind
+    /// it are unread, so any row past the cap is now reported as a cut window.
+    #[test]
+    fn the_count_bounded_walk_reports_a_cut_window_when_the_row_past_the_cap_is_inverted() {
+        let anchor = ADV_ANCHOR;
+        let dir = inverted_date_repo(anchor);
+        // Walk order is today, d3, d30, inverted, d40: cap 3 leaves `inverted`
+        // as the probe row and d40 (in the window) unread.
+        let report = adv_scan(&dir, Some(90), 3, anchor, DateWalk::CountBounded);
+        assert_eq!(report.cfr_sample_commits, 3);
+        assert!(
+            report.commit_scan_truncated,
+            "d40 is in the window and was not read, but the report says the scan was complete"
+        );
+        // The filtered walk gets the same history right.
+        let filtered = adv_scan(&dir, Some(90), 3, anchor, DateWalk::SinceAsFilter);
+        assert!(filtered.commit_scan_truncated);
+    }
+
+    /// `now` close to the epoch makes the cutoff negative: both walks must
+    /// still accept the flag and count the same commits.
+    #[test]
+    fn dora_with_a_negative_cutoff_agrees_on_both_walks() {
+        let dir = adv_repo_with_dates(&[ADV_ANCHOR - 2 * ADV_DAY, ADV_ANCHOR]);
+        let counts: Vec<usize> = ADV_WALKS
+            .iter()
+            .map(|walk| adv_scan(&dir, Some(90), 4_096, 100, *walk).cfr_sample_commits)
+            .collect();
+        assert_eq!(counts, vec![2, 2], "{counts:?}");
+    }
+
+    /// Dates that make the committer clock jump back and forth: both walks see
+    /// the same set.
+    #[test]
+    fn dora_zigzag_committer_dates_give_the_same_sample_on_both_walks() {
+        let since = ADV_ANCHOR - 90 * ADV_DAY;
+        let dates: Vec<i64> = (0..40)
+            .map(|n| {
+                if n % 2 == 0 {
+                    since - 1 - n
+                } else {
+                    since + 1 + n
+                }
+            })
+            .collect();
+        let dir = adv_repo_with_dates(&dates);
+        let samples: Vec<usize> = ADV_WALKS
+            .iter()
+            .map(|walk| adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, *walk).cfr_sample_commits)
+            .collect();
+        assert_eq!(samples, vec![20, 20], "{samples:?}");
     }
 }

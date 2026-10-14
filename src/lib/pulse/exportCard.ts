@@ -53,7 +53,7 @@ export interface ExportCardOptions {
   readonly blamePartial?: boolean;
   /** Share of commit subjects parsing as Conventional Commits. */
   readonly conventionalPct: CardValue;
-  /** Share of commits git reports as carrying a good signature. */
+  /** Share of commits that carry a signature. Not verified. */
   readonly signedPct: CardValue;
   /** Stamp shown in the header, `YYYY-MM-DD`. Defaults to today. */
   readonly generatedDate?: string;
@@ -384,7 +384,7 @@ export function generatePulseSvgCard(options: ExportCardOptions): string {
     percentTile(
       "SIGNED COMMITS",
       options.signedPct,
-      "Share of commits git reports as carrying a good signature.",
+      "Share of commits that carry a signature. Not verified.",
     ),
   ];
   const codeRow: Tile[] = [locTile(options), halfLifeTile(options), busFactorTile(options)];

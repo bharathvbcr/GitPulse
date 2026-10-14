@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -37,6 +37,7 @@ pub use preflight::{
     git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
     MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
 };
+pub(crate) use preflight::{git_supports, SINCE_AS_FILTER};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -388,6 +389,14 @@ const PINNED_GIT_CONFIG: &[&str] = &[
 /// no `-c` can blank) would run a program instead of git's own diff.
 const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
 
+/// The patch subcommands that print a signature header (and run the verifier
+/// to do it) when `log.showSignature` or `--show-signature` asks. `--no-show-signature`
+/// rides every one of them from here, so no read has to remember it; `diff` is
+/// left out because it rejects the flag. It turns off that header only: it does
+/// not touch the `%G*` placeholders, which always verify, and those are kept
+/// out of every bulk format string by a source-scan test.
+const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
+
 /// The one place the environment of a git child is decided. Both spawn
 /// builders ([`git_command_with_env`] for git itself and
 /// [`build_capture_command_in`] for tools that shell out to git, such as `gh`)
@@ -471,10 +480,13 @@ fn git_command_with_env(
         cmd.args(["-c", pin]);
     }
     match subcommand_index(args) {
-        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => cmd
-            .args(&args[..=at])
-            .arg("--no-ext-diff")
-            .args(&args[at + 1..]),
+        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => {
+            cmd.args(&args[..=at]).arg("--no-ext-diff");
+            if SIGNATURE_PRINTING_SUBCOMMANDS.contains(&args[at]) {
+                cmd.arg("--no-show-signature");
+            }
+            cmd.args(&args[at + 1..])
+        }
         _ => cmd.args(args),
     };
     pin_git_environment(&mut cmd);
@@ -573,7 +585,7 @@ pub fn git_bytes_capped(
 /// `Err(String)`, and a caller that cannot tell them apart ends up reporting a
 /// commit it could not look at as a commit it looked at and found nothing on.
 pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, None)
+    git_captured_inner(repo, args, None, MAX_OUTPUT_BYTES)
 }
 
 /// [`git_captured`] with `stdin_bytes` fed to the child, for git's `--batch`
@@ -583,21 +595,241 @@ pub(crate) fn git_captured_with_stdin(
     args: &[&str],
     stdin_bytes: &[u8],
 ) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, Some(stdin_bytes))
+    git_captured_inner(repo, args, Some(stdin_bytes), MAX_OUTPUT_BYTES)
+}
+
+/// What a [`read_objects_batch`] caller expects to find at each id: the object
+/// type git must report, and the noun its error messages use for it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchObject {
+    pub kind: &'static str,
+    pub noun: &'static str,
+}
+
+/// Ids more than this many in one `cat-file --batch` question. A caller
+/// already bounds its list (the pulse walk by `MAX_PULSE_COMMITS`); this is
+/// the reader's own ceiling, so no caller can hand it an unbounded stdin.
+const MAX_BATCH_OBJECTS: usize = 100_000;
+
+/// Reads objects in one `git cat-file --batch`, where each used to cost its
+/// own process, and maps each one's bytes through `extract`.
+///
+/// Every answer is taken by the size git declares, never by lines: an object
+/// may hold any byte, newlines included. A missing object, one of another
+/// type, an answer that names another id, and a stream that stops short are
+/// each an `Err` for the objects they leave unread, never an empty value. A
+/// stream cut at `budget` (or by the deadline) is read as far as it is whole:
+/// the objects before the cut keep their answers, and every later one is an
+/// `Err` that says the output was cut.
+pub(crate) fn read_objects_batch<T: Clone>(
+    repo: &Path,
+    oids: &[String],
+    object: BatchObject,
+    budget: usize,
+    extract: &dyn Fn(&[u8]) -> T,
+) -> HashMap<String, Result<T, String>> {
+    let mut answers: HashMap<String, Result<T, String>> = HashMap::new();
+    // Git answers with an object's lowercase name whatever case it was asked
+    // by, and the stream is matched to its questions by that name, so every
+    // question is lowercased; the answer is given back under the spelling the
+    // caller used too.
+    let mut respelled: Vec<(&String, String)> = Vec::new();
+    let mut asked: HashSet<String> = HashSet::new();
+    let mut sent: Vec<String> = Vec::new();
+    let mut query = String::new();
+    for oid in oids {
+        let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
+        if !shaped {
+            answers
+                .entry(oid.clone())
+                .or_insert_with(|| Err(format!("{oid:?} is not a {} id", object.noun)));
+            continue;
+        }
+        let lower = oid.to_ascii_lowercase();
+        if lower != *oid {
+            respelled.push((oid, lower.clone()));
+        }
+        if !asked.insert(lower.clone()) {
+            continue;
+        }
+        if sent.len() == MAX_BATCH_OBJECTS {
+            answers.insert(
+                lower,
+                Err(format!(
+                    "more than {MAX_BATCH_OBJECTS} objects were asked for at once"
+                )),
+            );
+            continue;
+        }
+        query.push_str(&lower);
+        query.push('\n');
+        sent.push(lower);
+    }
+    if !sent.is_empty() {
+        let questions: Vec<&str> = sent.iter().map(String::as_str).collect();
+        fetch_objects(
+            repo,
+            &query,
+            &questions,
+            object,
+            budget,
+            extract,
+            &mut answers,
+        );
+    }
+    for (original, lower) in respelled {
+        if let Some(answer) = answers.get(&lower).cloned() {
+            answers.insert(original.clone(), answer);
+        }
+    }
+    answers
+}
+
+/// Runs one `cat-file --batch` for `questions` (lowercase ids, `query` is the
+/// same list one per line) and records an answer for each in `answers`.
+fn fetch_objects<T>(
+    repo: &Path,
+    query: &str,
+    sent: &[&str],
+    object: BatchObject,
+    budget: usize,
+    extract: &dyn Fn(&[u8]) -> T,
+    answers: &mut HashMap<String, Result<T, String>>,
+) {
+    let run = git_captured_inner(
+        repo,
+        &["cat-file", "--batch"],
+        Some(query.as_bytes()),
+        budget,
+    );
+    let run = match run {
+        Ok(run) => run,
+        Err(e) => {
+            mark_unread(answers, sent, &format!("could not run git cat-file: {e}"));
+            return;
+        }
+    };
+    // A stream cut at the budget or the deadline is a prefix whose child was
+    // stopped, so it exits unsuccessfully: it is read as far as it is whole
+    // instead of being discarded as a failed run.
+    if !run.success && run.incomplete.is_none() {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        mark_unread(
+            answers,
+            sent,
+            &format!("git cat-file --batch failed: {stderr}"),
+        );
+        return;
+    }
+    let cut = run
+        .incomplete
+        .as_ref()
+        .map(|reason| format!("git cat-file {}", reason.describe()));
+    read_batch_answers(&run.stdout, sent, object, extract, cut.as_deref(), answers);
+}
+
+/// Where a body of the declared `size` starting at `pos` ends, if the stream
+/// holds all of it and the newline git writes after it. A size is the
+/// stream's own claim, so it is never trusted to fit in `usize` arithmetic.
+fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
+    let end = pos.checked_add(size.parse::<usize>().ok()?)?;
+    (out.get(end) == Some(&b'\n')).then_some(end)
+}
+
+/// Marks every object in `rest` unread for the same reason.
+fn mark_unread<T>(answers: &mut HashMap<String, Result<T, String>>, rest: &[&str], why: &str) {
+    for oid in rest {
+        answers.insert((*oid).to_string(), Err(why.to_string()));
+    }
+}
+
+/// Splits a `cat-file --batch` stream into the answers to `sent`, in order.
+/// Once the stream is out of step with its questions, nothing after that
+/// point is attributed to any of them. `cut` is why the stream ended early,
+/// when it did, and is what a question left unanswered by it reports.
+pub(crate) fn read_batch_answers<T>(
+    out: &[u8],
+    sent: &[&str],
+    object: BatchObject,
+    extract: &dyn Fn(&[u8]) -> T,
+    cut: Option<&str>,
+    answers: &mut HashMap<String, Result<T, String>>,
+) {
+    let noun = object.noun;
+    let mut pos = 0usize;
+    for (index, oid) in sent.iter().enumerate() {
+        let Some(end) = out[pos..].iter().position(|&b| b == b'\n') else {
+            let why = cut.map_or_else(
+                || format!("git cat-file answered nothing for this {noun}"),
+                |cut| format!("{cut} before this {noun} was read"),
+            );
+            mark_unread(answers, &sent[index..], &why);
+            return;
+        };
+        let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
+        pos += end + 1;
+        let fields: Vec<&str> = header.split(' ').collect();
+        if fields.first() != Some(oid) {
+            // Every later answer is now out of step with its question.
+            mark_unread(
+                answers,
+                &sent[index..],
+                &format!("git cat-file answered {header:?} for {noun} {oid}"),
+            );
+            return;
+        }
+        let answer = match fields.as_slice() {
+            [_, kind, size] if *kind == object.kind => match body_end(out, pos, size) {
+                Some(end) => {
+                    let content = extract(&out[pos..end]);
+                    pos = end + 1;
+                    Ok(content)
+                }
+                None => {
+                    let why = cut.map_or_else(
+                        || format!("git cat-file cut the {noun} {oid} short"),
+                        |cut| format!("{cut} inside the {noun} {oid}"),
+                    );
+                    mark_unread(answers, &sent[index..], &why);
+                    return;
+                }
+            },
+            [_, "missing"] => Err(format!("the {noun} {oid} is missing from this repository")),
+            [_, kind, size] => match body_end(out, pos, size) {
+                // Skipped by its size so the next answer stays in step.
+                Some(end) => {
+                    pos = end + 1;
+                    Err(format!("{oid} is a {kind}, not a {noun}"))
+                }
+                None => {
+                    mark_unread(
+                        answers,
+                        &sent[index..],
+                        &format!("git cat-file answered {header:?}"),
+                    );
+                    return;
+                }
+            },
+            _ => Err(format!("git cat-file answered {header:?} for {noun} {oid}")),
+        };
+        answers.insert((*oid).to_string(), answer);
+    }
 }
 
 fn git_captured_inner(
     repo: &Path,
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
 ) -> Result<BoundedRun, String> {
     crate::repository_trust::require(repo)?;
     let label = format!("git {}", subcommand(args));
-    run_bounded(
+    run_bounded_capped(
         git_command(Some(repo), args),
         &label,
         DEFAULT_TIMEOUT,
         stdin_bytes,
+        stdout_cap,
     )
 }
 
@@ -1769,6 +2001,10 @@ fn is_timeout_error(program: &str, err: &str) -> bool {
 #[derive(Default)]
 struct Drained {
     bytes: Vec<u8>,
+    /// Bytes already handed to a streaming observer and dropped from `bytes`
+    /// (see [`ProcessObserver::drains_stdout`]); they still count against the
+    /// cap, so a streamed read is as bounded as a buffered one.
+    discarded: usize,
     /// Cut off at the byte cap: the child had more to say.
     truncated: bool,
     /// Why the read stopped, when it was not end-of-stream.
@@ -1777,9 +2013,16 @@ struct Drained {
 
 impl Drained {
     fn append(&mut self, bytes: &[u8], cap: usize) {
-        let take = bytes.len().min(cap.saturating_sub(self.bytes.len()));
+        let held = self.bytes.len().saturating_add(self.discarded);
+        let take = bytes.len().min(cap.saturating_sub(held));
         self.bytes.extend_from_slice(&bytes[..take]);
         self.truncated |= take < bytes.len();
+    }
+
+    /// Drops what an observer has now seen, keeping its length in the budget.
+    fn discard_observed(&mut self) {
+        self.discarded = self.discarded.saturating_add(self.bytes.len());
+        self.bytes.clear();
     }
 }
 
@@ -1906,6 +2149,15 @@ pub(crate) trait ProcessObserver {
         false
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
+    /// True when the observer keeps what it needs from stdout itself, so the
+    /// run need not retain it: each chunk is dropped once `output` has seen it
+    /// and the returned [`BoundedRun::stdout`] holds only the unseen tail
+    /// (empty in practice). The byte cap still applies to the stream as a
+    /// whole. For a reader of a long stream that wants a few bytes per record
+    /// out of megabytes, which would otherwise be buffered whole.
+    fn drains_stdout(&self) -> bool {
+        false
+    }
 }
 
 impl ProcessObserver for () {}
@@ -7225,8 +7477,24 @@ mod tests {
             let args = argv(&[patch, "HEAD"]);
             let at = args.iter().position(|a| a == patch).expect("subcommand");
             assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
-            assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+            // `diff` rejects `--no-show-signature`; `show` and `log` carry it
+            // so a signature header is never printed (and verified) for them.
+            if patch == "diff" {
+                assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+            } else {
+                assert_eq!(args[at + 2], "--no-show-signature", "{patch}: {args:?}");
+                assert_eq!(args[at + 3], "HEAD", "{patch}: {args:?}");
+            }
         }
+        let notes_log = argv(&["-c", "x.y=z", "log", "-n1"]);
+        let at = notes_log.iter().position(|a| a == "log").unwrap();
+        assert_eq!(notes_log[at + 2], "--no-show-signature", "{notes_log:?}");
+        assert!(
+            !argv(&["diff", "--cached"])
+                .iter()
+                .any(|a| a == "--no-show-signature"),
+            "diff must not receive a flag it rejects"
+        );
         // A global option with a value before the subcommand does not hide it,
         // and a command that prints no patch is left alone.
         let notes = argv(&["-c", "x.y=z", "notes", "show", "HEAD"]);
@@ -7234,6 +7502,93 @@ mod tests {
         let global = argv(&["-C", "/tmp", "diff", "--cached"]);
         let at = global.iter().position(|a| a == "diff").unwrap();
         assert_eq!(global[at + 1], "--no-ext-diff", "{global:?}");
+    }
+
+    /// A batch stream that ends because its budget or deadline did keeps the
+    /// answers that are whole and says, for each one it lost, that the output
+    /// was cut: not "answered nothing", which would blame git for the cap.
+    #[test]
+    fn a_cut_batch_keeps_its_whole_answers_and_names_the_cut_for_the_rest() {
+        const OBJECT: BatchObject = BatchObject {
+            kind: "commit",
+            noun: "commit",
+        };
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let sent = [a.as_str(), b.as_str(), c.as_str()];
+        let run = |stream: &[u8]| {
+            let mut answers: HashMap<String, Result<usize, String>> = HashMap::new();
+            read_batch_answers(
+                stream,
+                &sent,
+                OBJECT,
+                &<[u8]>::len,
+                Some("git cat-file output exceeded 64 bytes"),
+                &mut answers,
+            );
+            answers
+        };
+        // The stream stops between answers: `c` was never started.
+        let between = run(format!("{a} commit 2\nhi\n{b} commit 3\nabc\n").as_bytes());
+        assert_eq!(between[&a], Ok(2));
+        assert_eq!(between[&b], Ok(3));
+        assert!(between[&c].as_ref().unwrap_err().contains("exceeded 64"));
+        // The stream stops inside `b`'s body: `a` stays, `b` and `c` are cut.
+        let inside = run(format!("{a} commit 2\nhi\n{b} commit 30\nabc").as_bytes());
+        assert_eq!(inside[&a], Ok(2));
+        for oid in [&b, &c] {
+            let err = inside[oid].as_ref().unwrap_err();
+            assert!(err.contains("exceeded 64") && err.contains(&b), "{err}");
+        }
+    }
+
+    /// An observer that keeps what it needs sees every byte of a long stream
+    /// while the run retains almost none of it, and the byte cap still ends a
+    /// stream that outruns it.
+    #[cfg(unix)]
+    #[test]
+    fn a_draining_observer_streams_without_the_run_buffering_the_output() {
+        struct Counting {
+            seen: usize,
+        }
+        impl ProcessObserver for Counting {
+            fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+                if matches!(stream, OutputStream::Stdout) {
+                    self.seen += bytes.len();
+                }
+            }
+            fn drains_stdout(&self) -> bool {
+                true
+            }
+        }
+        let run_with_cap = |cap: usize| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "head -c 3000000 /dev/zero"]);
+            let mut observer = Counting { seen: 0 };
+            let run = run_observed(
+                &mut cmd,
+                "sh",
+                Duration::from_secs(30),
+                None,
+                cap,
+                &mut observer,
+            )
+            .expect("run");
+            (run, observer.seen)
+        };
+        let (whole, seen) = run_with_cap(4_000_000);
+        assert!(whole.incomplete.is_none(), "{:?}", whole.incomplete);
+        assert_eq!(seen, 3_000_000, "the observer saw the whole stream");
+        assert!(
+            whole.stdout.len() < 1_000_000,
+            "the run kept {} of 3,000,000 bytes",
+            whole.stdout.len()
+        );
+        let (cut, seen) = run_with_cap(100_000);
+        assert_eq!(cut.incomplete, Some(Incomplete::OverCap(100_000)));
+        assert!(
+            seen <= 100_000,
+            "the cap bounds a streamed read too: {seen}"
+        );
     }
 
     /// The editor variables are PINNED rather than removed, and the difference
@@ -8985,6 +9340,145 @@ mod tests {
         assert_eq!(out.stdout, b"progress");
         assert_eq!(observer.0, b"progress");
         assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
+    }
+
+    // ------------------------------------------------------------------
+    // Adversarial batch-stream cases (CARD 16).
+    // ------------------------------------------------------------------
+
+    fn adv_answers(
+        stream: &[u8],
+        ids: &[&str],
+        cut: Option<&str>,
+    ) -> HashMap<String, Result<usize, String>> {
+        const OBJECT: BatchObject = BatchObject {
+            kind: "commit",
+            noun: "commit",
+        };
+        let mut answers = HashMap::new();
+        read_batch_answers(stream, ids, OBJECT, &<[u8]>::len, cut, &mut answers);
+        answers
+    }
+
+    /// A size that lies low ends the body mid-object, where no newline waits:
+    /// that answer and every one after it are unread, never re-framed.
+    #[test]
+    fn a_size_that_lies_low_leaves_this_and_every_later_commit_unread() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let stream = format!("{a} commit 2\nhi\n{b} commit 3\nabcdef\n{c} commit 1\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b, &c], None);
+        assert_eq!(got[&a], Ok(2));
+        assert!(got[&b].is_err(), "{:?}", got[&b]);
+        assert!(got[&c].is_err(), "{:?}", got[&c]);
+    }
+
+    /// A size that lies high swallows the next header: cut short, rest unread.
+    #[test]
+    fn a_size_that_lies_high_is_cut_short_not_misattributed() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let stream = format!("{a} commit 500\nhi\n{b} commit 1\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b], None);
+        assert!(got[&a].is_err() && got[&b].is_err(), "{got:?}");
+    }
+
+    /// A size too large for usize arithmetic.
+    #[test]
+    fn a_size_beyond_usize_is_an_error_not_a_panic() {
+        let a = "a".repeat(40);
+        for size in [
+            "18446744073709551615",
+            "99999999999999999999999",
+            "-1",
+            "1e3",
+            "",
+        ] {
+            let stream = format!("{a} commit {size}\nhi\n");
+            let got = adv_answers(stream.as_bytes(), &[&a], None);
+            assert!(got[&a].is_err(), "{size:?}: {got:?}");
+        }
+    }
+
+    /// The stream ends in the middle of a header line, then in the middle of
+    /// the very first byte: every id is answered, none as a value.
+    #[test]
+    fn a_stream_cut_inside_a_header_or_empty_leaves_all_unread() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let half = format!("{a} commit 2\nhi\n{b} comm");
+        let got = adv_answers(half.as_bytes(), &[&a, &b], None);
+        assert_eq!(got[&a], Ok(2));
+        assert!(got[&b].is_err());
+        let none = adv_answers(b"", &[&a, &b], None);
+        assert!(none[&a].is_err() && none[&b].is_err());
+    }
+
+    /// `missing` and `ambiguous` carry no body, so the next answer stays in
+    /// step; a stray extra header field is an error for that id only.
+    #[test]
+    fn missing_and_ambiguous_answers_keep_the_following_answers_in_step() {
+        let (a, b, c, d) = (
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40),
+            "d".repeat(40),
+        );
+        let stream =
+            format!("{a} missing\n{b} ambiguous\n{c} commit 3\nabc\n{d} commit 1 extra\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b, &c, &d], None);
+        assert!(got[&a].is_err());
+        assert!(got[&b].is_err());
+        assert_eq!(got[&c], Ok(3));
+        assert!(got[&d].is_err());
+    }
+
+    /// A commit message that is itself a perfectly formed batch answer for the
+    /// next id, with an honest size from git, must stay inside its own body.
+    #[test]
+    fn a_body_that_forges_the_next_answer_stays_inside_its_own_size() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let forged = format!("{b} commit 5\nFORGE\n");
+        let stream = format!(
+            "{a} commit {}\n{forged}\n{b} commit 4\nreal\n",
+            forged.len()
+        );
+        let got = adv_answers(stream.as_bytes(), &[&a, &b], None);
+        assert_eq!(got[&a], Ok(forged.len()));
+        assert_eq!(
+            got[&b],
+            Ok(4),
+            "b is the answer after a's own body, not the forgery"
+        );
+    }
+
+    /// 100,005 ids in one call: the first 100,000 are asked, the rest are
+    /// errors, and the call returns without stalling on a full pipe.
+    #[test]
+    fn an_oversized_id_list_is_capped_and_does_not_stall_the_pipe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-b", "main"]);
+        let oids: Vec<String> = (0..100_005u64).map(|n| format!("{n:040x}")).collect();
+        let started = std::time::Instant::now();
+        let got = read_objects_batch(
+            dir.path(),
+            &oids,
+            BatchObject {
+                kind: "commit",
+                noun: "commit",
+            },
+            64 * 1024 * 1024,
+            &<[u8]>::len,
+        );
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(60)),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.len(), oids.len(), "every id gets an answer");
+        assert!(got.values().all(Result::is_err), "nothing here is a commit");
+        let capped = got
+            .values()
+            .filter(|r| r.as_ref().unwrap_err().contains("asked for at once"))
+            .count();
+        assert_eq!(capped, 5);
     }
 }
 

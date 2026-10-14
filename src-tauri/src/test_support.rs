@@ -312,6 +312,141 @@ pub(crate) fn write(dir: &Path, rel: &str, content: &str) {
     fs::write(dest, content).unwrap();
 }
 
+/// Commits `message` with author and committer dated `epoch`.
+///
+/// `git_in` cannot carry environment, and a history test that lets git pick
+/// "now" for every commit can only ever assert on one bucket.
+#[cfg(test)]
+pub(crate) fn commit_at(dir: &Path, message: &str, epoch: i64, email: &str) {
+    let stamp = format!("@{epoch} +0000");
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=GitPulse",
+            "-c",
+            &format!("user.email={email}"),
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+        .env("GIT_AUTHOR_DATE", &stamp)
+        .env("GIT_COMMITTER_DATE", &stamp)
+        .env("GIT_AUTHOR_EMAIL", email)
+        .env("GIT_COMMITTER_EMAIL", email)
+        .current_dir(dir)
+        .output_locked()
+        .expect("spawn git commit");
+    assert!(
+        output.status.success(),
+        "commit {message} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Writes one object of `kind` holding `content` and returns its id.
+#[cfg(test)]
+pub(crate) fn hash_object(dir: &Path, kind: &str, content: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .args(["hash-object", "-t", kind, "-w", "--stdin"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn git hash-object");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(content)
+        .expect("write object");
+    let out = child.wait_with_output().expect("wait for hash-object");
+    assert!(
+        out.status.success(),
+        "hash-object {kind} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("object id")
+        .trim()
+        .to_string()
+}
+
+/// Writes a commit object by hand, so a fixture can carry headers no key could
+/// produce (`gpgsig`, `mergetag`) without a signing program. `extra_headers`
+/// is raw text placed after `committer`, each line newline-terminated, with
+/// continuation lines already indented. Does not move any ref.
+#[cfg(test)]
+pub(crate) fn raw_commit(
+    dir: &Path,
+    parents: &[&str],
+    extra_headers: &str,
+    message: &str,
+    epoch: i64,
+) -> String {
+    let tree = hash_object(dir, "tree", b"");
+    let mut body = format!("tree {tree}\n");
+    for parent in parents {
+        body.push_str(&format!("parent {parent}\n"));
+    }
+    let who = format!("T <t@test.local> {epoch} +0000");
+    body.push_str(&format!("author {who}\ncommitter {who}\n"));
+    body.push_str(extra_headers);
+    body.push_str(&format!("\n{message}\n"));
+    hash_object(dir, "commit", body.as_bytes())
+}
+
+/// An armored signature header of `armor` ("PGP SIGNATURE", "SSH SIGNATURE",
+/// "SIGNED MESSAGE") for `header` ("gpgsig" or "gpgsig-sha256"): the shape git
+/// writes, with a continuation line per armor line. The body is not a real
+/// signature; nothing here verifies it.
+#[cfg(test)]
+pub(crate) fn fake_signature_header(header: &str, armor: &str) -> String {
+    format!(
+        "{header} -----BEGIN {armor}-----\n \n bm90IGEgcmVhbCBzaWduYXR1cmU=\n -----END {armor}-----\n"
+    )
+}
+
+/// A signing program that records every call, drains its input, prints
+/// `output` and exits: the verifier stand-in for "was a verifier started at
+/// all". Returns the directory holding the script and the file it appends one
+/// line to per call; the directory is its own, so the stub never dirties the
+/// repository under test.
+#[cfg(all(test, unix))]
+pub(crate) fn counting_verifier(output: &str) -> (TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().expect("stub dir");
+    let script = dir.path().join("verifier");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho x >> \"$(dirname \"$0\")/count\"\ncat >/dev/null\n{output}\n"),
+    )
+    .expect("write verifier stub");
+    let mut permissions = fs::metadata(&script).expect("stub metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("stub executable");
+    (dir, script)
+}
+
+/// Points `gpg.program`, `gpg.ssh.program` and `gpg.x509.program` of `repo`
+/// at `script`, so whichever format a commit claims, its verifier is the stub.
+#[cfg(all(test, unix))]
+pub(crate) fn use_verifier(repo: &Path, script: &Path) {
+    for key in ["gpg.program", "gpg.ssh.program", "gpg.x509.program"] {
+        git_in(repo, &["config", key, script.to_str().expect("stub path")]);
+    }
+}
+
+/// Times the stub in `dir` has been called.
+#[cfg(all(test, unix))]
+pub(crate) fn verifier_spawns(dir: &TempDir) -> usize {
+    fs::read_to_string(dir.path().join("count")).map_or(0, |count| count.lines().count())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{coverage_relaxed, isolated_libtest_command};

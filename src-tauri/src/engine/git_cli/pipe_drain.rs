@@ -159,7 +159,7 @@ pub(super) struct OutputDrains {
 
 impl OutputDrains {
     pub(super) fn observe(
-        &self,
+        &mut self,
         observer: &mut dyn super::ProcessObserver,
         cursors: &mut [usize; 2],
     ) {
@@ -169,6 +169,10 @@ impl OutputDrains {
             &self.stdout.captured.bytes,
             &self.stderr.captured.bytes,
         );
+        if observer.drains_stdout() {
+            self.stdout.captured.discard_observed();
+            cursors[0] = 0;
+        }
     }
     pub(super) fn new(
         stdout: Option<ChildStdout>,

@@ -22,6 +22,12 @@ describe("CommitDetails", () => {
     expect(source).toContain("filePath={f.path}");
   });
 
+  it("labels the signature from the one-commit verification, not from the details", () => {
+    expect(source).toContain("signatureLabel(details?.signature_check, details != null && details.signature_check === undefined)");
+    expect(source).not.toContain("gpg_status");
+    expect(source).not.toContain('"Unsigned"');
+  });
+
   it("renders the cut-output notice and marks partial totals from the shared summary", () => {
     expect(source).toContain("summarizeCommitFiles(details)");
     expect(source).toContain('data-testid="commit-files-note"');
@@ -51,7 +57,7 @@ describe("CommitDetails", () => {
     // needs no hand-kept key in front of the fetch.
     const start = source.indexOf("$effect(() => {\n    const repo = $currentRepoPath;\n    const id = currentCommitId;");
     expect(start).toBeGreaterThan(-1);
-    const effect = source.slice(start, source.indexOf("function gpgLabel"));
+    const effect = source.slice(start, source.indexOf("// The label comes from the separate one-commit verification"));
     expect(effect).not.toContain("$repoStore");
     expect(source).not.toContain("provenanceKey");
     expect(effect.indexOf("++provenanceToken")).toBeLessThan(effect.indexOf("provenance = null"));

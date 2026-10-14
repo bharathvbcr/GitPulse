@@ -23,7 +23,7 @@
   import LanguageLogo from "./LanguageLogo.svelte";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatPathParts } from "../files/formatPath";
-  import { formatDate, shortHash } from "../format";
+  import { formatDate, shortHash, signatureLabel } from "../format";
   import { summarizeCommitFiles } from "../diff/commitFilesNotice";
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
@@ -31,7 +31,7 @@
   // The canonical wire types, not local copies: both were declared here as
   // well, and the CommitDetails one had silently fallen four fields behind.
   // `import type` is erased, so this pulls in no store at runtime.
-  import type { CommitDetails as CommitDetailsPayload } from "../stores/graphStore";
+  import type { SelectedCommitDetails as CommitDetailsPayload } from "../stores/graphStore";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import type { ProvenanceFreshness } from "../provenance/types";
 
@@ -193,15 +193,13 @@
       });
   });
 
-  function gpgLabel(status: string): { text: string; ok: boolean } {
-    if (status === "G") return { text: "Verified", ok: true };
-    if (status === "N" || !status) return { text: "Unsigned", ok: false };
-    return { text: "Unverified", ok: false };
-  }
+  // The label comes from the separate one-commit verification the store runs
+  // after the details land: the details themselves carry no verdict, so
+  // `signature_check` is `undefined` while that runs and `null` if it failed.
 </script>
 
 {#if selectedCommit}
-  {@const sig = gpgLabel(details?.gpg_status || "")}
+  {@const sig = signatureLabel(details?.signature_check, details != null && details.signature_check === undefined)}
   <div class="h-64 border-t border-border/60 gp-section-edge bg-surface flex flex-col font-sans select-none overflow-hidden">
     <div class="px-4 py-2.5 border-b border-border/60 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
       <div class="flex items-center gap-3 min-w-0">

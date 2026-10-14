@@ -1,5 +1,6 @@
 pub mod budget;
 pub mod churn_store;
+pub mod commit_signature;
 pub mod content_search;
 pub mod cow_clone;
 pub mod deadbranch;
@@ -24,6 +25,7 @@ pub use worktree_hooks::{
     HookOutcome, WorktreeHooksConfig, WorktreeHooksPreview,
 };
 
+pub use commit_signature::{CommitSignature, CommitSignatureCheck, SignatureStatus};
 pub use deadbranch::{
     DeadbranchBackupInfo, DeadbranchCleanResult, DeadbranchConfig, DeadbranchRestoreResult,
     DeadbranchScanResult, StaleBranchInfo,

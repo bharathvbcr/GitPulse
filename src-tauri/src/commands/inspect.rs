@@ -1,6 +1,7 @@
 //! Read-only repository inspection: status, diffs, file content, blame, history search, language stats.
 
 use super::*;
+use crate::engine::commit_signature::{verify_commit_signature, CommitSignatureCheck};
 
 #[tauri::command(async)]
 pub fn cmd_pick_folder() -> Option<String> {
@@ -92,6 +93,18 @@ pub async fn cmd_get_commit_details(
     commit_id: String,
 ) -> Result<CommitDetails, String> {
     off_thread(move || GitReader::get_commit_details(&repo_path, &commit_id)).await
+}
+
+/// Verifies the signature of the one commit the person selected. Separate from
+/// [`cmd_get_commit_details`] because it runs their signing program, which can
+/// take seconds (a keyserver, a pinentry); the details pane renders first and
+/// this answers after, cached for a minute against the signing configuration.
+#[tauri::command(async)]
+pub async fn cmd_verify_commit_signature(
+    repo_path: String,
+    commit_id: String,
+) -> Result<CommitSignatureCheck, String> {
+    off_thread(move || verify_commit_signature(&repo_path, &commit_id)).await
 }
 
 #[tauri::command(async)]

@@ -45,14 +45,14 @@
   <!-- Signed Commits -->
   <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
-      <span class="font-medium uppercase tracking-wider">Signed (GPG)</span>
+      <span class="font-medium uppercase tracking-wider">Signed (not verified)</span>
       <KeyRound size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-bold tracking-tight text-textPrimary">{hygiene.signedPercentage}%</span>
+      <span class="text-2xl font-bold tracking-tight text-textPrimary">{hygiene.signedPercentage === null ? "—" : `${hygiene.signedPercentage}%`}</span>
     </div>
     <div class="text-[10px] text-textMuted mt-1 truncate">
-      {hygiene.signedCount} verified signatures
+      {hygiene.signedCount} signed, not verified{hygiene.signatureUnknownCount > 0 ? ` · ${hygiene.signatureUnknownCount} unread` : ""}
     </div>
   </div>
 
