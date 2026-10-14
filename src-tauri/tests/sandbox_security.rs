@@ -680,6 +680,56 @@ fn a_gitdir_file_layout_protects_the_real_git_directory() {
 
 #[cfg(unix)]
 #[test]
+fn deleting_a_symlink_removes_only_the_link_whatever_it_points_at() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+    std::fs::create_dir(repo.join("real")).unwrap();
+    std::fs::write(repo.join("real/f.txt"), "inside").unwrap();
+    let before = dot_git_config(&repo);
+    std::os::unix::fs::symlink(repo.join("real"), repo.join("to_dir")).unwrap();
+    std::os::unix::fs::symlink(repo.join(".git"), repo.join("to_git")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.join("to_outside")).unwrap();
+
+    for link in ["to_dir", "to_git", "to_outside"] {
+        let result = GitWriter::delete_path(&repo_str, link, |_| Ok(()));
+        assert!(result.is_ok(), "{link}: {result:?}");
+        assert!(
+            std::fs::symlink_metadata(repo.join(link)).is_err(),
+            "{link} is still there"
+        );
+    }
+    assert_eq!(std::fs::read(repo.join("real/f.txt")).unwrap(), b"inside");
+    assert_eq!(
+        std::fs::read(outside.path().join("secret.txt")).unwrap(),
+        b"outside"
+    );
+    assert_eq!(dot_git_config(&repo), before);
+    assert!(repo.join(".git/HEAD").exists());
+}
+
+#[test]
+fn moving_onto_the_repository_root_is_refused_in_every_spelling() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    std::fs::write(repo_dir.path().join("keep.txt"), "keep").unwrap();
+    for destination in [".", "./.", "./"] {
+        let result = GitWriter::move_path(&repo_str, "keep.txt", destination, |_| Ok(()));
+        assert!(result.is_err(), "{destination:?} accepted: {result:?}");
+        assert_eq!(
+            std::fs::read(repo_dir.path().join("keep.txt")).unwrap(),
+            b"keep",
+            "{destination:?} moved the file"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn a_link_into_dot_git_moves_as_a_link_and_touches_nothing_in_it() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_repo(repo_dir.path());

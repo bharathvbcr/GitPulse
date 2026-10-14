@@ -737,7 +737,7 @@ fn blob_for_line_spans(
     let expected = rows.first().map(|row| row.content_hash)?;
     let matching = |commit: Option<&str>| -> Option<String> {
         let blob =
-            crate::engine::git_reader::GitReader::get_file_blob(repo_path, file_path, commit)
+            crate::engine::git_reader::GitReader::get_file_blob_view(repo_path, file_path, commit)
                 .ok()?;
         let text = blob.text?;
         if devmap_extract::content_hash(&text) != expected {

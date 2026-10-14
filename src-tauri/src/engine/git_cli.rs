@@ -9546,6 +9546,29 @@ mod tests {
     }
 
     #[test]
+    fn view_only_reads_skip_the_base_and_the_editor_open_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let open = crate::engine::GitReader::get_file_blob(&raw, "a.txt", None).unwrap();
+        assert!(
+            open.disk_base.is_some(),
+            "the editor open must carry a base"
+        );
+        let view = crate::engine::GitReader::get_file_blob_view(&raw, "a.txt", None).unwrap();
+        assert_eq!(
+            view.disk_base, None,
+            "a view-only read must not pay for one"
+        );
+        assert_eq!(view.text, open.text);
+        assert_eq!(
+            crate::engine::GitReader::get_file_content(&raw, "a.txt", None).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
     fn crlf_base_round_trips() {
         let dir = tempfile::TempDir::new().unwrap();
         init_plain_git_repo(dir.path());

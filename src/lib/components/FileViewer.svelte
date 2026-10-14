@@ -112,7 +112,7 @@
   let viewerLease: LatestOwnerLease | null = null;
 
   /** The disk version a refused save saw, for the file it was refused on. */
-  let saveRefusal = $state<{ path: string; actual: string | null } | null>(null);
+  let saveRefusal = $state<{ repo: string; path: string; actual: string | null } | null>(null);
 
   let openTabs = $derived(tabState.tabs);
   let activeTabPath = $derived(tabState.active);
@@ -129,7 +129,9 @@
    */
   let activeConflict = $derived.by(() => {
     if (!activeTabPath || !activeDraft) return null;
-    if (saveRefusal?.path === activeTabPath) return { actual: saveRefusal.actual };
+    if (saveRefusal?.repo === hydratedRepo && saveRefusal.path === activeTabPath) {
+      return { actual: saveRefusal.actual };
+    }
     const diskBase = activeBlob?.path === activeTabPath ? activeBlob.disk_base : null;
     return isEditorDraftConflicted(activeDraft, diskBase) && diskBase
       ? { actual: diskBase }
@@ -303,7 +305,9 @@
     // `updateEditorDraft` ignores the base on every later one.
     const base = activeBlob?.path === path ? activeBlob.disk_base ?? null : null;
     // A refusal belongs to the draft it refused; a new draft starts clean.
-    if (!tabState.drafts[path] && saveRefusal?.path === path) saveRefusal = null;
+    if (!tabState.drafts[path] && saveRefusal?.repo === hydratedRepo && saveRefusal.path === path) {
+      saveRefusal = null;
+    }
     tabState = updateEditorDraft(tabState, path, newContent, sourceContent, base);
     persistTabs(hydratedRepo);
   }
@@ -315,17 +319,20 @@
    * thrown so the editor stays in edit mode.
    */
   async function saveDraft(path: string, newContent: string, overrideBase?: string | null) {
+    // The repository the save was started in: a refusal belongs to it, not to
+    // whichever repository has the same relative path open when it settles.
+    const repo = hydratedRepo;
     try {
       await handleFileSave(path, newContent, overrideBase);
       saveRefusal = null;
     } catch (err: unknown) {
       const typed = readFileWriteError(err);
-      if (typed?.code === "changed_on_disk") {
-        saveRefusal = { path, actual: typed.actual };
+      if (repo && typed?.code === "changed_on_disk") {
+        saveRefusal = { repo, path, actual: typed.actual };
         void loadFileContent(path);
-      } else if (err instanceof UnbasedDraft) {
+      } else if (repo && err instanceof UnbasedDraft) {
         // No version to judge by: the banner offers Overwrite as the way out.
-        saveRefusal = { path, actual: null };
+        saveRefusal = { repo, path, actual: null };
       }
       throw err;
     }

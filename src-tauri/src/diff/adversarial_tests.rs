@@ -21,7 +21,7 @@ fn tmp() -> (tempfile::TempDir, PathBuf) {
 /// the lane, and so the token, unchanged: two different files of equal length
 /// with one token, built in O(1).
 #[test]
-fn token_has_a_two_word_same_lane_collision() {
+fn a_two_word_same_lane_edit_no_longer_collides() {
     let lane0: u64 = 0xcbf2_9ce4_8422_2325;
     let a = vec![0u8; 64];
     let first_b: u64 = 1;

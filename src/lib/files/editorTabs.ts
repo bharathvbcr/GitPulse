@@ -29,7 +29,9 @@ export interface EditorDraft {
   /**
    * The disk version (`FileBlob.disk_base`) this draft was made from, sent
    * with the save so the backend refuses it when the file has moved on. Null
-   * when the blob carried none, which saves as an explicit overwrite.
+   * when the blob carried none: such a draft is refused on save (the editor
+   * shows the conflict banner) and is written only by an explicit, confirmed
+   * Overwrite.
    */
   base: string | null;
 }

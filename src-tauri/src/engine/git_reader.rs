@@ -1457,7 +1457,7 @@ impl GitReader {
         file_path: &str,
         commit_id: Option<&str>,
     ) -> Result<String, String> {
-        let blob = Self::get_file_blob(repo_path, file_path, commit_id)?;
+        let blob = Self::get_file_blob_view(repo_path, file_path, commit_id)?;
         if let Some(text) = blob.text {
             Ok(text)
         } else {
@@ -1465,10 +1465,33 @@ impl GitReader {
         }
     }
 
+    /// The editor open: the blob carries `disk_base`, the version a save of
+    /// the draft is judged against, so it names the very bytes the user saw
+    /// and is computed eagerly here.
     pub fn get_file_blob(
         repo_path: &str,
         file_path: &str,
         commit_id: Option<&str>,
+    ) -> Result<FileBlob, String> {
+        Self::read_file_blob(repo_path, file_path, commit_id, true)
+    }
+
+    /// [`Self::get_file_blob`] for a read that only looks (file text for the
+    /// code graph, `get_file_content`): no draft will be saved from it, so it
+    /// does not pay the digest pass and `disk_base` is `None`.
+    pub fn get_file_blob_view(
+        repo_path: &str,
+        file_path: &str,
+        commit_id: Option<&str>,
+    ) -> Result<FileBlob, String> {
+        Self::read_file_blob(repo_path, file_path, commit_id, false)
+    }
+
+    fn read_file_blob(
+        repo_path: &str,
+        file_path: &str,
+        commit_id: Option<&str>,
+        with_base: bool,
     ) -> Result<FileBlob, String> {
         let repo = validate_repo(repo_path)?;
         sandbox_join(&repo, file_path)?;
@@ -1483,11 +1506,15 @@ impl GitReader {
             match sandbox_join_canonical(&repo, file_path) {
                 Ok(dest) if dest.exists() => {
                     let bytes = read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?;
-                    disk_base = Some(crate::diff::content_token(Some(&bytes)));
+                    if with_base {
+                        disk_base = Some(crate::diff::content_token(Some(&bytes)));
+                    }
                     bytes
                 }
                 Ok(_) => {
-                    disk_base = Some(crate::diff::content_token(None));
+                    if with_base {
+                        disk_base = Some(crate::diff::content_token(None));
+                    }
                     read_index_blob(&repo, file_path)?
                 }
                 Err(err) if git_cli::is_sandbox_symlink_escape(&err) => {

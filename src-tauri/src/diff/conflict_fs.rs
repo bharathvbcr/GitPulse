@@ -568,7 +568,9 @@ pub(crate) fn content_token(bytes: Option<&[u8]>) -> String {
 /// acceptable here because the other writer is the user's own external editor,
 /// an agent or `git`, none of which is trying to forge a token; the digest only
 /// has to tell the edits they actually make from no edit at all. A
-/// collision-resistant hash would need a dependency or a much slower pass.
+/// collision-resistant hash would need a dependency or a much slower pass. A
+/// crafted multi-lane collision (two lanes edited in one block and repaired in
+/// the next) remains possible; the tests cover the accidental shapes, not that.
 ///
 /// FNV-1a was the first choice and cost more than reading the file: its one
 /// multiply per byte is a serial dependency chain, so an 8 MiB open took

@@ -237,7 +237,7 @@ describe("FileViewer", () => {
       source.indexOf("async function requestDiscardDraft"),
     );
     expect(refusal).toContain('typed?.code === "changed_on_disk"');
-    expect(refusal).toContain("saveRefusal = { path, actual: typed.actual }");
+    expect(refusal).toContain("saveRefusal = { repo, path, actual: typed.actual }");
     // The error is rethrown so the editor stays in edit mode and the draft stays dirty.
     expect(refusal).toContain("throw err;");
     expect(refusal).toContain("saveDraft(path, draft.content, conflict.actual)");
