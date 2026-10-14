@@ -47,6 +47,7 @@
     content,
     eol = null,
     invalidUtf8Bytes = 0,
+    diskBase = null,
     readOnly = false,
     draftContent = null,
     dirty = false,
@@ -60,6 +61,8 @@
     eol?: LineEnding | null;
     /** Bytes `content` shows as U+FFFD because the file is not valid UTF-8. */
     invalidUtf8Bytes?: number;
+    /** The disk version `content` is (`FileBlob.disk_base`); sent with a standalone save. */
+    diskBase?: string | null;
     readOnly?: boolean;
     draftContent?: string | null;
     dirty?: boolean;
@@ -311,10 +314,13 @@
       } else {
         const repo = $repoStore.currentPath;
         if (!repo) throw new Error("No active repository");
+        // Standalone use has no draft owner to remember the base, so the
+        // file is saved against the version this viewer was handed.
         await invoke("cmd_write_file_content", {
           repoPath: repo,
           filePath: path,
           content: contentToSave,
+          expectedBase: diskBase,
         });
         await repoStore.refresh();
       }

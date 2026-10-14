@@ -20,8 +20,18 @@ export interface EditorTabState {
 
 export interface EditorDraft {
   content: string;
-  /** File content against which this draft first became dirty. */
+  /**
+   * File content against which this draft first became dirty. Kept for the
+   * life of the draft: a file that changes on disk afterwards must not
+   * quietly become the draft's new baseline.
+   */
   sourceContent: string;
+  /**
+   * The disk version (`FileBlob.disk_base`) this draft was made from, sent
+   * with the save so the backend refuses it when the file has moved on. Null
+   * when the blob carried none, which saves as an explicit overwrite.
+   */
+  base: string | null;
 }
 
 function makeTab(path: string, preview: boolean): EditorTab {
@@ -144,15 +154,21 @@ export function updateEditorDraft(
   path: string,
   content: string,
   sourceContent: string,
+  base: string | null = null,
 ): EditorTabState {
   if (!state.tabs.some((tab) => tab.path === path)) return state;
   const drafts = { ...state.drafts };
-  if (content === sourceContent) {
+  // Only the first dirtying keystroke fixes the baseline and the base. Later
+  // keystrokes arrive carrying whatever blob is loaded now, which after an
+  // external change is not the version this draft was made from.
+  const existing = drafts[path];
+  const source = existing ? existing.sourceContent : sourceContent;
+  if (content === source) {
     delete drafts[path];
   } else {
-    drafts[path] = { content, sourceContent };
+    drafts[path] = { content, sourceContent: source, base: existing ? existing.base : base };
   }
-  const tabs = content === sourceContent
+  const tabs = content === source
     ? state.tabs
     : state.tabs.map((tab) => tab.path === path ? { ...tab, preview: false } : tab);
   return { tabs, active: state.active, drafts };
@@ -165,17 +181,44 @@ function clearEditorDraft(state: EditorTabState, path: string): EditorTabState {
   return { ...state, drafts };
 }
 
-/** Successful writes are the only save-path callers allowed to clear dirty state. */
+/**
+ * Successful writes are the only save-path callers allowed to clear dirty state.
+ *
+ * `savedBase` is the disk version the write produced. Input can race a slow
+ * write, so a draft that has moved past what was saved stays dirty; it is then
+ * re-based onto the saved text and version, because the disk now holds what it
+ * saved and the next save must be judged against that, not the version from
+ * before this one. Omit `savedBase` to leave such a draft untouched.
+ */
 export function completeEditorSave(
   state: EditorTabState,
   path: string,
   savedContent: string,
+  savedBase?: string | null,
 ): EditorTabState {
   const draft = state.drafts[path];
-  // Input can race a slow write. Completing an older snapshot must not mark
-  // newer keystrokes clean.
-  if (draft && draft.content !== savedContent) return state;
+  if (draft && draft.content !== savedContent) {
+    if (savedBase === undefined) return state;
+    return {
+      ...state,
+      drafts: { ...state.drafts, [path]: { ...draft, sourceContent: savedContent, base: savedBase } },
+    };
+  }
   return clearEditorDraft(state, path);
+}
+
+/**
+ * True when the file on disk is not the version the draft was made from: the
+ * blob just loaded carries a different `disk_base` than the draft's. Tokens
+ * are compared, never text, so a CRLF flip or a same-size rewrite counts and
+ * a touch does not. Without a draft, a base on both sides, there is nothing
+ * to conflict with.
+ */
+export function isEditorDraftConflicted(
+  draft: EditorDraft | undefined,
+  diskBase: string | null | undefined,
+): boolean {
+  return Boolean(draft && draft.base !== null && diskBase != null && diskBase !== draft.base);
 }
 
 /** Called only after the user explicitly confirms discarding this draft. */

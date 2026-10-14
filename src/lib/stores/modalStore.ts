@@ -12,6 +12,13 @@ export interface TextPromptOptions extends PromptBaseOptions {
   mode?: "text";
   placeholder?: string;
   initialValue?: string;
+  /**
+   * Judges the answer when the person submits. A message keeps the dialog open
+   * and shows it under the field; null accepts. Not consulted on cancel.
+   */
+  validate?: (value: string) => string | null;
+  /** Shown under the field when the dialog opens, e.g. a refusal from the host for the name just typed. */
+  error?: string;
 }
 
 export interface ConfirmPromptOptions extends PromptBaseOptions {
@@ -30,6 +37,9 @@ interface PendingPrompt {
 /** The currently shown prompt, if any. Rendered once by PromptModal.svelte. */
 export const promptState = writable<PendingPrompt | null>(null);
 
+/** The open prompt's `validate` refusal, shown under its field; null when none. */
+export const promptError = writable<string | null>(null);
+
 /**
  * window.prompt / window.confirm return undefined / null under WKWebView,
  * silently no-oping branch create/rename/delete. These helpers promise the
@@ -38,6 +48,7 @@ export const promptState = writable<PendingPrompt | null>(null);
 function takePending(): PendingPrompt | null {
   const current = get(promptState);
   if (current) promptState.set(null);
+  promptError.set(null);
   return current;
 }
 
@@ -62,8 +73,20 @@ export function askConfirm(options: Omit<ConfirmPromptOptions, "mode">): Promise
   return begin({ ...options, mode: "confirm" }).then((value) => value === true);
 }
 
-/** Completes the open prompt with the user's answer (a string, boolean, or null). */
+/**
+ * Completes the open prompt with the user's answer (a string, boolean, or
+ * null). A text answer its `validate` refuses does not complete it: the
+ * refusal is published on [`promptError`] and the prompt stays open.
+ */
 export function completePrompt(value: string | boolean | null): void {
+  const current = get(promptState);
+  if (current && typeof value === "string" && current.options.mode === "text") {
+    const problem = current.options.validate?.(value) ?? null;
+    if (problem !== null) {
+      promptError.set(problem);
+      return;
+    }
+  }
   takePending()?.resolve(value);
 }
 

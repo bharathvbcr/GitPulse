@@ -57,6 +57,7 @@
   import { harnessStore, type Guarded } from "../../stores/harnessStore";
   import type { DeleteOutcome } from "../../files/types";
   import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
+  import { newPathProblem, readFileWriteError, withAncestors } from "../../files/fileWrite";
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
@@ -502,57 +503,90 @@
   }
 
   // File operations
+  /**
+   * Asks for a name and creates the empty file `toPath(name)` through the
+   * create-only command, which never replaces anything. A name the listing
+   * already holds is refused in the dialog; one the listing has not shown but
+   * the disk has comes back `already_exists`, and the dialog reopens on the
+   * name that was typed with that refusal under it. Resolves the created
+   * path, or null when cancelled or failed.
+   */
+  async function promptAndCreate(
+    repo: string,
+    parentDir: string,
+    prompt: { title: string; message: string; placeholder: string; confirmLabel: string },
+    toPath: (name: string) => string,
+  ): Promise<string | null> {
+    let typed = "";
+    let refusal: string | undefined;
+    for (;;) {
+      const name = await askText({
+        ...prompt,
+        initialValue: typed,
+        error: refusal,
+        validate: (value) => newPathProblem(value, parentDir, withAncestors(listedPaths)),
+      });
+      if (!name?.trim()) return null;
+      if (repo !== $repoStore.currentPath) return null;
+      const path = toPath(name.trim());
+      try {
+        const result = await invoke<Guarded<null>>("cmd_create_file", { repoPath: repo, filePath: path });
+        harnessStore.recordVerdict(result.policy, repo);
+        harnessStore.recordAction({ repoPath: repo, kind: "create", label: path, ok: true });
+        return path;
+      } catch (err: unknown) {
+        const typedError = readFileWriteError(err);
+        if (typedError?.code === "already_exists") {
+          typed = name;
+          refusal = typedError.message;
+          continue;
+        }
+        harnessStore.recordAction({ repoPath: repo, kind: "create", label: path, ok: false });
+        repoStore.setError(formatError(err));
+        return null;
+      }
+    }
+  }
+
   async function createNewFile(parentDir: string = "") {
     closeContextMenu();
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    const name = await askText({
-      title: "New File",
-      message: parentDir ? `Create file in ${parentDir}/` : "Create file in repository root",
-      placeholder: "example.ts",
-      confirmLabel: "Create",
-    });
-    if (!name?.trim()) return;
-    const fullRelative = parentDir ? `${parentDir}/${name.trim()}` : name.trim();
-    try {
-      await invoke("cmd_write_file_content", {
-        repoPath: repo,
-        filePath: fullRelative,
-        content: "",
-      });
-      await loadFiles(repo);
-      await repoStore.refresh();
-      chooseFile(fullRelative);
-    } catch (err: unknown) {
-      repoStore.setError(formatError(err));
-    }
+    const created = await promptAndCreate(
+      repo,
+      parentDir,
+      {
+        title: "New File",
+        message: parentDir ? `Create file in ${parentDir}/` : "Create file in repository root",
+        placeholder: "example.ts",
+        confirmLabel: "Create",
+      },
+      (name) => (parentDir ? `${parentDir}/${name}` : name),
+    );
+    if (!created) return;
+    await loadFiles(repo);
+    await repoStore.refresh();
+    chooseFile(created);
   }
 
   async function createNewFolder(parentDir: string = "") {
     closeContextMenu();
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    const folderName = await askText({
-      title: "New Folder",
-      message: parentDir ? `Create folder in ${parentDir}/` : "Create folder in repository root",
-      placeholder: "components",
-      confirmLabel: "Create Folder",
-    });
-    if (!folderName?.trim()) return;
-    const dummyPath = parentDir
-      ? `${parentDir}/${folderName.trim()}/.gitkeep`
-      : `${folderName.trim()}/.gitkeep`;
-    try {
-      await invoke("cmd_write_file_content", {
-        repoPath: repo,
-        filePath: dummyPath,
-        content: "",
-      });
-      await loadFiles(repo);
-      await repoStore.refresh();
-    } catch (err: unknown) {
-      repoStore.setError(formatError(err));
-    }
+    const created = await promptAndCreate(
+      repo,
+      parentDir,
+      {
+        title: "New Folder",
+        message: parentDir ? `Create folder in ${parentDir}/` : "Create folder in repository root",
+        placeholder: "components",
+        confirmLabel: "Create Folder",
+      },
+      (name) => (parentDir ? `${parentDir}/${name}/.gitkeep` : `${name}/.gitkeep`),
+    );
+    if (!created) return;
+    await loadFiles(repo);
+    await repoStore.refresh();
   }
 
   /**

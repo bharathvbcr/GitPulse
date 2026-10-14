@@ -52,6 +52,7 @@
       text?: string | null;
       base64?: string | null;
       invalid_utf8_bytes?: number;
+      disk_base?: string | null;
       eol?: LineEnding | null;
     };
     draftContent?: string | null;
@@ -397,6 +398,7 @@
           content={sourceContent}
           eol={blob.eol ?? null}
           invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
+          diskBase={blob.disk_base ?? null}
           {draftContent}
           {dirty}
           {onSave}
@@ -414,6 +416,7 @@
             content={sourceContent}
             eol={blob.eol ?? null}
             invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
+            diskBase={blob.disk_base ?? null}
             {draftContent}
             {dirty}
             {onSave}
