@@ -56,15 +56,28 @@ pub(super) fn tool_budget(id: &Value) -> usize {
 /// The frame is measured on the wire, where a quote, a backslash or a control
 /// character grows two to six times. A budget on raw length is not a budget.
 pub(super) fn escaped_len(text: &str) -> usize {
-    2 + text.chars().map(escape_cost).sum::<usize>()
+    2 + text.bytes().map(byte_cost).sum::<usize>()
 }
 
-/// Bytes `character` takes inside a JSON string, as `serde_json` writes it.
-pub(super) fn escape_cost(character: char) -> usize {
-    match character {
-        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
-        c if (c as u32) < 0x20 => 6,
-        c => c.len_utf8(),
+/// Bytes one byte of text takes inside a JSON string, as `serde_json` writes
+/// it: a quote, a backslash and the named control characters take two, any
+/// other control character six, everything else (every byte of a multi-byte
+/// character included) one. The one owner of the figure: the per-character
+/// prefix walk and the byte counter both read it.
+fn byte_cost(byte: u8) -> usize {
+    match byte {
+        b'"' | b'\\' | 0x08 | 0x09 | 0x0a | 0x0c | 0x0d => 2,
+        0..=0x1f => 6,
+        _ => 1,
+    }
+}
+
+/// [`byte_cost`] summed over the bytes of one character.
+fn char_cost(character: char) -> usize {
+    if character.is_ascii() {
+        byte_cost(character as u8)
+    } else {
+        character.len_utf8()
     }
 }
 
@@ -73,7 +86,7 @@ pub(super) fn escape_cost(character: char) -> usize {
 pub(super) fn escaped_prefix(text: &str, budget: usize) -> &str {
     let mut used = 0;
     for (index, character) in text.char_indices() {
-        used += escape_cost(character);
+        used += char_cost(character);
         if used > budget {
             return &text[..index];
         }
@@ -99,7 +112,12 @@ pub(super) struct Fitted {
 ///   compact form of the payload cut to that size, still JSON of the same shape.
 ///
 /// `Err` is the message of a tool execution error: the payload is too large
-/// and holds no list left to cut.
+/// and holds no list left to cut, or what is left is a page (a list beside a
+/// `next_cursor`) whose cursor cannot follow a cut. A page is cut only when its
+/// cursor is numeric and its rows carry integer ids, so the cursor can be moved
+/// to the last kept row; any other page is refused, with a message telling the
+/// caller to retry with a smaller `limit`, rather than cut into a cursor that
+/// skips rows or a `has_more` with no cursor to continue from.
 pub(super) fn fit(modern: bool, payload: Value, budget: usize) -> Result<Fitted, String> {
     let compact = serde_json::to_string(&payload)
         .map_err(|error| format!("result could not be serialized: {error}"))?;
@@ -113,7 +131,7 @@ pub(super) fn fit(modern: bool, payload: Value, budget: usize) -> Result<Fitted,
         let original = compact.len();
         drop(compact);
         let cut = truncate(payload, original, budget, escaped_compact_len)
-            .ok_or_else(|| too_large(original, budget))?;
+            .map_err(|refusal| refusal_message(&refusal, original, budget))?;
         return Ok(Fitted {
             text: to_compact(&cut)?,
             structured: None,
@@ -128,15 +146,30 @@ pub(super) fn fit(modern: bool, payload: Value, budget: usize) -> Result<Fitted,
         compact
     } else {
         drop(compact);
-        let cut = truncate(payload.clone(), original, mirror, escaped_compact_len)
-            .ok_or_else(|| too_large(original, budget))?;
-        to_compact(&cut)?
+        match truncate(payload.clone(), original, mirror, escaped_compact_len) {
+            Ok(cut) => to_compact(&cut)?,
+            // A page that cannot be cut honestly is not mirrored cut: the text
+            // says so and points at `structuredContent`, which carries it whole
+            // when the budget allows (and is refused below when it does not).
+            Err(Refusal::Paged) => to_compact(&json!({
+                TRUNCATION_KEY: {
+                    "budget_bytes": mirror,
+                    "original_bytes": original,
+                    "arrays": [],
+                    "arrays_total": 0,
+                    "note": "this page is too large to mirror as text and cannot be cut \
+                             without skipping rows; read structuredContent",
+                }
+            }))?,
+            Err(refusal) => return Err(refusal_message(&refusal, original, budget)),
+        }
     };
     let room = budget.saturating_sub(escaped_len(&text));
     let structured = if original <= room {
         payload
     } else {
-        truncate(payload, original, room, compact_len).ok_or_else(|| too_large(original, budget))?
+        truncate(payload, original, room, compact_len)
+            .map_err(|refusal| refusal_message(&refusal, original, budget))?
     };
     Ok(Fitted {
         text,
@@ -166,16 +199,7 @@ struct EscapedCounter(usize);
 
 impl io::Write for EscapedCounter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 += bytes
-            .iter()
-            .map(|byte| match byte {
-                b'"' | b'\\' => 2,
-                // Compact JSON holds no raw control byte; counted for safety.
-                0x08 | 0x09 | 0x0a | 0x0c | 0x0d => 2,
-                0..=0x1f => 6,
-                _ => 1,
-            })
-            .sum::<usize>();
+        self.0 += bytes.iter().map(|byte| byte_cost(*byte)).sum::<usize>();
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -205,6 +229,30 @@ struct Cut {
     total: usize,
 }
 
+/// The lists cut so far, in the order they were first cut, indexed by pointer
+/// so recording a cut of a list already cut is a lookup, not a scan.
+#[derive(Default)]
+struct Cuts {
+    list: Vec<Cut>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl Cuts {
+    fn record(&mut self, pointer: &str, kept: usize, total: usize) {
+        match self.index.get(pointer) {
+            Some(at) => self.list[*at].kept = kept,
+            None => {
+                self.index.insert(pointer.to_string(), self.list.len());
+                self.list.push(Cut {
+                    pointer: pointer.to_string(),
+                    kept,
+                    total,
+                });
+            }
+        }
+    }
+}
+
 /// `payload` with lists cut until `measure(payload) <= limit`.
 ///
 /// Each round takes the lists with two or more elements that are not inside
@@ -225,12 +273,15 @@ fn truncate(
     original: usize,
     limit: usize,
     measure: fn(&Value) -> usize,
-) -> Option<Value> {
-    let mut cuts: Vec<Cut> = Vec::new();
+) -> Result<Value, Refusal> {
+    let mut cuts = Cuts::default();
+    // Whether a paged list was left alone because cutting it could not keep its
+    // cursor honest; if the payload then stays over, that is the reason.
+    let mut paged_left_alone = false;
     for _ in 0..MAX_ROUNDS {
         let size = measure(&payload);
         if size <= limit {
-            return Some(payload);
+            return Ok(payload);
         }
         // First keep a head of every list; only when every list is down to one
         // element and the payload is still over is a list emptied, largest
@@ -239,7 +290,8 @@ fn truncate(
         let mut cut_any = false;
         let mut need = size - limit + MARKER_SLACK_BYTES;
         for (floor, min_len) in [(1, 2), (0, 1)] {
-            let lists = cuttable_lists(&payload, min_len);
+            let (lists, left_alone) = cuttable_lists(&payload, min_len, floor);
+            paged_left_alone |= left_alone;
             if floor == 1 {
                 need += MARKER_ENTRY_BYTES * lists.len().min(MARKER_ENTRIES);
             }
@@ -258,54 +310,118 @@ fn truncate(
         if !cut_any {
             break;
         }
-        describe_cuts(&mut payload, limit, original, &cuts);
+        describe_cuts(&mut payload, limit, original, &cuts.list);
     }
-    (measure(&payload) <= limit).then_some(payload)
+    if measure(&payload) <= limit {
+        return Ok(payload);
+    }
+    Err(if paged_left_alone {
+        Refusal::Paged
+    } else {
+        Refusal::NothingToCut
+    })
+}
+
+/// Why a payload could not be brought under its budget.
+enum Refusal {
+    /// It holds no list left to cut.
+    NothingToCut,
+    /// What remains is a page whose cursor cannot be kept honest across a cut.
+    Paged,
 }
 
 /// The message of the tool execution error for a payload that cannot be cut
 /// down: what it weighs, what it may, and what the caller can do.
-fn too_large(original: usize, budget: usize) -> String {
-    format!(
-        "tool result is {original} bytes and cannot be shortened to its {budget} byte budget: \
-         it holds no list left to cut. Ask for less (a narrower argument or a smaller limit)."
-    )
+fn refusal_message(refusal: &Refusal, original: usize, budget: usize) -> String {
+    match refusal {
+        Refusal::NothingToCut => format!(
+            "tool result is {original} bytes and cannot be shortened to its {budget} byte \
+             budget: it holds no list left to cut. Ask for less (a narrower argument or a \
+             smaller limit)."
+        ),
+        Refusal::Paged => format!(
+            "tool result is {original} bytes, over its {budget} byte budget, and it is a page \
+             whose cursor cannot be moved without skipping rows, so it is not cut. Retry with a \
+             smaller `limit`."
+        ),
+    }
 }
 
-/// JSON pointers to the lists with two or more elements that are not inside
-/// another such list, largest (by serialized bytes) first.
-fn cuttable_lists(root: &Value, min_len: usize) -> Vec<String> {
-    fn walk(value: &Value, min_len: usize, pointer: &mut String, found: &mut Vec<(usize, String)>) {
+/// Whether the cursor beside a list can follow a cut of it: numeric, with an
+/// integer `id` on every element, so it can be moved to the last kept one.
+fn cursor_can_follow(cursor: &Value, items: &[Value]) -> bool {
+    (cursor.is_i64() || cursor.is_u64())
+        && items
+            .iter()
+            .all(|item| item.get("id").is_some_and(Value::is_i64))
+}
+
+/// JSON pointers to the lists with at least `min_len` elements that are not
+/// inside another such list, largest (by serialized bytes) first, and whether a
+/// list was left out because it is a page (its object holds a `next_cursor`)
+/// whose cursor [cannot follow a cut](cursor_can_follow) or that `floor` would
+/// empty. A page is cut only where its cursor can be moved, so a cut can never
+/// leave a reader a cursor that skips the dropped rows, nor `has_more` with no
+/// cursor to continue from.
+fn cuttable_lists(root: &Value, min_len: usize, floor: usize) -> (Vec<String>, bool) {
+    struct Walk {
+        min_len: usize,
+        floor: usize,
+        found: Vec<(usize, String)>,
+        left_alone: bool,
+    }
+    fn walk(value: &Value, pointer: &mut String, state: &mut Walk) {
         match value {
             // Not descended into: cutting it shortens whatever is inside.
-            Value::Array(items) if items.len() >= min_len => {
-                found.push((compact_len(value), pointer.clone()));
+            Value::Array(items) if items.len() >= state.min_len => {
+                state.found.push((compact_len(value), pointer.clone()));
             }
             Value::Array(items) => {
                 for (index, item) in items.iter().enumerate() {
                     let mark = pointer.len();
                     pointer.push('/');
                     pointer.push_str(&index.to_string());
-                    walk(item, min_len, pointer, found);
+                    walk(item, pointer, state);
                     pointer.truncate(mark);
                 }
             }
             Value::Object(members) => {
+                let cursor = members.get("next_cursor");
                 for (key, item) in members {
+                    if let (Value::Array(items), Some(cursor)) = (item, cursor) {
+                        if items.len() >= state.min_len
+                            && !(state.floor >= 1 && cursor_can_follow(cursor, items))
+                        {
+                            state.left_alone = true;
+                            continue;
+                        }
+                    }
                     let mark = pointer.len();
                     pointer.push('/');
                     pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                    walk(item, min_len, pointer, found);
+                    walk(item, pointer, state);
                     pointer.truncate(mark);
                 }
             }
             _ => {}
         }
     }
-    let mut found = Vec::new();
-    walk(root, min_len, &mut String::new(), &mut found);
-    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    found.into_iter().map(|(_, pointer)| pointer).collect()
+    let mut state = Walk {
+        min_len,
+        floor,
+        found: Vec::new(),
+        left_alone: false,
+    };
+    walk(root, &mut String::new(), &mut state);
+    state.found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    (
+        state
+            .found
+            .into_iter()
+            .map(|(_, pointer)| pointer)
+            .collect(),
+        state.left_alone,
+    )
 }
 
 /// Cut the list at `pointer` to the longest prefix that removes at least
@@ -316,7 +432,7 @@ fn cut_list(
     pointer: &str,
     overshoot: usize,
     floor: usize,
-    cuts: &mut Vec<Cut>,
+    cuts: &mut Cuts,
 ) -> usize {
     let Some(Value::Array(items)) = root.pointer_mut(pointer) else {
         return 0;
@@ -334,14 +450,7 @@ fn cut_list(
         .and_then(|item| item.get("id"))
         .and_then(Value::as_i64);
 
-    match cuts.iter_mut().find(|cut| cut.pointer == pointer) {
-        Some(cut) => cut.kept = keep,
-        None => cuts.push(Cut {
-            pointer: pointer.to_string(),
-            kept: keep,
-            total: before,
-        }),
-    }
+    cuts.record(pointer, keep, before);
 
     let removed_bytes = removed;
     let (parent_pointer, key) = pointer.rsplit_once('/').unwrap_or(("", pointer));
@@ -358,28 +467,19 @@ fn cut_list(
         }
     }
     // Flags that already say "more exists" say it now, whatever they said.
-    for flag in [
-        "truncated".to_string(),
-        "has_more".to_string(),
-        format!("{key}_truncated"),
-    ] {
+    for flag in ["truncated".to_string(), format!("{key}_truncated")] {
         if parent.get(&flag).is_some_and(Value::is_boolean) {
             parent.insert(flag, json!(true));
         }
     }
     // A cursor says where the next page starts, and the rows this cut dropped
-    // are the next page's first. A numeric cursor naming the last row of the
-    // page is moved back to the last row that is left. Any other cursor (the
-    // task board's is opaque) cannot be moved correctly, so it is withdrawn
-    // rather than kept: a cursor that skips the dropped rows is the one
-    // outcome a reader cannot detect. `has_more` and `result_truncation` say
-    // rows were dropped, and a smaller request gets them.
-    if let Some(cursor) = parent.get_mut("next_cursor") {
-        match (last_id, cursor.is_i64() || cursor.is_u64()) {
-            (Some(id), true) => *cursor = json!(id),
-            _ if cursor.is_null() => {}
-            _ => *cursor = Value::Null,
-        }
+    // are the next page's first, so a numeric cursor naming the last row of the
+    // page is moved back to the last row that is left. Only such a page was
+    // chosen for cutting ([`cuttable_lists`]); any other (the task board's
+    // cursor is opaque) is never cut, because a cursor that skips the dropped
+    // rows, or `has_more` with no cursor, is an outcome a reader cannot detect.
+    if let (Some(id), Some(cursor)) = (last_id, parent.get_mut("next_cursor")) {
+        *cursor = json!(id);
     }
     removed_bytes
 }
@@ -660,22 +760,80 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_that_cannot_be_moved_is_withdrawn_and_has_more_is_set() {
-        let tasks = json!({
-            "has_more": false, "next_cursor": "opaque", "returned": 40,
-            "tasks": rows(40, 2000),
-        });
-        let structured = fit(true, tasks, 20_000).unwrap().structured.unwrap();
-        assert_eq!(structured["next_cursor"], Value::Null);
-        assert_eq!(structured["has_more"], true);
+    fn a_page_whose_cursor_cannot_be_moved_is_refused_not_cut() {
+        // Never `has_more: true` with `next_cursor: null` (a client looping on
+        // has_more would restart at page one), and never a cursor that skips
+        // the dropped rows: the page is not cut, the call is told to ask less.
+        for (has_more, cursor) in [
+            (json!(true), json!("opaque")),
+            (json!(false), json!("opaque")),
+            (json!(false), Value::Null),
+        ] {
+            let tasks = json!({
+                "has_more": has_more, "next_cursor": cursor, "returned": 40,
+                "tasks": rows(40, 2000),
+            });
+            for modern in [true, false] {
+                let message = match fit(modern, tasks.clone(), 20_000) {
+                    Ok(_) => panic!("a page that cannot be cut was cut (modern={modern})"),
+                    Err(message) => message,
+                };
+                assert!(message.contains("smaller `limit`"), "{message}");
+                assert!(message.contains("20000"), "{message}");
+            }
+        }
         // A numeric cursor over rows without an `id` cannot be moved either.
         let numeric = json!({
             "next_cursor": 40, "truncated": false,
             "xs": (0..40).map(|_| json!({ "blob": "b".repeat(2000) })).collect::<Vec<_>>(),
         });
-        let structured = fit(true, numeric, 20_000).unwrap().structured.unwrap();
-        assert_eq!(structured["next_cursor"], Value::Null);
-        assert_eq!(structured["truncated"], true);
+        assert!(fit(true, numeric, 20_000).is_err());
+        // Nor can an emptied page: it would leave a cursor naming no row.
+        let ledger = json!({
+            "next_cursor": 1, "truncated": false,
+            "events": [{ "id": 1, "blob": "b".repeat(100_000) }],
+        });
+        assert!(fit(true, ledger, 20_000).is_err());
+    }
+
+    #[test]
+    fn a_page_inside_the_budget_is_whole_and_a_text_mirror_too_big_for_it_says_so() {
+        let tasks = json!({
+            "has_more": true, "next_cursor": "opaque", "returned": 40,
+            "tasks": rows(40, 20_000),
+        });
+        let fitted = fit(true, tasks.clone(), 4 * 1024 * 1024 - 512).unwrap();
+        assert_eq!(fitted.structured.unwrap(), tasks, "the page is whole");
+        let mirror: Value = serde_json::from_str(&fitted.text).unwrap();
+        assert!(fitted.text.len() <= TEXT_MIRROR_BYTES);
+        assert!(
+            mirror[TRUNCATION_KEY]["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("structuredContent")),
+            "{mirror}"
+        );
+        // Legacy has only the text, so the same page is whole in it.
+        let legacy = fit(false, tasks.clone(), 4 * 1024 * 1024 - 512).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&legacy.text).unwrap(), tasks);
+    }
+
+    #[test]
+    fn a_page_is_left_alone_while_another_list_in_the_payload_is_cut() {
+        let payload = json!({
+            "page": { "has_more": true, "next_cursor": "opaque", "tasks": rows(3, 100) },
+            "other": rows(60, 2000),
+        });
+        let structured = fit(true, payload, 30_000).unwrap().structured.unwrap();
+        assert_eq!(structured["page"]["tasks"].as_array().unwrap().len(), 3);
+        assert_eq!(structured["page"]["next_cursor"], "opaque");
+        assert_eq!(structured["page"]["has_more"], true);
+        assert!(structured["other"].as_array().unwrap().len() < 60);
+        // Every list in an object that holds a cursor belongs to its page: the
+        // cursor cannot say which one it pages, so none is cut.
+        let one_object = json!({
+            "next_cursor": "opaque", "tasks": rows(3, 100), "other": rows(60, 2000),
+        });
+        assert!(fit(true, one_object, 30_000).is_err());
     }
 
     #[test]

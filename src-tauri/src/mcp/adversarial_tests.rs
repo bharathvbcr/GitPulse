@@ -27,10 +27,16 @@ fn a_cut_task_page_does_not_keep_a_cursor_that_skips_the_dropped_rows() {
         "has_more": true, "next_cursor": "opaque-offset-50",
         "tasks": rows(50, 2000),
     });
-    let structured = budget::fit(true, payload, 30_000)
-        .unwrap()
-        .structured
-        .unwrap();
+    // The page cannot be cut with an honest cursor, so it is refused with a
+    // tool error telling the caller to retry smaller: no rows are skipped. (The
+    // assertions below still hold for any implementation that does cut it.)
+    let structured = match budget::fit(true, payload, 30_000) {
+        Err(message) => {
+            assert!(message.contains("smaller `limit`"), "{message}");
+            return;
+        }
+        Ok(fitted) => fitted.structured.unwrap(),
+    };
     let kept = structured["tasks"].as_array().unwrap().len();
     assert!(kept < 50, "fixture was not cut");
     assert_ne!(
@@ -49,10 +55,16 @@ fn a_cut_last_task_page_still_reports_has_more() {
         "has_more": false, "next_cursor": null,
         "tasks": rows(50, 2000),
     });
-    let structured = budget::fit(true, payload, 30_000)
-        .unwrap()
-        .structured
-        .unwrap();
+    // Refused rather than cut: a cut last page would need `has_more: true` with
+    // no cursor to continue from, which a client looping on has_more would read
+    // as "start again". The refusal is the loud form of "more follows".
+    let structured = match budget::fit(true, payload, 30_000) {
+        Err(message) => {
+            assert!(message.contains("smaller `limit`"), "{message}");
+            return;
+        }
+        Ok(fitted) => fitted.structured.unwrap(),
+    };
     assert!(structured["tasks"].as_array().unwrap().len() < 50);
     assert_eq!(
         structured["has_more"], true,

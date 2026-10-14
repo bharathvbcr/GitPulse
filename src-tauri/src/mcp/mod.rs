@@ -901,7 +901,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_list_tasks",
             "List tasks",
-            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done.",
+            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done. A page is never cut to fit the result budget (that would skip rows or leave `has_more` with no `next_cursor`): a page too large to return is a tool error telling you to retry with a smaller `limit`.",
             ListTasksArgs::properties(),
             &ListTasksArgs::required(),
             json!({
