@@ -29,10 +29,13 @@
 //! by every later consumer.
 
 pub mod bindings;
+mod cap;
 mod consolidated;
 pub mod ids;
 pub mod redact;
 
+pub(crate) use cap::{bound_json_text, ROW_FIELD_CAP_BYTES};
+use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -305,33 +308,101 @@ impl EventStamp {
     }
 }
 
-/// `detail` redacted, with `stamp`'s keys in it.
+/// One server-built member set that skips the redactor when it is spliced into
+/// a `detail_json` object: the event-time stamp, or the record of an `object`
+/// cut. Each is checked against a closed shape first
+/// ([`EventStamp::is_well_formed`], [`ObjectCap::is_well_formed`]).
+enum Splice<'a> {
+    Stamp(&'a EventStamp),
+    ObjectCap(&'a ObjectCap),
+}
+
+impl Splice<'_> {
+    fn is_well_formed(&self) -> bool {
+        match self {
+            Splice::Stamp(stamp) => stamp.is_well_formed(),
+            Splice::ObjectCap(cap) => cap.is_well_formed(),
+        }
+    }
+
+    /// The members as JSON object text, without braces.
+    fn members(&self) -> String {
+        let object = match self {
+            Splice::Stamp(stamp) => stamp.members(),
+            Splice::ObjectCap(cap) => {
+                serde_json::json!({ OBJECT_TRUNCATED_KEY: cap.as_value() }).to_string()
+            }
+        };
+        object[1..object.len() - 1].to_string()
+    }
+
+    /// The members inserted into a parsed object, overwriting.
+    fn insert_into(&self, map: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            Splice::Stamp(stamp) => {
+                map.insert("occurred_at".into(), stamp.occurred_at.clone().into());
+                map.insert(
+                    "occurred_at_basis".into(),
+                    stamp.occurred_at_basis.clone().into(),
+                );
+                map.insert("task_basis".into(), stamp.task_basis.clone().into());
+            }
+            Splice::ObjectCap(cap) => {
+                map.insert(OBJECT_TRUNCATED_KEY.into(), cap.as_value());
+            }
+        }
+    }
+}
+
+/// `detail` redacted, with `stamp`'s keys and `cap`'s record in it.
 ///
-/// A well-formed stamp is spliced onto the redacted object: the detail is
-/// redacted without the three keys, and their validated members are appended.
-/// Anything else takes the closed path: a stamp that fails validation, or a
-/// detail that names a stamp key (spelled plainly or through a `\u` escape,
-/// which any JSON parser reads as the same key). There the keys go into the
-/// parsed object, overwriting, and the whole of it is redacted. A detail that
-/// does not parse as a JSON object carries no stamp on that path.
+/// Each well-formed member set is spliced onto the redacted object: the detail
+/// is redacted without those keys, and their validated members are appended.
+/// Anything else takes the closed path: a member set that fails validation, or
+/// a detail that names a spliced key (spelled plainly or through a `\u`
+/// escape, which any JSON parser reads as the same key). There the keys go into
+/// the parsed object, overwriting, and the whole of it is redacted. A detail
+/// that does not parse as a JSON object carries no stamp on that path, but a
+/// cut `object` is always recorded: the detail is wrapped as
+/// `{"detail": <original>, "object_truncated": {..}}`.
+///
+/// `object_truncated` is the server's key whether or not an object was cut: a
+/// caller who spells it takes the closed path, and the spelling is dropped (and
+/// replaced when there was a cut), so a row cannot claim a cut that never
+/// happened or choose the hash of one that did.
 ///
 /// Callers pass serde-built objects. The fast path does not parse: text that
 /// starts with `{` and ends with `}` is spliced as it is, so malformed brace
 /// text (`{}{}`, `{not json}`) is not validated there, and a debug build
 /// asserts that the redacted text is an object. A release-mode parse would cost
 /// back what the splice saves.
-fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<String> {
-    let Some(stamp) = stamp else {
-        return detail.map(redact::text);
-    };
-    // A detail that already names one of the keys would be given it twice.
+fn redact_detail(
+    detail: Option<&str>,
+    stamp: Option<&EventStamp>,
+    cap: Option<&ObjectCap>,
+) -> Option<String> {
+    let splices: Vec<Splice<'_>> = stamp
+        .map(Splice::Stamp)
+        .into_iter()
+        .chain(cap.map(Splice::ObjectCap))
+        .collect();
+    // A detail that already names a key the server writes would be given it
+    // twice, or would claim a record the server never made. With nothing to
+    // splice only the marker is the server's; its key is reserved always.
     let names_a_key = detail.is_some_and(|text| {
-        text.contains("\\u")
-            || ["\"occurred_at", "\"task_basis\""]
-                .iter()
-                .any(|key| text.contains(key))
+        names_a_reserved_key(
+            text,
+            if splices.is_empty() {
+                &[OBJECT_KEY_SPELLING]
+            } else {
+                &RESERVED_KEY_SPELLINGS
+            },
+        )
     });
-    if stamp.is_well_formed() && !names_a_key {
+    if splices.is_empty() && !names_a_key {
+        return detail.map(redact::text);
+    }
+    if !splices.is_empty() && splices.iter().all(Splice::is_well_formed) && !names_a_key {
         let redacted = detail.map_or_else(|| "{}".to_string(), redact::text);
         let trimmed = redacted.trim();
         if let Some(body) = trimmed
@@ -347,30 +418,53 @@ fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<Str
                 },
                 "the splice was handed text that is not a JSON object: {trimmed}"
             );
-            let members = stamp.members();
-            let members = &members[1..members.len() - 1];
-            let separator = if body.trim().is_empty() { "" } else { "," };
-            return Some(format!("{{{body}{separator}{members}}}"));
+            let mut text = format!("{{{body}");
+            let mut separator = if body.trim().is_empty() { "" } else { "," };
+            for splice in &splices {
+                text.push_str(separator);
+                text.push_str(&splice.members());
+                separator = ",";
+            }
+            text.push('}');
+            return Some(text);
         }
     }
     // The closed path: the keys join the object, and all of it is redacted.
-    let object = match detail {
-        None => Some(serde_json::Map::new()),
+    let mut map = match detail {
+        None => serde_json::Map::new(),
         Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
-            Ok(serde_json::Value::Object(map)) => Some(map),
-            _ => None,
+            Ok(serde_json::Value::Object(map)) => map,
+            // A detail that is not an object has nowhere to carry the record of
+            // a cut object, and a cut object with no record is a stored value
+            // ending in a suffix with no length and no hash. It is wrapped, as
+            // `{"detail": <the original>, "object_truncated": {..}}`: the
+            // original stays readable under `detail` (as its JSON value, or as
+            // a string when it is not JSON). A stamp alone does not wrap.
+            other if cap.is_some() => {
+                let original = other.unwrap_or_else(|_| serde_json::Value::String(text.into()));
+                serde_json::Map::from_iter([("detail".to_string(), original)])
+            }
+            _ => return detail.map(redact::text),
         },
     };
-    let Some(mut map) = object else {
-        return detail.map(redact::text);
-    };
-    map.insert("occurred_at".into(), stamp.occurred_at.clone().into());
-    map.insert(
-        "occurred_at_basis".into(),
-        stamp.occurred_at_basis.clone().into(),
-    );
-    map.insert("task_basis".into(), stamp.task_basis.clone().into());
+    // The marker key is the server's: a spelling of it by the caller is
+    // dropped, and replaced below when there was a cut.
+    map.remove(OBJECT_TRUNCATED_KEY);
+    for splice in &splices {
+        splice.insert_into(&mut map);
+    }
     Some(redact::text(&serde_json::Value::Object(map).to_string()))
+}
+
+/// How a reserved key appears as the start of a JSON key in text, quote first.
+const OBJECT_KEY_SPELLING: &str = "\"object_truncated";
+const RESERVED_KEY_SPELLINGS: [&str; 3] = ["\"occurred_at", "\"task_basis\"", OBJECT_KEY_SPELLING];
+
+/// Whether `text` names one of `spellings`, plainly or through a `\u` escape,
+/// which any JSON parser reads as the same key. The one predicate for "this
+/// detail spells a key the server writes".
+fn names_a_reserved_key(text: &str, spellings: &[&str]) -> bool {
+    text.contains("\\u") || spellings.iter().any(|key| text.contains(key))
 }
 
 /// An event read back, in the shape the frontend consumes.
@@ -1349,6 +1443,12 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
     let actor_kind = draft.actor_kind.unwrap_or(ActorKind::System);
     let outcome = draft.outcome.unwrap_or(Outcome::Ok);
 
+    let (object, detail) = store_object_and_detail(
+        draft.object.as_deref(),
+        draft.detail_json.as_deref(),
+        draft.event_stamp.as_ref(),
+    );
+
     // Redact every caller-controlled string at the one write boundary. The
     // verdict repeats the judged command in `target`, so redacting only argv
     // leaves a second full copy of the same credential in the same row.
@@ -1362,15 +1462,38 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         session_id: draft.session_id.as_deref().map(redact::text),
         task_id: draft.task_id.as_deref().map(redact::text),
         action: redact::text(&draft.action),
-        object: draft.object.as_deref().map(redact::text),
+        object,
         argv: draft.argv_json.as_deref().map(redact::text),
         outcome: outcome.as_str(),
         verdict: draft.verdict_json.as_deref().map(redact::text),
         before_ref: draft.before_ref.as_deref().map(redact::text),
         after_ref: draft.after_ref.as_deref().map(redact::text),
         duration_ms: draft.duration_ms,
-        detail: redact_detail(draft.detail_json.as_deref(), draft.event_stamp.as_ref()),
+        detail,
     })
+}
+
+/// The `object` and `detail_json` a row is stored with: the one place an
+/// object is redacted, capped, and its cut recorded, shared by every writer
+/// ([`prepare`] and the legacy family import) so none can store one that
+/// another would have cut.
+///
+/// The object is redacted first and cut second: cutting the raw text could
+/// leave half a credential that the redactor no longer recognises. The cut is
+/// recorded in the detail by [`redact_detail`].
+fn store_object_and_detail(
+    object: Option<&str>,
+    detail: Option<&str>,
+    stamp: Option<&EventStamp>,
+) -> (Option<String>, Option<String>) {
+    let (object, cap) = match object.map(redact::text) {
+        Some(redacted) => {
+            let (object, cap) = cap_object(redacted);
+            (Some(object), cap)
+        }
+        None => (None, None),
+    };
+    (object, redact_detail(detail, stamp, cap.as_ref()))
 }
 
 fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
@@ -1665,7 +1788,7 @@ pub fn record(draft: Draft) -> Option<i64> {
 /// asks for what followed, and the answer is the same whether it has been
 /// listening for an hour or has just opened the app.
 pub fn tail(repo_path: &str, cursor: i64, limit: u32) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, false, Access::Writable)
+    read_after(repo_path, cursor, limit, false, Access::Writable, None).map(|(events, _)| events)
 }
 
 /// The newest `limit` events after `cursor`, oldest first.
@@ -1681,7 +1804,7 @@ pub fn tail_newest(
     cursor: i64,
     limit: u32,
 ) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, true, Access::Writable)
+    read_after(repo_path, cursor, limit, true, Access::Writable, None).map(|(events, _)| events)
 }
 
 /// The one precedence order of a worktree's bind and unbind rows, newest first:
@@ -1933,13 +2056,22 @@ pub(crate) fn newest_binding_readonly(
     })
 }
 
+/// The one reader of event rows, with an optional byte bound on the page.
+///
+/// With `max_bytes` each row is [`LedgerEvent::bounded`] and the page ends at
+/// the last row that fits the budget (always at least one, so a page makes
+/// progress); the flag says rows after it were left for the next page. Without
+/// it the rows come back whole and the flag is false. [`tail`] and
+/// [`tail_newest`] pass `None`: `ingest` reads a short page as the end of
+/// history, which a silent cap would break.
 fn read_after(
     repo_path: &str,
     cursor: i64,
     limit: u32,
     newest: bool,
     access: Access,
-) -> Result<Vec<LedgerEvent>, LedgerError> {
+    max_bytes: Option<usize>,
+) -> Result<(Vec<LedgerEvent>, bool), LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
     // An unbounded limit would let one call page an entire history into the
@@ -1980,7 +2112,23 @@ fn read_after(
             // ever persisting the unredacted spelling in this row.
             event.repo_path.clone_from(&canonical_repo_path);
         }
-        Ok(events)
+        let Some(budget) = max_bytes else {
+            return Ok((events, false));
+        };
+        let mut used = 0;
+        let mut page = Vec::with_capacity(events.len());
+        let mut capped = false;
+        for event in events {
+            let event = event.bounded();
+            let size = serde_json::to_string(&event).map_or(0, |text| text.len() + 1);
+            if !page.is_empty() && used + size > budget {
+                capped = true;
+                break;
+            }
+            used += size;
+            page.push(event);
+        }
+        Ok((page, capped))
     })
 }
 
@@ -2088,12 +2236,32 @@ fn normalize_legacy_event(
     event.session_id = event.session_id.as_deref().map(redact::text);
     event.task_id = event.task_id.as_deref().map(redact::text);
     event.action = redact::text(&event.action);
-    event.object = event.object.as_deref().map(redact::text);
     event.argv_json = event.argv_json.as_deref().map(redact::text);
     event.verdict_json = event.verdict_json.as_deref().map(redact::text);
     event.before_ref = event.before_ref.as_deref().map(redact::text);
     event.after_ref = event.after_ref.as_deref().map(redact::text);
-    event.detail_json = event.detail_json.as_deref().map(redact::text);
+    // Every row is capped through the function every writer uses, which also
+    // drops any `object_truncated` a detail carries: the key is the server's.
+    // The one exception is a row that is itself a cut a newer writer made,
+    // judged on the REDACTED object (redaction can lengthen one past the cap)
+    // and on the record being exactly what that writer writes
+    // ([`cap::recorded_cut_is_genuine`]). Its record survives the copy; a
+    // forged or inconsistent one does not, and on a `reflog.*` row a forged
+    // hash would have changed the dedupe key and had the entry recorded again
+    // on every ingest.
+    let redacted_object = event.object.as_deref().map(redact::text);
+    let genuine = redacted_object
+        .as_deref()
+        .is_some_and(|object| cap::recorded_cut_is_genuine(object, event.detail_json.as_deref()));
+    if genuine {
+        event.object = redacted_object;
+        event.detail_json = event.detail_json.as_deref().map(redact::text);
+    } else {
+        let (object, detail) =
+            store_object_and_detail(event.object.as_deref(), event.detail_json.as_deref(), None);
+        event.object = object;
+        event.detail_json = detail;
+    }
     Ok(event)
 }
 
@@ -2391,8 +2559,9 @@ fn import_source(
 /// One query on the partial index `idx_events_reflog` in place of paging the whole ledger
 /// through [`tail`]. A read error is an error: the caller must not read "could
 /// not find out" as "nothing is recorded" and write the history a second time.
-/// Callers compare against [`redact::text`] of an identity, never the raw one,
-/// because the raw spelling is not what is stored.
+/// Callers compare against [`stored_object`] of an identity, never the raw one,
+/// because the raw spelling is not what is stored. What the set holds is each
+/// row's identity key, not its column: see [`stored_object`].
 pub(crate) fn recorded_reflog_objects(
     repo_path: &str,
     worktree_path: &str,
@@ -2403,14 +2572,20 @@ pub(crate) fn recorded_reflog_objects(
     with_conn(repo_path, |conn| {
         let mut stmt = conn
             .prepare(
-                "SELECT object FROM events
+                "SELECT object,
+                        CASE WHEN json_valid(detail_json)
+                             THEN json_extract(detail_json, '$.object_truncated.hash') END
+                 FROM events
                  WHERE action LIKE 'reflog.%' AND object IS NOT NULL
                    AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
             )
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
         let rows = stmt
             .query_map(params![raw, stored, is_anchor], |row| {
-                row.get::<_, String>(0)
+                Ok(cap::object_key_of_row(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
             })
             .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
         rows.collect::<Result<_, _>>()
@@ -2689,7 +2864,50 @@ pub fn tail_readonly(
     if !is_initialised(repo_path) {
         return Ok(None);
     }
-    read_after(repo_path, cursor, limit, false, Access::ReadOnly).map(Some)
+    read_after(repo_path, cursor, limit, false, Access::ReadOnly, None)
+        .map(|(events, _)| Some(events))
+}
+
+/// What a page of the ledger may weigh once serialized, before it is wrapped in
+/// a tool result. A quarter of the transport's frame, so the page, its text
+/// mirror and the envelope fit with room to spare.
+pub const PAGE_MAX_BYTES: usize = 1024 * 1024;
+
+/// [`tail_readonly`] for a page that crosses a size-limited transport: rows are
+/// [`LedgerEvent::bounded`] and the page holds at most `max_bytes` (at least
+/// one row). The flag is true when rows past the page's last one were left out
+/// for that reason.
+pub fn tail_readonly_page(
+    repo_path: &str,
+    cursor: i64,
+    limit: u32,
+    max_bytes: usize,
+) -> Result<Option<(Vec<LedgerEvent>, bool)>, LedgerError> {
+    if !is_initialised(repo_path) {
+        return Ok(None);
+    }
+    read_after(
+        repo_path,
+        cursor,
+        limit,
+        false,
+        Access::ReadOnly,
+        Some(max_bytes),
+    )
+    .map(Some)
+}
+
+/// The identity key of an object as it would be stored: redacted, cut to the
+/// append cap, and for a cut one tied to the hash of the redacted full text.
+///
+/// This is not the `object` column. The column holds the capped text, which two
+/// different long identities can share; the key adds the full-text hash so they
+/// differ. An ingest that compares a freshly built identity with stored rows
+/// must compare this key against [`recorded_reflog_objects`], which derives the
+/// same key from a row stored after the cap (capped text and recorded hash) or
+/// before it (the full redacted text). One function owns both sides.
+pub fn stored_object(raw: &str) -> String {
+    cap::object_key(redact::text(raw))
 }
 
 pub fn status(repo_path: &str) -> LedgerStatus {
@@ -4974,3 +5192,9 @@ mod identity_tests {
 
 #[cfg(test)]
 mod stamp_tests;
+
+#[cfg(test)]
+mod object_cap_tests;
+
+#[cfg(test)]
+mod adversarial_cap_tests;

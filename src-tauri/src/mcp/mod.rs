@@ -24,6 +24,9 @@
 //! `harness::guard_command`, and every writing tool must be added to the
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
+#[cfg(test)]
+mod adversarial_tests;
+mod budget;
 pub mod complete;
 pub mod devmap_parity;
 pub mod page;
@@ -51,6 +54,12 @@ pub const SERVER_NAME: &str = "gitpulse-mcp";
 /// server", and it is the client's job to disconnect if it cannot use it.
 pub const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
 
+/// Largest single JSON-RPC message, in either direction, matching the harness
+/// sidecar's frame cap. The one owner of the figure: the transport refuses to
+/// read or write a line past it, and every result budget (tool results, ledger
+/// pages, resource documents) is derived from it, so they cannot drift apart.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 const TOOLS_TTL_MS: u64 = 3_600_000;
 const DISCOVER_TTL_MS: u64 = 3_600_000;
 /// Prompts and templates are compiled in, so they are as cacheable as the tool
@@ -71,6 +80,11 @@ pub const BUDGET_MAX: u32 = 200_000;
 /// Longest `repo_path` / symbol argument accepted. Well past any real path,
 /// short enough that a megabyte of `A`s is refused before it reaches git.
 pub(crate) const MAX_ARG_CHARS: u32 = 4_096;
+/// Longest resource `uri` accepted: a `repo_path` at its limit with every
+/// character percent-encoded as four bytes, and the scheme and facet around it.
+/// A `uri` is echoed back in the document and in errors, so one the size of the
+/// frame would make every response about it too big to send.
+pub(crate) const MAX_URI_BYTES: usize = MAX_ARG_CHARS as usize * 12 + 256;
 
 pub fn server_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -803,7 +817,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority.",
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix).",
             LedgerEventsArgs::properties(),
             &LedgerEventsArgs::required(),
             json!({
@@ -887,7 +901,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_list_tasks",
             "List tasks",
-            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done.",
+            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done. A page is never cut to fit the result budget (that would skip rows or leave `has_more` with no `next_cursor`): a page too large to return is a tool error telling you to retry with a smaller `limit`.",
             ListTasksArgs::properties(),
             &ListTasksArgs::required(),
             json!({
@@ -1129,23 +1143,30 @@ fn list_result(
     Ok(cacheable(modern, envelope(modern, body), ttl_ms))
 }
 
-fn complete_tool_result(modern: bool, payload: Value) -> Value {
-    // The serialized JSON also goes in a text block: the spec asks for it
-    // ("a tool that returns structured content SHOULD also return the
-    // serialized JSON in a TextContent block") and legacy clients read nothing
-    // else.
-    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|error| {
-        json!({ "ok": false, "error": format!("result could not be serialized: {error}") })
-            .to_string()
-    });
-    let mut body = json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": false
-    });
-    if modern {
-        body["structuredContent"] = payload;
+/// A tool's successful result, fitted to `budget` bytes on the wire (see
+/// [`budget`]): the payload as `structuredContent` in the modern era, and its
+/// compact serialization in a text block in both.
+///
+/// The text is there because the spec asks for it ("a tool that returns
+/// structured content SHOULD also return the serialized JSON in a TextContent
+/// block") and legacy clients read nothing else. It is compact because
+/// pretty-printing cost a third again, and bounded in the modern era because
+/// carrying every large payload twice at full size did the rest. A payload too
+/// large to cut is a tool execution error that says so.
+fn complete_tool_result(modern: bool, payload: Value, budget: usize) -> Value {
+    match budget::fit(modern, payload, budget) {
+        Ok(fitted) => {
+            let mut body = json!({
+                "content": [{ "type": "text", "text": fitted.text }],
+                "isError": false
+            });
+            if let Some(structured) = fitted.structured {
+                body["structuredContent"] = structured;
+            }
+            envelope(modern, body)
+        }
+        Err(message) => tool_exec_error(modern, message),
     }
-    envelope(modern, body)
 }
 
 /// A tool *execution* error: reported inside the result so a model can
@@ -1481,10 +1502,19 @@ fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
 fn task_view(a: TaskViewArgs) -> Result<Value, String> {
     let address = crate::ledger::bindings::repository_address_readonly(&a.repo_path)
         .map_err(|error| error.to_string())?;
-    Ok(json!(crate::tasks::view_filtered(
-        &address.anchor,
-        a.task_id.as_deref()
-    )))
+    let mut view = crate::tasks::view_filtered(&address.anchor, a.task_id.as_deref());
+    // The view is also what the desktop app reads whole, so the cap is here, at
+    // the MCP boundary. Each row's stored JSON text is cut the way a ledger
+    // page cuts its own; the result budget then cuts the lists themselves and
+    // sets `evidence_truncated` / `gaps_truncated`.
+    let cap = crate::ledger::ROW_FIELD_CAP_BYTES;
+    for evidence in &mut view.evidence {
+        evidence.data_json = crate::ledger::bound_json_text(&evidence.data_json, cap);
+    }
+    for gap in &mut view.gaps {
+        gap.evidence_json = crate::ledger::bound_json_text(&gap.evidence_json, cap);
+    }
+    Ok(json!(view))
 }
 
 fn meta_object(params: &Value) -> Option<&Value> {
@@ -1765,6 +1795,13 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
         },
         "resources/read" => match params.get("uri").and_then(Value::as_str) {
             None => invalid_params(id, "Invalid params: uri must be a string"),
+            Some(target) if target.len() > MAX_URI_BYTES => invalid_params(
+                id,
+                format!(
+                    "Invalid params: uri is {} bytes; the limit is {MAX_URI_BYTES}",
+                    target.len()
+                ),
+            ),
             Some(target) => match resources::read(target) {
                 Ok(contents) => ok(id, envelope(modern, json!({ "contents": contents }))),
                 // A URI this server does not address is the caller's to fix; a
@@ -1811,7 +1848,10 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
                 );
             }
             match handle_tool_call(name, &arguments) {
-                Ok(payload) => ok(id, complete_tool_result(modern, payload)),
+                Ok(payload) => {
+                    let room = budget::tool_budget(&id);
+                    ok(id, complete_tool_result(modern, payload, room))
+                }
                 // Unknown tool is a protocol error: no argument the model could
                 // change would make the call succeed.
                 Err(message) if message.starts_with("Unknown tool:") => {
@@ -2614,6 +2654,233 @@ mod tests {
         assert!(tool["outputSchema"]["properties"]["total"].is_null());
     }
 
+    /// A trusted repository whose ledger holds `rows` events carrying `detail`
+    /// bytes each, and the anchor to read it back by.
+    fn repository_with_ledger_rows(rows: usize, detail: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", &repo])
+            .output_locked()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        crate::test_support::trust_repo(dir.path());
+        let address = crate::ledger::bindings::repository_address(&repo).expect("address");
+        for n in 0..rows {
+            let id = crate::ledger::record(crate::ledger::Draft {
+                repo_path: address.anchor.clone(),
+                action: "session.command".into(),
+                object: Some(format!("echo {n}")),
+                actor_kind: Some(crate::ledger::ActorKind::Agent),
+                outcome: Some(crate::ledger::Outcome::Ok),
+                detail_json: Some(json!({ "note": "d".repeat(detail) }).to_string()),
+                ..Default::default()
+            });
+            assert!(id.is_some(), "row {n} was not recorded");
+        }
+        (dir, repo)
+    }
+
+    /// A resource `uri` is echoed in the document and in every error about it,
+    /// so one the size of the frame could never be answered. It is refused at
+    /// the boundary, by size, without echoing it.
+    #[test]
+    fn an_over_long_resource_uri_is_refused_at_the_request_boundary() {
+        let long = format!("gitpulse://insights/{}", "a".repeat(MAX_URI_BYTES));
+        let response = call(
+            "resources/read",
+            json!({ "uri": long, "_meta": modern_meta() }),
+        );
+        let size = wire_len(&response);
+        let error = response.error.expect("refused");
+        assert_eq!(error["code"], -32602);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("limit"), "{message}");
+        assert!(message.len() < 200, "the uri was echoed: {}", message.len());
+        assert!(size < 1024);
+
+        // A uri at the limit still reaches the reader, which answers about it.
+        let at_limit = format!(
+            "gitpulse://insights/{}",
+            "a".repeat(MAX_URI_BYTES - "gitpulse://insights/".len())
+        );
+        assert_eq!(at_limit.len(), MAX_URI_BYTES);
+        let response = call(
+            "resources/read",
+            json!({ "uri": at_limit, "_meta": modern_meta() }),
+        );
+        let refused_by_size = response
+            .error
+            .as_ref()
+            .and_then(|error| error["message"].as_str())
+            .is_some_and(|message| message.contains("the limit is"));
+        assert!(!refused_by_size, "a uri at the limit is not over it");
+    }
+
+    fn wire_len(response: &JsonRpcResponse) -> usize {
+        serde_json::to_string(response).expect("serializes").len() + 1
+    }
+
+    /// 1000 rows of about 6.5 KiB is 6.5 MB of ledger, past the 4 MiB frame the
+    /// transport can carry. A page must come back bounded, say it is partial,
+    /// and hand back the cursor that continues exactly where it stopped.
+    #[test]
+    fn a_6_mib_ledger_is_paged_within_the_frame_without_skipping_or_repeating() {
+        let (_dir, repo) = repository_with_ledger_rows(1000, 6_500);
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .expect("tool")["outputSchema"]
+            .clone();
+        let mut cursor = 0_i64;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let response = call(
+                "tools/call",
+                json!({
+                    "name": "gitpulse_ledger_events",
+                    "arguments": { "repo_path": repo, "limit": 1000, "cursor": cursor },
+                    "_meta": modern_meta(),
+                }),
+            );
+            assert!(
+                wire_len(&response) <= 4 * 1024 * 1024,
+                "page {pages} is {} bytes on the wire",
+                wire_len(&response)
+            );
+            let result = response.result.expect("a result");
+            assert_eq!(result["isError"], false, "{result:.300}");
+            let page = result["structuredContent"].clone();
+            let violations = validate::validate(&page, &schema);
+            assert!(
+                violations.is_empty(),
+                "page violates its schema: {violations:?}"
+            );
+            let events = page["events"].as_array().expect("events");
+            assert_eq!(page["returned"], events.len());
+            seen.extend(events.iter().map(|e| e["id"].as_i64().expect("id")));
+            let last = events.last().expect("a page always makes progress")["id"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(
+                page["next_cursor"], last,
+                "next_cursor is the last returned id"
+            );
+            pages += 1;
+            if pages == 1 {
+                assert_eq!(
+                    page["truncated"], true,
+                    "the first page cannot be the whole ledger"
+                );
+            }
+            if page["truncated"] != true {
+                break;
+            }
+            assert!(pages < 40, "paging does not terminate");
+            cursor = last;
+        }
+        assert!(pages > 1, "6.5 MB of rows came back as one page");
+        assert_eq!(seen.len(), 1000, "paging skipped or repeated a row");
+        assert!(
+            seen.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "paging skipped or repeated a row: {seen:?}"
+        );
+    }
+
+    /// What the result budget adds to a call, alone: the budget step on a real
+    /// insights payload, min of 500, with no git underneath. Timing only, so it
+    /// is ignored; run it in release with
+    /// `cargo test --release --lib -- --ignored --nocapture the_budget_step`.
+    #[test]
+    #[ignore = "timing only, no assertion on speed"]
+    fn the_budget_step_alone_on_a_real_insights_payload() {
+        let (dir, repo) = repository_with_ledger_rows(1, 10);
+        let _keep = dir;
+        let payload = handle_tool_call("gitpulse_insights", &json!({ "repo_path": repo }))
+            .expect("insights answers");
+        let bytes = serde_json::to_string(&payload).unwrap().len();
+        let room = budget::tool_budget(&json!(1));
+        let mut least = std::time::Duration::MAX;
+        for _ in 0..500 {
+            let copy = payload.clone();
+            let started = std::time::Instant::now();
+            let fitted = std::hint::black_box(budget::fit(true, copy, room));
+            least = least.min(started.elapsed());
+            assert!(fitted.is_ok());
+        }
+        let mut before = std::time::Duration::MAX;
+        for _ in 0..500 {
+            let started = std::time::Instant::now();
+            let text = std::hint::black_box(serde_json::to_string_pretty(&payload));
+            before = before.min(started.elapsed());
+            assert!(text.is_ok());
+        }
+        println!(
+            "budget::fit on a {bytes} byte insights payload: min {least:?} of 500 \
+             (the pretty-printed text it replaced: min {before:?})"
+        );
+    }
+
+    /// A modern client reads `structuredContent`; the text block exists for
+    /// clients that read nothing else. Both full-size doubled every large
+    /// result on the wire. Modern gets one full copy and a bounded mirror, and a
+    /// legacy client (which has only the text) gets the whole budget in it.
+    #[test]
+    fn a_large_payload_has_one_full_copy_and_a_bounded_text_mirror() {
+        let (_dir, repo) = repository_with_ledger_rows(120, 6_500);
+        let arguments = json!({ "repo_path": repo, "limit": 1000 });
+
+        let modern = modern_call(
+            "tools/call",
+            json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+        );
+        let text = modern["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.len() <= 256 * 1024,
+            "the modern text mirror is {} bytes",
+            text.len()
+        );
+        let mirror: Value = serde_json::from_str(text).expect("the mirror is still JSON");
+        assert!(
+            mirror["events"].is_array(),
+            "the mirror keeps the payload's shape"
+        );
+        let structured = &modern["structuredContent"];
+        assert_eq!(structured["events"].as_array().expect("events").len(), 120);
+        assert!(
+            structured["events"].to_string().len() > 256 * 1024,
+            "the fixture is not large enough to exercise the mirror"
+        );
+        assert!(
+            !text.contains("\n  "),
+            "the text is compact, not pretty-printed"
+        );
+
+        let mut era = Era::Unknown;
+        process_request(request("initialize", Some(json!(0)), json!({})), &mut era);
+        let legacy = process_request(
+            request(
+                "tools/call",
+                Some(json!(1)),
+                json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+            ),
+            &mut era,
+        )
+        .expect("answered")
+        .result
+        .expect("result");
+        assert!(legacy.get("structuredContent").is_none());
+        let body: Value =
+            serde_json::from_str(legacy["content"][0]["text"].as_str().expect("text"))
+                .expect("legacy text is JSON");
+        assert_eq!(
+            body["events"].as_array().expect("events").len(),
+            120,
+            "a legacy client has only the text; it must not be shortened"
+        );
+    }
+
     /// Every declared property the payload carries as `null` must declare
     /// `null` among its types. `validate` reads an optional `null` as an absent
     /// argument, which is right for input; a client checking `structuredContent`
@@ -2635,6 +2902,166 @@ mod tests {
             }
         }
         found
+    }
+
+    /// Pointer to the non-empty list with the most serialized bytes, at any depth.
+    fn largest_nonempty_list(
+        value: &Value,
+        pointer: &mut String,
+        best: &mut Option<(usize, String)>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                if !items.is_empty() {
+                    let size = value.to_string().len();
+                    if best.as_ref().is_none_or(|(most, _)| size > *most) {
+                        *best = Some((size, pointer.clone()));
+                    }
+                }
+                for (index, item) in items.iter().enumerate() {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{index}"));
+                    largest_nonempty_list(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{}", key.replace('~', "~0").replace('/', "~1")));
+                    largest_nonempty_list(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pointer to the longest string in `value`, at any depth.
+    fn longest_string(value: &Value, pointer: &mut String, best: &mut Option<(usize, String)>) {
+        match value {
+            Value::String(text) => {
+                if best.as_ref().is_none_or(|(most, _)| text.len() > *most) {
+                    *best = Some((text.len(), pointer.clone()));
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{index}"));
+                    longest_string(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{}", key.replace('~', "~0").replace('/', "~1")));
+                    longest_string(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Inflate the longest string of a real tool payload to 300 KB of lines (a
+    /// log field: every newline costs six bytes once it is escaped into the text
+    /// block and again as a string), past the text mirror's half-budget but far
+    /// inside the budget, in the modern era. The call must succeed with the
+    /// payload whole in `structuredContent` and meet its `outputSchema`; an
+    /// error here is a tool that fails on a large field the budget could carry.
+    /// False when the payload holds no string.
+    fn probe_a_long_string(name: &str, label: &str, schema: &Value, payload: &Value) -> bool {
+        let mut best = None;
+        longest_string(payload, &mut String::new(), &mut best);
+        let Some((_, pointer)) = best else {
+            return false;
+        };
+        let mut inflated = payload.clone();
+        if let Some(slot) = inflated.pointer_mut(&pointer) {
+            *slot = Value::String("x\n".repeat(150_000));
+        }
+        let fitted = budget::fit(true, inflated.clone(), budget::tool_budget(&json!(1)))
+            .unwrap_or_else(|error| {
+                panic!("{name} on {label}: a long string failed: {error:.200}")
+            });
+        assert_eq!(
+            fitted.structured.as_ref(),
+            Some(&inflated),
+            "{name} on {label}: structuredContent was cut for a string"
+        );
+        let violations: Vec<String> = validate::validate(&inflated, schema)
+            .iter()
+            .map(validate::Violation::render)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "{name} on {label}: a long string violates its outputSchema: {violations:?}"
+        );
+        true
+    }
+
+    /// Inflate the largest list of a real tool payload past 200 KiB and fit it
+    /// to 64 KiB: the result must still meet the tool's `outputSchema`, say it
+    /// was cut, stay inside the budget and keep every top-level key (all seven
+    /// facets of an insights snapshot survive). False when the payload holds no
+    /// list to inflate.
+    fn probe_under_a_small_budget(
+        name: &str,
+        label: &str,
+        schema: &Value,
+        payload: &Value,
+    ) -> bool {
+        const BUDGET: usize = 64 * 1024;
+        let mut inflated = payload.clone();
+        let mut best = None;
+        largest_nonempty_list(&inflated, &mut String::new(), &mut best);
+        let Some((_, pointer)) = best else {
+            return false;
+        };
+        let Some(Value::Array(items)) = inflated.pointer_mut(&pointer) else {
+            return false;
+        };
+        for _ in 0..40 {
+            if serde_json::to_string(&items).map_or(0, |text| text.len()) > 200_000 {
+                break;
+            }
+            let more = items.clone();
+            items.extend(more);
+        }
+        let fitted = budget::fit(true, inflated.clone(), BUDGET)
+            .unwrap_or_else(|error| panic!("{name} on {label}: {error}"));
+        let structured = fitted.structured.expect("modern structured content");
+        let wire = budget::escaped_len(&fitted.text)
+            + serde_json::to_string(&structured)
+                .expect("serializes")
+                .len();
+        assert!(
+            wire <= BUDGET,
+            "{name} on {label}: {wire} bytes for a {BUDGET} byte budget"
+        );
+        assert!(
+            structured[budget::TRUNCATION_KEY].is_object(),
+            "{name} on {label} was cut without saying so"
+        );
+        let violations: Vec<String> = validate::validate(&structured, schema)
+            .iter()
+            .map(validate::Violation::render)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "{name} on {label}: the cut payload violates its outputSchema: {violations:?}"
+        );
+        let nulls = nulls_the_schema_does_not_allow(&structured, schema, "");
+        assert!(nulls.is_empty(), "{name} on {label}: {nulls:?}");
+        for key in payload.as_object().expect("an object payload").keys() {
+            assert!(
+                structured.get(key).is_some(),
+                "{name} on {label}: the cut dropped {key}"
+            );
+        }
+        true
     }
 
     fn validate_allows_null(schema: &Value) -> bool {
@@ -2762,6 +3189,8 @@ mod tests {
         crate::test_support::trust_repo(indexed_dir.path());
 
         let mut validated = std::collections::BTreeSet::new();
+        let mut probed = std::collections::BTreeSet::<String>::new();
+        let mut strings_probed = std::collections::BTreeSet::<String>::new();
         let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         let mut check =
             |name: &str,
@@ -2797,6 +3226,12 @@ mod tests {
                     "{name} on {label} returns null where its outputSchema forbids it: {nulls:?}"
                 );
                 validated.insert(name.to_string());
+                if probe_under_a_small_budget(name, label, schema, &payload) {
+                    probed.insert(name.to_string());
+                }
+                if probe_a_long_string(name, label, schema, &payload) {
+                    strings_probed.insert(name.to_string());
+                }
             };
         for repo in [&healthy, &broken, &untrusted, &ledgered, &missing, &indexed] {
             for tool in tools() {
@@ -2909,6 +3344,37 @@ mod tests {
                 &tool["outputSchema"],
                 handle_tool_call(name, &arguments),
                 &mut validated,
+            );
+        }
+
+        // The budget probe ran on real payloads, not only on the shapes this
+        // test invented: a tool with no list in its payload cannot be probed,
+        // so the ones that must be are named.
+        for name in [
+            "gitpulse_insights",
+            "gitpulse_change_context",
+            "gitpulse_get_task",
+        ] {
+            assert!(
+                probed.contains(name),
+                "{name} was never held to the result budget; probed: {probed:?}"
+            );
+        }
+        assert!(
+            probed.len() >= 5,
+            "only {probed:?} could be inflated and budgeted"
+        );
+        // Every advertised tool whose result holds a string was run with a
+        // long one at the mirror threshold.
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("name");
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            assert!(
+                strings_probed.contains(name) || !validated.contains(name),
+                "{name} has no string to inflate in any payload this test reached: \
+                 strings probed: {strings_probed:?}"
             );
         }
 

@@ -544,7 +544,9 @@ fn replay_reflog(
         // The selector (`HEAD@{3}`) is positional and shifts as the reflog
         // grows, so identity is the commit plus the message.
         let identity = format!("{} {}", entry.commit_id, entry.message);
-        if seen.contains(&ledger::redact::text(&identity)) {
+        // Compared as stored: redacted, and cut to the ledger's `object` cap,
+        // or an identity past the cap would never match its own row.
+        if seen.contains(&ledger::stored_object(&identity)) {
             continue;
         }
         out.reflog_entries += 1;
@@ -1025,6 +1027,29 @@ mod tests {
         assert_eq!(
             second.recorded, 0,
             "the redacted stored identity was compared with the raw one"
+        );
+    }
+
+    #[test]
+    fn a_reflog_message_longer_than_the_object_cap_is_not_recorded_again() {
+        let main = tempfile::tempdir().expect("checkout");
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").expect("seed");
+        git_in(main.path(), &["add", "seed.txt"]);
+        git_in(
+            main.path(),
+            &["commit", "-m", &format!("long {}", "w".repeat(5000))],
+        );
+        crate::test_support::trust_repo(main.path());
+        let repo = main.path().canonicalize().expect("canonical");
+        let repo = repo.to_string_lossy();
+
+        let first = ingest_reflog_into(&repo, &repo, 200);
+        assert!(first.recorded > 0, "{first:?}");
+        let second = ingest_reflog_into(&repo, &repo, 200);
+        assert_eq!(
+            second.recorded, 0,
+            "the capped stored identity was compared with the full one"
         );
     }
 

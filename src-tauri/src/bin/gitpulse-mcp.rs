@@ -20,6 +20,26 @@
 //! So: frames are read bounded ([`gitpulse_lib::ndjson`]), a bad frame is
 //! answered and skipped rather than fatal, each request runs on its own thread
 //! under a deadline and a panic guard, and a failed write ends the session.
+//!
+//! Not every failed write is the client's doing, and the wire tells them apart:
+//!
+//! * a response past [`mcp::MAX_FRAME_BYTES`] is the *request's* problem. It is
+//!   replaced by an error for that id (`bytes` and `cap` in its data) and the
+//!   session keeps serving. This used to end the session with exit 0 and no
+//!   answer at all. The library budgets its results well below the frame, so
+//!   this is the backstop for what a budget did not foresee. If the id alone
+//!   makes that error too big, it goes out with `id: null`, as JSON-RPC says of
+//!   an error whose request id cannot be used;
+//! * a closed pipe (EPIPE) is the client gone: the session ends at once;
+//! * a write that takes longer than `GITPULSE_MCP_WRITE_TIMEOUT_MS` (default
+//!   10 s, it was a fixed 1 s) means the client stopped reading. A partial line
+//!   may already be on the pipe, so the session ends rather than resume
+//!   mid-line. A reader that pauses for a second or two survives. While a write
+//!   is stalled, the read loop and the deadline watchdog (which answer through
+//!   the same single writer) wait behind it, for up to that window.
+//!
+//! `GITPULSE_MCP_MAX_RESPONSE_BYTES` lowers the response cap, for tests and
+//! diagnosis only: it is clamped to the frame and never raises it.
 
 use std::io::{self, BufReader, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,10 +50,23 @@ use gitpulse_lib::mcp::{self, Accepted, Era, JsonRpcRequest, JsonRpcResponse, Re
 use gitpulse_lib::ndjson;
 use serde_json::{json, Value};
 
-/// Largest single JSON-RPC message accepted, matching the harness sidecar's
-/// frame cap. A legitimate request is kilobytes; anything near this is a
-/// wedged or hostile peer, and the frame is dropped rather than buffered.
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Largest single JSON-RPC message accepted: [`mcp::MAX_FRAME_BYTES`], the
+/// figure every result budget in the library is derived from. A legitimate
+/// request is kilobytes; anything near this is a wedged or hostile peer, and the
+/// frame is dropped rather than buffered.
+const MAX_FRAME_BYTES: usize = mcp::MAX_FRAME_BYTES;
+
+/// A test and diagnostic knob: lowers the size past which a *response* is
+/// replaced by an error for its request (see [`Wire::send`]). It can only
+/// lower the backstop (a larger value is clamped to [`MAX_FRAME_BYTES`]) and
+/// never touches the result budgets, which stay derived from the real frame.
+const MAX_RESPONSE_ENV: &str = "GITPULSE_MCP_MAX_RESPONSE_BYTES";
+
+/// How long a response may take to leave the process before the client is
+/// judged stalled. A reader that merely pauses (a busy host, a debugger)
+/// recovers inside this; one that never reads does not, and the session ends.
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT_ENV: &str = "GITPULSE_MCP_WRITE_TIMEOUT_MS";
 
 /// How long one request may run before the client is told it was abandoned.
 ///
@@ -68,18 +101,44 @@ const DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SLOT_POLL: Duration = Duration::from_millis(2);
 
 fn call_budget() -> Duration {
-    std::env::var(CALL_BUDGET_ENV)
+    millis_from_env(CALL_BUDGET_ENV).unwrap_or(DEFAULT_CALL_BUDGET)
+}
+
+fn write_timeout() -> Duration {
+    millis_from_env(WRITE_TIMEOUT_ENV).unwrap_or(DEFAULT_WRITE_TIMEOUT)
+}
+
+/// Longest either window may be set to. A value past it is clamped, not
+/// honoured: an unbounded write window is a session hung on a reader that
+/// stopped reading, and an unbounded call budget is a request nobody answers.
+const MAX_ENV_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// A positive millisecond count from the environment, at most
+/// [`MAX_ENV_WINDOW`]; zero and anything unparseable are unset.
+fn millis_from_env(name: &str) -> Option<Duration> {
+    std::env::var(name)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_CALL_BUDGET)
+        .map(|ms| Duration::from_millis(ms).min(MAX_ENV_WINDOW))
+}
+
+/// The largest response line written, [`MAX_RESPONSE_ENV`] included.
+fn response_cap() -> usize {
+    std::env::var(MAX_RESPONSE_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .map_or(MAX_FRAME_BYTES, |bytes| bytes.min(MAX_FRAME_BYTES))
 }
 
 /// The single writer. Every response goes through here so concurrent workers
 /// cannot interleave bytes into the same line.
 struct Wire {
     out: Result<gitpulse_lib::output::BoundedOutput, io::Error>,
+    /// Largest line (newline included) this wire writes. A response past it is
+    /// replaced by an error for its own request rather than written.
+    cap: usize,
     broken: AtomicBool,
     /// The input loop's channel, poked when the wire breaks so a reader
     /// blocked waiting for the host wakes at once instead of polling the flag.
@@ -92,13 +151,18 @@ impl Wire {
     }
 
     fn to(writer: impl io::Write + Send + 'static) -> Self {
+        Self::with_limits(writer, response_cap(), write_timeout())
+    }
+
+    fn with_limits(writer: impl io::Write + Send + 'static, cap: usize, timeout: Duration) -> Self {
         Self {
             out: gitpulse_lib::output::BoundedOutput::new(
                 writer,
                 "gitpulse-mcp-stdout",
-                MAX_FRAME_BYTES,
-                Duration::from_secs(1),
+                cap,
+                timeout,
             ),
+            cap,
             broken: AtomicBool::new(false),
             input_wake: Mutex::new(None),
         }
@@ -157,12 +221,89 @@ impl Wire {
                 return false;
             }
         };
-        if let Err(error) = out.write(format!("{line}\n").as_bytes()) {
-            log::warn!(target: "mcp", "stdout failed: {error}; stopping without retry");
-            self.mark_broken();
-            return false;
+        // A response too big to write is the request's problem, not the
+        // wire's: answer that id with an error that says how big it was, and
+        // keep serving. The compare-and-swap that let this response through
+        // is already spent, so the request is still answered exactly once.
+        let size = line.len() + 1;
+        let line = if size > self.cap {
+            match self.refusal(&response.id, size) {
+                Some(refusal) => refusal,
+                None => return true,
+            }
+        } else {
+            line
+        };
+        let mut written = out.write(format!("{line}\n").as_bytes());
+        if written
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::InvalidInput)
+        {
+            // The output's own bound disagreed with ours. It refuses before it
+            // writes a byte, so the sink is still usable: say so to the
+            // request instead of ending the session.
+            match self.refusal(&response.id, size) {
+                Some(refusal) => written = out.write(format!("{refusal}\n").as_bytes()),
+                None => return true,
+            }
         }
-        true
+        match written {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail(&error);
+                false
+            }
+        }
+    }
+
+    /// The error that stands in for a response of `bytes` that cannot be
+    /// written, as a line; `None` when even that does not fit, in which case the
+    /// request goes unanswered and the session keeps running.
+    ///
+    /// The error names the request. When the id alone makes the error too big
+    /// (a client may send an id of any size up to the frame), the error is
+    /// sent with `id: null` instead, as JSON-RPC prescribes for an error whose
+    /// request id cannot be determined: the client learns that a response was
+    /// refused, and the session is not left silent.
+    fn refusal(&self, id: &Value, bytes: usize) -> Option<String> {
+        let shown: String = id.to_string().chars().take(64).collect();
+        log::warn!(
+            target: "mcp",
+            "response for request {shown} is {bytes} bytes, past the {} byte cap; answering with an error",
+            self.cap
+        );
+        for answering in [id, &Value::Null] {
+            let refusal = mcp::err(
+                answering.clone(),
+                -32603,
+                format!("response is {bytes} bytes; the frame cap is {}", self.cap),
+                Some(json!({ "bytes": bytes, "cap": self.cap })),
+            );
+            if let Ok(line) = serde_json::to_string(&refusal) {
+                if line.len() < self.cap {
+                    return Some(line);
+                }
+            }
+        }
+        log::error!(
+            target: "mcp",
+            "the error for oversized request {shown} does not fit the {} byte cap either; dropped",
+            self.cap
+        );
+        None
+    }
+
+    /// Ends the session after a write that may have left a partial line on the
+    /// pipe: the stream cannot be resynchronized, so nothing more is written.
+    fn fail(&self, error: &io::Error) {
+        match error.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => log::warn!(
+                target: "mcp",
+                "client stalled: {error}; ending the session (raise {WRITE_TIMEOUT_ENV} for a slower reader)"
+            ),
+            _ => log::warn!(target: "mcp", "stdout failed: {error}; stopping without retry"),
+        }
+        self.mark_broken();
     }
 }
 
@@ -663,6 +804,18 @@ starts it with no arguments; see `npm run mcp:install`.
 OPTIONS:
     -h, --help       Print this message
     -V, --version    Print the version
+
+ENVIRONMENT:
+    GITPULSE_MCP_CALL_TIMEOUT_MS      Per-request deadline in ms (default 60000,
+                                      at most 600000; zero or junk = default)
+    GITPULSE_MCP_WRITE_TIMEOUT_MS     How long a response may take to leave the
+                                      process before the client is judged stalled
+                                      and the session ends (default 10000). The
+                                      read loop and deadline watchdog can wait
+                                      this long behind a stalled write. At most
+                                      600000 (ten minutes); zero or junk = default.
+    GITPULSE_MCP_MAX_RESPONSE_BYTES   Test/diagnostic knob: lowers the response
+                                      cap below the 4 MiB frame; never raises it.
 ";
 
 /// What the command line asked for. Hosts pass no arguments, so any argument
@@ -769,6 +922,13 @@ fn main() {
     gitpulse_lib::procguard::exit(code);
 }
 
+/// The library's environment-override guard, compiled into this crate too: the
+/// library's own is `#[cfg(test)]` and `pub(crate)`, so it does not exist from
+/// here (as in `gitpulsed`, which includes it the same way).
+#[cfg(test)]
+#[path = "../test_support/env.rs"]
+mod test_env;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +945,297 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn result_of(id: Value, result: Value) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_5_mib_response_is_answered_with_an_error_and_the_wire_stays_open() {
+        let captured = Captured::default();
+        let wire = Wire::to(captured.clone());
+        let huge = result_of(json!(9), json!({ "blob": "x".repeat(5 * 1024 * 1024) }));
+        assert!(
+            wire.send(&huge),
+            "an oversized response must be answered, not end the session"
+        );
+        assert!(
+            !wire.broken.load(Ordering::Acquire),
+            "an oversized response is the request's problem, not the wire's"
+        );
+        assert!(wire.send(&result_of(json!(10), json!({ "small": true }))));
+
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one answer per send, got {} lines",
+            lines.len()
+        );
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["id"], 9, "the error names the request it answers");
+        assert_eq!(first["error"]["code"], -32603, "{first}");
+        let bytes = first["error"]["data"]["bytes"].as_u64().expect("bytes");
+        let cap = first["error"]["data"]["cap"].as_u64().expect("cap");
+        assert!(bytes > cap, "{bytes} should exceed {cap}");
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["id"], 10);
+        assert_eq!(second["result"]["small"], true);
+    }
+
+    #[test]
+    fn the_cap_is_on_the_whole_line_and_an_error_that_cannot_fit_is_dropped() {
+        let response = result_of(json!(1), json!({ "blob": "x".repeat(100) }));
+        let line = serde_json::to_string(&response).unwrap().len() + 1;
+
+        let fits = Captured::default();
+        let wire = Wire::with_limits(fits.clone(), line, Duration::from_secs(1));
+        assert!(wire.send(&response));
+        assert_eq!(
+            fits.0.lock().unwrap().len(),
+            line,
+            "exactly at the cap is written"
+        );
+
+        let over = Captured::default();
+        let wire = Wire::with_limits(over.clone(), line + 200, Duration::from_secs(1));
+        assert!(wire.send(&result_of(json!(1), json!({ "blob": "x".repeat(500) }))));
+        let text = String::from_utf8(over.0.lock().unwrap().clone()).unwrap();
+        let refusal: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(refusal["error"]["data"]["cap"], line + 200, "{refusal}");
+
+        let tiny = Captured::default();
+        let wire = Wire::with_limits(tiny.clone(), 10, Duration::from_secs(1));
+        assert!(
+            wire.send(&response),
+            "an unanswerable id must not end the session"
+        );
+        assert!(
+            tiny.0.lock().unwrap().is_empty(),
+            "nothing fits in ten bytes"
+        );
+        assert!(!wire.broken.load(Ordering::Acquire));
+    }
+
+    /// Runs `probe` with `name` set to each of `values`, then restores it.
+    ///
+    /// Through the repo's one sanctioned form (`bind_env`, serialized and
+    /// restored on drop, also when a probe panics): raw `set_var` in a test is
+    /// what `hermetic_contract` refuses.
+    fn with_env(name: &str, values: &[&str], mut probe: impl FnMut(&str)) {
+        let serial = crate::test_env::env_serial();
+        for value in values {
+            let _binding = crate::test_env::bind_env(&serial).set(name, value);
+            probe(value);
+        }
+    }
+
+    /// Attack 3: the test-only cap may only lower the cap.
+    #[test]
+    fn the_test_only_response_cap_can_never_raise_the_cap() {
+        with_env(
+            MAX_RESPONSE_ENV,
+            &[
+                "4194305",
+                "99999999999999",
+                "18446744073709551615",
+                "18446744073709551616",
+                "+99999999",
+                "-1",
+                "0",
+                "abc",
+                " 1",
+                "1e9",
+                "",
+            ],
+            |value| {
+                assert!(
+                    response_cap() <= MAX_FRAME_BYTES,
+                    "{value:?} raised the cap to {}",
+                    response_cap()
+                );
+            },
+        );
+    }
+
+    /// Attack 3: an unbounded write window is a hung session. 0 and garbage fall
+    /// back to the default; a huge value must be clamped, not honoured.
+    #[test]
+    fn the_write_timeout_is_bounded_whatever_the_environment_says() {
+        const CEILING: Duration = Duration::from_secs(10 * 60);
+        with_env(
+            WRITE_TIMEOUT_ENV,
+            &[
+                "0",
+                "-1",
+                "abc",
+                "",
+                "600000",
+                "86400000",
+                "99999999999",
+                "18446744073709551615",
+            ],
+            |value| {
+                let window = write_timeout();
+                assert!(!window.is_zero(), "{value:?} gave a zero write window");
+                assert!(
+                    window <= CEILING,
+                    "{value:?} gave a {window:?} write window: a reader that stops reading hangs the session that long"
+                );
+            },
+        );
+    }
+
+    /// Attack 3, same helper: the per-request deadline is unbounded too.
+    #[test]
+    fn the_call_budget_is_bounded_whatever_the_environment_says() {
+        const CEILING: Duration = Duration::from_secs(60 * 60);
+        with_env(
+            CALL_BUDGET_ENV,
+            &["86400000", "18446744073709551615"],
+            |value| {
+                let window = call_budget();
+                assert!(
+                    window <= CEILING,
+                    "{value:?} gave a {window:?} request deadline"
+                );
+            },
+        );
+    }
+
+    /// Attack 1: cap-1, cap and cap+1 on the whole line, newline included.
+    #[test]
+    fn the_whole_line_is_measured_at_cap_minus_one_cap_and_cap_plus_one() {
+        let response = result_of(json!(1), json!({ "blob": "x".repeat(600) }));
+        let size = serde_json::to_string(&response).unwrap().len() + 1;
+        for (cap, written) in [(size + 1, true), (size, true), (size - 1, false)] {
+            let sink = Captured::default();
+            let wire = Wire::with_limits(sink.clone(), cap, Duration::from_secs(1));
+            assert!(wire.send(&response), "cap {cap}");
+            let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                text.ends_with('\n') && text.lines().count() == 1,
+                "cap {cap}"
+            );
+            assert!(text.len() <= cap, "cap {cap}: wrote {} bytes", text.len());
+            let line: Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(
+                line.get("result").is_some(),
+                written,
+                "cap {cap}: {line:.120}"
+            );
+            if !written {
+                assert_eq!(line["error"]["data"]["bytes"], size);
+            }
+        }
+    }
+
+    /// Attack 4: a reader that closes mid-frame ends the session, and nothing is
+    /// written after the failure.
+    #[test]
+    fn a_reader_that_closes_mid_frame_ends_the_session_and_nothing_more_is_written() {
+        struct Breaks(Arc<Mutex<usize>>);
+        impl io::Write for Breaks {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut written = self.0.lock().unwrap();
+                if *written >= 10 {
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                let take = bytes.len().min(10 - *written);
+                *written += take;
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let count = Arc::new(Mutex::new(0));
+        let wire = Wire::with_limits(Breaks(count.clone()), 4096, Duration::from_secs(1));
+        assert!(!wire.send(&result_of(json!(1), json!({ "a": "b".repeat(200) }))));
+        assert!(wire.broken.load(Ordering::Acquire));
+        assert!(!wire.send(&result_of(json!(2), json!({}))));
+        assert_eq!(*count.lock().unwrap(), 10);
+    }
+
+    /// Attack 4: a reader that takes one byte per interval is judged stalled once
+    /// the window passes, the session ends promptly, and the detached writer
+    /// finishes its line without a second frame ever following it.
+    #[test]
+    fn a_one_byte_at_a_time_reader_is_judged_stalled_and_no_second_frame_follows() {
+        #[derive(Clone, Default)]
+        struct Trickle(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Trickle {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(40));
+                self.0.lock().unwrap().push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Trickle::default();
+        let wire = Wire::with_limits(sink.clone(), 4096, Duration::from_millis(200));
+        let started = Instant::now();
+        assert!(!wire.send(&result_of(json!(1), json!({ "a": "b".repeat(60) }))));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!wire.send(&result_of(json!(2), json!({ "second": true }))));
+        std::thread::sleep(Duration::from_secs(5));
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(!text.contains("second"));
+    }
+
+    #[test]
+    fn a_request_id_that_alone_overflows_the_refusal_is_answered_with_a_null_id() {
+        let sink = Captured::default();
+        let wire = Wire::with_limits(sink.clone(), 512, Duration::from_secs(1));
+        let id = json!("i".repeat(600));
+        assert!(wire.send(&result_of(id, json!({ "blob": "x".repeat(5000) }))));
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let line: Value = serde_json::from_str(text.trim()).expect("one JSON-RPC line");
+        assert_eq!(line["id"], Value::Null, "{line}");
+        assert_eq!(line["error"]["code"], -32603);
+        assert!(line["error"]["data"]["bytes"].as_u64().unwrap() > 5000);
+        assert!(text.len() <= 512);
+        assert!(!wire.broken.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_writer_that_stalls_past_the_write_window_ends_the_session() {
+        struct Stalled;
+        impl io::Write for Stalled {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(3));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let wire = Wire::with_limits(Stalled, 1024, Duration::from_millis(150));
+        let started = Instant::now();
+        assert!(
+            !wire.send(&result_of(json!(1), json!({}))),
+            "a stalled client ends the session"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(wire.broken.load(Ordering::Acquire));
+        assert!(
+            !wire.send(&result_of(json!(2), json!({}))),
+            "nothing is written after a possibly partial line"
+        );
     }
 
     #[test]
