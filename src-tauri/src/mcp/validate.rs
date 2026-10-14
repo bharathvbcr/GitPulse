@@ -155,7 +155,7 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
                 format!(
                     "expected {}, got {}",
                     render_scalar(expected),
-                    describe(value)
+                    describe(value, expected.as_str() == Some("integer"))
                 ),
             ));
             // Every other keyword is typed; checking them against the wrong
@@ -349,14 +349,15 @@ fn type_matches(value: &Value, expected: &str) -> Option<bool> {
     })
 }
 
-fn describe(value: &Value) -> String {
+fn describe(value: &Value, expecting_integer: bool) -> String {
     match value {
         Value::Null => "null".into(),
         Value::Bool(_) => "boolean".into(),
         Value::Number(n) => {
             if exact_int(n).is_some() {
                 "integer".into()
-            } else if n.as_f64().is_some_and(|f| f.abs() > MAX_EXACT_FLOAT_INT) {
+            } else if expecting_integer && n.as_f64().is_some_and(|f| f.abs() > MAX_EXACT_FLOAT_INT)
+            {
                 "float above 999999999999999; send an integer literal".into()
             } else {
                 "number".into()
@@ -661,7 +662,10 @@ impl<T: FromArg> FromArg for Option<T> {
 fn wrong_type(path: &str, expected: &str, value: &Value) -> Violation {
     Violation::new(
         path,
-        format!("expected {expected}, got {}", describe(value)),
+        format!(
+            "expected {expected}, got {}",
+            describe(value, expected == "integer")
+        ),
     )
 }
 
@@ -1190,9 +1194,10 @@ mod tests {
 
     #[test]
     fn a_whole_float_beyond_the_exact_range_is_not_an_integer() {
-        // Past 2^53 - 1 a double stands for a range of integers; converting it
-        // would pick one for the caller. The validator and extraction answer the
-        // same question, so what passes one passes the other.
+        // Past 10^15 - 1 a float can parse one ulp off what was written (no
+        // `float_roundtrip`), so converting it could name a different integer.
+        // The validator and extraction answer the same question, so what
+        // passes one passes the other.
         for beyond in [json!(9_007_199_254_740_992.0), json!(1e300)] {
             let found = messages(json!({ "repo_path": "/tmp/x", "limit": beyond }));
             assert_eq!(
@@ -1575,5 +1580,31 @@ mod tests {
         let message = refusal("probe", &violations);
         assert!(message.len() < 4096, "{} bytes", message.len());
         assert!(!message.contains("ZZZZ"));
+    }
+
+    #[test]
+    fn a_refusal_is_cut_at_the_byte_bound_on_a_character_boundary() {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("repo_path".into(), json!("/tmp/x"));
+        for index in 0..30 {
+            let control = if index % 2 == 0 { "\u{1}\u{7}\n\t" } else { "" };
+            arguments.insert(
+                format!("{}{control}{index}", "\u{20ac}".repeat(1000)),
+                json!(1),
+            );
+        }
+        let violations = validate(&Value::Object(arguments), &schema());
+        assert!(violations.len() >= 30);
+        let message = refusal("probe", &violations);
+        assert!(
+            message.len() <= MAX_REFUSAL_BYTES,
+            "{} bytes over the {MAX_REFUSAL_BYTES} bound",
+            message.len()
+        );
+        assert!(message.ends_with('\u{2026}'), "the cut is marked");
+        assert!(message.starts_with("invalid arguments for probe"));
+        // The cut landed inside a run of 3-byte characters and still produced a
+        // valid String; this is the boundary search working.
+        assert!(message.len() > MAX_REFUSAL_BYTES - 8);
     }
 }

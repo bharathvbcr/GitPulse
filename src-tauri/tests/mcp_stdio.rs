@@ -649,8 +649,8 @@ fn every_string_argument_is_held_to_its_advertised_limit_on_the_wire() {
     assert!(checked > 60, "only {checked} wire probes ran");
 }
 
-/// Pre-existing on 8026dd7e, not a regression: `devmap_parity::handle` answers
-/// an unknown `devmap_*` name with "Unknown DevMap tool", which `run` does not
+/// Was broken on 8026dd7e (fixed here): `devmap_parity::handle` answered
+/// an unknown `devmap_*` name in-band with "Unknown DevMap tool", which `run` did not
 /// recognise as the protocol error it maps "Unknown tool:" to.
 #[test]
 fn an_unknown_tool_is_a_protocol_error_whatever_its_prefix() {
@@ -664,4 +664,38 @@ fn an_unknown_tool_is_a_protocol_error_whatever_its_prefix() {
     );
     assert_eq!(replies[&71]["error"]["code"], -32602, "{}", replies[&71]);
     assert_eq!(replies[&70]["error"]["code"], -32602, "{}", replies[&70]);
+}
+
+/// Long multibyte argument names, some with control characters that JSON
+/// escaping inflates: the refusal is cut at its byte bound, and the reply still
+/// arrives and is bounded.
+#[test]
+fn a_refusal_over_the_byte_bound_still_gets_a_bounded_answer() {
+    let mut session = Session::open();
+    let mut arguments = String::from(r#"{"repo_path":"/no/such/gitpulse-stdio-repo""#);
+    for index in 0..40 {
+        let control = if index % 2 == 0 { "\u{1}\u{7}\n\t" } else { "" };
+        let key = format!("{}{control}{index}", "\u{20ac}".repeat(1000));
+        arguments.push_str(&format!(",{}:1", json!(key)));
+    }
+    arguments.push('}');
+    let replies = session.ask(
+        vec![call_frame(80, "gitpulse_status", &arguments)],
+        Duration::from_secs(20),
+    );
+    let reply = &replies[&80];
+    assert!(refused(reply), "{:.300}", reply.to_string());
+    let text = text_of(reply);
+    assert!(
+        text.len() <= 8 * 1024,
+        "the refusal text is {} bytes",
+        text.len()
+    );
+    assert!(text.ends_with('\u{2026}'), "the cut is marked");
+    // Escaping can inflate a control character six-fold, never more.
+    assert!(
+        reply.to_string().len() < 6 * 8 * 1024 + 4096,
+        "the reply is {} bytes",
+        reply.to_string().len()
+    );
 }
