@@ -922,3 +922,7 @@ mod write_tests {
         assert!(!target.exists());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "adversarial_tests.rs"]
+mod adversarial_tests;
