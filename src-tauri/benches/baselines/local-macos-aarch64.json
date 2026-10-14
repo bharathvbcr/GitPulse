@@ -394,7 +394,7 @@
         "get_file_blob 1 KB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 139790,
+          "min_ns": 119170,
           "counters": {
             "bytes": 1024
           }
@@ -402,7 +402,7 @@
         "get_file_blob 1 MB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 1060000,
+          "min_ns": 1100000,
           "counters": {
             "bytes": 1048576
           }
@@ -410,7 +410,7 @@
         "get_file_blob 8 MB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 8350000,
+          "min_ns": 8300000,
           "counters": {
             "bytes": 8388608
           }
@@ -454,7 +454,7 @@
         "save_edited_text 1 KB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 8250000,
+          "min_ns": 6350000,
           "counters": {
             "bytes": 1024
           }
@@ -462,7 +462,7 @@
         "save_edited_text 1 MB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 8850000,
+          "min_ns": 8650000,
           "counters": {
             "bytes": 1048576
           }
@@ -470,7 +470,7 @@
         "save_edited_text 8 MB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 17060000,
+          "min_ns": 19000000,
           "counters": {
             "bytes": 8388608
           }
