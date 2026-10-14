@@ -120,7 +120,9 @@ pub(super) fn docs_rename_guarded(
         }
         Ok(())
     })?;
-    let policy = fold.finish().ok_or("Doc rename did not produce a verdict")?;
+    let policy = fold
+        .finish()
+        .ok_or("Doc rename did not produce a verdict")?;
     Ok(Guarded {
         policy,
         output: outcome,
@@ -288,7 +290,10 @@ done
             .unwrap_or_else(|| panic!("no file check for docs/Guide.md: {asked:?}"));
         assert_eq!(guide["params"]["op"], "modify");
         assert_eq!(guide["params"]["scope"]["task_id"], "TASK-DOC");
-        assert_eq!(guide["params"]["scope"]["forbidden_changes"][0], "docs/Guide.md");
+        assert_eq!(
+            guide["params"]["scope"]["forbidden_changes"][0],
+            "docs/Guide.md"
+        );
 
         // Nothing moved, nothing was written, nothing was staged.
         assert!(dir.path().join("docs/Roadmap.md").exists());
@@ -297,8 +302,9 @@ done
             std::fs::read_to_string(dir.path().join("docs/Guide.md")).unwrap(),
             "# Guide\n\n[r](Roadmap.md)\n"
         );
-        let staged = crate::engine::git_cli::git_text(dir.path(), &["diff", "--cached", "--name-only"])
-            .unwrap();
+        let staged =
+            crate::engine::git_cli::git_text(dir.path(), &["diff", "--cached", "--name-only"])
+                .unwrap();
         assert_eq!(staged, "");
     }
 
@@ -317,7 +323,10 @@ done
             .filter_map(|request| request["params"]["path"].as_str().map(String::from))
             .collect();
         for path in ["README.md", "docs/Guide.md"] {
-            assert!(asked.iter().any(|p| p == path), "{path} was not judged: {asked:?}");
+            assert!(
+                asked.iter().any(|p| p == path),
+                "{path} was not judged: {asked:?}"
+            );
         }
     }
 }

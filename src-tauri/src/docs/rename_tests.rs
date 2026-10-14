@@ -105,10 +105,13 @@ fn assert_rename_preserves_every_link(
     let mut expected: Vec<(String, usize, Option<String>)> = Vec::new();
     for note in before.vault.notes() {
         for (position, link) in note.links.iter().enumerate() {
-            let landed = before
-                .vault
-                .resolve_link(&note.path, link)
-                .map(|r| if r.path == from { to.to_string() } else { r.path });
+            let landed = before.vault.resolve_link(&note.path, link).map(|r| {
+                if r.path == from {
+                    to.to_string()
+                } else {
+                    r.path
+                }
+            });
             let source = if note.path == from { to } else { &note.path };
             expected.push((source.to_string(), position, landed));
         }
@@ -142,7 +145,10 @@ fn assert_rename_preserves_every_link(
     }
     let mut broken_after = after.vault.broken_links();
     broken_after.sort();
-    assert_eq!(broken_after, broken_before, "the set of broken links changed");
+    assert_eq!(
+        broken_after, broken_before,
+        "the set of broken links changed"
+    );
     (outcome.rewritten_paths, read(dir, to))
 }
 
@@ -174,10 +180,16 @@ fn every_link_spelling_still_reaches_its_note_after_a_move_between_directories()
     ]);
     let (rewritten, moved) =
         assert_rename_preserves_every_link(&dir, "docs/deep/Target.md", "archive/Moved Target.md");
-    assert!(rewritten.contains(&"docs/deep/Sib.md".to_string()), "{rewritten:?}");
+    assert!(
+        rewritten.contains(&"docs/deep/Sib.md".to_string()),
+        "{rewritten:?}"
+    );
     assert!(moved.contains("[self](Moved%20Target.md#intro)"), "{moved}");
     assert!(moved.contains("[sib](../docs/deep/Sib.md)"), "{moved}");
-    assert!(moved.contains("[t](../docs/deep/Sib.md \"title\")"), "{moved}");
+    assert!(
+        moved.contains("[t](../docs/deep/Sib.md \"title\")"),
+        "{moved}"
+    );
     assert!(moved.contains("[n](<../docs/deep/Sib.md>)"), "{moved}");
     assert!(moved.contains("[root](/README.md)"), "{moved}");
     // Titles and the bracketed form are carried through byte for byte.
@@ -198,10 +210,7 @@ fn a_move_that_changes_the_extension_still_resolves() {
 
 #[test]
 fn the_moved_notes_own_relative_links_are_re_expressed_from_its_new_folder() {
-    let dir = repo_with(&[
-        ("docs/A.md", "# A\n\n[b](B.md)\n"),
-        ("docs/B.md", "# B\n"),
-    ]);
+    let dir = repo_with(&[("docs/A.md", "# A\n\n[b](B.md)\n"), ("docs/B.md", "# B\n")]);
     let path = dir.path().to_str().unwrap();
     let outcome = rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
 
@@ -257,7 +266,10 @@ fn a_self_wikilink_follows_a_stem_change() {
     let dir = repo_with(&[("docs/A.md", "# A\n\n[[A]] and [[A#x]]\n")]);
     let path = dir.path().to_str().unwrap();
     rename_doc(path, "docs/A.md", "docs/Alpha.md", |_| Ok(())).expect("rename");
-    assert_eq!(read(&dir, "docs/Alpha.md"), "# A\n\n[[Alpha]] and [[Alpha#x]]\n");
+    assert_eq!(
+        read(&dir, "docs/Alpha.md"),
+        "# A\n\n[[Alpha]] and [[Alpha#x]]\n"
+    );
 }
 
 #[test]
@@ -286,6 +298,70 @@ fn a_case_only_rename_on_a_case_insensitive_volume_is_refused() {
     let refused = rename_doc(path, "docs/Roadmap.md", "docs/ROADMAP.md", |_| Ok(()));
     assert!(refused.is_err(), "{refused:?}");
     assert!(dir.path().join("docs/Roadmap.md").exists());
+}
+
+/// Min-of-N timing of the rename path on the synthetic 5,000-note corpus the
+/// refresh benchmark uses, with the in-memory pre-check timed on its own so
+/// "rename without it" is the difference.
+///
+/// `cargo test --release --manifest-path src-tauri/Cargo.toml --lib
+/// docs::rename_tests::docs_rename_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore = "manual timing workload"]
+fn docs_rename_benchmark() {
+    use std::time::Instant;
+    const RUNS: usize = 7;
+    fn min_ms(runs: usize, mut run: impl FnMut()) -> f64 {
+        (0..runs)
+            .map(|_| {
+                let started = Instant::now();
+                run();
+                started.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+    let dir = git_repo();
+    for n in 0..MAX_DOC_FILES {
+        write(
+            dir.path(),
+            &format!("notes/{:02}/note-{n:05}.md", n % 50),
+            &format!("# Note {n}\n[[note-00000]] [m](../00/note-00000.md) #corpus body-{n}\n"),
+        );
+    }
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "-qm", "benchmark corpus"]);
+    let path = dir.path().to_str().unwrap();
+    probe::set_clock_ahead(Duration::from_secs(5));
+    let repo = validate_repo(path).unwrap();
+    let built = load_vault(path, true).unwrap();
+    load_vault(path, true).unwrap();
+
+    // A note nothing links at, and the one every note links at.
+    for (label, from, to) in [
+        ("leaf", "notes/07/note-00007.md", "moved/note-00007.md"),
+        ("hub", "notes/00/note-00000.md", "moved/note-00000.md"),
+    ] {
+        let mut edits = Vec::new();
+        let plan_ms = min_ms(RUNS, || {
+            edits = super::rename::plan_edits(&built.vault, from, to).unwrap();
+        });
+        let precheck_ms = min_ms(RUNS, || {
+            super::rename::links_the_rename_breaks(&repo, &built.vault, from, to, &edits);
+        });
+        let (mut a, mut b) = (from.to_string(), to.to_string());
+        let end_to_end_ms = min_ms(if label == "hub" { 1 } else { RUNS }, || {
+            rename_doc(path, &a, &b, |_| Ok(())).unwrap();
+            std::mem::swap(&mut a, &mut b);
+        });
+        println!(
+            "docs_rename_bench target={label} notes={} rewrites={} plan_ms={plan_ms:.2} \
+             precheck_ms={precheck_ms:.2} rename_end_to_end_ms={end_to_end_ms:.2} \
+             precheck_share={:.1}%",
+            built.status.note_count,
+            edits.len(),
+            100.0 * precheck_ms / end_to_end_ms
+        );
+    }
 }
 
 /// Four notes that all link at `Roadmap.md`, so a rename rewrites four files.
@@ -366,7 +442,10 @@ fn a_write_fault_on_one_note_is_reported_and_the_others_are_still_written() {
     assert_eq!(read(&dir, "docs/A.md"), "[r](Roadmap.md)\n");
     let staged = staged(&dir);
     for rewritten in ["README.md", "docs/B.md", "docs/C.md"] {
-        assert!(staged.contains(rewritten), "{rewritten} not staged: {staged}");
+        assert!(
+            staged.contains(rewritten),
+            "{rewritten} not staged: {staged}"
+        );
     }
     assert!(!staged.contains("docs/A.md"), "{staged}");
 }
@@ -390,7 +469,10 @@ fn a_refused_rewrite_path_refuses_the_whole_rename_before_anything_moves() {
     assert!(dir.path().join("docs/Roadmap.md").exists());
     assert!(!dir.path().join("plans").exists());
     assert_eq!(read(&dir, "docs/Guide.md"), before);
-    assert_eq!(git_text(dir.path(), &["status", "--porcelain"]).unwrap(), "");
+    assert_eq!(
+        git_text(dir.path(), &["status", "--porcelain"]).unwrap(),
+        ""
+    );
 }
 
 #[test]
@@ -457,7 +539,8 @@ fn a_reference_definition_is_reported_because_it_is_not_rewritten() {
         ("docs/Roadmap.md", "# Roadmap\n"),
     ]);
     let path = dir.path().to_str().unwrap();
-    let outcome = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
+    let outcome =
+        rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
     assert_eq!(
         outcome.left_broken,
         [BrokenLink {
@@ -473,7 +556,8 @@ fn a_reference_definition_is_reported_because_it_is_not_rewritten() {
 fn a_clean_rename_reports_nothing_left_broken_and_is_complete() {
     let dir = nested_fixture_repo();
     let path = dir.path().to_str().unwrap();
-    let outcome = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
+    let outcome =
+        rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
     assert!(outcome.complete, "{outcome:?}");
     assert!(outcome.left_broken.is_empty(), "{outcome:?}");
     assert!(outcome.skipped_conflict.is_empty() && outcome.failed.is_empty());

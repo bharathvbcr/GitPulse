@@ -8,7 +8,7 @@
 //! judge every path the rename will touch, and each write is made only over the
 //! bytes the plan was made from.
 
-use super::{load_vault, normalize_rel, refresh, invalidate, BrokenLink, DocsStatus};
+use super::{invalidate, load_vault, normalize_rel, refresh, BrokenLink, DocsStatus};
 use crate::engine::git_cli::{sandbox_join, sandbox_write_expecting, validate_repo};
 use crate::engine::git_writer::{GitWriter, MovePlan};
 use markdev_vault::note::{has_markdown_extension, stem, strip_markdown_extension};
@@ -68,7 +68,7 @@ pub struct DocRenamePlan<'a> {
 }
 
 /// One planned rewrite: the bytes it was planned from and the bytes it writes.
-struct PlannedEdit {
+pub(super) struct PlannedEdit {
     /// Where the file lives once the move is done.
     path: String,
     original: String,
@@ -185,7 +185,7 @@ fn write_planned(repo_path: &str, edit: &PlannedEdit, attempt: usize) -> Result<
 }
 
 /// Every rewrite the rename makes, against the snapshot, before any is applied.
-fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<PlannedEdit>, String> {
+pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<PlannedEdit>, String> {
     let old_stem = stem(from);
     let new_stem = stem(to);
     let new_path = strip_markdown_extension(to).to_string();
@@ -252,7 +252,10 @@ fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<PlannedEdit>, S
             continue;
         }
         if text.len() > DEFAULT_MAX_NOTE_BYTES {
-            return Err(format!("rewrite of {} exceeds the note size limit", note.path));
+            return Err(format!(
+                "rewrite of {} exceeds the note size limit",
+                note.path
+            ));
         }
         edits.push(PlannedEdit {
             path: linking_new.to_string(),
@@ -267,7 +270,7 @@ fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<PlannedEdit>, S
 /// Links that are broken in the vault the rename would leave and were not
 /// broken in the one it starts from, by multiset difference so a note with two
 /// identical dead links is not credited with one of them twice.
-fn links_the_rename_breaks(
+pub(super) fn links_the_rename_breaks(
     repo: &Path,
     vault: &Vault,
     from: &str,
@@ -282,7 +285,11 @@ fn links_the_rename_breaks(
         .notes()
         .iter()
         .map(|note| {
-            let path = if note.path == from { to } else { note.path.as_str() };
+            let path = if note.path == from {
+                to
+            } else {
+                note.path.as_str()
+            };
             match edited.get(path) {
                 Some(text) => Note::parse(path, text),
                 None if note.path == from => Note::parse(path, &note.text),
@@ -294,7 +301,11 @@ fn links_the_rename_breaks(
 
     let mut before: HashMap<(String, String), usize> = HashMap::new();
     for (source, target) in vault.broken_links() {
-        let source = if source == from { to.to_string() } else { source };
+        let source = if source == from {
+            to.to_string()
+        } else {
+            source
+        };
         *before.entry((source, target)).or_default() += 1;
     }
     let mut broken = Vec::new();
@@ -382,7 +393,10 @@ fn express_link(written: &str, linking_dir: &str, target: &str) -> Option<String
     };
     let escaped = has_percent_escape(dest);
     let path = escape_path(&path, escaped, !parts.open.is_empty());
-    Some(format!("{}{}{}{}", parts.open, path, parts.close, parts.tail))
+    Some(format!(
+        "{}{}{}{}",
+        parts.open, path, parts.close, parts.tail
+    ))
 }
 
 /// `target` as seen from the folder `from_dir`: the common folders dropped, a
