@@ -1514,12 +1514,25 @@ mod watermark_tests {
             "",
             "not a date",
             "2026-09-01",
-            "2026-09-01T12:00:00+01:00",
+            "2026-09-01T12:00:00",
+            "2026-09-01t12:00:00z",
+            "2026-02-30T12:00:00Z",
+            "2026-09-01T12:00:60Z",
             "2026\u{2014}09-01T12:00:00Z",
             "\u{1F680}026-09-01T12:00:00Z",
         ] {
             assert_eq!(iso_to_millis(bad), 0, "{bad:?} should not parse");
         }
+    }
+
+    #[test]
+    fn an_offset_timestamp_is_read_as_its_utc_instant() {
+        // A transcript may spell its own time with an offset; it names the same
+        // instant as the `Z` form, which is what the skip compares.
+        assert_eq!(
+            iso_to_millis("2026-09-01T13:00:00+01:00"),
+            iso_to_millis("2026-09-01T12:00:00.000Z"),
+        );
     }
 
     #[test]
