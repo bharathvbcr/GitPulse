@@ -4,6 +4,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 #[test]
 fn which_spellings_resolve_to_dot_git() {
     let dir = tempfile::TempDir::new().unwrap();
