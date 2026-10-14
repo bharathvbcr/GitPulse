@@ -47,6 +47,8 @@ describe("CodeViewer", () => {
     expect(source).toContain("startEdit");
     expect(source).toContain("saveChanges");
     expect(source).toContain('"cmd_write_file_content"');
+    // The standalone fallback save still names the version it was handed.
+    expect(source).toContain("expectedBase: diskBase");
   });
 
   it("publishes every edit to the canonical parent draft owner", () => {

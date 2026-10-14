@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 98 contracts over
- * 246 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 99 contracts over
+ * 247 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -150,6 +150,7 @@ export const CONTRACTS = Object.freeze([
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
   { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
+  { label: "file-write", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("files", "types.ts"), structs: ["SavedFile"] },
   { label: "markdown-render", rustPath: rust("markdown", "mod.rs"), tsPath: ts("files", "markdevRender.ts"), structs: ["RenderedMarkdown", "MarkdownHeading", "FrontmatterField"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry", "ResetPreview", "PreviewCommit"] },

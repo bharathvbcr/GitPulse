@@ -9534,6 +9534,49 @@ mod tests {
     }
 
     #[test]
+    fn file_write_error_serializes_to_the_contract_shape() {
+        let keys = |error: FileWriteError| -> (String, Vec<String>) {
+            let value = serde_json::to_value(&error).unwrap();
+            let object = value.as_object().unwrap();
+            let mut keys: Vec<String> = object.keys().cloned().collect();
+            keys.sort();
+            (object["code"].as_str().unwrap().to_string(), keys)
+        };
+        let strings = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            keys(FileWriteError::AlreadyExists {
+                message: "m".into(),
+                path: "p".into()
+            }),
+            (
+                "already_exists".to_string(),
+                strings(&["code", "message", "path"])
+            )
+        );
+        assert_eq!(
+            keys(FileWriteError::ChangedOnDisk {
+                message: "m".into(),
+                path: "p".into(),
+                expected: "e".into(),
+                actual: "a".into()
+            }),
+            (
+                "changed_on_disk".to_string(),
+                strings(&["actual", "code", "expected", "message", "path"])
+            )
+        );
+        assert_eq!(
+            keys(FileWriteError::from("no".to_string())),
+            ("refused".to_string(), strings(&["code", "message"]))
+        );
+        let saved = serde_json::to_value(SavedFile {
+            disk_base: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(saved, serde_json::json!({ "disk_base": "x" }));
+    }
+
+    #[test]
     fn git_metadata_components_are_recognised_and_lookalikes_are_not() {
         use std::ffi::OsStr;
         for name in [

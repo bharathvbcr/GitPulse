@@ -33,4 +33,18 @@ describe("FileTreePanel source contracts", () => {
     expect(source).toContain("revealInFileManager");
     expect(source).not.toContain("@tauri-apps/plugin-opener");
   });
+
+  /**
+   * New File and New Folder's `.gitkeep` used to go through the editor's
+   * overwrite command with empty content, which truncated an existing file.
+   * The rendered behaviour (existing name refused, nothing written) is the
+   * file-tree browser harness; this keeps the overwrite command out of the
+   * explorer.
+   */
+  it("creates through the create-only command and never the overwrite one", () => {
+    expect(source).toContain('"cmd_create_file"');
+    expect(source).not.toContain("cmd_write_file_content");
+    expect(source).toContain("validate: (value) => newPathProblem(");
+    expect(source).toContain('typedError?.code === "already_exists"');
+  });
 });
