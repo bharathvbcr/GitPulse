@@ -1,0 +1,1129 @@
+{
+  "devmap_affected_tests": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "depth": {
+        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
+        "maximum": 64,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "min_confidence": {
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "targets": {
+        "description": "Symbols or file paths (max 16)",
+        "items": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": [
+      "repo_path",
+      "targets"
+    ],
+    "type": "object"
+  },
+  "devmap_clones": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "devmap_dead_symbols": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "devmap_dependencies": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "min_confidence": {
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+      },
+      "min_rung": {
+        "description": "Optional minimum resolution rung",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "target": {
+        "description": "File or symbol whose dependencies to read",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "target"
+    ],
+    "type": "object"
+  },
+  "devmap_explore": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "depth": {
+        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
+        "maximum": 64,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "limit": {
+        "description": "Maximum definitions to return (default 20)",
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "min_confidence": {
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+      },
+      "query": {
+        "description": "Symbol name or fragment",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "query"
+    ],
+    "type": "object"
+  },
+  "devmap_impact": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "depth": {
+        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
+        "maximum": 64,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "min_confidence": {
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+      },
+      "min_rung": {
+        "description": "Optional minimum resolution rung",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "target": {
+        "description": "Symbol or file path",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "target"
+    ],
+    "type": "object"
+  },
+  "devmap_neighbors": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "depth": {
+        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
+        "maximum": 64,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "min_confidence": {
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "targets": {
+        "description": "Symbols or file paths (max 16)",
+        "items": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": [
+      "repo_path",
+      "targets"
+    ],
+    "type": "object"
+  },
+  "devmap_preview": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "content": {
+        "description": "Proposed full replacement content",
+        "maxLength": 1048576,
+        "type": "string"
+      },
+      "file": {
+        "description": "Repository-relative path being edited",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "file",
+      "content"
+    ],
+    "type": "object"
+  },
+  "devmap_search": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "query": {
+        "description": "Symbol name or prefix",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "query"
+    ],
+    "type": "object"
+  },
+  "devmap_status": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "devmap_trace": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "depth": {
+        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
+        "maximum": 64,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "from": {
+        "description": "Origin symbol or file",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "min_confidence": {
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
+        "maximum": 1.0,
+        "minimum": 0.0,
+        "type": "number"
+      },
+      "min_rung": {
+        "description": "Optional minimum resolution rung",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "to": {
+        "description": "Destination symbol or file",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from",
+      "to"
+    ],
+    "type": "object"
+  },
+  "gitpulse_active_changes": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "description": "Maximum files to return (default 200, max 500)",
+        "maximum": 500,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "worktree_path": {
+        "description": "Worktree to inspect; defaults to repo_path",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_add_task": {
+    "additionalProperties": false,
+    "properties": {
+      "acceptance_criteria": {
+        "description": "Definition of done, one item each",
+        "items": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "maxItems": 128,
+        "type": "array"
+      },
+      "description": {
+        "description": "Background and problem statement (Markdown)",
+        "maxLength": 65536,
+        "type": "string"
+      },
+      "due": {
+        "description": "Due date as YYYY-MM-DD, or Unix seconds",
+        "maxLength": 32,
+        "minLength": 1,
+        "type": "string"
+      },
+      "kind": {
+        "description": "Type, e.g. feature (default), bug, refactor, chore, spike",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "labels": {
+        "description": "Labels",
+        "items": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "logs": {
+        "description": "Raw logs or traces kept verbatim as evidence (up to 256 KiB)",
+        "maxLength": 262144,
+        "type": "string"
+      },
+      "overwrite": {
+        "description": "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours.",
+        "type": "boolean"
+      },
+      "owner": {
+        "description": "Assignee, e.g. '@alice'",
+        "maxLength": 300,
+        "minLength": 1,
+        "type": "string"
+      },
+      "planned_files": {
+        "description": "Files the work is expected to touch; kept as a section of the description",
+        "items": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "maxItems": 256,
+        "type": "array"
+      },
+      "priority": {
+        "description": "Priority: 0 (urgent), 1 (high), 2 (normal, default), 3 (low)",
+        "maximum": 3,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repositories": {
+        "description": "Other related repository names; kept as a section of the description",
+        "items": {
+          "maxLength": 300,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "reviewed_related": {
+        "description": "item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work",
+        "items": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "maxItems": 500,
+        "type": "array"
+      },
+      "severity": {
+        "description": "Severity (default none)",
+        "enum": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "critical"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "status": {
+        "description": "Board column (default inbox)",
+        "enum": [
+          "inbox",
+          "backlog",
+          "ready",
+          "in_progress",
+          "review",
+          "done"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "task_id": {
+        "description": "Stable key for this task (letters, digits, '-', '_', '.'), e.g. 'gp-auth-flow'. Defaults to 'gp-' plus the title's slug.",
+        "maxLength": 96,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": {
+        "description": "Task title: one line, at most 300 characters",
+        "maxLength": 1200,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "title"
+    ],
+    "type": "object"
+  },
+  "gitpulse_change_context": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "worktree_path": {
+        "description": "Worktree to describe; defaults to repo_path",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_codeintel_dead_symbols": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_codeintel_dependencies": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "file_path": {
+        "description": "Repo-relative file whose dependencies to read",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "file_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_codeintel_impact": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "target": {
+        "description": "Symbol or file path",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "target"
+    ],
+    "type": "object"
+  },
+  "gitpulse_codeintel_search": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "query": {
+        "description": "Symbol name or prefix",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "query"
+    ],
+    "type": "object"
+  },
+  "gitpulse_codeintel_suspects": {
+    "additionalProperties": false,
+    "properties": {
+      "depth": {
+        "description": "How many call edges out from the symptom to follow (default 3)",
+        "maximum": 10,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "since": {
+        "description": "Revision the window opens at (a commit, tag or branch)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "symptom": {
+        "description": "Symbol that is misbehaving — a qualified node id, or a bare name",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "symptom",
+      "since"
+    ],
+    "type": "object"
+  },
+  "gitpulse_codeintel_trace": {
+    "additionalProperties": false,
+    "properties": {
+      "budget": {
+        "description": "Maximum tokens of results",
+        "maximum": 200000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "from": {
+        "description": "Symbol to trace from",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "to": {
+        "description": "Symbol to trace to",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from",
+      "to"
+    ],
+    "type": "object"
+  },
+  "gitpulse_collision_risk": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_complete_task": {
+    "additionalProperties": false,
+    "properties": {
+      "expected_revision": {
+        "description": "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
+        "maximum": 9007199254740991,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "request_id": {
+        "description": "Optional idempotency key (letters, digits, '-' and '_'). Send the same key to repeat this call after a lost response; the store answers with the first result instead of writing twice",
+        "maxLength": 120,
+        "minLength": 1,
+        "type": "string"
+      },
+      "status": {
+        "description": "Where the task goes (default done)",
+        "enum": [
+          "in_progress",
+          "review",
+          "done"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "summary": {
+        "description": "What you changed and how you verified it, in a few lines; appended to the task's logs",
+        "maxLength": 16000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "task_id": {
+        "description": "The task id from your brief ('Task: <id>'), its board item_id, or the task_id it was filed with",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "task_id"
+    ],
+    "type": "object"
+  },
+  "gitpulse_delete_task": {
+    "additionalProperties": false,
+    "properties": {
+      "even_if_running": {
+        "description": "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false",
+        "type": "boolean"
+      },
+      "expected_revision": {
+        "description": "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
+        "maximum": 9007199254740991,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "reason": {
+        "description": "Why the task is being deleted, in a line or two; recorded in its history",
+        "maxLength": 4000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "request_id": {
+        "description": "Optional idempotency key (letters, digits, '-' and '_'). Send the same key to repeat this call after a lost response; the store answers with the first result instead of writing twice",
+        "maxLength": 120,
+        "minLength": 1,
+        "type": "string"
+      },
+      "task_id": {
+        "description": "The task_id it was filed with, or its board item_id from gitpulse_list_tasks",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "task_id",
+      "reason"
+    ],
+    "type": "object"
+  },
+  "gitpulse_get_task": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "task_id": {
+        "description": "The task_id it was added or imported with, or its board item_id",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "task_id"
+    ],
+    "type": "object"
+  },
+  "gitpulse_import_tasks": {
+    "additionalProperties": false,
+    "properties": {
+      "replace": {
+        "description": "Overwrite the board copy of briefs already imported with the file's current content (default false)",
+        "type": "boolean"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "tasks_dir": {
+        "description": "Tasks directory relative to the repository root (default 'tasks')",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_insights": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_ledger_events": {
+    "additionalProperties": false,
+    "properties": {
+      "cursor": {
+        "description": "Return events with an id greater than this. 0 (the default) starts at the beginning of history.",
+        "maximum": 9223372036854775807,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "limit": {
+        "description": "Maximum number of events (default 50, max 1000)",
+        "maximum": 1000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_list_tasks": {
+    "additionalProperties": false,
+    "properties": {
+      "archived": {
+        "description": "true lists the archive instead of the board (default false)",
+        "type": "boolean"
+      },
+      "cursor": {
+        "description": "next_cursor from a previous page",
+        "maxLength": 180,
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum tasks to return (default 50, max 200)",
+        "maximum": 200,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "status": {
+        "description": "Only this column",
+        "enum": [
+          "inbox",
+          "backlog",
+          "ready",
+          "in_progress",
+          "review",
+          "done"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_merge_tasks": {
+    "additionalProperties": false,
+    "properties": {
+      "even_if_running": {
+        "description": "Merge a source even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false",
+        "type": "boolean"
+      },
+      "into_expected_revision": {
+        "description": "Only merge if the target is still at this revision when the merge starts",
+        "maximum": 9007199254740991,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "into_task_id": {
+        "description": "The task that stays: its task_id or board item_id",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "reason": {
+        "description": "Why these are one task, in a line or two; recorded on the target and on every source",
+        "maxLength": 4000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "sources": {
+        "description": "The tasks to fold in and delete",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "expected_revision": {
+              "description": "Only merge if this task is still at this revision when the merge starts",
+              "maximum": 9007199254740991,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "task_id": {
+              "description": "Its task_id or board item_id",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id"
+          ],
+          "type": "object"
+        },
+        "maxItems": 25,
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": [
+      "repo_path",
+      "into_task_id",
+      "sources",
+      "reason"
+    ],
+    "type": "object"
+  },
+  "gitpulse_provenance": {
+    "additionalProperties": false,
+    "properties": {
+      "base_branch": {
+        "description": "Base branch to compute distance against (default HEAD)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "commit_sha": {
+        "description": "Commit SHA",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "commit_sha"
+    ],
+    "type": "object"
+  },
+  "gitpulse_status": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_task_view": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "task_id": {
+        "description": "Optional task id to filter evidence, gaps, and runs",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  }
+}

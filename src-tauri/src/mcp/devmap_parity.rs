@@ -15,7 +15,10 @@ use serde_json::{json, Value};
 
 use crate::codeintel::WalkBounds;
 
-use super::{budget_prop, path_prop, repo_prop, tool, MAX_ARG_CHARS};
+use super::validate::{tool_args, Spec, ToolArgs, Unit};
+use super::{
+    budget_spec, parse, path_spec, repo_spec, tool, BudgetArgs, RepoArgs, SearchArgs, MAX_ARG_CHARS,
+};
 
 /// Ordered tool names matching `devmap_serve::mcp::TOOL_NAMES`.
 ///
@@ -35,40 +38,112 @@ pub const TOOL_NAMES: &[&str] = &[
     "devmap_affected_tests",
 ];
 
-fn budget_default() -> Value {
-    budget_prop()
+fn depth_spec() -> Spec {
+    Spec::int(
+        "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
+        1,
+        64,
+    )
 }
 
-fn depth_prop() -> Value {
-    json!({
-        "type": "integer",
-        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
-        "minimum": 1,
-        "maximum": 64
-    })
+fn confidence_spec() -> Spec {
+    Spec::Num {
+        desc: "Minimum edge confidence in [0,1] (default 0.0)",
+        min: 0.0,
+        max: 1.0,
+    }
 }
 
-fn confidence_prop() -> Value {
-    json!({
-        "type": "number",
-        "description": "Minimum edge confidence in [0,1] (default 0.0)",
-        "minimum": 0.0,
-        "maximum": 1.0
-    })
+fn min_rung_spec() -> Spec {
+    path_spec("Optional minimum resolution rung")
 }
 
-fn targets_prop() -> Value {
-    json!({
-        "type": "array",
-        "description": "Symbols or file paths (max 16)",
-        "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": MAX_ARG_CHARS
-        },
-        "minItems": 1,
-        "maxItems": crate::codeintel::MAX_NEIGHBOR_TARGETS
-    })
+fn targets_spec() -> Spec {
+    Spec::StrArray {
+        desc: "Symbols or file paths (max 16)",
+        min_items: 1,
+        max_items: crate::codeintel::MAX_NEIGHBOR_TARGETS,
+        item_min: 1,
+        item_max: MAX_ARG_CHARS as usize,
+        unit: Unit::Chars,
+    }
+}
+
+// Argument structs for the tools whose shape is their own. The ones shared with
+// the `gitpulse_*` surface (`RepoArgs`, `BudgetArgs`, `SearchArgs`) live in the
+// parent module.
+
+tool_args! {
+    pub(super) struct DependenciesArgs {
+        repo_path: String = repo_spec(),
+        target: String = path_spec("File or symbol whose dependencies to read"),
+        budget: Option<u32> = budget_spec(),
+        min_confidence: Option<f32> = confidence_spec(),
+        min_rung: Option<String> = min_rung_spec(),
+    }
+}
+
+tool_args! {
+    pub(super) struct ImpactArgs {
+        repo_path: String = repo_spec(),
+        target: String = path_spec("Symbol or file path"),
+        budget: Option<u32> = budget_spec(),
+        depth: Option<usize> = depth_spec(),
+        min_confidence: Option<f32> = confidence_spec(),
+        min_rung: Option<String> = min_rung_spec(),
+    }
+}
+
+tool_args! {
+    pub(super) struct TraceArgs {
+        repo_path: String = repo_spec(),
+        from: String = path_spec("Origin symbol or file"),
+        to: String = path_spec("Destination symbol or file"),
+        budget: Option<u32> = budget_spec(),
+        depth: Option<usize> = depth_spec(),
+        min_confidence: Option<f32> = confidence_spec(),
+        min_rung: Option<String> = min_rung_spec(),
+    }
+}
+
+tool_args! {
+    pub(super) struct NeighborsArgs {
+        repo_path: String = repo_spec(),
+        targets: Vec<String> = targets_spec(),
+        budget: Option<u32> = budget_spec(),
+        depth: Option<usize> = depth_spec(),
+        min_confidence: Option<f32> = confidence_spec(),
+    }
+}
+
+tool_args! {
+    pub(super) struct PreviewArgs {
+        repo_path: String = repo_spec(),
+        file: String = path_spec("Repository-relative path being edited"),
+        content: String = Spec::chars("Proposed full replacement content", 0, 1_048_576),
+        budget: Option<u32> = budget_spec(),
+    }
+}
+
+tool_args! {
+    pub(super) struct ExploreArgs {
+        repo_path: String = repo_spec(),
+        query: String = path_spec("Symbol name or fragment"),
+        budget: Option<u32> = budget_spec(),
+        limit: Option<u32> = Spec::int("Maximum definitions to return (default 20)", 1, 100),
+        depth: Option<usize> = depth_spec(),
+        min_confidence: Option<f32> = confidence_spec(),
+    }
+}
+
+tool_args! {
+    pub(super) struct AffectedTestsArgs {
+        repo_path: String = repo_spec(),
+        targets: Vec<String> = targets_spec(),
+        budget: Option<u32> = budget_spec(),
+        depth: Option<usize> = depth_spec(),
+        min_confidence: Option<f32> = confidence_spec(),
+    }
 }
 
 /// The `CodeintelResponse<T>` envelope an agent reads before treating an empty
@@ -262,287 +337,203 @@ pub fn tool_definitions() -> Vec<Value> {
             "devmap_status",
             "DevMap status",
             "Index health for a repository: generation, node/edge counts, freshness. Call first when another DevMap tool returns an empty or surprising answer.",
-            json!({ "repo_path": repo_prop() }),
-            &["repo_path"],
+            RepoArgs::properties(),
+            &RepoArgs::required(),
             status_output_schema(),
         ),
         tool(
             "devmap_search",
             "DevMap search",
             "Find symbols by name across the indexed repository.",
-            json!({
-                "repo_path": repo_prop(),
-                "query": path_prop("Symbol name or prefix"),
-                "budget": budget_default()
-            }),
-            &["repo_path", "query"],
+            SearchArgs::properties(),
+            &SearchArgs::required(),
             search_output_schema(),
         ),
         tool(
             "devmap_dependencies",
             "DevMap dependencies",
             "Outgoing edges from a file in the code graph. These are the file's direct edges, so there is no depth to bound.",
-            json!({
-                "repo_path": repo_prop(),
-                "target": path_prop("File or symbol whose dependencies to read"),
-                "budget": budget_default(),
-                "min_confidence": confidence_prop(),
-                "min_rung": path_prop("Optional minimum resolution rung")
-            }),
-            &["repo_path", "target"],
+            DependenciesArgs::properties(),
+            &DependenciesArgs::required(),
             envelope_schema(edge_schema()),
         ),
         tool(
             "devmap_impact",
             "DevMap impact",
             "Downstream blast radius / affected callers for a symbol or file.",
-            json!({
-                "repo_path": repo_prop(),
-                "target": path_prop("Symbol or file path"),
-                "budget": budget_default(),
-                "depth": depth_prop(),
-                "min_confidence": confidence_prop(),
-                "min_rung": path_prop("Optional minimum resolution rung")
-            }),
-            &["repo_path", "target"],
+            ImpactArgs::properties(),
+            &ImpactArgs::required(),
             envelope_schema(edge_schema()),
         ),
         tool(
             "devmap_trace",
             "DevMap trace",
             "Shortest edge path between two symbols in the code graph.",
-            json!({
-                "repo_path": repo_prop(),
-                "from": path_prop("Origin symbol or file"),
-                "to": path_prop("Destination symbol or file"),
-                "budget": budget_default(),
-                "depth": depth_prop(),
-                "min_confidence": confidence_prop(),
-                "min_rung": path_prop("Optional minimum resolution rung")
-            }),
-            &["repo_path", "from", "to"],
+            TraceArgs::properties(),
+            &TraceArgs::required(),
             envelope_schema(edge_schema()),
         ),
         tool(
             "devmap_neighbors",
             "DevMap neighbors",
             "Callers and callees for up to 16 targets in one exchange.",
-            json!({
-                "repo_path": repo_prop(),
-                "targets": targets_prop(),
-                "budget": budget_default(),
-                "depth": depth_prop(),
-                "min_confidence": confidence_prop()
-            }),
-            &["repo_path", "targets"],
+            NeighborsArgs::properties(),
+            &NeighborsArgs::required(),
             neighbors_output_schema(),
         ),
         tool(
             "devmap_dead_symbols",
             "DevMap dead symbols",
             "Unreferenced symbols. Unavailable is reported; an empty list never means the check did not run.",
-            json!({
-                "repo_path": repo_prop(),
-                "budget": budget_default()
-            }),
-            &["repo_path"],
+            BudgetArgs::properties(),
+            &BudgetArgs::required(),
             dead_symbols_output_schema(),
         ),
         tool(
             "devmap_clones",
             "DevMap clones",
             "Duplicate and structurally similar code groups.",
-            json!({
-                "repo_path": repo_prop(),
-                "budget": budget_default()
-            }),
-            &["repo_path"],
+            BudgetArgs::properties(),
+            &BudgetArgs::required(),
             clones_output_schema(),
         ),
         tool(
             "devmap_preview",
             "DevMap preview",
             "Speculative edit preview. GitPulse's in-process path is parser-free; this tool reports unavailable and points at `devmap preview` / global `devmap mcp` when parse is required.",
-            json!({
-                "repo_path": repo_prop(),
-                "file": path_prop("Repository-relative path being edited"),
-                    "content": {
-                    "type": "string",
-                    "description": "Proposed full replacement content",
-                    "maxLength": 1_048_576
-                },
-                "budget": budget_default()
-            }),
-            &["repo_path", "file", "content"],
+            PreviewArgs::properties(),
+            &PreviewArgs::required(),
             preview_output_schema(),
         ),
         tool(
             "devmap_explore",
             "DevMap explore",
             "Definitions matching a query plus callers, callees, and layered blast radius.",
-            json!({
-                "repo_path": repo_prop(),
-                "query": path_prop("Symbol name or fragment"),
-                "budget": budget_default(),
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum definitions to return (default 20)",
-                    "minimum": 1,
-                    "maximum": 100
-                },
-                "depth": depth_prop(),
-                "min_confidence": confidence_prop()
-            }),
-            &["repo_path", "query"],
+            ExploreArgs::properties(),
+            &ExploreArgs::required(),
             explore_output_schema(),
         ),
         tool(
             "devmap_affected_tests",
             "DevMap affected tests",
             "Test files reachable through the inbound blast radius of the given targets.",
-            json!({
-                "repo_path": repo_prop(),
-                "targets": targets_prop(),
-                "budget": budget_default(),
-                "depth": depth_prop(),
-                "min_confidence": confidence_prop()
-            }),
-            &["repo_path", "targets"],
+            AffectedTestsArgs::properties(),
+            &AffectedTestsArgs::required(),
             affected_tests_output_schema(),
         ),
     ]
 }
 
-fn string_args(arguments: &Value, keys: &[&str]) -> Result<Vec<String>, String> {
-    let Some(arr) = arguments[keys[0]].as_array() else {
-        return Err(format!("missing {}", keys[0]));
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let Some(s) = item.as_str() else {
-            return Err(format!("{} entries must be strings", keys[0]));
-        };
-        out.push(s.to_string());
-    }
-    Ok(out)
-}
-
-/// `depth` and `min_confidence`, as the caller sent them. A present value of
-/// the wrong type is refused here; a number out of range is refused by
-/// [`WalkBounds`], so neither is silently replaced by the default.
-fn walk_bounds(arguments: &Value) -> Result<WalkBounds, String> {
-    let max_depth = match &arguments["depth"] {
-        Value::Null => None,
-        v => Some(
-            v.as_u64()
-                .and_then(|d| usize::try_from(d).ok())
-                .ok_or("depth must be an integer")?,
-        ),
-    };
-    let min_confidence = match &arguments["min_confidence"] {
-        Value::Null => None,
-        v => Some(v.as_f64().ok_or("min_confidence must be a number")? as f32),
-    };
-    Ok(WalkBounds {
-        max_depth,
+/// `depth` and `min_confidence` as the caller sent them. A number out of range
+/// is refused by [`WalkBounds`], so neither is silently replaced by a default.
+fn bounds(depth: Option<usize>, min_confidence: Option<f32>) -> WalkBounds {
+    WalkBounds {
+        max_depth: depth,
         min_confidence,
-    })
-}
-
-/// Only `min_confidence`: for a query that reads one file's direct edges and
-/// has no depth to bound (`devmap_dependencies`).
-fn confidence_bound(arguments: &Value) -> Result<WalkBounds, String> {
-    Ok(WalkBounds {
-        max_depth: None,
-        min_confidence: walk_bounds(&json!({ "min_confidence": arguments["min_confidence"] }))?
-            .min_confidence,
-    })
+    }
 }
 
 /// Dispatch one DevMap-parity tool through the in-process codeintel layer.
 pub fn handle(name: &str, arguments: &Value) -> Result<Value, String> {
-    let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-    let budget = arguments["budget"].as_u64().map(|b| b as u32);
     match name {
-        "devmap_status" => Ok(json!(crate::codeintel::status(repo))),
+        "devmap_status" => {
+            let a: RepoArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::status(&a.repo_path)))
+        }
         "devmap_search" => {
-            let query = arguments["query"].as_str().ok_or("missing query")?;
-            Ok(json!(crate::codeintel::search(repo, query, budget)))
+            let a: SearchArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::search(
+                &a.repo_path,
+                &a.query,
+                a.budget
+            )))
         }
         "devmap_dependencies" => {
-            let target = arguments["target"].as_str().ok_or("missing target")?;
-            let min_rung = arguments["min_rung"].as_str();
+            let a: DependenciesArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::dependencies_at_rung(
-                repo,
-                target,
-                budget,
-                min_rung,
-                confidence_bound(arguments)?,
+                &a.repo_path,
+                &a.target,
+                a.budget,
+                a.min_rung.as_deref(),
+                bounds(None, a.min_confidence),
                 None
             )))
         }
         "devmap_impact" => {
-            let target = arguments["target"].as_str().ok_or("missing target")?;
-            let min_rung = arguments["min_rung"].as_str();
+            let a: ImpactArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::impact_at_rung(
-                repo,
-                target,
-                budget,
-                min_rung,
-                walk_bounds(arguments)?,
+                &a.repo_path,
+                &a.target,
+                a.budget,
+                a.min_rung.as_deref(),
+                bounds(a.depth, a.min_confidence),
                 None
             )))
         }
         "devmap_trace" => {
-            let from = arguments["from"].as_str().ok_or("missing from")?;
-            let to = arguments["to"].as_str().ok_or("missing to")?;
-            let min_rung = arguments["min_rung"].as_str();
+            let a: TraceArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::trace_between_at_rung(
-                repo,
-                from,
-                to,
-                budget,
-                min_rung,
-                walk_bounds(arguments)?,
+                &a.repo_path,
+                &a.from,
+                &a.to,
+                a.budget,
+                a.min_rung.as_deref(),
+                bounds(a.depth, a.min_confidence),
                 None
             )))
         }
         "devmap_neighbors" => {
-            let targets = string_args(arguments, &["targets"])?;
+            let a: NeighborsArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::neighbors_envelope(
-                crate::codeintel::neighbors(repo, &targets, budget, None, walk_bounds(arguments)?)
+                crate::codeintel::neighbors(
+                    &a.repo_path,
+                    &a.targets,
+                    a.budget,
+                    None,
+                    bounds(a.depth, a.min_confidence)
+                )
             )))
         }
-        "devmap_dead_symbols" => Ok(json!(crate::codeintel::dead_symbols(repo, budget))),
-        "devmap_clones" => Ok(json!(crate::codeintel::clones(repo, budget))),
+        "devmap_dead_symbols" => {
+            let a: BudgetArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::dead_symbols(
+                &a.repo_path,
+                a.budget
+            )))
+        }
+        "devmap_clones" => {
+            let a: BudgetArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::clones(&a.repo_path, a.budget)))
+        }
         "devmap_preview" => {
-            let file = arguments["file"].as_str().ok_or("missing file")?;
-            let content = arguments["content"].as_str().ok_or("missing content")?;
+            let a: PreviewArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::preview(
-                repo, file, content, budget
+                &a.repo_path,
+                &a.file,
+                &a.content,
+                a.budget
             )))
         }
         "devmap_explore" => {
-            let query = arguments["query"].as_str().ok_or("missing query")?;
-            let limit = arguments["limit"].as_u64().map(|n| n as u32);
+            let a: ExploreArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::explore(
-                repo,
-                query,
-                budget,
-                limit,
-                walk_bounds(arguments)?
+                &a.repo_path,
+                &a.query,
+                a.budget,
+                a.limit,
+                bounds(a.depth, a.min_confidence)
             )))
         }
         "devmap_affected_tests" => {
-            let targets = string_args(arguments, &["targets"])?;
+            let a: AffectedTestsArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::affected_tests(
-                repo,
-                &targets,
-                budget,
-                walk_bounds(arguments)?
+                &a.repo_path,
+                &a.targets,
+                a.budget,
+                bounds(a.depth, a.min_confidence)
             )))
         }
-        _ => Err(format!("Unknown DevMap tool: {name}")),
+        _ => Err(format!("Unknown tool: {name}")),
     }
 }
 
@@ -855,72 +846,33 @@ mod tests {
         assert!(out["reason"].is_string(), "{out}");
     }
 
-    /// A handler that reads an argument its `inputSchema` does not declare is
-    /// unreachable for a validating client (`additionalProperties: false`), and
-    /// one that never reads a declared argument advertises a control that does
-    /// nothing. `devmap_neighbors` did both (`min_rung` read undeclared, `depth`
-    /// and `min_confidence` declared and ignored), and so did every other tool
-    /// that walks edges. Both directions are held here, per tool.
+    /// The validator calls `5.0` an integer, so the handler has to answer it as
+    /// 5 rather than refuse it or read it as absent.
     #[test]
-    fn handlers_read_exactly_the_arguments_their_input_schema_declares() {
-        let source = include_str!("devmap_parity.rs");
-        let body = &source[source.find("pub fn handle(").expect("handle")..];
-        let body = &body[..body.find("#[cfg(test)]").expect("tests follow handle")];
-        // What one arm of `handle` reads: literal `arguments["k"]` lookups, the
-        // bounds helpers (which read `depth` / `min_confidence`), and `budget`
-        // when the arm passes the shared prologue's value on.
-        let reads = |arm: &str| -> std::collections::BTreeSet<String> {
-            let mut keys = std::collections::BTreeSet::new();
-            let mut rest = arm;
-            while let Some(at) = rest.find("arguments[\"") {
-                rest = &rest[at + "arguments[\"".len()..];
-                keys.insert(rest[..rest.find('"').unwrap()].to_string());
-            }
-            // `string_args(arguments, &["targets"])` reads the named array.
-            let mut rest = arm;
-            while let Some(at) = rest.find("string_args(arguments, &[\"") {
-                rest = &rest[at + "string_args(arguments, &[\"".len()..];
-                keys.insert(rest[..rest.find('"').unwrap()].to_string());
-            }
-            if arm.contains("walk_bounds(") {
-                keys.extend(["depth".to_string(), "min_confidence".to_string()]);
-            }
-            if arm.contains("confidence_bound(") {
-                keys.insert("min_confidence".to_string());
-            }
-            if arm.contains("budget") {
-                keys.insert("budget".to_string());
-            }
-            keys
-        };
-        let (_prologue, arms) = body.split_once("match name {").expect("dispatch");
-        for definition in tool_definitions() {
-            let name = definition["name"].as_str().unwrap();
-            let marker = format!("\"{name}\" =>");
-            let start = arms
-                .find(&marker)
-                .unwrap_or_else(|| panic!("no arm for {name}"));
-            let arm = &arms[start + marker.len()..];
-            let end = arm.find("\n        \"devmap_").unwrap_or(arm.len());
-            let mut read = reads(&arm[..end]);
-            read.insert("repo_path".to_string());
-            let declared: std::collections::BTreeSet<String> = definition["inputSchema"]
-                ["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect();
-            let undeclared: Vec<_> = read.difference(&declared).collect();
-            assert!(
-                undeclared.is_empty(),
-                "{name} reads undeclared {undeclared:?}"
-            );
-            let ignored: Vec<_> = declared.difference(&read).collect();
-            assert!(
-                ignored.is_empty(),
-                "{name} declares but ignores {ignored:?}"
-            );
+    fn devmap_depth_5_0_matches_depth_5() {
+        let (_dir, root) = two_hop_repo();
+        for (name, base) in [
+            ("devmap_impact", json!({ "target": "probe_island" })),
+            (
+                "devmap_trace",
+                json!({ "from": "probe_caller", "to": "probe_island" }),
+            ),
+            ("devmap_explore", json!({ "query": "probe_island" })),
+            (
+                "devmap_affected_tests",
+                json!({ "targets": ["probe_island"] }),
+            ),
+            ("devmap_neighbors", json!({ "targets": ["probe_caller"] })),
+        ] {
+            let answer = |depth: Value| {
+                let mut args = json!({ "repo_path": root, "depth": depth, "budget": 5000 });
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(base.as_object().unwrap().clone());
+                ask(name, args)
+            };
+            assert_eq!(answer(json!(5.0)), answer(json!(5)), "{name}");
+            assert_eq!(answer(json!(1.0)), answer(json!(1)), "{name}");
         }
     }
 }

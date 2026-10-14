@@ -36,9 +36,14 @@ pub const MAX_TASKS_DIR: usize = 256;
 pub const MAX_BRIEF_BYTES: usize = 1024 * 1024;
 /// Most candidate files one scan parses; the rest are counted, not read.
 pub const MAX_BRIEF_FILES: usize = 500;
+// The limits below are in bytes, not characters. `gitpulse_add_task` declares
+// them with `Spec::bytes`, so its schema says "bytes, UTF-8" and the call is
+// refused at the boundary for a string whose byte length is over the limit.
+
 /// Longest task key, in bytes. Matches the workbench identifier bound.
 pub const MAX_TASK_KEY: usize = 96;
-/// Longest title, in characters. The board refuses anything longer.
+/// Longest title, in characters. The board refuses anything longer, and the
+/// `gitpulse_add_task` schema's `maxLength` is this constant.
 pub const MAX_TASK_TITLE: usize = 300;
 /// Longest description, in bytes, before planned files are folded in.
 pub const MAX_TASK_DESCRIPTION: usize = 65_536;

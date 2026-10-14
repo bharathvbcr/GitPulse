@@ -227,3 +227,475 @@ fn command_line_arguments_are_answered_without_serving() {
         assert!(stderr.contains("unexpected argument"), "{args:?}: {stderr}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial wire tests for typed tool arguments.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+/// A live server on a hermetic home, spoken to a few requests at a time (the
+/// server refuses past 32 in flight) and read until each id has answered.
+struct Session {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: Receiver<Value>,
+    _home: tempfile::TempDir,
+    unmatched: Vec<Value>,
+}
+
+impl Session {
+    fn open() -> Self {
+        let home = tempfile::tempdir().expect("home");
+        let mut child = Command::new(mcp_bin())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .env("HOME", home.path())
+            .env("GITPULSE_LOG_DIR", home.path())
+            .spawn_locked()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", mcp_bin()));
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("stdout");
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for raw in BufReader::new(stdout).lines() {
+                let Ok(raw) = raw else { break };
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                let parsed = serde_json::from_str::<Value>(&raw)
+                    .unwrap_or_else(|e| panic!("stdout is not JSON-RPC ({e}): {raw:.200}"));
+                if tx.send(parsed).is_err() {
+                    break;
+                }
+            }
+        });
+        Session {
+            child,
+            stdin,
+            lines,
+            _home: home,
+            unmatched: Vec::new(),
+        }
+    }
+
+    fn send_raw(&mut self, frame: &str) {
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        stdin.write_all(frame.as_bytes()).expect("write");
+        stdin.write_all(b"\n").expect("newline");
+        stdin.flush().expect("flush");
+    }
+
+    /// Answers by id; responses with another id (a parse error answers `null`)
+    /// are kept in `unmatched`.
+    fn ask(&mut self, frames: Vec<(u64, String)>, within: Duration) -> HashMap<u64, Value> {
+        let mut wanted: Vec<u64> = frames.iter().map(|(id, _)| *id).collect();
+        for (_, frame) in &frames {
+            self.send_raw(frame);
+        }
+        let deadline = Instant::now() + within;
+        let mut got = HashMap::new();
+        while !wanted.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(reply) = self.lines.recv_timeout(left) else {
+                panic!("no answer for ids {wanted:?} within {within:?}");
+            };
+            match reply["id"].as_u64() {
+                Some(id) if wanted.contains(&id) => {
+                    wanted.retain(|w| *w != id);
+                    got.insert(id, reply);
+                }
+                _ => self.unmatched.push(reply),
+            }
+        }
+        got
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+fn call_frame(id: u64, name: &str, arguments_text: &str) -> (u64, String) {
+    (
+        id,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"_meta":{},"name":{},"arguments":{arguments_text}}}}}"#,
+            modern_meta(),
+            json!(name)
+        ),
+    )
+}
+
+fn text_of(reply: &Value) -> String {
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn refused(reply: &Value) -> bool {
+    reply["result"]["isError"] == true && text_of(reply).starts_with("invalid arguments for")
+}
+
+fn advertised_tools(session: &mut Session) -> Vec<Value> {
+    let reply = session
+        .ask(
+            vec![(9000, line(9000, "tools/list", json!({})))],
+            Duration::from_secs(20),
+        )
+        .remove(&9000)
+        .expect("tools/list");
+    reply["result"]["tools"].as_array().expect("tools").clone()
+}
+
+const WAIT: Duration = Duration::from_secs(30);
+
+/// Arguments that satisfy `required` for `schema`, with `field` left out.
+fn required_except(schema: &Value, field: &str) -> serde_json::Map<String, Value> {
+    let mut arguments = serde_json::Map::new();
+    for key in schema["required"].as_array().unwrap() {
+        let key = key.as_str().unwrap();
+        if key == field {
+            continue;
+        }
+        let value = match key {
+            "repo_path" => json!("/no/such/gitpulse-stdio-repo"),
+            _ => match schema["properties"][key]["type"].as_str() {
+                Some("integer") => schema["properties"][key]["minimum"].clone(),
+                Some("array") if schema["properties"][key]["minItems"].is_null() => json!([]),
+                Some("array") if schema["properties"][key]["items"]["type"] == "object" => {
+                    json!([{ "task_id": "x" }])
+                }
+                Some("array") => json!(["x"]),
+                _ => json!("x"),
+            },
+        };
+        arguments.insert(key.to_string(), value);
+    }
+    arguments
+}
+
+#[test]
+fn tool_arguments_that_are_not_an_object_are_protocol_errors_and_the_server_keeps_serving() {
+    let mut session = Session::open();
+    let meta = modern_meta();
+    let shapes = [
+        ("null", r#""arguments":null,"#),
+        ("array", r#""arguments":[],"#),
+        ("string", r#""arguments":"repo_path","#),
+        ("number", r#""arguments":5,"#),
+        ("bool", r#""arguments":true,"#),
+    ];
+    let mut frames = Vec::new();
+    for (index, (_, member)) in shapes.iter().enumerate() {
+        let id = 10 + index as u64;
+        frames.push((
+            id,
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"_meta":{meta},{member}"name":"gitpulse_status"}}}}"#
+            ),
+        ));
+    }
+    let replies = session.ask(frames, WAIT);
+    for (index, (what, _)) in shapes.iter().enumerate() {
+        let reply = &replies[&(10 + index as u64)];
+        assert_eq!(reply["error"]["code"], -32602, "{what}: {reply}");
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("arguments must be an object"),
+            "{what}: {reply}"
+        );
+    }
+    // Missing `arguments` is an empty object, so the missing repo_path is named.
+    let missing = session.ask(
+        vec![(
+            20,
+            format!(
+                r#"{{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{{"_meta":{meta},"name":"gitpulse_status"}}}}"#
+            ),
+        )],
+        WAIT,
+    );
+    assert!(refused(&missing[&20]), "{}", missing[&20]);
+    assert!(text_of(&missing[&20]).contains("repo_path"));
+    assert!(!advertised_tools(&mut session).is_empty());
+}
+
+#[test]
+fn a_frame_over_the_cap_is_answered_and_the_connection_continues() {
+    let mut session = Session::open();
+    let giant = format!(r#"{{"repo_path":"{}"}}"#, "a".repeat(4 * 1024 * 1024));
+    let (_, frame) = call_frame(30, "gitpulse_status", &giant);
+    session.send_raw(&frame);
+    // Just under the cap: refused for its length, in a short message.
+    let nearly = format!(r#"{{"repo_path":"{}"}}"#, "a".repeat(3_900_000));
+    let replies = session.ask(vec![call_frame(31, "gitpulse_status", &nearly)], WAIT);
+    let text = text_of(&replies[&31]);
+    assert!(refused(&replies[&31]), "{text:.200}");
+    assert!(
+        text.contains("repo_path") && text.len() < 2048,
+        "{} bytes",
+        text.len()
+    );
+    assert!(!advertised_tools(&mut session).is_empty());
+    assert!(
+        session
+            .unmatched
+            .iter()
+            .any(|r| r["error"]["code"] == -32700),
+        "an over-cap frame was not answered: {:?}",
+        session.unmatched
+    );
+}
+
+#[test]
+fn frames_json_cannot_carry_are_parse_errors_not_a_dead_connection() {
+    let mut session = Session::open();
+    let meta = modern_meta();
+    for (index, bad) in [
+        r#""repo_path":"\ud800""#,
+        r#""repo_path":"\udc00x""#,
+        r#""repo_path":1e400"#,
+        r#""repo_path":-1e400"#,
+        r#""repo_path":NaN"#,
+        r#""repo_path":Infinity"#,
+        r#""repo_path":0x10"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        session.send_raw(&format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"_meta":{meta},"name":"gitpulse_status","arguments":{{{bad}}}}}}}"#,
+            40 + index
+        ));
+    }
+    // The connection is alive, and none of that reached a tool.
+    assert!(!advertised_tools(&mut session).is_empty());
+    let answered: Vec<&Value> = session
+        .unmatched
+        .iter()
+        .filter(|r| r["result"]["isError"] == false)
+        .collect();
+    assert!(
+        answered.is_empty(),
+        "a malformed frame ran a tool: {answered:?}"
+    );
+}
+
+#[test]
+fn a_duplicate_key_is_decided_by_the_last_and_that_one_is_validated() {
+    let mut session = Session::open();
+    let replies = session.ask(
+        vec![
+            call_frame(
+                50,
+                "gitpulse_status",
+                r#"{"repo_path":"/no/such/gitpulse-stdio-repo","repo_path":5}"#,
+            ),
+            call_frame(
+                51,
+                "gitpulse_status",
+                r#"{"repo_path":5,"repo_path":"/no/such/gitpulse-stdio-repo"}"#,
+            ),
+        ],
+        WAIT,
+    );
+    assert!(refused(&replies[&50]), "{}", replies[&50]);
+    assert!(!refused(&replies[&51]), "{}", replies[&51]);
+}
+
+#[test]
+fn a_refusal_with_a_hundred_thousand_violations_still_gets_an_answer() {
+    let mut session = Session::open();
+    let mut arguments = String::from(r#"{"repo_path":"/no/such/gitpulse-stdio-repo""#);
+    for index in 0..150_000 {
+        arguments.push_str(&format!(r#","k{index}":1"#));
+    }
+    arguments.push('}');
+    let replies = session.ask(
+        vec![call_frame(60, "gitpulse_status", &arguments)],
+        Duration::from_secs(20),
+    );
+    let reply = &replies[&60];
+    assert!(refused(reply), "{:.300}", reply.to_string());
+    assert!(
+        text_of(reply).contains("k0"),
+        "the refusal names no argument"
+    );
+    assert!(
+        reply.to_string().len() < 1_000_000,
+        "the refusal is {} bytes",
+        reply.to_string().len()
+    );
+}
+
+/// Every integer argument of every advertised tool, at its edges, as written
+/// by a client: an integer literal and a whole float.
+#[test]
+fn every_integer_argument_is_held_to_its_advertised_bounds_on_the_wire() {
+    let mut session = Session::open();
+    let tools = advertised_tools(&mut session);
+    let mut id = 1000u64;
+    let mut checked = 0;
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap();
+        let schema = &tool["inputSchema"];
+        for (field, prop) in schema["properties"].as_object().unwrap() {
+            if prop["type"] != "integer" {
+                continue;
+            }
+            let min = i128::from(prop["minimum"].as_i64().expect("minimum"));
+            let max = i128::from(prop["maximum"].as_u64().expect("maximum"));
+            let mut batch = Vec::new();
+            let mut expectations = HashMap::new();
+            for value in [min - 1, min, max, max + 1] {
+                // The text goes on the wire as written. A float spelling of a
+                // value past 10^15 - 1 is one the server refuses rather than misread.
+                let spellings = [
+                    (format!("{value}"), true),
+                    (format!("{value}.0"), value.abs() <= 999_999_999_999_999),
+                ];
+                for (text, representable) in spellings {
+                    let inside = (min..=max).contains(&value) && representable;
+                    id += 1;
+                    let mut arguments = format!(r#"{{{}:{text}"#, json!(field));
+                    for (key, value) in required_except(schema, field) {
+                        arguments.push_str(&format!(",{}:{}", json!(key), value));
+                    }
+                    arguments.push('}');
+                    batch.push(call_frame(id, name, &arguments));
+                    expectations.insert(id, (inside, format!("{name}.{field} = {text}")));
+                }
+            }
+            let replies = session.ask(batch, WAIT);
+            for (id, (inside, shown)) in expectations {
+                let reply = &replies[&id];
+                if inside {
+                    assert!(
+                        !refused(reply),
+                        "{shown} was refused: {:.300}",
+                        text_of(reply)
+                    );
+                } else {
+                    assert!(
+                        refused(reply),
+                        "{shown} was accepted: {:.200}",
+                        reply.to_string()
+                    );
+                    assert!(text_of(reply).contains(field.as_str()), "{shown}");
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 100, "only {checked} wire probes ran");
+}
+
+/// Every string argument of every tool at its limit and one over, in ASCII, so
+/// the bound a client reads is the bound the binary enforces.
+#[test]
+fn every_string_argument_is_held_to_its_advertised_limit_on_the_wire() {
+    let mut session = Session::open();
+    let tools = advertised_tools(&mut session);
+    let mut id = 5000u64;
+    let mut checked = 0;
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap();
+        let schema = &tool["inputSchema"];
+        for (field, prop) in schema["properties"].as_object().unwrap() {
+            if prop["type"] != "string" || !prop["enum"].is_null() {
+                continue;
+            }
+            let max = prop["maxLength"].as_u64().expect("maxLength") as usize;
+            if max > 1_100_000 || field == "repo_path" {
+                continue;
+            }
+            let mut batch = Vec::new();
+            let mut over_ids = Vec::new();
+            for (length, over) in [(max, false), (max + 1, true)] {
+                id += 1;
+                let mut arguments = required_except(schema, field);
+                arguments.insert(field.clone(), json!("a".repeat(length)));
+                batch.push(call_frame(id, name, &Value::Object(arguments).to_string()));
+                if over {
+                    over_ids.push(id);
+                }
+            }
+            let replies = session.ask(batch, WAIT);
+            for (id, reply) in &replies {
+                if over_ids.contains(id) {
+                    assert!(refused(reply), "{name}.{field}: {max}+1 chars accepted");
+                    assert!(text_of(reply).contains(field.as_str()), "{name}.{field}");
+                } else {
+                    assert!(
+                        !refused(reply),
+                        "{name}.{field}: {max} chars refused: {:.200}",
+                        text_of(reply)
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 60, "only {checked} wire probes ran");
+}
+
+/// Was broken on 8026dd7e (fixed here): `devmap_parity::handle` answered
+/// an unknown `devmap_*` name in-band with "Unknown DevMap tool", which `run` did not
+/// recognise as the protocol error it maps "Unknown tool:" to.
+#[test]
+fn an_unknown_tool_is_a_protocol_error_whatever_its_prefix() {
+    let mut session = Session::open();
+    let replies = session.ask(
+        vec![
+            call_frame(70, "devmap_no_such_tool", r#"{"anything":[1,2,3]}"#),
+            call_frame(71, "gitpulse_no_such_tool", r#"{"anything":[1,2,3]}"#),
+        ],
+        WAIT,
+    );
+    assert_eq!(replies[&71]["error"]["code"], -32602, "{}", replies[&71]);
+    assert_eq!(replies[&70]["error"]["code"], -32602, "{}", replies[&70]);
+}
+
+/// Long multibyte argument names, some with control characters that JSON
+/// escaping inflates: the refusal is cut at its byte bound, and the reply still
+/// arrives and is bounded.
+#[test]
+fn a_refusal_over_the_byte_bound_still_gets_a_bounded_answer() {
+    let mut session = Session::open();
+    let mut arguments = String::from(r#"{"repo_path":"/no/such/gitpulse-stdio-repo""#);
+    for index in 0..40 {
+        let control = if index % 2 == 0 { "\u{1}\u{7}\n\t" } else { "" };
+        let key = format!("{}{control}{index}", "\u{20ac}".repeat(1000));
+        arguments.push_str(&format!(",{}:1", json!(key)));
+    }
+    arguments.push('}');
+    let replies = session.ask(
+        vec![call_frame(80, "gitpulse_status", &arguments)],
+        Duration::from_secs(20),
+    );
+    let reply = &replies[&80];
+    assert!(refused(reply), "{:.300}", reply.to_string());
+    let text = text_of(reply);
+    assert!(
+        text.len() <= 8 * 1024,
+        "the refusal text is {} bytes",
+        text.len()
+    );
+    assert!(text.ends_with('\u{2026}'), "the cut is marked");
+    // Escaping can inflate a control character six-fold, never more.
+    assert!(
+        reply.to_string().len() < 6 * 8 * 1024 + 4096,
+        "the reply is {} bytes",
+        reply.to_string().len()
+    );
+}
