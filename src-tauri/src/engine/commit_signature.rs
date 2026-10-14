@@ -16,7 +16,8 @@
 //! appears.
 
 use crate::engine::git_cli::{
-    git_captured, git_text_with_timeout, read_objects_batch, validate_repo, BatchObject,
+    git_captured, git_captured_capped, git_text_with_timeout, read_objects_batch, validate_repo,
+    BatchObject,
 };
 use crate::engine::git_writer::validate_oid;
 use crate::engine::ref_cache::{user_config_paths, FileIdentity};
@@ -184,6 +185,50 @@ pub(crate) fn commit_signatures(repo: &Path, oids: &[String]) -> HashMap<String,
         BATCH_BUDGET,
         &classify_header,
     ))
+}
+
+/// How every commit a history walk visits is signed, from one header-only
+/// `git rev-list --header` run with the walk's own arguments, and no verifier.
+///
+/// Unlike [`commit_signatures`] it needs no list of ids, so a caller can run it
+/// beside the walk that produces them instead of after it. A commit the stream
+/// does not hold (the refs moved between the two reads, the output was cut at
+/// the budget, git failed) is absent from the map; the caller reads absence as
+/// [`CommitSignature::Unknown`].
+pub(crate) fn walk_signatures(repo: &Path, args: &[&str]) -> HashMap<String, CommitSignature> {
+    let Ok(run) = git_captured_capped(repo, args, BATCH_BUDGET) else {
+        return HashMap::new();
+    };
+    if !run.success && run.incomplete.is_none() {
+        return HashMap::new();
+    }
+    read_header_stream(&run.stdout, run.incomplete.is_some())
+}
+
+/// Splits `rev-list --header` output (`oid LF object-text NUL`, repeated) into
+/// signatures by oid. `cut` says the stream is a prefix, so its last record may
+/// be partial and is not trusted. A record whose first line is not an object
+/// id is skipped, never attributed to anyone.
+fn read_header_stream(out: &[u8], cut: bool) -> HashMap<String, CommitSignature> {
+    let mut records: Vec<&[u8]> = out.split(|&b| b == 0).collect();
+    if cut {
+        records.pop();
+    }
+    let mut found = HashMap::new();
+    for record in records {
+        let Some(newline) = record.iter().position(|&b| b == b'\n') else {
+            continue;
+        };
+        let oid = &record[..newline];
+        let shaped = matches!(oid.len(), 40 | 64) && oid.iter().all(u8::is_ascii_hexdigit);
+        if !shaped {
+            continue;
+        }
+        if let Ok(oid) = std::str::from_utf8(oid) {
+            found.insert(oid.to_string(), classify_header(&record[newline + 1..]));
+        }
+    }
+    found
 }
 
 /// A commit that could not be read is `Unknown`, whatever the reason: the one
@@ -508,6 +553,7 @@ fn parse_verifier_output(stdout: &str, signature: CommitSignature) -> Option<Com
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     fn header(extra: &str) -> Vec<u8> {
         format!(
@@ -1060,7 +1106,7 @@ mod tests {
         let _ = std::process::Command::new("git")
             .args(["log", "-1", "--format=%G?"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap();
         verifier_spawns(&stub) > 0
     }
@@ -1398,7 +1444,7 @@ mod tests {
         let alive = || {
             std::process::Command::new("kill")
                 .args(["-0", &pid])
-                .output()
+                .output_locked()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         };
@@ -1411,7 +1457,7 @@ mod tests {
             // Not ours to leave behind: this pid is the stub we started.
             let _ = std::process::Command::new("kill")
                 .args(["-9", &pid])
-                .output();
+                .output_locked();
         }
         assert!(!survived, "the signing program outlived the timeout");
     }
@@ -1667,5 +1713,146 @@ mod tests {
             check.signature,
             verifier_spawns(&stub)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The header-only walk read (`rev-list --header`) that replaces the
+    // post-walk batch on the pulse critical path.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_header_stream_splits_by_record_and_never_trusts_a_cut_tail() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let signed = "tree x\ngpgsig -----BEGIN SSH SIGNATURE-----\n x\n\n    m\n";
+        let stream = format!("{a}\n{signed}\0{b}\ntree x\n\n    m\n\0");
+        let whole = read_header_stream(stream.as_bytes(), false);
+        assert_eq!(whole[&a], CommitSignature::Ssh);
+        assert_eq!(whole[&b], CommitSignature::None);
+        // Cut inside b's record: b is not an answer, a still is.
+        let cut = format!("{a}\n{signed}\0{b}\ntree x\ngpgs");
+        let partial = read_header_stream(cut.as_bytes(), true);
+        assert_eq!(partial[&a], CommitSignature::Ssh);
+        assert!(!partial.contains_key(&b));
+        // Cut exactly after a record: both complete records stay.
+        let boundary = format!("{a}\n{signed}\0");
+        assert_eq!(
+            read_header_stream(boundary.as_bytes(), true)[&a],
+            CommitSignature::Ssh
+        );
+        assert!(read_header_stream(b"", true).is_empty());
+        assert!(read_header_stream(b"\0\0\0", false).is_empty());
+    }
+
+    #[test]
+    fn a_record_that_does_not_start_with_an_object_id_is_ignored() {
+        let a = "a".repeat(40);
+        let stream = format!("not-an-oid\ngpgsig -----BEGIN PGP SIGNATURE-----\n\0{a}\ntree x\n\n");
+        let got = read_header_stream(stream.as_bytes(), false);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[&a], CommitSignature::None);
+    }
+
+    /// A commit message that smuggles a NUL and then a well-formed record for
+    /// another commit must not mark that commit signed. `--literally` writes
+    /// the object past fsck, which refuses a NUL in a commit.
+    #[test]
+    fn a_nul_in_a_message_cannot_forge_a_record_for_another_commit() {
+        let (repo, tip) = repo_with_commit("");
+        let victim =
+            crate::test_support::raw_commit(repo.path(), &[&tip], "", "victim", 1_700_000_300);
+        let forged = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nparent {victim}\nauthor A <a@b> 1700000400 +0000\ncommitter A <a@b> 1700000400 +0000\n\nhello\0{victim}\ngpgsig -----BEGIN PGP SIGNATURE-----\n"
+        );
+        let mut child = std::process::Command::new("git")
+            .args([
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--literally",
+                "--stdin",
+            ])
+            .current_dir(repo.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), forged.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let attacker = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert_eq!(attacker.len(), 40, "fixture written");
+        crate::test_support::git_in(repo.path(), &["update-ref", "refs/heads/main", &attacker]);
+        let got = walk_signatures(
+            repo.path(),
+            &[
+                "rev-list",
+                "-n10",
+                "--topo-order",
+                "--header",
+                "refs/heads/main",
+            ],
+        );
+        assert_eq!(got[&victim], CommitSignature::None, "{got:?}");
+    }
+
+    /// The header read and the per-id batch read agree on every commit of a
+    /// mixed history, and the header read starts no verifier.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_read_agrees_with_the_batch_read_and_starts_no_verifier() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        let (repo, tip) = repo_with_commit(&pgp());
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(repo.path(), &script);
+        let mut chain = vec![tip];
+        for n in 0..12u64 {
+            let parent = chain.last().unwrap().clone();
+            let headers = match n % 4 {
+                0 => String::new(),
+                1 => crate::test_support::fake_signature_header("gpgsig", "SSH SIGNATURE"),
+                2 => crate::test_support::fake_signature_header("gpgsig", "SIGNED MESSAGE"),
+                _ => pgp(),
+            };
+            let oid = crate::test_support::raw_commit(
+                repo.path(),
+                &[&parent],
+                &headers,
+                &format!("c{n}"),
+                1_700_000_200 + n as i64,
+            );
+            chain.push(oid);
+        }
+        crate::test_support::git_in(
+            repo.path(),
+            &["update-ref", "refs/heads/main", chain.last().unwrap()],
+        );
+        let walked = walk_signatures(
+            repo.path(),
+            &[
+                "rev-list",
+                "-n100",
+                "--topo-order",
+                "--header",
+                "refs/heads/main",
+            ],
+        );
+        let batched = commit_signatures(repo.path(), &chain);
+        // The seed commit from the fixture is unsigned and part of the walk.
+        for oid in &chain {
+            assert_eq!(walked[oid], batched[oid], "{oid}");
+        }
+        assert_eq!(verifier_spawns(&stub), 0);
+    }
+
+    /// A rev-list that git refuses (a ref that does not exist) is an empty map,
+    /// which the caller reads as every commit `Unknown`.
+    #[test]
+    fn a_failed_walk_read_is_an_empty_map_not_a_claim_of_unsigned() {
+        let (repo, _) = repo_with_commit(&pgp());
+        let got = walk_signatures(
+            repo.path(),
+            &["rev-list", "-n10", "--header", "refs/heads/does-not-exist"],
+        );
+        assert!(got.is_empty());
     }
 }

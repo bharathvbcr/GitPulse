@@ -1,7 +1,7 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
-use crate::engine::commit_signature::{commit_signatures, CommitSignature};
+use crate::engine::commit_signature::{walk_signatures, CommitSignature};
 use crate::engine::git_cli::{
     self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
     sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
@@ -1921,36 +1921,48 @@ impl GitReader {
         // which is a metric measuring the tooling rather than the team.
         args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
 
-        let (stdout, payload_incomplete) =
-            match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
-                Ok(out) => out,
-                Err(e) => {
-                    if is_unborn_head_error(&e) {
-                        return Ok(PulseReport {
-                            commits: Vec::new(),
-                            top_files_by_churn: Vec::new(),
-                            extensions: Vec::new(),
-                            has_mailmap,
-                            total_commits_scanned: 0,
-                            truncated: false,
-                            payload_truncated: false,
-                            payload_truncation_reason: None,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                        });
-                    }
-                    return Err(e);
+        // Signature presence comes from the commit objects' own headers, read
+        // by a `rev-list --header` over the same refs that runs beside the log
+        // instead of after it (a `cat-file --batch` fed the log's ids cost a
+        // whole extra process on the critical path). No `%G` placeholder can
+        // say "signed" without running the verifier, and `--pretty=raw` skips
+        // `--use-mailmap`, so the log keeps its own format.
+        let mut header_args = vec!["rev-list", count_arg.as_str(), "--topo-order", "--header"];
+        header_args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
+        let admission = git_cli::current_admission();
+        let (log, mut signatures) = std::thread::scope(|scope| {
+            let headers = scope.spawn(|| {
+                git_cli::with_admission(admission, || walk_signatures(&repo, &header_args))
+            });
+            let log = git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES);
+            // A reader that panicked is a walk with no signatures read: every
+            // commit is `Unknown`, never `None`.
+            (log, headers.join().unwrap_or_default())
+        });
+        let (stdout, payload_incomplete) = match log {
+            Ok(out) => out,
+            Err(e) => {
+                if is_unborn_head_error(&e) {
+                    return Ok(PulseReport {
+                        commits: Vec::new(),
+                        top_files_by_churn: Vec::new(),
+                        extensions: Vec::new(),
+                        has_mailmap,
+                        total_commits_scanned: 0,
+                        truncated: false,
+                        payload_truncated: false,
+                        payload_truncation_reason: None,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
                 }
-            };
+                return Err(e);
+            }
+        };
 
         let mut captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
-        // One `cat-file --batch` for the rows kept, after the cap: a commit
-        // the walk read but the cap dropped is not asked about.
-        let oids: Vec<String> = captured.commits.iter().map(|c| c.sha.clone()).collect();
-        let signatures = commit_signatures(&repo, &oids);
         for commit in &mut captured.commits {
             commit.signature = signatures
-                .get(&commit.sha)
-                .copied()
+                .remove(&commit.sha)
                 .unwrap_or(CommitSignature::Unknown);
         }
         Ok(PulseReport {
@@ -10167,14 +10179,18 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 .count()
                 == 30
         );
-        let batches = used
+        let header_reads = used
             .iter()
-            .filter(|argv| argv.iter().any(|a| a == "--batch"))
+            .filter(|argv| argv.iter().any(|a| a == "--header"))
             .count();
-        assert_eq!(batches, 1, "{used:?}");
+        assert_eq!(header_reads, 1, "{used:?}");
+        assert!(
+            used.iter().all(|argv| !argv.iter().any(|a| a == "--batch")),
+            "no cat-file batch on the walk's critical path: {used:?}"
+        );
         assert!(
             used.len() <= 3,
-            "log, one batch and at most the mailmap probe: {used:?}"
+            "log, one header read and at most the mailmap probe: {used:?}"
         );
     }
 

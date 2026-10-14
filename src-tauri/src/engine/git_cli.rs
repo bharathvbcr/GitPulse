@@ -588,6 +588,16 @@ pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, Str
     git_captured_inner(repo, args, None, MAX_OUTPUT_BYTES)
 }
 
+/// [`git_captured`] with stdout bounded at `stdout_cap` bytes instead of the
+/// default: a stream cut at the cap is a prefix whose `incomplete` says so.
+pub(crate) fn git_captured_capped(
+    repo: &Path,
+    args: &[&str],
+    stdout_cap: usize,
+) -> Result<BoundedRun, String> {
+    git_captured_inner(repo, args, None, stdout_cap)
+}
+
 /// [`git_captured`] with `stdin_bytes` fed to the child, for git's `--batch`
 /// style line protocols.
 pub(crate) fn git_captured_with_stdin(
