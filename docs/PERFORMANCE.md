@@ -818,6 +818,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
+| `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
 
 `src/watcher/bench_seam.rs` is a `#[doc(hidden)]` module that builds the same
 `IgnoreRules` (through the same `parse_ignored_directories`) and calls the same
@@ -995,6 +996,16 @@ cycle 1.00, 40 builds started for 40 ticks**, 40 status probes. On main, every
 whole storm. This is the figure the live-index governor (lane
 `hx/lag1-live-index`) should bring down; the bench goes through the public
 `devmap::live::maybe_refresh` only.
+
+`worktree_teardown` (N = 5, one fresh worktree per sample holding 100 000
+ignored files, 1000 directories of 100 hard links of one 512 B file): before
+any lock split, **`remove_worktree` holds the repository mutation lock for
+4.38 s (min), and a `lock_worktree` issued 2 ms into it waited for the whole
+removal** (`contender_wait_ns` about 4.66 s, median). `merge_and_teardown` takes
+4.30 s in all against 0.12 s with no entries, so the entries are about 97% of
+it; 22 git processes in the merge path, 4 in the plain removal. The decision
+rule (more than about 50 ms under the lock at 100k) calls for the rename-aside
+split.
 
 ## 2026-10-13: `git status` against user-enabled `core.untrackedCache` / `core.fsmonitor` (spike ft-7450105d)
 
