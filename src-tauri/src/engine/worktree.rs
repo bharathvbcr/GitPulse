@@ -1837,6 +1837,12 @@ pub struct MergeTeardownResult {
     /// Hooks the repository lists that were not approved, so did not run.
     #[serde(default)]
     pub hook_notice: Option<String>,
+    /// The worktree is gone as far as git is concerned (`worktree_removed` is
+    /// true), but the files moved aside for deletion could not all be deleted,
+    /// or a leftover from an earlier teardown could not be cleared. Names the
+    /// path. The next teardown retries it.
+    #[serde(default)]
+    pub cleanup_error: Option<String>,
 }
 
 /// Why a merge and teardown did not merge. It crosses the IPC boundary as
@@ -1978,6 +1984,14 @@ const REMOVE_BACKOFF: [Duration; MAX_REMOVE_ATTEMPTS - 1] =
 /// `expected_tip` is the commit the caller verified the branch at. When it is
 /// given and the branch is anywhere else under the lock, nothing is merged.
 ///
+/// The removal holds the repository lock across a rename, not a recursive
+/// delete: the worktree directory is moved aside and its record removed under
+/// the lock, and the files are deleted after it is released (see
+/// [`remove_worktree_split`]). The gate is still asked about
+/// `worktree remove --force <wt>`: the effect is the same and no new git verb
+/// runs. A delete that fails leaves `worktree_removed: true` and a
+/// `cleanup_error` naming the path; the next teardown's sweep retries it.
+///
 /// The result is `Err` only while nothing has landed. A merge that did land
 /// is `Ok` whatever happens to the cleanup after it: a worktree or branch
 /// that could not be removed is `worktree_removed: false` / `branch_deleted:
@@ -2012,6 +2026,32 @@ fn merge_and_teardown_with(
     gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<MergeTeardownResult, MergeTeardownError> {
+    merge_and_teardown_with_seams(
+        repo_path,
+        worktree_path,
+        target_branch,
+        squash,
+        expected_tip,
+        gate,
+        sleep,
+        &mut delete_dir_tree,
+    )
+}
+
+/// [`merge_and_teardown_with`] with the deletion of the moved-aside worktree
+/// passed in as well (`delete_aside`), so a test can hold it open and look at
+/// what else can run meanwhile.
+#[allow(clippy::too_many_arguments)]
+fn merge_and_teardown_with_seams(
+    repo_path: &str,
+    worktree_path: &str,
+    target_branch: Option<&str>,
+    squash: bool,
+    expected_tip: Option<&str>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    sleep: &mut dyn FnMut(Duration),
+    delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Result<MergeTeardownResult, MergeTeardownError> {
     // The tip comes from the webview; it is a commit id or it is refused.
     let expected_tip = match expected_tip.map(str::trim) {
         None => None,
@@ -2034,6 +2074,10 @@ fn merge_and_teardown_with(
 
     let repo = family.anchor.clone();
     let worktree = family.worktree.clone();
+
+    // Files an earlier teardown moved aside and did not finish deleting: the
+    // sweep is their retry. It takes no lock; it is outside the merge's own.
+    let sweep_note = sweep_teardown_asides(&repo).note();
 
     // 1. Resolve branch name
     let branch_raw = git_text(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
@@ -2354,15 +2398,22 @@ fn merge_and_teardown_with(
     let remove = remove_worktree_argv(&worktree_text, true);
     // That builder spells the program; the gate takes git's arguments.
     let remove: Vec<&str> = remove.iter().skip(1).map(String::as_str).collect();
+    // The gate is asked about `worktree remove --force <wt>` and not about the
+    // rename: the effect is the same (the lane is gone from the checkout and
+    // from git's list) and no new git verb runs.
     let removal = match after_error {
         Some(kept) => Err(kept),
         None => gate(&remove)
             .and_then(|()| unchanged_since_merge(&repo, true))
-            .and_then(|()| remove_with_retry(&repo, &worktree_text, sleep)),
+            .and_then(|()| {
+                remove_worktree_split(&repo, &worktree_text, true, &mut || {
+                    remove_with_retry(&repo, &worktree_text, sleep)
+                })
+            }),
     };
-    let (worktree_removed, removal_error) = match removal {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
+    let (worktree_removed, removal_error, aside) = match removal {
+        Ok(aside) => (true, None, aside),
+        Err(e) => (false, Some(e), None),
     };
 
     // 6. Delete merged branch. A branch checked out in a worktree that is
@@ -2382,6 +2433,9 @@ fn merge_and_teardown_with(
         Err(e) => (false, Some(e)),
     };
     drop(_guard);
+
+    // The lane's files, moved aside under the lock, are deleted without it.
+    let cleanup_error = join_notes(sweep_note, finish_teardown(aside, delete_aside));
 
     // 7. Post-merge hooks
     let mut hook_error = None;
@@ -2416,6 +2470,7 @@ fn merge_and_teardown_with(
         } else {
             Some(hook_notices.join(" "))
         },
+        cleanup_error,
     })
 }
 
@@ -2509,10 +2564,26 @@ fn still_listed(repo: &Path, worktree_text: &str) -> Result<bool, String> {
 /// record is found by its `gitdir` file pointing at this worktree, and a
 /// locked one is left, since a lock is somebody's statement that it stays.
 fn remove_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<(), String> {
+    let Some(record) = find_own_worktree_record(repo, worktree_text)? else {
+        return Ok(());
+    };
+    if record.join("locked").exists() {
+        return Err(format!(
+            "its record {} is locked, so it was left",
+            record.display()
+        ));
+    }
+    std::fs::remove_dir_all(&record)
+        .map_err(|e| format!("could not remove its record {}: {e}", record.display()))
+}
+
+/// The directories of `<common>/worktrees` (one record per linked worktree)
+/// with the path each one's `gitdir` file points at, which is `<worktree>/.git`.
+fn worktree_records(repo: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let records = resolve_git_common_dir(repo)?.join("worktrees");
-    let wanted = lane_identity(Path::new(worktree_text));
     let listing = std::fs::read_dir(&records)
         .map_err(|e| format!("could not read {}: {e}", records.display()))?;
+    let mut found = Vec::new();
     for entry in listing {
         let record = entry
             .map_err(|e| format!("could not read {}: {e}", records.display()))?
@@ -2524,22 +2595,436 @@ fn remove_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<(), St
             continue;
         }
         let pointer = String::from_utf8_lossy(&pointer);
-        let Some(gitdir_parent) = Path::new(pointer.trim()).parent() else {
-            continue;
-        };
-        if lane_identity(gitdir_parent) != wanted {
-            continue;
+        found.push((record, PathBuf::from(pointer.trim())));
+    }
+    Ok(found)
+}
+
+/// The record `<common>/worktrees/<id>` of the linked worktree at
+/// `worktree_text`, found by its `gitdir` file pointing there. `None` for a
+/// path no record names (the main checkout, a stranger).
+fn find_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<Option<PathBuf>, String> {
+    let wanted = lane_identity(Path::new(worktree_text));
+    Ok(worktree_records(repo)?
+        .into_iter()
+        .find(|(_, gitdir)| {
+            gitdir
+                .parent()
+                .is_some_and(|dir| lane_identity(dir) == wanted)
+        })
+        .map(|(record, _)| record))
+}
+
+/// Directory under the git common directory that holds worktrees moved aside
+/// for deletion, and the markers of the ones moved beside their old place.
+const TEARDOWN_DIR: &str = "gitpulse-teardown";
+/// Leftovers one sweep deletes at most, so a pile of them cannot hold up the
+/// teardown that happened to find them. The rest wait for the next one.
+const SWEEP_CAP: usize = 16;
+/// How old another process's aside must be before a sweep takes it: that
+/// process may still be deleting it.
+const FOREIGN_ASIDE_MIN_AGE: Duration = Duration::from_secs(30);
+
+/// Asides this process is deleting right now; a sweep leaves them alone.
+static ASIDES_IN_FLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static ASIDE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A worktree's files after the rename that took them out of the checkout:
+/// the directory to delete, and the marker that names it when it was put
+/// beside the old place instead of under [`TEARDOWN_DIR`]. Registered as in
+/// flight for as long as it lives.
+struct TeardownAside {
+    path: PathBuf,
+    marker: Option<PathBuf>,
+}
+
+impl TeardownAside {
+    fn register(path: PathBuf, marker: Option<PathBuf>) -> Self {
+        ASIDES_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.clone());
+        Self { path, marker }
+    }
+}
+
+impl Drop for TeardownAside {
+    fn drop(&mut self) {
+        let mut flight = ASIDES_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = flight.iter().position(|path| path == &self.path) {
+            flight.swap_remove(at);
         }
-        if record.join("locked").exists() {
-            return Err(format!(
-                "its record {} is locked, so it was left",
-                record.display()
+    }
+}
+
+#[cfg(unix)]
+fn same_device(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
+
+/// Without a device number to compare, the aside goes beside the old place,
+/// which is always the same volume.
+#[cfg(not(unix))]
+fn same_device(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+/// `<pid>-<nanos>-<serial>`, the name of an aside and of its marker.
+fn new_aside_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let serial = ASIDE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{serial}", std::process::id())
+}
+
+/// The pid and the time (nanoseconds since the epoch) in an aside name, or
+/// `None` when the name is not one of ours.
+fn parse_aside_name(name: &str) -> Option<(u32, u128)> {
+    let mut parts = name.split('-');
+    let pid = parts.next()?.parse().ok()?;
+    let nanos = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next().is_none().then_some((pid, nanos))
+}
+
+/// Takes the linked worktree at `target_text` out of the checkout by renaming
+/// its directory, then removes its record, so git no longer lists it. Caller
+/// holds the repository lock; the rename and the record removal are all that
+/// the lock is held for.
+///
+/// `Ok(None)` is "this one is not for the rename path" and nothing was
+/// touched: not a directory, no record, a locked record, a submodule (git
+/// refuses those on remove and must be the one to say so), a worktree with
+/// uncommitted changes when `force` is off (same), an aside name that already
+/// exists, or a rename that failed (a mount point, another volume, a handle
+/// held open on Windows). The caller then removes it the way it always did.
+/// `Err` is only a rename that could not be finished and was put back.
+fn try_rename_aside(
+    repo: &Path,
+    target_text: &str,
+    force: bool,
+) -> Result<Option<TeardownAside>, String> {
+    let target = Path::new(target_text);
+    if !std::fs::symlink_metadata(target).is_ok_and(|meta| meta.is_dir()) {
+        return Ok(None);
+    }
+    let Some(record) = find_own_worktree_record(repo, target_text).ok().flatten() else {
+        return Ok(None);
+    };
+    if record.join("locked").exists()
+        || record.join("modules").exists()
+        || target.join(".gitmodules").exists()
+    {
+        return Ok(None);
+    }
+    if !force && !changed_paths(target_text).is_ok_and(|(changed, _)| changed.is_empty()) {
+        return Ok(None);
+    }
+    let Ok(common) = resolve_git_common_dir(repo) else {
+        return Ok(None);
+    };
+    let holding = common.join(TEARDOWN_DIR);
+    if std::fs::create_dir_all(&holding).is_err() {
+        return Ok(None);
+    }
+    let name = new_aside_name();
+    let (aside, marker) = match target.file_name() {
+        Some(base) if !same_device(target, &holding) => {
+            let Some(parent) = target.parent() else {
+                return Ok(None);
+            };
+            let aside = parent.join(format!(
+                ".{}.gitpulse-teardown-{name}",
+                base.to_string_lossy()
+            ));
+            let marker = holding.join(format!("{name}.sibling"));
+            if std::fs::write(&marker, aside.to_string_lossy().as_bytes()).is_err() {
+                return Ok(None);
+            }
+            (aside, Some(marker))
+        }
+        _ => (holding.join(&name), None),
+    };
+    // Unix `rename` replaces an empty directory, so a name already taken has
+    // to be seen first.
+    if std::fs::symlink_metadata(&aside).is_ok() {
+        if let Some(marker) = &marker {
+            let _ = std::fs::remove_file(marker);
+        }
+        return Ok(None);
+    }
+    let held = TeardownAside::register(aside, marker);
+    if std::fs::rename(target, &held.path).is_err() {
+        if let Some(marker) = &held.marker {
+            let _ = std::fs::remove_file(marker);
+        }
+        return Ok(None);
+    }
+    let put_back = |why: String| -> String {
+        match std::fs::rename(&held.path, target) {
+            Ok(()) => {
+                if let Some(marker) = &held.marker {
+                    let _ = std::fs::remove_file(marker);
+                }
+                format!("{why}; the worktree was put back")
+            }
+            Err(e) => format!(
+                "{why}; and putting the worktree back from {} failed: {e}",
+                held.path.display()
+            ),
+        }
+    };
+    if let Err(e) = remove_own_worktree_record(repo, target_text) {
+        return Err(put_back(e));
+    }
+    match still_listed(repo, target_text) {
+        Ok(false) => Ok(Some(held)),
+        Ok(true) => Err(put_back(format!("git still lists {target_text}"))),
+        Err(e) => Err(put_back(e)),
+    }
+}
+
+/// Removes a worktree with the repository lock held only across a rename: the
+/// directory is moved aside and its record removed, and the (slow) deletion of
+/// the files is left to [`finish_teardown`] once the caller has let the lock
+/// go. When the rename path is not available (see [`try_rename_aside`]),
+/// `fallback` removes it in place, under the lock, as removal always did. One
+/// owner for both the merge-and-teardown and the Worktrees panel's delete.
+///
+/// `Ok(Some(aside))` is a worktree that is gone from git's point of view and
+/// whose files are still to be deleted; `Ok(None)` one that is gone entirely.
+fn remove_worktree_split(
+    repo: &Path,
+    target_text: &str,
+    force: bool,
+    fallback: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<TeardownAside>, String> {
+    match try_rename_aside(repo, target_text, force)? {
+        Some(aside) => Ok(Some(aside)),
+        None => fallback().map(|()| None),
+    }
+}
+
+/// The production deleter for [`finish_teardown`]. A named function, not
+/// `std::fs::remove_dir_all` itself, which does not satisfy the seam's
+/// higher-ranked `&Path` signature.
+fn delete_dir_tree(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(path)
+}
+
+/// Deletes the files [`remove_worktree_split`] moved aside, with the lock
+/// released. A failure leaves the worktree removed (git no longer knows it)
+/// and says where the files are; the next teardown's sweep retries them.
+fn finish_teardown(
+    aside: Option<TeardownAside>,
+    delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Option<String> {
+    let aside = aside?;
+    match delete_aside(&aside.path) {
+        Ok(()) => {
+            if let Some(marker) = &aside.marker {
+                let _ = std::fs::remove_file(marker);
+            }
+            None
+        }
+        Err(e) => Some(format!(
+            "The worktree is removed, but its files at {} could not be deleted: {e}. \
+             The next teardown retries them.",
+            aside.path.display()
+        )),
+    }
+}
+
+/// What one [`sweep_teardown_asides`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepReport {
+    removed: usize,
+    /// A worktree record still points into it, so it is not leftover.
+    kept: usize,
+    /// Left alone, each with why: a symlink, one that could not be deleted,
+    /// a marker that could not be read.
+    problems: Vec<String>,
+    /// Leftovers not looked at because the cap was reached.
+    beyond_cap: usize,
+}
+
+impl SweepReport {
+    /// What a person should hear about; `None` for a sweep with nothing to say.
+    fn note(&self) -> Option<String> {
+        let mut parts = self.problems.clone();
+        if self.beyond_cap > 0 {
+            parts.push(format!(
+                "{} more leftover teardown director{} wait for the next teardown (the sweep deletes at most {SWEEP_CAP} at a time)",
+                self.beyond_cap,
+                if self.beyond_cap == 1 { "y" } else { "ies" }
             ));
         }
-        return std::fs::remove_dir_all(&record)
-            .map_err(|e| format!("could not remove its record {}: {e}", record.display()));
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
-    Ok(())
+}
+
+fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (first, second) => first.or(second),
+    }
+}
+
+/// Deletes what an earlier teardown moved aside and did not finish deleting
+/// (a crash, or a delete that failed). This is the retry. It takes only
+/// entries named like ours in `<common>/gitpulse-teardown` (and the
+/// directories their `.sibling` markers name), at most [`SWEEP_CAP`] per call,
+/// never one that a worktree record still points into or that this process is
+/// deleting now or that another process made less than
+/// [`FOREIGN_ASIDE_MIN_AGE`] ago, and never a symlink.
+fn sweep_teardown_asides(repo: &Path) -> SweepReport {
+    let mut report = SweepReport::default();
+    let holding = match resolve_git_common_dir(repo) {
+        Ok(common) => common.join(TEARDOWN_DIR),
+        Err(e) => {
+            report.problems.push(format!(
+                "leftover teardown directories were not checked: {e}"
+            ));
+            return report;
+        }
+    };
+    let listing = match std::fs::read_dir(&holding) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(e) => {
+            report.problems.push(format!(
+                "leftover teardown directories in {} were not checked: {e}",
+                holding.display()
+            ));
+            return report;
+        }
+    };
+    // (entry, the directory to delete, the marker to delete with it)
+    let mut leftovers: Vec<(PathBuf, Option<PathBuf>, u32, u128)> = Vec::new();
+    for entry in listing.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (stem, is_marker) = match name.strip_suffix(".sibling") {
+            Some(stem) => (stem, true),
+            None => (name.as_str(), false),
+        };
+        let Some((pid, nanos)) = parse_aside_name(stem) else {
+            continue;
+        };
+        let path = entry.path();
+        if is_marker {
+            leftovers.push((path.clone(), Some(path), pid, nanos));
+        } else {
+            leftovers.push((path, None, pid, nanos));
+        }
+    }
+    leftovers.sort();
+    let records = worktree_records(repo).unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let in_flight = ASIDES_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for (entry, marker, pid, nanos) in leftovers {
+        if report.removed + report.kept + report.problems.len() >= SWEEP_CAP {
+            report.beyond_cap += 1;
+            continue;
+        }
+        // The directory to delete: the entry itself, or what its marker names.
+        let target = match &marker {
+            None => entry.clone(),
+            Some(marker) => {
+                let named = std::fs::read(marker).ok().filter(|text| text.len() <= 4096);
+                let Some(named) =
+                    named.map(|text| PathBuf::from(String::from_utf8_lossy(&text).into_owned()))
+                else {
+                    report
+                        .problems
+                        .push(format!("could not read the marker {}", marker.display()));
+                    continue;
+                };
+                let stem = marker
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".sibling"))
+                    .unwrap_or_default();
+                let ours = named
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with('.')
+                            && name.ends_with(&format!(".gitpulse-teardown-{stem}"))
+                    });
+                if !ours {
+                    report.problems.push(format!(
+                        "the marker {} names {}, which is not a teardown directory, so it was left",
+                        marker.display(),
+                        named.display()
+                    ));
+                    continue;
+                }
+                named
+            }
+        };
+        if in_flight.contains(&target) {
+            continue;
+        }
+        if pid != std::process::id() && now.saturating_sub(nanos) < FOREIGN_ASIDE_MIN_AGE.as_nanos()
+        {
+            continue;
+        }
+        match std::fs::symlink_metadata(&target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(marker) = &marker {
+                    let _ = std::fs::remove_file(marker);
+                }
+                continue;
+            }
+            Err(e) => {
+                report
+                    .problems
+                    .push(format!("could not look at {}: {e}", target.display()));
+                continue;
+            }
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                report.problems.push(format!(
+                    "{} is not a plain directory, so it was left",
+                    target.display()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let identity = lane_identity(&target);
+        if records.iter().any(|(_, gitdir)| {
+            gitdir.starts_with(&target)
+                || lane_identity(gitdir.parent().unwrap_or(gitdir)) == identity
+        }) {
+            report.kept += 1;
+            continue;
+        }
+        match std::fs::remove_dir_all(&target) {
+            Ok(()) => {
+                if let Some(marker) = &marker {
+                    let _ = std::fs::remove_file(marker);
+                }
+                report.removed += 1;
+            }
+            Err(e) => report.problems.push(format!(
+                "could not delete the leftover {}: {e}",
+                target.display()
+            )),
+        }
+    }
+    report
 }
 
 /// Removes the merged worktree, trying up to [`MAX_REMOVE_ATTEMPTS`] times
@@ -2596,14 +3081,56 @@ pub fn merge_teardown_argv(branch: &str, squash: bool) -> Vec<String> {
     }
 }
 
+/// What a worktree removal left to say. The worktree itself is removed
+/// whenever the call is `Ok`; this is only about the files after it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeRemoval {
+    /// The files moved aside for deletion could not all be deleted, or a
+    /// leftover from an earlier removal could not be cleared. Names the path;
+    /// the next removal retries it.
+    #[serde(default)]
+    pub cleanup_error: Option<String>,
+}
+
 /// Removes a linked worktree. Git refuses the main worktree itself.
-pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Result<(), String> {
+///
+/// The repository lock is held across a rename, not the deletion: see
+/// [`remove_worktree_split`].
+pub fn remove_worktree(
+    repo_path: &str,
+    target_path: &str,
+    force: bool,
+) -> Result<WorktreeRemoval, String> {
+    remove_worktree_with(repo_path, target_path, force, &mut delete_dir_tree)
+}
+
+/// [`remove_worktree`] with the deletion of the moved-aside files passed in:
+/// it is called once the lock is released, with the directory to delete (and
+/// not at all when the removal was done in place), so a caller can tell the
+/// lock-held time from the deletion's.
+pub fn remove_worktree_with(
+    repo_path: &str,
+    target_path: &str,
+    force: bool,
+    delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Result<WorktreeRemoval, String> {
     let repo = validate_repo(repo_path)?;
-    let _repo_lock = repo_mutation_lock(&repo);
-    let _guard = _repo_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remove_worktree_locked(&repo, target_path, force)
+    let sweep_note = sweep_teardown_asides(&repo).note();
+    let aside = {
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        validate_target_path(target_path)?;
+        let target = validate_repo(target_path)?;
+        let target_text = plain_path_text(target.to_str().ok_or("Worktree path is not UTF-8")?);
+        remove_worktree_split(&repo, &target_text, force, &mut || {
+            remove_worktree_locked(&repo, target_path, force)
+        })?
+    };
+    Ok(WorktreeRemoval {
+        cleanup_error: join_notes(sweep_note, finish_teardown(aside, delete_aside)),
+    })
 }
 
 /// [`remove_worktree`] for a caller that already holds `repo`'s mutation lock
@@ -4804,6 +5331,7 @@ some-future-field whatever
             branch_error: Some("kept".into()),
             hook_error: None,
             hook_notice: None,
+            cleanup_error: None,
         };
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(
@@ -4814,6 +5342,7 @@ some-future-field whatever
                 "before_oid",
                 "branch_deleted",
                 "branch_error",
+                "cleanup_error",
                 "commits_merged",
                 "hook_error",
                 "hook_notice",
@@ -6461,5 +6990,528 @@ some-future-field whatever
         .unwrap();
         assert!(res.merged && !res.worktree_removed, "{res:?}");
         assert!(wt.path().join("late.txt").exists());
+    }
+
+    /// A second worktree of `repo`, on its own branch, that the tests lock
+    /// while a teardown is in progress.
+    fn second_lane(repo: &Path) -> tempfile::TempDir {
+        let lane = tempfile::tempdir().expect("second lane dir");
+        add_worktree_extended(
+            repo.to_str().unwrap(),
+            lane.path().to_str().unwrap(),
+            Some("other-lane"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("second worktree");
+        crate::test_support::trust_repo(lane.path());
+        lane
+    }
+
+    /// While a deleter is parked, in the way the real recursive delete would be,
+    /// another mutation of the repository (`lock_worktree` on a second lane)
+    /// and a listing both complete, and the listing no longer shows the lane
+    /// being torn down.
+    fn assert_repo_is_free_meanwhile(repo: &Path, other: &Path, gone: &Path) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let repo_text = repo.to_str().unwrap().to_string();
+        let other_text = other.to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let locked = lock_worktree(&repo_text, &other_text, Some("contender"));
+            let listed = list_worktrees_lite(&repo_text);
+            let _ = done_tx.send((locked, listed));
+        });
+        let (locked, listed) = done_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "a mutation and a listing were still waiting ten seconds into the deletion: \
+             the repository lock is held across it",
+        );
+        locked.expect("the contender's lock_worktree");
+        let listed = listed.expect("listing");
+        let gone = lane_identity(gone);
+        assert!(
+            listed
+                .iter()
+                .all(|entry| lane_identity(Path::new(&entry.path)) != gone),
+            "the lane being deleted is still listed: {listed:?}"
+        );
+    }
+
+    /// The deletion of the files runs after the repository lock is released:
+    /// the deleter is parked, and meanwhile `lock_worktree` on another lane and
+    /// a listing both finish. Before the split the removal ran under the lock,
+    /// and the deleter was never reached.
+    #[test]
+    fn teardown_delete_runs_outside_lock() {
+        let (dir, wt) = teardown_fixture(None);
+        let other = second_lane(dir.path());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let repo_text = dir.path().to_str().unwrap().to_string();
+        let wt_text = wt.path().to_str().unwrap().to_string();
+        let teardown = std::thread::spawn(move || {
+            merge_and_teardown_with_seams(
+                &repo_text,
+                &wt_text,
+                Some("main"),
+                false,
+                None,
+                &mut allow_all,
+                &mut |_| {},
+                &mut |aside: &Path| {
+                    entered_tx.send(aside.to_path_buf()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                    std::fs::remove_dir_all(aside)
+                },
+            )
+        });
+        let aside = entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the deleter was never reached: the removal did not move the lane aside");
+        assert!(aside.exists(), "the aside directory is not there to delete");
+        assert!(!wt.path().exists(), "the lane is still in place");
+        assert_repo_is_free_meanwhile(dir.path(), other.path(), wt.path());
+        release_tx.send(()).unwrap();
+        let result = teardown.join().unwrap().expect("the merge landed");
+        assert!(
+            result.worktree_removed && result.branch_deleted,
+            "{result:?}"
+        );
+        assert_eq!(result.cleanup_error, None);
+        assert!(!aside.exists(), "the aside directory was left behind");
+    }
+
+    /// The listing never takes the repository lock, so it is not held up for
+    /// the duration of a teardown. Pinned with the gate parked inside the
+    /// locked span, which holds whichever the implementation's lock is.
+    #[test]
+    fn listing_not_blocked_by_teardown() {
+        let (dir, wt) = teardown_fixture(None);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let repo_text = dir.path().to_str().unwrap().to_string();
+        let wt_text = wt.path().to_str().unwrap().to_string();
+        let teardown = std::thread::spawn(move || {
+            merge_and_teardown_worktree(
+                &repo_text,
+                &wt_text,
+                Some("main"),
+                false,
+                None,
+                &mut |argv: &[&str]| {
+                    if argv.first() == Some(&"worktree") {
+                        entered_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                    }
+                    Ok(())
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the teardown never reached its removal");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let repo_text = dir.path().to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _ = done_tx.send((list_worktrees_lite(&repo_text), list_worktrees(&repo_text)));
+        });
+        let (lite, full) = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a listing was blocked by a teardown in progress");
+        assert_eq!(lite.expect("lite listing").len(), 2);
+        assert_eq!(full.expect("full listing").len(), 2);
+        release_tx.send(()).unwrap();
+        let result = teardown.join().unwrap().expect("the merge landed");
+        assert!(result.worktree_removed, "{result:?}");
+    }
+
+    fn teardown_holding_dir(repo: &Path) -> PathBuf {
+        resolve_git_common_dir(repo).unwrap().join(TEARDOWN_DIR)
+    }
+
+    /// Entries in `<common>/gitpulse-teardown`, or none when it does not exist.
+    fn teardown_entries(repo: &Path) -> Vec<String> {
+        std::fs::read_dir(teardown_holding_dir(repo))
+            .map(|listing| {
+                listing
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A planted leftover named like ours, old enough that no sweep treats it
+    /// as another process's work in progress.
+    fn plant_aside(repo: &Path, name: &str) -> PathBuf {
+        let aside = teardown_holding_dir(repo).join(name);
+        std::fs::create_dir_all(aside.join("build")).unwrap();
+        std::fs::write(aside.join("build/out.o"), "object\n").unwrap();
+        aside
+    }
+
+    /// The Worktrees panel's delete goes through the same split: the lock is
+    /// free while the files are deleted, and the lane is gone from the listing.
+    #[test]
+    fn panel_remove_worktree_uses_the_same_split() {
+        let (dir, wt) = teardown_fixture(None);
+        let other = second_lane(dir.path());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let repo_text = dir.path().to_str().unwrap().to_string();
+        let wt_text = wt.path().to_str().unwrap().to_string();
+        let removal = std::thread::spawn(move || {
+            remove_worktree_with(&repo_text, &wt_text, true, &mut |aside: &Path| {
+                entered_tx.send(aside.to_path_buf()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                std::fs::remove_dir_all(aside)
+            })
+        });
+        let aside = entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the panel's removal never reached its deleter");
+        assert!(aside.starts_with(teardown_holding_dir(dir.path())) || aside.exists());
+        assert_repo_is_free_meanwhile(dir.path(), other.path(), wt.path());
+        release_tx.send(()).unwrap();
+        let removed = removal.join().unwrap().expect("removed");
+        assert_eq!(removed, WorktreeRemoval::default());
+        assert!(!aside.exists() && !wt.path().exists());
+    }
+
+    /// Without `force`, git's own refusal of a worktree with uncommitted work
+    /// still applies: nothing is moved and the deleter is not called.
+    #[test]
+    fn panel_remove_without_force_keeps_a_dirty_lane() {
+        let (dir, wt) = teardown_fixture(None);
+        std::fs::write(wt.path().join("scratch.txt"), "not committed\n").unwrap();
+        let mut deleted = Vec::new();
+        let refused = remove_worktree_with(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            false,
+            &mut |aside: &Path| {
+                deleted.push(aside.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!refused.is_empty());
+        assert!(deleted.is_empty(), "{deleted:?}");
+        assert!(wt.path().join("scratch.txt").exists());
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// Without `force`, a clean lane takes the rename path too.
+    #[test]
+    fn panel_remove_without_force_splits_a_clean_lane() {
+        let (dir, wt) = teardown_fixture(None);
+        let mut deleted = Vec::new();
+        let removed = remove_worktree_with(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            false,
+            &mut |aside: &Path| {
+                deleted.push(aside.to_path_buf());
+                std::fs::remove_dir_all(aside)
+            },
+        )
+        .expect("removed");
+        assert_eq!(removed.cleanup_error, None);
+        assert_eq!(deleted.len(), 1, "{deleted:?}");
+        assert!(!wt.path().exists());
+        assert_eq!(
+            list_worktrees(dir.path().to_str().unwrap()).unwrap().len(),
+            1
+        );
+    }
+
+    /// A deleter that fails: git no longer knows the lane, so it is removed and
+    /// the branch is deleted; the failure is reported naming the path, the
+    /// files stay where they were put, and the next removal sweeps them.
+    #[test]
+    fn a_failed_delete_is_reported_and_swept_by_the_next_teardown() {
+        let (dir, wt) = teardown_fixture(None);
+        let result = merge_and_teardown_with_seams(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+            &mut |_| {},
+            &mut |_: &Path| Err(std::io::Error::other("disk on fire")),
+        )
+        .expect("the merge landed");
+        assert!(
+            result.worktree_removed && result.branch_deleted,
+            "{result:?}"
+        );
+        assert_eq!(result.removal_error, None);
+        let reported = result.cleanup_error.expect("the failed delete is reported");
+        assert!(reported.contains("disk on fire"), "{reported}");
+        let left = teardown_entries(dir.path());
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            reported.contains(&left[0]),
+            "the report does not name the aside {}: {reported}",
+            left[0]
+        );
+        assert!(!wt.path().exists());
+
+        // The next removal on this repository clears it.
+        let other = second_lane(dir.path());
+        let removed = remove_worktree(
+            dir.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+            true,
+        )
+        .expect("removed");
+        assert_eq!(removed.cleanup_error, None, "{removed:?}");
+        assert!(
+            teardown_entries(dir.path()).is_empty(),
+            "the sweep left {:?}",
+            teardown_entries(dir.path())
+        );
+    }
+
+    /// A rename that cannot happen (here, the holding directory refuses
+    /// entries) falls back to removing the worktree in place, and the
+    /// CARD 22 result is the same as ever: removed, branch deleted, nothing to
+    /// clean up, the deleter never called.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_that_fails_falls_back_to_removal_under_the_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::fs::set_permissions(&holding, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut deleted = Vec::new();
+        let result = merge_and_teardown_with_seams(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+            &mut |_| {},
+            &mut |aside: &Path| {
+                deleted.push(aside.to_path_buf());
+                Ok(())
+            },
+        );
+        std::fs::set_permissions(&holding, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = result.expect("the merge landed");
+        assert!(
+            result.worktree_removed && result.branch_deleted,
+            "{result:?}"
+        );
+        assert_eq!(result.cleanup_error, None);
+        assert!(
+            deleted.is_empty(),
+            "the deleter ran for an in-place removal"
+        );
+        assert!(!wt.path().exists());
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// A locked record is refused before anything is renamed: the directory
+    /// stays where it is and nothing is put in the holding directory.
+    #[test]
+    fn a_locked_lane_is_refused_before_the_rename() {
+        let (dir, wt) = teardown_fixture(None);
+        crate::test_support::git_in(
+            dir.path(),
+            &["worktree", "lock", wt.path().to_str().unwrap()],
+        );
+        let mut deleted = Vec::new();
+        let result = merge_and_teardown_with_seams(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+            &mut |_| {},
+            &mut |aside: &Path| {
+                deleted.push(aside.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("the merge landed");
+        assert!(!result.worktree_removed, "{result:?}");
+        assert!(result.removal_error.is_some());
+        assert!(deleted.is_empty());
+        assert!(
+            wt.path().join("feature.txt").exists(),
+            "the lane was touched"
+        );
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// A worktree with a `.gitmodules` file is left to git: no rename, and
+    /// whatever git says about it is the result.
+    #[test]
+    fn a_lane_with_submodules_is_not_renamed() {
+        let (dir, wt) = teardown_fixture(None);
+        std::fs::write(
+            wt.path().join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = lib\n\turl = ./lib.git\n",
+        )
+        .unwrap();
+        crate::test_support::git_in(wt.path(), &["add", ".gitmodules"]);
+        crate::test_support::git_in(wt.path(), &["commit", "-m", "declare a submodule"]);
+        let mut deleted = Vec::new();
+        let result = merge_and_teardown_with_seams(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+            &mut |_| {},
+            &mut |aside: &Path| {
+                deleted.push(aside.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("the merge landed");
+        assert!(deleted.is_empty(), "a submodule lane was renamed aside");
+        assert_eq!(result.worktree_removed, !wt.path().exists(), "{result:?}");
+    }
+
+    #[test]
+    fn the_sweep_deletes_a_planted_aside_no_record_points_to() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-1-1");
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert_eq!(report.note(), None);
+        assert!(!aside.exists());
+    }
+
+    #[test]
+    fn the_sweep_keeps_an_aside_a_worktree_record_points_into() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-2-2");
+        let record = resolve_git_common_dir(dir.path())
+            .unwrap()
+            .join("worktrees/pointing-in");
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(
+            record.join("gitdir"),
+            format!("{}\n", aside.join(".git").display()),
+        )
+        .unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!((report.removed, report.kept), (0, 1), "{report:?}");
+        assert!(
+            aside.join("build/out.o").exists(),
+            "a live lane was deleted"
+        );
+    }
+
+    /// A symlink named like an aside is never followed or deleted through.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_refuses_a_symlinked_aside() {
+        let (dir, _wt) = teardown_fixture(None);
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("precious.txt"), "keep\n").unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), holding.join("1-3-3")).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(report.note().is_some());
+        assert!(elsewhere.path().join("precious.txt").exists());
+    }
+
+    /// Past the cap the rest wait, and the cap being hit is said.
+    #[test]
+    fn the_sweep_stops_at_its_cap_and_says_so() {
+        let (dir, _wt) = teardown_fixture(None);
+        for n in 0..SWEEP_CAP + 4 {
+            plant_aside(dir.path(), &format!("1-{}-{n}", 100 + n));
+        }
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, SWEEP_CAP, "{report:?}");
+        assert_eq!(report.beyond_cap, 4, "{report:?}");
+        let note = report.note().expect("the cap is reported");
+        assert!(note.contains("4 more"), "{note}");
+        assert_eq!(teardown_entries(dir.path()).len(), 4);
+        // The next one finishes the job.
+        let again = sweep_teardown_asides(dir.path());
+        assert_eq!((again.removed, again.beyond_cap), (4, 0), "{again:?}");
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// Another process's fresh aside may still be in use by it.
+    #[test]
+    fn the_sweep_leaves_a_young_aside_of_another_process() {
+        let (dir, _wt) = teardown_fixture(None);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let foreign = std::process::id().wrapping_add(1);
+        let aside = plant_aside(dir.path(), &format!("{foreign}-{now}-0"));
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert!(aside.exists());
+    }
+
+    /// A sibling aside (made when the worktree is on another volume than the
+    /// git directory) is found through its marker and deleted with it.
+    #[test]
+    fn the_sweep_deletes_a_sibling_aside_through_its_marker() {
+        let (dir, wt) = teardown_fixture(None);
+        let beside = wt
+            .path()
+            .parent()
+            .unwrap()
+            .join(".lane.gitpulse-teardown-1-4-4");
+        std::fs::create_dir_all(beside.join("build")).unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        let marker = holding.join("1-4-4.sibling");
+        std::fs::write(&marker, beside.to_string_lossy().as_bytes()).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!beside.exists() && !marker.exists());
+    }
+
+    /// A marker is trusted only for a name that is ours: one pointing at any
+    /// other directory deletes nothing.
+    #[test]
+    fn the_sweep_will_not_follow_a_marker_to_a_directory_that_is_not_ours() {
+        let (dir, _wt) = teardown_fixture(None);
+        let victim = tempfile::tempdir().unwrap();
+        std::fs::write(victim.path().join("precious.txt"), "keep\n").unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::fs::write(
+            holding.join("1-6-6.sibling"),
+            victim.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(victim.path().join("precious.txt").exists());
+    }
+
+    /// Entries not named like ours are none of the sweep's business.
+    #[test]
+    fn the_sweep_ignores_what_it_did_not_make() {
+        let (dir, _wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(holding.join("keep-me")).unwrap();
+        std::fs::write(holding.join("notes.txt"), "mine\n").unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report, SweepReport::default());
+        assert!(holding.join("keep-me").exists() && holding.join("notes.txt").exists());
     }
 }

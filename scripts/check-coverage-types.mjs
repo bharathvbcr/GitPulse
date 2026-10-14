@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 95 contracts over
- * 240 structs, spanning both wire surfaces: command returns and event payloads.
+ * 241 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -148,7 +148,7 @@ export const CONTRACTS = Object.freeze([
   { label: "markdown-render", rustPath: rust("markdown", "mod.rs"), tsPath: ts("files", "markdevRender.ts"), structs: ["RenderedMarkdown", "MarkdownHeading", "FrontmatterField"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry", "ResetPreview", "PreviewCommit"] },
-  { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult"] },
+  { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult", "WorktreeRemoval"] },
   // The hooks file as the approval dialog shows it: `approved` decides whether
   // the panel offers to approve, so a renamed field would read as unapproved.
   { label: "worktree-hooks", rustPath: rust("engine", "worktree_hooks.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeHooksPreview", "WorktreeHooksConfig"] },

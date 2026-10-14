@@ -426,37 +426,37 @@
       }
     },
     "worktree_teardown": {
-      "commit": "f5dd9d65dd66a6a74531a085e3729ba8dba2df23",
+      "commit": "920c25c3cf02e0d0ff0a85c74e919e10c458a5a3",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 6.06396484375,
+      "load1": 5.64208984375,
       "rows": {
         "merge_and_teardown 0 entries (control)": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 121434375,
+          "min_ns": 107989125,
           "counters": {
             "branch_deleted": 1,
             "entries": 0,
-            "git_processes": 22,
+            "git_processes": 21,
             "worktree_removed": 1
           }
         },
         "merge_and_teardown 100k (total)": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 4295373292,
+          "min_ns": 3741351250,
           "counters": {
             "branch_deleted": 1,
             "entries": 100000,
-            "git_processes": 22,
+            "git_processes": 21,
             "worktree_removed": 1
           }
         },
         "teardown remove 100k (lock-held)": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 4380628584,
+          "min_ns": 13481542,
           "counters": {
             "entries": 100000,
             "git_processes": 4,

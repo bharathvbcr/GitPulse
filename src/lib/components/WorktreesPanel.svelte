@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
+  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRemoval, type WorktreeRouteInfo } from "../branches/types";
   import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
   import { loadWorktreeTasks } from "../tasks/bindings";
@@ -418,8 +418,10 @@
     try {
       if (!(await repoStore.trustRepo(targetPath))) return;
       if ($repoStore.currentPath !== repo) return;
-      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath, force });
+      const removed = await invoke<Guarded<WorktreeRemoval>>("cmd_remove_worktree", { repoPath: repo, targetPath, force });
       removeCompleted = true;
+      // The worktree is gone; files that could not be deleted after it are a notice, not a failure.
+      for (const notice of worktreeSetupNotices(removed?.output ?? {}, "remove")) toastStore.warning(notice);
       harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: true });
       // T-F09: a tab on the removed directory is stranded on a deleted path,
       // active or not. Only the active one used to close; a background tab

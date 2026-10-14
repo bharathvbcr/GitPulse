@@ -30,6 +30,14 @@ describe("what a worktree operation left undone", () => {
     expect(worktreeSetupNotices({ worktree_removed: false, removal_error: "x" }, "create")).toEqual([]);
   });
 
+  it("reports files that could not be deleted after a removal or a merge, and never after a creation", () => {
+    const cleanup = "The worktree is removed, but its files at /repo/.git/gitpulse-teardown/1-2-3 could not be deleted: busy.";
+    expect(worktreeSetupNotices({ cleanup_error: cleanup }, "remove")).toEqual([cleanup]);
+    expect(worktreeSetupNotices({ worktree_removed: true, branch_deleted: true, cleanup_error: cleanup }, "merge")).toEqual([cleanup]);
+    expect(worktreeSetupNotices({ cleanup_error: cleanup }, "create")).toEqual([]);
+    expect(worktreeSetupNotices({}, "remove")).toEqual([]);
+  });
+
   it("after a teardown, says the merge happened and the cleanup did not", () => {
     expect(worktreeSetupNotices({ hook_error: "exit 4" }, "merge")).toEqual([
       "The merge and teardown finished, but the post_merge hook did not: exit 4",

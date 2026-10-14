@@ -1004,8 +1004,17 @@ any lock split, **`remove_worktree` holds the repository mutation lock for
 removal** (`contender_wait_ns` about 4.66 s, median). `merge_and_teardown` takes
 4.30 s in all against 0.12 s with no entries, so the entries are about 97% of
 it; 22 git processes in the merge path, 4 in the plain removal. The decision
-rule (more than about 50 ms under the lock at 100k) calls for the rename-aside
+rule (more than about 50 ms under the lock at 100k) called for the rename-aside
 split.
+
+After the split (the lock is held across the rename and the record removal;
+the files are deleted once it is released), the row is timed to the moment the
+lock is released: **13.5 ms (min, N = 5) at 100k entries**, a `lock_worktree`
+issued mid-teardown waiting 22 ms (median), and the deletion itself, 3.66 s
+(`delete_ns`, median), now outside the lock. `merge_and_teardown` total is
+3.74 s against 0.11 s for the control: the merge path still waits for the
+deletion before it returns (the hooks run after it), it just no longer blocks
+the repository's other mutations while it does.
 
 ## 2026-10-13: `git status` against user-enabled `core.untrackedCache` / `core.fsmonitor` (spike ft-7450105d)
 

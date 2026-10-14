@@ -16,9 +16,11 @@
 //!   The files are ignored rather than untracked because the merge refuses a
 //!   worktree with untracked files. They are 100 hard links of one 512 B file per directory, so
 //!   the fixture does not write 400 MB per sample (see `make_lane`);
-//! * `teardown remove 100k (lock-held)`: the public `remove_worktree`, which
-//!   takes the lock and runs the removal under it. The row's time is how long
-//!   it holds the lock;
+//! * `teardown remove 100k (lock-held)`: the public `remove_worktree_with`,
+//!   timed up to the moment the lock is released, which is when the moved-aside
+//!   files start to be deleted (the `delete_ns` metric is that deletion). Before
+//!   the rename-aside split the whole removal ran under the lock and the row
+//!   was the whole call;
 //! * `merge_and_teardown 100k (total)` and `... 0 entries (control)`: the
 //!   whole merge and removal, with and without the entries, so the entries'
 //!   share is the difference;
@@ -31,8 +33,8 @@ mod common;
 use common::fixture::{build_repo, count_git_processes, git, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::worktree::{
-    add_worktree, lock_worktree, merge_and_teardown_worktree, remove_worktree, unlock_worktree,
-    MergeTeardownResult,
+    add_worktree, lock_worktree, merge_and_teardown_worktree, remove_worktree,
+    remove_worktree_with, unlock_worktree, MergeTeardownResult,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,8 +171,21 @@ fn main() {
         };
         started_flag.store(true, Ordering::Release);
         let started = Instant::now();
-        remove_worktree(repo.path(), path_text(&lane), true).expect("remove_worktree");
-        let elapsed = started.elapsed();
+        // The deleter runs once the lock is released, so the instant it is
+        // called is when the lock-held span ends. A removal done in place
+        // never calls it, and its span is the whole call.
+        let mut released = None;
+        let removal = remove_worktree_with(repo.path(), path_text(&lane), true, &mut |aside| {
+            released = Some(started.elapsed());
+            std::fs::remove_dir_all(aside)
+        })
+        .expect("remove_worktree");
+        let total = started.elapsed();
+        assert_eq!(
+            removal.cleanup_error, None,
+            "the deletion was left half done"
+        );
+        let elapsed = released.unwrap_or(total);
         let waited = contender.join().expect("contender thread");
         assert!(!lane.exists(), "the lane directory is still there");
         Sample::default()
@@ -179,6 +194,7 @@ fn main() {
             .counter("worktree_removed", 1)
             .elapsed(elapsed)
             .metric("contender_wait_ns", waited.as_nanos() as f64)
+            .metric("delete_ns", total.saturating_sub(elapsed).as_nanos() as f64)
     };
 
     let merge_row = |dirs: usize| {
