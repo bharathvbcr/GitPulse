@@ -1691,11 +1691,10 @@ fn departed_owners_past_the_bound_still_record_under_their_own_path() {
     assert_eq!(nested.rows().len(), 300);
 }
 
-/// A family that could not be resolved says nothing about which worktrees are
-/// live: no removed worktree is recognised, the call keeps the trigger's
-/// attribution, and no cursor is written for the path it names.
+/// A directory that is not a Git checkout has no family to resolve: it still
+/// gets its pass for itself alone, with no removed worktree recognised.
 #[test]
-fn an_unresolved_family_recognises_no_departed_worktree() {
+fn a_non_git_directory_still_gets_its_trigger_only_pass() {
     let nested = Nested::new();
     let w = nested.worktrees[0].clone();
     with_transcript_root(&nested.corpus, || {
@@ -1703,14 +1702,88 @@ fn an_unresolved_family_recognises_no_departed_worktree() {
             &nested.file("U1.jsonl"),
             &[edit_line(&w, "U1", 1, &format!("{w}/a.rs"))],
         );
-        // A plain directory is not a Git repository: no family to resolve.
         let out = catch_up_into_bounded(&nested.base, &nested.base, None);
         assert_eq!(out.recorded, 1, "{out:?}");
+        assert!(out.family_unresolved, "{out:?}");
+        assert_eq!(out.family_unresolved_cycles, 0, "{out:?}");
         let rows = nested.rows();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, None, "{rows:?}");
         let progress = ledger::transcript_progress(&nested.base, &w).unwrap();
         assert!(progress.offsets.is_empty(), "{progress:?}");
+    });
+}
+
+/// A Git checkout with one real worktree `w` (bound to a task) under it, and
+/// one transcript call in `w`; the checkout's trust is then revoked so its
+/// family cannot be resolved.
+fn unresolved_git_family(nested: &Nested) -> String {
+    use crate::test_support::{git_in, trust_repo};
+    let base = std::path::Path::new(&nested.base);
+    nested.init_git();
+    let w = nested.worktrees[0].clone();
+    std::fs::remove_dir_all(&w).unwrap();
+    git_in(base, &["worktree", "add", "--detach", &w]);
+    trust_repo(std::path::Path::new(&w));
+    ledger::bindings::bind(&nested.base, &w, "T-W").unwrap();
+    write_lines(
+        &nested.file("X1.jsonl"),
+        &[edit_line(&w, "X1", 1, &format!("{w}/a.rs"))],
+    );
+    crate::repository_trust::revoke(&nested.base).unwrap();
+    w
+}
+
+/// A Git checkout whose family cannot be resolved may have live worktrees
+/// nested under it, so a pass for the trigger alone would record their calls
+/// under it and move only its cursor. The cycle writes nothing and says so,
+/// and the count of consecutive skipped cycles grows.
+#[test]
+fn an_unresolved_git_family_writes_nothing() {
+    let nested = Nested::new();
+    with_transcript_root(&nested.corpus, || {
+        let w = unresolved_git_family(&nested);
+        let first = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert!(first.family_unresolved, "{first:?}");
+        // An untrusted checkout fails the reflog phase first, and that error
+        // stands; the skip's own message is what any other failure would carry.
+        assert!(!first.error.is_empty(), "{first:?}");
+        assert_eq!(first.recorded, 0, "{first:?}");
+        assert_eq!(first.transcripts, 0, "{first:?}");
+        assert_eq!(first.family_unresolved_cycles, 1, "{first:?}");
+        assert_eq!(nested.rows(), vec![]);
+        for path in [&nested.base, &w] {
+            let progress = ledger::transcript_progress(&nested.base, path).unwrap();
+            assert!(progress.offsets.is_empty(), "{path}: {progress:?}");
+        }
+        let second = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert_eq!(second.family_unresolved_cycles, 2, "{second:?}");
+    });
+}
+
+/// An unresolved cycle and then a resolved one record the call once: under the
+/// worktree it ran in, with that worktree's task.
+#[test]
+fn an_unresolved_pass_then_a_resolved_pass_records_each_call_once() {
+    let nested = Nested::new();
+    with_transcript_root(&nested.corpus, || {
+        let w = unresolved_git_family(&nested);
+        let skipped = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert!(skipped.family_unresolved, "{skipped:?}");
+        crate::test_support::trust_repo(std::path::Path::new(&nested.base));
+        let resolved = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert!(!resolved.family_unresolved, "{resolved:?}");
+        assert_eq!(resolved.family_unresolved_cycles, 0, "{resolved:?}");
+        assert_eq!(
+            nested.rows(),
+            vec![(
+                Some(w.clone()),
+                format!("{w}/a.rs"),
+                Some("T-W".to_string())
+            )]
+        );
+        let again = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert_eq!(again.recorded, 0, "{again:?}");
     });
 }
 

@@ -84,10 +84,12 @@ pub(super) fn ingest_family_until(
     ingest_family(ledger_repo, trigger, siblings, true, expired)
 }
 
-/// [`ingest_family_until`] for a family that could not be resolved: the trigger
-/// alone, with no removed worktree recognised, because "unknown" is not "nothing
-/// else is live". Calls keep the deepest root the pass can see, as they did
-/// before families were known, and the result says so (`family_unresolved`).
+/// [`ingest_family_until`] for a directory that is not a Git checkout, whose
+/// family is the trigger alone. No removed worktree is recognised: there is no
+/// worktree layout to read one from. A Git checkout whose family cannot be
+/// resolved never comes here; its pass is skipped (see `catch_up_with`), since
+/// calls recorded for the trigger alone would be recorded again once the
+/// family can be seen. The result says so (`family_unresolved`).
 pub(super) fn ingest_unresolved_family_until(
     ledger_repo: &str,
     trigger: &str,

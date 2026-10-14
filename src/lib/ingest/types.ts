@@ -27,10 +27,18 @@ export interface CatchUp {
    */
   departed_overflow?: number;
   /**
-   * True when the worktree family could not be resolved, so no removed
-   * worktree was recognised and calls kept the trigger's attribution.
+   * True when the worktree family was not resolved this cycle. For a Git
+   * checkout the transcript pass was skipped (no row written, no cursor moved,
+   * `error` says why) and the next cycle catches up; a directory that is not a
+   * Git checkout still got its pass for itself alone.
    */
   family_unresolved?: boolean;
+  /**
+   * Consecutive cycles a Git checkout's transcript pass was skipped because its
+   * family could not be resolved. Zero once it resolves; a number that only
+   * grows is a family that never will.
+   */
+  family_unresolved_cycles?: number;
   reflog_entries: number;
   /** True when the wall-clock deadline stopped the pass early. */
   truncated: boolean;

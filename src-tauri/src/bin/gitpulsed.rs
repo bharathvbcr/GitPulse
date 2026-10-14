@@ -97,13 +97,20 @@ OUTPUT:
     One NDJSON object per repository per cycle on stdout:
       {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"skipped_lines\":0,
        \"rehosted_calls\":0,\"departed_overflow\":0,\"family_unresolved\":false,
+       \"family_unresolved_cycles\":0,
        \"reflog_entries\":7,\"recording\":true,\"error\":\"\",\"elapsed_ms\":42}
 
     `rehosted_calls` and `departed_overflow` count transcript calls that needed
     another worktree's transaction (past the per-pass worktree cap, or from
-    removed worktrees past the per-pass bound). `family_unresolved` is true when
-    the worktree family could not be listed, so no removed worktree was
-    recognised that cycle. None of them is an error; none reads as a clean pass.
+    removed worktrees past the per-pass bound).
+
+    `family_unresolved` is true when the worktree family could not be listed.
+    For a git checkout the transcript pass is then SKIPPED for the cycle (no row
+    written, no cursor moved; `error` says why) and the next cycle catches up;
+    a directory that is not a git checkout still gets its pass.
+    `family_unresolved_cycles` counts consecutive skipped cycles in this daemon
+    and returns to 0 once the family resolves: a number that only grows is a
+    family that never will.
 
     `recording` is the ledger's own status. A cycle that recorded nothing
     because the ledger could not be opened is not the same as one that
@@ -222,6 +229,7 @@ struct CycleReport {
     rehosted_calls: i64,
     departed_overflow: i64,
     family_unresolved: bool,
+    family_unresolved_cycles: i64,
     reflog_entries: i64,
     /// True when the catch-up deadline stopped the pass early: the counts are
     /// a floor, and what was not reached is the next cycle's. Carried as its
@@ -267,6 +275,7 @@ fn guarded_cycle(
                 rehosted_calls: 0,
                 departed_overflow: 0,
                 family_unresolved: false,
+                family_unresolved_cycles: 0,
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -304,6 +313,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 rehosted_calls: 0,
                 departed_overflow: 0,
                 family_unresolved: false,
+                family_unresolved_cycles: 0,
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -328,6 +338,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         rehosted_calls: caught.rehosted_calls,
         departed_overflow: caught.departed_overflow,
         family_unresolved: caught.family_unresolved,
+        family_unresolved_cycles: caught.family_unresolved_cycles,
         reflog_entries: caught.reflog_entries,
         truncated: caught.truncated,
         pruned: caught.pruned,
@@ -482,6 +493,7 @@ mod tests {
                         rehosted_calls: 0,
                         departed_overflow: 0,
                         family_unresolved: false,
+                        family_unresolved_cycles: 0,
                         reflog_entries: 0,
                         truncated: false,
                         pruned: 0,
@@ -827,6 +839,7 @@ mod tests {
             "rehosted_calls",
             "departed_overflow",
             "family_unresolved",
+            "family_unresolved_cycles",
             "reflog_entries",
             "recording",
             "error",

@@ -75,12 +75,18 @@ pub struct CatchUp {
     /// was not written, so a later pass of its own could record them again.
     #[serde(default)]
     pub departed_overflow: i64,
-    /// True when the worktree family could not be resolved (not a Git
-    /// repository, an untrusted one, a failed `git worktree list`). The pass
-    /// then ran for the one worktree and recognised no removed worktree, so
-    /// calls kept the trigger's attribution.
+    /// True when the worktree family was not resolved this cycle. For a Git
+    /// checkout (an untrusted one, a failed worktree listing) the transcript
+    /// pass was SKIPPED: no row written, no cursor moved, `error` says why, and
+    /// the next cycle catches up. For a directory that is not a Git checkout
+    /// the pass ran for that one directory, which is its whole family.
     #[serde(default)]
     pub family_unresolved: bool,
+    /// Consecutive cycles, in this process, a Git checkout's transcript pass was
+    /// skipped because its family could not be resolved. Zero once it resolves;
+    /// a number that only grows is a family that never will.
+    #[serde(default)]
+    pub family_unresolved_cycles: i64,
     /// Reflog entries replayed.
     pub reflog_entries: i64,
     /// True when the wall-clock deadline stopped the pass early.
@@ -204,8 +210,9 @@ fn ingest_transcripts_until(
 ///
 /// `Err` when the family could not be resolved (not a Git repository, an
 /// untrusted one, a failed worktree listing). That is not an empty family: the
-/// caller runs the pass for the one worktree and must not conclude from it that
-/// no other worktree is live, so it recognises no removed worktree and reports
+/// caller must not conclude from it that no other worktree is live. For a Git
+/// checkout it skips the transcript pass for the cycle; only a directory that
+/// is not a Git checkout gets a pass for itself alone. Either way it reports
 /// `family_unresolved`.
 fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Result<Vec<String>, String> {
     crate::engine::worktree::resolve_worktree_family(ledger_repo, worktree_path)
@@ -218,6 +225,32 @@ fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Result<Vec<String>
                 .collect()
         })
         .map_err(|e| e.to_string())
+}
+
+/// Whether `path` is a Git checkout, by the one definition the engine uses.
+fn is_git_checkout(path: &str) -> bool {
+    std::path::Path::new(path)
+        .canonicalize()
+        .is_ok_and(|canonical| crate::engine::git_cli::is_git_repository(&canonical))
+}
+
+/// Consecutive cycles in this process whose family could not be resolved, per
+/// checkout: `unresolved` extends the run and returns its length, anything else
+/// ends it. A family that never resolves shows as a count that only grows.
+fn unresolved_streak(key: &str, unresolved: bool) -> i64 {
+    static STREAKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    let mut streaks = STREAKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !unresolved {
+        streaks.remove(key);
+        return 0;
+    }
+    let streak = streaks.entry(key.to_string()).or_insert(0);
+    *streak += 1;
+    *streak
 }
 
 fn transcript_draft(
@@ -520,6 +553,7 @@ impl CatchUp {
         self.rehosted_calls = transcripts.rehosted_calls;
         self.departed_overflow = transcripts.departed_overflow;
         self.family_unresolved = transcripts.family_unresolved;
+        self.family_unresolved_cycles = transcripts.family_unresolved_cycles;
         self.truncated = self.truncated || transcripts.truncated;
         if self.error.is_empty() {
             self.error = if transcripts.truncated && transcripts.error.is_empty() {
@@ -675,10 +709,30 @@ fn catch_up_with(
         checks = checks.wrapping_add(1);
         budget.expired()
     };
+    let streak_key = format!("{ledger_repo}\n{worktree_path}");
     let transcripts = match &family {
         Ok(siblings) => {
+            unresolved_streak(&streak_key, false);
             pass::ingest_family_until(ledger_repo, worktree_path, siblings, &mut expired)
         }
+        Err(reason) if is_git_checkout(worktree_path) => {
+            // A checkout whose family cannot be listed may well have live
+            // worktrees nested under it, and a pass for the trigger alone
+            // would record their calls under it and move only its cursor: the
+            // next pass that can see them would record the same calls again.
+            // Nothing is written; the next cycle catches up.
+            CatchUp {
+                family_unresolved: true,
+                family_unresolved_cycles: unresolved_streak(&streak_key, true),
+                error: format!(
+                    "the worktree family could not be resolved, so the transcript pass was \
+                     skipped this cycle: {reason}"
+                ),
+                ..CatchUp::default()
+            }
+        }
+        // Not a Git checkout: there is no family to resolve, and the worktree is
+        // the whole of it.
         Err(_) => pass::ingest_unresolved_family_until(ledger_repo, worktree_path, &mut expired),
     };
     let mut total = total.with_transcripts(&transcripts);
