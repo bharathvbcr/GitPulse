@@ -10,6 +10,8 @@ export interface DocsStatus {
   truncated: boolean;
   skippedOversized: number;
   skippedUnreadable: number;
+  /** Tracked markdown files the vault does not hold, for any reason. */
+  notScanned: number;
 }
 
 export interface DocsSearchHit {
@@ -55,11 +57,27 @@ export interface DocGraph {
   truncated: boolean;
 }
 
+export interface DocRenameFailure {
+  path: string;
+  error: string;
+}
+
 export interface DocRenameOutcome {
   from: string;
   to: string;
+  /** Written and staged; includes `to` when the moved note's own links changed. */
   rewrittenPaths: string[];
   linksRewritten: number;
+  /** Every planned rewrite was written and staged. */
+  complete: boolean;
+  /** Changed after the plan was made, so left as they were. */
+  skippedConflict: string[];
+  /** Could not be written or staged. */
+  failed: DocRenameFailure[];
+  /** Links the rename leaves unresolved (reference-style definitions). */
+  leftBroken: BrokenLink[];
+  /** What the vault the rename was planned from covered. */
+  scan: DocsStatus;
 }
 
 export function docsRefresh(repoPath: string, options?: { background?: boolean }): Promise<DocsStatus> {
