@@ -24,9 +24,9 @@
 //! `harness::guard_command`, and every writing tool must be added to the
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
-mod budget;
 #[cfg(test)]
 mod adversarial_tests;
+mod budget;
 pub mod complete;
 pub mod devmap_parity;
 pub mod page;

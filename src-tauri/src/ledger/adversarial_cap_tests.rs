@@ -8,7 +8,13 @@ const CAP: usize = 2048;
 
 fn repo_dir() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().canonicalize().unwrap().to_str().unwrap().to_string();
+    let repo = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     (dir, repo)
 }
 
@@ -121,11 +127,14 @@ fn the_hash_covers_the_redacted_text_and_a_straddling_secret_is_gone() {
             !stored.contains(&SECRET[4..16]),
             "at {at}: the secret body survived the cut"
         );
-        let detail: serde_json::Value =
-            serde_json::from_str(&event.detail_json.unwrap()).unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&event.detail_json.unwrap()).unwrap();
         let hash = detail["object_truncated"]["hash"].as_str().unwrap();
         assert_eq!(hash, hash_of(&redact::text(&command)), "at {at}");
-        assert_ne!(hash, hash_of(&command), "at {at}: the hash fingerprints the raw secret");
+        assert_ne!(
+            hash,
+            hash_of(&command),
+            "at {at}: the hash fingerprints the raw secret"
+        );
     }
 }
 
@@ -135,7 +144,10 @@ fn the_cut_is_exact_and_never_splits_a_code_point() {
     let (_dir, repo) = repo_dir();
     let at_cap = append_row(&repo, &"a".repeat(CAP), None);
     assert_eq!(at_cap.object.unwrap().len(), CAP);
-    assert!(!at_cap.detail_json.unwrap_or_default().contains("object_truncated"));
+    assert!(!at_cap
+        .detail_json
+        .unwrap_or_default()
+        .contains("object_truncated"));
     for glyph in ["é", "€", "😀"] {
         for pad in 0..glyph.len() + 14 {
             for total in [CAP + 1, CAP + 2, CAP + 3, CAP + 4] {
@@ -166,7 +178,11 @@ fn a_detail_spelling_the_marker_is_overwritten_by_the_real_one() {
         let text = "z".repeat(4000);
         let event = append_row(&repo, &text, Some(detail));
         let value: serde_json::Value = serde_json::from_str(&event.detail_json.unwrap()).unwrap();
-        assert_eq!(value["object_truncated"]["hash"], hash_of(&text), "{detail}");
+        assert_eq!(
+            value["object_truncated"]["hash"],
+            hash_of(&text),
+            "{detail}"
+        );
         assert_eq!(value["object_truncated"]["bytes"], 4000);
     }
 }
@@ -207,7 +223,8 @@ fn a_reflog_row_stored_uncapped_still_matches_its_identity() {
     .unwrap();
     let seen = recorded_reflog_objects(&repo, &repo, true).unwrap();
     assert!(
-        seen.contains(&stored_object(&identity)) || seen.iter().any(|o| o == &stored_object(&identity)),
+        seen.contains(&stored_object(&identity))
+            || seen.iter().any(|o| o == &stored_object(&identity)),
         "an uncapped pre-cap row is not matched by its capped identity: it will be re-recorded"
     );
 }

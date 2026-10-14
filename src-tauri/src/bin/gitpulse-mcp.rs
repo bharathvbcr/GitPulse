@@ -27,7 +27,9 @@
 //!   replaced by an error for that id (`bytes` and `cap` in its data) and the
 //!   session keeps serving. This used to end the session with exit 0 and no
 //!   answer at all. The library budgets its results well below the frame, so
-//!   this is the backstop for what a budget did not foresee;
+//!   this is the backstop for what a budget did not foresee. If the id alone
+//!   makes that error too big, it goes out with `id: null`, as JSON-RPC says of
+//!   an error whose request id cannot be used;
 //! * a closed pipe (EPIPE) is the client gone: the session ends at once;
 //! * a write that takes longer than `GITPULSE_MCP_WRITE_TIMEOUT_MS` (default
 //!   10 s, it was a fixed 1 s) means the client stopped reading. A partial line
@@ -106,13 +108,19 @@ fn write_timeout() -> Duration {
     millis_from_env(WRITE_TIMEOUT_ENV).unwrap_or(DEFAULT_WRITE_TIMEOUT)
 }
 
-/// A positive millisecond count from the environment; anything else is unset.
+/// Longest either window may be set to. A value past it is clamped, not
+/// honoured: an unbounded write window is a session hung on a reader that
+/// stopped reading, and an unbounded call budget is a request nobody answers.
+const MAX_ENV_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// A positive millisecond count from the environment, at most
+/// [`MAX_ENV_WINDOW`]; zero and anything unparseable are unset.
 fn millis_from_env(name: &str) -> Option<Duration> {
     std::env::var(name)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
+        .map(|ms| Duration::from_millis(ms).min(MAX_ENV_WINDOW))
 }
 
 /// The largest response line written, [`MAX_RESPONSE_ENV`] included.
@@ -251,29 +259,38 @@ impl Wire {
     /// The error that stands in for a response of `bytes` that cannot be
     /// written, as a line; `None` when even that does not fit, in which case the
     /// request goes unanswered and the session keeps running.
+    ///
+    /// The error names the request. When the id alone makes the error too big
+    /// (a client may send an id of any size up to the frame), the error is
+    /// sent with `id: null` instead, as JSON-RPC prescribes for an error whose
+    /// request id cannot be determined: the client learns that a response was
+    /// refused, and the session is not left silent.
     fn refusal(&self, id: &Value, bytes: usize) -> Option<String> {
+        let shown: String = id.to_string().chars().take(64).collect();
         log::warn!(
             target: "mcp",
-            "response for request {id} is {bytes} bytes, past the {} byte cap; answering with an error",
+            "response for request {shown} is {bytes} bytes, past the {} byte cap; answering with an error",
             self.cap
         );
-        let refusal = mcp::err(
-            id.clone(),
-            -32603,
-            format!("response is {bytes} bytes; the frame cap is {}", self.cap),
-            Some(json!({ "bytes": bytes, "cap": self.cap })),
-        );
-        match serde_json::to_string(&refusal) {
-            Ok(line) if line.len() < self.cap => Some(line),
-            _ => {
-                log::error!(
-                    target: "mcp",
-                    "the error for oversized request {id} does not fit the {} byte cap either; dropped",
-                    self.cap
-                );
-                None
+        for answering in [id, &Value::Null] {
+            let refusal = mcp::err(
+                answering.clone(),
+                -32603,
+                format!("response is {bytes} bytes; the frame cap is {}", self.cap),
+                Some(json!({ "bytes": bytes, "cap": self.cap })),
+            );
+            if let Ok(line) = serde_json::to_string(&refusal) {
+                if line.len() < self.cap {
+                    return Some(line);
+                }
             }
         }
+        log::error!(
+            target: "mcp",
+            "the error for oversized request {shown} does not fit the {} byte cap either; dropped",
+            self.cap
+        );
+        None
     }
 
     /// Ends the session after a write that may have left a partial line on the
@@ -789,12 +806,14 @@ OPTIONS:
     -V, --version    Print the version
 
 ENVIRONMENT:
-    GITPULSE_MCP_CALL_TIMEOUT_MS      Per-request deadline in ms (default 60000)
+    GITPULSE_MCP_CALL_TIMEOUT_MS      Per-request deadline in ms (default 60000,
+                                      at most 600000; zero or junk = default)
     GITPULSE_MCP_WRITE_TIMEOUT_MS     How long a response may take to leave the
                                       process before the client is judged stalled
                                       and the session ends (default 10000). The
                                       read loop and deadline watchdog can wait
-                                      this long behind a stalled write.
+                                      this long behind a stalled write. At most
+                                      600000 (ten minutes); zero or junk = default.
     GITPULSE_MCP_MAX_RESPONSE_BYTES   Test/diagnostic knob: lowers the response
                                       cap below the 4 MiB frame; never raises it.
 ";
@@ -1002,7 +1021,9 @@ mod tests {
 
     /// Runs `probe` with `name` set to each of `values`, then restores it.
     fn with_env(name: &str, values: &[&str], mut probe: impl FnMut(&str)) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = std::env::var(name).ok();
         for value in values {
             std::env::set_var(name, value);
@@ -1049,7 +1070,16 @@ mod tests {
         const CEILING: Duration = Duration::from_secs(10 * 60);
         with_env(
             WRITE_TIMEOUT_ENV,
-            &["0", "-1", "abc", "", "600000", "86400000", "99999999999", "18446744073709551615"],
+            &[
+                "0",
+                "-1",
+                "abc",
+                "",
+                "600000",
+                "86400000",
+                "99999999999",
+                "18446744073709551615",
+            ],
             |value| {
                 let window = write_timeout();
                 assert!(!window.is_zero(), "{value:?} gave a zero write window");
@@ -1065,13 +1095,17 @@ mod tests {
     #[test]
     fn the_call_budget_is_bounded_whatever_the_environment_says() {
         const CEILING: Duration = Duration::from_secs(60 * 60);
-        with_env(CALL_BUDGET_ENV, &["86400000", "18446744073709551615"], |value| {
-            let window = call_budget();
-            assert!(
-                window <= CEILING,
-                "{value:?} gave a {window:?} request deadline"
-            );
-        });
+        with_env(
+            CALL_BUDGET_ENV,
+            &["86400000", "18446744073709551615"],
+            |value| {
+                let window = call_budget();
+                assert!(
+                    window <= CEILING,
+                    "{value:?} gave a {window:?} request deadline"
+                );
+            },
+        );
     }
 
     /// Attack 1: cap-1, cap and cap+1 on the whole line, newline included.
@@ -1084,10 +1118,17 @@ mod tests {
             let wire = Wire::with_limits(sink.clone(), cap, Duration::from_secs(1));
             assert!(wire.send(&response), "cap {cap}");
             let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-            assert!(text.ends_with('\n') && text.lines().count() == 1, "cap {cap}");
+            assert!(
+                text.ends_with('\n') && text.lines().count() == 1,
+                "cap {cap}"
+            );
             assert!(text.len() <= cap, "cap {cap}: wrote {} bytes", text.len());
             let line: Value = serde_json::from_str(text.trim()).unwrap();
-            assert_eq!(line.get("result").is_some(), written, "cap {cap}: {line:.120}");
+            assert_eq!(
+                line.get("result").is_some(),
+                written,
+                "cap {cap}: {line:.120}"
+            );
             if !written {
                 assert_eq!(line["error"]["data"]["bytes"], size);
             }
@@ -1142,12 +1183,31 @@ mod tests {
         let wire = Wire::with_limits(sink.clone(), 4096, Duration::from_millis(200));
         let started = Instant::now();
         assert!(!wire.send(&result_of(json!(1), json!({ "a": "b".repeat(60) }))));
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(!wire.send(&result_of(json!(2), json!({ "second": true }))));
         std::thread::sleep(Duration::from_secs(5));
         let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
         assert!(!text.contains("second"));
+    }
+
+    #[test]
+    fn a_request_id_that_alone_overflows_the_refusal_is_answered_with_a_null_id() {
+        let sink = Captured::default();
+        let wire = Wire::with_limits(sink.clone(), 512, Duration::from_secs(1));
+        let id = json!("i".repeat(600));
+        assert!(wire.send(&result_of(id, json!({ "blob": "x".repeat(5000) }))));
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let line: Value = serde_json::from_str(text.trim()).expect("one JSON-RPC line");
+        assert_eq!(line["id"], Value::Null, "{line}");
+        assert_eq!(line["error"]["code"], -32603);
+        assert!(line["error"]["data"]["bytes"].as_u64().unwrap() > 5000);
+        assert!(text.len() <= 512);
+        assert!(!wire.broken.load(Ordering::Acquire));
     }
 
     #[test]

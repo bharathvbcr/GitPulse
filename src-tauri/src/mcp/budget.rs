@@ -40,6 +40,11 @@ const MAX_ROUNDS: usize = 64;
 /// counts it rewrites.
 const MARKER_SLACK_BYTES: usize = 512;
 
+/// Cut lists the marker describes one by one, and the bytes each entry takes.
+/// The rest are counted in `arrays_total`.
+const MARKER_ENTRIES: usize = 64;
+const MARKER_ENTRY_BYTES: usize = 96;
+
 /// What a response with this request id may spend on one tool result.
 pub(super) fn tool_budget(id: &Value) -> usize {
     let id_bytes = serde_json::to_string(id).map_or(0, |text| text.len());
@@ -202,10 +207,19 @@ struct Cut {
 
 /// `payload` with lists cut until `measure(payload) <= limit`.
 ///
-/// Each round cuts the largest list that has two or more elements to a prefix
-/// that clears the overshoot, keeping at least one element so a list never
-/// disappears. A list of one element is descended into rather than cut, which
-/// reaches lists nested inside it.
+/// Each round takes the lists with two or more elements that are not inside
+/// another such list, and cuts them largest first, each to a prefix (never
+/// fewer than one element, so a list never disappears), until the round has
+/// removed the overshoot. A round therefore converges however many lists the
+/// payload holds: a payload of four hundred two-element lists is one round, not
+/// four hundred. A list of one element is descended into rather than cut, and
+/// a list inside a cut list is reached once its parent is down to one element.
+/// If every list is down to one element and the payload is still over, the
+/// round empties lists, largest first: a result with empty lists and a marker
+/// saying so beats a refusal for a payload whose lists could still be cut.
+///
+/// The work is bounded: at most [`MAX_ROUNDS`] rounds, each linear in the
+/// payload, and a round that finds nothing to cut ends the loop.
 fn truncate(
     mut payload: Value,
     original: usize,
@@ -218,15 +232,32 @@ fn truncate(
         if size <= limit {
             return Some(payload);
         }
-        let Some(pointer) = largest_list(&payload) else {
+        // First keep a head of every list; only when every list is down to one
+        // element and the payload is still over is a list emptied, largest
+        // first, because a payload whose smallest form is over the budget is
+        // otherwise refused although its lists could still be cut.
+        let mut cut_any = false;
+        let mut need = size - limit + MARKER_SLACK_BYTES;
+        for (floor, min_len) in [(1, 2), (0, 1)] {
+            let lists = cuttable_lists(&payload, min_len);
+            if floor == 1 {
+                need += MARKER_ENTRY_BYTES * lists.len().min(MARKER_ENTRIES);
+            }
+            for pointer in lists {
+                if need == 0 {
+                    break;
+                }
+                let removed = cut_list(&mut payload, &pointer, need, floor, &mut cuts);
+                cut_any |= removed > 0;
+                need = need.saturating_sub(removed);
+            }
+            if need == 0 {
+                break;
+            }
+        }
+        if !cut_any {
             break;
-        };
-        cut_list(
-            &mut payload,
-            &pointer,
-            size - limit + MARKER_SLACK_BYTES,
-            &mut cuts,
-        );
+        }
         describe_cuts(&mut payload, limit, original, &cuts);
     }
     (measure(&payload) <= limit).then_some(payload)
@@ -241,23 +272,21 @@ fn too_large(original: usize, budget: usize) -> String {
     )
 }
 
-/// The JSON pointer to the list with the most serialized bytes among those with
-/// two or more elements, at any depth.
-fn largest_list(root: &Value) -> Option<String> {
-    fn walk(value: &Value, pointer: &mut String, best: &mut Option<(usize, String)>) {
+/// JSON pointers to the lists with two or more elements that are not inside
+/// another such list, largest (by serialized bytes) first.
+fn cuttable_lists(root: &Value, min_len: usize) -> Vec<String> {
+    fn walk(value: &Value, min_len: usize, pointer: &mut String, found: &mut Vec<(usize, String)>) {
         match value {
+            // Not descended into: cutting it shortens whatever is inside.
+            Value::Array(items) if items.len() >= min_len => {
+                found.push((compact_len(value), pointer.clone()));
+            }
             Value::Array(items) => {
-                if items.len() >= 2 {
-                    let size = compact_len(value);
-                    if best.as_ref().is_none_or(|(most, _)| size > *most) {
-                        *best = Some((size, pointer.clone()));
-                    }
-                }
                 for (index, item) in items.iter().enumerate() {
                     let mark = pointer.len();
                     pointer.push('/');
                     pointer.push_str(&index.to_string());
-                    walk(item, pointer, best);
+                    walk(item, min_len, pointer, found);
                     pointer.truncate(mark);
                 }
             }
@@ -266,29 +295,36 @@ fn largest_list(root: &Value) -> Option<String> {
                     let mark = pointer.len();
                     pointer.push('/');
                     pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                    walk(item, pointer, best);
+                    walk(item, min_len, pointer, found);
                     pointer.truncate(mark);
                 }
             }
             _ => {}
         }
     }
-    let mut best = None;
-    walk(root, &mut String::new(), &mut best);
-    best.map(|(_, pointer)| pointer)
+    let mut found = Vec::new();
+    walk(root, min_len, &mut String::new(), &mut found);
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, pointer)| pointer).collect()
 }
 
 /// Cut the list at `pointer` to the longest prefix that removes at least
 /// `overshoot` bytes (or to one element), and bring its parent's counts and
-/// flags into line.
-fn cut_list(root: &mut Value, pointer: &str, overshoot: usize, cuts: &mut Vec<Cut>) {
+/// flags into line. Returns the bytes removed.
+fn cut_list(
+    root: &mut Value,
+    pointer: &str,
+    overshoot: usize,
+    floor: usize,
+    cuts: &mut Vec<Cut>,
+) -> usize {
     let Some(Value::Array(items)) = root.pointer_mut(pointer) else {
-        return;
+        return 0;
     };
     let before = items.len();
     let mut keep = before;
     let mut removed = 0;
-    while keep > 1 && removed < overshoot {
+    while keep > floor && removed < overshoot {
         keep -= 1;
         removed += compact_len(&items[keep]) + 1;
     }
@@ -307,42 +343,68 @@ fn cut_list(root: &mut Value, pointer: &str, overshoot: usize, cuts: &mut Vec<Cu
         }),
     }
 
+    let removed_bytes = removed;
     let (parent_pointer, key) = pointer.rsplit_once('/').unwrap_or(("", pointer));
     let key = key.replace("~1", "/").replace("~0", "~");
     let Some(Value::Object(parent)) = root.pointer_mut(parent_pointer) else {
-        return;
+        return removed_bytes;
     };
+    if keep == before {
+        return removed_bytes;
+    }
     for count in ["shown", "returned"] {
         if parent.get(count).is_some_and(Value::is_number) {
             parent.insert(count.into(), json!(keep));
         }
     }
-    for flag in ["truncated".to_string(), format!("{key}_truncated")] {
+    // Flags that already say "more exists" say it now, whatever they said.
+    for flag in [
+        "truncated".to_string(),
+        "has_more".to_string(),
+        format!("{key}_truncated"),
+    ] {
         if parent.get(&flag).is_some_and(Value::is_boolean) {
             parent.insert(flag, json!(true));
         }
     }
-    // A cursor that names the last row of a page must still name the last row
-    // that is left, or the next page skips what this one dropped.
-    if let (Some(id), Some(cursor)) = (last_id, parent.get_mut("next_cursor")) {
-        if cursor.is_i64() || cursor.is_u64() {
-            *cursor = json!(id);
+    // A cursor says where the next page starts, and the rows this cut dropped
+    // are the next page's first. A numeric cursor naming the last row of the
+    // page is moved back to the last row that is left. Any other cursor (the
+    // task board's is opaque) cannot be moved correctly, so it is withdrawn
+    // rather than kept: a cursor that skips the dropped rows is the one
+    // outcome a reader cannot detect. `has_more` and `result_truncation` say
+    // rows were dropped, and a smaller request gets them.
+    if let Some(cursor) = parent.get_mut("next_cursor") {
+        match (last_id, cursor.is_i64() || cursor.is_u64()) {
+            (Some(id), true) => *cursor = json!(id),
+            _ if cursor.is_null() => {}
+            _ => *cursor = Value::Null,
         }
     }
+    removed_bytes
 }
 
 /// Write [`TRUNCATION_KEY`] and the top-level `truncated` flag.
+///
+/// `arrays` lists the first [`MARKER_ENTRIES`] cut lists; `arrays_total` is how
+/// many were cut, so a long list of cuts is a counted sample, not a silent one.
 fn describe_cuts(payload: &mut Value, limit: usize, original: usize, cuts: &[Cut]) {
     let Value::Object(root) = payload else {
         return;
     };
     let arrays: Vec<Value> = cuts
         .iter()
+        .take(MARKER_ENTRIES)
         .map(|cut| json!({ "pointer": cut.pointer, "kept": cut.kept, "total": cut.total }))
         .collect();
     root.insert(
         TRUNCATION_KEY.into(),
-        json!({ "budget_bytes": limit, "original_bytes": original, "arrays": arrays }),
+        json!({
+            "budget_bytes": limit,
+            "original_bytes": original,
+            "arrays": arrays,
+            "arrays_total": cuts.len(),
+        }),
     );
     set_truncated(root);
 }
@@ -561,9 +623,59 @@ mod tests {
     }
 
     #[test]
-    fn a_list_of_one_giant_element_is_an_error_not_an_empty_list() {
-        let payload = json!({ "xs": [{ "blob": "g".repeat(200_000) }] });
-        assert!(fit(true, payload, 50_000).is_err());
+    fn a_list_of_one_giant_element_is_emptied_rather_than_refused() {
+        // Nothing smaller than one element can be kept, but the list can go.
+        let payload = json!({ "xs": [{ "blob": "g".repeat(200_000) }], "n": 1 });
+        let structured = fit(true, payload, 50_000).unwrap().structured.unwrap();
+        assert_eq!(structured["xs"], json!([]));
+        assert_eq!(structured["n"], 1);
+        assert_eq!(structured[TRUNCATION_KEY]["arrays"][0]["kept"], 0);
+    }
+
+    #[test]
+    fn hundreds_of_lists_converge_in_one_pass_and_the_marker_is_a_counted_sample() {
+        let mut flat = Map::new();
+        for n in 0..400 {
+            flat.insert(
+                format!("k{n}"),
+                json!(["f".repeat(20_000), "g".repeat(20_000)]),
+            );
+        }
+        let fitted = fit(true, Value::Object(flat), 4 * 1024 * 1024 - 512).unwrap();
+        let structured = fitted.structured.unwrap();
+        assert_eq!(
+            structured.as_object().unwrap().len(),
+            400 + 2,
+            "no key removed"
+        );
+        let marker = &structured[TRUNCATION_KEY];
+        assert!(marker["arrays"].as_array().unwrap().len() <= MARKER_ENTRIES);
+        assert!(marker["arrays_total"].as_u64().unwrap() > MARKER_ENTRIES as u64);
+        assert!(
+            wire(&Fitted {
+                text: fitted.text,
+                structured: Some(structured)
+            }) <= 4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn a_cursor_that_cannot_be_moved_is_withdrawn_and_has_more_is_set() {
+        let tasks = json!({
+            "has_more": false, "next_cursor": "opaque", "returned": 40,
+            "tasks": rows(40, 2000),
+        });
+        let structured = fit(true, tasks, 20_000).unwrap().structured.unwrap();
+        assert_eq!(structured["next_cursor"], Value::Null);
+        assert_eq!(structured["has_more"], true);
+        // A numeric cursor over rows without an `id` cannot be moved either.
+        let numeric = json!({
+            "next_cursor": 40, "truncated": false,
+            "xs": (0..40).map(|_| json!({ "blob": "b".repeat(2000) })).collect::<Vec<_>>(),
+        });
+        let structured = fit(true, numeric, 20_000).unwrap().structured.unwrap();
+        assert_eq!(structured["next_cursor"], Value::Null);
+        assert_eq!(structured["truncated"], true);
     }
 
     #[test]

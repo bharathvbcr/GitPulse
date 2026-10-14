@@ -162,6 +162,9 @@ fn a_cut_payload_keeps_every_top_level_key_in_text_and_structure() {
     let structured = fitted.structured.unwrap();
     for key in &keys {
         assert!(mirror.get(key).is_some(), "text lost {key}");
-        assert!(structured.get(key).is_some(), "structuredContent lost {key}");
+        assert!(
+            structured.get(key).is_some(),
+            "structuredContent lost {key}"
+        );
     }
 }
