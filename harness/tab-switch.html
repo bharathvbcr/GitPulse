@@ -548,6 +548,10 @@
           fixtures.cmd_get_commit_details = (a) => ({
             id: a.commitId, summary: "details", changed_files: [], total_additions: 0, total_deletions: 0,
           });
+          // Wire shape of `CommitSignatureCheck` (src/lib/pulse/types.ts; Rust
+          // commit_signature.rs): an unsigned commit is `none` / `none`, with
+          // no key or signer.
+          fixtures.cmd_verify_commit_signature = () => ({ signature: "none", status: "none", key: "", signer: "" });
           const LRU = Array.from({ length: 8 }, (_, i) => `/code/tabs/lru-${i}`);
           const graphFetches = (path) => calls.filter((c) => c.cmd === "cmd_get_commit_graph" && c.repo === path).length;
           const showsRows = (path) => {
@@ -578,6 +582,7 @@
           check("…with the commit that was selected still selected", () => get(graphStore).selectedCommit?.id === chosen.id);
           fixtures.cmd_get_commit_graph = originalGraph;
           delete fixtures.cmd_get_commit_details;
+          delete fixtures.cmd_verify_commit_signature;
           check("the graph and commit-details commands had fixtures throughout", () => unexpected.length === 0);
           report_();
         } catch (error) {
