@@ -334,8 +334,9 @@ pub struct LedgerStatus {
     /// True when the database for this repo is open and accepting writes.
     pub recording: bool,
     pub path: String,
-    /// Appends this process failed to write, ever. Non-zero means the history
-    /// on disk is known to be incomplete.
+    /// Appends this process failed to write, ever, plus bind/unbind writes whose
+    /// catch-up beforehand did not finish. Non-zero means the history on disk is
+    /// known to be incomplete.
     pub dropped: u64,
     /// Empty when recording; otherwise why not.
     pub error: String,
@@ -480,6 +481,14 @@ fn record_dropped_append(repo_path: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = dropped.entry(ledger_path(repo_path)).or_default();
     *count = count.saturating_add(1);
+}
+
+/// Counts a bind/unbind whose catch-up beforehand did not finish. The write
+/// went ahead; the rows the catch-up would have recorded are still owed, so the
+/// history on disk is incomplete until a later pass records them, which is what
+/// [`LedgerStatus::dropped`] says. It never reads as a clean bind.
+pub(crate) fn record_catch_up_failure(repo_path: &str) {
+    record_dropped_append(repo_path);
 }
 
 fn dropped_appends(repo_path: &str) -> u64 {
@@ -1528,6 +1537,57 @@ pub fn tail_newest(
     read_after(repo_path, cursor, limit, true, Access::Writable)
 }
 
+/// The one precedence order of a worktree's bind and unbind rows, newest first:
+/// `(ts_utc, ulid)`, the pair an imported legacy row keeps across databases.
+/// Every binding read spells it through this macro, so "which row is newest"
+/// has one definition, and `ulid` (unique) leaves no ties.
+macro_rules! binding_order {
+    () => {
+        "ORDER BY ts_utc DESC, ulid DESC"
+    };
+}
+
+/// The newest bind/unbind row of a worktree (`?1`, `?2` its two spellings).
+const LATEST_BINDING_SQL: &str = concat!(
+    "SELECT action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+     ",
+    binding_order!(),
+    "
+     LIMIT 1"
+);
+
+/// [`LATEST_BINDING_SQL`] as of a moment (`?3`, a fixed-width `ts_utc`): the
+/// newest row at or before it. A row exactly at `?3` counts.
+pub(crate) const BINDING_AS_OF_SQL: &str = concat!(
+    "SELECT action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+       AND ts_utc <= ?3
+     ",
+    binding_order!(),
+    "
+     LIMIT 1"
+);
+
+/// Every bind/unbind row of a worktree, newest first.
+pub(crate) const BINDING_HISTORY_SQL: &str = concat!(
+    "SELECT ts_utc, action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+     ",
+    binding_order!()
+);
+
+/// One bind or unbind row: when it was appended, and the task it names
+/// (`None` for an unbind, or a bind naming no task).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BindingRow {
+    pub ts_utc: String,
+    pub task_id: Option<String>,
+}
+
 /// Any row attributed to a repository other than the two spellings `?1 <= ?2`.
 /// See [`latest_binding`] for why this is range probes rather than `NOT IN`.
 const FOREIGN_ROW_SQL: &str = "SELECT 1 FROM events
@@ -1582,14 +1642,9 @@ pub(crate) fn latest_binding_readonly(
     query_latest_binding(&conn, repo_path, worktree, stored_worktree)
 }
 
-/// The one binding query behind [`latest_binding`] and
-/// [`latest_binding_readonly`].
-fn query_latest_binding(
-    conn: &Connection,
-    repo_path: &str,
-    worktree: &str,
-    stored_worktree: &str,
-) -> Result<Option<Option<String>>, LedgerError> {
+/// Refuses a ledger holding a row attributed to a repository other than
+/// `repo_path`: no binding read may be answered from it.
+fn refuse_foreign_rows(conn: &Connection, repo_path: &str) -> Result<(), LedgerError> {
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     // `NOT IN` cannot seek, and in the normal case — no foreign row — `LIMIT 1`
@@ -1612,18 +1667,84 @@ fn query_latest_binding(
             "the ledger contains an event attributed to a different repository",
         ));
     }
+    Ok(())
+}
+
+/// The task a bind/unbind row leaves in force: `Some` only for a bind that
+/// names one.
+fn bound_task(action: &str, task_id: Option<String>) -> Option<String> {
+    task_id.filter(|_| action == bindings::BIND)
+}
+
+/// The one binding query behind [`latest_binding`] and
+/// [`latest_binding_readonly`].
+fn query_latest_binding(
+    conn: &Connection,
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    refuse_foreign_rows(conn, repo_path)?;
     conn.query_row(
-        "SELECT action, task_id FROM events
-         WHERE action IN ('worktree.bind', 'worktree.unbind')
-           AND worktree_path IN (?1, ?2)
-         ORDER BY ts_utc DESC, ulid DESC
-         LIMIT 1",
+        LATEST_BINDING_SQL,
         params![worktree, stored_worktree],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .optional()
     .map_err(|e| LedgerError::new("query_failed", e.to_string()))
-    .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
+    .map(|found| found.map(|(action, task_id)| bound_task(&action, task_id)))
+}
+
+/// The binding of a worktree as of `at_ts` (a fixed-width `ts_utc`): the
+/// newest bind or unbind appended at or before it, in the shape of
+/// [`latest_binding`], including its refusal of a ledger holding another
+/// repository's rows.
+pub(crate) fn binding_as_of(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+    at_ts: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    with_conn(repo_path, |conn| {
+        refuse_foreign_rows(conn, repo_path)?;
+        conn.query_row(
+            BINDING_AS_OF_SQL,
+            params![worktree, stored_worktree, at_ts],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+        .map(|found| found.map(|(action, task_id)| bound_task(&action, task_id)))
+    })
+}
+
+/// Every bind and unbind of a worktree, oldest first, so a pass can answer
+/// "which task, at this moment" for thousands of calls from one read.
+pub(crate) fn binding_history(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Vec<BindingRow>, LedgerError> {
+    with_conn(repo_path, |conn| {
+        refuse_foreign_rows(conn, repo_path)?;
+        let mut stmt = conn
+            .prepare(BINDING_HISTORY_SQL)
+            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
+        let rows = stmt
+            .query_map(params![worktree, stored_worktree], |row| {
+                let action: String = row.get(1)?;
+                Ok(BindingRow {
+                    ts_utc: row.get(0)?,
+                    task_id: bound_task(&action, row.get(2)?),
+                })
+            })
+            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+        let mut history = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LedgerError::new("row_failed", e.to_string()))?;
+        history.reverse();
+        Ok(history)
+    })
 }
 
 /// A binding's `(ts_utc, ulid)` precedence key and the task it names, if any.
@@ -1641,11 +1762,15 @@ pub(crate) fn newest_binding_readonly(
 ) -> Result<Option<NewestBinding>, LedgerError> {
     with_access(sibling_repo, Access::ReadOnly, |conn| {
         conn.query_row(
-            "SELECT ts_utc, ulid, action, task_id FROM events
-             WHERE action IN ('worktree.bind', 'worktree.unbind')
-               AND worktree_path IN (?1, ?2)
-             ORDER BY ts_utc DESC, ulid DESC
-             LIMIT 1",
+            concat!(
+                "SELECT ts_utc, ulid, action, task_id FROM events
+                 WHERE action IN ('worktree.bind', 'worktree.unbind')
+                   AND worktree_path IN (?1, ?2)
+                 ",
+                binding_order!(),
+                "
+                 LIMIT 1"
+            ),
             params![worktree, stored_worktree],
             |row| {
                 let action: String = row.get(2)?;
@@ -2158,6 +2283,11 @@ const PRUNE_BATCH: i64 = 5_000;
 /// `keep_newest`, and never a worktree bind or unbind (they are what a
 /// worktree's task scope is enforced from, however old). One bounded batch per
 /// call; returns how many were deleted, so a caller loops until it is 0.
+///
+/// "Older" is the append clock, `ts_utc`, never `detail_json.occurred_at`.
+/// [`recorded_reflog_objects`] rebuilds the reflog's already-seen set from the
+/// rows that are stored, so a row pruned while git still holds its entry would
+/// be recorded again by the next catch-up, for ever.
 ///
 /// Catch-up ([`prune_expired`]) runs it on the default policy; a host may
 /// still call it with its own. Keeping the newest rows means the highest

@@ -266,10 +266,23 @@ pub struct CommitDetails {
 pub struct ReflogEntry {
     pub index: usize,
     pub commit_id: String,
+    /// Positional, `HEAD@{3}`: the form `git` takes as a revision.
     pub selector: String,
     pub action: String,
     pub message: String,
+    /// When the ref moved, in Unix seconds: the reflog's own record of the
+    /// move, not the committer date of the commit it moved to. `0` when git's
+    /// output named no readable time.
     pub timestamp: i64,
+}
+
+/// Splits `HEAD@{1785000000}`, a reflog selector rendered with `--date=unix`,
+/// into the ref and the Unix second the ref moved at. `None` for any other
+/// spelling, which a caller then keeps as git printed it.
+fn split_dated_selector(selector: &str) -> Option<(&str, i64)> {
+    let (name, rest) = selector.split_once("@{")?;
+    let seconds = rest.strip_suffix('}')?.parse::<i64>().ok()?;
+    Some((name, seconds))
 }
 
 /// One commit named in a [`ResetPreview`].
@@ -1638,7 +1651,15 @@ impl GitReader {
     ) -> Result<Vec<ReflogEntry>, String> {
         let repo = validate_repo(repo_path)?;
         let limit = format!("-n{}", max_entries.clamp(1, 10_000));
-        let args = ["reflog", limit.as_str(), "--format=%H%x00%gd%x00%gs%x00%ct"];
+        // `%gd` under `--date=unix` is `HEAD@{<seconds the ref moved at>}`:
+        // the reflog's own time. `%ct` is the committer date of the commit
+        // HEAD landed on, which a checkout of an old commit leaves where it was.
+        let args = [
+            "reflog",
+            limit.as_str(),
+            "--date=unix",
+            "--format=%H%x00%gd%x00%gs",
+        ];
         let stdout = match timeout {
             Some(timeout) => crate::engine::git_cli::git_text_with_timeout(&repo, &args, timeout)?,
             None => git_text(&repo, &args)?,
@@ -1646,9 +1667,15 @@ impl GitReader {
         let mut entries = Vec::new();
         for (idx, line) in stdout.lines().enumerate() {
             let parts: Vec<&str> = line.split('\x00').collect();
-            if parts.len() < 4 {
+            if parts.len() < 3 {
                 continue;
             }
+            // The selector the pane hands back to git as a revision stays
+            // positional; the time is read out of the dated spelling.
+            let (selector, timestamp) = match split_dated_selector(parts[1]) {
+                Some((name, seconds)) => (format!("{name}@{{{idx}}}"), seconds),
+                None => (parts[1].to_string(), 0),
+            };
             let full_msg = parts[2];
             let (action, message) = if let Some(colon_idx) = full_msg.find(':') {
                 (
@@ -1661,10 +1688,10 @@ impl GitReader {
             entries.push(ReflogEntry {
                 index: idx,
                 commit_id: parts[0].to_string(),
-                selector: parts[1].to_string(),
+                selector,
                 action,
                 message,
-                timestamp: parts[3].parse().unwrap_or(0),
+                timestamp,
             });
         }
         Ok(entries)

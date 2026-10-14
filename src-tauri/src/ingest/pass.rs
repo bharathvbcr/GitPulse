@@ -13,7 +13,7 @@
 //!   `<repo>/.claude/worktrees`), if that participant's own cursor is at or
 //!   below the line's byte offset. A call from a worktree that has since been
 //!   removed, or that this pass has no slot for, is recorded under that
-//!   worktree's own path (and, if live, task), hosted by the live root around
+//!   worktree's own path (and the task that was bound to it when each call ran), hosted by the live root around
 //!   it (whose cursor keeps it exactly-once), never folded into the
 //!   repository; the owner's own cursor moves with it, so one re-created at the
 //!   same path, or run on its own, does not read those bytes again;
@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use super::lines::LineReader;
 use super::{transcript, CatchUp};
 use crate::ledger;
+use crate::ledger::bindings::BindingHistory;
 
 /// Worktrees one pass serves with a cursor read of their own. Far above a real
 /// family. A worktree past it is not dropped: its calls are still recorded under
@@ -54,7 +55,9 @@ struct Participant {
     offsets: HashMap<String, u64>,
     baseline: String,
     baseline_ms: u64,
-    task_id: Option<String>,
+    /// Its bind and unbind rows, read once: each call is stamped with the task
+    /// bound when the call happened, not the one bound when the pass ran.
+    history: BindingHistory,
     pending: Vec<ledger::TranscriptAdvance>,
 }
 
@@ -266,13 +269,18 @@ fn ingest_family(
                             continue;
                         }
                         let participant = &participants[index];
+                        // Compared as instants: a transcript's own spelling may
+                        // carry an offset, which does not order as text. A time
+                        // that cannot be read is not skipped; a duplicate row
+                        // is recoverable, a lost one is not.
                         if owes.floored
-                            && !participant.baseline.is_empty()
-                            && call.ts_utc.as_str() <= participant.baseline.as_str()
+                            && participant.baseline_ms > 0
+                            && ledger::ids::parse_event_time(&call.ts_utc)
+                                .is_some_and(|at| at <= participant.baseline_ms)
                         {
                             continue;
                         }
-                        let (worktree, task_id) = match hosted_owner_root {
+                        let (worktree, history) = match hosted_owner_root {
                             Some((root, live)) => {
                                 match hosted_owner(ledger_repo, root, live, &mut owners, &mut out) {
                                     Some(owner) => {
@@ -287,25 +295,26 @@ fn ingest_family(
                                             continue;
                                         }
                                         touched.insert(owner);
-                                        (root, &owners.hosted[owner].task_id)
+                                        (root, &owners.hosted[owner].history)
                                     }
                                     // Past the bound on untrusted names: the
                                     // row is still the owner's and the host's
                                     // cursor still keeps it exactly-once, but
-                                    // the owner's own cursor is not touched.
+                                    // the owner's own cursor is not touched,
+                                    // and its task is not looked up.
                                     None => {
                                         out.departed_overflow += 1;
-                                        (root, &NO_TASK)
+                                        (root, &NO_HISTORY)
                                     }
                                 }
                             }
-                            None => (participant.path.as_str(), &participant.task_id),
+                            None => (participant.path.as_str(), &participant.history),
                         };
                         drafts[slot].push(super::transcript_draft(
                             &call,
                             ledger_repo,
                             worktree,
-                            task_id,
+                            history,
                         ));
                         out.rehosted_calls += i64::from(rehosted);
                     }
@@ -392,8 +401,9 @@ fn ingest_family(
     out
 }
 
-/// The no-task answer for a removed worktree's rows: never the host's.
-static NO_TASK: Option<String> = None;
+/// The answer for a removed worktree's rows the pass did not look up: no task,
+/// `unresolved`, and never the host's.
+static NO_HISTORY: BindingHistory = BindingHistory::unreadable();
 
 /// New removed worktrees one pass enters into [`Owners`]. Their names come from
 /// transcript content, so the cursors and ledger reads they cost are bounded;
@@ -413,7 +423,7 @@ struct Owners {
 }
 
 /// The owner at `root`, entered into `owners` with its cursors read once per
-/// pass, and for a live one (`live`) its task, resolved the way a participant's
+/// pass, and its binding history, read the way a participant's
 /// is. `None` for a removed worktree past [`MAX_DEPARTED_OWNERS`]. A ledger that
 /// cannot be read is reported in `out.error` and answers "nothing consumed": a
 /// repeated row is recoverable, a lost one is not.
@@ -442,13 +452,7 @@ fn hosted_owner(
         offsets,
         baseline: String::new(),
         baseline_ms: 0,
-        task_id: if live {
-            crate::ledger::bindings::resolve(ledger_repo, root)
-                .ok()
-                .flatten()
-        } else {
-            None
-        },
+        history: load_history(ledger_repo, root, out),
         pending: Vec::new(),
     });
     owners.departed += usize::from(!live);
@@ -456,6 +460,21 @@ fn hosted_owner(
         .index
         .insert(root.to_string(), owners.hosted.len() - 1);
     Some(owners.hosted.len() - 1)
+}
+
+/// The bind and unbind history of `worktree`, for stamping the calls it owns.
+/// Live and removed worktrees alike resolve from their own path's rows: a bind
+/// row exists only for a path that was authenticated when it was bound. One
+/// that cannot be read is reported in `out.error` and decides nothing, so its
+/// calls are `unresolved` rather than given a task they may not have had.
+fn load_history(ledger_repo: &str, worktree: &str, out: &mut CatchUp) -> BindingHistory {
+    match BindingHistory::load(ledger_repo, worktree) {
+        Ok(history) => history,
+        Err(e) => {
+            out.error = format!("a worktree's task binding history could not be read: {e}");
+            BindingHistory::unreadable()
+        }
+    }
 }
 
 /// Whether `owner` already consumed the line at `offset` of `file_key`, in a
@@ -531,9 +550,7 @@ fn participants(
                     offsets: progress.offsets,
                     baseline_ms: super::iso_to_millis(&baseline),
                     baseline,
-                    task_id: crate::ledger::bindings::resolve(ledger_repo, path)
-                        .ok()
-                        .flatten(),
+                    history: load_history(ledger_repo, path, out),
                     pending: Vec::new(),
                 }
             })

@@ -253,26 +253,85 @@ fn unresolved_streak(key: &str, unresolved: bool) -> i64 {
     *streak
 }
 
+/// How far past the ingest clock an event's own time may lie before it is not
+/// believed: a clock that is a minute fast is a clock, not a fact.
+const MAX_FUTURE_SKEW_MS: u64 = 60_000;
+
+/// When something happened and which task was bound then, as a row's
+/// `detail_json` records them: `occurred_at`, `occurred_at_basis` and
+/// `task_basis`. They live there, and not as columns or event fields, because
+/// the event contract is closed to new fields.
+struct EventTime {
+    occurred_at: String,
+    /// `transcript` or `reflog` when the source's own time was used, `ingest`
+    /// when it was missing, unreadable or in the future.
+    basis: &'static str,
+    task: ledger::bindings::TaskAtTime,
+}
+
+impl EventTime {
+    /// `source` timed at `at_ms` (UTC milliseconds), if it said, with the
+    /// binding that held then from `task_at`.
+    ///
+    /// A time that is absent, or more than [`MAX_FUTURE_SKEW_MS`] ahead of
+    /// `now_ms`, is not trusted: the row is stamped with ingest time and no
+    /// task. It never falls back to the binding that holds now, which would
+    /// attribute the work to whatever was bound when the pass happened to run.
+    fn at(
+        source: &'static str,
+        at_ms: Option<u64>,
+        now_ms: u64,
+        task_at: impl FnOnce(u64) -> ledger::bindings::TaskAtTime,
+    ) -> Self {
+        match at_ms.filter(|ms| *ms <= now_ms.saturating_add(MAX_FUTURE_SKEW_MS)) {
+            Some(ms) => EventTime {
+                occurred_at: ledger::ids::iso8601_utc(ms),
+                basis: source,
+                task: task_at(ms),
+            },
+            None => EventTime {
+                occurred_at: ledger::ids::iso8601_utc(now_ms),
+                basis: "ingest",
+                task: ledger::bindings::TaskAtTime::Unresolved,
+            },
+        }
+    }
+
+    /// Adds the three keys to a detail object.
+    fn stamp(&self, detail: &mut serde_json::Value) {
+        detail["occurred_at"] = self.occurred_at.clone().into();
+        detail["occurred_at_basis"] = self.basis.into();
+        detail["task_basis"] = self.task.basis().into();
+    }
+}
+
 fn transcript_draft(
     call: &transcript::ToolCall,
     ledger_repo: &str,
     worktree_path: &str,
-    task_id: &Option<String>,
+    history: &ledger::bindings::BindingHistory,
 ) -> Draft {
-    let detail = serde_json::json!({
+    let when = EventTime::at(
+        "transcript",
+        ledger::ids::parse_event_time(&call.ts_utc),
+        ledger::ids::now_millis(),
+        |ms| history.as_of(ms),
+    );
+    let mut detail = serde_json::json!({
         "source": "transcript",
         "tool": call.tool,
         "transcript_version": call.version,
         "git_branch": call.git_branch,
-    })
-    .to_string();
+    });
+    when.stamp(&mut detail);
+    let detail = detail.to_string();
     Draft {
         repo_path: ledger_repo.to_string(),
         worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
         action: call.action().to_string(),
         object: Some(call.object()),
         session_id: Some(call.session_id.clone()),
-        task_id: task_id.clone(),
+        task_id: when.task.task_id().map(str::to_string),
         // Derived from observation, not self-reported: this row exists because
         // a transcript recorded the call, not because an agent announced it.
         actor_kind: Some(ActorKind::Agent),
@@ -292,42 +351,10 @@ fn transcript_draft(
 /// Deliberately tolerant: a timestamp this cannot parse yields 0, which
 /// disables the skip and makes the pass read everything. Failing *open* here is
 /// the safe direction — the cost is time, and the alternative is silently
-/// skipping files that should have been read.
+/// skipping files that should have been read. What "cannot be read" means is
+/// [`ledger::ids::parse_event_time`]'s: the one strict parser.
 fn iso_to_millis(iso: &str) -> u64 {
-    if iso.len() < 20 || !iso.ends_with('Z') {
-        return 0;
-    }
-    // `get` rather than `iso[a..b]`: the length check above counts bytes, so a
-    // non-ASCII string long enough to pass it would otherwise panic on a
-    // mid-character index instead of failing open with 0.
-    let num = |a: usize, b: usize| iso.get(a..b).and_then(|s| s.parse::<i64>().ok());
-    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(sec)) = (
-        num(0, 4),
-        num(5, 7),
-        num(8, 10),
-        num(11, 13),
-        num(14, 16),
-        num(17, 19),
-    ) else {
-        return 0;
-    };
-    let ms = iso
-        .get(20..23)
-        .and_then(|m| m.parse::<i64>().ok())
-        .unwrap_or(0);
-    // Days from the civil date, the inverse of the ledger's own conversion.
-    let (y, mo) = if mo <= 2 { (y - 1, mo + 12) } else { (y, mo) };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (mo - 3) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let total = days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1000 + ms;
-    if total < 0 {
-        0
-    } else {
-        total as u64
-    }
+    ledger::ids::parse_event_time(iso).unwrap_or(0)
 }
 
 /// When `meta`'s file was last written, in epoch milliseconds; `None` when the
@@ -492,10 +519,18 @@ fn replay_reflog(
         }
     };
 
+    // The task each entry carries is the one bound when the ref moved, so the
+    // history is read once, not the binding that holds now. A history that
+    // cannot be read decides nothing, and is said so.
+    let history = match ledger::bindings::BindingHistory::load(ledger_repo, worktree_path) {
+        Ok(history) => history,
+        Err(e) => {
+            out.error = format!("the task binding history could not be read: {e}");
+            ledger::bindings::BindingHistory::unreadable()
+        }
+    };
+    let now_ms = ledger::ids::now_millis();
     // Oldest first, so the ledger's order matches the order things happened.
-    let task_id = crate::ledger::bindings::resolve(ledger_repo, worktree_path)
-        .ok()
-        .flatten();
     for entry in entries.iter().rev() {
         // The selector (`HEAD@{3}`) is positional and shifts as the reflog
         // grows, so identity is the commit plus the message.
@@ -512,16 +547,28 @@ fn replay_reflog(
                 ledger::action_segment(&entry.action)
             }
         );
-        let detail = serde_json::json!({
+        // Git records the move to the second, so a bind or unbind inside that
+        // second cannot be ordered against it.
+        let when = EventTime::at(
+            "reflog",
+            u64::try_from(entry.timestamp)
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| seconds.checked_mul(1000)),
+            now_ms,
+            |ms| history.as_of_second(ms),
+        );
+        let mut detail = serde_json::json!({
             "source": "reflog",
             "selector": entry.selector,
             "message": entry.message,
-        })
-        .to_string();
+        });
+        when.stamp(&mut detail);
+        let detail = detail.to_string();
         if ledger::record(Draft {
             repo_path: ledger_repo.to_string(),
             worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
-            task_id: task_id.clone(),
+            task_id: when.task.task_id().map(str::to_string),
             action,
             object: Some(identity),
             after_ref: Some(entry.commit_id.clone()),

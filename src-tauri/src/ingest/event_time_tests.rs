@@ -106,7 +106,10 @@ fn a_transcript_call_carries_the_time_it_happened() {
 
     let row = transcript_row(repo, &file);
     let detail = detail(&row);
-    assert_eq!(detail["occurred_at"], "2026-09-01T12:00:05.250Z", "{detail}");
+    assert_eq!(
+        detail["occurred_at"], "2026-09-01T12:00:05.250Z",
+        "{detail}"
+    );
     assert_eq!(detail["occurred_at_basis"], "transcript", "{detail}");
     assert_ne!(
         row.ts_utc, "2026-09-01T12:00:05.250Z",
@@ -128,7 +131,10 @@ fn an_offset_timestamp_is_converted_to_utc() {
     with_transcript_root(corpus.path(), || ingest_transcripts(repo));
 
     let detail = detail(&transcript_row(repo, &file));
-    assert_eq!(detail["occurred_at"], "2026-09-01T12:00:05.000Z", "{detail}");
+    assert_eq!(
+        detail["occurred_at"], "2026-09-01T12:00:05.000Z",
+        "{detail}"
+    );
     assert_eq!(detail["occurred_at_basis"], "transcript", "{detail}");
 }
 
