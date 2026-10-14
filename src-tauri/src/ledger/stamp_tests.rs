@@ -287,7 +287,8 @@ fn a_very_large_detail_still_takes_the_stamp_and_stays_redacted() {
     assert!(!out.contains(KEY));
     assert!(out.ends_with(r#""task_basis":"bound"}"#));
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
+        started.elapsed()
+            < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
         "{:?}",
         started.elapsed()
     );

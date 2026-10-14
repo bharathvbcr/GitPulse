@@ -379,19 +379,21 @@ mod catch_up_binding_tests {
     #[test]
     fn concurrent_binds_all_land_and_each_failed_catch_up_is_counted_once() {
         let (_dir, repo) = git_repo();
-        let threads: Vec<_> = (0..8)
-            .map(|n| {
-                let repo = repo.clone();
-                std::thread::spawn(move || {
-                    bind_after_catch_up(&repo, &repo, &format!("T-{n}"), |_| CatchUp {
-                        truncated: n % 2 == 0,
-                        ..CatchUp::default()
+        let ids: Vec<i64> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|n| {
+                    let repo = &repo;
+                    scope.spawn(move || {
+                        bind_after_catch_up(repo, repo, &format!("T-{n}"), |_| CatchUp {
+                            truncated: n % 2 == 0,
+                            ..CatchUp::default()
+                        })
+                        .unwrap()
                     })
-                    .unwrap()
                 })
-            })
-            .collect();
-        let ids: Vec<i64> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
         assert_eq!(ids.len(), 8);
         let rows = ledger::tail(&repo, 0, 100).unwrap();
         let mut binds: Vec<_> = rows
