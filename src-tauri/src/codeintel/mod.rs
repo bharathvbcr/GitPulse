@@ -2576,6 +2576,95 @@ pub(crate) mod tests {
         dir
     }
 
+    /// One indexed symbol for [`seed_file_symbols`]: `(name, qualified_name,
+    /// kind, first_line, last_line)`, lines 1-based and inclusive.
+    pub(crate) type SeedSymbol<'a> = (&'a str, &'a str, &'a str, u32, u32);
+
+    /// Gives a repository whose HEAD already holds `text` at `file` a one-file
+    /// map generation at `head_sha`, with the given symbols.
+    ///
+    /// GitPulse cannot write generations (the `parse` feature is off), so the
+    /// rows go in by SQL exactly as [`repo_with_one_generation`] does. The
+    /// content hash is the real `devmap_extract::content_hash` of `text`, which
+    /// is what lets `symbols_for_file` convert byte spans to lines. Spans are
+    /// derived from the line numbers: they start at the first line's first byte
+    /// and end on the last line's last byte before its newline.
+    pub(crate) fn seed_file_symbols(
+        repo: &Path,
+        head_sha: &str,
+        file: &str,
+        text: &str,
+        symbols: &[SeedSymbol<'_>],
+    ) {
+        let mut line_starts = vec![0usize];
+        line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+        let line_end = |line: u32| {
+            line_starts
+                .get(line as usize)
+                .map_or(text.len(), |next| next - 1)
+        };
+        let line_start = |line: u32| line_starts[(line - 1) as usize];
+
+        drop(open_fixture_store(repo));
+        let conn = rusqlite::Connection::open(map_path(repo)).expect("open fixture db");
+        conn.execute("INSERT INTO paths (id, path) VALUES (1, ?1)", [file])
+            .expect("insert path");
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, ?2, ?3)",
+            (
+                head_sha,
+                r#"{"total_files":1,"total_symbols":0,"total_edges":0,
+                    "dead_symbols":[],"communities":[],"status":"Ok",
+                    "unresolved_calls":0}"#,
+                repo.to_string_lossy().as_ref(),
+            ),
+        )
+        .expect("insert generation");
+        conn.execute(
+            "INSERT INTO file_payloads
+               (payload_id, file_id, content_hash, language,
+                parse_outcome_json, engine_json, extraction_json,
+                grammar_version, analyzer_version)
+             VALUES (1, 1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
+            [devmap_extract::content_hash(text) as i64],
+        )
+        .expect("insert file payload");
+        conn.execute(
+            "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+             VALUES (1, 1, 1)",
+            [],
+        )
+        .expect("insert generation file row");
+        for (ordinal, (name, qualified, kind, first, last)) in symbols.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO generation_nodes
+                   (generation_id, ordinal, file_id, name, qualified_name, kind,
+                    span_start, span_end, is_exported)
+                 VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, 1)",
+                (
+                    ordinal as i64,
+                    name,
+                    qualified,
+                    kind,
+                    line_start(*first) as i64,
+                    line_end(*last) as i64,
+                ),
+            )
+            .expect("insert node");
+        }
+        conn.execute(
+            "INSERT INTO build_history
+               (generation_id, built_at, head_sha, files, symbols, edges,
+                dead_confident, dead_ambiguous, parse_failed, languages_covered,
+                build_ms, db_bytes)
+             VALUES (1, 0.0, ?1, 1, ?2, 0, 0, 0, 0, 1, NULL, 0)",
+            (head_sha, symbols.len() as i64),
+        )
+        .expect("insert build history");
+        conn.close().expect("close fixture db");
+    }
+
     /// Depth and confidence reach the affected-tests walk: the test file is two
     /// hops from `probe_island` over a 0.9 and a 0.3 edge.
     #[test]

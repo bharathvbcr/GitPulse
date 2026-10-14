@@ -9,8 +9,8 @@ mod entity_collision;
 pub(crate) mod live_sessions;
 
 pub use entity_collision::{
-    classify_overlapping_path, classify_party_symbols, parse_old_side_ranges,
-    symbols_touching_ranges, EntityCollisionKind, EntityCollisionVerdict, LineRange,
+    classify_overlapping_path, parse_old_side_ranges, EntityCollisionKind, EntityCollisionVerdict,
+    LineRange, OldSideHunk,
 };
 
 use crate::codeintel::{self, CodeintelStatus};
