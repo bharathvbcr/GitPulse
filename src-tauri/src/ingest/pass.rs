@@ -8,8 +8,15 @@
 //!
 //! * each corpus file is read once, from the lowest offset any participant
 //!   still owes it;
-//! * each line is parsed once, then offered to every participant whose own
-//!   cursor is at or below the line's byte offset;
+//! * each line is parsed once, then each call in it goes to exactly one
+//!   participant: the deepest worktree it lies under (worktrees nest under
+//!   `<repo>/.claude/worktrees`), if that participant's own cursor is at or
+//!   below the line's byte offset. A call from a worktree that has since been
+//!   removed, or that this pass has no slot for, is recorded under that
+//!   worktree's own path (and, if live, task), hosted by the live root around
+//!   it (whose cursor keeps it exactly-once), never folded into the
+//!   repository; the owner's own cursor moves with it, so one re-created at the
+//!   same path, or run on its own, does not read those bytes again;
 //! * every participant's cursor advances in one transaction.
 //!
 //! Nothing about what a worktree *means* by its cursor changed. A participant
@@ -24,8 +31,11 @@ use super::lines::LineReader;
 use super::{transcript, CatchUp};
 use crate::ledger;
 
-/// Worktrees one pass serves. Far above a real family; past it the rest wait
-/// for a pass of their own, which reads exactly what they are owed.
+/// Worktrees one pass serves with a cursor read of their own. Far above a real
+/// family. A worktree past it is not dropped: its calls are still recorded under
+/// its own path and task, on the transaction of the deepest root that has a
+/// slot, and its cursor moves with them (`rehosted_calls` counts them), so a
+/// pass of its own owes nothing it already has.
 pub(super) const MAX_PARTICIPANTS: usize = 64;
 
 /// Offset-only advances held before one commit.
@@ -71,6 +81,34 @@ pub(super) fn ingest_family_until(
     siblings: &[String],
     expired: &mut dyn FnMut(&CatchUp) -> bool,
 ) -> CatchUp {
+    ingest_family(ledger_repo, trigger, siblings, true, expired)
+}
+
+/// [`ingest_family_until`] for a directory that is not a Git checkout, whose
+/// family is the trigger alone. No removed worktree is recognised: there is no
+/// worktree layout to read one from. A Git checkout whose family cannot be
+/// resolved never comes here; its pass is skipped (see `catch_up_with`), since
+/// calls recorded for the trigger alone would be recorded again once the
+/// family can be seen. The result says so (`family_unresolved`).
+pub(super) fn ingest_unresolved_family_until(
+    ledger_repo: &str,
+    trigger: &str,
+    expired: &mut dyn FnMut(&CatchUp) -> bool,
+) -> CatchUp {
+    let mut out = ingest_family(ledger_repo, trigger, &[], false, expired);
+    out.family_unresolved = true;
+    out
+}
+
+/// `resolved` is whether `siblings` is the whole family; only then can a path
+/// under `.claude/worktrees` that no member owns be read as a removed worktree.
+fn ingest_family(
+    ledger_repo: &str,
+    trigger: &str,
+    siblings: &[String],
+    resolved: bool,
+    expired: &mut dyn FnMut(&CatchUp) -> bool,
+) -> CatchUp {
     let mut out = CatchUp::default();
     let Some(root) = super::transcript_root() else {
         out.error = "no home directory, so transcripts cannot be located".into();
@@ -82,16 +120,27 @@ pub(super) fn ingest_family_until(
         return out;
     }
 
-    let mut paths: Vec<&str> = vec![trigger];
+    // Every checkout of the family decides which of them owns a call, however
+    // many of them this pass has room to serve: a worktree left out of the
+    // pass must still keep its calls from the shallower root around it.
+    let mut roots: Vec<&str> = vec![trigger];
+    let mut seen: HashSet<&str> = HashSet::from([trigger]);
     for sibling in siblings {
-        if paths.len() < MAX_PARTICIPANTS && !paths.contains(&sibling.as_str()) {
-            paths.push(sibling);
+        if seen.insert(sibling.as_str()) {
+            roots.push(sibling);
         }
     }
-    let mut participants = match participants(ledger_repo, &paths, &mut out, expired) {
+    let paths = &roots[..roots.len().min(MAX_PARTICIPANTS)];
+    let mut participants = match participants(ledger_repo, paths, &mut out, expired) {
         Some(participants) => participants,
         None => return out,
     };
+    let by_path: HashMap<&str, usize> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (*path, index))
+        .collect();
+    let mut owners = Owners::default();
 
     let mut files = Vec::new();
     let walk = super::collect_jsonl_until(&root, &mut files, 0, &mut || expired(&out));
@@ -138,6 +187,7 @@ pub(super) fn ingest_family_until(
         out.transcripts += 1;
 
         let mut drafts: Vec<Vec<ledger::Draft>> = owed.iter().map(|_| Vec::new()).collect();
+        let mut touched: HashSet<usize> = HashSet::new();
         let mut consumed = 0u64;
         loop {
             if expired(&out) {
@@ -172,29 +222,92 @@ pub(super) fn ingest_family_until(
                 transcript::LineOutcome::Unreadable => out.skipped_lines += 1,
                 transcript::LineOutcome::Calls(calls) => {
                     for call in calls {
-                        for (slot, owes) in owed.iter().enumerate() {
-                            // Bytes before a participant's own cursor are ones
-                            // it has already consumed.
-                            if line.offset < owes.start {
-                                continue;
+                        // One owner per call, and the row is always the owner's:
+                        // its path, its task. A removed worktree is found by
+                        // its path alone, and only when the family is known (an
+                        // unresolved one may hold live worktrees this pass
+                        // cannot see). A worktree this pass has no room for
+                        // owns its rows just the same. Either is "hosted": the
+                        // bytes ride the transaction of the deepest root that
+                        // has a slot, whose cursor keeps them exactly-once.
+                        let departed = if resolved {
+                            transcript::departed_root(&call, &roots)
+                        } else {
+                            None
+                        };
+                        let (hosted_owner_root, live_host) = match &departed {
+                            Some(departed) => (Some((departed.root, false)), departed.host),
+                            None => match transcript::attribution_root(&call, &roots) {
+                                Some(root) if by_path.contains_key(root) => (None, root),
+                                Some(root) => (Some((root, true)), root),
+                                None => continue,
+                            },
+                        };
+                        let (index, rehosted) = match by_path.get(live_host) {
+                            Some(&index) => (index, false),
+                            None => {
+                                let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
+                                match transcript::deepest_root(owner, paths)
+                                    .and_then(|root| by_path.get(root))
+                                {
+                                    Some(&index) => (index, true),
+                                    None => continue,
+                                }
                             }
-                            let participant = &participants[owes.participant];
-                            if !transcript::belongs_to(&call, &participant.path) {
-                                continue;
-                            }
-                            if owes.floored
-                                && !participant.baseline.is_empty()
-                                && call.ts_utc.as_str() <= participant.baseline.as_str()
-                            {
-                                continue;
-                            }
-                            drafts[slot].push(super::transcript_draft(
-                                &call,
-                                ledger_repo,
-                                &participant.path,
-                                &participant.task_id,
-                            ));
+                        };
+                        // A host that owes nothing here has already consumed it.
+                        let Some(slot) = owed.iter().position(|o| o.participant == index) else {
+                            continue;
+                        };
+                        let owes = &owed[slot];
+                        // Bytes before a participant's own cursor are ones
+                        // it has already consumed.
+                        if line.offset < owes.start {
+                            continue;
                         }
+                        let participant = &participants[index];
+                        if owes.floored
+                            && !participant.baseline.is_empty()
+                            && call.ts_utc.as_str() <= participant.baseline.as_str()
+                        {
+                            continue;
+                        }
+                        let (worktree, task_id) = match hosted_owner_root {
+                            Some((root, live)) => {
+                                match hosted_owner(ledger_repo, root, live, &mut owners, &mut out) {
+                                    Some(owner) => {
+                                        // Consumed in a pass of its own, or
+                                        // hosted by an earlier one.
+                                        if consumed_by(
+                                            &owners.hosted[owner],
+                                            &file_key,
+                                            line.offset,
+                                            len,
+                                        ) {
+                                            continue;
+                                        }
+                                        touched.insert(owner);
+                                        (root, &owners.hosted[owner].task_id)
+                                    }
+                                    // Past the bound on untrusted names: the
+                                    // row is still the owner's and the host's
+                                    // cursor still keeps it exactly-once, but
+                                    // the owner's own cursor is not touched.
+                                    None => {
+                                        out.departed_overflow += 1;
+                                        (root, &NO_TASK)
+                                    }
+                                }
+                            }
+                            None => (participant.path.as_str(), &participant.task_id),
+                        };
+                        drafts[slot].push(super::transcript_draft(
+                            &call,
+                            ledger_repo,
+                            worktree,
+                            task_id,
+                        ));
+                        out.rehosted_calls += i64::from(rehosted);
                     }
                 }
             }
@@ -222,13 +335,34 @@ pub(super) fn ingest_family_until(
                     });
             }
         }
+        // A removed worktree moves with the root that hosted its rows, so one
+        // re-created at the same path resumes after them instead of reading
+        // them again as its own. A cursor past the file is stale: it was
+        // rewritten shorter, and is read again from the start.
+        for owner in touched {
+            let owner = &mut owners.hosted[owner];
+            let current = owner.offsets.get(&file_key).copied();
+            if current.is_none_or(|current| current < end || current > len) {
+                owner.pending.push(ledger::TranscriptAdvance {
+                    file_key: file_key.clone(),
+                    from: current,
+                    to: end,
+                    drafts: Vec::new(),
+                });
+                owner.offsets.insert(file_key.clone(), end);
+            }
+        }
         // Events are committed as soon as their transcript is read, so a
         // deadline never discards them. Offset-only advances are batched: a
         // first read of a corpus holding nothing for these worktrees is
         // thousands of them.
-        let pending: usize = participants.iter().map(|p| p.pending.len()).sum();
+        let pending: usize = participants
+            .iter()
+            .chain(&owners.hosted)
+            .map(|p| p.pending.len())
+            .sum();
         if (has_events || pending >= ADVANCE_BATCH)
-            && !commit(ledger_repo, &mut participants, &mut out)
+            && !commit(ledger_repo, &mut participants, &mut owners.hosted, &mut out)
         {
             return out;
         }
@@ -236,14 +370,15 @@ pub(super) fn ingest_family_until(
             break;
         }
     }
-    if !commit(ledger_repo, &mut participants, &mut out) {
+    if !commit(ledger_repo, &mut participants, &mut owners.hosted, &mut out) {
         return out;
     }
     // Forget transcripts that are gone, but only on a pass that saw the whole
     // corpus: a file missing from a partial listing may still exist, and
-    // forgetting its offset would replay it.
+    // forgetting its offset would replay it. Hosted owners hold cursors too,
+    // for the files this pass met them in.
     if walk.complete && !out.truncated {
-        for participant in participants {
+        for participant in participants.into_iter().chain(owners.hosted) {
             let gone: Vec<String> = participant
                 .offsets
                 .into_keys()
@@ -255,6 +390,83 @@ pub(super) fn ingest_family_until(
         }
     }
     out
+}
+
+/// The no-task answer for a removed worktree's rows: never the host's.
+static NO_TASK: Option<String> = None;
+
+/// New removed worktrees one pass enters into [`Owners`]. Their names come from
+/// transcript content, so the cursors and ledger reads they cost are bounded;
+/// past it a row is still recorded under its owner's path and only the owner's
+/// own cursor is skipped, counted in `CatchUp::departed_overflow`.
+const MAX_DEPARTED_OWNERS: usize = 256;
+
+/// The worktrees whose rows this pass records on another's transaction: removed
+/// ones, and live ones with no slot. Each is entered once, with its own cursors
+/// as they stood when first met. Kept apart from `participants`: an owner reads
+/// no file, only has bytes hosted for it.
+#[derive(Default)]
+struct Owners {
+    hosted: Vec<Participant>,
+    index: HashMap<String, usize>,
+    departed: usize,
+}
+
+/// The owner at `root`, entered into `owners` with its cursors read once per
+/// pass, and for a live one (`live`) its task, resolved the way a participant's
+/// is. `None` for a removed worktree past [`MAX_DEPARTED_OWNERS`]. A ledger that
+/// cannot be read is reported in `out.error` and answers "nothing consumed": a
+/// repeated row is recoverable, a lost one is not.
+fn hosted_owner(
+    ledger_repo: &str,
+    root: &str,
+    live: bool,
+    owners: &mut Owners,
+    out: &mut CatchUp,
+) -> Option<usize> {
+    if let Some(&known) = owners.index.get(root) {
+        return Some(known);
+    }
+    if !live && owners.departed >= MAX_DEPARTED_OWNERS {
+        return None;
+    }
+    let offsets = match ledger::transcript_progress_many(ledger_repo, &[root]) {
+        Ok(mut progress) => progress.pop().map(|p| p.offsets).unwrap_or_default(),
+        Err(e) => {
+            out.error = format!("an owner's transcript progress could not be read: {e}");
+            HashMap::new()
+        }
+    };
+    owners.hosted.push(Participant {
+        path: root.to_string(),
+        offsets,
+        baseline: String::new(),
+        baseline_ms: 0,
+        task_id: if live {
+            crate::ledger::bindings::resolve(ledger_repo, root)
+                .ok()
+                .flatten()
+        } else {
+            None
+        },
+        pending: Vec::new(),
+    });
+    owners.departed += usize::from(!live);
+    owners
+        .index
+        .insert(root.to_string(), owners.hosted.len() - 1);
+    Some(owners.hosted.len() - 1)
+}
+
+/// Whether `owner` already consumed the line at `offset` of `file_key`, in a
+/// pass of its own or hosted by an earlier one, so recording it again would
+/// double it. A cursor past the file's `len` is stale (the file was rewritten
+/// shorter) and consumed nothing of it.
+fn consumed_by(owner: &Participant, file_key: &str, offset: u64, len: u64) -> bool {
+    owner
+        .offsets
+        .get(file_key)
+        .is_some_and(|consumed| *consumed > offset && *consumed <= len)
 }
 
 /// Every participant's progress, with the baseline floor frozen for any that
@@ -374,9 +586,15 @@ fn owed_on(
 /// Commits every participant's `pending` advances in one transaction, emptying
 /// them. False, with the error in `out`, when the ledger refused it — the pass
 /// stops there rather than read further into events it could not keep.
-fn commit(ledger_repo: &str, participants: &mut [Participant], out: &mut CatchUp) -> bool {
+fn commit(
+    ledger_repo: &str,
+    participants: &mut [Participant],
+    hosted: &mut [Participant],
+    out: &mut CatchUp,
+) -> bool {
     let advances: Vec<(&str, Vec<ledger::TranscriptAdvance>)> = participants
         .iter_mut()
+        .chain(hosted.iter_mut())
         .filter(|participant| !participant.pending.is_empty())
         .map(|participant| {
             (

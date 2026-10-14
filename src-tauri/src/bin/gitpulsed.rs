@@ -96,7 +96,21 @@ OPTIONS:
 OUTPUT:
     One NDJSON object per repository per cycle on stdout:
       {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"skipped_lines\":0,
+       \"rehosted_calls\":0,\"departed_overflow\":0,\"family_unresolved\":false,
+       \"family_unresolved_cycles\":0,
        \"reflog_entries\":7,\"recording\":true,\"error\":\"\",\"elapsed_ms\":42}
+
+    `rehosted_calls` and `departed_overflow` count transcript calls that needed
+    another worktree's transaction (past the per-pass worktree cap, or from
+    removed worktrees past the per-pass bound).
+
+    `family_unresolved` is true when the worktree family could not be listed.
+    For a git checkout the transcript pass is then SKIPPED for the cycle (no row
+    written, no cursor moved; `error` says why) and the next cycle catches up;
+    a directory that is not a git checkout still gets its pass.
+    `family_unresolved_cycles` counts consecutive skipped cycles in this daemon
+    and returns to 0 once the family resolves: a number that only grows is a
+    family that never will.
 
     `recording` is the ledger's own status. A cycle that recorded nothing
     because the ledger could not be opened is not the same as one that
@@ -208,6 +222,14 @@ struct CycleReport {
     recorded: i64,
     transcripts: i64,
     skipped_lines: i64,
+    /// Calls hosted past the participant cap, calls from removed worktrees past
+    /// the per-pass bound, and whether the worktree family could not be
+    /// resolved: each says a row may sit differently than a clean pass would
+    /// have put it, so none reads as a clean cycle.
+    rehosted_calls: i64,
+    departed_overflow: i64,
+    family_unresolved: bool,
+    family_unresolved_cycles: i64,
     reflog_entries: i64,
     /// True when the catch-up deadline stopped the pass early: the counts are
     /// a floor, and what was not reached is the next cycle's. Carried as its
@@ -250,6 +272,10 @@ fn guarded_cycle(
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                rehosted_calls: 0,
+                departed_overflow: 0,
+                family_unresolved: false,
+                family_unresolved_cycles: 0,
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -284,6 +310,10 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                rehosted_calls: 0,
+                departed_overflow: 0,
+                family_unresolved: false,
+                family_unresolved_cycles: 0,
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -305,6 +335,10 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         recorded: caught.recorded,
         transcripts: caught.transcripts,
         skipped_lines: caught.skipped_lines,
+        rehosted_calls: caught.rehosted_calls,
+        departed_overflow: caught.departed_overflow,
+        family_unresolved: caught.family_unresolved,
+        family_unresolved_cycles: caught.family_unresolved_cycles,
         reflog_entries: caught.reflog_entries,
         truncated: caught.truncated,
         pruned: caught.pruned,
@@ -456,6 +490,10 @@ mod tests {
                         recorded: 1,
                         transcripts: 0,
                         skipped_lines: 0,
+                        rehosted_calls: 0,
+                        departed_overflow: 0,
+                        family_unresolved: false,
+                        family_unresolved_cycles: 0,
                         reflog_entries: 0,
                         truncated: false,
                         pruned: 0,
@@ -798,6 +836,10 @@ mod tests {
             "recorded",
             "transcripts",
             "skipped_lines",
+            "rehosted_calls",
+            "departed_overflow",
+            "family_unresolved",
+            "family_unresolved_cycles",
             "reflog_entries",
             "recording",
             "error",

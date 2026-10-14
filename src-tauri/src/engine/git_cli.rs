@@ -92,7 +92,7 @@ pub fn validate_repo_path(repo_path: &str) -> Result<PathBuf, String> {
     Err(format!("Not a Git repository: {}", canonical.display()))
 }
 
-fn is_git_repository(canonical: &Path) -> bool {
+pub(crate) fn is_git_repository(canonical: &Path) -> bool {
     if canonical.join(".git").exists() {
         return true;
     }
