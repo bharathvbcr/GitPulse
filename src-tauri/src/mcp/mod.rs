@@ -80,6 +80,11 @@ pub const BUDGET_MAX: u32 = 200_000;
 /// Longest `repo_path` / symbol argument accepted. Well past any real path,
 /// short enough that a megabyte of `A`s is refused before it reaches git.
 pub(crate) const MAX_ARG_CHARS: u32 = 4_096;
+/// Longest resource `uri` accepted: a `repo_path` at its limit with every
+/// character percent-encoded as four bytes, and the scheme and facet around it.
+/// A `uri` is echoed back in the document and in errors, so one the size of the
+/// frame would make every response about it too big to send.
+pub(crate) const MAX_URI_BYTES: usize = MAX_ARG_CHARS as usize * 12 + 256;
 
 pub fn server_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -1790,6 +1795,13 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
         },
         "resources/read" => match params.get("uri").and_then(Value::as_str) {
             None => invalid_params(id, "Invalid params: uri must be a string"),
+            Some(target) if target.len() > MAX_URI_BYTES => invalid_params(
+                id,
+                format!(
+                    "Invalid params: uri is {} bytes; the limit is {MAX_URI_BYTES}",
+                    target.len()
+                ),
+            ),
             Some(target) => match resources::read(target) {
                 Ok(contents) => ok(id, envelope(modern, json!({ "contents": contents }))),
                 // A URI this server does not address is the caller's to fix; a
@@ -2667,6 +2679,42 @@ mod tests {
             assert!(id.is_some(), "row {n} was not recorded");
         }
         (dir, repo)
+    }
+
+    /// A resource `uri` is echoed in the document and in every error about it,
+    /// so one the size of the frame could never be answered. It is refused at
+    /// the boundary, by size, without echoing it.
+    #[test]
+    fn an_over_long_resource_uri_is_refused_at_the_request_boundary() {
+        let long = format!("gitpulse://insights/{}", "a".repeat(MAX_URI_BYTES));
+        let response = call(
+            "resources/read",
+            json!({ "uri": long, "_meta": modern_meta() }),
+        );
+        let size = wire_len(&response);
+        let error = response.error.expect("refused");
+        assert_eq!(error["code"], -32602);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("limit"), "{message}");
+        assert!(message.len() < 200, "the uri was echoed: {}", message.len());
+        assert!(size < 1024);
+
+        // A uri at the limit still reaches the reader, which answers about it.
+        let at_limit = format!(
+            "gitpulse://insights/{}",
+            "a".repeat(MAX_URI_BYTES - "gitpulse://insights/".len())
+        );
+        assert_eq!(at_limit.len(), MAX_URI_BYTES);
+        let response = call(
+            "resources/read",
+            json!({ "uri": at_limit, "_meta": modern_meta() }),
+        );
+        let refused_by_size = response
+            .error
+            .as_ref()
+            .and_then(|error| error["message"].as_str())
+            .is_some_and(|message| message.contains("the limit is"));
+        assert!(!refused_by_size, "a uri at the limit is not over it");
     }
 
     fn wire_len(response: &JsonRpcResponse) -> usize {
