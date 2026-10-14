@@ -192,7 +192,13 @@ fn text_content(target_uri: &str, payload: Value) -> Value {
         json!({ "ok": false, "error": format!("result could not be serialized: {error}") })
             .to_string()
     });
-    let (text, truncated) = if budget::escaped_len(&text) - 2 > MAX_DOCUMENT_BYTES {
+    // A character costs at most six bytes escaped, so a document under a sixth
+    // of the cap cannot overflow it and is not measured (the manifest is read
+    // on every `resources/read`, and counting its characters showed in the
+    // bench).
+    let (text, truncated) = if text.len() > MAX_DOCUMENT_BYTES / 6
+        && budget::escaped_len(&text) - 2 > MAX_DOCUMENT_BYTES
+    {
         // Cut where the *escaped* prefix fits, leaving room for the notice.
         let prefix = budget::escaped_prefix(&text, MAX_DOCUMENT_BYTES - NOTICE_RESERVE_BYTES);
         (
