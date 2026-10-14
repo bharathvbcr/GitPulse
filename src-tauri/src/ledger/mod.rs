@@ -263,6 +263,12 @@ pub struct Draft {
 /// timestamp and two words from fixed lists. A stamp that fails the check is
 /// not dropped and not trusted: it is merged into the detail object and
 /// redacted with everything else.
+///
+/// Trust: on a transcript row `occurred_at` comes from the transcript, which
+/// the agent wrote, so an agent can date a call into an old binding window and
+/// have it attributed to that window's task. `task_basis` and `task_id` on
+/// transcript rows are as trustworthy as the transcript itself: provenance, not
+/// an authority. Reflog rows take their time from git's own record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventStamp {
     pub occurred_at: String,
@@ -274,7 +280,13 @@ impl EventStamp {
     /// Whether every value has the shape the writer produces, so none can
     /// carry text a caller chose.
     pub fn is_well_formed(&self) -> bool {
+        // A real calendar instant, in the exact form the formatter writes: the
+        // shape check alone passes `9999-99-99T99:99:99.999Z`.
         valid_utc_timestamp(&self.occurred_at)
+            && ids::parse_event_time(&self.occurred_at)
+                .map(ids::iso8601_utc)
+                .as_deref()
+                == Some(self.occurred_at.as_str())
             && matches!(
                 self.occurred_at_basis.as_str(),
                 "transcript" | "reflog" | "ingest"
@@ -427,10 +439,14 @@ pub struct LedgerStatus {
     /// True when the database for this repo is open and accepting writes.
     pub recording: bool,
     pub path: String,
-    /// Appends this process failed to write, ever, plus bind/unbind writes whose
-    /// catch-up beforehand did not finish. Non-zero means the history on disk is
-    /// known to be incomplete.
+    /// Appends this process failed to write, ever. Non-zero means the history
+    /// on disk is known to be incomplete.
     pub dropped: u64,
+    /// Bind/unbind writes, in this process, whose catch-up beforehand failed or
+    /// was cut short. Nothing was dropped: the rows it would have recorded wait
+    /// for a later pass. Not folded into `dropped`.
+    #[serde(default)]
+    pub catch_up_failures: u64,
     /// Empty when recording; otherwise why not.
     pub error: String,
     pub error_code: String,
@@ -577,11 +593,31 @@ fn record_dropped_append(repo_path: &str) {
 }
 
 /// Counts a bind/unbind whose catch-up beforehand did not finish. The write
-/// went ahead; the rows the catch-up would have recorded are still owed, so the
-/// history on disk is incomplete until a later pass records them, which is what
-/// [`LedgerStatus::dropped`] says. It never reads as a clean bind.
+/// went ahead and nothing was dropped: the rows the catch-up would have
+/// recorded are still owed to a later pass. It is counted apart from dropped
+/// appends ([`LedgerStatus::catch_up_failures`]), so it never reads as a lost
+/// write, and never as a clean bind.
 pub(crate) fn record_catch_up_failure(repo_path: &str) {
-    record_dropped_append(repo_path);
+    let mut failures = catch_up_failure_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = failures.entry(ledger_path(repo_path)).or_default();
+    *count = count.saturating_add(1);
+}
+
+/// [`record_catch_up_failure`]'s counts, by canonical database path.
+fn catch_up_failure_registry() -> &'static DroppedRegistry {
+    static FAILURES: OnceLock<DroppedRegistry> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn catch_up_failures(repo_path: &str) -> u64 {
+    catch_up_failure_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&ledger_path(repo_path))
+        .copied()
+        .unwrap_or(0)
 }
 
 fn dropped_appends(repo_path: &str) -> u64 {
@@ -2613,6 +2649,11 @@ pub fn status_readonly(repo_path: &str) -> LedgerStatus {
         } else {
             0
         },
+        catch_up_failures: if recording {
+            catch_up_failures(repo_path)
+        } else {
+            0
+        },
         error,
         error_code,
     }
@@ -2636,11 +2677,13 @@ pub fn tail_readonly(
 pub fn status(repo_path: &str) -> LedgerStatus {
     let path = ledger_path(repo_path);
     let dropped = dropped_appends(repo_path);
+    let catch_up_failures = catch_up_failures(repo_path);
     match with_conn(repo_path, |_| Ok(())) {
         Ok(()) => LedgerStatus {
             recording: true,
             path: path.display().to_string(),
             dropped,
+            catch_up_failures,
             error: String::new(),
             error_code: String::new(),
         },
@@ -2648,6 +2691,7 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             recording: false,
             path: path.display().to_string(),
             dropped,
+            catch_up_failures,
             error: e.message,
             error_code: e.code.to_string(),
         },

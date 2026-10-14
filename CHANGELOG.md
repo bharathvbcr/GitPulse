@@ -199,7 +199,10 @@ before that tag is pushed.
   - Binding or unbinding a worktree first catches up its transcripts and reflog
     (5 s, best effort). A catch-up that fails or is cut short does not stop the
     bind; it is recorded on the bind row (`detail_json.catch_up`) and counted in
-    the ledger status's `dropped`.
+    the ledger status's own `catch_up_failures`, never as a dropped append. No home
+    directory to read transcripts from is not a failure; the row notes it.
+  - `occurred_at` on a transcript row comes from the agent-written transcript, so
+    its task attribution is as trustworthy as the transcript, not an authority.
   - Retention, ordering, the reflog's already-seen set and the legacy import stay
     on `ts_utc`: pruning by `occurred_at` would delete reflog rows git still
     holds and record them again on the next pass.

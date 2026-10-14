@@ -108,32 +108,40 @@ fn catch_up_before_binding(
 
 /// Runs `catch_up` for the address a binding change is about to be written at,
 /// and returns what it found as the `detail_json` of that row:
-/// `{"catch_up": {"ok", "truncated", "recorded", "error"}}`.
+/// `{"catch_up": {"ok", "truncated", "recorded", "error"}}`, plus a `note` when
+/// there was nothing to read.
 ///
 /// The catch-up is best-effort. Whatever it does, the binding is written, and
-/// one that did not finish is counted ([`crate::ledger::record_catch_up_failure`],
-/// surfaced as `LedgerStatus::dropped`) as well as recorded on the row, so a
-/// failure never reads as a clean bind.
+/// one that did not finish is counted
+/// ([`crate::ledger::record_catch_up_failure`], surfaced as
+/// `LedgerStatus::catch_up_failures`, apart from dropped appends) as well as
+/// recorded on the row, so a failure never reads as a clean bind. No home
+/// directory to find transcripts in is "nothing to read": `ok` stays true, it
+/// is not counted, and the row keeps the reason as a `note`.
 fn catch_up_note(
     address: &crate::ledger::bindings::BindingAddress,
     catch_up: impl FnOnce(&crate::ledger::bindings::BindingAddress) -> crate::ingest::CatchUp,
 ) -> Option<String> {
     let found = catch_up(address);
-    let ok = found.error.is_empty() && !found.truncated;
+    let nothing_to_read = found.error == crate::ingest::NO_TRANSCRIPT_ROOT;
+    let ok = (found.error.is_empty() || nothing_to_read) && !found.truncated;
     if !ok {
         crate::ledger::record_catch_up_failure(&address.anchor);
     }
-    Some(
-        serde_json::json!({
-            "catch_up": {
-                "ok": ok,
-                "truncated": found.truncated,
-                "recorded": found.recorded,
-                "error": found.error.chars().take(500).collect::<String>(),
-            }
-        })
-        .to_string(),
-    )
+    let mut note = serde_json::json!({
+        "ok": ok,
+        "truncated": found.truncated,
+        "recorded": found.recorded,
+        "error": if nothing_to_read {
+            String::new()
+        } else {
+            found.error.chars().take(500).collect::<String>()
+        },
+    });
+    if nothing_to_read {
+        note["note"] = found.error.into();
+    }
+    Some(serde_json::json!({ "catch_up": note }).to_string())
 }
 
 /// [`crate::ledger::bindings::bind_with`] after `catch_up`.
@@ -290,7 +298,7 @@ mod catch_up_binding_tests {
         let note = &detail(&row)["catch_up"];
         assert_eq!(note["ok"], true, "{note}");
         assert_eq!(note["recorded"], 1, "{note}");
-        assert_eq!(ledger::status(&repo).dropped, 0);
+        assert_eq!(ledger::status(&repo).catch_up_failures, 0);
     }
 
     #[test]
@@ -310,7 +318,11 @@ mod catch_up_binding_tests {
         let note = &detail(&row)["catch_up"];
         assert_eq!(note["ok"], false, "{note}");
         assert_eq!(note["error"], "the reflog could not be read", "{note}");
-        assert_eq!(ledger::status(&repo).dropped, 1, "the failure is counted");
+        assert_eq!(
+            ledger::status(&repo).catch_up_failures,
+            1,
+            "the failure is counted"
+        );
 
         // A pass the deadline cut short is a failure too, however empty its error.
         unbind_after_catch_up(&repo, &repo, |_| CatchUp {
@@ -318,7 +330,7 @@ mod catch_up_binding_tests {
             ..CatchUp::default()
         })
         .unwrap();
-        assert_eq!(ledger::status(&repo).dropped, 2);
+        assert_eq!(ledger::status(&repo).catch_up_failures, 2);
         assert_eq!(bindings::resolve(&repo, &repo).unwrap(), None);
     }
 
@@ -390,7 +402,7 @@ mod catch_up_binding_tests {
         binds.sort_by(|a, b| (&a.ts_utc, &a.ulid).cmp(&(&b.ts_utc, &b.ulid)));
         let newest = binds.last().unwrap().task_id.clone();
         assert_eq!(bindings::resolve(&repo, &repo).unwrap(), newest);
-        assert_eq!(ledger::status(&repo).dropped, 4);
+        assert_eq!(ledger::status(&repo).catch_up_failures, 4);
     }
 
     /// A catch-up that fails for a reason that is not about the ledger (no home
@@ -402,19 +414,35 @@ mod catch_up_binding_tests {
     fn a_catch_up_that_had_nothing_to_read_does_not_read_as_a_dropped_append() {
         let (_dir, repo) = git_repo();
         let serial = crate::test_support::env::env_serial();
-        let _env = crate::test_support::env::bind_env(&serial).remove("HOME").remove("GITPULSE_TRANSCRIPT_ROOT");
-        let before = ledger::status(&repo).dropped;
+        let _env = crate::test_support::env::bind_env(&serial)
+            .remove("HOME")
+            .remove("GITPULSE_TRANSCRIPT_ROOT");
+        let before = ledger::status(&repo);
         let bound = bind_after_catch_up(&repo, &repo, "T-1", catch_up_before_binding).unwrap();
         let row = ledger::tail(&repo, 0, 100)
             .unwrap()
             .into_iter()
             .find(|event| event.id == bound)
             .unwrap();
-        eprintln!("catch_up note: {}", detail(&row)["catch_up"]);
+        let note = &detail(&row)["catch_up"];
+        let after = ledger::status(&repo);
         assert_eq!(
-            ledger::status(&repo).dropped,
-            before,
+            after.dropped, before.dropped,
             "a bind whose catch-up merely found no transcript root is counted as a dropped append"
         );
+        assert_eq!(after.catch_up_failures, before.catch_up_failures, "{note}");
+        // Visible on the row, not a failure.
+        assert_eq!(note["ok"], true, "{note}");
+        assert_eq!(note["note"], crate::ingest::NO_TRANSCRIPT_ROOT, "{note}");
+
+        // A real failure is counted in its own counter, and never as a drop.
+        bind_after_catch_up(&repo, &repo, "T-2", |_| crate::ingest::CatchUp {
+            error: "the reflog could not be read".into(),
+            ..crate::ingest::CatchUp::default()
+        })
+        .unwrap();
+        let failed = ledger::status(&repo);
+        assert_eq!(failed.catch_up_failures, before.catch_up_failures + 1);
+        assert_eq!(failed.dropped, before.dropped);
     }
 }

@@ -482,7 +482,10 @@ fn ten_thousand_binds_load_and_answer_within_a_pass_budget() {
     eprintln!("10k binds: load {load:?}, 1M as_of {ask:?}, resolved {resolved}");
     assert_eq!(history.as_of(T0 + 9_999 * 10 + 5), bound("T9999"));
     assert!(load < std::time::Duration::from_secs(2), "load {load:?}");
-    assert!(ask < std::time::Duration::from_secs(5), "1M as_of took {ask:?}");
+    assert!(
+        ask < std::time::Duration::from_secs(5),
+        "1M as_of took {ask:?}"
+    );
 }
 
 /// A bind row naming no task is an unbind to every reader; an unbind as the
@@ -505,7 +508,10 @@ fn a_binding_stored_under_the_redacted_path_spelling_is_found() {
     let (_dir, repo) = repo();
     let odd = format!("{repo}/ghp_0123456789abcdefghijklmnopqrstuvwxyzA");
     let stored = crate::ledger::redact::text(&odd);
-    assert_ne!(stored, odd, "the fixture must be a path the redactor rewrites");
+    assert_ne!(
+        stored, odd,
+        "the fixture must be a path the redactor rewrites"
+    );
     with_conn(&repo, |conn| {
         conn.execute(
             "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, task_id,

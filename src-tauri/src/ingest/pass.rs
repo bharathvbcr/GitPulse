@@ -114,7 +114,7 @@ fn ingest_family(
 ) -> CatchUp {
     let mut out = CatchUp::default();
     let Some(root) = super::transcript_root() else {
-        out.error = "no home directory, so transcripts cannot be located".into();
+        out.error = super::NO_TRANSCRIPT_ROOT.into();
         return out;
     };
     if !root.is_dir() {

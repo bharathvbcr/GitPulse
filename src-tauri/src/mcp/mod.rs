@@ -803,7 +803,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided.",
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority.",
             LedgerEventsArgs::properties(),
             &LedgerEventsArgs::required(),
             json!({

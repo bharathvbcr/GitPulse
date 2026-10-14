@@ -108,6 +108,11 @@ pub struct CatchUp {
 /// than finishing late on the app-mount path.
 pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The `CatchUp::error` of a pass with no home directory to look for
+/// transcripts in. There is nothing to read, which is not a failure to read:
+/// callers that count failures leave it out, and callers that show errors keep it.
+pub(crate) const NO_TRANSCRIPT_ROOT: &str = "no home directory, so transcripts cannot be located";
+
 /// Where Claude Code keeps its transcripts.
 pub(crate) fn transcript_root() -> Option<std::path::PathBuf> {
     std::env::var_os("GITPULSE_TRANSCRIPT_ROOT")

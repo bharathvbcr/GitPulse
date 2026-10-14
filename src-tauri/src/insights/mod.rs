@@ -869,6 +869,7 @@ fn snapshot_observed(
             recording: false,
             path: String::new(),
             dropped: 0,
+            catch_up_failures: 0,
             error: error.to_string(),
             error_code: error.code.to_string(),
         },

@@ -193,8 +193,21 @@ fn a_detail_that_is_not_an_object_never_panics_leaks_or_drops_the_row() {
     let broken = format!("{{\"a\":\"{KEY}\"");
     let trailing = format!("{{\"a\":1}} {{\"b\":\"{KEY}\"}}");
     let cases: Vec<&str> = vec![
-        "", "null", "[]", "[1]", "\"s\"", "{", "}", "}{", "{}{}", "  {} ", "\u{feff}{}", &secret,
-        &string, &broken, &trailing,
+        "",
+        "null",
+        "[]",
+        "[1]",
+        "\"s\"",
+        "{",
+        "}",
+        "}{",
+        "{}{}",
+        "  {} ",
+        "\u{feff}{}",
+        &secret,
+        &string,
+        &broken,
+        &trailing,
     ];
     for detail in cases {
         let repo = tempfile::tempdir().unwrap();
@@ -223,7 +236,9 @@ fn a_detail_that_is_not_an_object_never_panics_leaks_or_drops_the_row() {
 /// shape of object, including ones the redactor rewrites.
 #[test]
 fn the_splice_always_yields_valid_json_with_the_stamp_for_an_object_detail() {
-    let nested_deep = (0..100).fold(format!("\"{KEY}\""), |inner, _| format!("{{\"k\":{inner}}}"));
+    let nested_deep = (0..100).fold(format!("\"{KEY}\""), |inner, _| {
+        format!("{{\"k\":{inner}}}")
+    });
     let details = [
         "{}".to_string(),
         "{ }".to_string(),
@@ -252,7 +267,9 @@ fn the_splice_always_yields_valid_json_with_the_stamp_for_an_object_detail() {
 #[test]
 fn a_detail_nested_past_the_redactor_depth_still_does_not_leak() {
     for depth in [150usize, 300, 5_000] {
-        let nested = (0..depth).fold(format!("\"{KEY}\""), |inner, _| format!("{{\"k\":{inner}}}"));
+        let nested = (0..depth).fold(format!("\"{KEY}\""), |inner, _| {
+            format!("{{\"k\":{inner}}}")
+        });
         let detail = format!("{{\"deep\":{nested}}}");
         let out = redact_detail(Some(&detail), Some(&stamp())).unwrap();
         assert!(!out.contains(KEY), "depth {depth} leaked");
