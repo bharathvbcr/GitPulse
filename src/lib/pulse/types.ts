@@ -146,7 +146,8 @@ export interface HygieneStats {
   readonly conventionalCount: number;
   readonly conventionalPercentage: number;
   readonly signedCount: number;
-  readonly signedPercentage: number;
+  /** `null` when no commit's signature could be read: a share of nothing is not 0%. */
+  readonly signedPercentage: number | null;
   /** Commits whose signature state could not be read; excluded from the share. */
   readonly signatureUnknownCount: number;
   readonly mergeCount: number;

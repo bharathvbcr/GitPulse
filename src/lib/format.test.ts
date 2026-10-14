@@ -169,7 +169,7 @@ describe("signatureLabel adversarial matrix", () => {
     expect(signatureLabel({ signature: "none", status: "good", key: "K", signer: "S" }).ok).toBe(false);
   });
 
-  it("break: does not throw on an unexpected status or signature from a newer or older backend", () => {
+  it("does not throw on an unexpected status or signature from a newer or older backend", () => {
     const odd = { signature: "pgp", status: "future_status", key: "", signer: "" } as unknown as CommitSignatureCheck;
     expect(() => signatureLabel(odd)).not.toThrow();
     expect(signatureLabel(odd).ok).toBe(false);

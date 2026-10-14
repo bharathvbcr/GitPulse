@@ -565,17 +565,18 @@ export function createGraphStore(
   ) {
     let check: CommitSignatureCheck | null;
     try {
-      check = await invokeFn<CommitSignatureCheck>("cmd_verify_commit_signature", {
+      // A reply with no verdict in it is a check that did not happen, the same
+      // as a failure: `null`, never left pending.
+      check = (await invokeFn<CommitSignatureCheck | undefined>("cmd_verify_commit_signature", {
         repoPath,
         commitId,
-      });
+      })) ?? null;
     } catch (err) {
       // Not a verdict: the pane says the signature was not checked, never
       // that the commit is unsigned.
       reportFailure("graph-signature", `${repoPath}/${commitId}: ${formatError(err)}`);
       check = null;
     }
-    if (check === undefined) return;
     if (!isCurrent(repoPath, token)) return;
     if (seq !== undefined && !selectionCurrent(repoPath, seq)) return;
     const attach = (details: SelectedCommitDetails | null): SelectedCommitDetails | null =>

@@ -467,8 +467,8 @@ const SIGNED_KINDS: ReadonlySet<string> = new Set(["pgp", "ssh", "x509", "other"
  * the share as if it had been found unsigned; it is reported beside the share
  * as `signatureUnknownCount`. With nothing known there is no share to state.
  */
-function signedPercentageOf(signed: number, known: number): number {
-  return known > 0 ? Math.round((signed / known) * 100) : 0;
+function signedPercentageOf(signed: number, known: number): number | null {
+  return known > 0 ? Math.round((signed / known) * 100) : null;
 }
 
 /**
@@ -483,7 +483,7 @@ export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneS
       conventionalCount: 0,
       conventionalPercentage: 0,
       signedCount: 0,
-      signedPercentage: 0,
+      signedPercentage: null,
       signatureUnknownCount: 0,
       mergeCount: 0,
       mergePercentage: 0,

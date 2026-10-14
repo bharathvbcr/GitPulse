@@ -1,7 +1,7 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
-use crate::engine::commit_signature::{walk_signatures, CommitSignature};
+use crate::engine::commit_signature::{read_walk_signatures, CommitSignature, WalkSignatures};
 use crate::engine::git_cli::{
     self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
     sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
@@ -1930,15 +1930,22 @@ impl GitReader {
         let mut header_args = vec!["rev-list", count_arg.as_str(), "--topo-order", "--header"];
         header_args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
         let admission = git_cli::current_admission();
-        let (log, mut signatures) = std::thread::scope(|scope| {
+        let (log, signatures) = std::thread::scope(|scope| {
             let headers = scope.spawn(|| {
-                git_cli::with_admission(admission, || walk_signatures(&repo, &header_args))
+                git_cli::with_admission(admission, || read_walk_signatures(&repo, &header_args))
             });
             let log = git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES);
             // A reader that panicked is a walk with no signatures read: every
             // commit is `Unknown`, never `None`.
-            (log, headers.join().unwrap_or_default())
+            let signatures = headers.join().unwrap_or_else(|_| WalkSignatures {
+                signatures: HashMap::new(),
+                failure: Some("the signature reader panicked".into()),
+            });
+            (log, signatures)
         });
+        if let Some(why) = &signatures.failure {
+            log::warn!(target: "pulse", "pulse signatures for {}: {why}", repo.display());
+        }
         let (stdout, payload_incomplete) = match log {
             Ok(out) => out,
             Err(e) => {
@@ -1960,11 +1967,7 @@ impl GitReader {
         };
 
         let mut captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
-        for commit in &mut captured.commits {
-            commit.signature = signatures
-                .remove(&commit.sha)
-                .unwrap_or(CommitSignature::Unknown);
-        }
+        apply_signatures(&mut captured.commits, signatures.signatures);
         Ok(PulseReport {
             commits: captured.commits,
             top_files_by_churn: captured.top_files,
@@ -2672,6 +2675,22 @@ fn extract_extension(path: &str) -> String {
             }
             "other".to_string()
         })
+}
+
+/// Stamps each pulse row with the signature the header read found for it.
+///
+/// The log and the header read are two walks over the same refs, so the refs
+/// can move between them: a row the header read did not see is `Unknown`, never
+/// `None`, and a header entry for a commit the log did not return is ignored.
+fn apply_signatures(
+    commits: &mut [PulseCommitSummary],
+    mut found: HashMap<String, CommitSignature>,
+) {
+    for commit in commits {
+        commit.signature = found
+            .remove(&commit.sha)
+            .unwrap_or(CommitSignature::Unknown);
+    }
 }
 
 #[derive(Debug)]
@@ -10155,10 +10174,51 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         );
     }
 
-    /// The pulse walk's own git processes: the log, and one batch read for
+    /// The log and the header read are two walks over refs that can move
+    /// between them: a row the header read missed is `Unknown` (never `None`),
+    /// and a header entry for a commit the log did not return is ignored.
+    #[test]
+    fn a_pulse_row_the_header_read_missed_is_unknown_and_extra_entries_are_ignored() {
+        let row = |sha: &str| PulseCommitSummary {
+            sha: sha.to_string(),
+            parents: Vec::new(),
+            timestamp: 0,
+            summary: String::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            signature: CommitSignature::Unknown,
+            additions: 0,
+            deletions: 0,
+            files_changed: 0,
+            is_merge: false,
+            is_revert: false,
+            co_authors: Vec::new(),
+            binary_files: 0,
+        };
+        let mut commits = vec![row("aaa"), row("bbb"), row("ccc")];
+        let found = HashMap::from([
+            ("aaa".to_string(), CommitSignature::Ssh),
+            ("ccc".to_string(), CommitSignature::None),
+            // The refs moved: the header read saw a commit the log did not.
+            ("zzz".to_string(), CommitSignature::Pgp),
+        ]);
+        apply_signatures(&mut commits, found);
+        let kinds: Vec<_> = commits.iter().map(|c| c.signature).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CommitSignature::Ssh,
+                CommitSignature::Unknown,
+                CommitSignature::None
+            ]
+        );
+        assert_eq!(commits.len(), 3, "an extra header entry adds no row");
+    }
+
+    /// The pulse walk's own git processes: the log, and one header read for
     /// every signature however many commits are signed.
     #[test]
-    fn pulse_report_reads_every_signature_in_one_batch() {
+    fn pulse_report_reads_every_signature_in_one_header_read() {
         use crate::test_support::{fake_signature_header as sig, raw_commit};
         let dir = init_repo_with_remotes(&[], "main");
         let path = dir.path();
@@ -10383,7 +10443,8 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     }
 
     // ------------------------------------------------------------------
-    // Adversarial DORA cases (CARD 16). `break_*` tests currently FAIL.
+    // Adversarial DORA cases (CARD 16): inputs chosen to break the two walks,
+    // each pinning the behavior that held or the fix that closed the break.
     // ------------------------------------------------------------------
 
     const ADV_DAY: i64 = 86_400;
@@ -10522,11 +10583,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(known.commit_scan_window_commits, Some(4));
     }
 
-    /// The fallback's truncation test looks only at the row just past the cap.
-    /// When that one row is the inverted-date commit (old), in-window commits
-    /// behind it are cut and the walk reports a complete window.
+    /// The fallback once judged truncation by the row just past the cap alone.
+    /// When that row is the inverted-date commit (old), in-window commits behind
+    /// it are unread, so any row past the cap is now reported as a cut window.
     #[test]
-    fn break_the_count_bounded_walk_claims_completeness_when_the_row_past_the_cap_is_inverted() {
+    fn the_count_bounded_walk_reports_a_cut_window_when_the_row_past_the_cap_is_inverted() {
         let anchor = ADV_ANCHOR;
         let dir = inverted_date_repo(anchor);
         // Walk order is today, d3, d30, inverted, d40: cap 3 leaves `inverted`

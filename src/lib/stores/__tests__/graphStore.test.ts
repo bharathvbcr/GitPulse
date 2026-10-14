@@ -832,6 +832,14 @@ describe("graphStore signature verification", () => {
     expect(get(store).selectedCommitDetails?.signature_check).toBeNull();
   });
 
+  it("treats a reply with no verdict in it as a check that did not happen, not as pending", async () => {
+    const { store, row } = await selecting(async () => undefined);
+    await store.selectCommit(row, "/r/a");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeNull();
+  });
+
   it("drops a verdict that arrives after another commit was selected", async () => {
     const slow = deferred<typeof check>();
     const { store, row } = await selecting((id) =>
@@ -933,7 +941,7 @@ describe("graphStore signature label when the details never load", () => {
    * the details fetch fails `details` stays null, so the label is the one for
    * "still running" for ever: no verification was ever started.
    */
-  it("break: a failed details fetch must not leave the signature label at 'Checking signature…'", async () => {
+  it("a failed details fetch must not leave the signature label at 'Checking signature…'", async () => {
     const { signatureLabel } = await import("../../format");
     const invoke: InvokeFn = async (cmd, args) => {
       if (cmd === "cmd_get_commit_graph") return payload("c1") as never;

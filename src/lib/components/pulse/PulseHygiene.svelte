@@ -49,7 +49,7 @@
       <KeyRound size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-bold tracking-tight text-textPrimary">{hygiene.signedPercentage}%</span>
+      <span class="text-2xl font-bold tracking-tight text-textPrimary">{hygiene.signedPercentage === null ? "—" : `${hygiene.signedPercentage}%`}</span>
     </div>
     <div class="text-[10px] text-textMuted mt-1 truncate">
       {hygiene.signedCount} signed, not verified{hygiene.signatureUnknownCount > 0 ? ` · ${hygiene.signatureUnknownCount} unread` : ""}

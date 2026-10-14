@@ -286,7 +286,7 @@ describe("computeHygiene", () => {
       createMockCommit({ signature: "unknown" }),
     ]);
     expect(hygiene.signedCount).toBe(0);
-    expect(hygiene.signedPercentage).toBe(0);
+    expect(hygiene.signedPercentage).toBeNull();
     expect(hygiene.signatureUnknownCount).toBe(2);
   });
 
@@ -431,17 +431,23 @@ describe("computeHygiene signature adversarial cases", () => {
   it("never produces NaN or Infinity for any all-one-kind repo", () => {
     for (const signature of ["none", "pgp", "ssh", "x509", "other", "unknown"] as const) {
       const hygiene = computeHygiene([createMockCommit({ signature })]);
-      expect(Number.isFinite(hygiene.signedPercentage), signature).toBe(true);
-      expect(hygiene.signedPercentage).toBeGreaterThanOrEqual(0);
-      expect(hygiene.signedPercentage).toBeLessThanOrEqual(100);
+      const share = hygiene.signedPercentage;
+      if (signature === "unknown") {
+        // Nothing was read, so there is no share: null, not a measured 0%.
+        expect(share, signature).toBeNull();
+      } else {
+        expect(Number.isFinite(share), signature).toBe(true);
+        expect(share).toBeGreaterThanOrEqual(0);
+        expect(share).toBeLessThanOrEqual(100);
+      }
     }
   });
 
-  it("a single commit is 100 or 0, and an unread single commit is 0 with one unread", () => {
+  it("a single commit is 100 or 0, and an unread single commit has no share and one unread", () => {
     expect(computeHygiene([createMockCommit({ signature: "ssh" })]).signedPercentage).toBe(100);
     expect(computeHygiene([createMockCommit({ signature: "none" })]).signedPercentage).toBe(0);
     const unread = computeHygiene([createMockCommit({ signature: "unknown" })]);
-    expect(unread.signedPercentage).toBe(0);
+    expect(unread.signedPercentage).toBeNull();
     expect(unread.signatureUnknownCount).toBe(1);
   });
 
@@ -460,7 +466,7 @@ describe("computeHygiene signature adversarial cases", () => {
    * and no `signature`; a value outside the closed set is as much a version
    * skew. Neither is a statement that the commit is signed.
    */
-  it("break: a missing or unrecognised signature value is not counted as signed", () => {
+  it("a missing or unrecognised signature value is not counted as signed", () => {
     const skewed = [
       createMockCommit({ signature: undefined as never }),
       createMockCommit({ signature: "G" as never }),

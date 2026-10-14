@@ -234,8 +234,9 @@ pub(crate) fn commit_signatures(repo: &Path, oids: &[String]) -> HashMap<String,
 /// reads, the output was cut at the budget, git failed or timed out) is absent
 /// from the map, and the caller reads absence as [`CommitSignature::Unknown`];
 /// a commit the stream names twice is `Unknown` too, since one of the two
-/// records was not git's.
-pub(crate) fn walk_signatures(repo: &Path, args: &[&str]) -> HashMap<String, CommitSignature> {
+/// records was not git's. When the read failed or was cut, `failure` says why,
+/// so the caller can report it instead of showing silently unread commits.
+pub(crate) fn read_walk_signatures(repo: &Path, args: &[&str]) -> WalkSignatures {
     let mut stream = HeaderStream::default();
     let run = {
         let mut observer = HeaderObserver(&mut stream);
@@ -243,10 +244,36 @@ pub(crate) fn walk_signatures(repo: &Path, args: &[&str]) -> HashMap<String, Com
     };
     match run {
         Ok(run) if run.success || run.incomplete.is_some() => {
-            stream.finish(run.incomplete.is_some())
+            let failure = run.incomplete.as_ref().map(|reason| {
+                format!(
+                    "the signature read was cut short: git output {}",
+                    reason.describe()
+                )
+            });
+            WalkSignatures {
+                signatures: stream.finish(failure.is_some()),
+                failure,
+            }
         }
-        _ => HashMap::new(),
+        Ok(run) => WalkSignatures {
+            signatures: HashMap::new(),
+            failure: Some(format!(
+                "the signature read failed: {}",
+                String::from_utf8_lossy(&run.stderr).trim()
+            )),
+        },
+        Err(error) => WalkSignatures {
+            signatures: HashMap::new(),
+            failure: Some(format!("the signature read could not run: {error}")),
+        },
     }
+}
+
+/// What [`read_walk_signatures`] read: the signature of each commit it saw, and
+/// why it did not see them all, when it did not.
+pub(crate) struct WalkSignatures {
+    pub(crate) signatures: HashMap<String, CommitSignature>,
+    pub(crate) failure: Option<String>,
 }
 
 /// Feeds a [`HeaderStream`] from a git child's stdout and tells the run not to
@@ -603,20 +630,18 @@ pub(crate) fn verify_commit_signature_with(
     let commit_id = commit_id.to_ascii_lowercase();
     let commit_id = commit_id.as_str();
     let fingerprint = signing_fingerprint(&repo);
-    if let Some(fingerprint) = &fingerprint {
-        if let Some(kept) = cache.lock().unwrap_or_else(PoisonError::into_inner).get(
-            &repo,
-            commit_id,
-            fingerprint,
-            now,
-        ) {
-            return Ok(kept);
-        }
-    }
 
     let key = (repo.clone(), commit_id.to_string());
     let turn = {
         let mut state = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        // Looked up under the same lock that registers a flight, so a select
+        // that lands just after a leader stored its verdict and left finds the
+        // verdict rather than starting a second verification.
+        if let Some(fingerprint) = &fingerprint {
+            if let Some(kept) = state.get(&repo, commit_id, fingerprint, now) {
+                return Ok(kept);
+            }
+        }
         match state.flights.get(&key) {
             Some(flight) => Turn::Follow(flight.clone()),
             None if state.flights.len() < MAX_FLIGHTS => {
@@ -791,6 +816,12 @@ mod tests {
     /// here is; a test about the other format says so with `ObjectFormat`.
     fn classify_header(object: &[u8]) -> CommitSignature {
         super::classify_header(object, ObjectFormat::Sha1)
+    }
+
+    /// The signatures of a walk, for the tests that do not care why a read
+    /// came up short.
+    fn walk_signatures(repo: &Path, args: &[&str]) -> HashMap<String, CommitSignature> {
+        read_walk_signatures(repo, args).signatures
     }
 
     /// A whole `rev-list --header` stream read at once, as [`walk_signatures`]
@@ -1337,8 +1368,9 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Adversarial cases (CARD 16). A test named `break_*` currently FAILS and
-    // is evidence of a defect; the others pin behavior that held under attack.
+    // Adversarial cases (CARD 16): inputs chosen to break the reader, the
+    // cache and the verify path. Each test pins behavior that held under attack
+    // or the fix that closed the break it found.
     // ------------------------------------------------------------------
 
     /// What git's own parser decides for `object`: does `%G?` start a verifier
@@ -1583,7 +1615,7 @@ mod tests {
     /// name. The reader must not read that as an answer to some other question
     /// and strand every id after it.
     #[test]
-    fn break_an_uppercase_oid_is_read_as_the_commit_it_names() {
+    fn an_uppercase_oid_is_read_as_the_commit_it_names() {
         let (repo, tip) = repo_with_commit(&pgp());
         let other = crate::test_support::raw_commit(repo.path(), &[&tip], "", "u", 1_700_000_300);
         let upper = tip.to_uppercase();
@@ -1599,7 +1631,7 @@ mod tests {
     /// The same through the one-commit verify, which accepts uppercase hex.
     #[cfg(unix)]
     #[test]
-    fn break_verifying_by_an_uppercase_oid_reports_the_signature_it_has() {
+    fn verifying_by_an_uppercase_oid_reports_the_signature_it_has() {
         use crate::test_support::{counting_verifier, use_verifier};
         let (repo, oid) = repo_with_commit(&pgp());
         let (_stub, script) = counting_verifier("exit 2");
@@ -1801,7 +1833,7 @@ mod tests {
     /// known limit rather than expected to hold.
     #[cfg(unix)]
     #[test]
-    fn break_an_in_place_rewrite_with_the_mtime_restored_is_a_cache_hit() {
+    fn an_in_place_rewrite_with_the_mtime_restored_is_a_bounded_cache_hit() {
         use crate::test_support::{counting_verifier, git_in, use_verifier, verifier_spawns};
         let ssh = crate::test_support::fake_signature_header("gpgsig", "SSH SIGNATURE");
         let (repo, oid) = repo_with_commit(&ssh);
@@ -1845,11 +1877,12 @@ mod tests {
         );
     }
 
-    /// `include.path` pulls in config the fingerprint never stamps, so a
-    /// signing program swapped there is invisible to it.
+    /// `include.path` pulls in config the fixed fingerprint cannot name, so the
+    /// files the effective config was read from are learned on the first verify
+    /// and a signing program swapped in one of them is a cache miss.
     #[cfg(unix)]
     #[test]
-    fn break_a_change_in_an_included_config_file_misses_the_cache() {
+    fn a_change_in_an_included_config_file_misses_the_cache() {
         use crate::test_support::{counting_verifier, git_in, verifier_spawns};
         let (repo, oid) = repo_with_commit(&pgp());
         let path = repo.path().to_str().unwrap();
@@ -1925,11 +1958,11 @@ mod tests {
         assert_ne!(one, two);
     }
 
-    /// Two selects of the same commit at once both miss and both start the
-    /// signing program: nothing coalesces them.
+    /// Two selects of the same commit at once share one verification, so the
+    /// signing program starts once.
     #[cfg(unix)]
     #[test]
-    fn break_two_selects_racing_for_one_oid_start_the_verifier_once() {
+    fn two_selects_racing_for_one_oid_start_the_verifier_once() {
         use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
         let (repo, oid) = repo_with_commit(&pgp());
         let path = repo.path().to_str().unwrap().to_string();
@@ -1970,7 +2003,7 @@ mod tests {
     /// allowed-signers file are both `signed, could not verify`, not unsigned.
     #[cfg(unix)]
     #[test]
-    fn break_a_gpgsig_sha256_header_in_a_sha1_repository_agrees_with_what_verify_does() {
+    fn a_gpgsig_sha256_header_in_a_sha1_repository_agrees_with_what_verify_does() {
         use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
         let header = crate::test_support::fake_signature_header("gpgsig-sha256", "PGP SIGNATURE");
         let (repo, oid) = repo_with_commit(&header);
@@ -2133,6 +2166,17 @@ mod tests {
             &["rev-list", "-n10", "--header", "refs/heads/does-not-exist"],
         );
         assert!(got.is_empty());
+        let read = read_walk_signatures(
+            repo.path(),
+            &["rev-list", "-n10", "--header", "refs/heads/does-not-exist"],
+        );
+        let why = read.failure.expect("a failed read says why");
+        assert!(why.contains("failed"), "{why}");
+        let ok = read_walk_signatures(
+            repo.path(),
+            &["rev-list", "-n10", "--header", "refs/heads/main"],
+        );
+        assert!(ok.failure.is_none() && !ok.signatures.is_empty());
     }
 
     /// The stream is parsed as it arrives, so how it is cut into chunks cannot

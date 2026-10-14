@@ -389,12 +389,12 @@ const PINNED_GIT_CONFIG: &[&str] = &[
 /// no `-c` can blank) would run a program instead of git's own diff.
 const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
 
-/// The patch subcommands that can run the signature verifier for a header
-/// (`log.showSignature`, a `--show-signature` alias, `--pretty=` presets).
-/// `--no-show-signature` rides every one of them from here, so no read has to
-/// remember it; `diff` is left out because it rejects the flag. It does not
-/// touch the `%G*` placeholders, which always verify: those are kept out of
-/// every bulk format string by a source-scan test.
+/// The patch subcommands that print a signature header (and run the verifier
+/// to do it) when `log.showSignature` or `--show-signature` asks. `--no-show-signature`
+/// rides every one of them from here, so no read has to remember it; `diff` is
+/// left out because it rejects the flag. It turns off that header only: it does
+/// not touch the `%G*` placeholders, which always verify, and those are kept
+/// out of every bulk format string by a source-scan test.
 const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
 
 /// The one place the environment of a git child is decided. Both spawn
@@ -7478,7 +7478,7 @@ mod tests {
             let at = args.iter().position(|a| a == patch).expect("subcommand");
             assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
             // `diff` rejects `--no-show-signature`; `show` and `log` carry it
-            // so a user's `--show-signature` alias never runs the verifier.
+            // so a signature header is never printed (and verified) for them.
             if patch == "diff" {
                 assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
             } else {
