@@ -926,3 +926,29 @@ describe("graphStore signature verification, rapid selection", () => {
     expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
   });
 });
+
+describe("graphStore signature label when the details never load", () => {
+  /**
+   * The pane labels with `signatureLabel(details?.signature_check)`, and when
+   * the details fetch fails `details` stays null, so the label is the one for
+   * "still running" for ever: no verification was ever started.
+   */
+  it("break: a failed details fetch must not leave the signature label at 'Checking signature…'", async () => {
+    const { signatureLabel } = await import("../../format");
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") return payload("c1") as never;
+      if (cmd === "cmd_get_commit_details") throw new Error(`no details for ${String(args?.commitId)}`);
+      if (cmd === "cmd_verify_commit_signature") throw new Error("never asked");
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const row = { ...get(store).rows[0], id: "c1" };
+    await store.selectCommit(row, "/r/a");
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    const details = get(store).selectedCommitDetails;
+    expect(details?.id === "c1" ? details : null).toBeNull();
+    expect(signatureLabel(details?.signature_check).text).not.toBe("Checking signature…");
+  });
+});
