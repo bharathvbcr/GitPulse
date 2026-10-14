@@ -2595,8 +2595,17 @@ fn worktree_records(repo: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
         let record = entry
             .map_err(|e| format!("could not read {}: {e}", records.display()))?
             .path();
-        let Ok(pointer) = std::fs::read(record.join("gitdir")) else {
-            continue;
+        // A record with no `gitdir` yet is one being made. One that cannot be
+        // read is not skipped: a caller would then read it as pointing nowhere.
+        let pointer = match std::fs::read(record.join("gitdir")) {
+            Ok(pointer) => pointer,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "could not read {}: {e}",
+                    record.join("gitdir").display()
+                ))
+            }
         };
         if pointer.len() > 4096 {
             continue;
@@ -2624,7 +2633,7 @@ fn find_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<Option<P
 
 /// Directory under the git common directory that holds worktrees moved aside
 /// for deletion, and the markers of the ones moved beside their old place.
-const TEARDOWN_DIR: &str = "gitpulse-teardown";
+pub(crate) const TEARDOWN_DIR: &str = "gitpulse-teardown";
 /// Leftovers one sweep deletes at most, so a pile of them cannot hold up the
 /// teardown that happened to find them. The rest wait for the next one.
 const SWEEP_CAP: usize = 16;
@@ -2965,7 +2974,36 @@ impl SweepReport {
 /// never one that a worktree record still points into or that this process is
 /// deleting now or that another process made less than
 /// [`FOREIGN_ASIDE_MIN_AGE`] ago, and never a symlink.
+///
+/// It runs at the start of every teardown, so a repository with nothing to
+/// sweep pays one `read_dir` of a directory that usually does not exist. It
+/// fails closed: when the worktree records cannot be read, so that "a record
+/// points into it" cannot be checked, it deletes nothing and says so.
 fn sweep_teardown_asides(repo: &Path) -> SweepReport {
+    sweep_teardown_asides_from(repo, &|holding| {
+        Ok(std::fs::read_dir(holding)?
+            .map(|entry| {
+                entry.map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.path(),
+                    )
+                })
+            })
+            .collect())
+    })
+}
+
+/// A listing of the holding directory: `(name, path)` per entry, or the error
+/// reading that entry, or the error listing it at all.
+type EntryListing = std::io::Result<Vec<std::io::Result<(String, PathBuf)>>>;
+
+/// [`sweep_teardown_asides`] with the listing of the holding directory passed
+/// in, so a test can hand it an entry that failed to read.
+fn sweep_teardown_asides_from(
+    repo: &Path,
+    list_entries: &dyn Fn(&Path) -> EntryListing,
+) -> SweepReport {
     let mut report = SweepReport::default();
     let holding = match resolve_git_common_dir(repo) {
         Ok(common) => common.join(TEARDOWN_DIR),
@@ -2976,7 +3014,7 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
             return report;
         }
     };
-    let listing = match std::fs::read_dir(&holding) {
+    let listing = match list_entries(&holding) {
         Ok(listing) => listing,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return report,
         Err(e) => {
@@ -2989,8 +3027,17 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
     };
     // (entry, the directory to delete, the marker to delete with it)
     let mut leftovers: Vec<(PathBuf, Option<PathBuf>, u32, u128)> = Vec::new();
-    for entry in listing.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for entry in listing {
+        let (name, path) = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.problems.push(format!(
+                    "an entry of {} could not be read, so it was not looked at: {e}",
+                    holding.display()
+                ));
+                continue;
+            }
+        };
         let (stem, is_marker) = match name.strip_suffix(".sibling") {
             Some(stem) => (stem, true),
             None => (name.as_str(), false),
@@ -2998,7 +3045,6 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
         let Some((pid, nanos)) = parse_aside_name(stem) else {
             continue;
         };
-        let path = entry.path();
         if is_marker {
             leftovers.push((path.clone(), Some(path), pid, nanos));
         } else {
@@ -3006,7 +3052,27 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
         }
     }
     leftovers.sort();
-    let records = worktree_records(repo).unwrap_or_default();
+    // No `worktrees` directory is no linked worktrees. Any other failure to
+    // read the records leaves "a record points into it" unchecked, and
+    // nothing is deleted on a pass that cannot check it.
+    let records = match worktree_records(repo) {
+        Ok(records) => records,
+        Err(e) => {
+            let no_records = holding.parent().is_some_and(|common| {
+                matches!(
+                    std::fs::symlink_metadata(common.join("worktrees")),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound
+                )
+            });
+            if !no_records {
+                report.problems.push(format!(
+                    "the worktree records could not be read, so no leftover was deleted this time: {e}"
+                ));
+                return report;
+            }
+            Vec::new()
+        }
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
@@ -3431,7 +3497,6 @@ pub fn prune_worktree_argv() -> Vec<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::doc_lazy_continuation)]
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
@@ -7828,7 +7893,7 @@ some-future-field whatever
     }
 
     /// 1. Sweep safety: a hard link and symlinks inside an aside are unlinked,
-    /// and what they reach is untouched.
+    ///    and what they reach is untouched.
     #[cfg(unix)]
     #[test]
     fn adv_sweep_unlinks_links_without_touching_what_they_reach() {
@@ -7877,8 +7942,8 @@ some-future-field whatever
     }
 
     /// 1. Pattern-looking things the sweep does not own are never visited: a
-    /// nested one under a user's folder in the holding directory, and a
-    /// sibling-pattern directory with no marker beside a worktree.
+    ///    nested one under a user's folder in the holding directory, and a
+    ///    sibling-pattern directory with no marker beside a worktree.
     #[test]
     fn adv_sweep_ignores_pattern_names_outside_its_own_listing() {
         let (dir, wt) = teardown_fixture(None);
@@ -7899,7 +7964,7 @@ some-future-field whatever
     }
 
     /// 1. A hostile or corrupt marker: `/`, a home directory, a path through
-    /// `..`, a symlink with a correct name, a name with a trailing newline.
+    ///    `..`, a symlink with a correct name, a name with a trailing newline.
     #[cfg(unix)]
     #[test]
     fn adv_sweep_refuses_hostile_markers() {
@@ -7933,9 +7998,9 @@ some-future-field whatever
     }
 
     /// 1. A marker that names a correctly spelled directory in a user's own
-    /// folder deletes it: the sweep checks the spelling, not that the place
-    /// is one a teardown could have used. Needs a planted or corrupt marker
-    /// under the git directory.
+    ///    folder deletes it: the sweep checks the spelling, not that the place
+    ///    is one a teardown could have used. Needs a planted or corrupt marker
+    ///    under the git directory.
     #[test]
     fn adv_a_marker_cannot_make_the_sweep_delete_a_users_own_pattern_named_folder() {
         let (dir, _wt) = teardown_fixture(None);
@@ -7958,7 +8023,7 @@ some-future-field whatever
     }
 
     /// 1. An aside whose name says it was made in the future (a clock that
-    /// went backwards, or a bad name) is not held off forever.
+    ///    went backwards, or a bad name) is not held off forever.
     #[test]
     fn adv_a_foreign_aside_dated_far_in_the_future_is_eventually_swept() {
         let (dir, _wt) = teardown_fixture(None);
@@ -7983,8 +8048,8 @@ some-future-field whatever
     }
 
     /// 1. Two sweeps at once (two threads here; two processes behave the same
-    /// way) over the same leftovers must both come back clean: the one that
-    /// loses the race is not a failure to report.
+    ///    way) over the same leftovers must both come back clean: the one that
+    ///    loses the race is not a failure to report.
     #[test]
     fn adv_concurrent_sweeps_do_not_report_each_other_as_failures() {
         let (dir, _wt) = teardown_fixture(None);
@@ -8020,7 +8085,7 @@ some-future-field whatever
     }
 
     /// 1. An aside this process is deleting right now is not swept, marker or
-    /// no marker, even when its name is old enough for any other rule.
+    ///    no marker, even when its name is old enough for any other rule.
     #[test]
     fn adv_an_aside_in_flight_in_this_process_is_not_swept() {
         let (dir, _wt) = teardown_fixture(None);
@@ -8083,7 +8148,7 @@ some-future-field whatever
     }
 
     /// 2. A long final component (the holding-directory aside has its own short
-    /// name, so the length of the worktree's does not matter).
+    ///    name, so the length of the worktree's does not matter).
     #[test]
     fn adv_a_very_long_worktree_name_takes_the_split() {
         let (dir, _wt) = teardown_fixture(None);
@@ -8115,7 +8180,7 @@ some-future-field whatever
     }
 
     /// 2. A worktree holding a nested repository: forced, it goes whole; not
-    /// forced, git's refusal applies and nothing moves.
+    ///    forced, git's refusal applies and nothing moves.
     #[test]
     fn adv_a_nested_repository_inside_the_worktree() {
         let (dir, wt) = teardown_fixture(None);
@@ -8149,7 +8214,7 @@ some-future-field whatever
     }
 
     /// 2. A worktree path that is a symlink to the worktree: the real
-    /// directory goes, as `git worktree remove` of the resolved path did.
+    ///    directory goes, as `git worktree remove` of the resolved path did.
     #[cfg(unix)]
     #[test]
     fn adv_a_symlinked_worktree_path_removes_the_real_directory() {
@@ -8165,8 +8230,8 @@ some-future-field whatever
     }
 
     /// 2. Removing the checkout the call is made from (repo = the worktree
-    /// itself) leaves no half state: the directory is there exactly when git
-    /// lists it.
+    ///    itself) leaves no half state: the directory is there exactly when git
+    ///    lists it.
     #[test]
     fn adv_removing_the_worktree_the_call_is_rooted_in_is_not_half_done() {
         let (dir, wt) = teardown_fixture(None);
@@ -8202,7 +8267,7 @@ some-future-field whatever
     }
 
     /// 2. A worktree whose parent is read-only cannot be renamed out; it falls
-    /// back to git's removal and leaves no aside or marker behind.
+    ///    back to git's removal and leaves no aside or marker behind.
     #[cfg(unix)]
     #[test]
     fn adv_a_read_only_parent_falls_back_and_leaves_nothing_behind() {
@@ -8269,8 +8334,8 @@ some-future-field whatever
     }
 
     /// 3. Crash after the rename and before the record is removed: the aside
-    /// is swept by the next call, and the record left behind is consistent
-    /// (listed as a missing directory), clearable by prune.
+    ///    is swept by the next call, and the record left behind is consistent
+    ///    (listed as a missing directory), clearable by prune.
     #[test]
     fn adv_crash_between_rename_and_record_removal_recovers() {
         let (dir, wt) = teardown_fixture(None);
@@ -8310,7 +8375,7 @@ some-future-field whatever
     }
 
     /// 3. The retry of a teardown whose worktree directory was moved aside by
-    /// a crash must not be stuck: either it finishes, or it says what to do.
+    ///    a crash must not be stuck: either it finishes, or it says what to do.
     #[test]
     fn adv_the_same_removal_retried_after_a_crash_finishes() {
         let (dir, wt) = teardown_fixture(None);
@@ -8330,7 +8395,7 @@ some-future-field whatever
     }
 
     /// 3. Crash after the record is gone and before the delete: the aside is
-    /// all that is left, and the sweep takes it.
+    ///    all that is left, and the sweep takes it.
     #[test]
     fn adv_crash_after_record_removal_leaves_only_an_aside_the_sweep_takes() {
         let (dir, wt) = teardown_fixture(None);
@@ -8363,7 +8428,7 @@ some-future-field whatever
     }
 
     /// 4. The panel's removal with a failing delete: removed, unlisted,
-    /// the error names the aside.
+    ///    the error names the aside.
     #[test]
     fn adv_panel_removal_with_a_failing_delete_reports_the_path() {
         let (dir, wt) = teardown_fixture(None);
@@ -8384,8 +8449,8 @@ some-future-field whatever
     }
 
     /// 4. A sweep problem (a symlinked leftover) is carried in `cleanup_error`
-    /// of a removal whose own delete succeeded. The field is "something to
-    /// clean up", not "this delete failed".
+    ///    of a removal whose own delete succeeded. The field is "something to
+    ///    clean up", not "this delete failed".
     #[cfg(unix)]
     #[test]
     fn adv_a_sweep_problem_shows_on_an_unrelated_successful_removal() {
@@ -8405,8 +8470,8 @@ some-future-field whatever
     }
 
     /// 5. When the deleter starts: the lock is free, the branch is already
-    /// deleted (under the lock), the lane is unlisted, and the post-merge hook
-    /// has not run yet; it runs after the delete.
+    ///    deleted (under the lock), the lane is unlisted, and the post-merge hook
+    ///    has not run yet; it runs after the delete.
     #[test]
     fn adv_lock_released_before_delete_branch_deleted_under_it_hooks_after() {
         let marker_dir = tempfile::tempdir().unwrap();
@@ -8446,7 +8511,7 @@ some-future-field whatever
     }
 
     /// 5. Two removals of the same lane at once: one wins, the other is
-    /// refused cleanly, and nothing is left behind.
+    ///    refused cleanly, and nothing is left behind.
     #[test]
     fn adv_two_removals_of_one_lane_leave_nothing_behind() {
         let (dir, wt) = teardown_fixture(None);
@@ -8524,7 +8589,7 @@ some-future-field whatever
     }
 
     /// 2. Cross-device: the aside goes beside the lane with a marker in the
-    /// holding directory, both are cleaned up after the delete.
+    ///    holding directory, both are cleaned up after the delete.
     #[cfg(target_os = "macos")]
     #[test]
     fn adv_cross_device_worktree_gets_a_sibling_aside_and_marker() {
@@ -8602,8 +8667,8 @@ some-future-field whatever
     }
 
     /// 2. Cross-device with a final name so long the sibling aside's name
-    /// would exceed NAME_MAX: the rename cannot happen, so the removal is
-    /// in place as before, and no marker is left.
+    ///    would exceed NAME_MAX: the rename cannot happen, so the removal is
+    ///    in place as before, and no marker is left.
     #[cfg(target_os = "macos")]
     #[test]
     fn adv_cross_device_name_too_long_for_a_sibling_falls_back() {
@@ -8616,5 +8681,97 @@ some-future-field whatever
         assert!(asides.is_empty(), "{asides:?}");
         assert!(teardown_entries(dir.path()).is_empty(), "marker leaked");
         assert!(!lane.exists() && !is_listed(dir.path(), &lane));
+    }
+
+    /// Records that cannot be read leave "a record points into it" unchecked,
+    /// so the sweep deletes nothing that pass and says why.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_deletes_nothing_when_the_worktree_records_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-31-1");
+        let records = resolve_git_common_dir(dir.path())
+            .unwrap()
+            .join("worktrees");
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(report.problems[0].contains("records"), "{report:?}");
+        assert!(aside.join("build/out.o").exists(), "deleted blind");
+        // Readable again, the same pass succeeds.
+        assert_eq!(sweep_teardown_asides(dir.path()).removed, 1);
+    }
+
+    /// A record whose `gitdir` cannot be read is not skipped as pointing
+    /// nowhere: that could be the one pointing into the aside.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_deletes_nothing_when_one_records_gitdir_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-32-1");
+        let records = resolve_git_common_dir(dir.path())
+            .unwrap()
+            .join("worktrees");
+        let record = std::fs::read_dir(&records)
+            .unwrap()
+            .flatten()
+            .next()
+            .expect("the fixture's lane has a record")
+            .path();
+        let gitdir = record.join("gitdir");
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            (report.removed, report.problems.len()),
+            (0, 1),
+            "{report:?}"
+        );
+        assert!(aside.exists());
+    }
+
+    /// No `worktrees` directory means no linked worktrees, which is not a
+    /// failure to read them: the sweep goes ahead.
+    #[test]
+    fn the_sweep_goes_ahead_when_there_are_no_linked_worktrees() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-33-1");
+        let records = resolve_git_common_dir(dir.path())
+            .unwrap()
+            .join("worktrees");
+        std::fs::remove_dir_all(&records).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(
+            (report.removed, report.problems.len()),
+            (1, 0),
+            "{report:?}"
+        );
+        assert!(!aside.exists());
+    }
+
+    /// A directory entry that fails to read is reported, and the entries that
+    /// did read are still looked at.
+    #[test]
+    fn the_sweep_reports_a_directory_entry_it_could_not_read() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-34-1");
+        let path = aside.clone();
+        let report = sweep_teardown_asides_from(dir.path(), &|_| {
+            Ok(vec![
+                Err(std::io::Error::other("injected: entry unreadable")),
+                Ok(("1-34-1".to_string(), path.clone())),
+            ])
+        });
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(
+            report.problems[0].contains("entry unreadable"),
+            "{report:?}"
+        );
+        assert!(!aside.exists());
     }
 }
