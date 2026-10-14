@@ -394,7 +394,7 @@
         "get_file_blob 1 KB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 119170,
+          "min_ns": 134583,
           "counters": {
             "bytes": 1024
           }
@@ -402,7 +402,7 @@
         "get_file_blob 1 MB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 1100000,
+          "min_ns": 1235125,
           "counters": {
             "bytes": 1048576
           }
@@ -410,7 +410,7 @@
         "get_file_blob 8 MB": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 8300000,
+          "min_ns": 9203375,
           "counters": {
             "bytes": 8388608
           }

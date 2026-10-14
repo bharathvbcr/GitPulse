@@ -962,27 +962,27 @@ dropped, 64 paths recorded (the window's bound; `truncated`), 3 change classes.
 Opening and saving a file (ft-f16fad35), `repo_read` rows added in the same
 bench. One text file in a clean 10-file repository; the save alternates two
 same-size texts so the publish is real. Three interleaved A/B pairs (before,
-after, before, ...) of N = 15 each, min over the three, host load 0.2x to 0.6x
-(4.5 to 10.3 on 18 CPUs). "Before" is `bl/integrate-1013`; "after" adds the
-base token a save is judged against: one digest pass over the bytes
-`get_file_blob` reads, and one over the bytes the save's entry transaction
-reads.
+after, before, ...) of N = 15 each, min over the three, on the shipped build
+(integration head c13d0af8, with the per-block lane mixing and the `as_chunks`
+loop), host load 6.5 to 21.9 on 18 CPUs. "Before" is the release bench binary
+built without the base token; "after" adds the base token a save is judged
+against: one digest pass over the bytes `get_file_blob` reads, and one over the
+bytes the save's entry transaction reads. The `get_file_blob` gap held in every
+pair (1 MB: 0.966/1.239, 0.966/1.251, 1.117/1.235 ms; 8 MB: 7.64/9.22,
+7.64/9.20, 8.46/9.62 ms), while the save rows moved in both directions.
 
 | row | before (min) | after (min) | change |
 | --- | --- | --- | --- |
-| get_file_blob 1 KB | 118.8 us | 119.2 us | +0.3% |
-| get_file_blob 1 MB | 0.961 ms | 1.10 ms | +14% |
-| get_file_blob 8 MB | 7.53 ms | 8.30 ms | +10% |
-| save_edited_text 1 KB | 8.02 ms | 6.35 ms | within run-to-run spread (p50 10.4 to 11.7 ms either way) |
-| save_edited_text 1 MB | 8.72 ms | 8.65 ms | -0.8% |
-| save_edited_text 8 MB | 18.12 ms | 19.00 ms | +4.9% |
+| get_file_blob 1 KB | 129.9 us | 134.6 us | +3.6% |
+| get_file_blob 1 MB | 0.966 ms | 1.235 ms | +27.9% |
+| get_file_blob 8 MB | 7.64 ms | 9.20 ms | +20.4% |
+| save_edited_text 1 KB | 7.63 ms | 6.97 ms | within run-to-run spread |
+| save_edited_text 1 MB | 8.74 ms | 8.58 ms | -1.9% |
+| save_edited_text 8 MB | 18.40 ms | 17.87 ms | within run-to-run spread |
 
-These rows were measured on the build before the final `as_chunks` rewrite of
-the digest loop (same arithmetic, written to satisfy clippy). Two further sets
-of three interleaved pairs were then taken on the final build, but the host had
-drifted by then (load 6 to 47 on 18 CPUs, and the unchanged "before" binary
-itself went from 7.4 ms to 11 to 15 ms at 8 MB), so they cannot be compared with
-the table and are not used; the final build is unmeasured in a quiet window.
+An earlier build without the per-block lane mixing measured +14% / +10%; the
+mixing that closes the same-lane collision (see `digest` in
+`diff/conflict_fs.rs`) costs the difference.
 The cost applies only to the editor open (`cmd_get_file_blob`, whose base names
 the bytes the user saw). View-only reads (`get_file_content`, the code graph's
 file text) use `get_file_blob_view` and skip the digest pass.
@@ -995,8 +995,8 @@ of the bytes and has to be computed from the bytes the open read, because the
 editor's textarea returns LF text while the save re-adds CRLF, so only the
 backend can say what is on disk; a stat (mtime and size) misses a same-size
 rewrite inside one timestamp tick and reports a conflict for a bare `touch`.
-The remaining cost is one pass over memory already read, about 0.8 ms per 8 MiB
-(roughly 10 GB/s). It is bounded by `MAX_FILE_BYTES` (8 MiB). The first digest,
+The remaining cost is one pass over memory already read, about 1.6 ms per 8 MiB
+(roughly 5 GB/s), once per file opened in the editor. It is bounded by `MAX_FILE_BYTES` (8 MiB). The first digest,
 FNV-1a, cost +130% (7.58 ms to 17.5 ms at 8 MiB) because its multiply is a
 serial chain per byte; the shipped digest takes four lanes a word at a time.
 It is an accidental-change detector, not collision-resistant against a crafted
