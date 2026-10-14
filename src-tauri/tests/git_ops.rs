@@ -2773,7 +2773,7 @@ fn commit_details_assigns_every_format_field_to_its_own_slot() {
 /// The reflog reader splits three positional fields out of one `--format`
 /// string, `%H %gd %gs`, and reads the move's time out of `%gd` rendered with
 /// `--date=unix`. The only existing coverage asserted the list was
-/// non-empty, so every one of those four could have swapped places without a
+/// non-empty, so every one of those three could have swapped places without a
 /// test noticing — a selector rendered as a commit id, a timestamp parsed out
 /// of hex and silently falling back to 0.
 ///

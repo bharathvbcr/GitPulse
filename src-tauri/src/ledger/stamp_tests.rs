@@ -156,8 +156,16 @@ fn a_detail_that_already_names_a_key_is_not_given_it_twice() {
 /// takes the first.
 #[test]
 fn an_escaped_spelling_of_a_stamp_key_is_not_given_twice() {
-    let detail = r#"{"occurred_at":"FORGED","task_basis":"FORGED","occurred_at_basis":"FORGED"}"#;
-    eprintln!("spliced: {:?}", redact_detail(Some(detail), Some(&stamp())));
+    // The JSON text carries a literal backslash-u: `occurred_at` is
+    // `occurred_at`, `task_basis` is `task_basis`.
+    let detail = "{\"occurred\\u005fat\":\"FORGED\",\"task\\u005fbasis\":\"FORGED\",\"occurred\\u005fat\\u005fbasis\":\"FORGED\"}";
+    assert!(
+        detail.contains("\\u005f"),
+        "the fixture must hold a real escape"
+    );
+    let spliced = redact_detail(Some(detail), Some(&stamp())).unwrap();
+    assert!(!spliced.contains("FORGED"), "{spliced}");
+    assert_eq!(spliced.matches("occurred_at\"").count(), 1, "{spliced}");
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path().canonicalize().unwrap();
     let repo = repo.to_str().unwrap().to_string();
@@ -182,6 +190,31 @@ fn an_escaped_spelling_of_a_stamp_key_is_not_given_twice() {
         first_wins, "2026-09-01T12:00:05.250Z",
         "SQL readers see the caller's value, not the stamp"
     );
+    let stored: String = with_conn(&repo, |conn| {
+        conn.query_row(
+            "SELECT detail_json FROM events WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|e| LedgerError::new("q", e.to_string()))
+    })
+    .unwrap();
+    assert_eq!(stored.matches("occurred_at\"").count(), 1, "{stored}");
+    assert_eq!(stored.matches("task_basis\"").count(), 1, "{stored}");
+    assert!(
+        !stored.contains("FORGED") && !stored.contains("\\u005f"),
+        "{stored}"
+    );
+}
+
+/// The fast path trusts its caller: brace-wrapped text that is not a single
+/// JSON object is a bug in the caller, and a debug build says so. A release
+/// build does not parse it (that would cost back what the splice saves).
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "not a JSON object")]
+fn brace_text_that_is_not_an_object_is_a_caller_bug_in_debug() {
+    let _ = redact_detail(Some("{}{}"), Some(&stamp()));
 }
 
 /// Anything that is not a JSON object carries no stamp, takes no splice, and
@@ -210,6 +243,16 @@ fn a_detail_that_is_not_an_object_never_panics_leaks_or_drops_the_row() {
         &trailing,
     ];
     for detail in cases {
+        // Brace-wrapped text that is not one object takes the unparsed fast
+        // path, where a debug build asserts (callers pass serde-built objects);
+        // `brace_text_that_is_not_an_object_is_a_caller_bug_in_debug` pins that.
+        if cfg!(debug_assertions) && detail.starts_with('{') && detail.ends_with('}') {
+            if serde_json::from_str::<serde_json::Value>(detail).is_ok_and(|v| v.is_object()) {
+                // fall through: a real object
+            } else {
+                continue;
+            }
+        }
         let repo = tempfile::tempdir().unwrap();
         let repo = repo.path().canonicalize().unwrap();
         let repo = repo.to_str().unwrap().to_string();

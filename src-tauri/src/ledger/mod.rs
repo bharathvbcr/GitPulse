@@ -309,18 +309,27 @@ impl EventStamp {
 ///
 /// A well-formed stamp is spliced onto the redacted object: the detail is
 /// redacted without the three keys, and their validated members are appended.
-/// Anything else (a stamp that fails validation, or a detail that is not a JSON
-/// object) takes the closed path: the keys go into the object first, and the
-/// whole of it is redacted. A detail that is not an object carries no stamp.
+/// Anything else takes the closed path: a stamp that fails validation, or a
+/// detail that names a stamp key (spelled plainly or through a `\u` escape,
+/// which any JSON parser reads as the same key). There the keys go into the
+/// parsed object, overwriting, and the whole of it is redacted. A detail that
+/// does not parse as a JSON object carries no stamp on that path.
+///
+/// Callers pass serde-built objects. The fast path does not parse: text that
+/// starts with `{` and ends with `}` is spliced as it is, so malformed brace
+/// text (`{}{}`, `{not json}`) is not validated there, and a debug build
+/// asserts that the redacted text is an object. A release-mode parse would cost
+/// back what the splice saves.
 fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<String> {
     let Some(stamp) = stamp else {
         return detail.map(redact::text);
     };
     // A detail that already names one of the keys would be given it twice.
     let names_a_key = detail.is_some_and(|text| {
-        ["\"occurred_at", "\"task_basis\""]
-            .iter()
-            .any(|key| text.contains(key))
+        text.contains("\\u")
+            || ["\"occurred_at", "\"task_basis\""]
+                .iter()
+                .any(|key| text.contains(key))
     });
     if stamp.is_well_formed() && !names_a_key {
         let redacted = detail.map_or_else(|| "{}".to_string(), redact::text);
@@ -329,6 +338,15 @@ fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<Str
             .strip_prefix('{')
             .and_then(|rest| rest.strip_suffix('}'))
         {
+            // Nesting past serde's own limit is still an object (the redactor
+            // reads it by other means); only a real syntax error is a bug.
+            debug_assert!(
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(value) => value.is_object(),
+                    Err(e) => e.to_string().contains("recursion limit"),
+                },
+                "the splice was handed text that is not a JSON object: {trimmed}"
+            );
             let members = stamp.members();
             let members = &members[1..members.len() - 1];
             let separator = if body.trim().is_empty() { "" } else { "," };
