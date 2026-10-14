@@ -24,7 +24,7 @@ import { interfaceStore } from "../stores/interfaceStore";
 import { askConfirm } from "../stores/modalStore";
 import { repoStore, type ResolvedRepo } from "../stores/repoStore";
 import type { Guarded } from "../stores/harnessStore";
-import type { MergeTeardownResult, WorktreeInfo } from "../branches/types";
+import type { MergeTeardownResult, WorktreeInfo, WorktreeRemoval } from "../branches/types";
 import { MergeTeardownFailure, readMergeTeardownError } from "../branches/mergeTeardown";
 import { familyFromCommonDir } from "../repos/repoFamily";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
@@ -146,6 +146,8 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
+  if (merged.cleanup_error) parts.push(merged.cleanup_error);
+  if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { message: parts.join(" ") };
 }
@@ -207,6 +209,8 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
+  if (merged.cleanup_error) parts.push(merged.cleanup_error);
+  if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { head: expectedHead, message: parts.join(" ") };
 }
@@ -230,9 +234,11 @@ export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeA
   if (!approved) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
   const force = dirty !== null && dirty > 0;
-  await invoke("cmd_remove_worktree", { repoPath: root, targetPath: run.cwd, force });
+  const removed = await invoke<Guarded<WorktreeRemoval>>("cmd_remove_worktree", { repoPath: root, targetPath: run.cwd, force });
   await closeStranded(run.cwd);
   const parts = ["The worktree was removed."];
+  if (removed?.output?.cleanup_error) parts.push(removed.output.cleanup_error);
+  if (removed?.output?.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${removed.output.sweep_problems.join("; ")}`);
   if (own.branch?.startsWith("gitpulse/")) {
     try {
       await invoke("cmd_delete_branch", { repoPath: root, branchName: own.branch, force: false });

@@ -306,6 +306,24 @@ pub(super) fn provision(
     Ok(provisioned)
 }
 
+/// What a removal left to say beyond "removed": the files that could not be
+/// deleted and the leftovers of earlier removals the sweep could not clear.
+/// Logged, and returned for a caller that reports it. `None` when nothing.
+fn removal_notice(
+    path: &str,
+    removal: &crate::engine::worktree::WorktreeRemoval,
+) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    parts.extend(removal.cleanup_error.as_deref());
+    parts.extend(removal.sweep_problems.iter().map(String::as_str));
+    if parts.is_empty() {
+        return None;
+    }
+    let notice = parts.join("; ");
+    log::warn!(target: "workbench", "agent worktree {path} was removed, but: {notice}");
+    Some(notice)
+}
+
 /// What [`reclaim`] did with an unclaimed attempt's worktree.
 pub(super) struct Reclaimed {
     path: String,
@@ -313,6 +331,10 @@ pub(super) struct Reclaimed {
     removed: bool,
     branch_deleted: bool,
     kept_because: Option<String>,
+    /// The worktree is removed but its files could not all be deleted, or a
+    /// leftover of an earlier removal could not be cleared; see
+    /// [`removal_notice`].
+    cleanup_error: Option<String>,
 }
 
 impl Reclaimed {
@@ -323,6 +345,7 @@ impl Reclaimed {
             removed: false,
             branch_deleted: false,
             kept_because: Some(why),
+            cleanup_error: None,
         }
     }
 
@@ -334,6 +357,7 @@ impl Reclaimed {
             "removed": self.removed,
             "branch_deleted": self.branch_deleted,
             "kept_because": self.kept_because,
+            "cleanup_error": self.cleanup_error,
         })
     }
 
@@ -434,11 +458,13 @@ fn reclaim_unshed(
     }
     let remove = crate::engine::worktree::remove_worktree_argv(&path, false);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
-    if let Err(why) = crate::harness::guard_command(&source, &refs)
+    let removal = match crate::harness::guard_command(&source, &refs)
         .and_then(|_| crate::engine::worktree::remove_worktree(&source, &path, false))
     {
-        return Some(Reclaimed::kept(&path, &branch, why));
-    }
+        Ok(removal) => removal,
+        Err(why) => return Some(Reclaimed::kept(&path, &branch, why)),
+    };
+    let cleanup_error = removal_notice(&path, &removal);
     let delete = ["git", "branch", "-d", branch.as_str()];
     let deleted = crate::harness::guard_command(&source, &delete).and_then(|_| {
         crate::engine::git_writer::GitWriter::delete_branch(&source, &branch, false).map(|_| ())
@@ -452,6 +478,7 @@ fn reclaim_unshed(
         path,
         branch,
         removed: true,
+        cleanup_error,
     })
 }
 
@@ -464,7 +491,11 @@ pub(super) fn discard(provisioned: &Provisioned) -> Result<(), String> {
     let remove = crate::engine::worktree::remove_worktree_argv(&provisioned.path, true);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
     crate::harness::guard_command(&provisioned.source, &refs)?;
-    crate::engine::worktree::remove_worktree(&provisioned.source, &provisioned.path, true)?;
+    let removal =
+        crate::engine::worktree::remove_worktree(&provisioned.source, &provisioned.path, true)?;
+    // The worktree is gone; files left to delete are not a failed discard, but
+    // they are not silent either.
+    removal_notice(&provisioned.path, &removal);
     let delete = ["git", "branch", "-d", provisioned.branch.as_str()];
     crate::harness::guard_command(&provisioned.source, &delete)?;
     crate::engine::git_writer::GitWriter::delete_branch(

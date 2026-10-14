@@ -101,7 +101,7 @@ pub async fn cmd_remove_worktree(
     target_path: String,
     force: bool,
     workbench: State<'_, crate::workbench::WorkbenchState>,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<crate::engine::worktree::WorktreeRemoval>, String> {
     let workbench = workbench.inner().clone();
     off_thread(move || {
         remove_worktree_guarded(
@@ -128,15 +128,15 @@ pub(crate) fn remove_worktree_guarded(
     target_path: &str,
     force: bool,
     gate: WorktreeGate<'_>,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<crate::engine::worktree::WorktreeRemoval>, String> {
     // A task run's agent, a dock tab's agent or any process may be working in
     // it; removal would pull its files out from under it.
     workbench.refuse_if_in_use(target_path)?;
     let argv_owned = crate::engine::worktree::remove_worktree_argv(target_path, force);
     let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
     let policy = gate(repo_path, &refs)?;
-    crate::engine::worktree::remove_worktree(repo_path, target_path, force)?;
-    Ok(Guarded { policy, output: () })
+    let output = crate::engine::worktree::remove_worktree(repo_path, target_path, force)?;
+    Ok(Guarded { policy, output })
 }
 
 #[tauri::command(async)]

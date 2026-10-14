@@ -784,6 +784,9 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     if is_fsmonitor_daemon_path(path, internal_roots) {
         return true;
     }
+    if is_teardown_aside_path(path, internal_roots) {
+        return true;
+    }
     if is_other_checkout_state(path, internal_roots) {
         return true;
     }
@@ -850,6 +853,22 @@ fn is_fsmonitor_daemon_path(path: &Path, internal_roots: &[PathBuf]) -> bool {
         first.is_some_and(|c| c.as_os_str() == "worktrees")
             && components.next().is_some()
             && is_daemon(components.next())
+    })
+}
+
+/// `gitpulse-teardown/` directly below a git directory (the common one, for a
+/// linked worktree): where a worktree teardown moves the lane to delete it
+/// (`engine::worktree::TEARDOWN_DIR`). The delete is one unlink per file, tens
+/// of thousands of them, in a directory that is watched recursively and that
+/// no git state lives in.
+fn is_teardown_aside_path(path: &Path, internal_roots: &[PathBuf]) -> bool {
+    internal_roots.iter().any(|root| {
+        path.strip_prefix(root).is_ok_and(|relative| {
+            relative
+                .components()
+                .next()
+                .is_some_and(|c| c.as_os_str() == crate::engine::worktree::TEARDOWN_DIR)
+        })
     })
 }
 
@@ -4276,6 +4295,43 @@ mod tests {
                 "real edits must still trigger after the noise gate ({n} probes)"
             );
         }
+        stop.stop();
+    }
+
+    /// A worktree teardown moves the lane into `<git dir>/gitpulse-teardown/`
+    /// and deletes it there: tens of thousands of unlinks under a directory
+    /// the watcher watches recursively. None of it is a change to the
+    /// repository, so an aside made and deleted there emits nothing.
+    #[test]
+    fn watch_loop_teardown_aside_churn_emits_nothing() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+        let git_dir = root.join(".git");
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+        await_watcher_quiescence(&rx);
+
+        let aside = git_dir.join("gitpulse-teardown").join("1-2-3");
+        let mut leaked = None;
+        for round in 0..20 {
+            std::fs::create_dir_all(aside.join("build/obj")).unwrap();
+            for n in 0..50 {
+                std::fs::write(aside.join(format!("build/obj/f{n}")), format!("{round}")).unwrap();
+            }
+            std::fs::remove_dir_all(&aside).unwrap();
+            if let Ok(path) = rx.recv_timeout(Duration::from_millis(50)) {
+                leaked = Some(path);
+                break;
+            }
+        }
+        if leaked.is_none() {
+            // Longer than the debounce's anti-starvation bound: an event that
+            // was accepted would be forced out by now.
+            leaked = rx.recv_timeout(Duration::from_secs(3)).ok();
+        }
+        assert!(
+            leaked.is_none(),
+            "a teardown aside under the git directory must not trigger repo-changed (got {leaked:?})"
+        );
         stop.stop();
     }
 

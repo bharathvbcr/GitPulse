@@ -337,6 +337,11 @@ name = "live_index"
 harness = false
 test = false
 
+[[bench]]
+name = "worktree_teardown"
+harness = false
+test = false
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"

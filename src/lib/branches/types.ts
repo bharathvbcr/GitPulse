@@ -283,6 +283,29 @@ export interface MergeTeardownResult {
   hook_error: string | null;
   /** Hooks the repository lists were not approved, so did not run. */
   hook_notice?: string | null;
+  /**
+   * The worktree is removed (`worktree_removed` true) but the files moved
+   * aside for deletion could not all be deleted, or a leftover from an earlier
+   * teardown could not be cleared. Names the path; the next teardown retries.
+   */
+  cleanup_error?: string | null;
+  /**
+   * Leftovers of earlier teardowns that the sweep before this one could not
+   * clear (and a cap that was hit): about the repository, not this removal.
+   * At most 17 short notes.
+   */
+  sweep_problems?: string[];
+}
+
+/**
+ * `engine::worktree::WorktreeRemoval`: what the Worktrees panel's delete
+ * (`cmd_remove_worktree`) returns as its `output`. The worktree is removed
+ * whenever the call resolved; this is only about the files after it.
+ */
+export interface WorktreeRemoval {
+  cleanup_error?: string | null;
+  /** As on {@link MergeTeardownResult.sweep_problems}. */
+  sweep_problems?: string[];
 }
 
 /**
@@ -347,10 +370,16 @@ export function worktreeSetupNotices(
     removal_error?: string | null;
     branch_deleted?: boolean;
     branch_error?: string | null;
+    cleanup_error?: string | null;
+    sweep_problems?: string[];
   },
-  when: "create" | "merge",
+  when: "create" | "merge" | "remove",
 ): string[] {
   const notices: string[] = [];
+  if (when !== "create" && done.cleanup_error) notices.push(done.cleanup_error);
+  if (when !== "create" && done.sweep_problems?.length) {
+    notices.push(`Leftover files from an earlier worktree removal could not be cleared: ${done.sweep_problems.join("; ")}`);
+  }
   if (when === "merge" && done.worktree_removed === false) {
     notices.push(`Merged, but the worktree was not removed: ${done.removal_error ?? "no reason was given"}. The merge stands; remove the worktree when it is free.`);
   } else if (when === "merge" && done.branch_deleted === false) {
