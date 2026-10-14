@@ -2240,18 +2240,27 @@ fn normalize_legacy_event(
     event.verdict_json = event.verdict_json.as_deref().map(redact::text);
     event.before_ref = event.before_ref.as_deref().map(redact::text);
     event.after_ref = event.after_ref.as_deref().map(redact::text);
-    // A row from before the append cap can hold an object of any length. It
-    // is capped through the function every writer uses. A row already within
-    // the cap is only redacted: its detail may carry the record of a cut a
-    // newer writer made, which is the server's own and must survive the copy.
-    if event.object.as_deref().is_some_and(cap::exceeds_object_cap) {
+    // Every row is capped through the function every writer uses, which also
+    // drops any `object_truncated` a detail carries: the key is the server's.
+    // The one exception is a row that is itself a cut a newer writer made,
+    // judged on the REDACTED object (redaction can lengthen one past the cap)
+    // and on the record being exactly what that writer writes
+    // ([`cap::recorded_cut_is_genuine`]). Its record survives the copy; a
+    // forged or inconsistent one does not, and on a `reflog.*` row a forged
+    // hash would have changed the dedupe key and had the entry recorded again
+    // on every ingest.
+    let redacted_object = event.object.as_deref().map(redact::text);
+    let genuine = redacted_object
+        .as_deref()
+        .is_some_and(|object| cap::recorded_cut_is_genuine(object, event.detail_json.as_deref()));
+    if genuine {
+        event.object = redacted_object;
+        event.detail_json = event.detail_json.as_deref().map(redact::text);
+    } else {
         let (object, detail) =
             store_object_and_detail(event.object.as_deref(), event.detail_json.as_deref(), None);
         event.object = object;
         event.detail_json = detail;
-    } else {
-        event.object = event.object.as_deref().map(redact::text);
-        event.detail_json = event.detail_json.as_deref().map(redact::text);
     }
     Ok(event)
 }

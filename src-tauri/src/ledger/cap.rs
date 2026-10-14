@@ -98,9 +98,42 @@ pub(super) fn cap_object(redacted: String) -> (String, Option<ObjectCap>) {
     (kept, Some(cap))
 }
 
-/// Whether a raw object is longer than the append cap.
-pub(super) fn exceeds_object_cap(object: &str) -> bool {
-    object.len() > OBJECT_CAP_BYTES
+/// Whether a stored (already redacted) `object` and its `detail_json` are a cut
+/// that [`cap_object`] made: the record parses to a well-formed [`ObjectCap`],
+/// the object is within the cap and ends with the cut suffix, and the record's
+/// `at` is exactly where that suffix begins. Only such a row may carry its
+/// record across a copy; a record that fails any of this was written by
+/// someone else, and the copy drops it.
+pub(super) fn recorded_cut_is_genuine(object: &str, detail: Option<&str>) -> bool {
+    if object.len() > OBJECT_CAP_BYTES || !object.ends_with(OBJECT_CUT_SUFFIX) {
+        return false;
+    }
+    let Some(Value::Object(members)) = detail.and_then(|text| serde_json::from_str(text).ok())
+    else {
+        return false;
+    };
+    let Some(Value::Object(record)) = members.get(OBJECT_TRUNCATED_KEY) else {
+        return false;
+    };
+    let number = |key: &str| {
+        record
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+    };
+    let (Some(at), Some(bytes), Some(Value::String(hash))) =
+        (number("at"), number("bytes"), record.get("hash"))
+    else {
+        return false;
+    };
+    ObjectCap {
+        at,
+        bytes,
+        hash: hash.clone(),
+    }
+    .is_well_formed()
+        && record.len() == 3
+        && at + OBJECT_CUT_SUFFIX.len() == object.len()
 }
 
 /// What identifies a stored object across the cap: the stored (capped) text,

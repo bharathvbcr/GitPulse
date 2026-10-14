@@ -295,6 +295,115 @@ fn a_legacy_row_over_the_cap_is_capped_through_the_append_path_and_a_capped_one_
     assert_eq!(again.detail_json, event.detail_json);
 }
 
+fn legacy_row(action: &str, object: Option<&str>, detail: Option<&str>) -> LedgerEvent {
+    LedgerEvent {
+        id: 1,
+        ulid: "01J00000000000000000000001".into(),
+        ts_utc: "2026-10-14T00:00:00.000Z".into(),
+        schema_version: SCHEMA_VERSION,
+        repo_path: "/r".into(),
+        worktree_path: None,
+        actor_kind: "system".into(),
+        actor_id: None,
+        session_id: None,
+        task_id: None,
+        action: action.into(),
+        object: object.map(str::to_string),
+        argv_json: None,
+        outcome: "ok".into(),
+        verdict_json: None,
+        before_ref: None,
+        after_ref: None,
+        duration_ms: None,
+        detail_json: detail.map(str::to_string),
+    }
+}
+
+fn import(row: LedgerEvent) -> LedgerEvent {
+    normalize_legacy_event(
+        row,
+        &std::path::PathBuf::from("/anchor"),
+        &std::path::PathBuf::from("/source"),
+        &[],
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_forged_marker_on_a_short_legacy_row_is_dropped_so_the_reflog_key_is_stable() {
+    let forged = r#"{"source":"reflog","object_truncated":{"at":3,"bytes":99,"hash":"fnv1a64:0123456789abcdef"}}"#;
+    let object = "a1b2c3 commit: short message";
+    let imported = import(legacy_row("reflog.commit", Some(object), Some(forged)));
+    assert_eq!(imported.object.as_deref(), Some(object));
+    let detail: serde_json::Value =
+        serde_json::from_str(&imported.detail_json.clone().unwrap()).unwrap();
+    assert!(detail.get("object_truncated").is_none(), "{detail}");
+    assert_eq!(detail["source"], "reflog");
+    // The dedupe key of the stored row is the key of its identity: nothing
+    // forged moves it, so the entry is not recorded again.
+    let hash = detail["object_truncated"]["hash"]
+        .as_str()
+        .map(str::to_string);
+    assert_eq!(
+        cap::object_key_of_row(imported.object.unwrap(), hash),
+        stored_object(object)
+    );
+    // No object at all: a marker there is just as forged.
+    let imported = import(legacy_row("reflog.commit", None, Some(forged)));
+    assert!(!imported.detail_json.unwrap().contains("object_truncated"));
+}
+
+#[test]
+fn a_marker_that_is_not_exactly_what_the_writer_writes_is_dropped() {
+    let (event, _) = stored(&"g".repeat(CAP * 2), None, None);
+    let object = event.object.clone().unwrap();
+    let genuine = event.detail_json.clone().unwrap();
+    assert_eq!(
+        import(legacy_row("session.command", Some(&object), Some(&genuine))).detail_json,
+        Some(genuine.clone()),
+        "a genuine record survives the copy"
+    );
+    let marker: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+    let mut shifted = marker.clone();
+    shifted["object_truncated"]["at"] = serde_json::json!(5);
+    let mut bad_hash = marker.clone();
+    bad_hash["object_truncated"]["hash"] = serde_json::json!("fnv1a64:xyz");
+    let mut extra = marker.clone();
+    extra["object_truncated"]["x"] = serde_json::json!(1);
+    for forged in [shifted, bad_hash, extra] {
+        let imported = import(legacy_row(
+            "session.command",
+            Some(&object),
+            Some(&forged.to_string()),
+        ));
+        assert!(
+            !imported.detail_json.unwrap().contains("object_truncated"),
+            "{forged}"
+        );
+    }
+    // The same record on an object that was never cut.
+    let imported = import(legacy_row("session.command", Some("short"), Some(&genuine)));
+    assert!(!imported.detail_json.unwrap().contains("object_truncated"));
+}
+
+#[test]
+fn an_object_under_the_cap_that_redaction_grows_past_it_is_still_capped() {
+    let raw = format!("{}{}", "--password=x ".repeat(156), "abcdefghijkl");
+    assert_eq!(raw.len(), 2040);
+    let redacted = redact::text(&raw);
+    assert!(
+        redacted.len() > CAP,
+        "the fixture must grow past the cap: {}",
+        redacted.len()
+    );
+    let (event, detail) = stored(&raw, None, None);
+    assert!(event.object.as_ref().unwrap().len() <= CAP);
+    assert_eq!(detail.unwrap()["object_truncated"]["bytes"], redacted.len());
+    let imported = import(legacy_row("session.command", Some(&raw), None));
+    assert!(imported.object.as_ref().unwrap().len() <= CAP);
+    assert!(imported.detail_json.unwrap().contains("object_truncated"));
+}
+
 #[test]
 fn an_object_that_fits_leaves_detail_exactly_as_it_was() {
     let (event, detail) = stored("git status", None, None);
