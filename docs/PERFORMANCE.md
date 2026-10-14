@@ -959,6 +959,49 @@ dropped, 64 paths recorded (the window's bound; `truncated`), 3 change classes.
 | get_status 10k files clean | 31.22 ms | 36.52 ms | 42.20 ms | 0 | 1 |
 | get_status 10k files dirty (500) | 96.64 ms | 110.10 ms | 145.72 ms | 500 | 2 |
 
+Opening and saving a file (ft-f16fad35), `repo_read` rows added in the same
+bench. One text file in a clean 10-file repository; the save alternates two
+same-size texts so the publish is real. Three interleaved A/B pairs (before,
+after, before, ...) of N = 15 each, min over the three, host load 0.2x to 0.6x
+(4.5 to 10.3 on 18 CPUs). "Before" is `bl/integrate-1013`; "after" adds the
+base token a save is judged against: one digest pass over the bytes
+`get_file_blob` reads, and one over the bytes the save's entry transaction
+reads.
+
+| row | before (min) | after (min) | change |
+| --- | --- | --- | --- |
+| get_file_blob 1 KB | 118.8 us | 119.2 us | +0.3% |
+| get_file_blob 1 MB | 0.961 ms | 1.10 ms | +14% |
+| get_file_blob 8 MB | 7.53 ms | 8.30 ms | +10% |
+| save_edited_text 1 KB | 8.02 ms | 6.35 ms | within run-to-run spread (p50 10.4 to 11.7 ms either way) |
+| save_edited_text 1 MB | 8.72 ms | 8.65 ms | -0.8% |
+| save_edited_text 8 MB | 18.12 ms | 19.00 ms | +4.9% |
+
+These rows were measured on the build before the final `as_chunks` rewrite of
+the digest loop (same arithmetic, written to satisfy clippy). Two further sets
+of three interleaved pairs were then taken on the final build, but the host had
+drifted by then (load 6 to 47 on 18 CPUs, and the unchanged "before" binary
+itself went from 7.4 ms to 11 to 15 ms at 8 MB), so they cannot be compared with
+the table and are not used; the final build is unmeasured in a quiet window.
+The cost applies only to the editor open (`cmd_get_file_blob`, whose base names
+the bytes the user saw). View-only reads (`get_file_content`, the code graph's
+file text) use `get_file_blob_view` and skip the digest pass.
+
+The open path is over the 5% budget at 1 MB and 8 MB, and that is accepted as
+the cost of correctness. Without a base, a save writes the whole draft over
+whatever an agent or `git pull` put on disk while the file was open, with no
+prompt (D-frontend-03); with one, the backend refuses it. The base is a digest
+of the bytes and has to be computed from the bytes the open read, because the
+editor's textarea returns LF text while the save re-adds CRLF, so only the
+backend can say what is on disk; a stat (mtime and size) misses a same-size
+rewrite inside one timestamp tick and reports a conflict for a bare `touch`.
+The remaining cost is one pass over memory already read, about 0.8 ms per 8 MiB
+(roughly 10 GB/s). It is bounded by `MAX_FILE_BYTES` (8 MiB). The first digest,
+FNV-1a, cost +130% (7.58 ms to 17.5 ms at 8 MiB) because its multiply is a
+serial chain per byte; the shipped digest takes four lanes a word at a time.
+It is an accidental-change detector, not collision-resistant against a crafted
+input (see `digest` in `diff/conflict_fs.rs`).
+
 `command_timings` (N = 15, cold N = 5; 600 files, 61 commits, 18 worktrees, 17
 dirty):
 

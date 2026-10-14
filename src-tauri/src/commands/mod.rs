@@ -10,7 +10,8 @@ use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
 use crate::engine::git_cli::{
-    git_text, resolve_repo, sandbox_write_edited_text, validate_repo, ResolvedRepo,
+    git_text, resolve_repo, sandbox_create, sandbox_save_edited_text, validate_repo,
+    FileWriteError, ResolvedRepo, SavedFile,
 };
 use crate::engine::git_reader::{
     BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,

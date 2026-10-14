@@ -1,3 +1,4 @@
+use crate::diff::{Expect, WriteFailure};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -179,11 +180,102 @@ pub fn sandbox_join(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
             Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
                 return Err("File path escapes the repository".into());
             }
+            Component::Normal(name) if is_git_metadata_component(name) => {
+                return Err(git_metadata_message(file_path));
+            }
             Component::CurDir | Component::Normal(_) => {}
         }
     }
     let joined = repo.join(rel);
     Ok(joined)
+}
+
+fn git_metadata_message(file_path: &str) -> String {
+    format!("Git metadata cannot be read or written as a repository file: {file_path}")
+}
+
+/// True when one path component names git's own metadata directory, in any
+/// spelling the platform's filesystem would resolve to it. Mirrors what git's
+/// `verify_path` refuses in a checkout: `.git` compared case-insensitively
+/// after dropping trailing dots and spaces (Windows ignores both), an NTFS
+/// alternate-data-stream suffix (`.git::$INDEX_ALLOCATION`), and on Windows
+/// the 8.3 short name `git~1`. `.gitignore`, `.gitkeep`, `.github` and
+/// `.gitattributes` are ordinary files and pass.
+///
+/// This is the lexical half. A symlink into the git directory, a hashed 8.3
+/// name, or a `gitdir:` layout with another name is caught by the resolved
+/// path in [`sandbox_join_write`].
+///
+/// Known gap, not closed here: a nested repository or worktree whose `.git`
+/// FILE points at a gitdir inside the tree under another name (`sub/.git` ->
+/// `gitdir: ../.modules/sub`) is refused only at `sub/.git` itself, not at the
+/// directory it names. Closing it means parsing every in-tree `.git` file.
+pub fn is_git_metadata_component(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    // `.git:stream` and `.git::$INDEX_ALLOCATION` open the directory on NTFS.
+    let base = name.split(':').next().unwrap_or("");
+    let base = base.trim_end_matches(['.', ' ']);
+    base.eq_ignore_ascii_case(".git") || (cfg!(windows) && base.eq_ignore_ascii_case("git~1"))
+}
+
+/// [`sandbox_join_canonical`] for a path about to be written, read for write
+/// authority or moved: it also refuses a target that resolves into the
+/// repository's private or common git directory. The lexical check in
+/// [`sandbox_join`] cannot see a symlink alias of `.git` or a `.bare` layout,
+/// where the git directory has another name. Both directories come from
+/// `repository_trust::git_directories`, which reads the `.git` file and
+/// spawns no git.
+///
+/// It follows a symlink at the final component, which is what a save wants
+/// (the bytes go to what the name resolves to). A create, move or delete acts
+/// on the entry itself and uses [`sandbox_join_write_entry`].
+pub fn sandbox_join_write(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+    let resolved = sandbox_join_canonical(repo, file_path)?;
+    guard_write_target(repo, file_path, resolved)
+}
+
+/// [`sandbox_join_write`] for an operation on the entry itself (create, move,
+/// delete): the parent is resolved and checked, and the final name is appended
+/// as it stands, so a symlink is the link and a dangling link is a name that
+/// exists, not an error.
+///
+/// The git-metadata refusal still holds: the name itself is checked
+/// lexically, and a parent that resolves into the git directory is refused. A
+/// link whose TARGET is in `.git` can be moved or deleted as a link, which
+/// never touches `.git`. The repository root is never a target, however it is
+/// spelled.
+pub fn sandbox_join_write_entry(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+    if Path::new(file_path)
+        .components()
+        .all(|component| matches!(component, Component::CurDir))
+    {
+        return Err(root_message(file_path));
+    }
+    let resolved = sandbox_join_entry(repo, file_path)?;
+    guard_write_target(repo, file_path, resolved)
+}
+
+fn root_message(file_path: &str) -> String {
+    format!("Refusing to change the repository root: {file_path}")
+}
+
+/// What no write target may be: the repository root, or anything at or under
+/// its private or common git directory.
+fn guard_write_target(repo: &Path, file_path: &str, resolved: PathBuf) -> Result<PathBuf, String> {
+    let root = repo
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve repository path '{}': {}", repo.display(), e))?;
+    if resolved == root {
+        return Err(root_message(file_path));
+    }
+    let (private, common) = crate::repository_trust::git_directories(repo)?;
+    for dir in [private, common] {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if resolved.starts_with(&dir) {
+            return Err(git_metadata_message(file_path));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Like [`sandbox_join`], but safe against symlinks that point outside the repo.
@@ -286,9 +378,104 @@ pub fn sandbox_write_expecting(
     expected: Option<&str>,
     content: &str,
 ) -> Result<bool, String> {
+    let dest = write_target(repo_path, file_path)?;
+    let expect = expected.map_or(Expect::Any, |bytes| Expect::Bytes(bytes.as_bytes()));
+    match crate::diff::write_regular_expecting(&dest, expect, |_| Ok(content.as_bytes().to_vec())) {
+        Ok(_) => Ok(true),
+        Err(WriteFailure::Changed { .. }) => Ok(false),
+        Err(failure) => Err(failure.to_string()),
+    }
+}
+
+/// The sandboxed target of a write: inside the repository, through no symlink
+/// that leaves it, and not git's own metadata.
+fn write_target(repo_path: &str, file_path: &str) -> Result<PathBuf, String> {
     let repo = validate_repo(repo_path)?;
-    let dest = sandbox_join_canonical(&repo, file_path)?;
-    crate::diff::write_regular_expecting(&dest, content.as_bytes(), expected.map(str::as_bytes))
+    sandbox_join_write(&repo, file_path)
+}
+
+/// Why a file write through [`sandbox_create`] or [`sandbox_save_edited_text`]
+/// did not happen. It crosses the IPC boundary as `{code, message, ...}`;
+/// every variant carries a `message` fit to show, and the code is what the
+/// editor branches on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum FileWriteError {
+    /// A create found something at the path. Nothing was written.
+    AlreadyExists { message: String, path: String },
+    /// The save's base is not what is on disk now. `expected` is the base the
+    /// draft carried and `actual` the token of the disk, so the editor can
+    /// re-save over exactly that version if the user chooses to.
+    ChangedOnDisk {
+        message: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    /// Refused or failed before anything was written.
+    Refused { message: String },
+}
+
+impl FileWriteError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::AlreadyExists { message, .. }
+            | Self::ChangedOnDisk { message, .. }
+            | Self::Refused { message } => message,
+        }
+    }
+
+    fn from_failure(failure: WriteFailure, path: &str, expected: Option<&str>) -> Self {
+        match failure {
+            WriteFailure::AlreadyExists => Self::AlreadyExists {
+                message: format!("'{path}' already exists"),
+                path: path.to_string(),
+            },
+            WriteFailure::Changed { actual } => Self::ChangedOnDisk {
+                message: format!(
+                    "'{path}' changed on disk since it was opened. Nothing was written."
+                ),
+                path: path.to_string(),
+                expected: expected.unwrap_or_default().to_string(),
+                actual,
+            },
+            WriteFailure::Other(message) => Self::Refused { message },
+        }
+    }
+}
+
+impl std::fmt::Display for FileWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for FileWriteError {}
+
+impl From<String> for FileWriteError {
+    fn from(message: String) -> Self {
+        Self::Refused { message }
+    }
+}
+
+/// A saved file's new base: the token the next save of this draft carries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedFile {
+    pub disk_base: String,
+}
+
+/// Creates an empty file that must not exist yet, making its parent folders.
+/// Anything already at the path (file, directory or link, tracked or ignored)
+/// is [`FileWriteError::AlreadyExists`] and is left untouched, including when
+/// it appears between the check and the publish.
+pub fn sandbox_create(repo_path: &str, file_path: &str) -> Result<(), FileWriteError> {
+    // The entry, not what it resolves to: a link at the path (dangling or not)
+    // is something already there, and `Expect::Absent` must see the link.
+    let repo = validate_repo(repo_path)?;
+    let dest = sandbox_join_write_entry(&repo, file_path)?;
+    crate::diff::write_regular_expecting(&dest, Expect::Absent, |_| Ok(Vec::new()))
+        .map(|_| ())
+        .map_err(|failure| FileWriteError::from_failure(failure, file_path, None))
 }
 
 /// Saves text that came out of the file editor. Unlike [`sandbox_write`],
@@ -301,19 +488,30 @@ pub fn sandbox_write_edited_text(
     file_path: &str,
     content: &str,
 ) -> Result<(), String> {
-    let repo = validate_repo(repo_path)?;
-    let dest = sandbox_join_canonical(&repo, file_path)?;
-    let existing = match std::fs::symlink_metadata(&dest) {
-        Ok(_) => Some(crate::engine::git_reader::read_working_tree_file(
-            &dest,
-            crate::engine::budget::MAX_FILE_BYTES,
-        )?),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(format!("Cannot inspect '{file_path}': {err}")),
-    };
-    let bytes =
-        crate::engine::text_shape::encode_edited_text(file_path, existing.as_deref(), content)?;
-    crate::diff::write_regular(&dest, &bytes)
+    sandbox_save_edited_text(repo_path, file_path, content, None)
+        .map(|_| ())
+        .map_err(|failure| failure.to_string())
+}
+
+/// [`sandbox_write_edited_text`] with the draft's base. `expected_base` is the
+/// `disk_base` the editor was given when it opened the file (see
+/// [`crate::diff::content_token`]); the save is refused as
+/// [`FileWriteError::ChangedOnDisk`] when the file no longer has those bytes,
+/// judged against the same read the line endings are chosen from and the swap
+/// re-checks. `None` is an explicit overwrite.
+pub fn sandbox_save_edited_text(
+    repo_path: &str,
+    file_path: &str,
+    content: &str,
+    expected_base: Option<&str>,
+) -> Result<SavedFile, FileWriteError> {
+    let dest = write_target(repo_path, file_path)?;
+    let expect = expected_base.map_or(Expect::Any, Expect::Token);
+    crate::diff::write_regular_expecting(&dest, expect, |existing| {
+        crate::engine::text_shape::encode_edited_text(file_path, existing, content)
+    })
+    .map(|disk_base| SavedFile { disk_base })
+    .map_err(|failure| FileWriteError::from_failure(failure, file_path, expected_base))
 }
 
 /// Environment names git reads that can redirect it away from the repository
@@ -9197,6 +9395,293 @@ mod tests {
         let raw = dir.path().to_string_lossy().into_owned();
         sandbox_write_edited_text(&raw, "pkg/.gitkeep", "").expect("create");
         assert_eq!(std::fs::read(dir.path().join("pkg/.gitkeep")).unwrap(), b"");
+    }
+
+    fn mtime(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn create_refuses_existing_tracked_untracked_ignored_lf_crlf_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let root = dir.path();
+        let raw = root.to_string_lossy().into_owned();
+        std::fs::write(root.join(".gitignore"), "ignored-*\n").unwrap();
+        let shapes: [(&str, &[u8]); 3] =
+            [("lf", b"a\nb\n"), ("crlf", b"a\r\nb\r\n"), ("empty", b"")];
+        let mut cases = Vec::new();
+        for (shape, bytes) in shapes {
+            for kind in ["tracked", "untracked", "ignored"] {
+                let name = if kind == "ignored" {
+                    format!("ignored-{shape}.txt")
+                } else {
+                    format!("{kind}-{shape}.txt")
+                };
+                std::fs::write(root.join(&name), bytes).unwrap();
+                if kind == "tracked" {
+                    git_text(root, &["add", "--", &name]).unwrap();
+                }
+                let before = mtime(&root.join(&name));
+                cases.push((name, bytes, before));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        for (name, bytes, before) in cases {
+            let err = sandbox_create(&raw, &name).expect_err(&name);
+            assert!(
+                matches!(err, FileWriteError::AlreadyExists { .. }),
+                "{name}: {err:?}"
+            );
+            assert_eq!(std::fs::read(root.join(&name)).unwrap(), bytes, "{name}");
+            assert_eq!(mtime(&root.join(&name)), before, "{name} mtime");
+        }
+    }
+
+    #[test]
+    fn create_refuses_dir_and_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let root = dir.path();
+        let raw = root.to_string_lossy().into_owned();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        std::fs::write(root.join("target.txt"), "keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target.txt", root.join("link.txt")).unwrap();
+        for name in ["folder", "link.txt"] {
+            if !root.join(name).exists() && std::fs::symlink_metadata(root.join(name)).is_err() {
+                continue;
+            }
+            let err = sandbox_create(&raw, name).expect_err(name);
+            assert!(
+                matches!(err, FileWriteError::AlreadyExists { .. }),
+                "{name}: {err:?}"
+            );
+        }
+        assert_eq!(std::fs::read(root.join("target.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn create_makes_an_empty_file_and_its_folders() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let raw = dir.path().to_string_lossy().into_owned();
+        sandbox_create(&raw, "a/b/new.txt").expect("create");
+        assert_eq!(std::fs::read(dir.path().join("a/b/new.txt")).unwrap(), b"");
+    }
+
+    #[test]
+    fn new_folder_keeps_nonempty_gitkeep() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/.gitkeep"), "keep me\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let err = sandbox_create(&raw, "pkg/.gitkeep").expect_err("exists");
+        assert!(
+            matches!(err, FileWriteError::AlreadyExists { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("pkg/.gitkeep")).unwrap(),
+            b"keep me\n"
+        );
+    }
+
+    fn open_base(raw: &str, file: &str) -> String {
+        crate::engine::GitReader::get_file_blob(raw, file, None)
+            .unwrap()
+            .disk_base
+            .expect("a working-tree read carries a base")
+    }
+
+    #[test]
+    fn save_with_stale_base_is_refused_and_disk_keeps_external_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        std::fs::write(dir.path().join("a.txt"), "agent wrote this\n").unwrap();
+        let err = sandbox_save_edited_text(&raw, "a.txt", "my draft\n", Some(&base))
+            .expect_err("stale base");
+        match err {
+            FileWriteError::ChangedOnDisk {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, base);
+                assert_eq!(actual, open_base(&raw, "a.txt"));
+            }
+            other => panic!("expected changed_on_disk, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"agent wrote this\n"
+        );
+    }
+
+    #[test]
+    fn save_with_current_base_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        sandbox_save_edited_text(&raw, "a.txt", "two\n", Some(&base)).expect("current base");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn saved_returns_new_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        let saved = sandbox_save_edited_text(&raw, "a.txt", "two\n", Some(&base)).unwrap();
+        assert_eq!(saved.disk_base, open_base(&raw, "a.txt"));
+        // The returned base is the one the next save of the same draft carries.
+        sandbox_save_edited_text(&raw, "a.txt", "three\n", Some(&saved.disk_base))
+            .expect("chained save");
+    }
+
+    #[test]
+    fn view_only_reads_skip_the_base_and_the_editor_open_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let open = crate::engine::GitReader::get_file_blob(&raw, "a.txt", None).unwrap();
+        assert!(
+            open.disk_base.is_some(),
+            "the editor open must carry a base"
+        );
+        let view = crate::engine::GitReader::get_file_blob_view(&raw, "a.txt", None).unwrap();
+        assert_eq!(
+            view.disk_base, None,
+            "a view-only read must not pay for one"
+        );
+        assert_eq!(view.text, open.text);
+        assert_eq!(
+            crate::engine::GitReader::get_file_content(&raw, "a.txt", None).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
+    fn crlf_base_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("w.txt"), "a\r\nb\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "w.txt");
+        let saved = sandbox_save_edited_text(&raw, "w.txt", "a\nB\n", Some(&base)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("w.txt")).unwrap(),
+            b"a\r\nB\r\n"
+        );
+        assert_eq!(saved.disk_base, open_base(&raw, "w.txt"));
+    }
+
+    #[test]
+    fn a_file_renamed_while_open_reports_absent_and_overwrite_recreates_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        std::fs::rename(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+        let err = sandbox_save_edited_text(&raw, "a.txt", "x\n", Some(&base)).expect_err("gone");
+        let FileWriteError::ChangedOnDisk { actual, .. } = err else {
+            panic!("expected changed_on_disk, got {err:?}");
+        };
+        assert_eq!(actual, "absent");
+        sandbox_save_edited_text(&raw, "a.txt", "x\n", Some(&actual)).expect("overwrite");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"x\n");
+    }
+
+    #[test]
+    fn file_write_error_serializes_to_the_contract_shape() {
+        let keys = |error: FileWriteError| -> (String, Vec<String>) {
+            let value = serde_json::to_value(&error).unwrap();
+            let object = value.as_object().unwrap();
+            let mut keys: Vec<String> = object.keys().cloned().collect();
+            keys.sort();
+            (object["code"].as_str().unwrap().to_string(), keys)
+        };
+        let strings = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            keys(FileWriteError::AlreadyExists {
+                message: "m".into(),
+                path: "p".into()
+            }),
+            (
+                "already_exists".to_string(),
+                strings(&["code", "message", "path"])
+            )
+        );
+        assert_eq!(
+            keys(FileWriteError::ChangedOnDisk {
+                message: "m".into(),
+                path: "p".into(),
+                expected: "e".into(),
+                actual: "a".into()
+            }),
+            (
+                "changed_on_disk".to_string(),
+                strings(&["actual", "code", "expected", "message", "path"])
+            )
+        );
+        assert_eq!(
+            keys(FileWriteError::from("no".to_string())),
+            ("refused".to_string(), strings(&["code", "message"]))
+        );
+        let saved = serde_json::to_value(SavedFile {
+            disk_base: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(saved, serde_json::json!({ "disk_base": "x" }));
+    }
+
+    #[test]
+    fn git_metadata_components_are_recognised_and_lookalikes_are_not() {
+        use std::ffi::OsStr;
+        for name in [
+            ".git",
+            ".GIT",
+            ".Git",
+            ".git.",
+            ".git ",
+            ".git. .",
+            ".git:stream",
+            ".git::$INDEX_ALLOCATION",
+        ] {
+            assert!(is_git_metadata_component(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            ".gitignore",
+            ".gitkeep",
+            ".github",
+            ".gitattributes",
+            ".gitmodules",
+            "git",
+            "x.git",
+            "git~1x",
+            "..git",
+            "",
+        ] {
+            assert!(!is_git_metadata_component(OsStr::new(name)), "{name}");
+        }
+        assert_eq!(
+            is_git_metadata_component(OsStr::new("GIT~1")),
+            cfg!(windows)
+        );
+        for path in [".git/config", "a/.git/hooks/x", "sub/.GIT", "a/.git./b"] {
+            assert!(sandbox_join(Path::new("/r"), path).is_err(), "{path}");
+        }
+        for path in [".gitignore", ".github/x", "sub/.gitattributes"] {
+            assert!(sandbox_join(Path::new("/r"), path).is_ok(), "{path}");
+        }
     }
 
     #[test]

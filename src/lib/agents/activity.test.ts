@@ -69,6 +69,7 @@ describe("actionKindForCommand", () => {
     expect(actionKindForCommand("cmd_stage_selective_patch")).toBe("stage");
     expect(actionKindForCommand("cmd_add_worktree")).toBe("worktree");
     expect(actionKindForCommand("cmd_write_file_content")).toBe("edit");
+    expect(actionKindForCommand("cmd_create_file")).toBe("edit");
   });
 
   it("maps every mutating surface to a human-readable verb", () => {

@@ -542,6 +542,12 @@ pub struct FileBlob {
     pub invalid_utf8_bytes: usize,
     /// The file's line-ending style; `None` for binary files.
     pub eol: Option<LineEnding>,
+    /// The version of the working-tree file these bytes are (see
+    /// `diff::content_token`), which a save hands back as `expected_base`:
+    /// `"absent"` when the working tree has no file and the index supplied the
+    /// content, `None` for a commit read, which is not a file on disk.
+    #[serde(default)]
+    pub disk_base: Option<String>,
 }
 
 pub struct GitReader;
@@ -1451,7 +1457,7 @@ impl GitReader {
         file_path: &str,
         commit_id: Option<&str>,
     ) -> Result<String, String> {
-        let blob = Self::get_file_blob(repo_path, file_path, commit_id)?;
+        let blob = Self::get_file_blob_view(repo_path, file_path, commit_id)?;
         if let Some(text) = blob.text {
             Ok(text)
         } else {
@@ -1459,13 +1465,37 @@ impl GitReader {
         }
     }
 
+    /// The editor open: the blob carries `disk_base`, the version a save of
+    /// the draft is judged against, so it names the very bytes the user saw
+    /// and is computed eagerly here.
     pub fn get_file_blob(
         repo_path: &str,
         file_path: &str,
         commit_id: Option<&str>,
     ) -> Result<FileBlob, String> {
+        Self::read_file_blob(repo_path, file_path, commit_id, true)
+    }
+
+    /// [`Self::get_file_blob`] for a read that only looks (file text for the
+    /// code graph, `get_file_content`): no draft will be saved from it, so it
+    /// does not pay the digest pass and `disk_base` is `None`.
+    pub fn get_file_blob_view(
+        repo_path: &str,
+        file_path: &str,
+        commit_id: Option<&str>,
+    ) -> Result<FileBlob, String> {
+        Self::read_file_blob(repo_path, file_path, commit_id, false)
+    }
+
+    fn read_file_blob(
+        repo_path: &str,
+        file_path: &str,
+        commit_id: Option<&str>,
+        with_base: bool,
+    ) -> Result<FileBlob, String> {
         let repo = validate_repo(repo_path)?;
         sandbox_join(&repo, file_path)?;
+        let mut disk_base = None;
         let bytes = if let Some(id) = commit_id {
             crate::engine::git_writer::validate_oid_or_revision(id)?;
             if id.contains(':') {
@@ -1474,8 +1504,19 @@ impl GitReader {
             read_commit_blob(&repo, id, file_path)?
         } else {
             match sandbox_join_canonical(&repo, file_path) {
-                Ok(dest) if dest.exists() => read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?,
-                Ok(_) => read_index_blob(&repo, file_path)?,
+                Ok(dest) if dest.exists() => {
+                    let bytes = read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?;
+                    if with_base {
+                        disk_base = Some(crate::diff::content_token(Some(&bytes)));
+                    }
+                    bytes
+                }
+                Ok(_) => {
+                    if with_base {
+                        disk_base = Some(crate::diff::content_token(None));
+                    }
+                    read_index_blob(&repo, file_path)?
+                }
                 Err(err) if git_cli::is_sandbox_symlink_escape(&err) => {
                     // Outbound Git symlink: return the link text, never the
                     // target. Coverage and the file viewer both hit this for
@@ -1520,6 +1561,7 @@ impl GitReader {
                 text_shape::invalid_utf8_bytes(&bytes)
             },
             eol: (!is_binary).then(|| text_shape::line_ending(&bytes)),
+            disk_base,
         })
     }
 

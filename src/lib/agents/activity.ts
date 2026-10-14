@@ -148,6 +148,7 @@ export function actionKindForCommand(cmd: string): string {
     case "remove_worktree":
       return "worktree";
     case "write_file_content":
+    case "create_file":
       return "edit";
     case "terminal_run":
       return "terminal";

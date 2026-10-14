@@ -589,8 +589,8 @@ impl GitWriter {
         if to.starts_with(&format!("{from}/")) {
             return Err(format!("Cannot move {from} into itself"));
         }
-        let from_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, from)?;
-        let to_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, to)?;
+        let from_abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, from)?;
+        let to_abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, to)?;
         if std::fs::symlink_metadata(&from_abs).is_err() {
             return Err(format!("{from} does not exist"));
         }
@@ -646,10 +646,10 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = path.trim_end_matches('/');
-        if path.is_empty() || path == "." {
-            return Err("Refusing to delete the repository root".into());
-        }
-        let abs = crate::engine::git_cli::sandbox_join_canonical(&repo, path)?;
+        // The repository root, in any spelling, is refused by the same check
+        // that resolves the target (`./.` and `.//` used to slip past a
+        // comparison with `.` and reach `git rm -r`).
+        let abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, path)?;
         if std::fs::symlink_metadata(&abs).is_err() {
             return Err(format!("{path} does not exist"));
         }

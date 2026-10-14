@@ -52,7 +52,30 @@ export interface FileBlob {
   invalid_utf8_bytes: number;
   /** Absent for binary files. */
   eol?: LineEnding | null;
+  /**
+   * The version of the working-tree file these bytes are, handed back to
+   * `cmd_write_file_content` as `expected_base`. `"absent"` when the working
+   * tree has no file (the index supplied the content); null for a commit read.
+   */
+  disk_base?: string | null;
 }
+
+/** `engine::git_cli::SavedFile`: the base a draft carries after a save. */
+export interface SavedFile {
+  disk_base: string;
+}
+
+/**
+ * `engine::git_cli::FileWriteError`: why a create or save did not happen, as
+ * `{code, message, ...}`. Every variant carries a `message` to show.
+ */
+export type FileWriteError =
+  /** A create found something at the path; nothing was written. */
+  | { code: "already_exists"; message: string; path: string }
+  /** The save's base is not what is on disk; `actual` is the disk's token now. */
+  | { code: "changed_on_disk"; message: string; path: string; expected: string; actual: string }
+  /** Refused or failed before anything was written. */
+  | { code: "refused"; message: string };
 
 /**
  * Single-file language detection. Consumed as an anonymous

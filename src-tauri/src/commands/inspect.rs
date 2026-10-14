@@ -130,19 +130,53 @@ pub async fn cmd_get_file_blob(
 /// path. This is the file editor's save path, so it is a real edit and is
 /// gated as one, and it keeps the file's CRLF endings and refuses to replace
 /// bytes the editor could not decode (see `sandbox_write_edited_text`).
+///
+/// `expected_base` is the `disk_base` of the blob the draft was made from: the
+/// save is refused as `changed_on_disk` when the file no longer has those
+/// bytes. Leaving it out is an explicit overwrite. The reply's `disk_base` is
+/// the base the draft carries from here on.
 #[tauri::command(async)]
 pub async fn cmd_write_file_content(
     repo_path: String,
     file_path: String,
     content: String,
-) -> Result<Guarded<()>, String> {
-    super::payload::check_content("file content", &content, super::payload::MAX_CONTENT_BYTES)?;
+    expected_base: Option<String>,
+) -> Result<Guarded<SavedFile>, FileWriteError> {
+    super::payload::check_content("file content", &content, super::payload::MAX_CONTENT_BYTES)
+        .map_err(|e| FileWriteError::from(e.to_string()))?;
+    // The pool carries `String` errors; the typed one rides inside the `Ok`.
     off_thread(move || {
-        let policy = guard_file(&repo_path, &file_path, "modify")?;
-        sandbox_write_edited_text(&repo_path, &file_path, &content)?;
-        Ok(Guarded { policy, output: () })
+        Ok((|| {
+            let policy = guard_file(&repo_path, &file_path, "modify")?;
+            let output = sandbox_save_edited_text(
+                &repo_path,
+                &file_path,
+                &content,
+                expected_base.as_deref(),
+            )?;
+            Ok(Guarded { policy, output })
+        })())
     })
-    .await
+    .await?
+}
+
+/// Creates an empty file that must not exist yet, for Explorer's New File and
+/// the `.gitkeep` of New Folder. Unlike [`cmd_write_file_content`] it never
+/// replaces anything: an existing file, directory or link at the path is an
+/// `already_exists` error and is left as it was.
+#[tauri::command(async)]
+pub async fn cmd_create_file(
+    repo_path: String,
+    file_path: String,
+) -> Result<Guarded<()>, FileWriteError> {
+    off_thread(move || {
+        Ok((|| {
+            let policy = guard_file(&repo_path, &file_path, "create")?;
+            sandbox_create(&repo_path, &file_path)?;
+            Ok(Guarded { policy, output: () })
+        })())
+    })
+    .await?
 }
 
 #[tauri::command(async)]

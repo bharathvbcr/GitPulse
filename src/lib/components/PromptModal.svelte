@@ -7,6 +7,7 @@
   import {
     cancelPrompt,
     completePrompt,
+    promptError,
     promptState,
   } from "../stores/modalStore";
 
@@ -18,6 +19,11 @@
   let pending = $derived($promptState);
   let options = $derived(pending?.options ?? null);
   let isConfirm = $derived(options?.mode === "confirm");
+  // A refusal from `validate` replaces the opening error; typing clears both.
+  let typed = $state(false);
+  let problem = $derived(
+    typed ? null : $promptError ?? (options?.mode === "text" ? options.error ?? null : null),
+  );
 
   $effect(() => {
     const current = pending;
@@ -27,6 +33,7 @@
       return;
     }
     value = current.options.mode === "text" ? current.options.initialValue ?? "" : "";
+    typed = false;
     // Focus lands after the DOM update; the prior holder is restored on close.
     previousFocus = document.activeElement;
     void tick().then(() => {
@@ -41,6 +48,8 @@
 
   function submit(event?: SubmitEvent) {
     event?.preventDefault();
+    // A refused answer keeps the prompt open; the next edit clears its message.
+    typed = false;
     completePrompt(isConfirm ? true : value);
   }
 
@@ -89,7 +98,15 @@
             type="text"
             placeholder={options.mode === "text" ? options.placeholder ?? "" : ""}
             class="gp-field w-full"
+            aria-invalid={problem ? "true" : undefined}
+            oninput={() => {
+              typed = true;
+              promptError.set(null);
+            }}
           />
+          {#if problem}
+            <p role="alert" class="text-rose-400 leading-relaxed wrap-break-word">{problem}</p>
+          {/if}
         {/if}
 
         <div class="flex justify-end gap-2 pt-1">

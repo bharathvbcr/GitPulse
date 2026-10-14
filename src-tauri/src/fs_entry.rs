@@ -131,7 +131,29 @@ pub(crate) fn pin_parent(path: &Path, create: bool) -> io::Result<std::fs::File>
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
-    open_dir_chain(parent, create).map(|pinned| pinned.dir)
+    open_dir_chain(parent, create, None).map(|pinned| pinned.dir)
+}
+
+/// [`pin_parent`] with creation, reporting the directories THIS call made (the
+/// ones its own `mkdirat` succeeded for, never one that was already there or
+/// that a concurrent creator won), outermost first. The list is filled even
+/// when the walk fails part-way, so a caller whose later step fails can remove
+/// exactly what it made.
+#[cfg(unix)]
+pub(crate) fn pin_parent_recording(
+    path: &Path,
+    created: &mut Vec<std::path::PathBuf>,
+) -> io::Result<std::fs::File> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected an absolute file path",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
+    open_dir_chain(parent, true, Some(created)).map(|pinned| pinned.dir)
 }
 
 /// A pinned directory, and whether its *name* is beyond another user's reach.
@@ -251,7 +273,7 @@ pub(crate) fn pin_dir_nofollow(dir: &Path) -> io::Result<PinnedDir> {
             "Expected an absolute directory path",
         ));
     }
-    open_dir_chain(dir, false)
+    open_dir_chain(dir, false, None)
 }
 
 #[cfg(unix)]
@@ -288,7 +310,11 @@ fn holder_keeps_entry_private(holder: &std::fs::Metadata, entry: &std::fs::Metad
 /// component of `dir` relative to the previous descriptor, never re-walking a
 /// path and never following a symlink.
 #[cfg(unix)]
-fn open_dir_chain(dir: &Path, create: bool) -> io::Result<PinnedDir> {
+fn open_dir_chain(
+    dir: &Path,
+    create: bool,
+    mut created: Option<&mut Vec<std::path::PathBuf>>,
+) -> io::Result<PinnedDir> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -336,9 +362,11 @@ fn open_dir_chain(dir: &Path, create: bool) -> io::Result<PinnedDir> {
         if fd < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
             // SAFETY: creates one name under the pinned parent. A raced entry
             // is inspected by the no-follow open below, never accepted blindly.
-            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) } != 0
-                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-            {
+            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+                if let Some(created) = created.as_deref_mut() {
+                    created.push(walked.join(part));
+                }
+            } else if io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
                 return Err(io::Error::last_os_error());
             }
             fd = open();
@@ -777,7 +805,10 @@ mod tests {
             },
             0
         );
-        crate::diff::write_regular(&path, b"new").unwrap();
+        crate::diff::write_regular_expecting(&path, crate::diff::Expect::Any, |_| {
+            Ok(b"new".to_vec())
+        })
+        .unwrap();
         let saved = std::fs::File::open(&path).unwrap();
         let after = saved.metadata().unwrap();
         let mut actual = [0u8; 64];

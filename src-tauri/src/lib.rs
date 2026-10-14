@@ -357,6 +357,7 @@ pub fn run() {
             cmd_get_file_content,
             cmd_get_file_blob,
             cmd_write_file_content,
+            cmd_create_file,
             cmd_compute_word_diff,
             cmd_syntax_highlight,
             cmd_stage_file,

@@ -91,7 +91,7 @@ describe("FileViewer", () => {
       source.indexOf("async function handleFileSave"),
       source.indexOf("function openInDefaultApp"),
     );
-    const write = save.indexOf('await invoke("cmd_write_file_content"');
+    const write = save.indexOf('await invoke<Guarded<SavedFile>>("cmd_write_file_content"');
     const complete = save.indexOf("completeCachedEditorSave");
     expect(write).toBeGreaterThan(-1);
     expect(complete).toBeGreaterThan(write);
@@ -104,8 +104,8 @@ describe("FileViewer", () => {
       source.indexOf("function openInDefaultApp"),
     );
     const queued = save.indexOf("fileSaveQueue.run(fileSaveKey(repo, path)");
-    const write = save.indexOf('invoke("cmd_write_file_content"');
-    const complete = save.indexOf("completeCachedEditorSave(repo, path, newContent)");
+    const write = save.indexOf('invoke<Guarded<SavedFile>>("cmd_write_file_content"');
+    const complete = save.indexOf("completeCachedEditorSave(repo, path, newContent, saved.output.disk_base)");
     const refresh = save.indexOf("repoStore.refresh()");
     expect(queued).toBeGreaterThan(-1);
     expect(write).toBeGreaterThan(queued);
@@ -119,7 +119,7 @@ describe("FileViewer", () => {
       source.indexOf("async function handleFileSave"),
     );
     const cacheRead = complete.indexOf("tabCache.get(repo)");
-    const transition = complete.indexOf("completeEditorSave(cached.tabs, path, savedContent)");
+    const transition = complete.indexOf("completeEditorSave(cached.tabs, path, savedContent, savedBase)");
     const cacheWrite = complete.indexOf("tabCache.set(repo");
     const ownerDispatch = complete.indexOf("viewerOwners.current(repo)?.completeSave");
     expect(cacheRead).toBeGreaterThan(-1);
@@ -138,8 +138,8 @@ describe("FileViewer", () => {
     );
     expect(apply).toContain("if (!isCurrentViewer(repo)) return");
     expect(apply).toContain("tabState = tabs");
-    expect(source).toContain("completeSave: (path, savedContent, tabs) =>");
-    expect(source).toContain("applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs)");
+    expect(source).toContain("completeSave: (path, savedContent, tabs, savedBase) =>");
+    expect(source).toContain("applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs, savedBase)");
   });
 
   it("binds writes to the repository that owns the displayed editor", () => {
@@ -150,7 +150,7 @@ describe("FileViewer", () => {
     expect(save).toContain("const repo = hydratedRepo;");
     expect(save).toContain("$repoStore.currentPath !== repo");
     expect(save.indexOf("$repoStore.currentPath !== repo")).toBeLessThan(
-      save.indexOf('await invoke("cmd_write_file_content"'),
+      save.indexOf('await invoke<Guarded<SavedFile>>("cmd_write_file_content"'),
     );
   });
 
@@ -210,10 +210,49 @@ describe("FileViewer", () => {
   });
 
   it("writes file content via cmd_write_file_content and opens through the shell gate", () => {
-    expect(source).toContain('invoke("cmd_write_file_content"');
+    expect(source).toContain('invoke<Guarded<SavedFile>>("cmd_write_file_content"');
     expect(source).toContain("openInDefaultApp");
     expect(source).not.toContain("@tauri-apps/plugin-opener");
     expect(source).toContain("formatError");
+  });
+
+  it("sends the draft's base with every save and re-bases the viewer on the saved one", () => {
+    const save = source.slice(
+      source.indexOf("async function handleFileSave"),
+      source.indexOf("function openInDefaultApp"),
+    );
+    expect(save).toContain("expectedBase,");
+    expect(save).toContain("tabCache.get(repo)?.tabs.drafts[path]");
+    expect(save).toContain("saveBase(");
+    expect(save).toContain('judged === "unbased"');
+    expect(save).toContain("overrideBase,");
+    expect(source).toContain("disk_base: savedBase");
+    // The first dirtying keystroke is what records the base.
+    expect(source).toContain("updateEditorDraft(tabState, path, newContent, sourceContent, base)");
+  });
+
+  it("answers a changed_on_disk refusal with a kept draft and Reload / Overwrite / Compare", () => {
+    const refusal = source.slice(
+      source.indexOf("async function saveDraft"),
+      source.indexOf("async function requestDiscardDraft"),
+    );
+    expect(refusal).toContain('typed?.code === "changed_on_disk"');
+    expect(refusal).toContain("saveRefusal = { repo, path, actual: typed.actual }");
+    // The error is rethrown so the editor stays in edit mode and the draft stays dirty.
+    expect(refusal).toContain("throw err;");
+    expect(refusal).toContain("saveDraft(path, draft.content, conflict.actual)");
+    expect(refusal).toContain("requestDiscardDraft(path)");
+    expect(refusal.indexOf("requestDiscardDraft(path)")).toBeLessThan(
+      refusal.indexOf("await loadFileContent(path)"),
+    );
+    expect(source).toContain("<EditorConflictBanner");
+    expect(source).toContain("onReload=");
+    expect(source).toContain("onOverwrite=");
+    expect(source).toContain("onSave={(newContent) => saveDraft(activeTabPath, newContent)}");
+  });
+
+  it("marks a draft conflicted as soon as the reloaded blob's base differs", () => {
+    expect(source).toContain("isEditorDraftConflicted(activeDraft, diskBase)");
   });
 
   it("surfaces clipboard failure when copying the active path", () => {

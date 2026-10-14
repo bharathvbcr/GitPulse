@@ -644,9 +644,10 @@ mod payload_cap_tests {
             "/no/such/repo".into(),
             "src/lib.rs".into(),
             huge,
+            None,
         ))
         .expect_err("over the cap");
-        assert!(err.contains("too large"), "{err}");
+        assert!(err.message().contains("too large"), "{err}");
     }
 
     /// A fake `devmap` whose `preview` takes a moment and logs each file it
