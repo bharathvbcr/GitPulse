@@ -360,4 +360,61 @@ mod catch_up_binding_tests {
         let unbind_row = events.iter().find(|event| event.id == unbound).unwrap();
         assert!(detail(unbind_row)["catch_up"]["recorded"].as_i64().unwrap() >= 1);
     }
+
+    /// Concurrent binds of one worktree: every row lands, the live read agrees
+    /// with the newest `(ts_utc, ulid)`, and each failed catch-up is counted
+    /// exactly once.
+    #[test]
+    fn concurrent_binds_all_land_and_each_failed_catch_up_is_counted_once() {
+        let (_dir, repo) = git_repo();
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let repo = repo.clone();
+                std::thread::spawn(move || {
+                    bind_after_catch_up(&repo, &repo, &format!("T-{n}"), |_| CatchUp {
+                        truncated: n % 2 == 0,
+                        ..CatchUp::default()
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<i64> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(ids.len(), 8);
+        let rows = ledger::tail(&repo, 0, 100).unwrap();
+        let mut binds: Vec<_> = rows
+            .iter()
+            .filter(|event| event.action == bindings::BIND)
+            .collect();
+        assert_eq!(binds.len(), 8);
+        binds.sort_by(|a, b| (&a.ts_utc, &a.ulid).cmp(&(&b.ts_utc, &b.ulid)));
+        let newest = binds.last().unwrap().task_id.clone();
+        assert_eq!(bindings::resolve(&repo, &repo).unwrap(), newest);
+        assert_eq!(ledger::status(&repo).dropped, 4);
+    }
+
+    /// A catch-up that fails for a reason that is not about the ledger (no home
+    /// directory to look for transcripts in) makes `LedgerStatus::dropped` say
+    /// an append was dropped. Nothing was: the bind row landed and the ledger is
+    /// complete. The counter is the only thing a person sees, and it is
+    /// per-process and never cleared.
+    #[test]
+    fn a_catch_up_that_had_nothing_to_read_does_not_read_as_a_dropped_append() {
+        let (_dir, repo) = git_repo();
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial).remove("HOME").remove("GITPULSE_TRANSCRIPT_ROOT");
+        let before = ledger::status(&repo).dropped;
+        let bound = bind_after_catch_up(&repo, &repo, "T-1", catch_up_before_binding).unwrap();
+        let row = ledger::tail(&repo, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == bound)
+            .unwrap();
+        eprintln!("catch_up note: {}", detail(&row)["catch_up"]);
+        assert_eq!(
+            ledger::status(&repo).dropped,
+            before,
+            "a bind whose catch-up merely found no transcript root is counted as a dropped append"
+        );
+    }
 }
