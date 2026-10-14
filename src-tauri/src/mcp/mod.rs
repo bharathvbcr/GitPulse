@@ -2614,6 +2614,148 @@ mod tests {
         assert!(tool["outputSchema"]["properties"]["total"].is_null());
     }
 
+    /// A trusted repository whose ledger holds `rows` events carrying `detail`
+    /// bytes each, and the anchor to read it back by.
+    fn repository_with_ledger_rows(rows: usize, detail: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", &repo])
+            .output_locked()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        crate::test_support::trust_repo(dir.path());
+        let address = crate::ledger::bindings::repository_address(&repo).expect("address");
+        for n in 0..rows {
+            let id = crate::ledger::record(crate::ledger::Draft {
+                repo_path: address.anchor.clone(),
+                action: "session.command".into(),
+                object: Some(format!("echo {n}")),
+                actor_kind: Some(crate::ledger::ActorKind::Agent),
+                outcome: Some(crate::ledger::Outcome::Ok),
+                detail_json: Some(json!({ "note": "d".repeat(detail) }).to_string()),
+                ..Default::default()
+            });
+            assert!(id.is_some(), "row {n} was not recorded");
+        }
+        (dir, repo)
+    }
+
+    fn wire_len(response: &JsonRpcResponse) -> usize {
+        serde_json::to_string(response).expect("serializes").len() + 1
+    }
+
+    /// 1000 rows of about 6.5 KiB is 6.5 MB of ledger, past the 4 MiB frame the
+    /// transport can carry. A page must come back bounded, say it is partial,
+    /// and hand back the cursor that continues exactly where it stopped.
+    #[test]
+    fn a_6_mib_ledger_is_paged_within_the_frame_without_skipping_or_repeating() {
+        let (_dir, repo) = repository_with_ledger_rows(1000, 6_500);
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .expect("tool")["outputSchema"]
+            .clone();
+        let mut cursor = 0_i64;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let response = call(
+                "tools/call",
+                json!({
+                    "name": "gitpulse_ledger_events",
+                    "arguments": { "repo_path": repo, "limit": 1000, "cursor": cursor },
+                    "_meta": modern_meta(),
+                }),
+            );
+            assert!(
+                wire_len(&response) <= 4 * 1024 * 1024,
+                "page {pages} is {} bytes on the wire",
+                wire_len(&response)
+            );
+            let result = response.result.expect("a result");
+            assert_eq!(result["isError"], false, "{result:.300}");
+            let page = result["structuredContent"].clone();
+            let violations = validate::validate(&page, &schema);
+            assert!(violations.is_empty(), "page violates its schema: {violations:?}");
+            let events = page["events"].as_array().expect("events");
+            assert_eq!(page["returned"], events.len());
+            seen.extend(events.iter().map(|e| e["id"].as_i64().expect("id")));
+            let last = events.last().expect("a page always makes progress")["id"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(page["next_cursor"], last, "next_cursor is the last returned id");
+            pages += 1;
+            if pages == 1 {
+                assert_eq!(page["truncated"], true, "the first page cannot be the whole ledger");
+            }
+            if page["truncated"] != true {
+                break;
+            }
+            assert!(pages < 40, "paging does not terminate");
+            cursor = last;
+        }
+        assert!(pages > 1, "6.5 MB of rows came back as one page");
+        assert_eq!(seen.len(), 1000, "paging skipped or repeated a row");
+        assert!(
+            seen.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "paging skipped or repeated a row: {seen:?}"
+        );
+    }
+
+    /// A modern client reads `structuredContent`; the text block exists for
+    /// clients that read nothing else. Both full-size doubled every large
+    /// result on the wire. Modern gets one full copy and a bounded mirror, and a
+    /// legacy client (which has only the text) gets the whole budget in it.
+    #[test]
+    fn a_large_payload_has_one_full_copy_and_a_bounded_text_mirror() {
+        let (_dir, repo) = repository_with_ledger_rows(120, 6_500);
+        let arguments = json!({ "repo_path": repo, "limit": 1000 });
+
+        let modern = modern_call(
+            "tools/call",
+            json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+        );
+        let text = modern["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.len() <= 256 * 1024,
+            "the modern text mirror is {} bytes",
+            text.len()
+        );
+        let mirror: Value = serde_json::from_str(text).expect("the mirror is still JSON");
+        assert!(mirror["events"].is_array(), "the mirror keeps the payload's shape");
+        let structured = &modern["structuredContent"];
+        assert_eq!(structured["events"].as_array().expect("events").len(), 120);
+        assert!(
+            structured["events"].to_string().len() > 256 * 1024,
+            "the fixture is not large enough to exercise the mirror"
+        );
+        assert!(!text.contains("\n  "), "the text is compact, not pretty-printed");
+
+        let mut era = Era::Unknown;
+        process_request(request("initialize", Some(json!(0)), json!({})), &mut era);
+        let legacy = process_request(
+            request(
+                "tools/call",
+                Some(json!(1)),
+                json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+            ),
+            &mut era,
+        )
+        .expect("answered")
+        .result
+        .expect("result");
+        assert!(legacy.get("structuredContent").is_none());
+        let body: Value =
+            serde_json::from_str(legacy["content"][0]["text"].as_str().expect("text"))
+                .expect("legacy text is JSON");
+        assert_eq!(
+            body["events"].as_array().expect("events").len(),
+            120,
+            "a legacy client has only the text; it must not be shortened"
+        );
+    }
+
     /// Every declared property the payload carries as `null` must declare
     /// `null` among its types. `validate` reads an optional `null` as an absent
     /// argument, which is right for input; a client checking `structuredContent`

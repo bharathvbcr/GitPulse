@@ -787,6 +787,49 @@ mod tests {
         }
     }
 
+    fn result_of(id: Value, result: Value) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_5_mib_response_is_answered_with_an_error_and_the_wire_stays_open() {
+        let captured = Captured::default();
+        let wire = Wire::to(captured.clone());
+        let huge = result_of(json!(9), json!({ "blob": "x".repeat(5 * 1024 * 1024) }));
+        assert!(
+            wire.send(&huge),
+            "an oversized response must be answered, not end the session"
+        );
+        assert!(
+            !wire.broken.load(Ordering::Acquire),
+            "an oversized response is the request's problem, not the wire's"
+        );
+        assert!(wire.send(&result_of(json!(10), json!({ "small": true }))));
+
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one answer per send, got {} lines",
+            lines.len()
+        );
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["id"], 9, "the error names the request it answers");
+        assert_eq!(first["error"]["code"], -32603, "{first}");
+        let bytes = first["error"]["data"]["bytes"].as_u64().expect("bytes");
+        let cap = first["error"]["data"]["cap"].as_u64().expect("cap");
+        assert!(bytes > cap, "{bytes} should exceed {cap}");
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["id"], 10);
+        assert_eq!(second["result"]["small"], true);
+    }
+
     #[test]
     fn a_request_whose_thread_cannot_start_is_still_answered_once() {
         let request: JsonRpcRequest = serde_json::from_value(json!({

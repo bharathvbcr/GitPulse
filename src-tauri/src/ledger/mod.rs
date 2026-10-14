@@ -4974,3 +4974,6 @@ mod identity_tests {
 
 #[cfg(test)]
 mod stamp_tests;
+
+#[cfg(test)]
+mod object_cap_tests;

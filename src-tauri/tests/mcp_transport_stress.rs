@@ -539,6 +539,113 @@ fn the_server_exits_when_its_client_stops_reading() {
 }
 
 // ---------------------------------------------------------------------------
+// Output budgets: a result the wire cannot carry is the request's problem
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_oversized_result_is_reported_and_the_session_survives() {
+    // The transport backstop lowered to 16 KiB makes an ordinary `tools/list`
+    // (tens of KiB) too big for one frame. Before the split a failed write
+    // ended the session with exit 0 and no answer for the request at all.
+    let mut server = Server::start(&[("GITPULSE_MCP_MAX_RESPONSE_BYTES", "16384")]);
+    server.write(request(json!("big"), "tools/list", json!({})).as_bytes());
+    server.write(request(json!("next"), "server/discover", json!({})).as_bytes());
+
+    let (responses, status) = server.finish();
+    assert_eq!(status, Some(0));
+    let big = by_id(&responses, &json!("big"));
+    assert_eq!(big.len(), 1, "the oversized request was not answered: {responses:?}");
+    assert_eq!(error_code(&big[0]), -32603, "{:?}", big[0]);
+    let bytes = big[0]["error"]["data"]["bytes"].as_u64().expect("bytes");
+    let cap = big[0]["error"]["data"]["cap"].as_u64().expect("cap");
+    assert_eq!(cap, 16384, "{:?}", big[0]);
+    assert!(bytes > cap, "{bytes} should exceed {cap}");
+    let next = by_id(&responses, &json!("next"));
+    assert_eq!(
+        next.len(),
+        1,
+        "the session ended after the oversized result: {responses:?}"
+    );
+    assert!(next[0]["result"].is_object(), "{:?}", next[0]);
+}
+
+/// A trusted repository whose ledger holds about 2 MB of rows, so a page of it
+/// is far past a pipe buffer.
+fn repository_with_a_heavy_ledger() -> (tempfile::TempDir, String) {
+    use gitpulse_lib::ledger::{self, ActorKind, Draft, Outcome};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let canonical = dir.path().canonicalize().expect("canonical repo");
+    let repo = canonical.to_str().expect("utf8").to_string();
+    let status = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .arg(&canonical)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status_locked()
+        .expect("spawn git");
+    assert!(status.success(), "git init");
+    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
+    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
+    for n in 0..320 {
+        let id = ledger::record(Draft {
+            repo_path: repo.clone(),
+            action: "session.command".into(),
+            object: Some(format!("echo {n}")),
+            actor_kind: Some(ActorKind::Agent),
+            outcome: Some(Outcome::Ok),
+            detail_json: Some(json!({ "note": "d".repeat(6_000) }).to_string()),
+            ..Default::default()
+        });
+        assert!(id.is_some(), "row {n} was not recorded");
+    }
+    (dir, repo)
+}
+
+#[test]
+fn a_slow_but_live_reader_does_not_end_the_session() {
+    // The measured shape: a response bigger than the pipe buffer blocks the
+    // server's write until the client reads. A client that pauses for 1.5 s
+    // (a busy host, a debugger) is alive, and a 1 s write deadline ended its
+    // session with no answer.
+    let (_dir, repo) = repository_with_a_heavy_ledger();
+    let (mut server, stdout) = Server::start_undrained(&[]);
+    server.write(
+        request(
+            json!("page"),
+            "tools/call",
+            json!({
+                "name": "gitpulse_ledger_events",
+                "arguments": { "repo_path": repo, "limit": 1000 }
+            }),
+        )
+        .as_bytes(),
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut reader = BufReader::new(stdout);
+    let mut page = String::new();
+    reader.read_line(&mut page).expect("the page response");
+    let page: Value = serde_json::from_str(&page).expect("one JSON-RPC line");
+    assert_eq!(page["id"], json!("page"), "{page:.300}");
+    assert!(
+        page["result"]["structuredContent"]["events"].is_array(),
+        "the page was not delivered: {page:.300}"
+    );
+
+    server.write(request(json!("after"), "tools/list", json!({})).as_bytes());
+    let mut after = String::new();
+    reader.read_line(&mut after).expect("the next response");
+    let after: Value = serde_json::from_str(&after).expect("one JSON-RPC line");
+    assert_eq!(after["id"], json!("after"), "{after:.300}");
+    assert!(
+        server.child.try_wait().expect("try_wait").is_none(),
+        "the server exited while its client was alive"
+    );
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+}
+
+// ---------------------------------------------------------------------------
 // Fuzzing: no input may kill the server or corrupt the stream
 // ---------------------------------------------------------------------------
 
