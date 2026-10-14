@@ -16,15 +16,26 @@
 
 use serde_json::{json, Value};
 
+use super::budget;
 use super::uri::{self, Target, UriError};
 
-/// Ceiling on one resource document, in bytes of serialized JSON.
+/// Ceiling on one resource document, in bytes of the text as it is carried on
+/// the wire: after JSON escaping, which grows a quote or a control character
+/// two to six times.
 ///
 /// stdio has no backpressure: a 200 MB `insights` payload for a monorepo is
 /// written to the pipe in one `writeln!` and the client has to buffer all of
 /// it. Truncation here is always *reported* — never a silently shortened
 /// document that reads as complete.
-pub const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+///
+/// Below the frame by a quarter megabyte, which is what the response around the
+/// document (the envelope, the `uri`, the notice) may take. A cap equal to the
+/// frame could never fit it: any document near the cap overflowed, and the
+/// transport could only answer that with an error.
+pub const MAX_DOCUMENT_BYTES: usize = super::MAX_FRAME_BYTES - 256 * 1024;
+
+/// Room the notice appended to a cut document may take on the wire.
+const NOTICE_RESERVE_BYTES: usize = 512;
 
 /// A repository facet: one `gitpulse://<facet>{+repo_path}` template.
 struct Facet {
@@ -181,16 +192,14 @@ fn text_content(target_uri: &str, payload: Value) -> Value {
         json!({ "ok": false, "error": format!("result could not be serialized: {error}") })
             .to_string()
     });
-    let (text, truncated) = if text.len() > MAX_DOCUMENT_BYTES {
-        let mut cut = MAX_DOCUMENT_BYTES;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
+    let (text, truncated) = if budget::escaped_len(&text) - 2 > MAX_DOCUMENT_BYTES {
+        // Cut where the *escaped* prefix fits, leaving room for the notice.
+        let prefix = budget::escaped_prefix(&text, MAX_DOCUMENT_BYTES - NOTICE_RESERVE_BYTES);
         (
             format!(
-                "{}\n\n… truncated: document is {} bytes, capped at {}. \
-                 Use the equivalent tool with a narrower argument to read it in full.",
-                &text[..cut],
+                "{prefix}\n\n… truncated: document is {} bytes, capped at {} bytes as carried \
+                 on the wire. Use the equivalent tool with a narrower argument to read it \
+                 in full.",
                 text.len(),
                 MAX_DOCUMENT_BYTES
             ),
@@ -274,21 +283,30 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
 /// an hour or just opened. `returned` says how many came back, `truncated` is
 /// true only when more events really follow (an exactly-full final page is not
 /// truncated), and `next_cursor` is what to pass to get them.
+///
+/// A page is bounded in bytes as well as rows: each row is cut field by field
+/// ([`crate::ledger::LedgerEvent::bounded`]) and the page ends at the last row
+/// that fits [`crate::ledger::PAGE_MAX_BYTES`], so a thousand heavy rows come
+/// back as several pages whose `next_cursor` continues without a gap.
 pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, String> {
-    match crate::ledger::tail_readonly(anchor, cursor, limit).map_err(|e| e.to_string())? {
-        Some(events) => {
+    match crate::ledger::tail_readonly_page(anchor, cursor, limit, crate::ledger::PAGE_MAX_BYTES)
+        .map_err(|e| e.to_string())?
+    {
+        Some((events, byte_capped)) => {
             let next_cursor = events.last().map(|event| event.id);
-            // A full page might be the last one. One more row of lookahead
+            // A page cut for its size always has more behind it. Otherwise a
+            // full page might be the last one: one more row of lookahead
             // settles it, and only a full page pays for it.
-            let truncated = match next_cursor {
-                Some(last) if events.len() as u32 >= limit => {
-                    !crate::ledger::tail_readonly(anchor, last, 1)
-                        .map_err(|e| e.to_string())?
-                        .unwrap_or_default()
-                        .is_empty()
-                }
-                _ => false,
-            };
+            let truncated = byte_capped
+                || match next_cursor {
+                    Some(last) if events.len() as u32 >= limit => {
+                        !crate::ledger::tail_readonly(anchor, last, 1)
+                            .map_err(|e| e.to_string())?
+                            .unwrap_or_default()
+                            .is_empty()
+                    }
+                    _ => false,
+                };
             Ok(json!({
                 "ok": true,
                 "returned": events.len(),
@@ -522,7 +540,10 @@ mod tests {
     #[test]
     fn a_document_that_escapes_to_more_than_the_frame_is_delivered_truncated() {
         const FRAME: usize = 4 * 1024 * 1024;
-        for payload in ["\"".repeat(3 * 1024 * 1024), "\u{1}".repeat(3 * 1024 * 1024)] {
+        for payload in [
+            "\"".repeat(3 * 1024 * 1024),
+            "\u{1}".repeat(3 * 1024 * 1024),
+        ] {
             let contents = vec![text_content(
                 "gitpulse://insights/tmp/x",
                 json!({ "blob": payload }),
@@ -534,9 +555,15 @@ mod tests {
                 error: None,
             };
             let wire = serde_json::to_string(&response).unwrap().len() + 1;
-            assert!(wire <= FRAME, "a truncated document is {wire} bytes on the wire");
             assert!(
-                contents[0]["text"].as_str().unwrap().contains("… truncated"),
+                wire <= FRAME,
+                "a truncated document is {wire} bytes on the wire"
+            );
+            assert!(
+                contents[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("… truncated"),
                 "the truncation is not announced"
             );
         }

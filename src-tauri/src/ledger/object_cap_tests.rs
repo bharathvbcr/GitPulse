@@ -73,7 +73,10 @@ fn a_command_over_the_cap_is_cut_after_redaction_and_hashed_redacted() {
         let object = event.object.as_deref().expect("an object");
         assert!(object.len() <= CAP, "{} bytes stored", object.len());
         assert!(!object.contains(SECRET), "a secret reached the object");
-        assert!(!object.contains("ghp_0123456789abcdef"), "half a token survived");
+        assert!(
+            !object.contains("ghp_0123456789abcdef"),
+            "half a token survived"
+        );
         let detail = detail.expect("the cut is recorded in detail_json");
         assert!(!detail.to_string().contains(SECRET));
         let marker = &detail["object_truncated"];
@@ -83,7 +86,11 @@ fn a_command_over_the_cap_is_cut_after_redaction_and_hashed_redacted() {
             hash_of(&redacted),
             "the hash is of the redacted full text"
         );
-        assert_ne!(marker["hash"], hash_of(&raw), "the hash fingerprints a secret");
+        assert_ne!(
+            marker["hash"],
+            hash_of(&raw),
+            "the hash fingerprints a secret"
+        );
         let at_cut = usize::try_from(marker["at"].as_u64().expect("at")).unwrap();
         assert!(redacted.is_char_boundary(at_cut));
         assert!(object.starts_with(&redacted[..at_cut]), "{object}");
@@ -119,7 +126,10 @@ fn the_cut_never_splits_a_multibyte_character() {
             assert!(object.len() <= CAP, "{glyph} pad {pad}: {}", object.len());
             let marker = detail.expect("a marker")["object_truncated"].clone();
             let at = usize::try_from(marker["at"].as_u64().unwrap()).unwrap();
-            assert!(command.is_char_boundary(at), "{glyph} pad {pad}: cut at {at}");
+            assert!(
+                command.is_char_boundary(at),
+                "{glyph} pad {pad}: cut at {at}"
+            );
             assert!(object.starts_with(&command[..at]));
         }
     }
@@ -155,5 +165,8 @@ fn an_object_that_fits_leaves_detail_exactly_as_it_was() {
     assert_eq!(event.object.as_deref(), Some("git status"));
     assert!(detail.is_none());
     let (_, detail) = stored("git status", Some(r#"{"source":"transcript"}"#), None);
-    assert_eq!(detail.unwrap(), serde_json::json!({ "source": "transcript" }));
+    assert_eq!(
+        detail.unwrap(),
+        serde_json::json!({ "source": "transcript" })
+    );
 }

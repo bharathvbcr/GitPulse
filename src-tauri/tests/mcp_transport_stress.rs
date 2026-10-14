@@ -554,7 +554,11 @@ fn an_oversized_result_is_reported_and_the_session_survives() {
     let (responses, status) = server.finish();
     assert_eq!(status, Some(0));
     let big = by_id(&responses, &json!("big"));
-    assert_eq!(big.len(), 1, "the oversized request was not answered: {responses:?}");
+    assert_eq!(
+        big.len(),
+        1,
+        "the oversized request was not answered: {responses:?}"
+    );
     assert_eq!(error_code(&big[0]), -32603, "{:?}", big[0]);
     let bytes = big[0]["error"]["data"]["bytes"].as_u64().expect("bytes");
     let cap = big[0]["error"]["data"]["cap"].as_u64().expect("cap");

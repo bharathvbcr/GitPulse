@@ -29,10 +29,13 @@
 //! by every later consumer.
 
 pub mod bindings;
+mod cap;
 mod consolidated;
 pub mod ids;
 pub mod redact;
 
+pub(crate) use cap::{bound_json_text, ROW_FIELD_CAP_BYTES};
+use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -305,33 +308,88 @@ impl EventStamp {
     }
 }
 
-/// `detail` redacted, with `stamp`'s keys in it.
+/// One server-built member set that skips the redactor when it is spliced into
+/// a `detail_json` object: the event-time stamp, or the record of an `object`
+/// cut. Each is checked against a closed shape first
+/// ([`EventStamp::is_well_formed`], [`ObjectCap::is_well_formed`]).
+enum Splice<'a> {
+    Stamp(&'a EventStamp),
+    ObjectCap(&'a ObjectCap),
+}
+
+impl Splice<'_> {
+    fn is_well_formed(&self) -> bool {
+        match self {
+            Splice::Stamp(stamp) => stamp.is_well_formed(),
+            Splice::ObjectCap(cap) => cap.is_well_formed(),
+        }
+    }
+
+    /// The members as JSON object text, without braces.
+    fn members(&self) -> String {
+        let object = match self {
+            Splice::Stamp(stamp) => stamp.members(),
+            Splice::ObjectCap(cap) => {
+                serde_json::json!({ OBJECT_TRUNCATED_KEY: cap.as_value() }).to_string()
+            }
+        };
+        object[1..object.len() - 1].to_string()
+    }
+
+    /// The members inserted into a parsed object, overwriting.
+    fn insert_into(&self, map: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            Splice::Stamp(stamp) => {
+                map.insert("occurred_at".into(), stamp.occurred_at.clone().into());
+                map.insert(
+                    "occurred_at_basis".into(),
+                    stamp.occurred_at_basis.clone().into(),
+                );
+                map.insert("task_basis".into(), stamp.task_basis.clone().into());
+            }
+            Splice::ObjectCap(cap) => {
+                map.insert(OBJECT_TRUNCATED_KEY.into(), cap.as_value());
+            }
+        }
+    }
+}
+
+/// `detail` redacted, with `stamp`'s keys and `cap`'s record in it.
 ///
-/// A well-formed stamp is spliced onto the redacted object: the detail is
-/// redacted without the three keys, and their validated members are appended.
-/// Anything else takes the closed path: a stamp that fails validation, or a
-/// detail that names a stamp key (spelled plainly or through a `\u` escape,
-/// which any JSON parser reads as the same key). There the keys go into the
-/// parsed object, overwriting, and the whole of it is redacted. A detail that
-/// does not parse as a JSON object carries no stamp on that path.
+/// Each well-formed member set is spliced onto the redacted object: the detail
+/// is redacted without those keys, and their validated members are appended.
+/// Anything else takes the closed path: a member set that fails validation, or
+/// a detail that names a spliced key (spelled plainly or through a `\u`
+/// escape, which any JSON parser reads as the same key). There the keys go into
+/// the parsed object, overwriting, and the whole of it is redacted. A detail
+/// that does not parse as a JSON object carries no spliced member on that path.
 ///
 /// Callers pass serde-built objects. The fast path does not parse: text that
 /// starts with `{` and ends with `}` is spliced as it is, so malformed brace
 /// text (`{}{}`, `{not json}`) is not validated there, and a debug build
 /// asserts that the redacted text is an object. A release-mode parse would cost
 /// back what the splice saves.
-fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<String> {
-    let Some(stamp) = stamp else {
+fn redact_detail(
+    detail: Option<&str>,
+    stamp: Option<&EventStamp>,
+    cap: Option<&ObjectCap>,
+) -> Option<String> {
+    let splices: Vec<Splice<'_>> = stamp
+        .map(Splice::Stamp)
+        .into_iter()
+        .chain(cap.map(Splice::ObjectCap))
+        .collect();
+    if splices.is_empty() {
         return detail.map(redact::text);
-    };
+    }
     // A detail that already names one of the keys would be given it twice.
     let names_a_key = detail.is_some_and(|text| {
         text.contains("\\u")
-            || ["\"occurred_at", "\"task_basis\""]
+            || ["\"occurred_at", "\"task_basis\"", "\"object_truncated"]
                 .iter()
                 .any(|key| text.contains(key))
     });
-    if stamp.is_well_formed() && !names_a_key {
+    if splices.iter().all(Splice::is_well_formed) && !names_a_key {
         let redacted = detail.map_or_else(|| "{}".to_string(), redact::text);
         let trimmed = redacted.trim();
         if let Some(body) = trimmed
@@ -347,10 +405,15 @@ fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<Str
                 },
                 "the splice was handed text that is not a JSON object: {trimmed}"
             );
-            let members = stamp.members();
-            let members = &members[1..members.len() - 1];
-            let separator = if body.trim().is_empty() { "" } else { "," };
-            return Some(format!("{{{body}{separator}{members}}}"));
+            let mut text = format!("{{{body}");
+            let mut separator = if body.trim().is_empty() { "" } else { "," };
+            for splice in &splices {
+                text.push_str(separator);
+                text.push_str(&splice.members());
+                separator = ",";
+            }
+            text.push('}');
+            return Some(text);
         }
     }
     // The closed path: the keys join the object, and all of it is redacted.
@@ -364,12 +427,9 @@ fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<Str
     let Some(mut map) = object else {
         return detail.map(redact::text);
     };
-    map.insert("occurred_at".into(), stamp.occurred_at.clone().into());
-    map.insert(
-        "occurred_at_basis".into(),
-        stamp.occurred_at_basis.clone().into(),
-    );
-    map.insert("task_basis".into(), stamp.task_basis.clone().into());
+    for splice in &splices {
+        splice.insert_into(&mut map);
+    }
     Some(redact::text(&serde_json::Value::Object(map).to_string()))
 }
 
@@ -1349,6 +1409,16 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
     let actor_kind = draft.actor_kind.unwrap_or(ActorKind::System);
     let outcome = draft.outcome.unwrap_or(Outcome::Ok);
 
+    // The object is redacted first and cut second: cutting the raw text could
+    // leave half a credential that the redactor no longer recognises.
+    let (object, object_cap) = match draft.object.as_deref().map(redact::text) {
+        Some(redacted) => {
+            let (object, cap) = cap_object(redacted);
+            (Some(object), cap)
+        }
+        None => (None, None),
+    };
+
     // Redact every caller-controlled string at the one write boundary. The
     // verdict repeats the judged command in `target`, so redacting only argv
     // leaves a second full copy of the same credential in the same row.
@@ -1362,14 +1432,18 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         session_id: draft.session_id.as_deref().map(redact::text),
         task_id: draft.task_id.as_deref().map(redact::text),
         action: redact::text(&draft.action),
-        object: draft.object.as_deref().map(redact::text),
+        object,
         argv: draft.argv_json.as_deref().map(redact::text),
         outcome: outcome.as_str(),
         verdict: draft.verdict_json.as_deref().map(redact::text),
         before_ref: draft.before_ref.as_deref().map(redact::text),
         after_ref: draft.after_ref.as_deref().map(redact::text),
         duration_ms: draft.duration_ms,
-        detail: redact_detail(draft.detail_json.as_deref(), draft.event_stamp.as_ref()),
+        detail: redact_detail(
+            draft.detail_json.as_deref(),
+            draft.event_stamp.as_ref(),
+            object_cap.as_ref(),
+        ),
     })
 }
 
@@ -1665,7 +1739,7 @@ pub fn record(draft: Draft) -> Option<i64> {
 /// asks for what followed, and the answer is the same whether it has been
 /// listening for an hour or has just opened the app.
 pub fn tail(repo_path: &str, cursor: i64, limit: u32) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, false, Access::Writable)
+    read_after(repo_path, cursor, limit, false, Access::Writable, None).map(|(events, _)| events)
 }
 
 /// The newest `limit` events after `cursor`, oldest first.
@@ -1681,7 +1755,7 @@ pub fn tail_newest(
     cursor: i64,
     limit: u32,
 ) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, true, Access::Writable)
+    read_after(repo_path, cursor, limit, true, Access::Writable, None).map(|(events, _)| events)
 }
 
 /// The one precedence order of a worktree's bind and unbind rows, newest first:
@@ -1933,13 +2007,22 @@ pub(crate) fn newest_binding_readonly(
     })
 }
 
+/// The one reader of event rows, with an optional byte bound on the page.
+///
+/// With `max_bytes` each row is [`LedgerEvent::bounded`] and the page ends at
+/// the last row that fits the budget (always at least one, so a page makes
+/// progress); the flag says rows after it were left for the next page. Without
+/// it the rows come back whole and the flag is false. [`tail`] and
+/// [`tail_newest`] pass `None`: `ingest` reads a short page as the end of
+/// history, which a silent cap would break.
 fn read_after(
     repo_path: &str,
     cursor: i64,
     limit: u32,
     newest: bool,
     access: Access,
-) -> Result<Vec<LedgerEvent>, LedgerError> {
+    max_bytes: Option<usize>,
+) -> Result<(Vec<LedgerEvent>, bool), LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
     // An unbounded limit would let one call page an entire history into the
@@ -1980,7 +2063,23 @@ fn read_after(
             // ever persisting the unredacted spelling in this row.
             event.repo_path.clone_from(&canonical_repo_path);
         }
-        Ok(events)
+        let Some(budget) = max_bytes else {
+            return Ok((events, false));
+        };
+        let mut used = 0;
+        let mut page = Vec::with_capacity(events.len());
+        let mut capped = false;
+        for event in events {
+            let event = event.bounded();
+            let size = serde_json::to_string(&event).map_or(0, |text| text.len() + 1);
+            if !page.is_empty() && used + size > budget {
+                capped = true;
+                break;
+            }
+            used += size;
+            page.push(event);
+        }
+        Ok((page, capped))
     })
 }
 
@@ -2689,7 +2788,44 @@ pub fn tail_readonly(
     if !is_initialised(repo_path) {
         return Ok(None);
     }
-    read_after(repo_path, cursor, limit, false, Access::ReadOnly).map(Some)
+    read_after(repo_path, cursor, limit, false, Access::ReadOnly, None)
+        .map(|(events, _)| Some(events))
+}
+
+/// What a page of the ledger may weigh once serialized, before it is wrapped in
+/// a tool result. A quarter of the transport's frame, so the page, its text
+/// mirror and the envelope fit with room to spare.
+pub const PAGE_MAX_BYTES: usize = 1024 * 1024;
+
+/// [`tail_readonly`] for a page that crosses a size-limited transport: rows are
+/// [`LedgerEvent::bounded`] and the page holds at most `max_bytes` (at least
+/// one row). The flag is true when rows past the page's last one were left out
+/// for that reason.
+pub fn tail_readonly_page(
+    repo_path: &str,
+    cursor: i64,
+    limit: u32,
+    max_bytes: usize,
+) -> Result<Option<(Vec<LedgerEvent>, bool)>, LedgerError> {
+    if !is_initialised(repo_path) {
+        return Ok(None);
+    }
+    read_after(
+        repo_path,
+        cursor,
+        limit,
+        false,
+        Access::ReadOnly,
+        Some(max_bytes),
+    )
+    .map(Some)
+}
+
+/// What an object is stored as: redacted, then cut to the append cap. An
+/// ingest that compares a freshly built identity with stored rows must compare
+/// this, or an identity longer than the cap would never match its own row.
+pub fn stored_object(raw: &str) -> String {
+    cap_object(redact::text(raw)).0
 }
 
 pub fn status(repo_path: &str) -> LedgerStatus {

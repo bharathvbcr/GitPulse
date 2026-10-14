@@ -41,6 +41,7 @@ fn a_well_formed_stamp_is_spliced_onto_the_redacted_object() {
     let out = redact_detail(
         Some(r#"{"source":"transcript","tool":"Edit"}"#),
         Some(&stamp()),
+        None,
     );
     assert_eq!(
         out.as_deref(),
@@ -50,14 +51,14 @@ fn a_well_formed_stamp_is_spliced_onto_the_redacted_object() {
     );
     // No detail, and an empty one, carry the stamp alone.
     for detail in [None, Some("{}")] {
-        let out = redact_detail(detail, Some(&stamp())).unwrap();
+        let out = redact_detail(detail, Some(&stamp()), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["task_basis"], "bound", "{out}");
         assert_eq!(parsed.as_object().unwrap().len(), 3, "{out}");
     }
     // No stamp: the old path, byte for byte.
     assert_eq!(
-        redact_detail(Some(r#"{"a":1}"#), None),
+        redact_detail(Some(r#"{"a":1}"#), None, None),
         Some(redact::text(r#"{"a":1}"#))
     );
 }
@@ -130,7 +131,7 @@ fn every_mismatch_takes_the_closed_path() {
     ];
     for bad in mismatches {
         assert!(!bad.is_well_formed(), "{bad:?}");
-        let out = redact_detail(Some(r#"{"source":"transcript"}"#), Some(&bad)).unwrap();
+        let out = redact_detail(Some(r#"{"source":"transcript"}"#), Some(&bad), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         // Through the object, not spliced as text: an injected quote stays inside its value.
         assert!(parsed.get("injected").is_none(), "{out}");
@@ -141,7 +142,7 @@ fn every_mismatch_takes_the_closed_path() {
 
 #[test]
 fn a_detail_that_already_names_a_key_is_not_given_it_twice() {
-    let out = redact_detail(Some(r#"{"occurred_at":"x"}"#), Some(&stamp())).unwrap();
+    let out = redact_detail(Some(r#"{"occurred_at":"x"}"#), Some(&stamp()), None).unwrap();
     assert_eq!(out.matches("occurred_at\"").count(), 1, "{out}");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["occurred_at"], "2026-09-01T12:00:05.250Z");
@@ -163,7 +164,7 @@ fn an_escaped_spelling_of_a_stamp_key_is_not_given_twice() {
         detail.contains("\\u005f"),
         "the fixture must hold a real escape"
     );
-    let spliced = redact_detail(Some(detail), Some(&stamp())).unwrap();
+    let spliced = redact_detail(Some(detail), Some(&stamp()), None).unwrap();
     assert!(!spliced.contains("FORGED"), "{spliced}");
     assert_eq!(spliced.matches("occurred_at\"").count(), 1, "{spliced}");
     let repo = tempfile::tempdir().unwrap();
@@ -214,7 +215,7 @@ fn an_escaped_spelling_of_a_stamp_key_is_not_given_twice() {
 #[test]
 #[should_panic(expected = "not a JSON object")]
 fn brace_text_that_is_not_an_object_is_a_caller_bug_in_debug() {
-    let _ = redact_detail(Some("{}{}"), Some(&stamp()));
+    let _ = redact_detail(Some("{}{}"), Some(&stamp()), None);
 }
 
 /// Anything that is not a JSON object carries no stamp, takes no splice, and
@@ -292,7 +293,7 @@ fn the_splice_always_yields_valid_json_with_the_stamp_for_an_object_detail() {
         "{\"a\":\"\\\",\\\"occurred_at\\\":\\\"x\"}".to_string(),
     ];
     for detail in details {
-        let out = redact_detail(Some(&detail), Some(&stamp())).unwrap();
+        let out = redact_detail(Some(&detail), Some(&stamp()), None).unwrap();
         assert!(
             !out.contains(KEY),
             "leaked from {}: {out}",
@@ -314,7 +315,7 @@ fn a_detail_nested_past_the_redactor_depth_still_does_not_leak() {
             format!("{{\"k\":{inner}}}")
         });
         let detail = format!("{{\"deep\":{nested}}}");
-        let out = redact_detail(Some(&detail), Some(&stamp())).unwrap();
+        let out = redact_detail(Some(&detail), Some(&stamp()), None).unwrap();
         assert!(!out.contains(KEY), "depth {depth} leaked");
         assert!(out.ends_with(r#""task_basis":"bound"}"#), "depth {depth}");
     }
@@ -326,7 +327,7 @@ fn a_very_large_detail_still_takes_the_stamp_and_stays_redacted() {
     let big = "x".repeat(8 * 1024 * 1024);
     let detail = serde_json::json!({ "blob": big, "secret": KEY }).to_string();
     let started = std::time::Instant::now();
-    let out = redact_detail(Some(&detail), Some(&stamp())).unwrap();
+    let out = redact_detail(Some(&detail), Some(&stamp()), None).unwrap();
     assert!(!out.contains(KEY));
     assert!(out.ends_with(r#""task_basis":"bound"}"#));
     assert!(

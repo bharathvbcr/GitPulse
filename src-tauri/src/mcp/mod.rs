@@ -24,6 +24,7 @@
 //! `harness::guard_command`, and every writing tool must be added to the
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
+mod budget;
 pub mod complete;
 pub mod devmap_parity;
 pub mod page;
@@ -50,6 +51,12 @@ pub const SERVER_NAME: &str = "gitpulse-mcp";
 /// version it supports. This SHOULD be the *latest* version supported by the
 /// server", and it is the client's job to disconnect if it cannot use it.
 pub const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
+
+/// Largest single JSON-RPC message, in either direction, matching the harness
+/// sidecar's frame cap. The one owner of the figure: the transport refuses to
+/// read or write a line past it, and every result budget (tool results, ledger
+/// pages, resource documents) is derived from it, so they cannot drift apart.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 const TOOLS_TTL_MS: u64 = 3_600_000;
 const DISCOVER_TTL_MS: u64 = 3_600_000;
@@ -1129,23 +1136,30 @@ fn list_result(
     Ok(cacheable(modern, envelope(modern, body), ttl_ms))
 }
 
-fn complete_tool_result(modern: bool, payload: Value) -> Value {
-    // The serialized JSON also goes in a text block: the spec asks for it
-    // ("a tool that returns structured content SHOULD also return the
-    // serialized JSON in a TextContent block") and legacy clients read nothing
-    // else.
-    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|error| {
-        json!({ "ok": false, "error": format!("result could not be serialized: {error}") })
-            .to_string()
-    });
-    let mut body = json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": false
-    });
-    if modern {
-        body["structuredContent"] = payload;
+/// A tool's successful result, fitted to `budget` bytes on the wire (see
+/// [`budget`]): the payload as `structuredContent` in the modern era, and its
+/// compact serialization in a text block in both.
+///
+/// The text is there because the spec asks for it ("a tool that returns
+/// structured content SHOULD also return the serialized JSON in a TextContent
+/// block") and legacy clients read nothing else. It is compact because
+/// pretty-printing cost a third again, and bounded in the modern era because
+/// carrying every large payload twice at full size did the rest. A payload too
+/// large to cut is a tool execution error that says so.
+fn complete_tool_result(modern: bool, payload: Value, budget: usize) -> Value {
+    match budget::fit(modern, payload, budget) {
+        Ok(fitted) => {
+            let mut body = json!({
+                "content": [{ "type": "text", "text": fitted.text }],
+                "isError": false
+            });
+            if let Some(structured) = fitted.structured {
+                body["structuredContent"] = structured;
+            }
+            envelope(modern, body)
+        }
+        Err(message) => tool_exec_error(modern, message),
     }
-    envelope(modern, body)
 }
 
 /// A tool *execution* error: reported inside the result so a model can
@@ -1481,10 +1495,19 @@ fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
 fn task_view(a: TaskViewArgs) -> Result<Value, String> {
     let address = crate::ledger::bindings::repository_address_readonly(&a.repo_path)
         .map_err(|error| error.to_string())?;
-    Ok(json!(crate::tasks::view_filtered(
-        &address.anchor,
-        a.task_id.as_deref()
-    )))
+    let mut view = crate::tasks::view_filtered(&address.anchor, a.task_id.as_deref());
+    // The view is also what the desktop app reads whole, so the cap is here, at
+    // the MCP boundary. Each row's stored JSON text is cut the way a ledger
+    // page cuts its own; the result budget then cuts the lists themselves and
+    // sets `evidence_truncated` / `gaps_truncated`.
+    let cap = crate::ledger::ROW_FIELD_CAP_BYTES;
+    for evidence in &mut view.evidence {
+        evidence.data_json = crate::ledger::bound_json_text(&evidence.data_json, cap);
+    }
+    for gap in &mut view.gaps {
+        gap.evidence_json = crate::ledger::bound_json_text(&gap.evidence_json, cap);
+    }
+    Ok(json!(view))
 }
 
 fn meta_object(params: &Value) -> Option<&Value> {
@@ -1811,7 +1834,10 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
                 );
             }
             match handle_tool_call(name, &arguments) {
-                Ok(payload) => ok(id, complete_tool_result(modern, payload)),
+                Ok(payload) => {
+                    let room = budget::tool_budget(&id);
+                    ok(id, complete_tool_result(modern, payload, room))
+                }
                 // Unknown tool is a protocol error: no argument the model could
                 // change would make the call succeed.
                 Err(message) if message.starts_with("Unknown tool:") => {
@@ -2677,17 +2703,26 @@ mod tests {
             assert_eq!(result["isError"], false, "{result:.300}");
             let page = result["structuredContent"].clone();
             let violations = validate::validate(&page, &schema);
-            assert!(violations.is_empty(), "page violates its schema: {violations:?}");
+            assert!(
+                violations.is_empty(),
+                "page violates its schema: {violations:?}"
+            );
             let events = page["events"].as_array().expect("events");
             assert_eq!(page["returned"], events.len());
             seen.extend(events.iter().map(|e| e["id"].as_i64().expect("id")));
             let last = events.last().expect("a page always makes progress")["id"]
                 .as_i64()
                 .unwrap();
-            assert_eq!(page["next_cursor"], last, "next_cursor is the last returned id");
+            assert_eq!(
+                page["next_cursor"], last,
+                "next_cursor is the last returned id"
+            );
             pages += 1;
             if pages == 1 {
-                assert_eq!(page["truncated"], true, "the first page cannot be the whole ledger");
+                assert_eq!(
+                    page["truncated"], true,
+                    "the first page cannot be the whole ledger"
+                );
             }
             if page["truncated"] != true {
                 break;
@@ -2723,14 +2758,20 @@ mod tests {
             text.len()
         );
         let mirror: Value = serde_json::from_str(text).expect("the mirror is still JSON");
-        assert!(mirror["events"].is_array(), "the mirror keeps the payload's shape");
+        assert!(
+            mirror["events"].is_array(),
+            "the mirror keeps the payload's shape"
+        );
         let structured = &modern["structuredContent"];
         assert_eq!(structured["events"].as_array().expect("events").len(), 120);
         assert!(
             structured["events"].to_string().len() > 256 * 1024,
             "the fixture is not large enough to exercise the mirror"
         );
-        assert!(!text.contains("\n  "), "the text is compact, not pretty-printed");
+        assert!(
+            !text.contains("\n  "),
+            "the text is compact, not pretty-printed"
+        );
 
         let mut era = Era::Unknown;
         process_request(request("initialize", Some(json!(0)), json!({})), &mut era);
