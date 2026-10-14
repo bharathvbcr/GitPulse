@@ -41,7 +41,18 @@ describe("native mutation policy contract", () => {
 
   it("routes every policy-carrying command through the write gate", () => {
     for (const name of guardedCommands()) {
-      const body = functionSource(name);
+      let body = functionSource(name);
+      // A command that hands its body to a named sync delegate (so the gate
+      // is testable without the async runtime) is judged by that delegate's
+      // body, which must itself call the gate: `docs_rename_guarded` judges
+      // the move and every path the rename writes.
+      const delegate = /\b(docs_rename_guarded)\(/.exec(body)?.[1];
+      if (delegate) {
+        const start = source.indexOf(`fn ${delegate}(`);
+        expect(start, `${name} delegates to ${delegate}, which must exist`).toBeGreaterThanOrEqual(0);
+        body = source.slice(start, source.indexOf("\n}\n", start));
+        expect(body, `${delegate} must judge each path it rewrites`).toContain('guard_file(repo_path, path, "modify")');
+      }
       // `guard` judges a rendered command line; `guard_file` judges a path.
       // Both are the canonical harness entry points; anything else is a
       // command that reports a verdict it never actually obtained.

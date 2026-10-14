@@ -272,9 +272,23 @@ pub fn sandbox_join_entry(repo: &Path, file_path: &str) -> Result<PathBuf, Strin
 }
 
 pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<(), String> {
+    sandbox_write_expecting(repo_path, file_path, None, content).map(|_| ())
+}
+
+/// The one sandboxed write. With `expected` the file is replaced only if it
+/// still holds exactly those bytes: `Ok(false)` means it does not (changed, or
+/// gone) and nothing was written, `Ok(true)` that the content was written. The
+/// bytes are compared under the same anchored read the replacement uses.
+/// `None` writes unconditionally, which is [`sandbox_write`].
+pub fn sandbox_write_expecting(
+    repo_path: &str,
+    file_path: &str,
+    expected: Option<&str>,
+    content: &str,
+) -> Result<bool, String> {
     let repo = validate_repo(repo_path)?;
     let dest = sandbox_join_canonical(&repo, file_path)?;
-    crate::diff::write_regular(&dest, content.as_bytes())
+    crate::diff::write_regular_expecting(&dest, content.as_bytes(), expected.map(str::as_bytes))
 }
 
 /// Saves text that came out of the file editor. Unlike [`sandbox_write`],

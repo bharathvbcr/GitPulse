@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 96 contracts over
- * 241 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 98 contracts over
+ * 245 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -134,6 +134,11 @@ export const CONTRACTS = Object.freeze([
   { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskEvidence", "TaskGap", "DevCouncilRun", "TaskView"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupCandidate", "BranchCleanupPlan", "CommitReviewReport", "TagCleanupPlan", "TagCleanupEntry"] },
   { label: "release", rustPath: rust("commands", "refs.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  // The doc vault's coverage honesty (`notScanned` is what says a search or a
+  // rename did not see every note) and a rename's per-file results, which are
+  // how a partial rename is told apart from a complete one.
+  { label: "docs-vault", rustPath: rust("docs", "mod.rs"), tsPath: ts("docs", "client.ts"), structs: ["DocsStatus", "BrokenLink"] },
+  { label: "docs-rename", rustPath: rust("docs", "rename.rs"), tsPath: ts("docs", "client.ts"), structs: ["DocRenameOutcome", "DocRenameFailure"] },
   // The envelope on every gated command: `policy` travels with `output` so the
   // UI can tell an approved action from one that ran with no gate available.
   // Renaming either field would have broken 33 commands at once, silently.

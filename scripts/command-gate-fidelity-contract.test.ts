@@ -72,7 +72,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_discard_changes: "gated by path not command; covered by file-gate-fidelity-contract",
   cmd_save_conflict: "conflict_session::mutation builds argv once for judging and execution; native conflict gate regressions cover hash-object, update-index and denial",
   cmd_move_path: "GitWriter::move_path hands the gate its MovePlan (the git mv argv, or the untracked delete and write) before executing it, so the judged lines are the lines that run",
-  cmd_docs_rename: "docs::rename_doc hands the gate the same MovePlan GitWriter::move_path does, through guard_move, before it touches the filesystem",
+  cmd_docs_rename: "docs::rename_doc hands the gate the same MovePlan GitWriter::move_path does, through guard_move, plus every path it will rewrite, each judged with guard_file, before it touches the filesystem",
   cmd_delete_path: "GitWriter::delete_path hands the gate every planned git rm / git clean argv before the first runs",
 });
 

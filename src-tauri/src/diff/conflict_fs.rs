@@ -512,6 +512,22 @@ pub(super) fn replace(
 /// They retain the editor's file-size budget and retain displaced content when
 /// an external edit races publication.
 pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_regular_expecting(path, content, None).map(|_| ())
+}
+
+/// [`write_regular`] that writes only over `expected` when one is given.
+///
+/// The comparison is made against the bytes read under the same anchored
+/// directory the replacement then checks again, so there is no window between
+/// "these are the bytes I planned from" and the write. `Ok(false)` means the
+/// file no longer holds `expected` (changed, or gone) and nothing was written;
+/// `Err` is a failure to read or write. With `None` this is exactly
+/// `write_regular`, which delegates here so writes keep one owner.
+pub(crate) fn write_regular_expecting(
+    path: &Path,
+    content: &[u8],
+    expected: Option<&[u8]>,
+) -> Result<bool, String> {
     let cap = crate::engine::budget::MAX_FILE_BYTES as usize;
     if content.len() > cap {
         return Err(format!(
@@ -527,6 +543,9 @@ pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
     {
         if !matches!(source.mode.as_str(), "missing" | "100644" | "100755") {
             return Err("Only regular files can be saved".into());
+        }
+        if expected.is_some_and(|expected| source.bytes.as_deref() != Some(expected)) {
+            return Ok(false);
         }
         let next = Worktree {
             bytes: Some(content.to_vec()),
@@ -544,11 +563,11 @@ pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
         if let Some(mut original) = saved {
             original.keep = false;
         }
-        Ok(())
+        Ok(true)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = path;
+        let _ = (path, expected);
         Err("Atomic file saves are unavailable on this platform".into())
     }
 }
