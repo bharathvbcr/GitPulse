@@ -2505,6 +2505,7 @@ mod tests {
                 kind: crate::insights::EntityCollisionKind::DisjointSymbols,
                 reason: "src/lib.rs is dirty in multiple worktrees, but no shared symbol was seen on the old-side ranges — file overlap, not a merge promise".into(),
                 shared_symbols: Vec::new(),
+                stale: false,
             }),
         });
         let specific = output.hook_specific_output.as_ref().expect("a notice");
@@ -2539,6 +2540,7 @@ mod tests {
                 kind: crate::insights::EntityCollisionKind::FileLevel,
                 reason: "indexed generation head_sha abc is not the requested def".into(),
                 shared_symbols: Vec::new(),
+                stale: true,
             }),
         });
         let specific = output.hook_specific_output.as_ref().expect("a notice");
