@@ -977,6 +977,16 @@ reads.
 | save_edited_text 1 MB | 8.72 ms | 8.65 ms | -0.8% |
 | save_edited_text 8 MB | 18.12 ms | 19.00 ms | +4.9% |
 
+These rows were measured on the build before the final `as_chunks` rewrite of
+the digest loop (same arithmetic, written to satisfy clippy). Two further sets
+of three interleaved pairs were then taken on the final build, but the host had
+drifted by then (load 6 to 47 on 18 CPUs, and the unchanged "before" binary
+itself went from 7.4 ms to 11 to 15 ms at 8 MB), so they cannot be compared with
+the table and are not used; the final build is unmeasured in a quiet window.
+The cost applies only to the editor open (`cmd_get_file_blob`, whose base names
+the bytes the user saw). View-only reads (`get_file_content`, the code graph's
+file text) use `get_file_blob_view` and skip the digest pass.
+
 The open path is over the 5% budget at 1 MB and 8 MB, and that is accepted as
 the cost of correctness. Without a base, a save writes the whole draft over
 whatever an agent or `git pull` put on disk while the file was open, with no
