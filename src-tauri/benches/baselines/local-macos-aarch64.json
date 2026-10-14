@@ -369,6 +369,32 @@
             "git_processes": 2,
             "rows": 50
           }
+        },
+        "transcript_pass 100k lines": {
+          "counters": {
+            "recorded": 100000,
+            "transcripts": 1
+          },
+          "max_ns": 8096865166,
+          "metrics": {},
+          "min_ns": 4390312292,
+          "n": 15,
+          "p50_ns": 4867414166,
+          "p95_ns": 6151513041,
+          "time_gated": true
+        },
+        "transcript_pass 10k cwds": {
+          "counters": {
+            "recorded": 10000,
+            "transcripts": 1
+          },
+          "max_ns": 952406709,
+          "metrics": {},
+          "min_ns": 440687167,
+          "n": 15,
+          "p50_ns": 472977667,
+          "p95_ns": 858354833,
+          "time_gated": true
         }
       }
     },

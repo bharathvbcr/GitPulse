@@ -220,7 +220,7 @@ pub fn belongs_to(call: &ToolCall, repo_path: &str) -> bool {
     under(candidate_path(call), repo_path)
 }
 
-fn candidate_path(call: &ToolCall) -> &str {
+pub fn candidate_path(call: &ToolCall) -> &str {
     call.file_path.as_deref().unwrap_or(&call.cwd)
 }
 
@@ -233,7 +233,7 @@ pub fn attribution_root<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<&'a st
     deepest_root(candidate_path(call), roots)
 }
 
-fn deepest_root<'a>(path: &str, roots: &[&'a str]) -> Option<&'a str> {
+pub fn deepest_root<'a>(path: &str, roots: &[&'a str]) -> Option<&'a str> {
     let depth = |root: &str| root.trim_end_matches('/').len();
     roots
         .iter()
@@ -248,128 +248,61 @@ fn deepest_root<'a>(path: &str, roots: &[&'a str]) -> Option<&'a str> {
         })
 }
 
-/// Distinct working directories one [`DepartedResolver`] looks up. A hostile
-/// transcript can name any number; past this the rest are counted, not checked.
-pub const MAX_DEPARTED_LOOKUPS: usize = 256;
-/// A working directory longer than this is not looked up (`PATH_MAX` on Linux).
+/// A call longer than this is never read as a removed worktree's.
 const MAX_CWD_BYTES: usize = 4096;
-/// Directories below the deepest live root that one lookup will test.
-const MAX_DEPARTED_DEPTH: usize = 64;
+/// Where isolation worktrees live below a checkout.
+const WORKTREES_DIR: &str = "/.claude/worktrees/";
 
-/// A worktree that was removed between passes, found from a call's `cwd`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Departed<'a> {
-    /// The removed worktree: the shallowest ancestor of the cwd that is gone.
-    pub root: String,
-    /// The deepest live root containing it, whose cursor hosts the row.
-    pub host: &'a str,
+/// A worktree that has been removed, found from a call's `cwd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Departed<'c, 'r> {
+    /// The removed worktree: `<checkout>/.claude/worktrees/<name>`, exactly,
+    /// borrowed from the call's cwd.
+    pub root: &'c str,
+    /// The deepest live root containing it, which hosts the row.
+    pub host: &'r str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Lookup {
-    /// Every directory down to the cwd exists.
-    Present,
-    Gone(String),
-    /// The cwd could not be checked: hostile, too deep, or the filesystem erred.
-    Unverified,
-}
-
-/// Finds the worktree a call ran in when it no longer exists.
+/// The removed worktree `call` ran in, by its path alone.
 ///
-/// A `cwd` is not a root: most of them are a subdirectory of one. A removed
-/// worktree is the shallowest ancestor of the cwd that is gone from disk and
-/// lies strictly below a live root, and the call's own path must be under it.
-/// The filesystem check is injected so the walk is testable, and the answers
-/// are memoized per distinct cwd up to [`MAX_DEPARTED_LOOKUPS`].
+/// GitPulse's isolation worktrees live at `<checkout>/.claude/worktrees/<name>`
+/// and nowhere else, so a cwd under a live root that passes through that shape
+/// at a name which is not itself a live root ran in a worktree that no longer
+/// exists. The deepest such name wins, so `…/a/.claude/worktrees/b` is `b`
+/// whether or not `a` is live. Nothing is read from disk: whether a directory
+/// exists says nothing about whether it was a worktree (a branch switch deletes
+/// plain directories, and a path can fail to stat for reasons other than being
+/// gone), so a deleted plain subdirectory stays with the live root around it.
 ///
-/// Transcript content is untrusted, so a cwd with a `.`, `..` or empty
-/// segment, a NUL, an unbounded length or depth, or a check that fails for any
-/// reason other than "not found" is never treated as departed: it is counted in
-/// [`Self::unverified`] and the call keeps its live attribution.
-pub struct DepartedResolver<'e> {
-    exists: &'e dyn Fn(&str) -> std::io::Result<bool>,
-    memo: std::collections::HashMap<String, Lookup>,
-    /// Calls that could not be checked; see the type's doc.
-    pub unverified: i64,
-}
-
-impl<'e> DepartedResolver<'e> {
-    pub fn new(exists: &'e dyn Fn(&str) -> std::io::Result<bool>) -> Self {
-        Self {
-            exists,
-            memo: std::collections::HashMap::new(),
-            unverified: 0,
-        }
+/// The call's own path must also lie under the removed worktree. A cwd with an
+/// empty, `.` or `..` segment, a NUL, or more than 4096 bytes is never read as
+/// departed.
+pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &[&'r str]) -> Option<Departed<'c, 'r>> {
+    let cwd = call.cwd.trim_end_matches('/');
+    // Almost every call: nothing below its root has the shape.
+    if cwd.len() > MAX_CWD_BYTES || !cwd.contains(WORKTREES_DIR) {
+        return None;
     }
-
-    /// The departed worktree `call` ran in, if it did and was not already
-    /// attributed by a live root.
-    pub fn departed<'a>(&mut self, call: &ToolCall, roots: &[&'a str]) -> Option<Departed<'a>> {
-        let cwd = call.cwd.trim_end_matches('/');
-        let host = deepest_root(cwd, roots)?;
-        let lookup = if cwd.len() > MAX_CWD_BYTES {
-            // Never kept as a memo key.
-            Lookup::Unverified
-        } else if let Some(lookup) = self.memo.get(cwd) {
-            lookup.clone()
-        } else if self.memo.len() >= MAX_DEPARTED_LOOKUPS {
-            Lookup::Unverified
-        } else {
-            let lookup = self.look_up(cwd, host);
-            self.memo.insert(cwd.to_string(), lookup.clone());
-            lookup
-        };
-        match lookup {
-            Lookup::Present => None,
-            Lookup::Unverified => {
-                self.unverified += 1;
-                None
-            }
-            // An edit that names a path outside the removed worktree is not
-            // that worktree's.
-            Lookup::Gone(root) => {
-                under(candidate_path(call), &root).then_some(Departed { root, host })
-            }
+    let host = deepest_root(cwd, roots)?;
+    let host_len = host.trim_end_matches('/').len();
+    let below = &cwd[host_len..];
+    let (mut before_last, mut last) = ("", "");
+    let mut end = host_len;
+    let mut deepest = None;
+    for segment in below.split('/').skip(1) {
+        if matches!(segment, "" | "." | "..") || segment.contains('\0') {
+            return None;
         }
-    }
-
-    fn look_up(&self, cwd: &str, host: &str) -> Lookup {
-        let host = host.trim_end_matches('/');
-        let Some(below) = cwd.strip_prefix(host) else {
-            return Lookup::Unverified;
-        };
-        // `below` is empty or starts with the separator `under` required.
-        let segments: Vec<&str> = below.split('/').skip(1).collect();
-        // The whole path is vetted before any of it is looked up.
-        if cwd.contains('\0')
-            || segments.len() > MAX_DEPARTED_DEPTH
-            || segments.iter().any(|s| matches!(*s, "" | "." | ".."))
-        {
-            return Lookup::Unverified;
+        end += 1 + segment.len();
+        if before_last == ".claude" && last == "worktrees" {
+            deepest = Some(end);
         }
-        let mut path = host.to_string();
-        for segment in segments {
-            path.push('/');
-            path.push_str(segment);
-            match (self.exists)(&path) {
-                Ok(true) => {}
-                Ok(false) => return Lookup::Gone(path),
-                Err(_) => return Lookup::Unverified,
-            }
-        }
-        Lookup::Present
+        (before_last, last) = (last, segment);
     }
-}
-
-/// Whether `path` exists, without following a final symlink: a dangling link
-/// is still something on disk. Only "not found" means gone; any other failure
-/// is an error for the caller to count.
-pub fn path_exists(path: &str) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+    let root = &cwd[..deepest?];
+    // A live checkout is the live root's, whatever it is called.
+    let live = roots.iter().any(|live| live.trim_end_matches('/') == root);
+    (!live && under(candidate_path(call), root)).then_some(Departed { root, host })
 }
 
 fn under(path: &str, root: &str) -> bool {
@@ -584,149 +517,93 @@ mod tests {
     const REPO: &str = "/repo";
     const WT: &str = "/repo/.claude/worktrees/wt";
 
-    /// A filesystem of exactly these directories, and the paths asked of it.
-    fn fs_with<'a>(
-        dirs: &'a [&'a str],
-        asked: &'a std::cell::RefCell<Vec<String>>,
-    ) -> impl Fn(&str) -> std::io::Result<bool> + 'a {
-        move |path: &str| {
-            asked.borrow_mut().push(path.to_string());
-            Ok(dirs.contains(&path))
-        }
+    fn departed<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<(String, &'a str)> {
+        departed_root(call, roots).map(|d| (d.root.to_string(), d.host))
     }
 
     #[test]
-    fn a_missing_worktree_is_the_shallowest_missing_ancestor_below_a_live_root() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let exists = fs_with(&["/repo/.claude", "/repo/.claude/worktrees"], &asked);
-        let mut resolver = DepartedResolver::new(&exists);
-        // The cwd is deep inside the removed worktree; the worktree is the
-        // first directory that is gone, not the cwd itself.
+    fn a_worktree_that_is_not_live_is_the_one_segment_name_under_worktrees() {
+        // The cwd is deep inside the removed worktree; the root is the name.
         let call = command_in(
             &format!("{WT}/src-tauri/src"),
             Some(&format!("{WT}/src-tauri/a.rs")),
         );
-        assert_eq!(
-            resolver.departed(&call, &[REPO]),
-            Some(Departed {
-                root: WT.into(),
-                host: REPO
-            })
-        );
-        assert_eq!(resolver.unverified, 0);
-        // Nothing below the missing directory is asked about.
-        assert!(!asked
-            .borrow()
-            .iter()
-            .any(|p| p.starts_with(&format!("{WT}/"))));
-    }
-
-    #[test]
-    fn a_cwd_that_exists_has_no_departed_root_and_is_asked_about_once() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let exists = fs_with(&["/repo/src-tauri"], &asked);
-        let mut resolver = DepartedResolver::new(&exists);
-        let call = command_in("/repo/src-tauri", None);
-        for _ in 0..3 {
-            assert_eq!(resolver.departed(&call, &[REPO]), None);
-        }
-        assert_eq!(asked.borrow().len(), 1, "memoized per distinct cwd");
-        // The live root itself is never looked up.
-        let at_root = command_in("/repo/", None);
-        assert_eq!(resolver.departed(&at_root, &[REPO]), None);
-        assert_eq!(asked.borrow().len(), 1);
-    }
-
-    #[test]
-    fn a_departed_root_is_strictly_below_the_deepest_live_root() {
-        // The worktree is live, so the host is the worktree and only what is
-        // below it can have departed.
-        let asked = std::cell::RefCell::new(Vec::new());
-        let exists = fs_with(&[], &asked);
-        let mut resolver = DepartedResolver::new(&exists);
-        let call = command_in(&format!("{WT}/gone/deeper"), None);
-        assert_eq!(
-            resolver.departed(&call, &[REPO, WT]),
-            Some(Departed {
-                root: format!("{WT}/gone"),
-                host: WT
-            })
-        );
-        // A cwd under no live root has no host to record under.
-        assert_eq!(
-            resolver.departed(&command_in("/elsewhere/x", None), &[REPO]),
-            None
-        );
-    }
-
-    #[test]
-    fn a_path_outside_the_departed_worktree_is_not_its_call() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let exists = fs_with(&[], &asked);
-        let mut resolver = DepartedResolver::new(&exists);
-        let call = command_in(WT, Some("/repo/src/a.rs"));
-        assert_eq!(resolver.departed(&call, &[REPO]), None);
-        assert_eq!(resolver.unverified, 0);
-    }
-
-    #[test]
-    fn a_hostile_cwd_is_counted_and_never_departed() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let exists = fs_with(&[], &asked);
-        let mut resolver = DepartedResolver::new(&exists);
-        let deep = format!("/repo{}", "/d".repeat(MAX_DEPARTED_DEPTH + 1));
-        let long = format!("/repo/{}", "x".repeat(64 * 1024));
-        let hostile = [
-            "/repo/../../etc".to_string(),
-            "/repo/a/../b".to_string(),
-            "/repo/./a".to_string(),
-            "/repo//a".to_string(),
-            "/repo/a\0b".to_string(),
-            deep,
-            long,
-        ];
-        for cwd in &hostile {
-            let call = command_in(cwd, None);
-            assert_eq!(resolver.departed(&call, &[REPO]), None, "{cwd:.40}");
-        }
-        assert_eq!(resolver.unverified, hostile.len() as i64);
-        assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
-    }
-
-    #[test]
-    fn a_filesystem_error_is_counted_not_read_as_missing() {
-        let exists = |_: &str| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        let mut resolver = DepartedResolver::new(&exists);
+        assert_eq!(departed(&call, &[REPO]), Some((WT.into(), REPO)));
+        // Trailing separators change nothing.
+        let call = command_in(&format!("{WT}/"), None);
+        assert_eq!(departed(&call, &[REPO]), Some((WT.into(), REPO)));
+        // A live worktree is not departed.
         let call = command_in(&format!("{WT}/src"), None);
-        assert_eq!(resolver.departed(&call, &[REPO]), None);
-        assert_eq!(resolver.unverified, 1);
+        assert_eq!(departed(&call, &[REPO, WT]), None);
+        assert_eq!(departed(&call, &[REPO, &format!("{WT}/")]), None);
     }
 
     #[test]
-    fn a_hundred_thousand_distinct_cwds_cost_a_bounded_lookup_and_memo() {
-        let asked = std::cell::RefCell::new(Vec::new());
-        let exists = fs_with(&[], &asked);
-        let mut resolver = DepartedResolver::new(&exists);
-        for i in 0..100_000 {
-            let call = command_in(
-                &format!("/repo/gone{i}/src"),
-                Some(&format!("/repo/gone{i}/a.rs")),
-            );
-            let _ = resolver.departed(&call, &[REPO]);
+    fn a_plain_subdirectory_is_never_departed() {
+        for cwd in [
+            "/repo/src-tauri",
+            "/repo/.claude",
+            "/repo/.claude/worktrees",
+            "/repo/.claude/other/x",
+            "/repo/old_dir_removed_by_checkout",
+            "/repo/worktrees/x",
+        ] {
+            assert_eq!(departed(&command_in(cwd, None), &[REPO]), None, "{cwd}");
         }
-        assert!(resolver.memo.len() <= MAX_DEPARTED_LOOKUPS);
-        assert_eq!(asked.borrow().len(), MAX_DEPARTED_LOOKUPS);
-        assert_eq!(resolver.unverified, 100_000 - MAX_DEPARTED_LOOKUPS as i64);
     }
 
     #[test]
-    fn path_exists_distinguishes_missing_from_unreadable() {
-        let dir = tempfile::tempdir().unwrap();
-        let here = dir.path().to_str().unwrap();
-        assert!(path_exists(here).unwrap());
-        assert!(!path_exists(&format!("{here}/missing")).unwrap());
-        // A NUL is an error, not "missing".
-        assert!(path_exists(&format!("{here}/a\0b")).is_err());
+    fn the_deepest_convention_match_wins() {
+        let a = "/repo/.claude/worktrees/a";
+        let b = "/repo/.claude/worktrees/a/.claude/worktrees/b";
+        let call = command_in(&format!("{b}/src"), Some(&format!("{b}/src/x.rs")));
+        // Neither live: b.
+        assert_eq!(departed(&call, &[REPO]), Some((b.into(), REPO)));
+        // a live, b gone: b, hosted by a.
+        assert_eq!(departed(&call, &[REPO, a]), Some((b.into(), a)));
+        // b live: nothing departed.
+        assert_eq!(departed(&call, &[REPO, a, b]), None);
+        // The call's own path must lie under the departed worktree.
+        let call = command_in(&format!("{b}/src"), Some("/repo/src/x.rs"));
+        assert_eq!(departed(&call, &[REPO]), None);
+        // A cwd in a, with a edit in b's tree: a's.
+        let call = command_in(&format!("{a}/src"), Some(&format!("{b}/x.rs")));
+        assert_eq!(departed(&call, &[REPO]), Some((a.into(), REPO)));
+    }
+
+    #[test]
+    fn a_cwd_under_no_live_root_is_nobodys() {
+        let call = command_in("/repo-old/.claude/worktrees/x", None);
+        assert_eq!(departed(&call, &[REPO]), None);
+        assert_eq!(departed(&call, &[]), None);
+    }
+
+    #[test]
+    fn a_hostile_cwd_is_never_departed() {
+        let long = format!("/repo/.claude/worktrees/{}", "x".repeat(64 * 1024));
+        for cwd in [
+            "/repo/.claude/worktrees/../x",
+            "/repo/.claude/worktrees/./x",
+            "/repo/.claude/worktrees//x",
+            "/repo/.claude/worktrees/a\0b",
+            "/repo/../.claude/worktrees/x",
+            long.as_str(),
+        ] {
+            assert_eq!(departed(&command_in(cwd, None), &[REPO]), None, "{cwd:.60}");
+        }
+    }
+
+    #[test]
+    fn a_hundred_thousand_distinct_cwds_are_pure_string_work() {
+        for i in 0..100_000 {
+            let cwd = format!("/repo/.claude/worktrees/gone{i}/src");
+            let call = command_in(&cwd, Some(&format!("{cwd}/a.rs")));
+            let d = departed_root(&call, &[REPO]).unwrap();
+            assert_eq!(
+                d.root.len(),
+                "/repo/.claude/worktrees/gone".len() + i.to_string().len()
+            );
+        }
     }
 
     fn parses_for(line: &str) -> (LineOutcome, usize) {

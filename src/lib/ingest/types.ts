@@ -15,6 +15,11 @@ export interface CatchUp {
    */
   transcripts_listed?: number;
   skipped_lines: number;
+  /**
+   * Calls whose worktree had no room in this pass and were recorded under the
+   * deepest worktree that did. Zero for any real family.
+   */
+  rehosted_calls?: number;
   reflog_entries: number;
   /** True when the wall-clock deadline stopped the pass early. */
   truncated: boolean;

@@ -1,5 +1,6 @@
 //! `GitReader::get_status` on generated repositories of 1k and 10k files,
-//! clean and dirty.
+//! clean and dirty, and the transcript pass over a 100k-line corpus and a
+//! 10k-distinct-cwd corpus.
 //!
 //! Run with `cargo bench --manifest-path src-tauri/Cargo.toml --bench repo_read`.
 //!
@@ -103,7 +104,85 @@ fn main() {
             })
         })
         .collect();
+    let mut cases = cases;
+
+    // The transcript pass reads agent history into the ledger, so it sits with
+    // the other reads of what a repository already holds. Two corpora: many
+    // calls from a few working directories (the steady shape), and one call
+    // from each of many distinct ones (what attribution must not make slower).
+    // Each sample is a fresh, empty ledger directory, and only the pass is
+    // timed.
+    let transcripts = temp.path().join("transcripts");
+    let shapes = [
+        ("transcript_pass 100k lines", TRANSCRIPT_LINES, 1),
+        ("transcript_pass 10k cwds", TRANSCRIPT_CWDS, TRANSCRIPT_CWDS),
+    ];
+    for (name, lines, cwds) in shapes {
+        let temp = temp.path().to_path_buf();
+        let transcripts = transcripts.clone();
+        cases.push(Case::new(name, move || {
+            transcript_pass(&temp, &transcripts, lines, cwds)
+        }));
+    }
+    report.note(format!(
+        "transcript_pass: one corpus file of {TRANSCRIPT_LINES} edit lines from 1 cwd, and one of \
+         {TRANSCRIPT_CWDS} lines from {TRANSCRIPT_CWDS} distinct cwds, into a fresh ledger"
+    ));
+
     let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
     report.extend(rows);
     report.finish();
+}
+
+const TRANSCRIPT_LINES: usize = 100_000;
+const TRANSCRIPT_CWDS: usize = 10_000;
+
+/// One timed `ingest_transcripts` of a corpus of `lines` edit lines spread over
+/// `cwds` working directories of a fresh repository directory.
+fn transcript_pass(
+    temp: &std::path::Path,
+    corpus: &std::path::Path,
+    lines: usize,
+    cwds: usize,
+) -> Sample {
+    static FRESH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = FRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let repo = temp.join(format!("ledger-{id}"));
+    std::fs::create_dir_all(&repo).expect("ledger dir");
+    let repo = repo.to_string_lossy().into_owned();
+    let slug = corpus.join("slug");
+    std::fs::create_dir_all(&slug).expect("corpus dir");
+    let mut text = String::new();
+    for line in 0..lines {
+        let cwd = format!("{repo}/d{}", line % cwds);
+        let record = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "S",
+            "timestamp": format!("2026-09-01T12:{:02}:{:02}.000Z", (line / 60) % 60, line % 60),
+            "version": "2.1.241",
+            "cwd": cwd,
+            "message": { "content": [
+                { "type": "tool_use", "name": "Edit",
+                  "input": { "file_path": format!("{cwd}/f{}.rs", line % 500) } }
+            ]}
+        });
+        text.push_str(&record.to_string());
+        text.push('\n');
+    }
+    let file = slug.join("S.jsonl");
+    std::fs::write(&file, text).expect("write corpus");
+    std::env::set_var("GITPULSE_TRANSCRIPT_ROOT", corpus);
+    let started = std::time::Instant::now();
+    let out = gitpulse_lib::ingest::ingest_transcripts(&repo);
+    let elapsed = started.elapsed();
+    std::fs::remove_file(&file).expect("remove corpus");
+    assert!(
+        out.error.is_empty() && !out.truncated && out.skipped_lines == 0,
+        "transcript pass degraded ({}), so this run would time a partial pass",
+        out.error
+    );
+    Sample::default()
+        .counter("recorded", out.recorded as u64)
+        .counter("transcripts", out.transcripts as u64)
+        .elapsed(elapsed)
 }
