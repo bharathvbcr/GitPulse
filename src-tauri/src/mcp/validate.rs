@@ -1334,4 +1334,168 @@ mod tests {
         assert_eq!(schema["properties"]["ratio"]["type"], "number");
         assert!(unsupported_keywords(&schema).is_empty());
     }
+
+    // -- adversarial --
+
+    /// A float spelled `N.0` or `NeX` inside the exact range is the integer it
+    /// says. serde_json without `float_roundtrip` can parse the digits one ulp
+    /// off, and `exact_int` then converts a different integer without noticing.
+    #[test]
+    fn a_whole_float_inside_the_exact_range_is_read_as_the_integer_it_spells() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut wrong = Vec::new();
+        let mut cases: Vec<i128> = vec![
+            9_007_199_254_740_991,
+            9_007_199_254_740_990,
+            4_503_599_627_370_497,
+            1_000_000_000_000_001,
+            123_456_789_012_345,
+        ];
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            cases.push(i128::from(state % 9_007_199_254_740_991));
+        }
+        for n in cases {
+            for text in [format!("{n}.0"), format!("-{n}.0")] {
+                let want = if text.starts_with('-') { -n } else { n };
+                if exact_int(&raw_number(&text)) != Some(want) {
+                    wrong.push(text);
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} whole floats were read as another integer, e.g. {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
+        );
+    }
+
+    fn raw_number(text: &str) -> Number {
+        match serde_json::from_str::<Value>(text).unwrap_or_else(|e| panic!("{text}: {e}")) {
+            Value::Number(number) => number,
+            other => panic!("{text} is {other}"),
+        }
+    }
+
+    /// Raw JSON text, as a client writes it, against what `exact_int` makes of it.
+    #[test]
+    fn exact_int_reads_every_spelling_a_client_can_write() {
+        let table: [(&str, Option<i128>); 30] = [
+            ("0", Some(0)),
+            ("-0", Some(0)),
+            ("-0.0", Some(0)),
+            ("0.0", Some(0)),
+            ("5.0", Some(5)),
+            ("5.5", None),
+            ("1e2", Some(100)),
+            ("1E2", Some(100)),
+            ("1e+2", Some(100)),
+            ("100e-2", Some(1)),
+            ("1e-320", None),
+            ("5e-324", None),
+            ("1e300", None),
+            ("-1e300", None),
+            ("9007199254740990", Some(9_007_199_254_740_990)),
+            ("9007199254740991", Some(9_007_199_254_740_991)),
+            ("9007199254740991.0", Some(9_007_199_254_740_991)),
+            // A JavaScript client writes 2^53 as an integer literal.
+            ("9007199254740992", Some(9_007_199_254_740_992)),
+            ("9007199254740992.0", None),
+            ("9007199254740993", Some(9_007_199_254_740_993)),
+            ("9007199254740993.0", None),
+            ("-9007199254740991.0", Some(-9_007_199_254_740_991)),
+            ("-9007199254740992.0", None),
+            ("9223372036854775807", Some(9_223_372_036_854_775_807)),
+            ("9223372036854775808", Some(9_223_372_036_854_775_808)),
+            ("-9223372036854775808", Some(-9_223_372_036_854_775_808)),
+            ("-9223372036854775809", None),
+            ("18446744073709551615", Some(18_446_744_073_709_551_615)),
+            ("18446744073709551616", None),
+            ("1.0000000000000002", None),
+        ];
+        for (text, expected) in table {
+            assert_eq!(exact_int(&raw_number(text)), expected, "{text}");
+            let schema = json!({ "type": "integer" });
+            assert_eq!(
+                validate(&number_value(text), &schema).is_empty(),
+                expected.is_some(),
+                "the validator and exact_int disagree on {text}"
+            );
+        }
+    }
+
+    fn number_value(text: &str) -> Value {
+        Value::Number(raw_number(text))
+    }
+
+    /// Two integers compare as integers: through `f64` the neighbours of 2^63
+    /// and 2^64 are one number.
+    #[test]
+    fn bounds_compare_integer_literals_exactly_at_the_edge_of_i64_and_u64() {
+        let signed = json!({ "type": "integer", "minimum": 0, "maximum": i64::MAX });
+        assert!(validate(&number_value("9223372036854775807"), &signed).is_empty());
+        assert_eq!(
+            validate(&number_value("9223372036854775808"), &signed).len(),
+            1
+        );
+        let unsigned = json!({ "type": "integer", "minimum": 0, "maximum": u64::MAX });
+        assert!(validate(&number_value("18446744073709551615"), &unsigned).is_empty());
+        assert_eq!(
+            validate(&number_value("18446744073709551616"), &unsigned).len(),
+            1,
+            "2^64 passed a u64 maximum"
+        );
+        let lowest = json!({ "type": "integer", "minimum": i64::MIN });
+        assert!(validate(&number_value("-9223372036854775808"), &lowest).is_empty());
+        assert_eq!(
+            validate(&number_value("-9223372036854775809"), &lowest).len(),
+            1
+        );
+        let exact = json!({ "type": "integer", "minimum": 9_007_199_254_740_993_i64 });
+        assert_eq!(validate(&number_value("9007199254740992"), &exact).len(), 1);
+        assert!(validate(&number_value("9007199254740993"), &exact).is_empty());
+    }
+
+    /// A model that sends a thousand wrong things is told about them, but the
+    /// answer must stay a record the transport can write: the stdio server
+    /// drops a response over its output bound, and then the caller hears nothing.
+    #[test]
+    fn a_refusal_over_a_hundred_thousand_violations_is_still_a_small_message() {
+        let closed = schema();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("repo_path".into(), json!("/tmp/x"));
+        for index in 0..100_000 {
+            arguments.insert(format!("junk{index}"), json!(1));
+        }
+        let violations = validate(&Value::Object(arguments), &closed);
+        assert!(violations.len() >= 100_000);
+        let message = refusal("probe", &violations);
+        assert!(
+            message.len() <= 64 * 1024,
+            "a refusal of {} violations is {} bytes",
+            violations.len(),
+            message.len()
+        );
+        assert!(message.contains("junk0"), "it must still name an argument");
+    }
+
+    #[test]
+    fn a_refusal_never_echoes_a_hostile_value() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["fast", "full"], "maxLength": 32 },
+                "n": { "type": "integer", "minimum": 1, "maximum": 5 }
+            },
+            "additionalProperties": false
+        });
+        let long = "Z".repeat(1 << 20);
+        let violations = validate(&json!({ "mode": long, "n": [long] }), &schema);
+        let message = refusal("probe", &violations);
+        assert!(message.len() < 4096, "{} bytes", message.len());
+        assert!(!message.contains("ZZZZ"));
+    }
 }

@@ -5329,4 +5329,857 @@ mod tests {
         assert_eq!(call(json!(5)), Some(5));
         assert_eq!(call(Value::Null), None);
     }
+
+    /// Hostile-input attacks on the typed-argument layer. Everything here runs
+    /// the validator and the extractor over what the advertised schemas say,
+    /// never over values a person picked to fit the implementation.
+    mod adversarial {
+        use super::*;
+        use validate::Violation;
+
+        type Extract = fn(&Value) -> Result<Value, Vec<Violation>>;
+
+        fn extract<T: ToolArgs>(arguments: &Value) -> Result<Value, Vec<Violation>> {
+            T::from_args(arguments).map(|parsed| parsed.to_value())
+        }
+
+        /// One extractor per advertised tool, independent of `args_registry`.
+        fn extractors() -> Vec<(&'static str, Extract)> {
+            macro_rules! rows {
+                ($(($name:literal, $ty:ty)),+ $(,)?) => {
+                    vec![$(($name, extract::<$ty> as Extract)),+]
+                };
+            }
+            use devmap_parity as dm;
+            rows![
+                ("gitpulse_insights", RepoArgs),
+                ("gitpulse_status", RepoArgs),
+                ("gitpulse_active_changes", ActiveChangesArgs),
+                ("gitpulse_collision_risk", RepoArgs),
+                ("gitpulse_change_context", ChangeContextArgs),
+                ("gitpulse_ledger_events", LedgerEventsArgs),
+                ("gitpulse_task_view", TaskViewArgs),
+                ("gitpulse_add_task", AddTaskArgs),
+                ("gitpulse_import_tasks", ImportTasksArgs),
+                ("gitpulse_list_tasks", ListTasksArgs),
+                ("gitpulse_get_task", GetTaskArgs),
+                ("gitpulse_complete_task", CompleteTaskArgs),
+                ("gitpulse_delete_task", DeleteTaskArgs),
+                ("gitpulse_merge_tasks", MergeTasksArgs),
+                ("gitpulse_codeintel_search", SearchArgs),
+                ("gitpulse_codeintel_impact", CodeintelImpactArgs),
+                ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
+                ("gitpulse_codeintel_trace", CodeintelTraceArgs),
+                ("gitpulse_codeintel_dead_symbols", BudgetArgs),
+                ("gitpulse_codeintel_suspects", SuspectsArgs),
+                ("gitpulse_provenance", ProvenanceArgs),
+                ("devmap_status", RepoArgs),
+                ("devmap_search", SearchArgs),
+                ("devmap_dependencies", dm::DependenciesArgs),
+                ("devmap_impact", dm::ImpactArgs),
+                ("devmap_trace", dm::TraceArgs),
+                ("devmap_neighbors", dm::NeighborsArgs),
+                ("devmap_dead_symbols", BudgetArgs),
+                ("devmap_clones", BudgetArgs),
+                ("devmap_preview", dm::PreviewArgs),
+                ("devmap_explore", dm::ExploreArgs),
+                ("devmap_affected_tests", dm::AffectedTestsArgs),
+            ]
+        }
+
+        fn schema_of(name: &str) -> Value {
+            tools()
+                .into_iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not advertised"))["inputSchema"]
+                .clone()
+        }
+
+        /// The call survives the validator and extraction, as the server does it.
+        fn accepted(name: &str, extract: Extract, arguments: &Value) -> bool {
+            validate_arguments(name, arguments).is_ok() && extract(arguments).is_ok()
+        }
+
+        fn short(value: &Value) -> String {
+            value.to_string().chars().take(80).collect()
+        }
+
+        /// A number from an integer that may be outside `i64`/`u64`.
+        fn int_json(value: i128) -> Value {
+            if let Ok(signed) = i64::try_from(value) {
+                json!(signed)
+            } else if let Ok(unsigned) = u64::try_from(value) {
+                json!(unsigned)
+            } else {
+                json!(value as f64)
+            }
+        }
+
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % (n.max(1) as u64)) as usize
+            }
+        }
+
+        const WEIRD: [&str; 12] = [
+            "\0",
+            "\u{feff}",
+            "\u{202e}",
+            "e\u{301}",
+            "😀",
+            "€",
+            "\u{10ffff}",
+            "\u{7f}",
+            "a",
+            " ",
+            "\n",
+            "\u{200d}",
+        ];
+
+        /// A random JSON value, leaning on the boundaries `schema` declares.
+        fn gen(rng: &mut Rng, schema: &Value, depth: u8) -> Value {
+            let max_len = schema["maxLength"].as_u64().unwrap_or(16).min(70_000) as usize;
+            let min = schema["minimum"].as_i64().unwrap_or(0) as i128;
+            let max = schema["maximum"].as_u64().unwrap_or(100) as i128;
+            match rng.below(15) {
+                0 => Value::Null,
+                1 => json!(rng.below(2) == 0),
+                2 => {
+                    let candidates = [min - 1, min, min + 1, max - 1, max, max + 1, 0, -1, 1];
+                    int_json(candidates[rng.below(candidates.len())])
+                }
+                3 => {
+                    let floats = [
+                        5.0,
+                        5.5,
+                        -0.0,
+                        0.0,
+                        1e300,
+                        -1e300,
+                        1e-320,
+                        -1e-320,
+                        9_007_199_254_740_991.0,
+                        9_007_199_254_740_992.0,
+                        9_223_372_036_854_775_808.0,
+                        18_446_744_073_709_551_616.0,
+                        4_294_967_296.0,
+                        0.5,
+                        1.0,
+                        f64::MAX,
+                        f64::MIN_POSITIVE,
+                    ];
+                    json!(floats[rng.below(floats.len())])
+                }
+                4 => {
+                    let anchors = [min, max];
+                    let anchor = anchors[rng.below(2)] + rng.below(3) as i128 - 1;
+                    json!(anchor as f64)
+                }
+                5 => json!("a".repeat(rng.below(max_len + 2))),
+                6 => json!("a".repeat(max_len)),
+                7 => json!("a".repeat(max_len + 1)),
+                8 => json!("€".repeat(max_len / 3 + rng.below(2))),
+                9 => {
+                    let mut text = String::new();
+                    for _ in 0..rng.below(24) {
+                        text.push_str(WEIRD[rng.below(WEIRD.len())]);
+                    }
+                    json!(text)
+                }
+                10 if depth < 2 => {
+                    let items = &schema["items"];
+                    Value::Array(
+                        (0..rng.below(5))
+                            .map(|_| gen(rng, items, depth + 1))
+                            .collect(),
+                    )
+                }
+                11 => {
+                    let wanted = schema["maxItems"].as_u64().unwrap_or(3).min(3_000) as usize;
+                    let count = (wanted + rng.below(2)).min(3_000);
+                    let element = match schema["items"]["type"].as_str() {
+                        Some("string") => json!("a"),
+                        Some("object") => json!({ "task_id": "a" }),
+                        _ => json!(1),
+                    };
+                    Value::Array(vec![element; count])
+                }
+                12 if depth < 2 => {
+                    let keys = [
+                        "__proto__",
+                        "task_id",
+                        "a",
+                        "Repo_Path",
+                        "expected_revision",
+                    ];
+                    let mut object = serde_json::Map::new();
+                    for _ in 0..rng.below(4) {
+                        object.insert(
+                            keys[rng.below(keys.len())].to_string(),
+                            gen(rng, &Value::Null, depth + 1),
+                        );
+                    }
+                    Value::Object(object)
+                }
+                13 => match schema["enum"].as_array() {
+                    Some(values) if !values.is_empty() => {
+                        let mut pick = values[rng.below(values.len())].clone();
+                        if rng.below(3) == 0 {
+                            pick = json!(format!("{}x", pick.as_str().unwrap_or("")));
+                        }
+                        pick
+                    }
+                    _ => json!("x"),
+                },
+                _ => json!(rng.below(1000) as u64),
+            }
+        }
+
+        /// The invariants the validator and the extractor owe each other.
+        fn judge(name: &str, extract: Extract, schema: &Value, arguments: &Value) -> (bool, bool) {
+            let violations = validate::validate(arguments, schema);
+            let extracted = extract(arguments);
+            let shown = short(arguments);
+
+            // Extraction owns the byte bounds, so a call the validator passed may
+            // still be refused for those, and only for those.
+            let only_bytes = extracted.as_ref().err().is_some_and(|refused| {
+                refused.iter().all(|v| v.message.contains("bytes of UTF-8"))
+            });
+            if violations.is_empty() && !only_bytes {
+                assert!(
+                    extracted.is_ok(),
+                    "{name}: the validator passed what extraction refuses: {shown} -> {:?}",
+                    extracted.as_ref().err()
+                );
+            }
+            if let Err(refused) = &extracted {
+                assert!(!refused.is_empty(), "{name}: an empty refusal for {shown}");
+            }
+            if extracted.is_ok() {
+                for violation in &violations {
+                    assert!(
+                        violation.message.starts_with("must "),
+                        "{name}: extraction read what the validator refused for a reason that is not a bound ({}): {shown}",
+                        violation.render()
+                    );
+                }
+            }
+            let known = schema["properties"].as_object().unwrap();
+            let named = violations
+                .iter()
+                .chain(extracted.as_ref().err().into_iter().flatten());
+            for violation in named {
+                let head = violation
+                    .path
+                    .split(['[', '.'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    known.contains_key(&head) || arguments.get(&head).is_some(),
+                    "{name}: a refusal that names no argument: {:?} for {shown}",
+                    violation.path
+                );
+            }
+            if let Some(first) = violations.first() {
+                let message = validate::refusal(name, &violations);
+                assert!(message.starts_with(&format!("invalid arguments for {name}: ")));
+                assert!(message.contains(&first.path), "{name}: {message}");
+            }
+            (violations.is_empty(), extracted.is_ok())
+        }
+
+        #[test]
+        fn a_seeded_fuzz_keeps_validation_and_extraction_in_agreement() {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let (mut accepted_calls, mut refused_calls) = (0usize, 0usize);
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                let fields: Vec<String> = schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
+                let base = sample(&schema);
+                for _ in 0..300 {
+                    let mut arguments = base.clone();
+                    for _ in 0..=rng.below(3) {
+                        let field = &fields[rng.below(fields.len())];
+                        match rng.below(10) {
+                            0 => {
+                                arguments.as_object_mut().unwrap().remove(field);
+                            }
+                            1 => {
+                                arguments[format!("junk{}", rng.below(5))] = json!(1);
+                            }
+                            _ => {
+                                arguments[field.as_str()] =
+                                    gen(&mut rng, &schema["properties"][field], 0);
+                            }
+                        }
+                    }
+                    let (valid, extracted) = judge(name, extract, &schema, &arguments);
+                    if valid && extracted {
+                        accepted_calls += 1;
+                    } else {
+                        refused_calls += 1;
+                    }
+                }
+                // Whole-object noise: keys drawn from the fields and from junk.
+                for _ in 0..100 {
+                    let mut arguments = serde_json::Map::new();
+                    for _ in 0..rng.below(6) {
+                        let key = if rng.below(4) == 0 {
+                            "__proto__".to_string()
+                        } else {
+                            fields[rng.below(fields.len())].clone()
+                        };
+                        let sub = schema["properties"]
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        arguments.insert(key, gen(&mut rng, &sub, 0));
+                    }
+                    judge(name, extract, &schema, &Value::Object(arguments));
+                }
+            }
+            assert!(
+                accepted_calls > 200 && refused_calls > 200,
+                "the fuzz explored one side only: {accepted_calls} accepted, {refused_calls} refused"
+            );
+        }
+
+        #[test]
+        fn every_integer_argument_at_and_around_its_bounds_as_integer_and_whole_float() {
+            let max_exact: i128 = 9_007_199_254_740_991;
+            let mut checked = 0;
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    if prop["type"] != "integer" {
+                        continue;
+                    }
+                    let min = prop["minimum"].as_i64().expect("minimum") as i128;
+                    let max = prop["maximum"].as_u64().expect("maximum") as i128;
+                    for value in [min - 1, min, max, max + 1] {
+                        let inside = (min..=max).contains(&value);
+                        let forms = [
+                            (int_json(value), true),
+                            (
+                                json!(value as f64),
+                                (-max_exact..=max_exact).contains(&value),
+                            ),
+                        ];
+                        for (sent, representable) in forms {
+                            let mut arguments = base.clone();
+                            arguments[field.as_str()] = sent.clone();
+                            let shown = format!("{name}.{field} = {sent}");
+                            let validated = validate_arguments(name, &arguments);
+                            if inside && representable {
+                                validated.unwrap_or_else(|e| panic!("{shown} refused: {e}"));
+                                let read = extract(&arguments)
+                                    .unwrap_or_else(|e| panic!("{shown} not extracted: {e:?}"));
+                                assert_eq!(read[field.as_str()], int_json(value), "{shown}");
+                            } else {
+                                let error = validated.expect_err(&format!("{shown} was accepted"));
+                                assert!(error.contains(field.as_str()), "{shown}: {error}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(checked > 100, "only {checked} integer probes ran");
+        }
+
+        #[test]
+        fn merge_sources_revisions_are_held_to_the_same_bounds() {
+            let schema = schema_of("gitpulse_merge_tasks");
+            let item = &schema["properties"]["sources"]["items"]["properties"]["expected_revision"];
+            let max = item["maximum"].as_u64().expect("maximum") as i128;
+            let min = item["minimum"].as_i64().expect("minimum") as i128;
+            let base = |revision: Value| {
+                json!({
+                    "repo_path": "/no/such/repo",
+                    "into_task_id": "a",
+                    "reason": "r",
+                    "sources": [{ "task_id": "b", "expected_revision": revision }]
+                })
+            };
+            for (value, ok) in [(min - 1, false), (min, true), (max, true), (max + 1, false)] {
+                for sent in [int_json(value), json!(value as f64)] {
+                    let arguments = base(sent.clone());
+                    let validated = validate_arguments("gitpulse_merge_tasks", &arguments);
+                    let float_beyond_exact = sent.is_f64() && value.abs() > 9_007_199_254_740_991;
+                    if ok && !float_beyond_exact {
+                        validated.unwrap_or_else(|e| panic!("{sent}: {e}"));
+                        let read = extract::<MergeTasksArgs>(&arguments).expect("extracts");
+                        assert_eq!(
+                            read["sources"][0]["expected_revision"],
+                            int_json(value),
+                            "{sent}"
+                        );
+                    } else {
+                        let error = validated.expect_err(&format!("{sent} accepted"));
+                        assert!(error.contains("sources[0].expected_revision"), "{error}");
+                    }
+                }
+            }
+        }
+
+        /// How a string field counts its bound, from what its schema says.
+        fn unit_of(prop: &Value) -> Option<&'static str> {
+            let description = prop["description"].as_str().unwrap_or_default();
+            if description.contains("bytes, UTF-8)") {
+                Some("bytes")
+            } else if description.contains("characters)") {
+                Some("characters")
+            } else {
+                None
+            }
+        }
+
+        /// Every string argument and every string-array item of every tool.
+        fn string_fields() -> Vec<(&'static str, Extract, String, Value, bool)> {
+            let mut out = Vec::new();
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    match prop["type"].as_str() {
+                        Some("string") if prop["enum"].is_null() => {
+                            out.push((name, extract, field.clone(), prop.clone(), false));
+                        }
+                        Some("array") if prop["items"]["type"] == "string" => {
+                            let mut shaped = prop.clone();
+                            shaped["maxLength"] = prop["items"]["maxLength"].clone();
+                            out.push((name, extract, field.clone(), shaped, true));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            out
+        }
+
+        fn with_string(base: &Value, field: &str, in_array: bool, text: &str) -> Value {
+            let mut arguments = base.clone();
+            arguments[field] = if in_array { json!([text]) } else { json!(text) };
+            arguments
+        }
+
+        #[test]
+        fn every_string_bound_counts_what_it_says_for_ascii_three_byte_four_byte_and_combining() {
+            let mut checked = 0;
+            for (name, extract, field, prop, in_array) in string_fields() {
+                let max = prop["maxLength"].as_u64().expect("maxLength") as usize;
+                if max > 100_000 {
+                    continue;
+                }
+                let unit = unit_of(&prop)
+                    .unwrap_or_else(|| panic!("{name}.{field} names no unit: {prop}"));
+                let base = sample(&schema_of(name));
+                let bytes = unit == "bytes";
+                // (text unit, its length in the bound's unit)
+                let pieces: [(&str, usize); 4] = [
+                    ("a", 1),
+                    ("€", if bytes { 3 } else { 1 }),
+                    ("😀", if bytes { 4 } else { 1 }),
+                    ("e\u{301}", if bytes { 3 } else { 2 }),
+                ];
+                for (piece, width) in pieces {
+                    let fits = max / width;
+                    let at_limit = piece.repeat(fits);
+                    let over = piece.repeat(fits + 1);
+                    let minimum = prop["minLength"].as_u64().unwrap_or(0) as usize;
+                    if fits >= minimum.max(1) {
+                        let good = with_string(&base, &field, in_array, &at_limit);
+                        validate_arguments(name, &good).unwrap_or_else(|e| {
+                            panic!(
+                                "{name}.{field}: {fits} x {piece:?} ({unit}) refused: {}",
+                                &e[..e.len().min(200)]
+                            )
+                        });
+                        let read = extract(&good)
+                            .unwrap_or_else(|e| panic!("{name}.{field} {piece:?}: {e:?}"));
+                        assert_eq!(
+                            read[field.as_str()],
+                            if in_array {
+                                json!([at_limit])
+                            } else {
+                                json!(at_limit)
+                            },
+                            "{name}.{field} did not echo {piece:?} exactly"
+                        );
+                    }
+                    let bad = with_string(&base, &field, in_array, &over);
+                    assert!(
+                        !accepted(name, extract, &bad),
+                        "{name}.{field}: {} x {piece:?} is over {max} {unit} and was accepted",
+                        fits + 1
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 150, "only {checked} string probes ran");
+        }
+
+        #[test]
+        fn awkward_unicode_survives_extraction_byte_for_byte() {
+            let text = "\u{0}\u{feff}\u{202e}e\u{301}\u{200d}😀\u{7f}\u{10ffff}\n";
+            let mut checked = 0;
+            for (name, extract, field, prop, in_array) in string_fields() {
+                let max = prop["maxLength"].as_u64().unwrap() as usize;
+                if max < text.len()
+                    || prop["minLength"].as_u64().unwrap_or(0) > text.chars().count() as u64
+                {
+                    continue;
+                }
+                let arguments = with_string(&sample(&schema_of(name)), &field, in_array, text);
+                if validate_arguments(name, &arguments).is_err() {
+                    continue;
+                }
+                let read = extract(&arguments).expect("validated, so extracted");
+                let echoed = if in_array {
+                    read[field.as_str()][0].clone()
+                } else {
+                    read[field.as_str()].clone()
+                };
+                assert_eq!(echoed, json!(text), "{name}.{field}");
+                checked += 1;
+            }
+            assert!(checked > 30, "only {checked} fields took the probe");
+        }
+
+        #[test]
+        fn a_value_of_the_wrong_shape_is_refused_naming_its_argument() {
+            let shapes = [
+                json!({}),
+                json!({ "a": { "b": [] } }),
+                json!([]),
+                json!([[]]),
+                json!([{}]),
+                json!(12),
+                json!(true),
+                json!("text"),
+                json!(-0.0),
+            ];
+            let mut checked = 0;
+            for (name, _) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    let expects = prop["type"].as_str().unwrap();
+                    for shape in &shapes {
+                        let fits = match shape {
+                            Value::Object(_) => expects == "object",
+                            Value::Array(items) => {
+                                expects == "array"
+                                    && (items.is_empty()
+                                        || prop["items"]["type"] == "array"
+                                        || (prop["items"]["type"] == "object"
+                                            && items.iter().all(Value::is_object)))
+                            }
+                            Value::Number(_) => matches!(expects, "number" | "integer"),
+                            Value::Bool(_) => expects == "boolean",
+                            Value::String(_) => expects == "string" && prop["enum"].is_null(),
+                            Value::Null => true,
+                        };
+                        if fits {
+                            continue;
+                        }
+                        let mut arguments = base.clone();
+                        arguments[field.as_str()] = shape.clone();
+                        let error = validate_arguments(name, &arguments)
+                            .expect_err(&format!("{name}.{field} accepted {shape}"));
+                        assert!(
+                            error.starts_with(&format!("invalid arguments for {name}: "))
+                                && error.contains(field.as_str()),
+                            "{name}.{field} = {shape}: {error}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 500, "only {checked} wrong shapes ran");
+        }
+
+        #[test]
+        fn a_huge_array_and_a_megabyte_string_are_refused_quickly_and_name_the_argument() {
+            let started = std::time::Instant::now();
+            let megabyte = "x".repeat(2 << 20);
+            for (name, _) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    let hostile = match prop["type"].as_str() {
+                        Some("string") => json!(megabyte),
+                        Some("array") => Value::Array(vec![json!(1); 10_000]),
+                        _ => continue,
+                    };
+                    let mut arguments = base.clone();
+                    arguments[field.as_str()] = hostile;
+                    let error = validate_arguments(name, &arguments)
+                        .expect_err(&format!("{name}.{field} accepted a hostile value"));
+                    assert!(error.contains(field.as_str()), "{name}.{field}");
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "hostile values took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn a_key_that_only_differs_in_case_or_is_a_prototype_name_is_unknown() {
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                let mut hostile: Vec<String> = vec![
+                    "__proto__".into(),
+                    "constructor".into(),
+                    "prototype".into(),
+                    "$ref".into(),
+                    String::new(),
+                ];
+                for field in schema["properties"].as_object().unwrap().keys() {
+                    hostile.push(field.to_uppercase());
+                    hostile.push(format!("{field} "));
+                    hostile.push(format!(" {field}"));
+                    hostile.push(format!("{field}\u{0}"));
+                    hostile.push(field.replace('_', "-"));
+                }
+                for key in hostile {
+                    let mut arguments = base.clone();
+                    arguments[key.as_str()] = json!(1);
+                    if schema["properties"].get(&key).is_some() {
+                        continue;
+                    }
+                    let error = validate_arguments(name, &arguments)
+                        .expect_err(&format!("{name} accepted the key {key:?}"));
+                    assert!(
+                        error.contains("unknown argument"),
+                        "{name} {key:?}: {error}"
+                    );
+                    assert!(extract(&arguments).is_err(), "{name} {key:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_duplicate_key_is_decided_by_the_json_parser_and_the_winner_is_what_is_validated() {
+            let last_wins: Value =
+                serde_json::from_str(r#"{"repo_path":5,"repo_path":"/no/such/repo"}"#).unwrap();
+            assert_eq!(last_wins["repo_path"], "/no/such/repo");
+            validate_arguments("gitpulse_status", &last_wins).expect("the last key is valid");
+            assert!(extract::<RepoArgs>(&last_wins).is_ok());
+
+            let bad_last: Value =
+                serde_json::from_str(r#"{"repo_path":"/no/such/repo","repo_path":5}"#).unwrap();
+            let error =
+                validate_arguments("gitpulse_status", &bad_last).expect_err("5 is not a path");
+            assert!(error.contains("repo_path"), "{error}");
+            assert!(extract::<RepoArgs>(&bad_last).is_err());
+        }
+
+        #[test]
+        fn json_cannot_carry_what_the_extractor_would_have_to_trust() {
+            for text in [
+                "NaN",
+                "Infinity",
+                "-Infinity",
+                "1e400",
+                "-1e400",
+                "+1",
+                "01",
+                ".5",
+                "5.",
+                "0x10",
+            ] {
+                assert!(
+                    serde_json::from_str::<Value>(text).is_err(),
+                    "{text} parsed as JSON"
+                );
+            }
+            assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+            assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
+            // "-0" is a float, whole, and equal to zero.
+            let negative_zero: Value = serde_json::from_str("-0").unwrap();
+            assert!(validate::exact_int(negative_zero.as_number().unwrap()) == Some(0));
+            let subnormal: Value = serde_json::from_str("1e-320").unwrap();
+            assert!(validate::exact_int(subnormal.as_number().unwrap()).is_none());
+        }
+
+        #[test]
+        fn zero_subnormal_and_borderline_confidences_are_read_within_their_range() {
+            let schema = schema_of("devmap_impact");
+            let base = {
+                let mut base = sample(&schema);
+                base["repo_path"] = json!("/no/such/repo");
+                base
+            };
+            let min = schema["properties"]["min_confidence"]["minimum"]
+                .as_f64()
+                .unwrap();
+            let max = schema["properties"]["min_confidence"]["maximum"]
+                .as_f64()
+                .unwrap();
+            for text in [
+                "0",
+                "-0",
+                "-0.0",
+                "0.0",
+                "1e-320",
+                "5e-324",
+                "1",
+                "1.0",
+                "0.9999999999999999",
+                "0.99999999999999999999",
+                "1.0000000000000002",
+                "-1e-320",
+                "1.0000000000000001",
+            ] {
+                let sent: Value = serde_json::from_str(text).unwrap();
+                let mut arguments = base.clone();
+                arguments["min_confidence"] = sent.clone();
+                let verdict = validate_arguments("devmap_impact", &arguments);
+                let parsed = extract::<devmap_parity::ImpactArgs>(&arguments);
+                let value = sent.as_f64().unwrap();
+                if (min..=max).contains(&value) {
+                    verdict.unwrap_or_else(|e| panic!("{text}: {e}"));
+                    let read = parsed.unwrap_or_else(|e| panic!("{text}: {e:?}"));
+                    let narrowed = read["min_confidence"].as_f64().expect("a number");
+                    assert!(
+                        (min..=max).contains(&narrowed),
+                        "{text} was read as {narrowed}, outside [{min}, {max}]"
+                    );
+                } else {
+                    assert!(verdict.is_err(), "{text} was accepted");
+                }
+            }
+        }
+
+        #[test]
+        fn the_parse_path_has_no_shared_mutable_state_and_is_deterministic_across_threads() {
+            let source = include_str!("validate.rs");
+            let typed = &source[source.find("// Typed arguments").expect("typed section")
+                ..source.find("#[cfg(test)]\nmod tests").expect("tests")];
+            for needle in [
+                "static mut",
+                "thread_local",
+                "OnceLock",
+                "Mutex",
+                "RwLock",
+                "lazy_static",
+                "AtomicU",
+            ] {
+                assert!(
+                    !typed.contains(needle),
+                    "the typed layer holds global state: {needle}"
+                );
+            }
+            let schema = schema_of("gitpulse_ledger_events");
+            let cases: Vec<Value> = (0..40)
+                .map(|n| {
+                    let mut arguments = sample(&schema);
+                    arguments["cursor"] = match n % 4 {
+                        0 => json!(n),
+                        1 => json!(n as f64),
+                        2 => json!(-1),
+                        _ => json!(1e300),
+                    };
+                    arguments
+                })
+                .collect();
+            let verdicts = |cases: &[Value]| -> Vec<(bool, Option<Value>)> {
+                cases
+                    .iter()
+                    .map(|arguments| {
+                        (
+                            validate_arguments("gitpulse_ledger_events", arguments).is_ok(),
+                            extract::<LedgerEventsArgs>(arguments).ok(),
+                        )
+                    })
+                    .collect()
+            };
+            let expected = verdicts(&cases);
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let cases = cases.clone();
+                    std::thread::spawn(move || {
+                        (0..200).all(|_| {
+                            cases
+                                .iter()
+                                .map(|arguments| {
+                                    (
+                                        validate_arguments("gitpulse_ledger_events", arguments)
+                                            .is_ok(),
+                                        extract::<LedgerEventsArgs>(arguments).ok(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                == verdicts(&cases)
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().expect("no panic"));
+            }
+            assert_eq!(expected, verdicts(&cases));
+        }
+
+        #[test]
+        fn nothing_outside_handle_tool_call_dispatches_a_tool() {
+            let production = |source: &'static str| {
+                &source[..source
+                    .find("#[cfg(test)]\nmod tests")
+                    .unwrap_or(source.len())]
+            };
+            let mod_rs = production(include_str!("mod.rs"));
+            assert_eq!(
+                mod_rs.matches("handle_tool_call(").count(),
+                2,
+                "handle_tool_call is defined once and called once, from `run`"
+            );
+            assert_eq!(mod_rs.matches("devmap_parity::handle(").count(), 1);
+            for (file, source) in [
+                ("resources.rs", include_str!("resources.rs")),
+                ("prompts.rs", include_str!("prompts.rs")),
+                ("complete.rs", include_str!("complete.rs")),
+                ("page.rs", include_str!("page.rs")),
+                (
+                    "devmap_parity.rs",
+                    production(include_str!("devmap_parity.rs")),
+                ),
+                (
+                    "bin/gitpulse-mcp.rs",
+                    include_str!("../bin/gitpulse-mcp.rs"),
+                ),
+            ] {
+                for needle in [
+                    "handle_tool_call(",
+                    "devmap_parity::handle(",
+                    "::from_args(",
+                ] {
+                    assert!(
+                        !source.contains(needle),
+                        "{file} dispatches around the validator: {needle}"
+                    );
+                }
+            }
+        }
+    }
 }
