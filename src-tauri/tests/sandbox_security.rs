@@ -560,3 +560,120 @@ fn clone_repo_still_clones_local_file_urls() {
 }
 
 mod common;
+
+// ---------------------------------------------------------------------------
+// Git metadata is not a writable target. The write gate is the MANVI sidecar,
+// which is absent by default, so the sandbox itself must refuse.
+// ---------------------------------------------------------------------------
+
+const HOSTILE_CONFIG: &str = "[core]\n\tfsmonitor = sh -c 'touch /tmp/pwn'\n";
+
+fn dot_git_config(repo: &Path) -> Vec<u8> {
+    std::fs::read(repo.join(".git/config")).expect("read .git/config")
+}
+
+#[test]
+fn writing_dot_git_config_is_refused_and_the_config_is_untouched() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    let before = dot_git_config(repo_dir.path());
+
+    for path in [".git/config", ".GIT/config", ".git./config", ".git /config"] {
+        let edited = gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+            &repo_str,
+            path,
+            HOSTILE_CONFIG,
+        );
+        assert!(edited.is_err(), "edited-text write to {path} must fail");
+        let raw = sandbox_write_raw(&repo_str, path);
+        assert!(raw.is_err(), "raw write to {path} must fail");
+        assert_eq!(
+            dot_git_config(repo_dir.path()),
+            before,
+            "{path} changed .git/config"
+        );
+    }
+}
+
+fn sandbox_write_raw(repo: &str, path: &str) -> Result<(), String> {
+    gitpulse_lib::engine::git_cli::sandbox_write(repo, path, HOSTILE_CONFIG)
+}
+
+#[test]
+fn moving_an_untracked_file_into_dot_git_hooks_is_refused() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    std::fs::write(repo_dir.path().join("x"), "#!/bin/sh\ntouch /tmp/pwn\n").unwrap();
+
+    let result = GitWriter::move_path(&repo_str, "x", ".git/hooks/x", |_| Ok(()));
+    assert!(result.is_err(), "move into .git/hooks must fail");
+    assert!(!repo_dir.path().join(".git/hooks/x").exists());
+    assert!(repo_dir.path().join("x").exists(), "the source stays put");
+
+    // The other end: moving a file out of git metadata is just as refused.
+    let result = GitWriter::move_path(&repo_str, ".git/HEAD", "stolen", |_| Ok(()));
+    assert!(result.is_err(), "move out of .git must fail");
+    assert!(repo_dir.path().join(".git/HEAD").exists());
+}
+
+#[test]
+fn ordinary_dot_git_prefixed_names_still_write() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    for path in [".gitignore", ".gitkeep", ".github/x", "sub/.gitattributes"] {
+        gitpulse_lib::engine::git_cli::sandbox_write(&repo_str, path, "ok\n")
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join(path)).unwrap(),
+            "ok\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_alias_of_dot_git_cannot_be_written_through() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    std::os::unix::fs::symlink(repo.join(".git"), repo.join("meta")).unwrap();
+    let before = dot_git_config(&repo);
+
+    assert!(sandbox_write_raw(&repo_str, "meta/config").is_err());
+    assert!(gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+        &repo_str,
+        "meta/config",
+        HOSTILE_CONFIG
+    )
+    .is_err());
+    assert_eq!(dot_git_config(&repo), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_gitdir_file_layout_protects_the_real_git_directory() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    // The `.bare` layout: the git directory has another name and `.git` is a
+    // file that points at it.
+    std::fs::rename(repo.join(".git"), repo.join(".bare")).unwrap();
+    std::fs::write(repo.join(".git"), "gitdir: .bare\n").unwrap();
+    common::trust_repo(&repo);
+    let repo_str = repo.to_string_lossy().into_owned();
+    let before = std::fs::read(repo.join(".bare/config")).unwrap();
+
+    assert!(sandbox_write_raw(&repo_str, ".bare/config").is_err());
+    assert!(gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+        &repo_str,
+        ".bare/hooks/pre-commit",
+        HOSTILE_CONFIG
+    )
+    .is_err());
+    assert_eq!(std::fs::read(repo.join(".bare/config")).unwrap(), before);
+    assert!(!repo.join(".bare/hooks/pre-commit").exists());
+}
