@@ -7514,4 +7514,854 @@ some-future-field whatever
         assert_eq!(report, SweepReport::default());
         assert!(holding.join("keep-me").exists() && holding.join("notes.txt").exists());
     }
+
+    // ---- Adversarial cases for the teardown lock split (CARD 22 S5-11) ----
+
+    fn now_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    fn add_lane_at(repo: &Path, at: &Path, branch: &str) {
+        add_worktree_extended(
+            repo.to_str().unwrap(),
+            at.to_str().unwrap(),
+            Some(branch),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("worktree");
+        crate::test_support::trust_repo(at);
+    }
+
+    /// Paths `git worktree list` reports, by lane identity.
+    fn listed_lanes(repo: &Path) -> Vec<PathBuf> {
+        git_text(repo, &["worktree", "list", "--porcelain"])
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(|path| lane_identity(Path::new(path)))
+            .collect()
+    }
+
+    fn is_listed(repo: &Path, lane: &Path) -> bool {
+        listed_lanes(repo).contains(&lane_identity(lane))
+    }
+
+    /// Removes the lane with a recording deleter that really deletes.
+    fn remove_recording(
+        repo: &Path,
+        lane: &Path,
+        force: bool,
+    ) -> (Result<WorktreeRemoval, String>, Vec<PathBuf>) {
+        let mut asides = Vec::new();
+        let result = remove_worktree_with(
+            repo.to_str().unwrap(),
+            lane.to_str().unwrap(),
+            force,
+            &mut |aside: &Path| {
+                asides.push(aside.to_path_buf());
+                std::fs::remove_dir_all(aside)
+            },
+        );
+        (result, asides)
+    }
+
+    /// 1. Sweep safety: a hard link and symlinks inside an aside are unlinked,
+    /// and what they reach is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn adv_sweep_unlinks_links_without_touching_what_they_reach() {
+        use std::os::unix::fs::symlink;
+        let (dir, _wt) = teardown_fixture(None);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("precious.txt"), "keep\n").unwrap();
+        std::fs::create_dir(outside.path().join("sub")).unwrap();
+        std::fs::write(outside.path().join("sub/deep.txt"), "deep\n").unwrap();
+        let aside = plant_aside(dir.path(), "1-11-1");
+        std::fs::hard_link(
+            outside.path().join("precious.txt"),
+            aside.join("linked.txt"),
+        )
+        .unwrap();
+        symlink(outside.path(), aside.join("home-link")).unwrap();
+        symlink(outside.path().join("sub"), aside.join("build/sub-link")).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(
+            (report.removed, report.problems.len()),
+            (1, 0),
+            "{report:?}"
+        );
+        assert!(!aside.exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("precious.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("sub/deep.txt")).unwrap(),
+            "deep\n"
+        );
+    }
+
+    /// 1. A pattern-named path that is a regular file is left and reported.
+    #[test]
+    fn adv_sweep_leaves_a_regular_file_named_like_an_aside() {
+        let (dir, _wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::fs::write(holding.join("1-12-1"), "not a directory\n").unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(holding.join("1-12-1").is_file());
+    }
+
+    /// 1. Pattern-looking things the sweep does not own are never visited: a
+    /// nested one under a user's folder in the holding directory, and a
+    /// sibling-pattern directory with no marker beside a worktree.
+    #[test]
+    fn adv_sweep_ignores_pattern_names_outside_its_own_listing() {
+        let (dir, wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(holding.join("mine/1-13-1")).unwrap();
+        std::fs::write(holding.join("mine/1-13-1/keep.txt"), "mine\n").unwrap();
+        let beside = wt
+            .path()
+            .parent()
+            .unwrap()
+            .join(".docs.gitpulse-teardown-1-13-2");
+        std::fs::create_dir_all(&beside).unwrap();
+        std::fs::write(beside.join("keep.txt"), "mine\n").unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report, SweepReport::default());
+        assert!(holding.join("mine/1-13-1/keep.txt").exists() && beside.join("keep.txt").exists());
+        std::fs::remove_dir_all(&beside).unwrap();
+    }
+
+    /// 1. A hostile or corrupt marker: `/`, a home directory, a path through
+    /// `..`, a symlink with a correct name, a name with a trailing newline.
+    #[cfg(unix)]
+    #[test]
+    fn adv_sweep_refuses_hostile_markers() {
+        use std::os::unix::fs::symlink;
+        let (dir, _wt) = teardown_fixture(None);
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("precious.txt"), "keep\n").unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        let named = |stem: &str, text: String| {
+            std::fs::write(holding.join(format!("{stem}.sibling")), text).unwrap();
+        };
+        named("1-14-1", "/".into());
+        named("1-14-2", home.path().to_string_lossy().into_owned());
+        named("1-14-3", format!("{}/..", home.path().display()));
+        let link = home
+            .path()
+            .parent()
+            .unwrap()
+            .join(".x.gitpulse-teardown-1-14-4");
+        let _ = std::fs::remove_file(&link);
+        symlink(home.path(), &link).unwrap();
+        named("1-14-4", link.to_string_lossy().into_owned());
+        named("1-14-5", format!("{}\n", link.display()));
+        named("1-14-6", String::new());
+        named("1-14-7", "x".repeat(10_000));
+        let report = sweep_teardown_asides(dir.path());
+        let _ = std::fs::remove_file(&link);
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert!(home.path().join("precious.txt").exists());
+    }
+
+    /// 1. A marker that names a correctly spelled directory in a user's own
+    /// folder deletes it: the sweep checks the spelling, not that the place
+    /// is one a teardown could have used. Needs a planted or corrupt marker
+    /// under the git directory.
+    #[test]
+    fn adv_a_marker_cannot_make_the_sweep_delete_a_users_own_pattern_named_folder() {
+        let (dir, _wt) = teardown_fixture(None);
+        let users = tempfile::tempdir().unwrap();
+        let theirs = users.path().join(".docs.gitpulse-teardown-1-15-1");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("precious.txt"), "keep\n").unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::fs::write(
+            holding.join("1-15-1.sibling"),
+            theirs.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let _ = sweep_teardown_asides(dir.path());
+        assert!(
+            theirs.join("precious.txt").exists(),
+            "the sweep deleted a directory only because a marker named it"
+        );
+    }
+
+    /// 1. An aside whose name says it was made in the future (a clock that
+    /// went backwards, or a bad name) is not held off forever.
+    #[test]
+    fn adv_a_foreign_aside_dated_far_in_the_future_is_eventually_swept() {
+        let (dir, _wt) = teardown_fixture(None);
+        let foreign = std::process::id().wrapping_add(1);
+        let tomorrow = now_nanos() + 24 * 3600 * 1_000_000_000;
+        let aside = plant_aside(dir.path(), &format!("{foreign}-{tomorrow}-1"));
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!aside.exists());
+    }
+
+    /// 1. A foreign aside older than the age rule is swept.
+    #[test]
+    fn adv_a_foreign_aside_past_the_age_rule_is_swept() {
+        let (dir, _wt) = teardown_fixture(None);
+        let foreign = std::process::id().wrapping_add(1);
+        let old = now_nanos() - 31 * 1_000_000_000;
+        let aside = plant_aside(dir.path(), &format!("{foreign}-{old}-1"));
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!aside.exists());
+    }
+
+    /// 1. Two sweeps at once (two threads here; two processes behave the same
+    /// way) over the same leftovers must both come back clean: the one that
+    /// loses the race is not a failure to report.
+    #[test]
+    fn adv_concurrent_sweeps_do_not_report_each_other_as_failures() {
+        let (dir, _wt) = teardown_fixture(None);
+        for round in 0..40 {
+            for n in 0..4 {
+                let aside = plant_aside(dir.path(), &format!("1-16-{round}{n}"));
+                for file in 0..200 {
+                    std::fs::write(aside.join(format!("f{file}")), "x").unwrap();
+                }
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let reports: Vec<SweepReport> = (0..2)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let repo = dir.path().to_path_buf();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        sweep_teardown_asides(&repo)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            for report in &reports {
+                assert!(
+                    report.problems.is_empty(),
+                    "round {round}: a sweep reported a problem that was only the other sweep: {report:?}"
+                );
+            }
+            assert!(teardown_entries(dir.path()).is_empty());
+        }
+    }
+
+    /// 1. An aside this process is deleting right now is not swept, marker or
+    /// no marker, even when its name is old enough for any other rule.
+    #[test]
+    fn adv_an_aside_in_flight_in_this_process_is_not_swept() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), &format!("{}-1-17", std::process::id()));
+        let held = TeardownAside::register(aside.clone(), None);
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert!(aside.join("build/out.o").exists());
+        drop(held);
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 1, "{report:?}");
+    }
+
+    /// 1/3. A sweep that runs while a teardown's deleter is parked (the real
+    /// delete is in progress) leaves that teardown's aside alone.
+    #[test]
+    fn adv_a_sweep_during_a_live_delete_leaves_that_aside_alone() {
+        let (dir, wt) = teardown_fixture(None);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let repo_text = dir.path().to_str().unwrap().to_string();
+        let wt_text = wt.path().to_str().unwrap().to_string();
+        let removal = std::thread::spawn(move || {
+            remove_worktree_with(&repo_text, &wt_text, true, &mut |aside: &Path| {
+                entered_tx.send(aside.to_path_buf()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                std::fs::remove_dir_all(aside)
+            })
+        });
+        let aside = entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deleter");
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(
+            report,
+            SweepReport::default(),
+            "the sweep touched a live delete"
+        );
+        assert!(
+            aside.join("feature.txt").exists(),
+            "the sweep deleted a live aside"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(removal.join().unwrap().unwrap(), WorktreeRemoval::default());
+    }
+
+    /// 2. A worktree path with spaces and non-ASCII characters.
+    #[test]
+    fn adv_unicode_and_space_worktree_path_takes_the_split() {
+        let (dir, _wt) = teardown_fixture(None);
+        let parent = tempfile::tempdir().unwrap();
+        let lane = parent.path().join("wörk tree ✓ 日本");
+        add_lane_at(dir.path(), &lane, "uni-lane");
+        std::fs::write(lane.join("ünï.txt"), "x").unwrap();
+        let (result, asides) = remove_recording(dir.path(), &lane, true);
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        assert!(!lane.exists() && !is_listed(dir.path(), &lane));
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// 2. A long final component (the holding-directory aside has its own short
+    /// name, so the length of the worktree's does not matter).
+    #[test]
+    fn adv_a_very_long_worktree_name_takes_the_split() {
+        let (dir, _wt) = teardown_fixture(None);
+        let parent = tempfile::tempdir().unwrap();
+        let lane = parent.path().join("l".repeat(240));
+        add_lane_at(dir.path(), &lane, "long-lane");
+        let (result, asides) = remove_recording(dir.path(), &lane, true);
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        assert!(!lane.exists() && !is_listed(dir.path(), &lane));
+    }
+
+    /// 2. A process whose cwd is inside the worktree: macOS allows the rename.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_running_process_inside_the_worktree_does_not_stop_the_removal() {
+        let (dir, wt) = teardown_fixture(None);
+        let mut child = std::process::Command::new("sleep")
+            .arg("120")
+            .current_dir(wt.path())
+            .spawn()
+            .expect("sleep");
+        let (result, asides) = remove_recording(dir.path(), wt.path(), true);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        assert!(!wt.path().exists() && !is_listed(dir.path(), wt.path()));
+    }
+
+    /// 2. A worktree holding a nested repository: forced, it goes whole; not
+    /// forced, git's refusal applies and nothing moves.
+    #[test]
+    fn adv_a_nested_repository_inside_the_worktree() {
+        let (dir, wt) = teardown_fixture(None);
+        let nested = wt.path().join("vendor/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        crate::test_support::git_in(&nested, &["init", "-b", "main", "."]);
+        std::fs::write(nested.join("f"), "x").unwrap();
+        crate::test_support::git_in(&nested, &["add", "."]);
+        crate::test_support::git_in(
+            &nested,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "i",
+            ],
+        );
+        let (refused, asides) = remove_recording(dir.path(), wt.path(), false);
+        assert!(
+            refused.is_err() && asides.is_empty(),
+            "{refused:?} {asides:?}"
+        );
+        assert!(nested.join("f").exists() && teardown_entries(dir.path()).is_empty());
+        let (result, asides) = remove_recording(dir.path(), wt.path(), true);
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert_eq!(asides.len(), 1);
+        assert!(!wt.path().exists());
+    }
+
+    /// 2. A worktree path that is a symlink to the worktree: the real
+    /// directory goes, as `git worktree remove` of the resolved path did.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_symlinked_worktree_path_removes_the_real_directory() {
+        let (dir, wt) = teardown_fixture(None);
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("lane-link");
+        std::os::unix::fs::symlink(wt.path(), &link).unwrap();
+        let (result, _) = remove_recording(dir.path(), &link, true);
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert!(!wt.path().exists(), "the real directory is still there");
+        assert!(!is_listed(dir.path(), wt.path()));
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// 2. Removing the checkout the call is made from (repo = the worktree
+    /// itself) leaves no half state: the directory is there exactly when git
+    /// lists it.
+    #[test]
+    fn adv_removing_the_worktree_the_call_is_rooted_in_is_not_half_done() {
+        let (dir, wt) = teardown_fixture(None);
+        let mut deleted = Vec::new();
+        let result = remove_worktree_with(
+            wt.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            true,
+            &mut |aside: &Path| {
+                deleted.push(aside.to_path_buf());
+                std::fs::remove_dir_all(aside)
+            },
+        );
+        let here = wt.path().exists();
+        let listed = is_listed(dir.path(), wt.path());
+        eprintln!("self-removal: {result:?} dir_exists={here} listed={listed} deleted={deleted:?}");
+        assert_eq!(
+            here, listed,
+            "half state: dir_exists={here} listed={listed} ({result:?})"
+        );
+        assert!(teardown_entries(dir.path()).is_empty() || deleted.is_empty());
+    }
+
+    /// 2. The main checkout is never renamed.
+    #[test]
+    fn adv_the_main_checkout_is_not_renamed() {
+        let (dir, _wt) = teardown_fixture(None);
+        let (result, asides) = remove_recording(dir.path(), dir.path(), true);
+        assert!(result.is_err(), "{result:?}");
+        assert!(asides.is_empty());
+        assert!(dir.path().join("README.md").exists());
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// 2. A worktree whose parent is read-only cannot be renamed out; it falls
+    /// back to git's removal and leaves no aside or marker behind.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_read_only_parent_falls_back_and_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _wt) = teardown_fixture(None);
+        let parent = tempfile::tempdir().unwrap();
+        let lane = parent.path().join("lane");
+        add_lane_at(dir.path(), &lane, "ro-parent-lane");
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (result, asides) = remove_recording(dir.path(), &lane, true);
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!(
+            "read-only parent: {result:?} asides={asides:?} dir={} listed={}",
+            lane.exists(),
+            is_listed(dir.path(), &lane)
+        );
+        assert!(
+            asides.is_empty(),
+            "renamed out of a read-only parent: {asides:?}"
+        );
+        assert!(teardown_entries(dir.path()).is_empty());
+        // Git's own removal (the unchanged fallback) unlists the lane before
+        // its rmdir fails: that half state is git's, as it was before the split.
+    }
+
+    /// 2/4. A read-only directory inside the worktree makes the delete fail
+    /// after the worktree is already unlisted: reported, named, kept for the
+    /// sweep, and cleared by the next removal once it can be.
+    #[cfg(unix)]
+    #[test]
+    fn adv_an_undeletable_tree_is_reported_and_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, wt) = teardown_fixture(None);
+        let locked = wt.path().join("ro");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("f"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (result, _) = remove_recording(dir.path(), wt.path(), true);
+        let first = result.expect("the worktree is removed");
+        let left = teardown_entries(dir.path());
+        let reported = first
+            .cleanup_error
+            .clone()
+            .expect("the failed delete is reported");
+        assert!(!is_listed(dir.path(), wt.path()), "still listed");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(reported.contains(&left[0]), "{reported}");
+        let aside = teardown_holding_dir(dir.path()).join(&left[0]);
+        // Still stuck: the next removal reports it again rather than hiding it.
+        let other = tempfile::tempdir().unwrap();
+        add_lane_at(dir.path(), other.path(), "undeletable-b");
+        let (second, _) = remove_recording(dir.path(), other.path(), true);
+        let second = second.expect("removed");
+        assert!(
+            second.cleanup_error.is_some(),
+            "a leftover that cannot be deleted went quiet"
+        );
+        std::fs::set_permissions(aside.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let third = tempfile::tempdir().unwrap();
+        add_lane_at(dir.path(), third.path(), "undeletable-c");
+        let (third, _) = remove_recording(dir.path(), third.path(), true);
+        assert_eq!(third.unwrap(), WorktreeRemoval::default());
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// 3. Crash after the rename and before the record is removed: the aside
+    /// is swept by the next call, and the record left behind is consistent
+    /// (listed as a missing directory), clearable by prune.
+    #[test]
+    fn adv_crash_between_rename_and_record_removal_recovers() {
+        let (dir, wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        let aside = holding.join("1-20-1");
+        std::fs::rename(wt.path(), &aside).unwrap();
+        assert!(
+            is_listed(dir.path(), wt.path()),
+            "the record should still be there"
+        );
+        let other = second_lane(dir.path());
+        let (result, _) = remove_recording(dir.path(), other.path(), true);
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert!(!aside.exists(), "the aside was not swept");
+        // Retrying the same removal: what does the person get?
+        let retry = remove_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            true,
+        );
+        let merge_retry = merge_and_teardown_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+        );
+        eprintln!("retry after crash: panel={retry:?} merge={merge_retry:?}");
+        prune_worktree(dir.path().to_str().unwrap()).unwrap();
+        assert!(
+            !is_listed(dir.path(), wt.path()),
+            "prune did not clear the record"
+        );
+        assert!(branch_exists(dir.path(), "feature-x"));
+    }
+
+    /// 3. The retry of a teardown whose worktree directory was moved aside by
+    /// a crash must not be stuck: either it finishes, or it says what to do.
+    #[test]
+    fn adv_the_same_removal_retried_after_a_crash_finishes() {
+        let (dir, wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::fs::rename(wt.path(), holding.join("1-21-1")).unwrap();
+        let retry = remove_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            true,
+        );
+        assert!(
+            retry.is_ok(),
+            "the retry of the same removal is refused: {retry:?}"
+        );
+        assert!(!is_listed(dir.path(), wt.path()));
+    }
+
+    /// 3. Crash after the record is gone and before the delete: the aside is
+    /// all that is left, and the sweep takes it.
+    #[test]
+    fn adv_crash_after_record_removal_leaves_only_an_aside_the_sweep_takes() {
+        let (dir, wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        let aside = holding.join("1-22-1");
+        std::fs::rename(wt.path(), &aside).unwrap();
+        git_text(dir.path(), &["worktree", "prune", "--expire", "now"]).unwrap();
+        assert!(!is_listed(dir.path(), wt.path()));
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!aside.exists());
+    }
+
+    /// 3. A delete that died half way: a partial tree is swept.
+    #[test]
+    fn adv_a_partially_deleted_tree_is_swept() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-23-1");
+        std::fs::create_dir_all(aside.join("a/b/c")).unwrap();
+        std::fs::write(aside.join("a/b/c/leaf"), "x").unwrap();
+        std::fs::create_dir_all(aside.join("emptied")).unwrap();
+        let report = sweep_teardown_asides(dir.path());
+        assert_eq!(
+            (report.removed, report.problems.len()),
+            (1, 0),
+            "{report:?}"
+        );
+        assert!(!aside.exists());
+    }
+
+    /// 4. The panel's removal with a failing delete: removed, unlisted,
+    /// the error names the aside.
+    #[test]
+    fn adv_panel_removal_with_a_failing_delete_reports_the_path() {
+        let (dir, wt) = teardown_fixture(None);
+        let removal = remove_worktree_with(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            true,
+            &mut |_: &Path| Err(std::io::Error::other("disk on fire")),
+        )
+        .expect("removed");
+        let left = teardown_entries(dir.path());
+        let reported = removal.cleanup_error.expect("reported");
+        assert!(
+            reported.contains("disk on fire") && reported.contains(&left[0]),
+            "{reported}"
+        );
+        assert!(!is_listed(dir.path(), wt.path()) && !wt.path().exists());
+    }
+
+    /// 4. A sweep problem (a symlinked leftover) is carried in `cleanup_error`
+    /// of a removal whose own delete succeeded. The field is "something to
+    /// clean up", not "this delete failed".
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_sweep_problem_shows_on_an_unrelated_successful_removal() {
+        let (dir, wt) = teardown_fixture(None);
+        let target = tempfile::tempdir().unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        std::os::unix::fs::symlink(target.path(), holding.join("1-24-1")).unwrap();
+        let (result, asides) = remove_recording(dir.path(), wt.path(), true);
+        let removal = result.unwrap();
+        assert_eq!(asides.len(), 1);
+        assert!(removal.cleanup_error.is_some(), "{removal:?}");
+        assert!(target.path().exists());
+    }
+
+    /// 5. When the deleter starts: the lock is free, the branch is already
+    /// deleted (under the lock), the lane is unlisted, and the post-merge hook
+    /// has not run yet; it runs after the delete.
+    #[test]
+    fn adv_lock_released_before_delete_branch_deleted_under_it_hooks_after() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let ran = marker_dir.path().join("hook-ran");
+        let hooks = format!(
+            r#"{{"worktree":{{"post_merge":["touch {}"]}}}}"#,
+            ran.display()
+        );
+        let (dir, wt) = teardown_fixture(Some(&hooks));
+        let other = second_lane(dir.path());
+        let mut observed = None;
+        let result = merge_and_teardown_with_seams(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+            &mut |_| {},
+            &mut |aside: &Path| {
+                assert_repo_is_free_meanwhile(dir.path(), other.path(), wt.path());
+                observed = Some((branch_exists(dir.path(), "feature-x"), ran.exists()));
+                std::fs::remove_dir_all(aside)
+            },
+        )
+        .expect("merged");
+        assert_eq!(
+            observed,
+            Some((false, false)),
+            "(branch still there, hook already ran)"
+        );
+        assert!(
+            result.worktree_removed && result.branch_deleted && result.hook_error.is_none(),
+            "{result:?}"
+        );
+        assert!(ran.exists(), "the post-merge hook never ran");
+    }
+
+    /// 5. Two removals of the same lane at once: one wins, the other is
+    /// refused cleanly, and nothing is left behind.
+    #[test]
+    fn adv_two_removals_of_one_lane_leave_nothing_behind() {
+        let (dir, wt) = teardown_fixture(None);
+        let results: Vec<_> = (0..2)
+            .map(|_| {
+                let repo = dir.path().to_str().unwrap().to_string();
+                let lane = wt.path().to_str().unwrap().to_string();
+                std::thread::spawn(move || remove_worktree(&repo, &lane, true))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(results.iter().any(Result::is_ok), "{results:?}");
+        assert!(!wt.path().exists() && !is_listed(dir.path(), wt.path()));
+        assert!(teardown_entries(dir.path()).is_empty());
+    }
+
+    /// A small APFS volume mounted under a temp directory, so a worktree can
+    /// sit on another device than the repository's git directory.
+    #[cfg(target_os = "macos")]
+    struct DiskImage {
+        mount: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl DiskImage {
+        fn attach() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let image = dir.path().join("volume.dmg");
+            let mount = dir.path().join("mnt");
+            std::fs::create_dir(&mount).unwrap();
+            let run = |args: &[&std::ffi::OsStr]| {
+                let out = std::process::Command::new("hdiutil")
+                    .args(args)
+                    .output()
+                    .expect("hdiutil");
+                assert!(
+                    out.status.success(),
+                    "hdiutil {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            run(&[
+                "create".as_ref(),
+                "-size".as_ref(),
+                "64m".as_ref(),
+                "-fs".as_ref(),
+                "APFS".as_ref(),
+                "-volname".as_ref(),
+                "gpxdev".as_ref(),
+                image.as_os_str(),
+            ]);
+            run(&[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-mountpoint".as_ref(),
+                mount.as_os_str(),
+                image.as_os_str(),
+            ]);
+            let mount = mount.canonicalize().unwrap();
+            Self { mount, _dir: dir }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for DiskImage {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.mount)
+                .output();
+        }
+    }
+
+    /// 2. Cross-device: the aside goes beside the lane with a marker in the
+    /// holding directory, both are cleaned up after the delete.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adv_cross_device_worktree_gets_a_sibling_aside_and_marker() {
+        let (dir, _wt) = teardown_fixture(None);
+        let volume = DiskImage::attach();
+        let lane = volume.mount.join("lane");
+        add_lane_at(dir.path(), &lane, "xdev-lane");
+        assert!(
+            !same_device(
+                &lane,
+                &teardown_holding_dir(dir.path())
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            ),
+            "not a cross-device fixture"
+        );
+        let mut seen = None;
+        let result = remove_worktree_with(
+            dir.path().to_str().unwrap(),
+            lane.to_str().unwrap(),
+            true,
+            &mut |aside: &Path| {
+                seen = Some((aside.to_path_buf(), teardown_entries(dir.path())));
+                std::fs::remove_dir_all(aside)
+            },
+        )
+        .expect("removed");
+        assert_eq!(result, WorktreeRemoval::default());
+        let (aside, markers) = seen.expect("the deleter ran");
+        assert_eq!(aside.parent().unwrap(), volume.mount, "{aside:?}");
+        assert!(aside
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".lane.gitpulse-teardown-"));
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert!(markers[0].ends_with(".sibling"));
+        assert!(
+            teardown_entries(dir.path()).is_empty(),
+            "marker left behind"
+        );
+        assert!(!lane.exists() && !aside.exists() && !is_listed(dir.path(), &lane));
+    }
+
+    /// 2/3. Cross-device, delete fails: the sibling aside and its marker stay;
+    /// the next removal sweeps both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adv_cross_device_failed_delete_is_swept_through_its_marker() {
+        let (dir, _wt) = teardown_fixture(None);
+        let volume = DiskImage::attach();
+        let lane = volume.mount.join("lane");
+        add_lane_at(dir.path(), &lane, "xdev-lane");
+        let removal = remove_worktree_with(
+            dir.path().to_str().unwrap(),
+            lane.to_str().unwrap(),
+            true,
+            &mut |_: &Path| Err(std::io::Error::other("disk on fire")),
+        )
+        .expect("removed");
+        assert!(removal.cleanup_error.is_some());
+        assert_eq!(teardown_entries(dir.path()).len(), 1);
+        let beside: Vec<_> = std::fs::read_dir(&volume.mount)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("gitpulse-teardown"))
+            .collect();
+        assert_eq!(beside.len(), 1, "{beside:?}");
+        // The marker's name carries our pid and the time, so it is ours to
+        // retry at once.
+        let other = second_lane(dir.path());
+        let (swept, _) = remove_recording(dir.path(), other.path(), true);
+        assert_eq!(swept.unwrap(), WorktreeRemoval::default());
+        assert!(teardown_entries(dir.path()).is_empty());
+        assert!(
+            !volume.mount.join(&beside[0]).exists(),
+            "sibling aside not swept"
+        );
+    }
+
+    /// 2. Cross-device with a final name so long the sibling aside's name
+    /// would exceed NAME_MAX: the rename cannot happen, so the removal is
+    /// in place as before, and no marker is left.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adv_cross_device_name_too_long_for_a_sibling_falls_back() {
+        let (dir, _wt) = teardown_fixture(None);
+        let volume = DiskImage::attach();
+        let lane = volume.mount.join("n".repeat(250));
+        add_lane_at(dir.path(), &lane, "xdev-long");
+        let (result, asides) = remove_recording(dir.path(), &lane, true);
+        assert_eq!(result.unwrap(), WorktreeRemoval::default());
+        assert!(asides.is_empty(), "{asides:?}");
+        assert!(teardown_entries(dir.path()).is_empty(), "marker leaked");
+        assert!(!lane.exists() && !is_listed(dir.path(), &lane));
+    }
 }
