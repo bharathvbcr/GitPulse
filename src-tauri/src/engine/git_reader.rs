@@ -2504,7 +2504,8 @@ enum DateWalk {
     /// An older git has no such flag. The walk is bounded by count alone
     /// (`-n cap+1`, no date flag) and the window is applied here, to the
     /// committer dates git printed. The sample is the in-window rows among the
-    /// first `cap`; truncation is a further in-window row; the true window
+    /// first `cap`; any further row is reported as a possibly-cut window (the
+    /// walk has no date bound to say nothing in the window lies behind it); the true window
     /// size is not known and is not claimed.
     CountBounded,
 }
@@ -2592,7 +2593,11 @@ fn dora_commit_scan(
                 "the commit scan",
             )?;
             let mut rows = parse(&stdout);
-            let truncated = rows.get(cap).is_some_and(|(_, ts)| *ts >= since_secs);
+            // A row past the cap means the walk stopped before the end of history, and
+            // without a date bound it cannot be said that nothing in the window lies
+            // behind it (an inverted date can put one anywhere): "possibly cut" is
+            // reported as cut, never as complete.
+            let truncated = rows.len() > cap;
             rows.truncate(cap);
             rows.retain(|(_, ts)| *ts >= since_secs);
             Ok(DoraCommitScan {
@@ -10134,7 +10139,9 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             (&ssh, CommitSignature::Ssh),
             (&x509, CommitSignature::X509),
             (&other, CommitSignature::Other),
-            (&sha256, CommitSignature::Pgp),
+            // A `gpgsig-sha256` header in a SHA-1 repository is an unknown header to
+            // git, which does not verify it, so it is not signed here either.
+            (&sha256, CommitSignature::None),
             (&unsigned, CommitSignature::None),
             (&tag_merge, CommitSignature::None),
             (&signed_merge, CommitSignature::Ssh),

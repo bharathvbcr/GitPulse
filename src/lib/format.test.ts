@@ -109,7 +109,9 @@ describe("signatureLabel", () => {
   });
 
   it("says a check still running, or one that failed, is not a verdict", () => {
-    expect(signatureLabel(undefined).text).toBe("Checking signature…");
+    expect(signatureLabel(undefined, true).text).toBe("Checking signature…");
+    // No details loaded, so nothing was asked: not "checking" for ever.
+    expect(signatureLabel(undefined).text).toBe("Signature not checked");
     expect(signatureLabel(null).text).toBe("Signature not checked");
     expect(signatureLabel(check("unknown", "none")).text).toBe("Signature state unknown");
   });

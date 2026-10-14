@@ -62,15 +62,26 @@ export interface SignatureLabel {
 /**
  * The label for the one selected commit's signature check.
  *
- * `undefined` is a check still running (the verifier can take seconds) and
- * `null` one that could not be run: neither is "unsigned". A commit that
- * carries a signature is never labelled "Unsigned" because the verifier said
- * `N` or `E`; that means the verifier could not check it (no program, no key,
- * no allowed-signers file), not that nobody signed it.
+ * `undefined` is no check at all (the details never loaded, so nothing asked)
+ * and `null` one that could not be run; neither is "unsigned", and neither is
+ * "checking". Only a caller that knows a verification is in flight (the
+ * details are in and the verdict is not) says so with `running`: the verifier
+ * can take seconds. A commit that carries a signature is never labelled
+ * "Unsigned" because the verifier said `N` or `E`; that means the verifier
+ * could not check it (no program, no key, no allowed-signers file), not that
+ * nobody signed it. A value this build does not know (a backend newer or older
+ * than the pane) gets a safe label, never a throw.
  */
-export function signatureLabel(check: CommitSignatureCheck | null | undefined): SignatureLabel {
-  if (check === undefined) return { text: "Checking signature…", ok: false };
+export function signatureLabel(
+  check: CommitSignatureCheck | null | undefined,
+  running = false
+): SignatureLabel {
+  if (check === undefined) {
+    return { text: running ? "Checking signature…" : "Signature not checked", ok: false };
+  }
   if (check === null) return { text: "Signature not checked", ok: false };
+  const kinds: readonly string[] = ["none", "pgp", "ssh", "x509", "other", "unknown"];
+  if (!kinds.includes(check.signature)) return { text: "Signature status unknown", ok: false };
   if (check.signature === "none") return { text: "Unsigned", ok: false };
   if (check.signature === "unknown" && (check.status === "none" || check.status === "cannot_check")) {
     return { text: "Signature state unknown", ok: false };
@@ -91,5 +102,7 @@ export function signatureLabel(check: CommitSignatureCheck | null | undefined): 
     case "cannot_check":
     case "none":
       return { text: "Signed, could not verify", ok: false };
+    default:
+      return { text: "Signature status unknown", ok: false };
   }
 }

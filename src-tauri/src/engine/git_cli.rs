@@ -588,16 +588,6 @@ pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, Str
     git_captured_inner(repo, args, None, MAX_OUTPUT_BYTES)
 }
 
-/// [`git_captured`] with stdout bounded at `stdout_cap` bytes instead of the
-/// default: a stream cut at the cap is a prefix whose `incomplete` says so.
-pub(crate) fn git_captured_capped(
-    repo: &Path,
-    args: &[&str],
-    stdout_cap: usize,
-) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, None, stdout_cap)
-}
-
 /// [`git_captured`] with `stdin_bytes` fed to the child, for git's `--batch`
 /// style line protocols.
 pub(crate) fn git_captured_with_stdin(
@@ -631,7 +621,7 @@ const MAX_BATCH_OBJECTS: usize = 100_000;
 /// stream cut at `budget` (or by the deadline) is read as far as it is whole:
 /// the objects before the cut keep their answers, and every later one is an
 /// `Err` that says the output was cut.
-pub(crate) fn read_objects_batch<T>(
+pub(crate) fn read_objects_batch<T: Clone>(
     repo: &Path,
     oids: &[String],
     object: BatchObject,
@@ -639,38 +629,73 @@ pub(crate) fn read_objects_batch<T>(
     extract: &dyn Fn(&[u8]) -> T,
 ) -> HashMap<String, Result<T, String>> {
     let mut answers: HashMap<String, Result<T, String>> = HashMap::new();
-    let mut asked: HashSet<&str> = HashSet::new();
-    let mut sent: Vec<&str> = Vec::new();
+    // Git answers with an object's lowercase name whatever case it was asked
+    // by, and the stream is matched to its questions by that name, so every
+    // question is lowercased; the answer is given back under the spelling the
+    // caller used too.
+    let mut respelled: Vec<(&String, String)> = Vec::new();
+    let mut asked: HashSet<String> = HashSet::new();
+    let mut sent: Vec<String> = Vec::new();
     let mut query = String::new();
     for oid in oids {
-        if answers.contains_key(oid) || !asked.insert(oid.as_str()) {
-            continue;
-        }
         let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
         if !shaped {
-            asked.remove(oid.as_str());
-            answers.insert(
-                oid.clone(),
-                Err(format!("{oid:?} is not a {} id", object.noun)),
-            );
+            answers
+                .entry(oid.clone())
+                .or_insert_with(|| Err(format!("{oid:?} is not a {} id", object.noun)));
+            continue;
+        }
+        let lower = oid.to_ascii_lowercase();
+        if lower != *oid {
+            respelled.push((oid, lower.clone()));
+        }
+        if !asked.insert(lower.clone()) {
             continue;
         }
         if sent.len() == MAX_BATCH_OBJECTS {
             answers.insert(
-                oid.clone(),
+                lower,
                 Err(format!(
                     "more than {MAX_BATCH_OBJECTS} objects were asked for at once"
                 )),
             );
             continue;
         }
-        query.push_str(oid);
+        query.push_str(&lower);
         query.push('\n');
-        sent.push(oid);
+        sent.push(lower);
     }
-    if sent.is_empty() {
-        return answers;
+    if !sent.is_empty() {
+        let questions: Vec<&str> = sent.iter().map(String::as_str).collect();
+        fetch_objects(
+            repo,
+            &query,
+            &questions,
+            object,
+            budget,
+            extract,
+            &mut answers,
+        );
     }
+    for (original, lower) in respelled {
+        if let Some(answer) = answers.get(&lower).cloned() {
+            answers.insert(original.clone(), answer);
+        }
+    }
+    answers
+}
+
+/// Runs one `cat-file --batch` for `questions` (lowercase ids, `query` is the
+/// same list one per line) and records an answer for each in `answers`.
+fn fetch_objects<T>(
+    repo: &Path,
+    query: &str,
+    sent: &[&str],
+    object: BatchObject,
+    budget: usize,
+    extract: &dyn Fn(&[u8]) -> T,
+    answers: &mut HashMap<String, Result<T, String>>,
+) {
     let run = git_captured_inner(
         repo,
         &["cat-file", "--batch"],
@@ -680,12 +705,8 @@ pub(crate) fn read_objects_batch<T>(
     let run = match run {
         Ok(run) => run,
         Err(e) => {
-            mark_unread(
-                &mut answers,
-                &sent,
-                &format!("could not run git cat-file: {e}"),
-            );
-            return answers;
+            mark_unread(answers, sent, &format!("could not run git cat-file: {e}"));
+            return;
         }
     };
     // A stream cut at the budget or the deadline is a prefix whose child was
@@ -694,25 +715,17 @@ pub(crate) fn read_objects_batch<T>(
     if !run.success && run.incomplete.is_none() {
         let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
         mark_unread(
-            &mut answers,
-            &sent,
+            answers,
+            sent,
             &format!("git cat-file --batch failed: {stderr}"),
         );
-        return answers;
+        return;
     }
     let cut = run
         .incomplete
         .as_ref()
         .map(|reason| format!("git cat-file {}", reason.describe()));
-    read_batch_answers(
-        &run.stdout,
-        &sent,
-        object,
-        extract,
-        cut.as_deref(),
-        &mut answers,
-    );
-    answers
+    read_batch_answers(&run.stdout, sent, object, extract, cut.as_deref(), answers);
 }
 
 /// Where a body of the declared `size` starting at `pos` ends, if the stream
@@ -1988,6 +2001,10 @@ fn is_timeout_error(program: &str, err: &str) -> bool {
 #[derive(Default)]
 struct Drained {
     bytes: Vec<u8>,
+    /// Bytes already handed to a streaming observer and dropped from `bytes`
+    /// (see [`ProcessObserver::drains_stdout`]); they still count against the
+    /// cap, so a streamed read is as bounded as a buffered one.
+    discarded: usize,
     /// Cut off at the byte cap: the child had more to say.
     truncated: bool,
     /// Why the read stopped, when it was not end-of-stream.
@@ -1996,9 +2013,16 @@ struct Drained {
 
 impl Drained {
     fn append(&mut self, bytes: &[u8], cap: usize) {
-        let take = bytes.len().min(cap.saturating_sub(self.bytes.len()));
+        let held = self.bytes.len().saturating_add(self.discarded);
+        let take = bytes.len().min(cap.saturating_sub(held));
         self.bytes.extend_from_slice(&bytes[..take]);
         self.truncated |= take < bytes.len();
+    }
+
+    /// Drops what an observer has now seen, keeping its length in the budget.
+    fn discard_observed(&mut self) {
+        self.discarded = self.discarded.saturating_add(self.bytes.len());
+        self.bytes.clear();
     }
 }
 
@@ -2125,6 +2149,15 @@ pub(crate) trait ProcessObserver {
         false
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
+    /// True when the observer keeps what it needs from stdout itself, so the
+    /// run need not retain it: each chunk is dropped once `output` has seen it
+    /// and the returned [`BoundedRun::stdout`] holds only the unseen tail
+    /// (empty in practice). The byte cap still applies to the stream as a
+    /// whole. For a reader of a long stream that wants a few bytes per record
+    /// out of megabytes, which would otherwise be buffered whole.
+    fn drains_stdout(&self) -> bool {
+        false
+    }
 }
 
 impl ProcessObserver for () {}
@@ -7506,6 +7539,56 @@ mod tests {
             let err = inside[oid].as_ref().unwrap_err();
             assert!(err.contains("exceeded 64") && err.contains(&b), "{err}");
         }
+    }
+
+    /// An observer that keeps what it needs sees every byte of a long stream
+    /// while the run retains almost none of it, and the byte cap still ends a
+    /// stream that outruns it.
+    #[cfg(unix)]
+    #[test]
+    fn a_draining_observer_streams_without_the_run_buffering_the_output() {
+        struct Counting {
+            seen: usize,
+        }
+        impl ProcessObserver for Counting {
+            fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+                if matches!(stream, OutputStream::Stdout) {
+                    self.seen += bytes.len();
+                }
+            }
+            fn drains_stdout(&self) -> bool {
+                true
+            }
+        }
+        let run_with_cap = |cap: usize| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "head -c 3000000 /dev/zero"]);
+            let mut observer = Counting { seen: 0 };
+            let run = run_observed(
+                &mut cmd,
+                "sh",
+                Duration::from_secs(30),
+                None,
+                cap,
+                &mut observer,
+            )
+            .expect("run");
+            (run, observer.seen)
+        };
+        let (whole, seen) = run_with_cap(4_000_000);
+        assert!(whole.incomplete.is_none(), "{:?}", whole.incomplete);
+        assert_eq!(seen, 3_000_000, "the observer saw the whole stream");
+        assert!(
+            whole.stdout.len() < 1_000_000,
+            "the run kept {} of 3,000,000 bytes",
+            whole.stdout.len()
+        );
+        let (cut, seen) = run_with_cap(100_000);
+        assert_eq!(cut.incomplete, Some(Incomplete::OverCap(100_000)));
+        assert!(
+            seen <= 100_000,
+            "the cap bounds a streamed read too: {seen}"
+        );
     }
 
     /// The editor variables are PINNED rather than removed, and the difference

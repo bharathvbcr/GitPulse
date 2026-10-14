@@ -199,7 +199,7 @@
 </script>
 
 {#if selectedCommit}
-  {@const sig = signatureLabel(details?.signature_check)}
+  {@const sig = signatureLabel(details?.signature_check, details != null && details.signature_check === undefined)}
   <div class="h-64 border-t border-border/60 gp-section-edge bg-surface flex flex-col font-sans select-none overflow-hidden">
     <div class="px-4 py-2.5 border-b border-border/60 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
       <div class="flex items-center gap-3 min-w-0">

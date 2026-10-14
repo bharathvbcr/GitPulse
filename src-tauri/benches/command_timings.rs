@@ -182,7 +182,7 @@ fn signed_chain(root: &Path, signed: usize, verifier: &Path) -> String {
 /// The `pulse signed 0|50|500` rows. Empty off unix, where the stand-in
 /// signing program is a shell script.
 #[cfg(unix)]
-fn pulse_signed_cases(root: &Path) -> Vec<Case<'static>> {
+fn pulse_signed_cases(root: &Path, only: Option<&str>) -> Vec<Case<'static>> {
     use std::os::unix::fs::PermissionsExt;
     let stub_dir = root.join("verifier");
     std::fs::create_dir_all(&stub_dir).expect("create stub dir");
@@ -202,6 +202,7 @@ fn pulse_signed_cases(root: &Path) -> Vec<Case<'static>> {
 
     [0usize, 50, PULSE_COMMITS]
         .into_iter()
+        .filter(|signed| wanted(only, &format!("pulse signed {signed}")))
         .map(|signed| {
             let path = signed_chain(root, signed, &verifier);
             let count_file = count_file.clone();
@@ -236,6 +237,7 @@ fn pulse_signed_cases(root: &Path) -> Vec<Case<'static>> {
                     .counter("commits", report.commits.len() as u64)
                     .counter("verifier_spawns", verifier_spawns)
                     .counter("git_processes", git_processes)
+                    .metric("peak_rss_mb", peak_rss_mb())
                     .elapsed(elapsed)
             })
         })
@@ -243,7 +245,132 @@ fn pulse_signed_cases(root: &Path) -> Vec<Case<'static>> {
 }
 
 #[cfg(not(unix))]
-fn pulse_signed_cases(_root: &Path) -> Vec<Case<'static>> {
+fn pulse_signed_cases(_root: &Path, _only: Option<&str>) -> Vec<Case<'static>> {
+    Vec::new()
+}
+
+/// Whether the row `name` is selected by `GITPULSE_BENCH_ONLY` (all of them
+/// when it is unset).
+fn wanted(only: Option<&str>, name: &str) -> bool {
+    only.is_none_or(|only| only == name)
+}
+
+/// This process's peak resident set so far, in MiB. A high-water mark for the
+/// whole process, so it says something about one row only when that row is the
+/// only work the process did: run it with `GITPULSE_BENCH_ONLY=<row>`.
+#[cfg(unix)]
+fn peak_rss_mb() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` is a valid, writable rusage and RUSAGE_SELF needs no
+    // other argument; it is read only after getrusage reports success.
+    let peak = unsafe {
+        if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+            return 0.0;
+        }
+        usage.assume_init().ru_maxrss as f64
+    };
+    // macOS reports bytes, Linux kilobytes.
+    let bytes = if cfg!(target_os = "macos") {
+        peak
+    } else {
+        peak * 1024.0
+    };
+    bytes / (1024.0 * 1024.0)
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> f64 {
+    0.0
+}
+
+/// A chain of `commits` unsigned empty-tree commits, written by one
+/// `git fast-import`, so a 25,000-commit history costs seconds to build.
+#[cfg(unix)]
+fn unsigned_chain(root: &Path, commits: usize) -> String {
+    use common::fixture::{git, trust_repo};
+    use gitpulse_lib::procguard::LockedSpawn;
+    use std::io::Write;
+    let dir = root.join(format!("unsigned-{commits}"));
+    std::fs::create_dir_all(&dir).expect("create chain dir");
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let mut stream = String::new();
+    for n in 0..commits {
+        let message = format!("feat: change {n}");
+        stream.push_str(&format!(
+            "commit refs/heads/main\nmark :{}\ncommitter Bench <bench@example.com> {} +0000\ndata {}\n{message}\n",
+            n + 1,
+            1_700_000_000 + n,
+            message.len()
+        ));
+        if n > 0 {
+            stream.push_str(&format!("from :{n}\n"));
+        }
+        stream.push('\n');
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn git fast-import");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stream.as_bytes())
+        .expect("write the import stream");
+    let out = child.wait_with_output().expect("wait for fast-import");
+    assert!(
+        out.status.success(),
+        "fast-import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    trust_repo(&dir);
+    let counted = git(&dir, &["rev-list", "--count", "HEAD"]);
+    assert_eq!(counted.trim(), commits.to_string(), "the chain is whole");
+    dir.to_str().expect("utf-8").to_string()
+}
+
+/// The `pulse unsigned 500|5000|25000` rows: the pulse walk over histories
+/// with no signed commit at all, which is what almost every repository is and
+/// where any per-commit cost of reading signatures shows up undiluted. Empty
+/// off unix.
+#[cfg(unix)]
+fn pulse_unsigned_cases(root: &Path, only: Option<&str>) -> Vec<Case<'static>> {
+    [500usize, 5_000, 25_000]
+        .into_iter()
+        .filter(|commits| wanted(only, &format!("pulse unsigned {commits}")))
+        .map(|commits| {
+            let path = unsigned_chain(root, commits);
+            let walk = move || {
+                GitReader::pulse_report(&path, Some(commits))
+                    .unwrap_or_else(|error| panic!("pulse report failed: {error}"))
+            };
+            let (report, git_processes) = count_git_processes(&walk);
+            assert_eq!(
+                report.commits.len(),
+                commits,
+                "the pulse walk did not read the whole chain, so this run would time a partial walk"
+            );
+            Case::new(format!("pulse unsigned {commits}"), move || {
+                let started = std::time::Instant::now();
+                let report = walk();
+                let elapsed = started.elapsed();
+                std::hint::black_box(&report);
+                Sample::default()
+                    .counter("commits", report.commits.len() as u64)
+                    .counter("git_processes", git_processes)
+                    .metric("peak_rss_mb", peak_rss_mb())
+                    .elapsed(elapsed)
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn pulse_unsigned_cases(_root: &Path, _only: Option<&str>) -> Vec<Case<'static>> {
     Vec::new()
 }
 
@@ -257,6 +384,25 @@ fn main() {
     gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("command_timings");
     let temp = tempfile::tempdir().expect("temp dir");
+
+    // `GITPULSE_BENCH_ONLY=<row>` runs one pulse row in a process that did
+    // nothing else, which is what makes its `peak_rss_mb` the row's own.
+    if let Ok(name) = std::env::var("GITPULSE_BENCH_ONLY") {
+        let root = temp.path().join("pulse");
+        let mut cases = pulse_unsigned_cases(&root, Some(&name));
+        cases.extend(pulse_signed_cases(&root, Some(&name)));
+        assert!(
+            !cases.is_empty(),
+            "GITPULSE_BENCH_ONLY={name} names no pulse row"
+        );
+        report.note(format!(
+            "only `{name}`: its peak_rss_mb is this process's whole high-water mark"
+        ));
+        let rows = interleave(cases, report.opts.samples(5), report.opts.warmup(1));
+        report.extend(rows);
+        report.finish();
+        return;
+    }
     let repo = build_repo(&temp.path().join("fixture"), &SPEC);
     let path = repo.path().to_string();
     let commit = head(&repo);
@@ -406,7 +552,8 @@ fn main() {
     // The pulse walk over histories that differ only in how many commits are
     // signed. The fixtures are built here, outside every timed span.
     let signed_root = temp.path().join("pulse-signed");
-    let signed_cases = pulse_signed_cases(&signed_root);
+    let signed_cases = pulse_signed_cases(&signed_root, None);
+    let unsigned_cases = pulse_unsigned_cases(&signed_root, None);
     if !signed_cases.is_empty() {
         report.note(format!(
             "pulse signed: {PULSE_COMMITS}-commit chains of hand-written commits carrying 0, 50 and \
@@ -416,6 +563,18 @@ fn main() {
         ));
         rows.extend(interleave(
             signed_cases,
+            report.opts.samples(5),
+            report.opts.warmup(1),
+        ));
+    }
+    if !unsigned_cases.is_empty() {
+        report.note(
+            "pulse unsigned: 500, 5,000 and 25,000 unsigned commits (one fast-import each); \
+             the walk's own cost with nothing to verify, which is where reading signatures \
+             costs the most if it costs anything per commit",
+        );
+        rows.extend(interleave(
+            unsigned_cases,
             report.opts.samples(5),
             report.opts.warmup(1),
         ));

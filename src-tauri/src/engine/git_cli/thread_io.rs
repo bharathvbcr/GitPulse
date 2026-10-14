@@ -171,7 +171,7 @@ impl OutputDrains {
     }
 
     pub(super) fn observe(&self, observer: &mut dyn ProcessObserver, cursors: &mut [usize; 2]) {
-        let stdout = self
+        let mut stdout = self
             .stdout
             .state
             .lock()
@@ -182,6 +182,10 @@ impl OutputDrains {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::observe_output(observer, cursors, &stdout.bytes, &stderr.bytes);
+        if observer.drains_stdout() {
+            stdout.discard_observed();
+            cursors[0] = 0;
+        }
     }
 
     pub(super) fn finish(self, deadline: Instant) -> (Drained, Drained) {

@@ -454,6 +454,13 @@ export function computeLocTrend(
 }
 
 /**
+ * The signature kinds that mean a commit carries a signature. Anything else
+ * that is not `none` (a missing field, a kind a newer backend invented) is not
+ * known to be signed, and is not known to be unsigned: it counts as unread.
+ */
+const SIGNED_KINDS: ReadonlySet<string> = new Set(["pgp", "ssh", "x509", "other"]);
+
+/**
  * Share of commits that carry a signature, over the commits whose signature
  * state is known. A commit the backend could not read ("unknown") is neither
  * signed nor unsigned, so it stays out of the denominator rather than diluting
@@ -498,7 +505,8 @@ export function computeHygiene(commits: readonly PulseCommitSummary[]): HygieneS
   for (const c of commits) {
     if (isConventionalCommit(c.summary)) conventionalCount++;
     if (c.signature === "unknown") signatureUnknownCount++;
-    else if (c.signature !== "none") signedCount++;
+    else if (SIGNED_KINDS.has(c.signature)) signedCount++;
+    else if (c.signature !== "none") signatureUnknownCount++;
     if (c.is_merge) mergeCount++;
     if (c.is_revert) revertCount++;
     if (c.co_authors.length > 0) coAuthorCount++;

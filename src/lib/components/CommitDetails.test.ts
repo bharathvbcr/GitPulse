@@ -23,7 +23,7 @@ describe("CommitDetails", () => {
   });
 
   it("labels the signature from the one-commit verification, not from the details", () => {
-    expect(source).toContain("signatureLabel(details?.signature_check)");
+    expect(source).toContain("signatureLabel(details?.signature_check, details != null && details.signature_check === undefined)");
     expect(source).not.toContain("gpg_status");
     expect(source).not.toContain('"Unsigned"');
   });

@@ -2,9 +2,11 @@
 //!
 //! Two different questions with two different costs, kept apart on purpose.
 //!
-//! *Carries one* is a fact about the commit object: a `gpgsig` header. It is
-//! read for a whole walk at once, from the objects themselves, and never runs a
-//! signing program ([`commit_signatures`]).
+//! *Carries one* is a fact about the commit object: a signature header. A
+//! history walk reads it for every commit at once, from the objects themselves,
+//! beside the log that produces the rows ([`walk_signatures`]), and never runs a
+//! signing program; the one-commit verify reads it for the commit it is about to
+//! check ([`commit_signatures`]).
 //!
 //! *Verifies* runs the user's signing program (`gpg`, `ssh-keygen`, `gpgsm`),
 //! which may start an agent, wait on a keyserver or a pinentry, and measured
@@ -16,15 +18,15 @@
 //! appears.
 
 use crate::engine::git_cli::{
-    git_captured, git_captured_capped, git_text_with_timeout, read_objects_batch, validate_repo,
-    BatchObject,
+    git_captured, git_observed, git_text_with_timeout, read_objects_batch, validate_repo,
+    BatchObject, OutputStream, ProcessObserver, DEFAULT_TIMEOUT,
 };
 use crate::engine::git_writer::validate_oid;
 use crate::engine::ref_cache::{user_config_paths, FileIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How a commit is signed, by the armor of the signature it carries. Says
@@ -105,35 +107,66 @@ pub struct CommitSignatureCheck {
     pub signer: String,
 }
 
+/// The hash a repository names its objects with, which decides which header
+/// carries a commit's signature: git reads `gpgsig` in a SHA-1 repository and
+/// `gpgsig-sha256` in a SHA-256 one, and treats the other as an ordinary
+/// unknown header. Read from an object id's length, so no process is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl ObjectFormat {
+    /// The format an object id of this shape belongs to; `None` for anything
+    /// that is not 40 or 64 hex digits.
+    pub(crate) fn of_oid(oid: &str) -> Option<Self> {
+        let hex = oid.bytes().all(|b| b.is_ascii_hexdigit());
+        match (oid.len(), hex) {
+            (40, true) => Some(Self::Sha1),
+            (64, true) => Some(Self::Sha256),
+            _ => None,
+        }
+    }
+
+    /// The header line prefix that holds a signature in this format.
+    fn signature_header(self) -> &'static [u8] {
+        match self {
+            Self::Sha1 => b"gpgsig ",
+            Self::Sha256 => b"gpgsig-sha256 ",
+        }
+    }
+}
+
 /// The longest run of commit-header bytes the classifier reads. A real header
 /// is a few hundred bytes (an octopus merge a few KiB); anything past this is
 /// not scanned further, and a commit whose header is still going at the limit
 /// is `Unknown` rather than guessed `None`.
 const MAX_HEADER_BYTES: usize = 256 * 1024;
 
-/// Byte budget for one batch of commit reads. A signature walk asks for up to
-/// [`crate::engine::budget`]'s pulse commit count, and a commit is mostly its
-/// message; past this the unread commits are `Unknown`.
-const BATCH_BUDGET: usize = 32 * 1024 * 1024;
+/// Byte budget for one read of commit objects, whether per id or for a walk. A
+/// commit is mostly its message; past this the unread commits are `Unknown`.
+const READ_BUDGET: usize = 32 * 1024 * 1024;
 
 const COMMIT: BatchObject = BatchObject {
     kind: "commit",
     noun: "commit",
 };
 
-/// Classifies one commit object (the bytes `cat-file` prints for it) by its
-/// signature header, without running anything.
+/// Classifies one commit object (the bytes git prints for it) by its signature
+/// header, without running anything.
 ///
-/// Only a `gpgsig` or `gpgsig-sha256` header at column 0, before the blank line
-/// that ends the headers, counts. A `mergetag` header (the signature of a
-/// *tag* that was merged) does not, and neither does a message body that
-/// happens to start a line with `gpgsig `: continuation lines of a header begin
-/// with a space, and the body begins after the blank line. The input is
-/// untrusted object content: it is scanned once, never past
-/// [`MAX_HEADER_BYTES`], with no allocation proportional to it, and no input
-/// panics.
-pub(crate) fn classify_header(object: &[u8]) -> CommitSignature {
+/// Only the signature header of the repository's `format`, at column 0, before
+/// the blank line that ends the headers, counts: the same line git's own parser
+/// reads. A `mergetag` header (the signature of a *tag* that was merged) does
+/// not, and neither does a message body that happens to start a line with
+/// `gpgsig `: continuation lines of a header begin with a space, and the body
+/// begins after the blank line. The input is untrusted object content: it is
+/// scanned once, never past [`MAX_HEADER_BYTES`], with no allocation
+/// proportional to it, and no input panics.
+pub(crate) fn classify_header(object: &[u8], format: ObjectFormat) -> CommitSignature {
     let scanned = &object[..object.len().min(MAX_HEADER_BYTES)];
+    let header = format.signature_header();
     let mut rest = scanned;
     while !rest.is_empty() {
         let (line, tail) = match rest.iter().position(|&b| b == b'\n') {
@@ -143,10 +176,8 @@ pub(crate) fn classify_header(object: &[u8]) -> CommitSignature {
         if line.is_empty() {
             return CommitSignature::None;
         }
-        for header in [&b"gpgsig "[..], &b"gpgsig-sha256 "[..]] {
-            if let Some(armor) = line.strip_prefix(header) {
-                return classify_armor(armor);
-            }
+        if let Some(armor) = line.strip_prefix(header) {
+            return classify_armor(armor);
         }
         rest = tail;
     }
@@ -173,62 +204,132 @@ fn classify_armor(first_line: &[u8]) -> CommitSignature {
 }
 
 /// How each of `oids` is signed, in one `git cat-file --batch` and no verifier.
+/// For the one-commit verify; a walk uses [`walk_signatures`]. All of `oids`
+/// belong to one repository, so the first well-formed id names its format.
 ///
 /// Every id gets an answer. One whose object could not be read, or that came
 /// after the batch was cut short, is [`CommitSignature::Unknown`]: a check that
 /// could not run never reports the same as one that ran and found nothing.
 pub(crate) fn commit_signatures(repo: &Path, oids: &[String]) -> HashMap<String, CommitSignature> {
+    let format = oids
+        .iter()
+        .find_map(|oid| ObjectFormat::of_oid(oid))
+        .unwrap_or(ObjectFormat::Sha1);
     settle(read_objects_batch(
         repo,
         oids,
         COMMIT,
-        BATCH_BUDGET,
-        &classify_header,
+        READ_BUDGET,
+        &|object| classify_header(object, format),
     ))
 }
 
 /// How every commit a history walk visits is signed, from one header-only
 /// `git rev-list --header` run with the walk's own arguments, and no verifier.
 ///
-/// Unlike [`commit_signatures`] it needs no list of ids, so a caller can run it
-/// beside the walk that produces them instead of after it. A commit the stream
-/// does not hold (the refs moved between the two reads, the output was cut at
-/// the budget, git failed) is absent from the map; the caller reads absence as
-/// [`CommitSignature::Unknown`].
+/// It needs no list of ids, so a caller runs it beside the walk that produces
+/// the rows instead of after it, and the stream is parsed as it arrives: only
+/// an id and a signature kind are kept per commit, however long the messages
+/// are. A commit the stream does not hold (the refs moved between the two
+/// reads, the output was cut at the budget, git failed or timed out) is absent
+/// from the map, and the caller reads absence as [`CommitSignature::Unknown`];
+/// a commit the stream names twice is `Unknown` too, since one of the two
+/// records was not git's.
 pub(crate) fn walk_signatures(repo: &Path, args: &[&str]) -> HashMap<String, CommitSignature> {
-    let Ok(run) = git_captured_capped(repo, args, BATCH_BUDGET) else {
-        return HashMap::new();
+    let mut stream = HeaderStream::default();
+    let run = {
+        let mut observer = HeaderObserver(&mut stream);
+        git_observed(repo, args, DEFAULT_TIMEOUT, READ_BUDGET, &mut observer)
     };
-    if !run.success && run.incomplete.is_none() {
-        return HashMap::new();
+    match run {
+        Ok(run) if run.success || run.incomplete.is_some() => {
+            stream.finish(run.incomplete.is_some())
+        }
+        _ => HashMap::new(),
     }
-    read_header_stream(&run.stdout, run.incomplete.is_some())
 }
 
-/// Splits `rev-list --header` output (`oid LF object-text NUL`, repeated) into
-/// signatures by oid. `cut` says the stream is a prefix, so its last record may
-/// be partial and is not trusted. A record whose first line is not an object
-/// id is skipped, never attributed to anyone.
-fn read_header_stream(out: &[u8], cut: bool) -> HashMap<String, CommitSignature> {
-    let mut records: Vec<&[u8]> = out.split(|&b| b == 0).collect();
-    if cut {
-        records.pop();
+/// Feeds a [`HeaderStream`] from a git child's stdout and tells the run not to
+/// buffer it.
+struct HeaderObserver<'a>(&'a mut HeaderStream);
+
+impl ProcessObserver for HeaderObserver<'_> {
+    fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+        if matches!(stream, OutputStream::Stdout) {
+            self.0.feed(bytes);
+        }
     }
-    let mut found = HashMap::new();
-    for record in records {
+
+    fn drains_stdout(&self) -> bool {
+        true
+    }
+}
+
+/// Bytes of one record kept: its id line and the longest header run the
+/// classifier reads, plus one so an over-long header is recognised as such.
+const KEPT_RECORD_BYTES: usize = 65 + MAX_HEADER_BYTES + 1;
+
+/// Incremental reader of `rev-list --header` output (`oid LF object-text NUL`,
+/// repeated). Memory is the answers plus one bounded record, not the stream.
+#[derive(Default)]
+struct HeaderStream {
+    found: HashMap<String, CommitSignature>,
+    /// The head of the record being read, at most [`KEPT_RECORD_BYTES`].
+    record: Vec<u8>,
+    /// Whether any byte of the record being read has arrived.
+    started: bool,
+}
+
+impl HeaderStream {
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let end = bytes.iter().position(|&b| b == 0);
+            let chunk = &bytes[..end.unwrap_or(bytes.len())];
+            if !chunk.is_empty() {
+                self.started = true;
+                let room = KEPT_RECORD_BYTES.saturating_sub(self.record.len());
+                self.record
+                    .extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            match end {
+                Some(at) => {
+                    self.complete_record();
+                    bytes = &bytes[at + 1..];
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// A record whose first line is not an object id is skipped, never
+    /// attributed to anyone.
+    fn complete_record(&mut self) {
+        let record = std::mem::take(&mut self.record);
+        self.started = false;
         let Some(newline) = record.iter().position(|&b| b == b'\n') else {
-            continue;
+            return;
         };
-        let oid = &record[..newline];
-        let shaped = matches!(oid.len(), 40 | 64) && oid.iter().all(u8::is_ascii_hexdigit);
-        if !shaped {
-            continue;
-        }
-        if let Ok(oid) = std::str::from_utf8(oid) {
-            found.insert(oid.to_string(), classify_header(&record[newline + 1..]));
-        }
+        let Ok(oid) = std::str::from_utf8(&record[..newline]) else {
+            return;
+        };
+        let Some(format) = ObjectFormat::of_oid(oid) else {
+            return;
+        };
+        let signature = classify_header(&record[newline + 1..], format);
+        self.found
+            .entry(oid.to_ascii_lowercase())
+            .and_modify(|seen| *seen = CommitSignature::Unknown)
+            .or_insert(signature);
     }
-    found
+
+    /// The answers read. `cut` says the stream is a prefix, so a record still
+    /// being read is not trusted; at a clean end it is read as it stands.
+    fn finish(mut self, cut: bool) -> HashMap<String, CommitSignature> {
+        if self.started && !cut {
+            self.complete_record();
+        }
+        self.found
+    }
 }
 
 /// A commit that could not be read is `Unknown`, whatever the reason: the one
@@ -246,7 +347,9 @@ fn settle(
 /// config that names the signing program and trust level, the user's git
 /// config, and the keyring the program reads. An identity per file, so a
 /// changed key ring, allowed-signers list or config shows as a changed
-/// fingerprint without spawning anything.
+/// fingerprint without spawning anything. Files the config pulls in with
+/// `include.path` are not knowable without asking git; those are learned on the
+/// first verify (see [`learn_signing_files`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SigningFingerprint {
     files: Vec<(PathBuf, Option<FileIdentity>)>,
@@ -289,50 +392,59 @@ pub(crate) fn signing_fingerprint(repo: &Path) -> Option<SigningFingerprint> {
     })
 }
 
-/// The identities of files a verify read that no fixed list names: the SSH
-/// allowed-signers and revocation files, wherever the config points.
+/// The identities of files a verify read that no fixed list names: every file
+/// the effective config was read from (including `include.path` and matching
+/// `includeIf` targets), and the SSH allowed-signers and revocation files,
+/// wherever the config points.
 type LearnedFiles = Vec<(PathBuf, Option<FileIdentity>)>;
 
-/// Asks git where the SSH trust files are, and stamps them. `None` when the
-/// config could not be read, so the answer is not cached against a guess.
-fn learn_trust_files(repo: &Path) -> Option<LearnedFiles> {
+/// Asks git which files its effective config came from and where the SSH trust
+/// files are, and stamps them all. `None` when the config could not be read, so
+/// the answer is not cached against a guess.
+///
+/// A file an `includeIf` condition rejected is not listed, and is not stamped:
+/// it matters only if it starts to match, which the 60 s TTL bounds.
+fn learn_signing_files(repo: &Path) -> Option<LearnedFiles> {
     let run = git_captured(
         repo,
-        &[
-            "config",
-            "-z",
-            "--includes",
-            "--get-regexp",
-            r"^gpg\.ssh\.(allowedsignersfile|revocationfile)$",
-        ],
+        &["config", "-z", "--includes", "--list", "--show-origin"],
     )
     .ok()?;
-    // Exit 1 is git's "no such key", which is an answer: nothing to stamp.
-    if run.incomplete.is_some() || !(run.success || run.status_code == 1) {
+    if run.incomplete.is_some() || !run.success {
         return None;
     }
     let text = String::from_utf8_lossy(&run.stdout);
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let mut learned: LearnedFiles = Vec::new();
-    for record in text.split('\0').filter(|record| !record.is_empty()) {
-        let Some((_, value)) = record.split_once('\n') else {
+    let mut fields = text.split('\0');
+    // `file:<path> NUL key LF value NUL`, repeated.
+    while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        if let Some(origin_path) = origin.strip_prefix("file:") {
+            learned.push((repo.join(origin_path), None));
+        }
+        let Some((key, value)) = entry.split_once('\n') else {
             continue;
         };
-        let path = match (value.strip_prefix("~/"), &home) {
-            (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-            _ => repo.join(value),
-        };
-        let identity = FileIdentity::at(&path);
-        learned.push((path, identity));
+        if matches!(key, "gpg.ssh.allowedsignersfile" | "gpg.ssh.revocationfile") {
+            let path = match (value.strip_prefix("~/"), &home) {
+                (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+                _ => repo.join(value),
+            };
+            learned.push((path, None));
+        }
     }
     learned.sort_by(|a, b| a.0.cmp(&b.0));
     learned.dedup_by(|a, b| a.0 == b.0);
+    for (path, identity) in &mut learned {
+        *identity = FileIdentity::at(path);
+    }
     Some(learned)
 }
 
 /// How long a verification is served again. A verdict depends on files this
-/// cache stamps, and on inputs it cannot see (a key server, an `include`d
-/// config, the clock a signature expires by), so it is bounded in time too.
+/// cache stamps, and on inputs it cannot see (a key server, a file rewritten in
+/// place to the same length with its modification time put back, the clock a
+/// signature expires by), so it is bounded in time too.
 const VERIFY_TTL: Duration = Duration::from_secs(60);
 
 /// Verdicts kept at once, across every repository.
@@ -342,6 +454,15 @@ const VERIFY_CAPACITY: usize = 256;
 /// short of the ninety seconds a hung pinentry would otherwise hold a worker.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a select waits for another select's verification of the same
+/// commit before giving up: the verification's own limit and a margin for the
+/// reads around it.
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Verifications that may be in flight and coalesced at once. A request past
+/// this runs on its own, uncoalesced, instead of queueing behind them.
+const MAX_FLIGHTS: usize = 64;
+
 struct Verdict {
     check: CommitSignatureCheck,
     fingerprint: SigningFingerprint,
@@ -349,11 +470,21 @@ struct Verdict {
     stored_at: Instant,
 }
 
+/// One verification in progress, which other selects of the same commit wait
+/// on rather than starting a second signing program.
+#[derive(Default)]
+struct Flight {
+    outcome: Mutex<Option<Result<CommitSignatureCheck, String>>>,
+    done: Condvar,
+}
+
 /// Recent verifications, keyed by repository and full commit id and valid
-/// while the signing state it was computed under is unchanged. The clock is a
-/// parameter of every call so expiry is testable without sleeping.
+/// while the signing state it was computed under is unchanged, and the
+/// verifications in flight. The clock is a parameter of every call so expiry is
+/// testable without sleeping.
 pub(crate) struct VerifyCache {
     verdicts: HashMap<(PathBuf, String), Verdict>,
+    flights: HashMap<(PathBuf, String), Arc<Flight>>,
     ttl: Duration,
     capacity: usize,
 }
@@ -362,13 +493,14 @@ impl VerifyCache {
     pub(crate) fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
             verdicts: HashMap::new(),
+            flights: HashMap::new(),
             ttl,
             capacity: capacity.max(1),
         }
     }
 
     /// The kept verdict for `oid`, if it is younger than the TTL and neither
-    /// the fingerprint nor any learned trust file has changed since.
+    /// the fingerprint nor any learned file has changed since.
     pub(crate) fn get(
         &mut self,
         repo: &Path,
@@ -440,8 +572,8 @@ fn shared_cache() -> &'static Mutex<VerifyCache> {
 }
 
 /// Verifies the signature of the one commit `commit_id`, which must be a full
-/// object id. Runs the signing program at most once per cache lifetime; an
-/// unsigned commit runs none.
+/// object id. Runs the signing program at most once per cache lifetime, however
+/// many selects ask at once; an unsigned commit runs none.
 pub fn verify_commit_signature(
     repo_path: &str,
     commit_id: &str,
@@ -453,7 +585,8 @@ pub fn verify_commit_signature(
 ///
 /// A failure to run (timeout, a git that would not start, output that is not a
 /// `%G?` answer) is an `Err` and is never cached: the next select tries again
-/// instead of being served a verdict nobody reached.
+/// instead of being served a verdict nobody reached. Selects of one commit that
+/// overlap share one verification, success or failure.
 pub(crate) fn verify_commit_signature_with(
     cache: &Mutex<VerifyCache>,
     now: Instant,
@@ -465,6 +598,10 @@ pub(crate) fn verify_commit_signature_with(
     if !matches!(commit_id.len(), 40 | 64) {
         return Err("Signature verification needs a full commit id".into());
     }
+    // Git names an object by its lowercase hex; every key and every comparison
+    // below uses that one spelling.
+    let commit_id = commit_id.to_ascii_lowercase();
+    let commit_id = commit_id.as_str();
     let fingerprint = signing_fingerprint(&repo);
     if let Some(fingerprint) = &fingerprint {
         if let Some(kept) = cache.lock().unwrap_or_else(PoisonError::into_inner).get(
@@ -477,8 +614,103 @@ pub(crate) fn verify_commit_signature_with(
         }
     }
 
+    let key = (repo.clone(), commit_id.to_string());
+    let turn = {
+        let mut state = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.flights.get(&key) {
+            Some(flight) => Turn::Follow(flight.clone()),
+            None if state.flights.len() < MAX_FLIGHTS => {
+                let flight = Arc::new(Flight::default());
+                state.flights.insert(key.clone(), flight.clone());
+                Turn::Lead(flight)
+            }
+            None => Turn::Alone,
+        }
+    };
+    match turn {
+        Turn::Follow(flight) => follow(&flight),
+        Turn::Alone => verify_uncached(cache, now, &repo, commit_id, fingerprint),
+        Turn::Lead(flight) => {
+            let mut lead = Lead {
+                cache,
+                key,
+                flight,
+                settled: false,
+            };
+            let result = verify_uncached(cache, now, &repo, commit_id, fingerprint);
+            lead.settle(result.clone());
+            result
+        }
+    }
+}
+
+enum Turn {
+    Lead(Arc<Flight>),
+    Follow(Arc<Flight>),
+    Alone,
+}
+
+/// Waits for the leader of a flight and takes its answer.
+fn follow(flight: &Flight) -> Result<CommitSignatureCheck, String> {
+    let guard = flight
+        .outcome
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let (guard, _) = flight
+        .done
+        .wait_timeout_while(guard, FOLLOW_TIMEOUT, |outcome| outcome.is_none())
+        .unwrap_or_else(PoisonError::into_inner);
+    guard.clone().unwrap_or_else(|| {
+        Err("Timed out waiting for a signature verification already running for this commit".into())
+    })
+}
+
+/// The leader of a flight. Settling it removes the flight and wakes the
+/// followers with the answer; dropping it unsettled (a panic in the
+/// verification) wakes them with an error instead of leaving them to time out.
+struct Lead<'a> {
+    cache: &'a Mutex<VerifyCache>,
+    key: (PathBuf, String),
+    flight: Arc<Flight>,
+    settled: bool,
+}
+
+impl Lead<'_> {
+    fn settle(&mut self, result: Result<CommitSignatureCheck, String>) {
+        self.settled = true;
+        self.cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .flights
+            .remove(&self.key);
+        *self
+            .flight
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(result);
+        self.flight.done.notify_all();
+    }
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(Err("Signature verification was interrupted".into()));
+        }
+    }
+}
+
+/// Reads the commit's signature kind, runs the signing program if there is a
+/// signature to check, and keeps the answer. One call, one verification.
+fn verify_uncached(
+    cache: &Mutex<VerifyCache>,
+    now: Instant,
+    repo: &Path,
+    commit_id: &str,
+    fingerprint: Option<SigningFingerprint>,
+) -> Result<CommitSignatureCheck, String> {
     let oids = [commit_id.to_string()];
-    let signature = commit_signatures(&repo, &oids)
+    let signature = commit_signatures(repo, &oids)
         .remove(commit_id)
         .unwrap_or(CommitSignature::Unknown);
     // Stamped before the verifier runs, so a trust file edited while it runs
@@ -487,7 +719,7 @@ pub(crate) fn verify_commit_signature_with(
     let learned = if signature == CommitSignature::None {
         Some(Vec::new())
     } else {
-        learn_trust_files(&repo)
+        learn_signing_files(repo)
     };
     let check = if signature == CommitSignature::None {
         CommitSignatureCheck {
@@ -497,11 +729,11 @@ pub(crate) fn verify_commit_signature_with(
             signer: String::new(),
         }
     } else {
-        run_verifier(&repo, commit_id, signature)?
+        run_verifier(repo, commit_id, signature)?
     };
     if let (Some(fingerprint), Some(learned)) = (fingerprint, learned) {
         cache.lock().unwrap_or_else(PoisonError::into_inner).put(
-            &repo,
+            repo,
             commit_id,
             fingerprint,
             learned,
@@ -555,6 +787,20 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
 
+    /// [`super::classify_header`] for the SHA-1 repository nearly every fixture
+    /// here is; a test about the other format says so with `ObjectFormat`.
+    fn classify_header(object: &[u8]) -> CommitSignature {
+        super::classify_header(object, ObjectFormat::Sha1)
+    }
+
+    /// A whole `rev-list --header` stream read at once, as [`walk_signatures`]
+    /// reads it a chunk at a time.
+    fn read_header_stream(out: &[u8], cut: bool) -> HashMap<String, CommitSignature> {
+        let mut stream = HeaderStream::default();
+        stream.feed(out);
+        stream.finish(cut)
+    }
+
     fn header(extra: &str) -> Vec<u8> {
         format!(
             "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n{extra}\nbody\n"
@@ -574,12 +820,34 @@ mod tests {
         assert_eq!(signed("SIGNED MESSAGE"), CommitSignature::X509);
         assert_eq!(signed("SOMETHING ELSE"), CommitSignature::Other);
         assert_eq!(
+            super::classify_header(
+                &header(&crate::test_support::fake_signature_header(
+                    "gpgsig-sha256",
+                    "PGP SIGNATURE"
+                )),
+                ObjectFormat::Sha256
+            ),
+            CommitSignature::Pgp,
+            "a SHA-256 repository reads gpgsig-sha256"
+        );
+        assert_eq!(
             classify_header(&header(&crate::test_support::fake_signature_header(
                 "gpgsig-sha256",
                 "PGP SIGNATURE"
             ))),
-            CommitSignature::Pgp,
-            "a SHA-256 repository's header counts"
+            CommitSignature::None,
+            "a SHA-1 repository does not: git treats it as an unknown header"
+        );
+        assert_eq!(
+            super::classify_header(
+                &header(&crate::test_support::fake_signature_header(
+                    "gpgsig",
+                    "PGP SIGNATURE"
+                )),
+                ObjectFormat::Sha256
+            ),
+            CommitSignature::None,
+            "and a SHA-256 repository does not read gpgsig"
         );
         assert_eq!(classify_header(&header("")), CommitSignature::None);
     }
@@ -639,10 +907,7 @@ mod tests {
                 if line.is_empty() {
                     return CommitSignature::None;
                 }
-                if let Some(armor) = line
-                    .strip_prefix(b"gpgsig ")
-                    .or_else(|| line.strip_prefix(b"gpgsig-sha256 "))
-                {
+                if let Some(armor) = line.strip_prefix(b"gpgsig ") {
                     return classify_armor(armor);
                 }
             }
@@ -1562,9 +1827,21 @@ mod tests {
         std::fs::write(&signers, "bbbb ssh-ed25519 BBBB\n").unwrap();
         file.set_modified(stamped).unwrap();
         verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        // ACCEPTED LIMIT, not a goal. A stat fingerprint (inode, length,
+        // modification time) cannot see a file rewritten in place to the same
+        // length with its modification time put back; hashing every trust file
+        // on every select would buy that at the cost of reading a keyring per
+        // click. The verdict is served stale for at most the TTL, and the
+        // next verification after it reads the file as it is.
+        assert_eq!(
+            verifier_spawns(&stub),
+            first,
+            "the documented limit: an invisible in-place rewrite is a cache hit"
+        );
+        verify_commit_signature_with(&cache, now + VERIFY_TTL, path, &oid).unwrap();
         assert!(
             verifier_spawns(&stub) > first,
-            "edited trust file was served from the cache"
+            "the TTL bounds the staleness: past it the file is read again"
         );
     }
 
@@ -1856,5 +2133,174 @@ mod tests {
             &["rev-list", "-n10", "--header", "refs/heads/does-not-exist"],
         );
         assert!(got.is_empty());
+    }
+
+    /// The stream is parsed as it arrives, so how it is cut into chunks cannot
+    /// change what it says, down to one byte at a time.
+    #[test]
+    fn a_stream_cut_into_any_chunks_reads_the_same_as_whole() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let signed = "tree x\ngpgsig -----BEGIN SSH SIGNATURE-----\n x\n\n    m\n";
+        let whole = format!("{a}\n{signed}\0{b}\ntree x\n\n    m\n\0");
+        let expected = read_header_stream(whole.as_bytes(), false);
+        for size in [1, 2, 3, 7, 41, 64] {
+            let mut stream = HeaderStream::default();
+            for chunk in whole.as_bytes().chunks(size) {
+                stream.feed(chunk);
+            }
+            assert_eq!(stream.finish(false), expected, "chunks of {size}");
+        }
+    }
+
+    /// A message of any length keeps its head only: the record buffer never
+    /// grows past its bound, and the classification is unchanged.
+    #[test]
+    fn a_giant_message_is_streamed_without_being_kept() {
+        let oid = "c".repeat(40);
+        let mut stream = HeaderStream::default();
+        stream.feed(
+            format!("{oid}\ntree x\ngpgsig -----BEGIN PGP SIGNATURE-----\n x\n\n").as_bytes(),
+        );
+        let filler = vec![b'm'; 1024 * 1024];
+        for _ in 0..16 {
+            stream.feed(&filler);
+            assert!(
+                stream.record.len() <= KEPT_RECORD_BYTES,
+                "kept {} bytes of a record",
+                stream.record.len()
+            );
+        }
+        stream.feed(b"\0");
+        assert_eq!(stream.finish(false)[&oid], CommitSignature::Pgp);
+    }
+
+    /// A header that outruns what is kept is `Unknown`, as in the whole-object
+    /// classifier, whichever way it arrives.
+    #[test]
+    fn an_endless_header_in_the_stream_is_unknown_not_unsigned() {
+        let oid = "d".repeat(40);
+        let mut stream = HeaderStream::default();
+        stream.feed(format!("{oid}\n").as_bytes());
+        let filler = vec![b'x'; 1024 * 1024];
+        for _ in 0..2 {
+            stream.feed(&filler);
+        }
+        stream.feed(b"\0");
+        assert_eq!(stream.finish(false)[&oid], CommitSignature::Unknown);
+    }
+
+    /// A commit the stream names twice has one record that is not git's, and
+    /// says nothing either way.
+    #[test]
+    fn a_commit_named_twice_is_unknown() {
+        let a = "a".repeat(40);
+        let stream =
+            format!("{a}\ntree x\n\n\0{a}\ntree x\ngpgsig -----BEGIN PGP SIGNATURE-----\n\n\0");
+        assert_eq!(
+            read_header_stream(stream.as_bytes(), false)[&a],
+            CommitSignature::Unknown
+        );
+    }
+
+    /// In a SHA-256 repository git reads `gpgsig-sha256` and not `gpgsig`, and
+    /// the classifier does the same: it says signed exactly when a
+    /// verification starts a verifier.
+    #[cfg(unix)]
+    #[test]
+    fn a_sha256_repository_reads_gpgsig_sha256_and_agrees_with_git() {
+        use crate::test_support::{counting_verifier, git_in, use_verifier, verifier_spawns};
+        for (header, signed) in [("gpgsig-sha256", true), ("gpgsig", false)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            git_in(
+                dir.path(),
+                &["init", "-b", "main", "--object-format=sha256"],
+            );
+            let oid = crate::test_support::raw_commit(
+                dir.path(),
+                &[],
+                &crate::test_support::fake_signature_header(header, "PGP SIGNATURE"),
+                "c",
+                1_700_000_000,
+            );
+            assert_eq!(oid.len(), 64);
+            git_in(dir.path(), &["update-ref", "refs/heads/main", &oid]);
+            let (stub, script) = counting_verifier("exit 2");
+            use_verifier(dir.path(), &script);
+            let check = verify_commit_signature_with(
+                &fresh_cache(),
+                Instant::now(),
+                dir.path().to_str().unwrap(),
+                &oid,
+            )
+            .unwrap();
+            assert_eq!(check.signature.is_signed(), signed, "{header}: {check:?}");
+            assert_eq!(
+                verifier_spawns(&stub) > 0,
+                signed,
+                "{header}: the classifier and git disagree about whether this is signed"
+            );
+            let walked = walk_signatures(
+                dir.path(),
+                &["rev-list", "-n5", "--header", "refs/heads/main"],
+            );
+            assert_eq!(walked[&oid].is_signed(), signed, "{header} (walk)");
+        }
+    }
+
+    /// An id in capitals reads the commit it names in the walk-free reader
+    /// too: the answer comes back under the spelling that was asked, and the
+    /// ids after it stay in step.
+    #[test]
+    fn mixed_case_ids_in_a_batch_are_answered_under_each_spelling() {
+        let (repo, tip) = repo_with_commit(&pgp());
+        let other = crate::test_support::raw_commit(repo.path(), &[&tip], "", "u", 1_700_000_301);
+        let upper = tip.to_uppercase();
+        let got = commit_signatures(repo.path(), &[upper.clone(), tip.clone(), other.clone()]);
+        assert_eq!(got[&upper], CommitSignature::Pgp);
+        assert_eq!(got[&tip], CommitSignature::Pgp);
+        assert_eq!(got[&other], CommitSignature::None);
+    }
+
+    /// A verification that fails releases the select waiting on it with that
+    /// failure, and is not kept: the next select tries again.
+    #[test]
+    fn a_failed_verification_releases_its_waiters_with_the_error_and_is_not_cached() {
+        let (repo, _) = repo_with_commit("");
+        let path = repo.path().to_str().unwrap().to_string();
+        let absent = "2".repeat(40);
+        let cache = fresh_cache();
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        verify_commit_signature_with(&cache, Instant::now(), &path, &absent)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        let state = cache.lock().unwrap();
+        assert_eq!(state.len(), 0, "a failure is never cached");
+        assert!(state.flights.is_empty(), "no flight outlives its leader");
+    }
+
+    /// Past the flight bound a select still runs, alone.
+    #[test]
+    fn selects_past_the_flight_bound_are_not_refused() {
+        let (repo, oid) = repo_with_commit("");
+        let path = repo.path().to_str().unwrap();
+        let cache = fresh_cache();
+        {
+            let mut state = cache.lock().unwrap();
+            for n in 0..MAX_FLIGHTS {
+                state.flights.insert(
+                    (PathBuf::from(format!("/busy/{n}")), "e".repeat(40)),
+                    Arc::default(),
+                );
+            }
+        }
+        let check = verify_commit_signature_with(&cache, Instant::now(), path, &oid).unwrap();
+        assert_eq!(check.signature, CommitSignature::None);
     }
 }
