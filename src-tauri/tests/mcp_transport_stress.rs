@@ -1013,7 +1013,9 @@ fn a_reader_that_closes_mid_frame_ends_the_server_promptly() {
         .as_bytes(),
     );
     let mut head = [0u8; 100];
-    stdout.read_exact(&mut head).expect("the start of the frame");
+    stdout
+        .read_exact(&mut head)
+        .expect("the start of the frame");
     drop(stdout);
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut exited = false;
