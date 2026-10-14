@@ -846,3 +846,83 @@ describe("graphStore signature verification", () => {
     expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
   });
 });
+
+describe("graphStore signature verification, rapid selection", () => {
+  type Check = { signature: string; status: string; key: string; signer: string };
+  const verdict = (status: string): Check => ({ signature: "pgp", status, key: "", signer: "" });
+  const flush = async () => {
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+  };
+
+  async function harness() {
+    const pending: Array<{ id: string; gate: ReturnType<typeof deferred<Check>> }> = [];
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") return payload("c1") as never;
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, summary: "s", changed_files: [] } as never;
+      }
+      if (cmd === "cmd_verify_commit_signature") {
+        const gate = deferred<Check>();
+        pending.push({ id: String(args?.commitId), gate });
+        return gate.promise as never;
+      }
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const row = { ...get(store).rows[0], id: "c1" };
+    // loadGraph may already have selected a commit: start from a clean slate.
+    await flush();
+    pending.splice(0, pending.length);
+    return { store, row, pending };
+  }
+
+  it("A, B, A: only the last selection's own verdict lands, in any resolution order", async () => {
+    const { store, row, pending } = await harness();
+    await store.selectCommit(row, "/r/a");
+    await store.selectCommit({ ...row, id: "c2" }, "/r/a");
+    await store.selectCommit(row, "/r/a");
+    await flush();
+    expect(pending.map((p) => p.id)).toEqual(["c1", "c2", "c1"]);
+
+    // The stale first verification of c1 answers before the current one.
+    pending[0].gate.resolve(verdict("bad"));
+    await flush();
+    expect(get(store).selectedCommitDetails?.id).toBe("c1");
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+
+    pending[1].gate.resolve(verdict("none"));
+    await flush();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+
+    pending[2].gate.resolve(verdict("good"));
+    await flush();
+    expect(get(store).selectedCommitDetails?.signature_check).toEqual(verdict("good"));
+  });
+
+  it("a verification that rejects after the selection moved on does not blank the new commit's verdict", async () => {
+    const { store, row, pending } = await harness();
+    await store.selectCommit(row, "/r/a");
+    await store.selectCommit({ ...row, id: "c2" }, "/r/a");
+    await flush();
+    pending[1].gate.resolve(verdict("good"));
+    await flush();
+    pending[0].gate.promise.catch(() => {});
+    pending[0].gate.resolve(undefined as never);
+    await flush();
+    expect(get(store).selectedCommitDetails?.id).toBe("c2");
+    expect(get(store).selectedCommitDetails?.signature_check).toEqual(verdict("good"));
+  });
+
+  it("deselecting while a verification runs drops its verdict", async () => {
+    const { store, row, pending } = await harness();
+    await store.selectCommit(row, "/r/a");
+    await flush();
+    await store.selectCommit(null as never, "/r/a");
+    pending[0].gate.resolve(verdict("good"));
+    await flush();
+    expect(get(store).selectedCommit).toBeNull();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+  });
+});

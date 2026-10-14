@@ -426,3 +426,47 @@ describe("computeCommitWindow", () => {
   });
 });
 
+
+describe("computeHygiene signature adversarial cases", () => {
+  it("never produces NaN or Infinity for any all-one-kind repo", () => {
+    for (const signature of ["none", "pgp", "ssh", "x509", "other", "unknown"] as const) {
+      const hygiene = computeHygiene([createMockCommit({ signature })]);
+      expect(Number.isFinite(hygiene.signedPercentage), signature).toBe(true);
+      expect(hygiene.signedPercentage).toBeGreaterThanOrEqual(0);
+      expect(hygiene.signedPercentage).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it("a single commit is 100 or 0, and an unread single commit is 0 with one unread", () => {
+    expect(computeHygiene([createMockCommit({ signature: "ssh" })]).signedPercentage).toBe(100);
+    expect(computeHygiene([createMockCommit({ signature: "none" })]).signedPercentage).toBe(0);
+    const unread = computeHygiene([createMockCommit({ signature: "unknown" })]);
+    expect(unread.signedPercentage).toBe(0);
+    expect(unread.signatureUnknownCount).toBe(1);
+  });
+
+  it("counts signed + unsigned + unread to the total, across a large mixed walk", () => {
+    const kinds = ["pgp", "none", "unknown", "x509", "other", "none", "ssh"] as const;
+    const commits = Array.from({ length: 25_000 }, (_, n) =>
+      createMockCommit({ signature: kinds[n % kinds.length] })
+    );
+    const hygiene = computeHygiene(commits);
+    const unsigned = commits.filter((c) => c.signature === "none").length;
+    expect(hygiene.signedCount + unsigned + hygiene.signatureUnknownCount).toBe(25_000);
+  });
+
+  /**
+   * A payload from a backend that predates the rename still carries `gpg_status`
+   * and no `signature`; a value outside the closed set is as much a version
+   * skew. Neither is a statement that the commit is signed.
+   */
+  it("break: a missing or unrecognised signature value is not counted as signed", () => {
+    const skewed = [
+      createMockCommit({ signature: undefined as never }),
+      createMockCommit({ signature: "G" as never }),
+      createMockCommit({ signature: "" as never }),
+    ];
+    const hygiene = computeHygiene(skewed);
+    expect(hygiene.signedCount).toBe(0);
+  });
+});

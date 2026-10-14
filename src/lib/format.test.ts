@@ -133,3 +133,46 @@ describe("clock minutes", () => {
     }
   });
 });
+
+describe("signatureLabel adversarial matrix", () => {
+  const signatures = ["none", "pgp", "ssh", "x509", "other", "unknown"] as const;
+  const statuses = [
+    "good",
+    "bad",
+    "good_unknown_validity",
+    "expired",
+    "expired_key",
+    "revoked",
+    "cannot_check",
+    "none",
+  ] as const;
+
+  it("labels every signature x status pair, never 'Unsigned' for a commit that carries a signature, and passes only good", () => {
+    for (const signature of signatures) {
+      for (const status of statuses) {
+        const label = signatureLabel({ signature, status, key: "", signer: "" });
+        expect(label.text, `${signature}/${status}`).toBeTruthy();
+        if (signature !== "none") {
+          expect(label.text, `${signature}/${status}`).not.toBe("Unsigned");
+        }
+        if (label.ok) {
+          expect(status, `${signature}/${status}`).toBe("good");
+          expect(signature, `${signature}/${status}`).not.toBe("none");
+        }
+      }
+    }
+  });
+
+  it("never passes a commit the object says is unsigned, whatever the verifier claims", () => {
+    expect(signatureLabel({ signature: "none", status: "good", key: "K", signer: "S" }).ok).toBe(false);
+  });
+
+  it("break: does not throw on an unexpected status or signature from a newer or older backend", () => {
+    const odd = { signature: "pgp", status: "future_status", key: "", signer: "" } as unknown as CommitSignatureCheck;
+    expect(() => signatureLabel(odd)).not.toThrow();
+    expect(signatureLabel(odd).ok).toBe(false);
+    expect(signatureLabel(odd).text).toBeTruthy();
+    const alien = { signature: "gpg2", status: "good", key: "", signer: "" } as unknown as CommitSignatureCheck;
+    expect(() => signatureLabel(alien)).not.toThrow();
+  });
+});
