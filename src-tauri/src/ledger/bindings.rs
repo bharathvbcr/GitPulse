@@ -10,6 +10,12 @@
 //! Resolution is "the most recent bind or unbind for this path wins". An
 //! unbind is recorded rather than deleting the bind, for the same reason: the
 //! work that happened while the binding held really did happen under it.
+//!
+//! That history is read two ways. [`binding_at`] is the live gate's question,
+//! "what holds now". [`binding_as_of`] and [`BindingHistory`] answer "what held
+//! at that moment", which is what a replayed event needs: a transcript call
+//! from before a rebind is stamped with the task that was bound when it ran.
+//! Both order rows by the same `(ts_utc, ulid)` key.
 
 use super::{append, ActorKind, Draft, LedgerError, Outcome};
 
@@ -235,8 +241,24 @@ fn validate_task(anchor: &str, task_id: &str) -> Result<(), LedgerError> {
 
 /// Binds `worktree_path` to `task_id`, recording it as an event.
 pub fn bind(repo_path: &str, worktree_path: &str, task_id: &str) -> Result<i64, LedgerError> {
+    bind_with(repo_path, worktree_path, task_id, |_| None)
+}
+
+/// [`bind`] that runs `before` once the pair is resolved and the task
+/// validated, and records the `detail_json` it returns on the bind row.
+///
+/// For work that must precede the row, such as catching up what happened under
+/// the old binding. `before` runs with no ledger lock held, and whatever it
+/// does, the bind is written.
+pub fn bind_with(
+    repo_path: &str,
+    worktree_path: &str,
+    task_id: &str,
+    before: impl FnOnce(&BindingAddress) -> Option<String>,
+) -> Result<i64, LedgerError> {
     let address = address(repo_path, worktree_path)?;
     validate_task(&address.anchor, task_id)?;
+    let detail_json = before(&address);
     append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
@@ -245,13 +267,24 @@ pub fn bind(repo_path: &str, worktree_path: &str, task_id: &str) -> Result<i64, 
         object: Some(address.worktree),
         actor_kind: Some(ActorKind::Human),
         outcome: Some(Outcome::Ok),
+        detail_json,
         ..Default::default()
     })
 }
 
 /// Clears whatever `worktree_path` was bound to.
 pub fn unbind(repo_path: &str, worktree_path: &str) -> Result<i64, LedgerError> {
+    unbind_with(repo_path, worktree_path, |_| None)
+}
+
+/// [`unbind`] with the same `before` hook as [`bind_with`].
+pub fn unbind_with(
+    repo_path: &str,
+    worktree_path: &str,
+    before: impl FnOnce(&BindingAddress) -> Option<String>,
+) -> Result<i64, LedgerError> {
     let address = address(repo_path, worktree_path)?;
+    let detail_json = before(&address);
     append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
@@ -259,6 +292,7 @@ pub fn unbind(repo_path: &str, worktree_path: &str) -> Result<i64, LedgerError> 
         object: Some(address.worktree),
         actor_kind: Some(ActorKind::Human),
         outcome: Some(Outcome::Ok),
+        detail_json,
         ..Default::default()
     })
 }
@@ -353,6 +387,142 @@ pub(crate) fn binding_at(address: &BindingAddress) -> Result<Option<ResolvedBind
         anchor: address.anchor.clone(),
         worktree: address.worktree.clone(),
     }))
+}
+
+/// What held for a worktree at a moment, as far as the ledger can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskAtTime {
+    /// The newest bind at or before the moment names this task.
+    Bound(String),
+    /// The newest row at or before the moment is an unbind: a decided state
+    /// with no task.
+    Unbound,
+    /// Nothing decides it: no bind or unbind at or before the moment, a
+    /// moment that is not trusted or not exact enough, or a history that could
+    /// not be read. Never the binding that holds now.
+    Unresolved,
+}
+
+impl TaskAtTime {
+    /// The task, for a [`TaskAtTime::Bound`] moment.
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            TaskAtTime::Bound(task) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// The `task_basis` an event records: `bound`, `unbound` or `unresolved`.
+    pub fn basis(&self) -> &'static str {
+        match self {
+            TaskAtTime::Bound(_) => "bound",
+            TaskAtTime::Unbound => "unbound",
+            TaskAtTime::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// The binding at `address` as of `at_ms` (epoch milliseconds): the newest bind
+/// or unbind appended at or before it. A row exactly at `at_ms` counts, and
+/// ties go to the larger ULID, as in [`binding_at`], which this agrees with at
+/// any moment after the last row.
+///
+/// One indexed query for one question. A pass with many calls to answer reads
+/// [`BindingHistory`] once instead.
+pub fn binding_as_of(address: &BindingAddress, at_ms: u64) -> Result<TaskAtTime, LedgerError> {
+    if !super::is_initialised(&address.anchor) {
+        return Ok(TaskAtTime::Unresolved);
+    }
+    let stored_worktree = super::redact::text(&address.worktree);
+    let found = super::binding_as_of(
+        &address.anchor,
+        &address.worktree,
+        &stored_worktree,
+        &super::ids::iso8601_utc(at_ms),
+    )?;
+    Ok(match found {
+        Some(Some(task)) => TaskAtTime::Bound(task),
+        Some(None) => TaskAtTime::Unbound,
+        None => TaskAtTime::Unresolved,
+    })
+}
+
+/// One worktree's bind and unbind rows, read once, answering "what held at
+/// this moment" for any number of moments.
+///
+/// Departed worktrees resolve from their own path's rows with no family
+/// authentication: a bind row exists only for a path that was authenticated
+/// when it was bound, so this widens whose events can be attributed, not
+/// who can act.
+#[derive(Debug, Clone, Default)]
+pub struct BindingHistory {
+    /// Oldest first, in `(ts_utc, ulid)` order.
+    rows: Vec<super::BindingRow>,
+    /// The read failed: every answer is `Unresolved`.
+    unreadable: bool,
+}
+
+impl BindingHistory {
+    /// The history of `worktree` in the ledger at `anchor`. A repository with
+    /// no ledger has none, and is not created by asking.
+    pub fn load(anchor: &str, worktree: &str) -> Result<Self, LedgerError> {
+        if !super::is_initialised(anchor) {
+            return Ok(Self::default());
+        }
+        let stored_worktree = super::redact::text(worktree);
+        Ok(Self {
+            rows: super::binding_history(anchor, worktree, &stored_worktree)?,
+            unreadable: false,
+        })
+    }
+
+    /// A history that could not be read: it decides nothing.
+    pub const fn unreadable() -> Self {
+        Self {
+            rows: Vec::new(),
+            unreadable: true,
+        }
+    }
+
+    /// What held at `at_ms`, exact to the millisecond.
+    pub fn as_of(&self, at_ms: u64) -> TaskAtTime {
+        // Nothing to order against: most worktrees were never bound, and this
+        // runs once per call of a corpus.
+        if self.unreadable || self.rows.is_empty() {
+            return TaskAtTime::Unresolved;
+        }
+        let at = super::ids::iso8601_utc(at_ms);
+        match self
+            .rows
+            .partition_point(|row| row.ts_utc.as_str() <= at.as_str())
+        {
+            0 => TaskAtTime::Unresolved,
+            newest => match &self.rows[newest - 1].task_id {
+                Some(task) => TaskAtTime::Bound(task.clone()),
+                None => TaskAtTime::Unbound,
+            },
+        }
+    }
+
+    /// What held at some moment of the whole second starting at `second_ms`,
+    /// for a source that records only seconds (the reflog). A bind or unbind
+    /// anywhere in `[second_ms, second_ms + 999]` leaves the order of the two
+    /// undecidable, so it is `Unresolved`.
+    pub fn as_of_second(&self, second_ms: u64) -> TaskAtTime {
+        let from = super::ids::iso8601_utc(second_ms);
+        let to = super::ids::iso8601_utc(second_ms.saturating_add(999));
+        let start = self
+            .rows
+            .partition_point(|row| row.ts_utc.as_str() < from.as_str());
+        if self
+            .rows
+            .get(start)
+            .is_some_and(|row| row.ts_utc.as_str() <= to.as_str())
+        {
+            return TaskAtTime::Unresolved;
+        }
+        self.as_of(second_ms)
+    }
 }
 
 /// [`resolve_binding`] for the agent hook, which must not write.
@@ -1652,3 +1822,6 @@ mod family_cost_tests {
         repository_address(&repo).expect("the repository itself still resolves");
     }
 }
+
+#[cfg(test)]
+mod history_tests;

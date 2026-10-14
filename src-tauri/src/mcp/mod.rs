@@ -803,7 +803,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow.",
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority.",
             LedgerEventsArgs::properties(),
             &LedgerEventsArgs::required(),
             json!({
@@ -2567,6 +2567,23 @@ mod tests {
                 "{name} is annotated read-only but created {created:?} in the repository"
             );
         }
+    }
+
+    #[test]
+    fn ledger_events_says_where_event_time_lives() {
+        // Event time rides in `detail_json`: the event contract is closed to a
+        // new top-level field, so the tool is where a reader learns of it.
+        let tool = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .expect("tool");
+        let description = tool["description"].as_str().expect("a description");
+        assert!(
+            description.contains("detail_json.occurred_at"),
+            "{description}"
+        );
+        assert!(description.contains("task_basis"), "{description}");
+        assert!(description.contains("`ts_utc` is when the row was appended"));
     }
 
     #[test]

@@ -10,11 +10,22 @@ fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn edit_line(cwd: &str, session: &str, second: u32, file: &str) -> String {
+fn past(second: u32) -> String {
+    format!("2026-09-01T12:00:{second:02}.000Z")
+}
+
+/// The time a call made right now carries. A test that binds a task and then
+/// expects its calls to carry it stamps them with this, after the bind: a call
+/// stamped before the bind happened before it, and carries no task.
+fn now_stamp() -> String {
+    ledger::ids::iso8601_utc(ledger::ids::now_millis())
+}
+
+fn edit_line_at(cwd: &str, session: &str, timestamp: &str, file: &str) -> String {
     serde_json::json!({
         "type": "assistant",
         "sessionId": session,
-        "timestamp": format!("2026-09-01T12:00:{second:02}.000Z"),
+        "timestamp": timestamp,
         "version": "2.1.241",
         "cwd": cwd,
         "message": { "content": [
@@ -24,11 +35,11 @@ fn edit_line(cwd: &str, session: &str, second: u32, file: &str) -> String {
     .to_string()
 }
 
-fn command_line(cwd: &str, session: &str, second: u32, command: &str) -> String {
+fn command_line_at(cwd: &str, session: &str, timestamp: &str, command: &str) -> String {
     serde_json::json!({
         "type": "assistant",
         "sessionId": session,
-        "timestamp": format!("2026-09-01T12:00:{second:02}.000Z"),
+        "timestamp": timestamp,
         "version": "2.1.241",
         "cwd": cwd,
         "message": { "content": [
@@ -36,6 +47,14 @@ fn command_line(cwd: &str, session: &str, second: u32, command: &str) -> String 
         ]}
     })
     .to_string()
+}
+
+fn edit_line(cwd: &str, session: &str, second: u32, file: &str) -> String {
+    edit_line_at(cwd, session, &past(second), file)
+}
+
+fn command_line(cwd: &str, session: &str, second: u32, command: &str) -> String {
+    command_line_at(cwd, session, &past(second), command)
 }
 
 fn write_lines(path: &std::path::Path, lines: &[String]) {
@@ -824,7 +843,10 @@ fn a_removed_git_worktree_keeps_its_path_and_never_takes_the_main_task() {
         rows
     };
     with_transcript_root(&corpus_dir, || {
-        write_lines(&file, &[edit_line(&w, "G1", 1, &format!("{w}/a.rs"))]);
+        write_lines(
+            &file,
+            &[edit_line_at(&w, "G1", &now_stamp(), &format!("{w}/a.rs"))],
+        );
         catch_up_into_bounded(&anchor, &anchor, None);
         assert_eq!(
             rows(),
@@ -840,7 +862,7 @@ fn a_removed_git_worktree_keeps_its_path_and_never_takes_the_main_task() {
             &file,
             &(edit_line(&w, "G1", 2, &format!("{w}/b.rs"))
                 + "\n"
-                + &edit_line(&anchor, "G1", 3, &format!("{anchor}/m.rs"))
+                + &edit_line_at(&anchor, "G1", &now_stamp(), &format!("{anchor}/m.rs"))
                 + "\n"),
         );
         catch_up_into_bounded(&anchor, &anchor, None);
@@ -1041,8 +1063,8 @@ fn adv_a_deleted_plain_subdirectory_stays_on_main() {
         write_lines(
             &nested.file("Q1.jsonl"),
             &[
-                command_line(&gone, "Q1", 1, "cargo test"),
-                edit_line(&gone, "Q1", 2, &format!("{gone}/a.rs")),
+                command_line_at(&gone, "Q1", &now_stamp(), "cargo test"),
+                edit_line_at(&gone, "Q1", &now_stamp(), &format!("{gone}/a.rs")),
             ],
         );
         nested.pass(&nested.base, &[]);
@@ -1076,7 +1098,7 @@ fn adv_a_worktree_recreated_at_the_same_path_between_passes() {
     with_transcript_root(&nested.corpus, || {
         write_lines(
             &nested.file("C1.jsonl"),
-            &[edit_line(&w, "C1", 1, &format!("{w}/a.rs"))],
+            &[edit_line_at(&w, "C1", &now_stamp(), &format!("{w}/a.rs"))],
         );
         nested.pass(&nested.base, &[&w]);
         std::fs::remove_dir_all(&w).unwrap();
@@ -1088,7 +1110,7 @@ fn adv_a_worktree_recreated_at_the_same_path_between_passes() {
         std::fs::create_dir_all(format!("{w}/src")).unwrap();
         append_text(
             &nested.file("C1.jsonl"),
-            &(edit_line(&w, "C1", 3, &format!("{w}/back.rs")) + "\n"),
+            &(edit_line_at(&w, "C1", &now_stamp(), &format!("{w}/back.rs")) + "\n"),
         );
         nested.pass(&nested.base, &[&w]);
         let first = nested.rows();
@@ -1106,6 +1128,8 @@ fn adv_a_worktree_recreated_at_the_same_path_between_passes() {
         "{rows:?}"
     );
     assert_eq!(task("gone.rs"), None);
+    assert_eq!(task("a.rs").as_deref(), Some("T-W"));
+    assert_eq!(task("back.rs").as_deref(), Some("T-W"));
 }
 
 /// Worktree b nested in worktree a (both under the repo).
@@ -1619,8 +1643,7 @@ fn a_worktree_beyond_the_cap_owns_its_rows_and_its_cursor_moves() {
     with_transcript_root(&nested.corpus, || {
         let lines: Vec<String> = wts
             .iter()
-            .enumerate()
-            .map(|(i, w)| edit_line(w, "B2", (i % 59) as u32, &format!("{w}/a.rs")))
+            .map(|w| edit_line_at(w, "B2", &now_stamp(), &format!("{w}/a.rs")))
             .collect();
         write_lines(&nested.file("B2.jsonl"), &lines);
         let first = pass::ingest_family_until(&base, &base, &wts, &mut |_| false);
@@ -1644,6 +1667,23 @@ fn a_worktree_beyond_the_cap_owns_its_rows_and_its_cursor_moves() {
         };
         assert_eq!(task(&real69).as_deref(), Some("T-real69"));
         assert_eq!(task(&wts[68]).as_deref(), Some("T-real68"));
+        // The hosted, off-cap owner's task came from its own history, the same
+        // read every other worktree gets; one nothing was bound to decides none.
+        let basis = |w: &str| {
+            let event = ledger::tail(&base, 0, 5000)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.worktree_path.as_deref() == Some(w)
+                        && transcript::ACTIONS.contains(&event.action.as_str())
+                })
+                .unwrap();
+            let detail: serde_json::Value =
+                serde_json::from_str(event.detail_json.as_deref().unwrap()).unwrap();
+            detail["task_basis"].clone()
+        };
+        assert_eq!(basis(&real69), "bound");
+        assert_eq!(basis(&wts[0]), "unresolved");
 
         // A pass triggered by a worktree that was past the cap: it has its own
         // cursor now, and the family's order has changed who has a slot.
@@ -1728,7 +1768,7 @@ fn unresolved_git_family(nested: &Nested) -> String {
     ledger::bindings::bind(&nested.base, &w, "T-W").unwrap();
     write_lines(
         &nested.file("X1.jsonl"),
-        &[edit_line(&w, "X1", 1, &format!("{w}/a.rs"))],
+        &[edit_line_at(&w, "X1", &now_stamp(), &format!("{w}/a.rs"))],
     );
     crate::repository_trust::revoke(&nested.base).unwrap();
     w
@@ -1811,4 +1851,144 @@ fn an_unresolved_family_is_reported() {
         let resolved = nested.pass(&nested.base, &[]);
         assert!(!resolved.family_unresolved, "{resolved:?}");
     });
+}
+
+/// The detail object of the one transcript row naming `needle`.
+fn row_detail(base: &str, needle: &str) -> serde_json::Value {
+    let event = ledger::tail(base, 0, 5000)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.object.as_deref().is_some_and(|o| o.contains(needle)))
+        .unwrap_or_else(|| panic!("no row for {needle}"));
+    serde_json::from_str(event.detail_json.as_deref().unwrap()).unwrap()
+}
+
+/// A removed worktree is attributed from its own path's bind history, with no
+/// family authentication (a bind row exists only for a path that was
+/// authenticated when it was bound): a call after its bind carries the task, a
+/// call from before it does not, and neither takes the main checkout's task.
+#[test]
+fn a_departed_worktree_resolves_from_its_own_history() {
+    use crate::test_support::{git_in, trust_repo};
+    let main = tempfile::tempdir().unwrap();
+    let base = main.path().canonicalize().unwrap();
+    git_in(&base, &["init", "-b", "main"]);
+    std::fs::write(base.join("seed.txt"), "seed").unwrap();
+    git_in(&base, &["add", "seed.txt"]);
+    git_in(&base, &["commit", "-m", "seed"]);
+    let linked = base.join(".claude/worktrees/w");
+    git_in(
+        &base,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    trust_repo(&linked);
+    let w = linked
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let anchor = base.to_string_lossy().into_owned();
+    ledger::bindings::bind(&anchor, &anchor, "T-MAIN").unwrap();
+    ledger::bindings::bind(&anchor, &w, "T-W").unwrap();
+
+    let corpus = tempfile::tempdir().unwrap();
+    let corpus_dir = corpus.path().canonicalize().unwrap();
+    let file = corpus_dir.join("slug/D1.jsonl");
+    with_transcript_root(&corpus_dir, || {
+        git_in(&base, &["worktree", "remove", "--force", &w]);
+        write_lines(
+            &file,
+            &[
+                edit_line_at(&w, "D1", &now_stamp(), &format!("{w}/after.rs")),
+                edit_line(&w, "D1", 1, &format!("{w}/before.rs")),
+            ],
+        );
+        let out = catch_up_into_bounded(&anchor, &anchor, None);
+        assert!(out.recorded >= 2, "{out:?}");
+    });
+    let task = |needle: &str| {
+        ledger::tail(&anchor, 0, 5000)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.object.as_deref().is_some_and(|o| o.contains(needle)))
+            .map(|event| (event.worktree_path, event.task_id))
+            .unwrap()
+    };
+    assert_eq!(task("after.rs"), (Some(w.clone()), Some("T-W".into())));
+    assert_eq!(task("before.rs"), (Some(w.clone()), None));
+    assert_eq!(row_detail(&anchor, "after.rs")["task_basis"], "bound");
+    assert_eq!(row_detail(&anchor, "before.rs")["task_basis"], "unresolved");
+}
+
+/// A removed worktree nothing was ever bound to has no history to read: its
+/// calls are `unresolved`, never the host's or the main checkout's task.
+#[test]
+fn a_departed_worktree_with_no_history_is_unresolved() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    nested.init_git();
+    ledger::bindings::bind(&base, &base, "T-MAIN").unwrap();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("D2.jsonl"),
+            &[edit_line_at(&w, "D2", &now_stamp(), &format!("{w}/a.rs"))],
+        );
+        std::fs::remove_dir_all(&w).unwrap();
+        nested.pass(&base, &[]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0.as_deref(), Some(w.as_str()), "{rows:?}");
+    assert_eq!(rows[0].2, None, "{rows:?}");
+    assert_eq!(row_detail(&base, "a.rs")["task_basis"], "unresolved");
+}
+
+/// The baseline floor compares instants. A call spelled with a far-east offset
+/// reads as a later wall clock than the baseline's UTC text while being an
+/// earlier instant, so comparing the raw strings kept a call the old watermark
+/// had already recorded, and recorded it twice.
+#[test]
+fn the_baseline_floor_compares_instants_not_text() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    ledger::append(ledger::Draft {
+        repo_path: base.clone(),
+        action: "session.edit".into(),
+        object: Some("legacy".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let now = ledger::ids::now_millis();
+    let spelled = |ms: u64| ledger::ids::iso8601_utc(ms + 14 * 3_600_000).replace('Z', "+14:00");
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("F1.jsonl"),
+            &[
+                // An hour before the baseline, spelled at +14:00.
+                edit_line_at(
+                    &base,
+                    "F1",
+                    &spelled(now - 3_600_000),
+                    &format!("{base}/old.rs"),
+                ),
+                // Half a minute after it.
+                edit_line_at(
+                    &base,
+                    "F1",
+                    &spelled(now + 30_000),
+                    &format!("{base}/new.rs"),
+                ),
+            ],
+        );
+        let out = nested.pass(&base, &[]);
+        assert_eq!(out.recorded, 1, "{out:?}");
+    });
+    let rows: Vec<_> = nested
+        .rows()
+        .into_iter()
+        .filter(|row| row.1 != "legacy")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].1.ends_with("new.rs"), "{rows:?}");
 }

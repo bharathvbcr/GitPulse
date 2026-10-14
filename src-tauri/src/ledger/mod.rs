@@ -248,6 +248,129 @@ pub struct Draft {
     pub after_ref: Option<String>,
     pub duration_ms: Option<i64>,
     pub detail_json: Option<String>,
+    /// When the event happened and how its task was decided, for the writer to
+    /// place in `detail_json`. See [`EventStamp`].
+    pub event_stamp: Option<EventStamp>,
+}
+
+/// The three `detail_json` keys that carry event time: `occurred_at`,
+/// `occurred_at_basis` and `task_basis`.
+///
+/// They are the only keys that skip the redactor, which is what keeps a replay
+/// of a large corpus from redacting three more fields per row. That is safe
+/// only because each value is checked against a closed shape before it is
+/// spliced in ([`EventStamp::is_well_formed`]): a canonical 24-character UTC
+/// timestamp and two words from fixed lists. A stamp that fails the check is
+/// not dropped and not trusted: it is merged into the detail object and
+/// redacted with everything else.
+///
+/// Trust: on a transcript row `occurred_at` comes from the transcript, which
+/// the agent wrote, so an agent can date a call into an old binding window and
+/// have it attributed to that window's task. `task_basis` and `task_id` on
+/// transcript rows are as trustworthy as the transcript itself: provenance, not
+/// an authority. Reflog rows take their time from git's own record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventStamp {
+    pub occurred_at: String,
+    pub occurred_at_basis: String,
+    pub task_basis: String,
+}
+
+impl EventStamp {
+    /// Whether every value has the shape the writer produces, so none can
+    /// carry text a caller chose.
+    pub fn is_well_formed(&self) -> bool {
+        // A real calendar instant, in the exact form the formatter writes: the
+        // shape check alone passes `9999-99-99T99:99:99.999Z`.
+        valid_utc_timestamp(&self.occurred_at)
+            && ids::parse_event_time(&self.occurred_at)
+                .map(ids::iso8601_utc)
+                .as_deref()
+                == Some(self.occurred_at.as_str())
+            && matches!(
+                self.occurred_at_basis.as_str(),
+                "transcript" | "reflog" | "ingest"
+            )
+            && matches!(self.task_basis.as_str(), "bound" | "unbound" | "unresolved")
+    }
+
+    /// The three members as JSON object text, without braces.
+    fn members(&self) -> String {
+        serde_json::json!({
+            "occurred_at": self.occurred_at,
+            "occurred_at_basis": self.occurred_at_basis,
+            "task_basis": self.task_basis,
+        })
+        .to_string()
+    }
+}
+
+/// `detail` redacted, with `stamp`'s keys in it.
+///
+/// A well-formed stamp is spliced onto the redacted object: the detail is
+/// redacted without the three keys, and their validated members are appended.
+/// Anything else takes the closed path: a stamp that fails validation, or a
+/// detail that names a stamp key (spelled plainly or through a `\u` escape,
+/// which any JSON parser reads as the same key). There the keys go into the
+/// parsed object, overwriting, and the whole of it is redacted. A detail that
+/// does not parse as a JSON object carries no stamp on that path.
+///
+/// Callers pass serde-built objects. The fast path does not parse: text that
+/// starts with `{` and ends with `}` is spliced as it is, so malformed brace
+/// text (`{}{}`, `{not json}`) is not validated there, and a debug build
+/// asserts that the redacted text is an object. A release-mode parse would cost
+/// back what the splice saves.
+fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<String> {
+    let Some(stamp) = stamp else {
+        return detail.map(redact::text);
+    };
+    // A detail that already names one of the keys would be given it twice.
+    let names_a_key = detail.is_some_and(|text| {
+        text.contains("\\u")
+            || ["\"occurred_at", "\"task_basis\""]
+                .iter()
+                .any(|key| text.contains(key))
+    });
+    if stamp.is_well_formed() && !names_a_key {
+        let redacted = detail.map_or_else(|| "{}".to_string(), redact::text);
+        let trimmed = redacted.trim();
+        if let Some(body) = trimmed
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            // Nesting past serde's own limit is still an object (the redactor
+            // reads it by other means); only a real syntax error is a bug.
+            debug_assert!(
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(value) => value.is_object(),
+                    Err(e) => e.to_string().contains("recursion limit"),
+                },
+                "the splice was handed text that is not a JSON object: {trimmed}"
+            );
+            let members = stamp.members();
+            let members = &members[1..members.len() - 1];
+            let separator = if body.trim().is_empty() { "" } else { "," };
+            return Some(format!("{{{body}{separator}{members}}}"));
+        }
+    }
+    // The closed path: the keys join the object, and all of it is redacted.
+    let object = match detail {
+        None => Some(serde_json::Map::new()),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(map)) => Some(map),
+            _ => None,
+        },
+    };
+    let Some(mut map) = object else {
+        return detail.map(redact::text);
+    };
+    map.insert("occurred_at".into(), stamp.occurred_at.clone().into());
+    map.insert(
+        "occurred_at_basis".into(),
+        stamp.occurred_at_basis.clone().into(),
+    );
+    map.insert("task_basis".into(), stamp.task_basis.clone().into());
+    Some(redact::text(&serde_json::Value::Object(map).to_string()))
 }
 
 /// An event read back, in the shape the frontend consumes.
@@ -337,6 +460,11 @@ pub struct LedgerStatus {
     /// Appends this process failed to write, ever. Non-zero means the history
     /// on disk is known to be incomplete.
     pub dropped: u64,
+    /// Bind/unbind writes, in this process, whose catch-up beforehand failed or
+    /// was cut short. Nothing was dropped: the rows it would have recorded wait
+    /// for a later pass. Not folded into `dropped`.
+    #[serde(default)]
+    pub catch_up_failures: u64,
     /// Empty when recording; otherwise why not.
     pub error: String,
     pub error_code: String,
@@ -480,6 +608,34 @@ fn record_dropped_append(repo_path: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = dropped.entry(ledger_path(repo_path)).or_default();
     *count = count.saturating_add(1);
+}
+
+/// Counts a bind/unbind whose catch-up beforehand did not finish. The write
+/// went ahead and nothing was dropped: the rows the catch-up would have
+/// recorded are still owed to a later pass. It is counted apart from dropped
+/// appends ([`LedgerStatus::catch_up_failures`]), so it never reads as a lost
+/// write, and never as a clean bind.
+pub(crate) fn record_catch_up_failure(repo_path: &str) {
+    let mut failures = catch_up_failure_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = failures.entry(ledger_path(repo_path)).or_default();
+    *count = count.saturating_add(1);
+}
+
+/// [`record_catch_up_failure`]'s counts, by canonical database path.
+fn catch_up_failure_registry() -> &'static DroppedRegistry {
+    static FAILURES: OnceLock<DroppedRegistry> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn catch_up_failures(repo_path: &str) -> u64 {
+    catch_up_failure_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&ledger_path(repo_path))
+        .copied()
+        .unwrap_or(0)
 }
 
 fn dropped_appends(repo_path: &str) -> u64 {
@@ -1213,7 +1369,7 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         before_ref: draft.before_ref.as_deref().map(redact::text),
         after_ref: draft.after_ref.as_deref().map(redact::text),
         duration_ms: draft.duration_ms,
-        detail: draft.detail_json.as_deref().map(redact::text),
+        detail: redact_detail(draft.detail_json.as_deref(), draft.event_stamp.as_ref()),
     })
 }
 
@@ -1528,6 +1684,57 @@ pub fn tail_newest(
     read_after(repo_path, cursor, limit, true, Access::Writable)
 }
 
+/// The one precedence order of a worktree's bind and unbind rows, newest first:
+/// `(ts_utc, ulid)`, the pair an imported legacy row keeps across databases.
+/// Every binding read spells it through this macro, so "which row is newest"
+/// has one definition, and `ulid` (unique) leaves no ties.
+macro_rules! binding_order {
+    () => {
+        "ORDER BY ts_utc DESC, ulid DESC"
+    };
+}
+
+/// The newest bind/unbind row of a worktree (`?1`, `?2` its two spellings).
+const LATEST_BINDING_SQL: &str = concat!(
+    "SELECT action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+     ",
+    binding_order!(),
+    "
+     LIMIT 1"
+);
+
+/// [`LATEST_BINDING_SQL`] as of a moment (`?3`, a fixed-width `ts_utc`): the
+/// newest row at or before it. A row exactly at `?3` counts.
+pub(crate) const BINDING_AS_OF_SQL: &str = concat!(
+    "SELECT action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+       AND ts_utc <= ?3
+     ",
+    binding_order!(),
+    "
+     LIMIT 1"
+);
+
+/// Every bind/unbind row of a worktree, newest first.
+pub(crate) const BINDING_HISTORY_SQL: &str = concat!(
+    "SELECT ts_utc, action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+     ",
+    binding_order!()
+);
+
+/// One bind or unbind row: when it was appended, and the task it names
+/// (`None` for an unbind, or a bind naming no task).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BindingRow {
+    pub ts_utc: String,
+    pub task_id: Option<String>,
+}
+
 /// Any row attributed to a repository other than the two spellings `?1 <= ?2`.
 /// See [`latest_binding`] for why this is range probes rather than `NOT IN`.
 const FOREIGN_ROW_SQL: &str = "SELECT 1 FROM events
@@ -1582,14 +1789,9 @@ pub(crate) fn latest_binding_readonly(
     query_latest_binding(&conn, repo_path, worktree, stored_worktree)
 }
 
-/// The one binding query behind [`latest_binding`] and
-/// [`latest_binding_readonly`].
-fn query_latest_binding(
-    conn: &Connection,
-    repo_path: &str,
-    worktree: &str,
-    stored_worktree: &str,
-) -> Result<Option<Option<String>>, LedgerError> {
+/// Refuses a ledger holding a row attributed to a repository other than
+/// `repo_path`: no binding read may be answered from it.
+fn refuse_foreign_rows(conn: &Connection, repo_path: &str) -> Result<(), LedgerError> {
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     // `NOT IN` cannot seek, and in the normal case — no foreign row — `LIMIT 1`
@@ -1612,18 +1814,84 @@ fn query_latest_binding(
             "the ledger contains an event attributed to a different repository",
         ));
     }
+    Ok(())
+}
+
+/// The task a bind/unbind row leaves in force: `Some` only for a bind that
+/// names one.
+fn bound_task(action: &str, task_id: Option<String>) -> Option<String> {
+    task_id.filter(|_| action == bindings::BIND)
+}
+
+/// The one binding query behind [`latest_binding`] and
+/// [`latest_binding_readonly`].
+fn query_latest_binding(
+    conn: &Connection,
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    refuse_foreign_rows(conn, repo_path)?;
     conn.query_row(
-        "SELECT action, task_id FROM events
-         WHERE action IN ('worktree.bind', 'worktree.unbind')
-           AND worktree_path IN (?1, ?2)
-         ORDER BY ts_utc DESC, ulid DESC
-         LIMIT 1",
+        LATEST_BINDING_SQL,
         params![worktree, stored_worktree],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .optional()
     .map_err(|e| LedgerError::new("query_failed", e.to_string()))
-    .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
+    .map(|found| found.map(|(action, task_id)| bound_task(&action, task_id)))
+}
+
+/// The binding of a worktree as of `at_ts` (a fixed-width `ts_utc`): the
+/// newest bind or unbind appended at or before it, in the shape of
+/// [`latest_binding`], including its refusal of a ledger holding another
+/// repository's rows.
+pub(crate) fn binding_as_of(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+    at_ts: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    with_conn(repo_path, |conn| {
+        refuse_foreign_rows(conn, repo_path)?;
+        conn.query_row(
+            BINDING_AS_OF_SQL,
+            params![worktree, stored_worktree, at_ts],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+        .map(|found| found.map(|(action, task_id)| bound_task(&action, task_id)))
+    })
+}
+
+/// Every bind and unbind of a worktree, oldest first, so a pass can answer
+/// "which task, at this moment" for thousands of calls from one read.
+pub(crate) fn binding_history(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Vec<BindingRow>, LedgerError> {
+    with_conn(repo_path, |conn| {
+        refuse_foreign_rows(conn, repo_path)?;
+        let mut stmt = conn
+            .prepare(BINDING_HISTORY_SQL)
+            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
+        let rows = stmt
+            .query_map(params![worktree, stored_worktree], |row| {
+                let action: String = row.get(1)?;
+                Ok(BindingRow {
+                    ts_utc: row.get(0)?,
+                    task_id: bound_task(&action, row.get(2)?),
+                })
+            })
+            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+        let mut history = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LedgerError::new("row_failed", e.to_string()))?;
+        history.reverse();
+        Ok(history)
+    })
 }
 
 /// A binding's `(ts_utc, ulid)` precedence key and the task it names, if any.
@@ -1641,11 +1909,15 @@ pub(crate) fn newest_binding_readonly(
 ) -> Result<Option<NewestBinding>, LedgerError> {
     with_access(sibling_repo, Access::ReadOnly, |conn| {
         conn.query_row(
-            "SELECT ts_utc, ulid, action, task_id FROM events
-             WHERE action IN ('worktree.bind', 'worktree.unbind')
-               AND worktree_path IN (?1, ?2)
-             ORDER BY ts_utc DESC, ulid DESC
-             LIMIT 1",
+            concat!(
+                "SELECT ts_utc, ulid, action, task_id FROM events
+                 WHERE action IN ('worktree.bind', 'worktree.unbind')
+                   AND worktree_path IN (?1, ?2)
+                 ",
+                binding_order!(),
+                "
+                 LIMIT 1"
+            ),
             params![worktree, stored_worktree],
             |row| {
                 let action: String = row.get(2)?;
@@ -2159,6 +2431,11 @@ const PRUNE_BATCH: i64 = 5_000;
 /// worktree's task scope is enforced from, however old). One bounded batch per
 /// call; returns how many were deleted, so a caller loops until it is 0.
 ///
+/// "Older" is the append clock, `ts_utc`, never `detail_json.occurred_at`.
+/// [`recorded_reflog_objects`] rebuilds the reflog's already-seen set from the
+/// rows that are stored, so a row pruned while git still holds its entry would
+/// be recorded again by the next catch-up, for ever.
+///
 /// Catch-up ([`prune_expired`]) runs it on the default policy; a host may
 /// still call it with its own. Keeping the newest rows means the highest
 /// cursor survives, so ids are never reused.
@@ -2390,6 +2667,11 @@ pub fn status_readonly(repo_path: &str) -> LedgerStatus {
         } else {
             0
         },
+        catch_up_failures: if recording {
+            catch_up_failures(repo_path)
+        } else {
+            0
+        },
         error,
         error_code,
     }
@@ -2413,11 +2695,13 @@ pub fn tail_readonly(
 pub fn status(repo_path: &str) -> LedgerStatus {
     let path = ledger_path(repo_path);
     let dropped = dropped_appends(repo_path);
+    let catch_up_failures = catch_up_failures(repo_path);
     match with_conn(repo_path, |_| Ok(())) {
         Ok(()) => LedgerStatus {
             recording: true,
             path: path.display().to_string(),
             dropped,
+            catch_up_failures,
             error: String::new(),
             error_code: String::new(),
         },
@@ -2425,6 +2709,7 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             recording: false,
             path: path.display().to_string(),
             dropped,
+            catch_up_failures,
             error: e.message,
             error_code: e.code.to_string(),
         },
@@ -4686,3 +4971,6 @@ mod identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stamp_tests;

@@ -174,6 +174,40 @@ before that tag is pushed.
 
 ### Fixed
 
+- **Ledger rows say when the thing happened, and which task was bound then.**
+  A transcript or reflog row used to be stamped when a catch-up pass read it, so
+  twelve rows from two sessions sat within 5 ms of one another, and every one of
+  them carried the task bound when the pass ran: work done under T1 with the app
+  closed was filed under T2 after a rebind.
+  - `detail_json.occurred_at` holds the call's own time (a transcript's
+    timestamp, offsets converted to UTC) or the reflog's own record of the move
+    (`--date=unix` on `%gd`, no longer the committer date `%ct`, which a
+    checkout of an old commit leaves where it was), with `occurred_at_basis`
+    (`transcript`, `reflog` or `ingest`) and, for those rows, `task_basis`
+    (`bound`, `unbound` or `unresolved`). `ts_utc` stays the append clock, and
+    the event contract, `WRITER_VERSION` and the schema are unchanged: no
+    top-level field was added. The journal shows `occurred_at` and falls back to
+    `ts_utc`; `gitpulse_ledger_events` says so in its description.
+  - `task_id` is the newest bind or unbind at or before the event
+    (`binding_as_of`, one `(ts_utc, ulid)` order shared with the live gate). A call from
+    before the first bind is `unresolved` with no task, never the current
+    binding. So is a call whose time is unreadable or more than a minute in the
+    future (`occurred_at_basis: "ingest"`), and a reflog move in the same second
+    as a bind or unbind. Removed worktrees resolve from their own path's bind
+    history without authenticating the family, which widens whose calls can be
+    attributed, not who can act.
+  - Binding or unbinding a worktree first catches up its transcripts and reflog
+    (5 s, best effort). A catch-up that fails or is cut short does not stop the
+    bind; it is recorded on the bind row (`detail_json.catch_up`) and counted in
+    the ledger status's own `catch_up_failures`, never as a dropped append. No home
+    directory to read transcripts from is not a failure; the row notes it.
+  - `occurred_at` on a transcript row comes from the agent-written transcript, so
+    its task attribution is as trustworthy as the transcript, not an authority.
+  - Retention, ordering, the reflog's already-seen set and the legacy import stay
+    on `ts_utc`: pruning by `occurred_at` would delete reflog rows git still
+    holds and record them again on the next pass.
+  - The transcript pass compares a call with a worktree's baseline as instants,
+    not as text, so a call spelled with an offset is no longer recorded twice.
 
 - A slow host no longer kills a terminal's input. Any keystroke whose answer
   took more than five seconds stopped the tab's input for good ("Input delivery
