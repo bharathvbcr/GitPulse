@@ -677,3 +677,26 @@ fn a_gitdir_file_layout_protects_the_real_git_directory() {
     assert_eq!(std::fs::read(repo.join(".bare/config")).unwrap(), before);
     assert!(!repo.join(".bare/hooks/pre-commit").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_link_into_dot_git_moves_as_a_link_and_touches_nothing_in_it() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    let before = dot_git_config(&repo);
+    std::os::unix::fs::symlink(repo.join(".git"), repo.join("meta")).unwrap();
+
+    GitWriter::move_path(&repo_str, "meta", "meta2", |_| Ok(())).expect("the link moves");
+    assert!(std::fs::symlink_metadata(repo.join("meta2"))
+        .unwrap()
+        .is_symlink());
+    assert!(std::fs::symlink_metadata(repo.join("meta")).is_err());
+    assert_eq!(dot_git_config(&repo), before, "the move reached .git");
+
+    // Through the link is still refused, by whichever name reaches it.
+    assert!(sandbox_write_raw(&repo_str, "meta2/config").is_err());
+    assert!(GitWriter::move_path(&repo_str, "meta2/hooks", "x", |_| Ok(())).is_err());
+    assert_eq!(dot_git_config(&repo), before);
+}

@@ -225,8 +225,49 @@ pub fn is_git_metadata_component(name: &std::ffi::OsStr) -> bool {
 /// where the git directory has another name. Both directories come from
 /// `repository_trust::git_directories`, which reads the `.git` file and
 /// spawns no git.
+///
+/// It follows a symlink at the final component, which is what a save wants
+/// (the bytes go to what the name resolves to). A create, move or delete acts
+/// on the entry itself and uses [`sandbox_join_write_entry`].
 pub fn sandbox_join_write(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
     let resolved = sandbox_join_canonical(repo, file_path)?;
+    guard_write_target(repo, file_path, resolved)
+}
+
+/// [`sandbox_join_write`] for an operation on the entry itself (create, move,
+/// delete): the parent is resolved and checked, and the final name is appended
+/// as it stands, so a symlink is the link and a dangling link is a name that
+/// exists, not an error.
+///
+/// The git-metadata refusal still holds: the name itself is checked
+/// lexically, and a parent that resolves into the git directory is refused. A
+/// link whose TARGET is in `.git` can be moved or deleted as a link, which
+/// never touches `.git`. The repository root is never a target, however it is
+/// spelled.
+pub fn sandbox_join_write_entry(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+    if Path::new(file_path)
+        .components()
+        .all(|component| matches!(component, Component::CurDir))
+    {
+        return Err(root_message(file_path));
+    }
+    let resolved = sandbox_join_entry(repo, file_path)?;
+    guard_write_target(repo, file_path, resolved)
+}
+
+fn root_message(file_path: &str) -> String {
+    format!("Refusing to change the repository root: {file_path}")
+}
+
+/// What no write target may be: the repository root, or anything at or under
+/// its private or common git directory.
+fn guard_write_target(repo: &Path, file_path: &str, resolved: PathBuf) -> Result<PathBuf, String> {
+    let root = repo
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve repository path '{}': {}", repo.display(), e))?;
+    if resolved == root {
+        return Err(root_message(file_path));
+    }
     let (private, common) = crate::repository_trust::git_directories(repo)?;
     for dir in [private, common] {
         let dir = dir.canonicalize().unwrap_or(dir);
@@ -428,7 +469,10 @@ pub struct SavedFile {
 /// is [`FileWriteError::AlreadyExists`] and is left untouched, including when
 /// it appears between the check and the publish.
 pub fn sandbox_create(repo_path: &str, file_path: &str) -> Result<(), FileWriteError> {
-    let dest = write_target(repo_path, file_path)?;
+    // The entry, not what it resolves to: a link at the path (dangling or not)
+    // is something already there, and `Expect::Absent` must see the link.
+    let repo = validate_repo(repo_path)?;
+    let dest = sandbox_join_write_entry(&repo, file_path)?;
     crate::diff::write_regular_expecting(&dest, Expect::Absent, |_| Ok(Vec::new()))
         .map(|_| ())
         .map_err(|failure| FileWriteError::from_failure(failure, file_path, None))
