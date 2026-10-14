@@ -2770,8 +2770,9 @@ fn commit_details_assigns_every_format_field_to_its_own_slot() {
     );
 }
 
-/// The reflog reader splits four positional fields out of one `--format`
-/// string: %H %gd %gs %ct. The only existing coverage asserted the list was
+/// The reflog reader splits three positional fields out of one `--format`
+/// string, `%H %gd %gs`, and reads the move's time out of `%gd` rendered with
+/// `--date=unix`. The only existing coverage asserted the list was
 /// non-empty, so every one of those four could have swapped places without a
 /// test noticing — a selector rendered as a commit id, a timestamp parsed out
 /// of hex and silently falling back to 0.
@@ -2803,12 +2804,10 @@ fn reflog_assigns_every_format_field_to_its_own_slot() {
         "commit_id is not hex: {}",
         newest.commit_id
     );
-    // %gd: the selector, which is the only field shaped like HEAD@{n}.
-    assert!(
-        newest.selector.starts_with("HEAD@{"),
-        "selector: {}",
-        newest.selector
-    );
+    // %gd: the selector, which is the only field shaped like HEAD@{n}. It is
+    // read under `--date=unix` for its time, and stays positional: the pane
+    // hands it back to git as a revision.
+    assert_eq!(newest.selector, "HEAD@{0}", "selector");
     // %gs: the subject, split at its first colon into action and message.
     assert!(
         newest.action.starts_with("commit"),
@@ -2816,11 +2815,12 @@ fn reflog_assigns_every_format_field_to_its_own_slot() {
         newest.action
     );
     assert_eq!(newest.message, "feat: second", "message");
-    // %ct: seconds since the epoch. A hex object id parsed here yields 0, and
-    // any real commit made after 2001 is well past this floor.
+    // The reflog's own time, in seconds since the epoch, read out of the
+    // dated selector. A hex object id parsed here yields 0, and any real move
+    // made after 2001 is well past this floor.
     assert!(
         newest.timestamp > 1_000_000_000,
-        "timestamp did not come from %ct: {}",
+        "timestamp did not come from the dated selector: {}",
         newest.timestamp
     );
 }
