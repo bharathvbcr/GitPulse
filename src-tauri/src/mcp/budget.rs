@@ -148,20 +148,22 @@ pub(super) fn fit(modern: bool, payload: Value, budget: usize) -> Result<Fitted,
         drop(compact);
         match truncate(payload.clone(), original, mirror, escaped_compact_len) {
             Ok(cut) => to_compact(&cut)?,
-            // A page that cannot be cut honestly is not mirrored cut: the text
-            // says so and points at `structuredContent`, which carries it whole
-            // when the budget allows (and is refused below when it does not).
-            Err(Refusal::Paged) => to_compact(&json!({
+            // Whatever stops the mirror (a page that cannot be cut honestly, or
+            // a payload of long text with no list to cut) is the mirror's
+            // problem, not the call's: the text says so and points at
+            // `structuredContent`, which carries the result whole when the
+            // budget allows. The call fails only if that copy cannot fit,
+            // below. (An escaped-twice log field, as in `gitpulse_get_task`,
+            // passes the mirror's half-budget long before the budget.)
+            Err(_) => to_compact(&json!({
                 TRUNCATION_KEY: {
                     "budget_bytes": mirror,
                     "original_bytes": original,
                     "arrays": [],
                     "arrays_total": 0,
-                    "note": "this page is too large to mirror as text and cannot be cut \
-                             without skipping rows; read structuredContent",
+                    "note": "this result is too large to mirror as text; read structuredContent",
                 }
             }))?,
-            Err(refusal) => return Err(refusal_message(&refusal, original, budget)),
         }
     };
     let room = budget.saturating_sub(escaped_len(&text));
@@ -350,7 +352,12 @@ fn refusal_message(refusal: &Refusal, original: usize, budget: usize) -> String 
 /// Whether the cursor beside a list can follow a cut of it: numeric, with an
 /// integer `id` on every element, so it can be moved to the last kept one.
 fn cursor_can_follow(cursor: &Value, items: &[Value]) -> bool {
-    (cursor.is_i64() || cursor.is_u64())
+    (cursor.is_i64() || cursor.is_u64()) && has_row_ids(items)
+}
+
+/// Whether a list is a list of rows, each with an integer `id`.
+fn has_row_ids(items: &[Value]) -> bool {
+    !items.is_empty()
         && items
             .iter()
             .all(|item| item.get("id").is_some_and(Value::is_i64))
@@ -387,10 +394,19 @@ fn cuttable_lists(root: &Value, min_len: usize, floor: usize) -> (Vec<String>, b
             }
             Value::Object(members) => {
                 let cursor = members.get("next_cursor");
+                // A cursor names the last row of one list. With two lists whose
+                // rows both carry ids it cannot be told which, and moving it for
+                // one would skip rows of the other's page: neither is cut.
+                let id_lists = members
+                    .values()
+                    .filter(|member| matches!(member, Value::Array(items) if has_row_ids(items)))
+                    .count();
                 for (key, item) in members {
                     if let (Value::Array(items), Some(cursor)) = (item, cursor) {
                         if items.len() >= state.min_len
-                            && !(state.floor >= 1 && cursor_can_follow(cursor, items))
+                            && !(state.floor >= 1
+                                && id_lists <= 1
+                                && cursor_can_follow(cursor, items))
                         {
                             state.left_alone = true;
                             continue;
@@ -480,6 +496,14 @@ fn cut_list(
     // rows, or `has_more` with no cursor, is an outcome a reader cannot detect.
     if let (Some(id), Some(cursor)) = (last_id, parent.get_mut("next_cursor")) {
         *cursor = json!(id);
+        // And the page says that more follows, in whichever flag it has: the
+        // dropped rows are what follows, whatever the flag said of the page it
+        // was cut from.
+        for flag in ["has_more", "truncated"] {
+            if parent.get(flag).is_some_and(Value::is_boolean) {
+                parent.insert(flag.into(), json!(true));
+            }
+        }
     }
     removed_bytes
 }
@@ -815,6 +839,78 @@ mod tests {
         // Legacy has only the text, so the same page is whole in it.
         let legacy = fit(false, tasks.clone(), 4 * 1024 * 1024 - 512).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&legacy.text).unwrap(), tasks);
+    }
+
+    /// `gitpulse_get_task` carries up to 256 KiB of logs twice (in the task and
+    /// in the brief), each newline escaped twice in the text block. That text
+    /// passes its half-budget mirror long before the budget; the call must not
+    /// fail for it while `structuredContent` fits whole.
+    #[test]
+    fn a_long_string_payload_too_big_to_mirror_is_whole_in_structured_content() {
+        let payload = json!({ "ok": true, "brief": "x\n".repeat(150_000) });
+        let fitted = fit(true, payload.clone(), tool_budget(&json!(1))).unwrap();
+        assert_eq!(fitted.structured, Some(payload));
+        assert!(
+            fitted.text.len() < 1024,
+            "the mirror is a note: {}",
+            fitted.text
+        );
+        assert!(fitted.text.contains("structuredContent"));
+        // Legacy clients have only the text, and keep the whole budget in it.
+        let legacy = fit(
+            false,
+            json!({ "ok": true, "brief": "x\n".repeat(150_000) }),
+            tool_budget(&json!(1)),
+        )
+        .unwrap();
+        assert!(legacy.text.len() > 300_000);
+        // Past the budget itself it is an error naming size and cap.
+        let message = match fit(true, json!({ "brief": "x\n".repeat(2_500_000) }), 1_000_000) {
+            Ok(_) => panic!("a payload past its budget with no list was returned"),
+            Err(message) => message,
+        };
+        assert!(message.contains("1000000"), "{message}");
+    }
+
+    #[test]
+    fn a_cursor_beside_two_id_bearing_lists_refuses_rather_than_guessing_which_it_pages() {
+        let two = json!({
+            "next_cursor": 40,
+            "events": (1..=40).map(|id| json!({ "id": id, "blob": "b".repeat(2000) })).collect::<Vec<_>>(),
+            "others": (1..=40).map(|id| json!({ "id": id, "blob": "b".repeat(2000) })).collect::<Vec<_>>(),
+        });
+        let message = fit(true, two, 20_000).err().expect("refused");
+        assert!(message.contains("smaller `limit`"), "{message}");
+        // One id-bearing list and one without ids: the cursor is that one's.
+        let one = json!({
+            "next_cursor": 40,
+            "events": (1..=40).map(|id| json!({ "id": id, "blob": "b".repeat(2000) })).collect::<Vec<_>>(),
+            "notes": ["a", "b"],
+        });
+        let structured = fit(true, one, 40_000).unwrap().structured.unwrap();
+        assert!(structured["events"].as_array().unwrap().len() < 40);
+    }
+
+    #[test]
+    fn a_cut_followable_page_says_more_follows_in_the_flag_it_has() {
+        let rows = |n: i64| {
+            (1..=n)
+                .map(|id| json!({ "id": id, "blob": "b".repeat(2000) }))
+                .collect::<Vec<_>>()
+        };
+        for flag in ["has_more", "truncated"] {
+            let page =
+                json!({ flag: false, "next_cursor": 40, "returned": 40, "events": rows(40) });
+            let structured = fit(true, page, 30_000).unwrap().structured.unwrap();
+            let kept = structured["events"].as_array().unwrap();
+            assert!(kept.len() < 40);
+            assert_eq!(structured[flag], true, "{flag}");
+            assert_eq!(structured["next_cursor"], kept.last().unwrap()["id"]);
+        }
+        // An unrelated flag the page does not have is not invented.
+        let page = json!({ "next_cursor": 40, "events": rows(40) });
+        let structured = fit(true, page, 30_000).unwrap().structured.unwrap();
+        assert!(structured.get("has_more").is_none());
     }
 
     #[test]

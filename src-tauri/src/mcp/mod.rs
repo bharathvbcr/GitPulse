@@ -2937,6 +2937,71 @@ mod tests {
         }
     }
 
+    /// Pointer to the longest string in `value`, at any depth.
+    fn longest_string(value: &Value, pointer: &mut String, best: &mut Option<(usize, String)>) {
+        match value {
+            Value::String(text) => {
+                if best.as_ref().is_none_or(|(most, _)| text.len() > *most) {
+                    *best = Some((text.len(), pointer.clone()));
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{index}"));
+                    longest_string(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{}", key.replace('~', "~0").replace('/', "~1")));
+                    longest_string(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Inflate the longest string of a real tool payload to 300 KB of lines (a
+    /// log field: every newline costs six bytes once it is escaped into the text
+    /// block and again as a string), past the text mirror's half-budget but far
+    /// inside the budget, in the modern era. The call must succeed with the
+    /// payload whole in `structuredContent` and meet its `outputSchema`; an
+    /// error here is a tool that fails on a large field the budget could carry.
+    /// False when the payload holds no string.
+    fn probe_a_long_string(name: &str, label: &str, schema: &Value, payload: &Value) -> bool {
+        let mut best = None;
+        longest_string(payload, &mut String::new(), &mut best);
+        let Some((_, pointer)) = best else {
+            return false;
+        };
+        let mut inflated = payload.clone();
+        if let Some(slot) = inflated.pointer_mut(&pointer) {
+            *slot = Value::String("x\n".repeat(150_000));
+        }
+        let fitted = budget::fit(true, inflated.clone(), budget::tool_budget(&json!(1)))
+            .unwrap_or_else(|error| {
+                panic!("{name} on {label}: a long string failed: {error:.200}")
+            });
+        assert_eq!(
+            fitted.structured.as_ref(),
+            Some(&inflated),
+            "{name} on {label}: structuredContent was cut for a string"
+        );
+        let violations: Vec<String> = validate::validate(&inflated, schema)
+            .iter()
+            .map(validate::Violation::render)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "{name} on {label}: a long string violates its outputSchema: {violations:?}"
+        );
+        true
+    }
+
     /// Inflate the largest list of a real tool payload past 200 KiB and fit it
     /// to 64 KiB: the result must still meet the tool's `outputSchema`, say it
     /// was cut, stay inside the budget and keep every top-level key (all seven
@@ -3125,6 +3190,7 @@ mod tests {
 
         let mut validated = std::collections::BTreeSet::new();
         let mut probed = std::collections::BTreeSet::<String>::new();
+        let mut strings_probed = std::collections::BTreeSet::<String>::new();
         let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         let mut check =
             |name: &str,
@@ -3162,6 +3228,9 @@ mod tests {
                 validated.insert(name.to_string());
                 if probe_under_a_small_budget(name, label, schema, &payload) {
                     probed.insert(name.to_string());
+                }
+                if probe_a_long_string(name, label, schema, &payload) {
+                    strings_probed.insert(name.to_string());
                 }
             };
         for repo in [&healthy, &broken, &untrusted, &ledgered, &missing, &indexed] {
@@ -3295,6 +3364,19 @@ mod tests {
             probed.len() >= 5,
             "only {probed:?} could be inflated and budgeted"
         );
+        // Every advertised tool whose result holds a string was run with a
+        // long one at the mirror threshold.
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("name");
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            assert!(
+                strings_probed.contains(name) || !validated.contains(name),
+                "{name} has no string to inflate in any payload this test reached: \
+                 strings probed: {strings_probed:?}"
+            );
+        }
 
         // Every advertised tool is validated or explicitly exempt. A tool whose
         // every call errored was never checked, and says why.

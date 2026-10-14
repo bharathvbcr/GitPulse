@@ -650,6 +650,83 @@ fn a_slow_but_live_reader_does_not_end_the_session() {
 }
 
 #[test]
+fn a_task_with_logs_near_the_cap_is_returned_over_stdio_not_refused_as_too_large() {
+    // The logs appear twice (in the task and in the brief) and every newline
+    // costs six bytes once escaped into the text block, so ~117 KB of lines
+    // passes the text mirror's half-budget long before the 4 MiB budget. The
+    // call succeeded before the budgets existed and must still.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let canonical = dir.path().canonicalize().expect("canonical repo");
+    let repo = canonical.to_str().expect("utf8").to_string();
+    let init = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .arg(&canonical)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status_locked()
+        .expect("spawn git");
+    assert!(init.success(), "git init");
+    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
+    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
+
+    let logs = "a log line with some text\n".repeat(4_500);
+    assert!(logs.len() > 100_000 && logs.len() < 256 * 1024);
+    let (mut server, stdout) = Server::start_undrained(&[]);
+    let mut reader = BufReader::new(stdout);
+    let mut ask = |server: &mut Server, id: &str, name: &str, arguments: Value| -> Value {
+        server.write(
+            request(
+                json!(id),
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .as_bytes(),
+        );
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a response");
+        let response: Value = serde_json::from_str(&line).expect("one JSON-RPC line");
+        assert_eq!(response["id"], json!(id), "{response:.300}");
+        response
+    };
+    let added = ask(
+        &mut server,
+        "add",
+        "gitpulse_add_task",
+        json!({
+            "repo_path": repo, "task_id": "gp-big-logs", "title": "Large logs",
+            "status": "ready", "priority": 2, "logs": logs,
+        }),
+    );
+    assert_eq!(added["result"]["isError"], false, "{added:.400}");
+
+    let got = ask(
+        &mut server,
+        "get",
+        "gitpulse_get_task",
+        json!({ "repo_path": repo, "task_id": "gp-big-logs" }),
+    );
+    assert_eq!(
+        got["result"]["isError"],
+        false,
+        "a task with {} bytes of logs was refused: {got:.400}",
+        logs.len()
+    );
+    let structured = &got["result"]["structuredContent"];
+    assert!(
+        structured["brief"]
+            .as_str()
+            .is_some_and(|brief| brief.contains("a log line with some text")),
+        "structuredContent is not whole: {structured:.300}"
+    );
+    assert!(
+        structured.get("result_truncation").is_none(),
+        "the result was cut although it fits"
+    );
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+}
+
+#[test]
 fn a_client_that_never_reads_ends_the_session_after_the_write_window() {
     // The other side of the slow reader: past the (configurable) write window
     // the client is judged stalled, and since a partial line may be on the pipe
