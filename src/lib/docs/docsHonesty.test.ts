@@ -130,6 +130,21 @@ describe("docsRenameHonesty (adversarial)", () => {
     expect(line).toContain("5000");
   });
 
+  it("shows the first five of each list, says how many more, and keeps the true count", () => {
+    const names = Array.from({ length: 8 }, (_, i) => `docs/n${i}.md`);
+    const line = docsRenameHonesty({
+      ...base,
+      complete: false,
+      skippedConflict: names,
+      failed: names.map((path) => ({ path, error: "e".repeat(500) })),
+    }) ?? "";
+    expect(line).toContain("8 note(s) changed during the rename");
+    expect(line).toContain("docs/n4.md");
+    expect(line).not.toContain("docs/n5.md");
+    expect(line.match(/and 3 more/g)?.length).toBe(2);
+    expect(line.length).toBeLessThan(2000);
+  });
+
   it("names a failed rewrite even when the complete flag disagrees", () => {
     const line = docsRenameHonesty({
       ...base,

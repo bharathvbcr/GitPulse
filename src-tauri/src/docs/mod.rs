@@ -647,16 +647,29 @@ fn index_key(repo: &Path) -> Option<(PathBuf, StatKey)> {
 
 /// Tracked markdown paths from `git ls-files`, never a filesystem walk.
 fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
+    #[cfg(test)]
+    probe::note_listing();
+    ls_files_markdown(repo, &[])
+}
+
+/// Markdown files git does not track and does not ignore. The vault never
+/// holds them, so anything that searches or rewrites across it did not see
+/// them. Listed the same way, and bounded the same way, as the tracked set.
+fn list_untracked_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
+    ls_files_markdown(repo, &["--others", "--exclude-standard"])
+}
+
+fn ls_files_markdown(repo: &Path, selection: &[&str]) -> Result<Vec<String>, String> {
     let patterns: Vec<String> = MARKDOWN_EXTENSIONS
         .iter()
         .map(|extension| format!(":(icase)*.{extension}"))
         .collect();
-    let args: Vec<&str> = ["-c", "core.quotepath=off", "ls-files", "-z", "--"]
+    let args: Vec<&str> = ["-c", "core.quotepath=off", "ls-files", "-z"]
         .into_iter()
+        .chain(selection.iter().copied())
+        .chain(["--"])
         .chain(patterns.iter().map(String::as_str))
         .collect();
-    #[cfg(test)]
-    probe::note_listing();
     let stdout = git_text(repo, &args)?;
     let mut paths: Vec<String> = stdout
         .split('\0')

@@ -52,7 +52,8 @@ pub struct DocRenameOutcome {
     /// rewritten vault reads them. A reference-style definition
     /// (`[ref]: Note.md`) is the case this exists for: it is not rewritten.
     pub left_broken: Vec<BrokenLink>,
-    /// What the vault the rename was planned from covered. A note it did not
+    /// What the rename was planned from covered: the vault plus the untracked
+    /// markdown files around it. A note it did not
     /// scan was neither searched for links nor rewritten.
     pub scan: DocsStatus,
 }
@@ -62,6 +63,9 @@ pub struct DocRenameOutcome {
 pub struct DocRenamePlan<'a> {
     /// The move `GitWriter::move_path` decided on.
     pub mv: &'a MovePlan,
+    /// The normalized source and destination paths, as the move uses them.
+    pub from: &'a str,
+    pub to: &'a str,
     /// Every path whose content will be rewritten after the move. The moved
     /// note appears under its new path.
     pub rewrites: &'a [String],
@@ -107,12 +111,36 @@ pub fn rename_doc(
     if vault.notes().iter().any(|n| n.path == to) {
         return Err(format!("destination already exists in vault: {to}"));
     }
+    // The vault names a note by its path without the extension, lowercased, so
+    // `B.md` and `B.mdx` are one name: moving a note onto it would make every
+    // link written for the other note resolve here instead. Asked of the vault
+    // itself (a root-relative destination), not decided by a rule of ours.
+    if let Some(other) = vault
+        .resolve_from(&from, &format!("/{to}"), None)
+        .map(|resolved| resolved.path)
+        .filter(|path| {
+            path != &from
+                && strip_markdown_extension(path).to_lowercase()
+                    == strip_markdown_extension(&to).to_lowercase()
+        })
+    {
+        return Err(format!(
+            "destination {to} shares its link name with the existing note {other}; \
+             links to either would resolve to the wrong one"
+        ));
+    }
     // Filesystem authority: refuse overwriting an on-disk file the index
     // somehow missed.
     let to_abs = sandbox_join(&repo, &to)?;
     if to_abs.exists() {
         return Err(format!("destination already exists on disk: {to}"));
     }
+
+    // Untracked notes are outside the vault, so their links were not searched
+    // either: counted with the notes the vault skipped, never quietly absent.
+    let mut scan = built.status.clone();
+    let untracked = super::list_untracked_markdown_paths(&repo)?;
+    scan.not_scanned = scan.not_scanned.saturating_add(untracked.len() as u32);
 
     let edits = plan_edits(vault, &from, &to)?;
     let left_broken = links_the_rename_breaks(&repo, vault, &from, &to, &edits);
@@ -123,6 +151,8 @@ pub fn rename_doc(
     GitWriter::move_path(repo_path, &from, &to, |mv| {
         gate(&DocRenamePlan {
             mv,
+            from: &from,
+            to: &to,
             rewrites: &rewrites,
         })
     })?;
@@ -169,7 +199,7 @@ pub fn rename_doc(
         skipped_conflict,
         failed,
         left_broken,
-        scan: built.status.clone(),
+        scan,
     })
 }
 
@@ -439,6 +469,11 @@ fn escape_path(path: &str, escaped: bool, bracketed: bool) -> String {
             ')' => out.push_str("%29"),
             '<' => out.push_str("%3C"),
             '>' => out.push_str("%3E"),
+            // `#` starts an anchor, `?` a query, and a backslash is a path
+            // separator to some readers: none may stand for itself in a path.
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '\\' => out.push_str("%5C"),
             ' ' if escaped || !bracketed => out.push_str("%20"),
             '%' if escaped => out.push_str("%25"),
             _ => out.push(c),

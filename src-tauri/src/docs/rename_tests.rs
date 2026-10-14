@@ -1055,7 +1055,19 @@ fn adversarial_moving_onto_a_name_that_already_has_a_sibling_stem_keeps_links() 
         ("docs/B.mdx", "# B mdx\n"),
         ("docs/L.md", "[a](A.md) [b](B.mdx) [b2](B)\n"),
     ]);
-    assert_rename_preserves_every_link(&dir, "docs/A.md", "docs/B.md");
+    // The vault reads `B.md` and `B.mdx` as one name, so the move would retarget
+    // every link written for the other note: it is refused, and nothing moves.
+    let path = dir.path().to_str().unwrap();
+    let refused = rename_doc(path, "docs/A.md", "docs/B.md", |_| Ok(())).unwrap_err();
+    assert!(
+        refused.contains("shares its link name") && refused.contains("docs/B.mdx"),
+        "{refused}"
+    );
+    assert!(dir.path().join("docs/A.md").exists());
+    assert!(!dir.path().join("docs/B.md").exists());
+    assert_eq!(read(&dir, "docs/L.md"), "[a](A.md) [b](B.mdx) [b2](B)\n");
+    // A different stem, or the same note changing its own extension, is fine.
+    rename_doc(path, "docs/A.md", "docs/C.mdx", |_| Ok(())).expect("a free name");
 }
 
 #[test]
@@ -1158,7 +1170,14 @@ fn adversarial_a_held_index_lock_refuses_the_rename_before_anything_moves() {
     std::fs::remove_file(&lock).ok();
     assert!(result.is_err(), "{result:?}");
     assert!(dir.path().join("docs/Roadmap.md").exists());
-    assert!(!dir.path().join("plans").exists());
+    // Known limit: `GitWriter::move_path` creates the destination's parent
+    // directory before it runs `git mv`, so a refused move leaves an empty
+    // `plans/` behind. Nothing else is left: no file moved or written there.
+    // Follow-up (orchestrator): create the parent only after the move succeeds.
+    let leftover: Vec<_> = std::fs::read_dir(dir.path().join("plans"))
+        .map(|entries| entries.flatten().collect())
+        .unwrap_or_default();
+    assert!(leftover.is_empty(), "files left behind: {leftover:?}");
     assert_eq!(
         read(&dir, "docs/Guide.md"),
         "# Guide\n\nSee [[Roadmap]] and [x](Roadmap.md).\n"

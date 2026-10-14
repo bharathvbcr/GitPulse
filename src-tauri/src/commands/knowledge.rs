@@ -115,7 +115,12 @@ pub(super) fn docs_rename_guarded(
     let fold = VerdictFold::default();
     let outcome = crate::docs::rename_doc(repo_path, from, to, |plan| {
         fold.record(guard_move(repo_path, plan.mv)?);
-        for path in plan.rewrites {
+        // The move is judged as the command it runs, but a write gate that
+        // knows paths refuses by path: the source leaves and the destination
+        // appears whether or not either note has links to rewrite.
+        fold.record(guard_file(repo_path, plan.from, "delete")?);
+        fold.record(guard_file(repo_path, plan.to, "modify")?);
+        for path in plan.rewrites.iter().filter(|path| path.as_str() != plan.to) {
             fold.record(guard_file(repo_path, path, "modify")?);
         }
         Ok(())
