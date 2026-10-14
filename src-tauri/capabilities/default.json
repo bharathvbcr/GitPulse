@@ -296,6 +296,7 @@
     "allow-cmd-worktree-merge-teardown",
     "allow-cmd-worktree-routes",
     "allow-cmd-worktree-task",
-    "allow-cmd-write-file-content"
+    "allow-cmd-write-file-content",
+    "allow-cmd-create-file"
   ]
 }

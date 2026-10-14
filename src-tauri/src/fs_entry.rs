@@ -777,7 +777,10 @@ mod tests {
             },
             0
         );
-        crate::diff::write_regular(&path, b"new").unwrap();
+        crate::diff::write_regular_expecting(&path, crate::diff::Expect::Any, |_| {
+            Ok(b"new".to_vec())
+        })
+        .unwrap();
         let saved = std::fs::File::open(&path).unwrap();
         let after = saved.metadata().unwrap();
         let mut actual = [0u8; 64];

@@ -5,6 +5,27 @@ use std::path::Path;
 #[cfg(not(windows))]
 use std::path::PathBuf;
 
+/// The three ways an entry transaction reports that another writer got there
+/// first. [`concurrent_change`] recognises them so a save can answer with a
+/// typed conflict rather than a string a caller would have to parse.
+const CHANGED_BEFORE_PUBLISH: &str =
+    "The working file or its directory changed; reload before saving";
+const NEW_ENTRY_APPEARED: &str = "Cannot create the resolution without replacing a new entry";
+const RACED_AFTER_PUBLISH: &str = "An external edit raced the save";
+/// The Windows transaction's own wording for the same condition.
+const WINDOWS_SOURCE_CHANGED: &str = "Conflict source changed";
+
+fn concurrent_change(message: &str) -> bool {
+    [
+        CHANGED_BEFORE_PUBLISH,
+        NEW_ENTRY_APPEARED,
+        RACED_AFTER_PUBLISH,
+        WINDOWS_SOURCE_CHANGED,
+    ]
+    .iter()
+    .any(|known| message.starts_with(known))
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -177,6 +198,15 @@ mod unix {
             return Err("Only regular files can be saved".into());
         }
         read_at_with_limit(&directory, &target, cap)
+    }
+
+    /// What stands at `path` for a create: the entry itself in whatever form
+    /// (file, directory, link), never its target. Unlike [`read_for_save`] a
+    /// directory is an answer here, not an error. The parent is created, which
+    /// is what New Folder needs for its `.gitkeep`.
+    pub(super) fn read_for_create(path: &Path) -> Result<Worktree, String> {
+        let directory = crate::fs_entry::pin_parent(path, true).map_err(|e| e.to_string())?;
+        read_at(&directory, &name(path)?)
     }
 
     pub struct Recovery {
@@ -398,7 +428,7 @@ mod unix {
         if (still_here.dev(), still_here.ino()) != (anchored.dev(), anchored.ino())
             || read_at_with_limit(&directory, &target, cap)? != *source
         {
-            return Err("The working file or its directory changed; reload before saving".into());
+            return Err(CHANGED_BEFORE_PUBLISH.into());
         }
         if source.mode == "missing" {
             // SAFETY: linkat without AT_SYMLINK_FOLLOW links the entry itself;
@@ -413,10 +443,7 @@ mod unix {
                 )
             } != 0
             {
-                return Err(format!(
-                    "Cannot create the resolution without replacing a new entry: {}",
-                    error()
-                ));
+                return Err(format!("{NEW_ENTRY_APPEARED}: {}", error()));
             }
             directory.sync_all().map_err(|e| e.to_string())?;
             return Ok(None);
@@ -433,7 +460,7 @@ mod unix {
         }
         recovery.keep = true;
         if read_at_with_limit(&directory, &recovery.name, cap)? != *source {
-            return Err(format!("An external edit raced the save. Review the working file and the displaced content retained at {} before staging", recovery.path.display()));
+            return Err(format!("{RACED_AFTER_PUBLISH}. Review the working file and the displaced content retained at {} before staging", recovery.path.display()));
         }
         directory.sync_all().map_err(|e| {
             format!(
@@ -508,47 +535,184 @@ pub(super) fn replace(
     }
 }
 
+/// A version of a file's content, small enough to carry in an editor draft and
+/// compare on save: `"<len>:<fnv1a64 hex>"` of the raw bytes, or `"absent"`
+/// for a path with no file.
+///
+/// Content rather than mtime and size on purpose. The editor's textarea hands
+/// back LF text while the save re-adds CRLF, so only the backend can say what
+/// the bytes on disk are; and a timestamp misses a same-size rewrite inside
+/// one tick while reporting a conflict for a bare `touch`. FNV is not a
+/// security boundary: this guards against a lost update, and a 2^-64 collision
+/// is the same risk as the write racing in just after the check.
+pub(crate) fn content_token(bytes: Option<&[u8]>) -> String {
+    match bytes {
+        None => "absent".into(),
+        Some(bytes) => format!(
+            "{}:{:016x}",
+            bytes.len(),
+            crate::ledger::ids::fnv1a64(bytes)
+        ),
+    }
+}
+
+/// What a write requires of the entry it replaces.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Expect<'a> {
+    /// Replace whatever regular file is there, or create it.
+    Any,
+    /// Replace only a regular file holding exactly these bytes.
+    Bytes(&'a [u8]),
+    /// Replace only the entry whose [`content_token`] is this.
+    Token(&'a str),
+    /// Create only: nothing may stand at the path, in any form.
+    Absent,
+}
+
+/// Why a write did not happen, or failed part-way.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// An [`Expect::Absent`] write found an entry, including one that
+    /// appeared between the check and the publish.
+    AlreadyExists,
+    /// The entry is not what the caller expected; `actual` is its token now.
+    Changed {
+        actual: String,
+    },
+    Other(String),
+}
+
+impl From<String> for WriteFailure {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists => f.write_str("File already exists"),
+            Self::Changed { .. } => f.write_str("The file changed on disk"),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+/// The token of what is at `path` now, for a conflict report.
+fn current_token(path: &Path) -> String {
+    #[cfg(unix)]
+    let now = unix::read(path);
+    #[cfg(windows)]
+    let now = windows::read(path);
+    #[cfg(not(any(unix, windows)))]
+    let now: Result<Worktree, String> = Err(String::new());
+    match now {
+        Ok(entry) if matches!(entry.mode.as_str(), "missing" | "100644" | "100755") => {
+            content_token(entry.bytes.as_deref())
+        }
+        Ok(_) => "other".into(),
+        Err(_) => "unreadable".into(),
+    }
+}
+
+/// Reads `path` for a write: a create needs the entry in whatever form it has
+/// (and its parent made), a save needs a regular file it may write.
+#[cfg(unix)]
+fn read_source(path: &Path, expected: Expect<'_>, cap: usize) -> Result<Worktree, String> {
+    if matches!(expected, Expect::Absent) {
+        unix::read_for_create(path)
+    } else {
+        unix::read_for_save(path, cap)
+    }
+}
+
+#[cfg(windows)]
+fn read_source(path: &Path, expected: Expect<'_>, cap: usize) -> Result<Worktree, String> {
+    if matches!(expected, Expect::Absent) && std::fs::symlink_metadata(path).is_ok() {
+        // Any entry at all refuses a create; its form does not matter.
+        return Ok(Worktree {
+            bytes: None,
+            mode: "160000".into(),
+        });
+    }
+    windows::read_for_save(path, cap)
+}
+
+/// Maps a failed publish to the typed failure when another writer caused it.
+fn settled(path: &Path, expected: Expect<'_>, message: String) -> WriteFailure {
+    if !concurrent_change(&message) {
+        WriteFailure::Other(message)
+    } else if matches!(expected, Expect::Absent) {
+        WriteFailure::AlreadyExists
+    } else {
+        WriteFailure::Changed {
+            actual: current_token(path),
+        }
+    }
+}
+
+/// The one write owner: replaces or creates the regular file at `path` with
+/// what `encode` returns, provided the entry is what `expected` says.
+///
 /// Ordinary saves share the anchored entry transaction used by conflict saves.
 /// They retain the editor's file-size budget and retain displaced content when
 /// an external edit races publication.
-pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
-    write_regular_expecting(path, content, None).map(|_| ())
-}
-
-/// [`write_regular`] that writes only over `expected` when one is given.
 ///
-/// The comparison is made against the bytes read under the same anchored
-/// directory the replacement then checks again, so there is no window between
-/// "these are the bytes I planned from" and the write. `Ok(false)` means the
-/// file no longer holds `expected` (changed, or gone) and nothing was written;
-/// `Err` is a failure to read or write. With `None` this is exactly
-/// `write_regular`, which delegates here so writes keep one owner.
+/// `encode` is handed the bytes read under the same anchored directory the
+/// replacement then re-checks, so the bytes a caller plans from, the bytes the
+/// expectation is judged against and the bytes the swap displaces are one
+/// read, with no window between them. Returns the [`content_token`] of the
+/// bytes now on disk. Nothing is written when the expectation fails.
 pub(crate) fn write_regular_expecting(
     path: &Path,
-    content: &[u8],
-    expected: Option<&[u8]>,
-) -> Result<bool, String> {
+    expected: Expect<'_>,
+    encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
+) -> Result<String, WriteFailure> {
+    write_regular_after_check(path, expected, encode, || {})
+}
+
+/// [`write_regular_expecting`] with a seam that runs once the expectation has
+/// held and before the publish, so a test can be the other writer.
+fn write_regular_after_check(
+    path: &Path,
+    expected: Expect<'_>,
+    encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
+    after_check: impl FnOnce(),
+) -> Result<String, WriteFailure> {
     let cap = crate::engine::budget::MAX_FILE_BYTES as usize;
-    if content.len() > cap {
-        return Err(format!(
-            "File exceeds the {} MiB save limit",
-            cap / (1024 * 1024)
-        ));
-    }
-    #[cfg(unix)]
-    let source = unix::read_for_save(path, cap)?;
-    #[cfg(windows)]
-    let source = windows::read_for_save(path, cap)?;
     #[cfg(any(unix, windows))]
     {
-        if !matches!(source.mode.as_str(), "missing" | "100644" | "100755") {
-            return Err("Only regular files can be saved".into());
+        let source = read_source(path, expected, cap)?;
+        if matches!(expected, Expect::Absent) {
+            if source.mode != "missing" {
+                return Err(WriteFailure::AlreadyExists);
+            }
+        } else if !matches!(source.mode.as_str(), "missing" | "100644" | "100755") {
+            return Err(WriteFailure::Other(
+                "Only regular files can be saved".into(),
+            ));
         }
-        if expected.is_some_and(|expected| source.bytes.as_deref() != Some(expected)) {
-            return Ok(false);
+        let existing = source.bytes.as_deref();
+        let changed = match expected {
+            Expect::Bytes(want) => existing != Some(want),
+            Expect::Token(want) => content_token(existing) != want,
+            Expect::Any | Expect::Absent => false,
+        };
+        if changed {
+            return Err(WriteFailure::Changed {
+                actual: content_token(existing),
+            });
         }
+        let content = encode(existing)?;
+        if content.len() > cap {
+            return Err(WriteFailure::Other(format!(
+                "File exceeds the {} MiB save limit",
+                cap / (1024 * 1024)
+            )));
+        }
+        let token = content_token(Some(&content));
         let next = Worktree {
-            bytes: Some(content.to_vec()),
+            bytes: Some(content),
             mode: if source.mode == "100755" {
                 "100755"
             } else {
@@ -556,18 +720,135 @@ pub(crate) fn write_regular_expecting(
             }
             .into(),
         };
+        after_check();
         #[cfg(unix)]
-        let saved = unix::replace_with_limit(path, &source, &next, cap)?;
+        let saved = unix::replace_with_limit(path, &source, &next, cap);
         #[cfg(windows)]
-        let saved = windows::replace_with_limit(path, &source, &next, cap as u64)?;
+        let saved = windows::replace_with_limit(path, &source, &next, cap as u64);
+        let saved = saved.map_err(|message| settled(path, expected, message))?;
         if let Some(mut original) = saved {
             original.keep = false;
         }
-        Ok(true)
+        Ok(token)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (path, expected);
-        Err("Atomic file saves are unavailable on this platform".into())
+        let _ = (path, expected, encode, after_check, cap);
+        Err(WriteFailure::Other(
+            "Atomic file saves are unavailable on this platform".into(),
+        ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod write_tests {
+    use super::*;
+
+    fn dir() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        (root, canonical)
+    }
+
+    #[test]
+    fn create_does_not_replace_file_created_after_check() {
+        let (_root, root) = dir();
+        let target = root.join("new.txt");
+        let planted = target.clone();
+        let result = write_regular_after_check(
+            &target,
+            Expect::Absent,
+            |_| Ok(Vec::new()),
+            || std::fs::write(&planted, b"someone else's work").unwrap(),
+        );
+        assert_eq!(result, Err(WriteFailure::AlreadyExists));
+        assert_eq!(std::fs::read(&target).unwrap(), b"someone else's work");
+    }
+
+    #[test]
+    fn create_makes_a_missing_parent_and_a_zero_byte_file() {
+        let (_root, root) = dir();
+        let target = root.join("a/b/.gitkeep");
+        let token = write_regular_expecting(&target, Expect::Absent, |_| Ok(Vec::new())).unwrap();
+        assert_eq!(token, "0:cbf29ce484222325");
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    #[test]
+    fn create_refuses_a_file_a_directory_and_a_link_without_touching_them() {
+        let (_root, root) = dir();
+        std::fs::write(root.join("f"), b"keep").unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(root.join("f"), root.join("l")).unwrap();
+        for name in ["f", "d", "l"] {
+            let result =
+                write_regular_expecting(&root.join(name), Expect::Absent, |_| Ok(Vec::new()));
+            assert_eq!(result, Err(WriteFailure::AlreadyExists), "{name}");
+        }
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"keep");
+        assert!(root.join("d").is_dir());
+        assert!(root.join("l").is_symlink());
+    }
+
+    #[test]
+    fn a_token_save_is_refused_when_the_bytes_moved_and_succeeds_when_they_did_not() {
+        let (_root, root) = dir();
+        let target = root.join("t.txt");
+        std::fs::write(&target, b"one\n").unwrap();
+        let base = content_token(Some(b"one\n"));
+        std::fs::write(&target, b"two\n").unwrap();
+        let refused =
+            write_regular_expecting(&target, Expect::Token(&base), |_| Ok(b"mine\n".to_vec()));
+        assert_eq!(
+            refused,
+            Err(WriteFailure::Changed {
+                actual: content_token(Some(b"two\n"))
+            })
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"two\n");
+        let current = content_token(Some(b"two\n"));
+        let saved =
+            write_regular_expecting(&target, Expect::Token(&current), |_| Ok(b"mine\n".to_vec()))
+                .unwrap();
+        assert_eq!(saved, content_token(Some(b"mine\n")));
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine\n");
+    }
+
+    #[test]
+    fn a_save_that_loses_the_race_is_a_typed_conflict_and_keeps_the_other_writers_bytes() {
+        let (_root, root) = dir();
+        let target = root.join("t.txt");
+        std::fs::write(&target, b"one\n").unwrap();
+        let base = content_token(Some(b"one\n"));
+        let rival = target.clone();
+        let result = write_regular_after_check(
+            &target,
+            Expect::Token(&base),
+            |_| Ok(b"mine\n".to_vec()),
+            || std::fs::write(&rival, b"theirs, longer\n").unwrap(),
+        );
+        assert_eq!(
+            result,
+            Err(WriteFailure::Changed {
+                actual: content_token(Some(b"theirs, longer\n"))
+            })
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs, longer\n");
+    }
+
+    #[test]
+    fn an_absent_token_means_the_file_was_not_there() {
+        assert_eq!(content_token(None), "absent");
+        assert_ne!(content_token(Some(b"")), "absent");
+        let (_root, root) = dir();
+        let target = root.join("gone.txt");
+        let refused = write_regular_expecting(&target, Expect::Token("1:00"), |_| Ok(Vec::new()));
+        assert_eq!(
+            refused,
+            Err(WriteFailure::Changed {
+                actual: "absent".into()
+            })
+        );
+        assert!(!target.exists());
     }
 }
