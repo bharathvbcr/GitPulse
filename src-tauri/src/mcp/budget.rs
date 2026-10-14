@@ -304,7 +304,7 @@ fn cuttable_lists(root: &Value, min_len: usize) -> Vec<String> {
     }
     let mut found = Vec::new();
     walk(root, min_len, &mut String::new(), &mut found);
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     found.into_iter().map(|(_, pointer)| pointer).collect()
 }
 
