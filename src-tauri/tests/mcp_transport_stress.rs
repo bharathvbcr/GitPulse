@@ -669,7 +669,7 @@ fn a_task_with_logs_near_the_cap_is_returned_over_stdio_not_refused_as_too_large
     let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
 
-    let logs = "a log line with some text\n".repeat(4_500);
+    let logs = "ab\n".repeat(40_000);
     assert!(logs.len() > 100_000 && logs.len() < 256 * 1024);
     let (mut server, stdout) = Server::start_undrained(&[]);
     let mut reader = BufReader::new(stdout);
@@ -715,7 +715,7 @@ fn a_task_with_logs_near_the_cap_is_returned_over_stdio_not_refused_as_too_large
     assert!(
         structured["brief"]
             .as_str()
-            .is_some_and(|brief| brief.contains("a log line with some text")),
+            .is_some_and(|brief| brief.contains("ab\nab\n")),
         "structuredContent is not whole: {structured:.300}"
     );
     assert!(
