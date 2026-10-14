@@ -1024,4 +1024,648 @@ mod tests {
         let mapped = settle(got);
         assert_eq!(mapped[chain.last().unwrap()], CommitSignature::Unknown);
     }
+
+    // ------------------------------------------------------------------
+    // Adversarial cases (CARD 16). A test named `break_*` currently FAILS and
+    // is evidence of a defect; the others pin behavior that held under attack.
+    // ------------------------------------------------------------------
+
+    /// What git's own parser decides for `object`: does `%G?` start a verifier
+    /// for it? The oracle the header classifier must agree with.
+    #[cfg(unix)]
+    fn git_spawns_a_verifier_for(object: &[u8]) -> bool {
+        use crate::test_support::{
+            counting_verifier, git_in, hash_object, use_verifier, verifier_spawns,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let oid = hash_object(dir.path(), "commit", object);
+        git_in(dir.path(), &["update-ref", "refs/heads/main", &oid]);
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(dir.path(), &script);
+        // Without an allowed-signers file git refuses an SSH signature before
+        // it reaches any program.
+        let signers = stub.path().join("allowed_signers");
+        std::fs::write(&signers, "a@b ssh-ed25519 AAAA\n").unwrap();
+        git_in(
+            dir.path(),
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                signers.to_str().unwrap(),
+            ],
+        );
+        // git may die on a signature value it cannot place (`bad/incompatible
+        // signature`); whether it got as far as a verifier is the question.
+        let _ = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%G?"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        verifier_spawns(&stub) > 0
+    }
+
+    const TREE: &str = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n";
+
+    /// The classifier says Pgp/Ssh/X509 exactly when git would run a verifier.
+    /// Every divergence is a commit the pane labels differently from what a
+    /// verification of it does.
+    #[cfg(unix)]
+    #[test]
+    fn the_header_classifier_agrees_with_gits_own_parser_on_hostile_objects() {
+        let sig = |h: &str, a: &str| crate::test_support::fake_signature_header(h, a);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("plain pgp", format!("{TREE}{}\nmsg\n", sig("gpgsig", "PGP SIGNATURE")).into_bytes()),
+            ("plain ssh", format!("{TREE}{}\nmsg\n", sig("gpgsig", "SSH SIGNATURE")).into_bytes()),
+            ("plain x509", format!("{TREE}{}\nmsg\n", sig("gpgsig", "SIGNED MESSAGE")).into_bytes()),
+            ("unsigned", format!("{TREE}\nmsg\n").into_bytes()),
+            (
+                "armor quoted in the body",
+                format!("{TREE}\n-----BEGIN PGP SIGNATURE-----\nx\n").into_bytes(),
+            ),
+            (
+                "gpgsig at the start of the message",
+                format!("{TREE}\ngpgsig -----BEGIN PGP SIGNATURE-----\nx\n").into_bytes(),
+            ),
+            (
+                "gpgsig-sha256 header in a sha1 repository",
+                format!("{TREE}{}\nmsg\n", sig("gpgsig-sha256", "PGP SIGNATURE")).into_bytes(),
+            ),
+            (
+                "two gpgsig headers, ssh first",
+                format!(
+                    "{TREE}{}{}\nmsg\n",
+                    sig("gpgsig", "SSH SIGNATURE"),
+                    sig("gpgsig", "PGP SIGNATURE")
+                )
+                .into_bytes(),
+            ),
+            (
+                "CRLF blank line before a body that says gpgsig",
+                format!("{TREE}\r\nmsg\r\ngpgsig -----BEGIN PGP SIGNATURE-----\r\n \r\n abc\r\n -----END PGP SIGNATURE-----\r\n")
+                    .into_bytes(),
+            ),
+            (
+                "gpgsig with a value that is no armor",
+                format!("{TREE}gpgsig hello\n\nmsg\n").into_bytes(),
+            ),
+            (
+                "gpgsig with an empty value",
+                format!("{TREE}gpgsig \n\nmsg\n").into_bytes(),
+            ),
+        ];
+        let mut divergences = Vec::new();
+        for (name, object) in &cases {
+            let ours = matches!(
+                classify_header(object),
+                CommitSignature::Pgp | CommitSignature::Ssh | CommitSignature::X509
+            );
+            let gits = git_spawns_a_verifier_for(object);
+            if ours != gits {
+                divergences.push(format!(
+                    "{name}: classifier says signed={ours}, git spawns a verifier={gits}"
+                ));
+            }
+        }
+        assert!(divergences.is_empty(), "{divergences:#?}");
+    }
+
+    #[test]
+    fn a_message_that_quotes_armor_is_not_a_signature_however_it_is_framed() {
+        for body in [
+            "-----BEGIN PGP SIGNATURE-----\n",
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n",
+            "gpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n",
+            "\ngpgsig -----BEGIN PGP SIGNATURE-----\n",
+        ] {
+            let object = format!("{TREE}\n{body}");
+            assert_eq!(
+                classify_header(object.as_bytes()),
+                CommitSignature::None,
+                "{body:?}"
+            );
+        }
+        // Headers end at the first empty line even when the commit has no body.
+        assert_eq!(
+            classify_header(format!("{TREE}\ngpgsig x\n").as_bytes()),
+            CommitSignature::None
+        );
+    }
+
+    #[test]
+    fn crlf_header_lines_still_classify_by_their_armor() {
+        let object = b"tree x\r\nauthor a\r\ngpgsig -----BEGIN PGP SIGNATURE-----\r\n \r\n abc\r\n\r\nmsg\r\n";
+        assert_eq!(classify_header(object), CommitSignature::Pgp);
+        let ssh = b"gpgsig -----BEGIN SSH SIGNATURE-----\r\n";
+        assert_eq!(classify_header(ssh), CommitSignature::Ssh);
+    }
+
+    #[test]
+    fn two_signature_headers_answer_with_the_first_and_an_unarmored_one_is_other() {
+        let two = format!(
+            "{TREE}gpgsig -----BEGIN SSH SIGNATURE-----\n x\ngpgsig -----BEGIN PGP SIGNATURE-----\n y\n\nm\n"
+        );
+        assert_eq!(classify_header(two.as_bytes()), CommitSignature::Ssh);
+        assert_eq!(
+            classify_header(format!("{TREE}gpgsig \n\nm\n").as_bytes()),
+            CommitSignature::Other
+        );
+        assert_eq!(
+            classify_header(format!("{TREE}gpgsig\n\nm\n").as_bytes()),
+            CommitSignature::None
+        );
+    }
+
+    /// A 10 MiB single header line: classified without scanning past the bound
+    /// and without being called unsigned.
+    #[test]
+    fn a_ten_mebibyte_header_line_is_bounded_and_not_called_unsigned() {
+        let mut huge = format!("{TREE}x-big ").into_bytes();
+        huge.extend(std::iter::repeat_n(b'a', 10 * 1024 * 1024));
+        huge.extend_from_slice(b"\ngpgsig -----BEGIN PGP SIGNATURE-----\n\nmsg\n");
+        let started = Instant::now();
+        assert_eq!(classify_header(&huge), CommitSignature::Unknown);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // A signature first, then 10 MiB of armor: read from its first line.
+        let mut signed = b"gpgsig -----BEGIN PGP SIGNATURE-----\n ".to_vec();
+        signed.extend(std::iter::repeat_n(b'a', 10 * 1024 * 1024));
+        assert_eq!(classify_header(&signed), CommitSignature::Pgp);
+    }
+
+    /// Whole objects are read into memory by `cat-file --batch` before the
+    /// header is looked at. A 10 MiB commit message is read in full for a
+    /// 300-byte answer; four of them exhaust the 32 MiB budget and the commits
+    /// behind them become `Unknown`. Records the cost the header-only read of
+    /// `log --pretty=raw` would not pay.
+    #[test]
+    fn large_messages_cost_the_batch_its_budget_but_never_misreport() {
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-b", "main"]);
+        let big = "x".repeat(10 * 1024 * 1024);
+        let mut chain: Vec<String> = Vec::new();
+        for n in 0..5 {
+            let parents: Vec<&str> = chain.last().map(String::as_str).into_iter().collect();
+            let message = if n < 4 { big.as_str() } else { "small" };
+            let oid = crate::test_support::raw_commit(
+                dir.path(),
+                &parents,
+                &pgp(),
+                message,
+                1_700_000_000 + n,
+            );
+            chain.push(oid);
+        }
+        let got = commit_signatures(dir.path(), &chain);
+        let known = chain
+            .iter()
+            .filter(|o| got[*o] == CommitSignature::Pgp)
+            .count();
+        let unknown = chain
+            .iter()
+            .filter(|o| got[*o] == CommitSignature::Unknown)
+            .count();
+        assert_eq!(
+            known + unknown,
+            5,
+            "every commit is either read or unknown: {got:?}"
+        );
+        assert!(unknown >= 1, "the budget bites: {got:?}");
+        assert_eq!(got[&chain[0]], CommitSignature::Pgp);
+    }
+
+    /// A tag, a tree and a blob where a commit is expected, a missing id and a
+    /// repeat, in one stream. Every later commit keeps its own answer.
+    #[test]
+    fn wrong_typed_and_missing_objects_do_not_shift_the_commits_after_them() {
+        let (repo, tip) = repo_with_commit(&pgp());
+        let dir = repo.path();
+        let tree = crate::test_support::hash_object(dir, "tree", b"");
+        let blob = crate::test_support::hash_object(dir, "blob", b"hello\nworld\n");
+        let tag = crate::test_support::hash_object(
+            dir,
+            "tag",
+            format!("object {tip}\ntype commit\ntag t\ntagger A <a@b> 1 +0000\n\nmsg\n").as_bytes(),
+        );
+        let unsigned = crate::test_support::raw_commit(dir, &[&tip], "", "u", 1_700_000_300);
+        let missing = "1".repeat(40);
+        let asked = vec![
+            tag.clone(),
+            tree.clone(),
+            blob.clone(),
+            missing.clone(),
+            unsigned.clone(),
+            tip.clone(),
+        ];
+        let got = commit_signatures(dir, &asked);
+        for wrong in [&tag, &tree, &blob, &missing] {
+            assert_eq!(got[wrong], CommitSignature::Unknown, "{wrong}");
+        }
+        assert_eq!(got[&unsigned], CommitSignature::None);
+        assert_eq!(got[&tip], CommitSignature::Pgp);
+    }
+
+    /// An uppercase id is a valid id to git, which answers with the lowercase
+    /// name. The reader must not read that as an answer to some other question
+    /// and strand every id after it.
+    #[test]
+    fn break_an_uppercase_oid_is_read_as_the_commit_it_names() {
+        let (repo, tip) = repo_with_commit(&pgp());
+        let other = crate::test_support::raw_commit(repo.path(), &[&tip], "", "u", 1_700_000_300);
+        let upper = tip.to_uppercase();
+        let got = commit_signatures(repo.path(), &[upper.clone(), other.clone()]);
+        assert_eq!(got[&upper], CommitSignature::Pgp, "{got:?}");
+        assert_eq!(
+            got[&other],
+            CommitSignature::None,
+            "the id after it stays in step: {got:?}"
+        );
+    }
+
+    /// The same through the one-commit verify, which accepts uppercase hex.
+    #[cfg(unix)]
+    #[test]
+    fn break_verifying_by_an_uppercase_oid_reports_the_signature_it_has() {
+        use crate::test_support::{counting_verifier, use_verifier};
+        let (repo, oid) = repo_with_commit(&pgp());
+        let (_stub, script) = counting_verifier("exit 2");
+        use_verifier(repo.path(), &script);
+        let check = verify_commit_signature_with(
+            &fresh_cache(),
+            Instant::now(),
+            repo.path().to_str().unwrap(),
+            &oid.to_uppercase(),
+        )
+        .unwrap();
+        assert_eq!(check.signature, CommitSignature::Pgp, "{check:?}");
+    }
+
+    #[test]
+    fn hostile_ids_are_refused_before_any_git_runs() {
+        let (repo, oid) = repo_with_commit("");
+        let path = repo.path().to_str().unwrap();
+        let cache = fresh_cache();
+        for bad in [
+            "",
+            "abc123",
+            "HEAD~1",
+            "HEAD",
+            "--output=x",
+            "--output=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "-1",
+            "refs/heads/main",
+            "../../etc/passwd",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            &format!("{oid}\n"),
+            &format!("{oid} "),
+            &format!("{oid}\0"),
+            &"a".repeat(41),
+            &"a".repeat(65),
+            &"a".repeat(10_000),
+        ] {
+            assert!(
+                verify_commit_signature_with(&cache, Instant::now(), path, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(!repo.path().join("x").exists(), "--output=x must not write");
+        assert_eq!(cache.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_repository_is_an_error() {
+        let plain = tempfile::TempDir::new().unwrap();
+        let oid = "a".repeat(40);
+        for bad in [
+            plain.path().to_str().unwrap(),
+            "",
+            "relative/path",
+            "/nonexistent/for/sure",
+        ] {
+            assert!(
+                verify_commit_signature_with(&fresh_cache(), Instant::now(), bad, &oid).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A 64-hex id in a sha1 repository cannot name an object: an error, and
+    /// nothing cached.
+    #[test]
+    fn a_sha256_length_id_in_a_sha1_repository_is_an_error_and_is_not_cached() {
+        let (repo, _) = repo_with_commit(&pgp());
+        let cache = fresh_cache();
+        let err = verify_commit_signature_with(
+            &cache,
+            Instant::now(),
+            repo.path().to_str().unwrap(),
+            &"a".repeat(64),
+        );
+        assert!(err.is_err(), "{err:?}");
+        assert_eq!(cache.lock().unwrap().len(), 0);
+    }
+
+    /// A signing program that never returns: the bounded git read must give up
+    /// and take the program down with it, not leave it running.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_signing_program_is_killed_when_the_timeout_fires() {
+        use crate::test_support::{counting_verifier, use_verifier};
+        let (repo, oid) = repo_with_commit(&pgp());
+        let (stub, script) =
+            counting_verifier("echo $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 120");
+        use_verifier(repo.path(), &script);
+        let started = Instant::now();
+        let err = git_text_with_timeout(
+            repo.path(),
+            &["log", "-1", "--no-walk", "--format=%G?%x00%GK%x00%GS", &oid],
+            Duration::from_secs(2),
+        )
+        .expect_err("the verifier never answers");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!err.is_empty());
+        let pid = std::fs::read_to_string(stub.path().join("pid"))
+            .expect("the stub started")
+            .trim()
+            .to_string();
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let survived = alive();
+        if survived {
+            // Not ours to leave behind: this pid is the stub we started.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .output();
+        }
+        assert!(!survived, "the signing program outlived the timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_same_oid_in_two_repositories_is_verified_and_cached_separately() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        // Identical objects: the same ids in both, as in a fork.
+        let (a, oid_a) = repo_with_commit(&pgp());
+        let (b, oid_b) = repo_with_commit(&pgp());
+        assert_eq!(oid_a, oid_b, "fixture: same bytes, same id");
+        let (stub_a, script_a) = counting_verifier("exit 2");
+        let (stub_b, script_b) = counting_verifier("exit 2");
+        use_verifier(a.path(), &script_a);
+        use_verifier(b.path(), &script_b);
+        let cache = fresh_cache();
+        let now = Instant::now();
+        verify_commit_signature_with(&cache, now, a.path().to_str().unwrap(), &oid_a).unwrap();
+        verify_commit_signature_with(&cache, now, b.path().to_str().unwrap(), &oid_b).unwrap();
+        assert_eq!(verifier_spawns(&stub_a), 1);
+        assert_eq!(
+            verifier_spawns(&stub_b),
+            1,
+            "B is not answered from A's verdict"
+        );
+        assert_eq!(cache.lock().unwrap().len(), 2);
+    }
+
+    /// An atomically replaced allowed-signers file with the same size and the
+    /// same mtime is a new inode.
+    #[cfg(unix)]
+    #[test]
+    fn an_atomically_replaced_trust_file_with_the_same_size_and_mtime_misses() {
+        use crate::test_support::{counting_verifier, git_in, use_verifier, verifier_spawns};
+        let ssh = crate::test_support::fake_signature_header("gpgsig", "SSH SIGNATURE");
+        let (repo, oid) = repo_with_commit(&ssh);
+        let path = repo.path().to_str().unwrap();
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(repo.path(), &script);
+        let signers = stub.path().join("allowed_signers");
+        std::fs::write(&signers, "aaaa ssh-ed25519 AAAA\n").unwrap();
+        let stamped = std::fs::metadata(&signers).unwrap().modified().unwrap();
+        git_in(
+            repo.path(),
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                signers.to_str().unwrap(),
+            ],
+        );
+        let cache = fresh_cache();
+        let now = Instant::now();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        let first = verifier_spawns(&stub);
+        let swap = stub.path().join("allowed_signers.new");
+        std::fs::write(&swap, "bbbb ssh-ed25519 BBBB\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&swap)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        std::fs::rename(&swap, &signers).unwrap();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        assert!(
+            verifier_spawns(&stub) > first,
+            "a replaced file is a changed file"
+        );
+    }
+
+    /// The edge of a stat fingerprint: the same file rewritten in place to the
+    /// same length with its mtime put back. Bounded by the TTL; recorded as a
+    /// known limit rather than expected to hold.
+    #[cfg(unix)]
+    #[test]
+    fn break_an_in_place_rewrite_with_the_mtime_restored_is_a_cache_hit() {
+        use crate::test_support::{counting_verifier, git_in, use_verifier, verifier_spawns};
+        let ssh = crate::test_support::fake_signature_header("gpgsig", "SSH SIGNATURE");
+        let (repo, oid) = repo_with_commit(&ssh);
+        let path = repo.path().to_str().unwrap();
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(repo.path(), &script);
+        let signers = stub.path().join("allowed_signers");
+        std::fs::write(&signers, "aaaa ssh-ed25519 AAAA\n").unwrap();
+        let stamped = std::fs::metadata(&signers).unwrap().modified().unwrap();
+        git_in(
+            repo.path(),
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                signers.to_str().unwrap(),
+            ],
+        );
+        let cache = fresh_cache();
+        let now = Instant::now();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        let first = verifier_spawns(&stub);
+        let file = std::fs::File::options().write(true).open(&signers).unwrap();
+        std::fs::write(&signers, "bbbb ssh-ed25519 BBBB\n").unwrap();
+        file.set_modified(stamped).unwrap();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        assert!(
+            verifier_spawns(&stub) > first,
+            "edited trust file was served from the cache"
+        );
+    }
+
+    /// `include.path` pulls in config the fingerprint never stamps, so a
+    /// signing program swapped there is invisible to it.
+    #[cfg(unix)]
+    #[test]
+    fn break_a_change_in_an_included_config_file_misses_the_cache() {
+        use crate::test_support::{counting_verifier, git_in, verifier_spawns};
+        let (repo, oid) = repo_with_commit(&pgp());
+        let path = repo.path().to_str().unwrap();
+        let (stub_one, script_one) = counting_verifier("exit 2");
+        let (stub_two, script_two) = counting_verifier("exit 2");
+        let include = stub_one.path().join("signing.cfg");
+        std::fs::write(
+            &include,
+            format!("[gpg]\n\tprogram = {}\n", script_one.display()),
+        )
+        .unwrap();
+        git_in(
+            repo.path(),
+            &["config", "include.path", include.to_str().unwrap()],
+        );
+        let cache = fresh_cache();
+        let now = Instant::now();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        assert_eq!(verifier_spawns(&stub_one), 1);
+        std::fs::write(
+            &include,
+            format!("[gpg]\n\tprogram = {}\n# changed\n", script_two.display()),
+        )
+        .unwrap();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        assert_eq!(
+            verifier_spawns(&stub_two),
+            1,
+            "the verdict was reached under a gpg.program that is no longer configured"
+        );
+    }
+
+    /// Changing the user's own gitconfig is stamped.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_in_the_user_gitconfig_misses_the_cache() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        let (repo, oid) = repo_with_commit(&pgp());
+        let path = repo.path().to_str().unwrap();
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(repo.path(), &script);
+        let _serial = crate::test_support::env::env_serial();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("hermetic HOME");
+        let config = home.join(".gitconfig");
+        let original = std::fs::read(&config).ok();
+        let cache = fresh_cache();
+        let now = Instant::now();
+        verify_commit_signature_with(&cache, now, path, &oid).unwrap();
+        let first = verifier_spawns(&stub);
+        let mut changed = original.clone().unwrap_or_default();
+        changed.extend_from_slice(b"\n[gpg]\n\tminTrustLevel = ultimate\n");
+        std::fs::write(&config, &changed).unwrap();
+        let again = verify_commit_signature_with(&cache, now, path, &oid);
+        match original {
+            Some(bytes) => std::fs::write(&config, bytes).unwrap(),
+            None => std::fs::remove_file(&config).unwrap(),
+        }
+        again.unwrap();
+        assert!(verifier_spawns(&stub) > first);
+    }
+
+    #[test]
+    fn a_different_gnupg_home_is_a_different_fingerprint() {
+        let (repo, _) = repo_with_commit("");
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial).set("GNUPGHOME", "/tmp/gp-one");
+        let one = signing_fingerprint(repo.path()).unwrap();
+        drop(_env);
+        let _env = crate::test_support::env::bind_env(&serial).set("GNUPGHOME", "/tmp/gp-two");
+        let two = signing_fingerprint(repo.path()).unwrap();
+        assert_ne!(one, two);
+    }
+
+    /// Two selects of the same commit at once both miss and both start the
+    /// signing program: nothing coalesces them.
+    #[cfg(unix)]
+    #[test]
+    fn break_two_selects_racing_for_one_oid_start_the_verifier_once() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        let (repo, oid) = repo_with_commit(&pgp());
+        let path = repo.path().to_str().unwrap().to_string();
+        let (stub, script) = counting_verifier("sleep 1\nexit 2");
+        use_verifier(repo.path(), &script);
+        let cache = fresh_cache();
+        let now = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| verify_commit_signature_with(&cache, now, &path, &oid).unwrap());
+            }
+        });
+        assert_eq!(
+            verifier_spawns(&stub),
+            1,
+            "two concurrent verifications of one commit"
+        );
+    }
+
+    #[test]
+    fn the_cache_never_exceeds_its_capacity_under_many_distinct_commits() {
+        let mut cache = VerifyCache::new(Duration::from_secs(3600), 16);
+        let t0 = Instant::now();
+        for n in 0..5_000u64 {
+            cache.put(
+                Path::new(&format!("/r/{}", n % 7)),
+                &format!("{n:040x}"),
+                fingerprint("f"),
+                Vec::new(),
+                check(SignatureStatus::Good),
+                t0 + Duration::from_millis(n),
+            );
+            assert!(cache.len() <= 16);
+        }
+    }
+
+    /// `%G?` with a verifier that cannot run and an SSH commit with no
+    /// allowed-signers file are both `signed, could not verify`, not unsigned.
+    #[cfg(unix)]
+    #[test]
+    fn break_a_gpgsig_sha256_header_in_a_sha1_repository_agrees_with_what_verify_does() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        let header = crate::test_support::fake_signature_header("gpgsig-sha256", "PGP SIGNATURE");
+        let (repo, oid) = repo_with_commit(&header);
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(repo.path(), &script);
+        let check = verify_commit_signature_with(
+            &fresh_cache(),
+            Instant::now(),
+            repo.path().to_str().unwrap(),
+            &oid,
+        )
+        .unwrap();
+        // If the object reads as signed, a verification must have been
+        // attempted; otherwise the pane says "signed, could not verify" for a
+        // commit git itself treats as unsigned.
+        assert!(
+            check.signature == CommitSignature::None || verifier_spawns(&stub) > 0,
+            "classified {:?}, verifier spawns {}",
+            check.signature,
+            verifier_spawns(&stub)
+        );
+    }
 }
