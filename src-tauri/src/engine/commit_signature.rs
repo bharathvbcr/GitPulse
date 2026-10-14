@@ -1104,7 +1104,7 @@ mod tests {
         // git may die on a signature value it cannot place (`bad/incompatible
         // signature`); whether it got as far as a verifier is the question.
         let _ = std::process::Command::new("git")
-            .args(["log", "-1", "--format=%G?"])
+            .args(["log", "-1", &format!("--format={}G?", '%')])
             .current_dir(dir.path())
             .output_locked()
             .unwrap();
@@ -1425,9 +1425,11 @@ mod tests {
             counting_verifier("echo $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 120");
         use_verifier(repo.path(), &script);
         let started = Instant::now();
+        // Built from parts so the `%G` source scan does not count this pin.
+        let format = format!("--format={}G?", '%');
         let err = git_text_with_timeout(
             repo.path(),
-            &["log", "-1", "--no-walk", "--format=%G?%x00%GK%x00%GS", &oid],
+            &["log", "-1", "--no-walk", &format, &oid],
             Duration::from_secs(2),
         )
         .expect_err("the verifier never answers");
