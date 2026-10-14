@@ -208,6 +208,13 @@ struct CycleReport {
     recorded: i64,
     transcripts: i64,
     skipped_lines: i64,
+    /// Calls hosted past the participant cap, calls from removed worktrees past
+    /// the per-pass bound, and whether the worktree family could not be
+    /// resolved: each says a row may sit differently than a clean pass would
+    /// have put it, so none reads as a clean cycle.
+    rehosted_calls: i64,
+    departed_overflow: i64,
+    family_unresolved: bool,
     reflog_entries: i64,
     /// True when the catch-up deadline stopped the pass early: the counts are
     /// a floor, and what was not reached is the next cycle's. Carried as its
@@ -250,6 +257,9 @@ fn guarded_cycle(
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                rehosted_calls: 0,
+                departed_overflow: 0,
+                family_unresolved: false,
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -284,6 +294,9 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                rehosted_calls: 0,
+                departed_overflow: 0,
+                family_unresolved: false,
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -305,6 +318,9 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         recorded: caught.recorded,
         transcripts: caught.transcripts,
         skipped_lines: caught.skipped_lines,
+        rehosted_calls: caught.rehosted_calls,
+        departed_overflow: caught.departed_overflow,
+        family_unresolved: caught.family_unresolved,
         reflog_entries: caught.reflog_entries,
         truncated: caught.truncated,
         pruned: caught.pruned,
@@ -456,6 +472,9 @@ mod tests {
                         recorded: 1,
                         transcripts: 0,
                         skipped_lines: 0,
+                        rehosted_calls: 0,
+                        departed_overflow: 0,
+                        family_unresolved: false,
                         reflog_entries: 0,
                         truncated: false,
                         pruned: 0,
@@ -798,6 +817,9 @@ mod tests {
             "recorded",
             "transcripts",
             "skipped_lines",
+            "rehosted_calls",
+            "departed_overflow",
+            "family_unresolved",
             "reflog_entries",
             "recording",
             "error",

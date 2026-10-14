@@ -63,12 +63,24 @@ pub struct CatchUp {
     /// the transcript format is known to move — 17 distinct schema versions
     /// appear across the real corpus.
     pub skipped_lines: i64,
-    /// Calls whose worktree had no room in this pass (more worktrees than one
-    /// pass serves) and were recorded under the deepest worktree that did. Zero
-    /// for any real family; a count says how many rows may sit under a
-    /// shallower worktree than the one they ran in.
+    /// Calls whose worktree had no slot in this pass (more worktrees than one
+    /// pass serves) or was removed, and which another worktree's transaction
+    /// carried. The row is the owner's either way (its path, its task); this
+    /// counts only the ones that needed a host beyond the participant cap. Zero
+    /// for any real family.
     #[serde(default)]
     pub rehosted_calls: i64,
+    /// Calls from removed worktrees past the per-pass bound on new ones. Their
+    /// rows are recorded under the removed worktree's path, but its own cursor
+    /// was not written, so a later pass of its own could record them again.
+    #[serde(default)]
+    pub departed_overflow: i64,
+    /// True when the worktree family could not be resolved (not a Git
+    /// repository, an untrusted one, a failed `git worktree list`). The pass
+    /// then ran for the one worktree and recognised no removed worktree, so
+    /// calls kept the trigger's attribution.
+    #[serde(default)]
+    pub family_unresolved: bool,
     /// Reflog entries replayed.
     pub reflog_entries: i64,
     /// True when the wall-clock deadline stopped the pass early.
@@ -190,10 +202,12 @@ fn ingest_transcripts_until(
 /// Every other checkout that shares `worktree_path`'s repository, so one pass
 /// can read each transcript once for all of them.
 ///
-/// Best effort, and only ever a widening: a family that cannot be resolved
-/// (not a Git repository, an untrusted one) is just the one worktree, which is
-/// what the pass did before it knew about siblings.
-fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Vec<String> {
+/// `Err` when the family could not be resolved (not a Git repository, an
+/// untrusted one, a failed worktree listing). That is not an empty family: the
+/// caller runs the pass for the one worktree and must not conclude from it that
+/// no other worktree is live, so it recognises no removed worktree and reports
+/// `family_unresolved`.
+fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Result<Vec<String>, String> {
     crate::engine::worktree::resolve_worktree_family(ledger_repo, worktree_path)
         .map(|family| {
             family
@@ -203,7 +217,7 @@ fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Vec<String> {
                 .filter(|member| member != worktree_path)
                 .collect()
         })
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
 }
 
 fn transcript_draft(
@@ -504,6 +518,8 @@ impl CatchUp {
         self.transcripts_listed = transcripts.transcripts_listed;
         self.skipped_lines = transcripts.skipped_lines;
         self.rehosted_calls = transcripts.rehosted_calls;
+        self.departed_overflow = transcripts.departed_overflow;
+        self.family_unresolved = transcripts.family_unresolved;
         self.truncated = self.truncated || transcripts.truncated;
         if self.error.is_empty() {
             self.error = if transcripts.truncated && transcripts.error.is_empty() {
@@ -647,19 +663,24 @@ fn catch_up_with(
     }
 
     progress.enter(Phase::Transcripts);
-    let siblings = family_siblings(ledger_repo, worktree_path);
+    let family = family_siblings(ledger_repo, worktree_path);
     let base = total.clone();
     let mut checks = 0u32;
-    let transcripts =
-        pass::ingest_family_until(ledger_repo, worktree_path, &siblings, &mut |out| {
-            // Published often enough to say what a stalled pass had done, not on
-            // every line of a large transcript.
-            if checks.is_multiple_of(256) {
-                progress.publish(&base.clone().with_transcripts(out));
-            }
-            checks = checks.wrapping_add(1);
-            budget.expired()
-        });
+    let mut expired = |out: &CatchUp| {
+        // Published often enough to say what a stalled pass had done, not on
+        // every line of a large transcript.
+        if checks.is_multiple_of(256) {
+            progress.publish(&base.clone().with_transcripts(out));
+        }
+        checks = checks.wrapping_add(1);
+        budget.expired()
+    };
+    let transcripts = match &family {
+        Ok(siblings) => {
+            pass::ingest_family_until(ledger_repo, worktree_path, siblings, &mut expired)
+        }
+        Err(_) => pass::ingest_unresolved_family_until(ledger_repo, worktree_path, &mut expired),
+    };
     let mut total = total.with_transcripts(&transcripts);
     // Retention rides the pass every host already runs (the app on open, the
     // daemon on its interval), so the events table is bounded without a

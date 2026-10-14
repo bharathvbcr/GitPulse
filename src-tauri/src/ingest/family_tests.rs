@@ -759,8 +759,8 @@ fn no_double_recording_across_a_three_worktree_family() {
     });
 }
 
-/// Transcript content is untrusted: a hostile cwd never panics, never invents
-/// a departed worktree, and is counted rather than silently attributed.
+/// Transcript content is untrusted: a hostile cwd never panics and never
+/// invents a departed worktree; the call keeps the live root's attribution.
 #[test]
 fn a_hostile_cwd_is_attributed_without_panic_or_a_departed_root() {
     let nested = Nested::new();
@@ -854,6 +854,10 @@ fn a_removed_git_worktree_keeps_its_path_and_never_takes_the_main_task() {
             after.contains(&(None, format!("{anchor}/m.rs"), Some("T-MAIN".into()))),
             "{after:?}"
         );
+        // A third catch-up finds nothing new.
+        let third = catch_up_into_bounded(&anchor, &anchor, None);
+        assert_eq!(third.recorded, 0, "{third:?}");
+        assert_eq!(rows(), after);
     });
 }
 
@@ -908,8 +912,9 @@ impl Nested {
     }
 }
 
-/// An ancestor that is a dangling symlink is something on disk, not a removed
-/// worktree: a cwd that goes through it must not mint a departed root below it.
+/// A cwd that goes through a dangling symlink is not a removed worktree: the
+/// path has no `.claude/worktrees/<name>` shape, and nothing is statted.
+#[cfg(unix)]
 #[test]
 fn adv_a_dangling_symlink_ancestor_is_not_a_departed_worktree() {
     let nested = Nested::new();
@@ -952,7 +957,9 @@ fn adv_a_cwd_that_is_a_file_is_not_departed() {
     assert!(rows.iter().all(|r| r.0.is_none()), "{rows:?}");
 }
 
-/// A real permission-denied directory is an error, never "departed".
+/// A permission-denied directory is not departed: only the path decides, and
+/// nothing about the directory's permissions is ever read.
+#[cfg(unix)]
 #[test]
 fn adv_a_permission_denied_directory_is_not_departed() {
     use std::os::unix::fs::PermissionsExt;
@@ -1021,8 +1028,8 @@ fn adv_a_removed_worktrees_directory_does_not_become_the_root() {
 }
 
 /// A plain subdirectory deleted by a branch switch, used as cwd by an old
-/// session in main. The brief accepts this false positive; this records what
-/// it costs: main's own work leaves main and loses main's task.
+/// session in main. Only `.claude/worktrees/<name>` is read as a removed
+/// worktree, so this is main's work: it stays on main, with main's task.
 #[test]
 fn adv_a_deleted_plain_subdirectory_stays_on_main() {
     let nested = Nested::new();
@@ -1148,7 +1155,8 @@ fn adv_a_worktree_nested_two_levels_deep() {
 }
 
 /// 300 distinct departed cwds in one pass. Detection is pure string work with
-/// no memo and no cap, so every one of them keeps its own worktree.
+/// no memo, so every one of them keeps its own worktree; only the cursors of
+/// owners past the per-pass bound are skipped, and counted.
 #[test]
 fn adv_more_departed_cwds_than_the_memo_holds() {
     let nested = Nested::new();
@@ -1164,6 +1172,9 @@ fn adv_more_departed_cwds_than_the_memo_holds() {
         let out = nested.pass(&nested.base, &[]);
         assert_eq!(out.recorded, 300);
         assert_eq!(out.rehosted_calls, 0, "{out:?}");
+        // 256 new removed worktrees are entered per pass; the other 44 are
+        // counted, and still recorded under their own paths.
+        assert_eq!(out.departed_overflow, 44, "{out:?}");
     });
     let rows = nested.rows();
     let main = rows.iter().filter(|r| r.0.is_none()).count();
@@ -1341,7 +1352,7 @@ fn adv_one_transcript_two_departed_worktrees() {
 /// shows up as a deliberate change. Only the first rewritten line is affected:
 /// the others lie past the stale cursor and are recorded once.
 #[test]
-fn adv_rotation_longer_than_the_departed_cursor_loses_nothing() {
+fn adv_rotation_longer_than_the_cursor_skips_the_first_line_a_known_limit() {
     let nested = Nested::new();
     let w = nested.worktrees[0].clone();
     with_transcript_root(&nested.corpus, || {
@@ -1522,6 +1533,7 @@ fn perf_n(var: &str, default: u32) -> u32 {
 /// Timing, no threshold: lines over a live family, and distinct cwds. Set
 /// GITPULSE_ADV_PERF_LINES=100000 and GITPULSE_ADV_PERF_CWDS=10000 for the full size.
 #[test]
+#[ignore = "timing only, no assertion on speed; benches/repo_read.rs measures this in release"]
 fn adv_perf_pass_time_on_a_large_corpus() {
     let mut best_a = u128::MAX;
     let mut best_b = u128::MAX;
@@ -1574,4 +1586,156 @@ fn adv_perf_pass_time_on_a_large_corpus() {
         });
     }
     println!("PERF 100k-lines min-of-3 = {best_a} ms; 10k-distinct-cwds min-of-3 = {best_b} ms");
+}
+
+/// A worktree past the participant cap owns its rows: the row is under its own
+/// path with its own task, its cursor moves in the same transaction, and a pass
+/// triggered by it afterwards owes nothing.
+#[test]
+fn a_worktree_beyond_the_cap_owns_its_rows_and_its_cursor_moves() {
+    use crate::test_support::{git_in, trust_repo};
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    nested.init_git();
+    let mut wts: Vec<String> = (0..68)
+        .map(|i| {
+            let p = format!("{base}/.claude/worktrees/live{i:02}");
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        })
+        .collect();
+    // The last two are real worktrees, so a task can be bound to them.
+    for name in ["real68", "real69"] {
+        let p = format!("{base}/.claude/worktrees/{name}");
+        git_in(
+            std::path::Path::new(&base),
+            &["worktree", "add", "--detach", &p],
+        );
+        trust_repo(std::path::Path::new(&p));
+        ledger::bindings::bind(&base, &p, &format!("T-{name}")).unwrap();
+        wts.push(p);
+    }
+    let real69 = wts[69].clone();
+    with_transcript_root(&nested.corpus, || {
+        let lines: Vec<String> = wts
+            .iter()
+            .enumerate()
+            .map(|(i, w)| edit_line(w, "B2", (i % 59) as u32, &format!("{w}/a.rs")))
+            .collect();
+        write_lines(&nested.file("B2.jsonl"), &lines);
+        let first = pass::ingest_family_until(&base, &base, &wts, &mut |_| false);
+        assert_eq!(first.recorded, 70, "{first:?}");
+        assert_eq!(first.rehosted_calls, 7, "{first:?}");
+
+        let rows = nested.rows();
+        for w in &wts {
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r.0.as_deref() == Some(w.as_str()))
+                    .count(),
+                1,
+                "{w}: {rows:?}"
+            );
+        }
+        let task = |w: &str| {
+            rows.iter()
+                .find(|r| r.0.as_deref() == Some(w))
+                .and_then(|r| r.2.clone())
+        };
+        assert_eq!(task(&real69).as_deref(), Some("T-real69"));
+        assert_eq!(task(&wts[68]).as_deref(), Some("T-real68"));
+
+        // A pass triggered by a worktree that was past the cap: it has its own
+        // cursor now, and the family's order has changed who has a slot.
+        let mut family = vec![base.clone()];
+        family.extend(wts.iter().filter(|w| **w != real69).cloned());
+        let second = pass::ingest_family_until(&base, &real69, &family, &mut |_| false);
+        assert_eq!(second.recorded, 0, "{second:?}");
+        assert_eq!(nested.rows(), rows);
+    });
+}
+
+/// More new removed worktrees than one pass enters: every row is still the
+/// owner's, the overflow is counted, and no owner past the bound gets a cursor.
+#[test]
+fn departed_owners_past_the_bound_still_record_under_their_own_path() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    with_transcript_root(&nested.corpus, || {
+        let lines: Vec<String> = (0..300)
+            .map(|i| {
+                let g = format!("{base}/.claude/worktrees/gone{i}");
+                edit_line(&g, "V1", (i % 59) as u32, &format!("{g}/a.rs"))
+            })
+            .collect();
+        write_lines(&nested.file("V1.jsonl"), &lines);
+        let out = nested.pass(&base, &[]);
+        assert_eq!(out.recorded, 300, "{out:?}");
+        assert_eq!(out.departed_overflow, 44, "{out:?}");
+        let rows = nested.rows();
+        assert!(rows.iter().all(|r| r.0.is_some()), "{rows:?}");
+        let key = ledger::transcript_key(&nested.file("V1.jsonl"));
+        let cursors = (0..300)
+            .filter(|i| {
+                let g = format!("{base}/.claude/worktrees/gone{i}");
+                ledger::transcript_progress(&base, &g)
+                    .unwrap()
+                    .offsets
+                    .contains_key(&key)
+            })
+            .count();
+        assert_eq!(cursors, 256);
+        // Replayed: the host's cursor keeps every row exactly-once.
+        assert_eq!(nested.pass(&base, &[]).recorded, 0);
+    });
+    assert_eq!(nested.rows().len(), 300);
+}
+
+/// A family that could not be resolved says nothing about which worktrees are
+/// live: no removed worktree is recognised, the call keeps the trigger's
+/// attribution, and no cursor is written for the path it names.
+#[test]
+fn an_unresolved_family_recognises_no_departed_worktree() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("U1.jsonl"),
+            &[edit_line(&w, "U1", 1, &format!("{w}/a.rs"))],
+        );
+        // A plain directory is not a Git repository: no family to resolve.
+        let out = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert_eq!(out.recorded, 1, "{out:?}");
+        let rows = nested.rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, None, "{rows:?}");
+        let progress = ledger::transcript_progress(&nested.base, &w).unwrap();
+        assert!(progress.offsets.is_empty(), "{progress:?}");
+    });
+}
+
+/// The failure is reported, so an unresolved family never reads as a clean one.
+#[test]
+fn an_unresolved_family_is_reported() {
+    let nested = Nested::new();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("U2.jsonl"),
+            &[edit_line(
+                &nested.base,
+                "U2",
+                1,
+                &format!("{}/a.rs", nested.base),
+            )],
+        );
+        let unresolved = catch_up_into_bounded(&nested.base, &nested.base, None);
+        assert!(unresolved.family_unresolved, "{unresolved:?}");
+        assert!(
+            CatchUp::default()
+                .with_transcripts(&unresolved)
+                .family_unresolved
+        );
+        let resolved = nested.pass(&nested.base, &[]);
+        assert!(!resolved.family_unresolved, "{resolved:?}");
+    });
 }

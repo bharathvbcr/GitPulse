@@ -89,7 +89,7 @@ fn main() {
         processes.push(spawned);
     }
 
-    let cases: Vec<Case> = repos
+    let mut cases: Vec<Case> = repos
         .iter()
         .zip(&processes)
         .map(|((name, repo), spawned)| {
@@ -104,7 +104,6 @@ fn main() {
             })
         })
         .collect();
-    let mut cases = cases;
 
     // The transcript pass reads agent history into the ledger, so it sits with
     // the other reads of what a repository already holds. Two corpora: many
@@ -114,19 +113,31 @@ fn main() {
     // timed.
     let transcripts = temp.path().join("transcripts");
     let shapes = [
-        ("transcript_pass 100k lines", TRANSCRIPT_LINES, 1),
-        ("transcript_pass 10k cwds", TRANSCRIPT_CWDS, TRANSCRIPT_CWDS),
+        ("transcript_pass 100k lines", TRANSCRIPT_LINES, 1, false),
+        (
+            "transcript_pass 10k cwds",
+            TRANSCRIPT_CWDS,
+            TRANSCRIPT_CWDS,
+            false,
+        ),
+        (
+            "transcript_pass 10k departed cwds",
+            TRANSCRIPT_CWDS,
+            TRANSCRIPT_CWDS,
+            true,
+        ),
     ];
-    for (name, lines, cwds) in shapes {
+    for (name, lines, cwds, departed) in shapes {
         let temp = temp.path().to_path_buf();
         let transcripts = transcripts.clone();
         cases.push(Case::new(name, move || {
-            transcript_pass(&temp, &transcripts, lines, cwds)
+            transcript_pass(&temp, &transcripts, lines, cwds, departed)
         }));
     }
     report.note(format!(
         "transcript_pass: one corpus file of {TRANSCRIPT_LINES} edit lines from 1 cwd, and one of \
-         {TRANSCRIPT_CWDS} lines from {TRANSCRIPT_CWDS} distinct cwds, into a fresh ledger"
+         {TRANSCRIPT_CWDS} lines from {TRANSCRIPT_CWDS} distinct cwds, into a fresh ledger; the \
+         departed row names a distinct removed `.claude/worktrees/<name>` in each line"
     ));
 
     let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
@@ -144,6 +155,7 @@ fn transcript_pass(
     corpus: &std::path::Path,
     lines: usize,
     cwds: usize,
+    departed: bool,
 ) -> Sample {
     static FRESH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = FRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -154,7 +166,11 @@ fn transcript_pass(
     std::fs::create_dir_all(&slug).expect("corpus dir");
     let mut text = String::new();
     for line in 0..lines {
-        let cwd = format!("{repo}/d{}", line % cwds);
+        let cwd = if departed {
+            format!("{repo}/.claude/worktrees/gone{}", line % cwds)
+        } else {
+            format!("{repo}/d{}", line % cwds)
+        };
         let record = serde_json::json!({
             "type": "assistant",
             "sessionId": "S",

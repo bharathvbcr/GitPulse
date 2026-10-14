@@ -205,30 +205,22 @@ fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
     calls
 }
 
-/// Whether `call` lies under the root `repo_path`.
-///
-/// A file tool is attributed by its own absolute path; a command by the
-/// record's `cwd`. Both are prefix matches against the root, with a separator
-/// check so `/repo-other` never matches `/repo`. Roots nest (a worktree under
-/// `<repo>/.claude/worktrees` is also under `<repo>`), so a match alone does
-/// not say whose call it is: [`attribution_root`] picks the one that is.
-///
-/// No path is canonicalized, so `/tmp/x` and `/private/tmp/x` are different
-/// roots, and `\` is not a separator; both are the byte-wise comparison of
-/// [`under`], which is the one place to change for either.
-pub fn belongs_to(call: &ToolCall, repo_path: &str) -> bool {
-    under(candidate_path(call), repo_path)
-}
-
+/// What a call is attributed by: a file tool's own absolute path, a command's
+/// record `cwd`.
 pub fn candidate_path(call: &ToolCall) -> &str {
     call.file_path.as_deref().unwrap_or(&call.cwd)
 }
 
-/// The root of `roots` that owns `call`: the deepest one it lies under, so a
-/// worktree nested in the repository takes its own calls and the repository
-/// keeps only what is not under any worktree. Roots are ranked by their length
-/// without trailing separators, so `/repo/` does not outrank `/repo`; equal
-/// depth keeps the first listed.
+/// The root of `roots` that owns `call`: the deepest one its path lies under,
+/// so a worktree nested in the repository takes its own calls and the
+/// repository keeps only what is not under any worktree. Roots are ranked by
+/// their length without trailing separators, so `/repo/` does not outrank
+/// `/repo`; equal depth keeps the first listed.
+///
+/// Containment is a prefix match with a separator check, so `/repo-other` is
+/// never under `/repo`. No path is canonicalized, so `/tmp/x` and
+/// `/private/tmp/x` are different roots, and `\` is not a separator; both are
+/// the byte-wise comparison of [`under`], the one place to change for either.
 pub fn attribution_root<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<&'a str> {
     deepest_root(candidate_path(call), roots)
 }
@@ -320,6 +312,11 @@ fn under(path: &str, root: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Whether `root` alone would own `call`.
+    fn owned_by(call: &ToolCall, root: &str) -> bool {
+        attribution_root(call, &[root]).is_some()
+    }
+
     fn record(tool: &str, input: &str) -> String {
         format!(
             r#"{{"type":"assistant","sessionId":"S1","timestamp":"2026-09-01T12:00:00.000Z",
@@ -350,7 +347,7 @@ mod tests {
         assert_eq!(calls[0].command.as_deref(), Some("cargo test"));
         assert!(calls[0].file_path.is_none());
         assert_eq!(calls[0].action(), "session.command");
-        assert!(belongs_to(&calls[0], "/repo"));
+        assert!(owned_by(&calls[0], "/repo"));
     }
 
     #[test]
@@ -413,19 +410,19 @@ mod tests {
     fn attribution_is_by_path_for_files_and_cwd_for_commands() {
         let edit = &parse_line(&record("Edit", r#"{"file_path":"/other/x.rs"}"#))[0];
         // The file's own path wins: an agent can edit outside its cwd.
-        assert!(!belongs_to(edit, "/repo"));
-        assert!(belongs_to(edit, "/other"));
+        assert!(!owned_by(edit, "/repo"));
+        assert!(owned_by(edit, "/other"));
 
         let cmd = &parse_line(&record("Bash", r#"{"command":"ls"}"#))[0];
-        assert!(belongs_to(cmd, "/repo"));
-        assert!(!belongs_to(cmd, "/other"));
+        assert!(owned_by(cmd, "/repo"));
+        assert!(!owned_by(cmd, "/other"));
     }
 
     #[test]
     fn a_sibling_directory_is_not_the_repository() {
         // `/repo-other` must never attribute to `/repo`.
         let c = &parse_line(&record("Edit", r#"{"file_path":"/repo-other/a.rs"}"#))[0];
-        assert!(!belongs_to(c, "/repo"));
+        assert!(!owned_by(c, "/repo"));
         assert!(under("/repo/a.rs", "/repo"));
         assert!(under("/repo/a.rs", "/repo/"));
         assert!(under("/repo", "/repo"));
@@ -441,8 +438,8 @@ mod tests {
             "Edit",
             r#"{"file_path":"/repo/.claude/worktrees/wt/a.rs"}"#,
         ))[0];
-        assert!(belongs_to(c, "/repo"));
-        assert!(belongs_to(c, "/repo/.claude/worktrees/wt"));
+        assert!(owned_by(c, "/repo"));
+        assert!(owned_by(c, "/repo/.claude/worktrees/wt"));
         assert_eq!(
             attribution_root(c, &["/repo", "/repo/.claude/worktrees/wt"]),
             Some("/repo/.claude/worktrees/wt")
