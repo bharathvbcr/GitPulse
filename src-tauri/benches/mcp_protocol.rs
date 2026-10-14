@@ -39,10 +39,13 @@
 //!   away through `.len()`, materialising the whole edge table to learn one
 //!   integer — 46 MB resident on a 13-file repository, on a call that runs on
 //!   every `gitpulse_status` and every `gitpulse_insights`.
-//! * `tools/call` serialises its payload twice, once pretty-printed into
-//!   `content[0].text` and once raw into `structuredContent`. That is what the
+//! * `tools/call` carries its payload twice, once as compact JSON in
+//!   `content[0].text` and once raw in `structuredContent`. That is what the
 //!   spec asks for, so the row exists to keep the cost visible rather than to
-//!   argue with it.
+//!   argue with it. It used to pretty-print the text, which cost a third again
+//!   on the wire, and had no size budget: a payload now has to fit the frame
+//!   (the modern text is a bounded mirror past 256 KiB), so the `bytes` metric
+//!   falls while the time per call is what the budget's measuring adds.
 
 mod common;
 
@@ -260,8 +263,9 @@ fn main() {
         }
     }
     report.note(
-        "tools/call emits its payload twice (pretty-printed content[0].text and raw \
-         structuredContent) as the spec asks; the `bytes` metric counts both"
+        "tools/call emits its payload twice (compact content[0].text and raw \
+         structuredContent) as the spec asks, fitted to the frame budget; the `bytes` \
+         metric counts both"
             .to_string(),
     );
     report.extend(rows);

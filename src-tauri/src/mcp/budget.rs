@@ -364,11 +364,7 @@ mod tests {
     }
 
     fn wire(fitted: &Fitted) -> usize {
-        escaped_len(&fitted.text)
-            + fitted
-                .structured
-                .as_ref()
-                .map_or(0, |value| compact_len(value))
+        escaped_len(&fitted.text) + fitted.structured.as_ref().map_or(0, compact_len)
     }
 
     #[test]
@@ -415,7 +411,7 @@ mod tests {
         let fitted = fit(true, payload, 40_000).unwrap();
         let structured = fitted.structured.unwrap();
         let kept = structured["events"].as_array().unwrap().len();
-        assert!(kept < 100 && kept >= 1);
+        assert!((1..100).contains(&kept));
         assert_eq!(structured["returned"], kept);
         assert_eq!(structured["truncated"], true);
         assert_eq!(structured["total"], 100, "the total is never rewritten");
