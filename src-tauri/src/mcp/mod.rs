@@ -2578,7 +2578,10 @@ mod tests {
             .find(|t| t["name"] == "gitpulse_ledger_events")
             .expect("tool");
         let description = tool["description"].as_str().expect("a description");
-        assert!(description.contains("detail_json.occurred_at"), "{description}");
+        assert!(
+            description.contains("detail_json.occurred_at"),
+            "{description}"
+        );
         assert!(description.contains("task_basis"), "{description}");
         assert!(description.contains("`ts_utc` is when the row was appended"));
     }

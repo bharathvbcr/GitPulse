@@ -1904,7 +1904,7 @@ fn a_departed_worktree_resolves_from_its_own_history() {
             ],
         );
         let out = catch_up_into_bounded(&anchor, &anchor, None);
-        assert_eq!(out.recorded >= 2, true, "{out:?}");
+        assert!(out.recorded >= 2, "{out:?}");
     });
     let task = |needle: &str| {
         ledger::tail(&anchor, 0, 5000)
