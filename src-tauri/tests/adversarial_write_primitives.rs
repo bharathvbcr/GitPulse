@@ -73,7 +73,8 @@ fn dot_git_spellings_are_refused_by_every_write_entry_point() {
         let create = sandbox_create(&f.repo_str, &format!("{spelling}x"));
         let save = sandbox_save_edited_text(&f.repo_str, spelling, "[core]\n", None);
         let raw = sandbox_write(&f.repo_str, spelling, "[core]\n");
-        let moved = GitWriter::move_path(&f.repo_str, "src.txt", &format!("{spelling}x"), |_| Ok(()));
+        let moved =
+            GitWriter::move_path(&f.repo_str, "src.txt", &format!("{spelling}x"), |_| Ok(()));
         if resolves && (create.is_ok() || save.is_ok() || raw.is_ok() || moved.is_ok()) {
             leaks.push(format!(
                 "{spelling:?} resolves to .git but create={create:?} save={save:?} raw={raw:?} move={moved:?}"
@@ -112,7 +113,9 @@ fn moving_a_symlink_moves_the_link_not_its_target() {
         f.repo.join("real.txt").exists(),
         "move_path renamed the link's TARGET real.txt instead of the link"
     );
-    assert!(std::fs::symlink_metadata(f.repo.join("link2")).unwrap().is_symlink());
+    assert!(std::fs::symlink_metadata(f.repo.join("link2"))
+        .unwrap()
+        .is_symlink());
 }
 
 /// ATTACK 1: `./.` names the repository root; deleting it must be refused the
@@ -125,7 +128,10 @@ fn delete_path_refuses_every_spelling_of_the_repository_root() {
     for spelling in ["./.", "./", ".//", "sub/..", "a/b/../.."] {
         let result = GitWriter::delete_path(&f.repo_str, spelling, |_| Ok(()));
         assert!(result.is_err(), "{spelling:?} deleted: {result:?}");
-        assert!(f.repo.join("keep.txt").exists(), "{spelling:?} removed keep.txt");
+        assert!(
+            f.repo.join("keep.txt").exists(),
+            "{spelling:?} removed keep.txt"
+        );
     }
 }
 
@@ -226,13 +232,17 @@ fn an_overlong_create_name_strands_no_directories() {
 fn a_save_after_the_file_was_renamed_is_a_conflict_and_recreates_nothing() {
     let f = fixture();
     std::fs::write(f.repo.join("a.txt"), "one\n").unwrap();
-    let base = gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
-        .unwrap()
-        .disk_base
-        .unwrap();
+    let base =
+        gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
+            .unwrap()
+            .disk_base
+            .unwrap();
     std::fs::rename(f.repo.join("a.txt"), f.repo.join("b.txt")).unwrap();
     let result = sandbox_save_edited_text(&f.repo_str, "a.txt", "mine\n", Some(&base));
-    assert!(matches!(result, Err(FileWriteError::ChangedOnDisk { .. })), "{result:?}");
+    assert!(
+        matches!(result, Err(FileWriteError::ChangedOnDisk { .. })),
+        "{result:?}"
+    );
     assert!(!f.repo.join("a.txt").exists());
 }
 
@@ -243,10 +253,11 @@ fn a_save_after_the_file_was_renamed_is_a_conflict_and_recreates_nothing() {
 fn overwrite_with_the_conflict_token_rechecks_the_disk() {
     let f = fixture();
     std::fs::write(f.repo.join("a.txt"), "one\n").unwrap();
-    let base = gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
-        .unwrap()
-        .disk_base
-        .unwrap();
+    let base =
+        gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "a.txt", None)
+            .unwrap()
+            .disk_base
+            .unwrap();
     std::fs::write(f.repo.join("a.txt"), "two\n").unwrap();
     let Err(FileWriteError::ChangedOnDisk { actual, .. }) =
         sandbox_save_edited_text(&f.repo_str, "a.txt", "mine\n", Some(&base))
@@ -255,7 +266,10 @@ fn overwrite_with_the_conflict_token_rechecks_the_disk() {
     };
     std::fs::write(f.repo.join("a.txt"), "three\n").unwrap();
     let again = sandbox_save_edited_text(&f.repo_str, "a.txt", "mine\n", Some(&actual));
-    assert!(matches!(again, Err(FileWriteError::ChangedOnDisk { .. })), "{again:?}");
+    assert!(
+        matches!(again, Err(FileWriteError::ChangedOnDisk { .. })),
+        "{again:?}"
+    );
     assert_eq!(std::fs::read(f.repo.join("a.txt")).unwrap(), b"three\n");
 }
 
@@ -271,7 +285,10 @@ fn overwrite_does_not_write_through_a_symlink_swapped_in_after_the_conflict() {
     std::os::unix::fs::symlink(outside.path().join("victim"), f.repo.join("a.txt")).unwrap();
     let result = sandbox_save_edited_text(&f.repo_str, "a.txt", "mine\n", None);
     assert!(result.is_err());
-    assert_eq!(std::fs::read(outside.path().join("victim")).unwrap(), b"outside");
+    assert_eq!(
+        std::fs::read(outside.path().join("victim")).unwrap(),
+        b"outside"
+    );
 }
 
 /// ATTACK 4: a save of an executable through the whole sandbox path keeps +x.
@@ -282,11 +299,15 @@ fn saving_an_executable_keeps_plus_x_through_the_sandbox() {
     let p = f.repo.join("run.sh");
     std::fs::write(&p, "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let base = gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "run.sh", None)
-        .unwrap()
-        .disk_base;
+    let base =
+        gitpulse_lib::engine::git_reader::GitReader::get_file_blob(&f.repo_str, "run.sh", None)
+            .unwrap()
+            .disk_base;
     sandbox_save_edited_text(&f.repo_str, "run.sh", "#!/bin/sh\necho\n", base.as_deref()).unwrap();
-    assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o111, 0o111);
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().permissions().mode() & 0o111,
+        0o111
+    );
 }
 
 /// ATTACK 1: a linked worktree's private git dir (`<common>/worktrees/x`) is
@@ -299,14 +320,23 @@ fn a_linked_worktree_cannot_write_its_gitdir_or_the_common_dir() {
     commit_all(&f.repo);
     let wt_dir = tempfile::TempDir::new().unwrap();
     let wt = wt_dir.path().canonicalize().unwrap().join("wt");
-    common::run_git(&f.repo, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "w"]);
+    common::run_git(
+        &f.repo,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "w"],
+    );
     common::trust_repo(&wt);
     let wt_str = wt.to_string_lossy().into_owned();
     let before = config(&f.repo);
     for path in [".git", ".git/config", ".git/hooks/x"] {
         assert!(sandbox_create(&wt_str, path).is_err(), "{path}");
-        assert!(sandbox_save_edited_text(&wt_str, path, "x", None).is_err(), "{path}");
-        assert!(GitWriter::move_path(&wt_str, "a.txt", path, |_| Ok(())).is_err(), "{path}");
+        assert!(
+            sandbox_save_edited_text(&wt_str, path, "x", None).is_err(),
+            "{path}"
+        );
+        assert!(
+            GitWriter::move_path(&wt_str, "a.txt", path, |_| Ok(())).is_err(),
+            "{path}"
+        );
     }
     // The `.git` FILE itself is not savable either.
     let gitfile = std::fs::read(wt.join(".git")).unwrap();

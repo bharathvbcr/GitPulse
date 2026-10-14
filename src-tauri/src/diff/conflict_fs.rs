@@ -204,8 +204,15 @@ mod unix {
     /// (file, directory, link), never its target. Unlike [`read_for_save`] a
     /// directory is an answer here, not an error. The parent is created, which
     /// is what New Folder needs for its `.gitkeep`.
-    pub(super) fn read_for_create(path: &Path) -> Result<Worktree, String> {
-        let directory = crate::fs_entry::pin_parent(path, true).map_err(|e| e.to_string())?;
+    ///
+    /// `created` receives the directories this call made, so a create that
+    /// then fails can take them away again.
+    pub(super) fn read_for_create(
+        path: &Path,
+        created: &mut Vec<PathBuf>,
+    ) -> Result<Worktree, String> {
+        let directory =
+            crate::fs_entry::pin_parent_recording(path, created).map_err(|e| e.to_string())?;
         read_at(&directory, &name(path)?)
     }
 
@@ -555,14 +562,25 @@ pub(crate) fn content_token(bytes: Option<&[u8]>) -> String {
 /// A 64-bit digest of `bytes`, fast enough to run over every file the editor
 /// opens or saves (8 MiB at most).
 ///
+/// This is an accidental-change detector, not a hash that holds against a
+/// crafted input. Each block is absorbed by an invertible step, so someone who
+/// knows the function can build two different files with one token. That is
+/// acceptable here because the other writer is the user's own external editor,
+/// an agent or `git`, none of which is trying to forge a token; the digest only
+/// has to tell the edits they actually make from no edit at all. A
+/// collision-resistant hash would need a dependency or a much slower pass.
+///
 /// FNV-1a was the first choice and cost more than reading the file: its one
 /// multiply per byte is a serial dependency chain, so an 8 MiB open took
-/// about 2.3x as long. This takes a word at a time on four independent lanes,
-/// which lets the multiplies overlap, and folds the lanes, the tail bytes and
-/// the length at the end. Tokens are compared within one running app against
-/// bytes it just read, never stored, so the function may change.
+/// about 2.3x as long. This takes a word at a time on four lanes so the
+/// multiplies overlap. The lanes are not independent: after every block each
+/// absorbs a mix of all four, so a change confined to one lane at one offset
+/// cannot be undone by a change to the same lane later. The tail bytes and the
+/// length are folded in at the end. Tokens are compared within one running app
+/// against bytes it just read, never stored, so the function may change.
 fn digest(bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
+    const FOLD: u64 = 0xC2B2_AE3D_27D4_EB4F;
     let mut lanes: [u64; 4] = [
         0xcbf2_9ce4_8422_2325,
         0x8422_2325_cbf2_9ce4,
@@ -574,6 +592,14 @@ fn digest(bytes: &[u8]) -> u64 {
         for (lane, word) in lanes.iter_mut().zip(block.chunks_exact(8)) {
             let word = u64::from_le_bytes(word.try_into().expect("an 8-byte chunk"));
             *lane = (*lane ^ word).wrapping_mul(PRIME).rotate_left(29);
+        }
+        let mix = (lanes[0]
+            ^ lanes[1].rotate_left(16)
+            ^ lanes[2].rotate_left(32)
+            ^ lanes[3].rotate_left(48))
+        .wrapping_mul(FOLD);
+        for lane in &mut lanes {
+            *lane = lane.wrapping_add(mix ^ (mix >> 29));
         }
     }
     let mut hash = bytes.len() as u64;
@@ -648,16 +674,28 @@ fn current_token(path: &Path) -> String {
 /// Reads `path` for a write: a create needs the entry in whatever form it has
 /// (and its parent made), a save needs a regular file it may write.
 #[cfg(unix)]
-fn read_source(path: &Path, expected: Expect<'_>, cap: usize) -> Result<Worktree, String> {
+fn read_source(
+    path: &Path,
+    expected: Expect<'_>,
+    cap: usize,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<Worktree, String> {
     if matches!(expected, Expect::Absent) {
-        unix::read_for_create(path)
+        unix::read_for_create(path, created)
     } else {
         unix::read_for_save(path, cap)
     }
 }
 
+/// Windows does not report the directories its pin made, so a failed create
+/// there leaves them (unlike unix, where they are removed again).
 #[cfg(windows)]
-fn read_source(path: &Path, expected: Expect<'_>, cap: usize) -> Result<Worktree, String> {
+fn read_source(
+    path: &Path,
+    expected: Expect<'_>,
+    cap: usize,
+    _created: &mut Vec<std::path::PathBuf>,
+) -> Result<Worktree, String> {
     if matches!(expected, Expect::Absent) && std::fs::symlink_metadata(path).is_ok() {
         // Any entry at all refuses a create; its form does not matter.
         return Ok(Worktree {
@@ -709,10 +747,32 @@ fn write_regular_after_check(
     encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
     after_check: impl FnOnce(),
 ) -> Result<String, WriteFailure> {
+    let mut created = Vec::new();
+    let result = write_regular_recording(path, expected, encode, after_check, &mut created);
+    if result.is_err() {
+        // A create that did not happen leaves the tree as it found it:
+        // innermost first, `remove_dir` only (it refuses a directory that has
+        // anything in it, so another creator's file is never lost), and only
+        // the directories this call made, so one a concurrent creator got to
+        // first is not touched.
+        for directory in created.iter().rev() {
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+    result
+}
+
+fn write_regular_recording(
+    path: &Path,
+    expected: Expect<'_>,
+    encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
+    after_check: impl FnOnce(),
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<String, WriteFailure> {
     let cap = crate::engine::budget::MAX_FILE_BYTES as usize;
     #[cfg(any(unix, windows))]
     {
-        let source = read_source(path, expected, cap)?;
+        let source = read_source(path, expected, cap, created)?;
         if matches!(expected, Expect::Absent) {
             if source.mode != "missing" {
                 return Err(WriteFailure::AlreadyExists);
@@ -763,7 +823,7 @@ fn write_regular_after_check(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (path, expected, encode, after_check, cap);
+        let _ = (path, expected, encode, after_check, cap, created);
         Err(WriteFailure::Other(
             "Atomic file saves are unavailable on this platform".into(),
         ))
@@ -904,6 +964,91 @@ mod write_tests {
             content_token(Some(&b)),
             "swapped blocks"
         );
+    }
+
+    /// The digest's lane step and seeds as they were when the lanes were
+    /// independent: the model a same-lane compensating edit is built on.
+    const SEEDS: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x8422_2325_cbf2_9ce4,
+        0x1000_0000_01b3_0001,
+        0x0001_0000_0000_01b3,
+    ];
+    fn step(lane: u64, word: u64) -> u64 {
+        (lane ^ word)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(29)
+    }
+
+    #[test]
+    fn a_compensating_edit_to_one_lane_at_two_offsets_changes_the_token() {
+        // 4 blocks of 32 bytes. For every lane and every pair of blocks, edit
+        // that lane's word in the earlier block and solve the later block's
+        // word in the same lane so that, were the lanes independent, the lane
+        // would return to its original state. The token must still differ.
+        for lane in 0..4 {
+            for first in 0..4 {
+                for second in first + 1..4 {
+                    for edit in [1u64, 0xdead_beef_cafe_f00d, u64::MAX] {
+                        let base = vec![0u8; 128];
+                        let (mut u, mut v) = (step(SEEDS[lane], edit), step(SEEDS[lane], 0));
+                        for _ in first + 1..second {
+                            u = step(u, 0);
+                            v = step(v, 0);
+                        }
+                        let mut changed = base.clone();
+                        let at = |block: usize| block * 32 + lane * 8;
+                        changed[at(first)..at(first) + 8].copy_from_slice(&edit.to_le_bytes());
+                        changed[at(second)..at(second) + 8].copy_from_slice(&(u ^ v).to_le_bytes());
+                        assert_ne!(
+                            content_token(Some(&base)),
+                            content_token(Some(&changed)),
+                            "lane {lane} blocks {first}/{second} edit {edit:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edits_that_cross_lanes_never_cancel() {
+        // Two words, anywhere in 16 positions, each set to a spread of values:
+        // every pair of distinct two-word edits of a zero file gets its own
+        // token, so no pair of positions cancels another.
+        let mut seen = std::collections::HashMap::new();
+        let values = [1u64, 2, 0xff, 0x0100, 0x8000_0000_0000_0000, u64::MAX];
+        for p in 0..16usize {
+            for q in p + 1..16 {
+                for x in values {
+                    for y in values {
+                        let mut bytes = vec![0u8; 128];
+                        bytes[p * 8..p * 8 + 8].copy_from_slice(&x.to_le_bytes());
+                        bytes[q * 8..q * 8 + 8].copy_from_slice(&y.to_le_bytes());
+                        let token = content_token(Some(&bytes));
+                        assert!(
+                            seen.insert(token, (p, q, x, y)).is_none(),
+                            "{p} {q} {x:x} {y:x}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(!seen.contains_key(&content_token(Some(&[0u8; 128]))));
+    }
+
+    #[test]
+    fn every_two_byte_tail_has_its_own_token() {
+        // 32 bytes of block, then a 2-byte tail: all 65536 tails distinct, so
+        // no pair of tail bytes cancels another.
+        let mut seen = std::collections::HashSet::new();
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let mut bytes = vec![7u8; 32];
+                bytes.extend([a, b]);
+                assert!(seen.insert(content_token(Some(&bytes))), "tail {a} {b}");
+            }
+        }
     }
 
     #[test]

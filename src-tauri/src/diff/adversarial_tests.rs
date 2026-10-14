@@ -45,9 +45,7 @@ fn save_does_not_write_through_a_symlinked_parent() {
     let (_g, root) = tmp();
     let outside = tempfile::TempDir::new().unwrap();
     std::os::unix::fs::symlink(outside.path(), root.join("d")).unwrap();
-    let result = write_regular_expecting(&root.join("d/f.txt"), Expect::Any, |_| {
-        Ok(b"x".to_vec())
-    });
+    let result = write_regular_expecting(&root.join("d/f.txt"), Expect::Any, |_| Ok(b"x".to_vec()));
     assert!(
         result.is_err() && !outside.path().join("f.txt").exists(),
         "wrote through a symlinked parent: {result:?}"
@@ -110,7 +108,9 @@ fn concurrent_creates_of_one_path_have_one_winner_and_typed_losers() {
     let handles: Vec<_> = (0..16)
         .map(|_| {
             let t = target.clone();
-            std::thread::spawn(move || write_regular_expecting(&t, Expect::Absent, |_| Ok(Vec::new())))
+            std::thread::spawn(move || {
+                write_regular_expecting(&t, Expect::Absent, |_| Ok(Vec::new()))
+            })
         })
         .collect();
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -130,7 +130,9 @@ fn concurrent_creates_racing_on_intermediate_dirs_all_succeed() {
     let handles: Vec<_> = (0..16)
         .map(|i| {
             let t = root.join(format!("x/y/z/f{i}"));
-            std::thread::spawn(move || write_regular_expecting(&t, Expect::Absent, |_| Ok(Vec::new())))
+            std::thread::spawn(move || {
+                write_regular_expecting(&t, Expect::Absent, |_| Ok(Vec::new()))
+            })
         })
         .collect();
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -148,7 +150,10 @@ fn a_failed_create_leaves_no_parent_directories() {
         |_| Ok(Vec::new()),
     );
     assert!(result.is_err());
-    assert!(!root.join("fresh").exists(), "left an empty `fresh/dir` behind");
+    assert!(
+        !root.join("fresh").exists(),
+        "left an empty `fresh/dir` behind"
+    );
 }
 
 /// ATTACK 3: a parent that is a regular file fails closed and is left alone.

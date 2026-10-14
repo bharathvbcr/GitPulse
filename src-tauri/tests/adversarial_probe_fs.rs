@@ -12,8 +12,17 @@ fn which_spellings_resolve_to_dot_git() {
     std::fs::write(repo.join(".git/config"), "x").unwrap();
     let mut resolving = Vec::new();
     for name in [
-        ".GIT", ".git.", ".git ", ".g\u{200c}it", ".g\u{200d}it", ".\u{feff}git", ".git\u{200b}",
-        ".gi\u{0307}t", ".g\u{0131}t", "\u{200c}.git", ".git\u{fe0f}",
+        ".GIT",
+        ".git.",
+        ".git ",
+        ".g\u{200c}it",
+        ".g\u{200d}it",
+        ".\u{feff}git",
+        ".git\u{200b}",
+        ".gi\u{0307}t",
+        ".g\u{0131}t",
+        "\u{200c}.git",
+        ".git\u{fe0f}",
     ] {
         if std::fs::metadata(repo.join(name).join("config")).is_ok() {
             resolving.push(name.escape_unicode().to_string());
@@ -21,7 +30,9 @@ fn which_spellings_resolve_to_dot_git() {
     }
     println!("PROBE resolving spellings: {resolving:?}");
     assert!(
-        resolving.iter().all(|n| n == "\\u{2e}\\u{47}\\u{49}\\u{54}"),
+        resolving
+            .iter()
+            .all(|n| n == "\\u{2e}\\u{47}\\u{49}\\u{54}"),
         "non-case spellings resolve to .git on this filesystem: {resolving:?}"
     );
 }
