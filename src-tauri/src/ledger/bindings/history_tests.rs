@@ -390,3 +390,133 @@ fn the_live_gate_and_the_hook_still_authenticate_through_git() {
     // And the registered worktree still resolves through the same path.
     assert_eq!(resolve(&repo, &repo).unwrap(), Some("T1".into()));
 }
+
+// ---- adversarial cases -------------------------------------------------
+
+#[test]
+fn a_bind_and_an_unbind_in_one_millisecond_resolve_by_ulid_either_way() {
+    for (bind_ulid, unbind_ulid, expected) in [(1, 2, TaskAtTime::Unbound), (2, 1, bound("T"))] {
+        let (_dir, repo) = repo();
+        put(&repo, T0, &ulid(bind_ulid), Some("T"));
+        put(&repo, T0, &ulid(unbind_ulid), None);
+        let history = BindingHistory::load(&repo, &repo).unwrap();
+        assert_eq!(history.as_of(T0), expected);
+        assert_eq!(binding_as_of(&address(&repo), T0).unwrap(), expected);
+        assert_eq!(history.as_of(T0 - 1), TaskAtTime::Unresolved);
+        assert_eq!(history.as_of(T0 + 1), expected);
+        // The live read agrees with the history at the end.
+        let live = latest_binding(&repo, &repo, &repo).unwrap();
+        assert_eq!(live, Some(expected.task_id().map(str::to_string)));
+    }
+}
+
+#[test]
+fn the_reflog_second_next_to_a_row_resolves_exactly_at_the_edges() {
+    let (_dir, repo) = repo();
+    put(&repo, T0 - 1, &ulid(1), Some("PREV-SECOND"));
+    put(&repo, T0 + 1_000, &ulid(2), Some("NEXT-SECOND"));
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    // A row 1 ms before the second began is decided; one at the next second's
+    // first millisecond is outside this second.
+    assert_eq!(history.as_of_second(T0), bound("PREV-SECOND"));
+    assert_eq!(history.as_of_second(T0 + 1_000), TaskAtTime::Unresolved);
+    assert_eq!(history.as_of_second(T0 + 2_000), bound("NEXT-SECOND"));
+    // The far end of the range must not panic (the answer is not asserted).
+    let _ = history.as_of_second(u64::MAX);
+    let _ = history.as_of(u64::MAX);
+}
+
+/// A clock that stepped backwards between two binds: the later append carries
+/// the earlier time. Order is by time, not by insertion, which is also what the
+/// live gate does, so the two agree and the later bind is the one never seen.
+#[test]
+fn a_clock_that_went_backwards_orders_by_time_like_the_live_read() {
+    let (_dir, repo) = repo();
+    put(&repo, T0 + 10_000, &ulid(1), Some("APPENDED-FIRST"));
+    put(&repo, T0, &ulid(2), Some("APPENDED-SECOND"));
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    assert_eq!(history.as_of(T0 + 5_000), bound("APPENDED-SECOND"));
+    assert_eq!(history.as_of(T0 + 10_000), bound("APPENDED-FIRST"));
+    assert_eq!(history.as_of(FOREVER_MS), bound("APPENDED-FIRST"));
+    assert_eq!(
+        latest_binding(&repo, &repo, &repo).unwrap(),
+        Some(Some("APPENDED-FIRST".to_string()))
+    );
+}
+
+#[test]
+fn ten_thousand_binds_load_and_answer_within_a_pass_budget() {
+    let (_dir, repo) = repo();
+    with_conn(&repo, |conn| {
+        let tx = conn.unchecked_transaction().unwrap();
+        for n in 0..10_000usize {
+            let task = (n % 3 != 2).then(|| format!("T{n}"));
+            tx.execute(
+                "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, task_id,
+                                     action, outcome)
+                 VALUES (?1, ?2, ?3, ?3, 'human', ?4, ?5, 'ok')",
+                rusqlite::params![
+                    ulid(n),
+                    iso8601_utc(T0 + n as u64 * 10),
+                    &repo,
+                    task,
+                    if task.is_some() { BIND } else { UNBIND },
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        Ok(())
+    })
+    .unwrap();
+    let loaded = std::time::Instant::now();
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    let load = loaded.elapsed();
+    let asked = std::time::Instant::now();
+    let mut resolved = 0u64;
+    for call in 0..1_000_000u64 {
+        let at = T0 + (call * 7_919) % 100_000;
+        resolved += u64::from(history.as_of(at).task_id().is_some());
+    }
+    let ask = asked.elapsed();
+    eprintln!("10k binds: load {load:?}, 1M as_of {ask:?}, resolved {resolved}");
+    assert_eq!(history.as_of(T0 + 9_999 * 10 + 5), bound("T9999"));
+    assert!(load < std::time::Duration::from_secs(2), "load {load:?}");
+    assert!(ask < std::time::Duration::from_secs(5), "1M as_of took {ask:?}");
+}
+
+/// A bind row naming no task is an unbind to every reader; an unbind as the
+/// newest row decides "unbound", not "unresolved".
+#[test]
+fn an_unbind_as_the_newest_row_is_a_decided_state() {
+    let (_dir, repo) = repo();
+    put(&repo, T0, &ulid(1), Some("T1"));
+    put(&repo, T0 + 100, &ulid(2), None);
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    assert_eq!(history.as_of(FOREVER_MS), TaskAtTime::Unbound);
+    assert_eq!(history.as_of_second(T0 + 5_000), TaskAtTime::Unbound);
+    assert_eq!(resolve(&repo, &repo).unwrap(), None);
+}
+
+/// A bind row stored under the redacted spelling of the path still resolves:
+/// both spellings are queried, as they are for the live read.
+#[test]
+fn a_binding_stored_under_the_redacted_path_spelling_is_found() {
+    let (_dir, repo) = repo();
+    let odd = format!("{repo}/ghp_0123456789abcdefghijklmnopqrstuvwxyzA");
+    let stored = crate::ledger::redact::text(&odd);
+    assert_ne!(stored, odd, "the fixture must be a path the redactor rewrites");
+    with_conn(&repo, |conn| {
+        conn.execute(
+            "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, task_id,
+                                 action, outcome)
+             VALUES (?1, ?2, ?3, ?4, 'human', 'T9', 'worktree.bind', 'ok')",
+            rusqlite::params![ulid(1), iso8601_utc(T0), &repo, &stored],
+        )
+        .unwrap();
+        Ok(())
+    })
+    .unwrap();
+    let history = BindingHistory::load(&repo, &odd).unwrap();
+    assert_eq!(history.as_of(T0 + 1), bound("T9"));
+}
