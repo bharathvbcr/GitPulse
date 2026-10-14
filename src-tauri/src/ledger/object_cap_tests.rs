@@ -224,6 +224,78 @@ fn a_page_always_holds_a_row_and_reports_when_it_left_some() {
 }
 
 #[test]
+fn a_non_object_detail_is_wrapped_so_the_cut_is_recorded_and_the_original_survives() {
+    let command = "c".repeat(CAP * 2);
+    for (detail, original) in [
+        ("plain text", serde_json::json!("plain text")),
+        ("[1,2,3]", serde_json::json!([1, 2, 3])),
+        ("\"s\"", serde_json::json!("s")),
+    ] {
+        let (_, wrapped) = stored(&command, Some(detail), None);
+        let wrapped = wrapped.unwrap();
+        assert_eq!(wrapped["detail"], original, "{detail}");
+        assert_eq!(wrapped["object_truncated"]["bytes"], CAP * 2);
+        assert_eq!(wrapped["object_truncated"]["hash"], hash_of(&command));
+    }
+    // Without a cut a non-object detail is stored as it always was.
+    assert_eq!(
+        redact_detail(Some("plain text"), Some(&stamp()), None).as_deref(),
+        Some("plain text")
+    );
+}
+
+#[test]
+fn a_legacy_row_over_the_cap_is_capped_through_the_append_path_and_a_capped_one_keeps_its_record() {
+    let source = std::path::PathBuf::from("/source");
+    let anchor = std::path::PathBuf::from("/anchor");
+    let base = |object: String, detail: Option<String>| LedgerEvent {
+        id: 1,
+        ulid: "01J00000000000000000000001".into(),
+        ts_utc: "2026-10-14T00:00:00.000Z".into(),
+        schema_version: SCHEMA_VERSION,
+        repo_path: "/r".into(),
+        worktree_path: None,
+        actor_kind: "agent".into(),
+        actor_id: None,
+        session_id: None,
+        task_id: None,
+        action: "session.command".into(),
+        object: Some(object),
+        argv_json: None,
+        outcome: "ok".into(),
+        verdict_json: None,
+        before_ref: None,
+        after_ref: None,
+        duration_ms: None,
+        detail_json: detail,
+    };
+    let long = "l".repeat(9000);
+    let imported = normalize_legacy_event(
+        base(long.clone(), Some(r#"{"source":"transcript"}"#.into())),
+        &anchor,
+        &source,
+        &[],
+    )
+    .unwrap();
+    assert!(imported.object.as_ref().unwrap().len() <= CAP);
+    let detail: serde_json::Value = serde_json::from_str(&imported.detail_json.unwrap()).unwrap();
+    assert_eq!(detail["source"], "transcript");
+    assert_eq!(detail["object_truncated"]["hash"], hash_of(&long));
+
+    // A row a newer writer already capped is copied with its record intact.
+    let (event, _) = stored(&long, None, None);
+    let again = normalize_legacy_event(
+        base(event.object.clone().unwrap(), event.detail_json.clone()),
+        &anchor,
+        &source,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(again.object, event.object);
+    assert_eq!(again.detail_json, event.detail_json);
+}
+
+#[test]
 fn an_object_that_fits_leaves_detail_exactly_as_it_was() {
     let (event, detail) = stored("git status", None, None);
     assert_eq!(event.object.as_deref(), Some("git status"));

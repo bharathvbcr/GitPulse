@@ -98,6 +98,35 @@ pub(super) fn cap_object(redacted: String) -> (String, Option<ObjectCap>) {
     (kept, Some(cap))
 }
 
+/// Whether a raw object is longer than the append cap.
+pub(super) fn exceeds_object_cap(object: &str) -> bool {
+    object.len() > OBJECT_CAP_BYTES
+}
+
+/// What identifies a stored object across the cap: the stored (capped) text,
+/// and for a cut one the FNV-1a hash of the redacted full text, so two long
+/// objects that share their first 2 KiB are not the same object. An object
+/// within the cap is its own key. A row stored before the cap holds the full
+/// redacted object and gets the same key from it; a row stored after holds the
+/// capped text and the hash it recorded ([`object_key_of_row`]).
+pub(super) fn object_key(redacted_full: String) -> String {
+    let (kept, cap) = cap_object(redacted_full);
+    match cap {
+        Some(cap) => format!("{kept}#{}", cap.hash),
+        None => kept,
+    }
+}
+
+/// [`object_key`] for a stored row: its `object` column, and the hash recorded
+/// in its `detail_json` when it was cut. A row with no recorded hash holds the
+/// full object (stored before the cap), whose key is computed from it.
+pub(super) fn object_key_of_row(stored: String, recorded_hash: Option<String>) -> String {
+    match recorded_hash {
+        Some(hash) => format!("{stored}#{hash}"),
+        None => object_key(stored),
+    }
+}
+
 /// `text` cut to at most `cap` bytes, ending with how much was removed.
 fn cut_text(text: &str, cap: usize) -> String {
     if text.len() <= cap {
