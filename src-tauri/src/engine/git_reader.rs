@@ -10358,4 +10358,198 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let counted = git_text(dir.path(), &["rev-list", "--count", &since, "HEAD"]).unwrap();
         assert_eq!(counted.trim(), "4");
     }
+
+    // ------------------------------------------------------------------
+    // Adversarial DORA cases (CARD 16). `break_*` tests currently FAIL.
+    // ------------------------------------------------------------------
+
+    const ADV_DAY: i64 = 86_400;
+    const ADV_ANCHOR: i64 = 1_800_000_000;
+    const ADV_WALKS: [DateWalk; 2] = [DateWalk::SinceAsFilter, DateWalk::CountBounded];
+
+    /// A linear history, oldest first, one commit per committer date.
+    fn adv_repo_with_dates(dates: &[i64]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for (n, date) in dates.iter().enumerate() {
+            crate::test_support::commit_at(dir.path(), &format!("c{n}"), *date, "a@example.com");
+        }
+        dir
+    }
+
+    fn adv_scan(
+        dir: &tempfile::TempDir,
+        window: Option<u32>,
+        cap: usize,
+        now: i64,
+        walk: DateWalk,
+    ) -> DoraReport {
+        GitReader::dora_report_scanning(dir.path().to_str().unwrap(), window, cap, now, walk)
+            .unwrap()
+    }
+
+    /// A window of 0 days is clamped to 7 and a huge one to 365, the same on
+    /// both walks, with the cutoffs landing where the clamp says.
+    #[test]
+    fn dora_window_zero_and_huge_clamp_identically_on_both_walks() {
+        let dir = adv_repo_with_dates(&[
+            ADV_ANCHOR - 366 * ADV_DAY,
+            ADV_ANCHOR - 364 * ADV_DAY,
+            ADV_ANCHOR - 8 * ADV_DAY,
+            ADV_ANCHOR - 6 * ADV_DAY,
+        ]);
+        for walk in ADV_WALKS {
+            let zero = adv_scan(&dir, Some(0), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(zero.cfr_sample_commits, 1, "0 days reads as 7: {walk:?}");
+            let huge = adv_scan(&dir, Some(u32::MAX), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(
+                huge.cfr_sample_commits, 3,
+                "u32::MAX reads as 365: {walk:?}"
+            );
+            let none = adv_scan(&dir, None, 4_096, ADV_ANCHOR, walk);
+            assert_eq!(none.cfr_sample_commits, 2, "default 90 days: {walk:?}");
+        }
+    }
+
+    /// A commit exactly at the cutoff second is inside, one second older is
+    /// outside, on both walks, so the two can never disagree about it.
+    #[test]
+    fn dora_cutoff_second_is_inclusive_and_identical_on_both_walks() {
+        let since = ADV_ANCHOR - 90 * ADV_DAY;
+        let dir = adv_repo_with_dates(&[since - 1, since, since + 1]);
+        for walk in ADV_WALKS {
+            let report = adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(report.cfr_sample_commits, 2, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_on_an_unborn_head_is_an_empty_answer_on_both_walks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for walk in ADV_WALKS {
+            let report = adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(report.cfr_sample_commits, 0, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_on_a_shallow_clone_counts_what_is_there_on_both_walks() {
+        let source = adv_repo_with_dates(&[
+            ADV_ANCHOR - 30 * ADV_DAY,
+            ADV_ANCHOR - 20 * ADV_DAY,
+            ADV_ANCHOR - 10 * ADV_DAY,
+        ]);
+        let parent = tempfile::TempDir::new().unwrap();
+        git_in(
+            parent.path(),
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &format!("file://{}", source.path().display()),
+                "shallow",
+            ],
+        );
+        let shallow = parent.path().join("shallow");
+        crate::test_support::trust_repo(&shallow);
+        assert!(
+            shallow.join(".git/shallow").is_file(),
+            "fixture: a shallow clone"
+        );
+        for walk in ADV_WALKS {
+            let report = GitReader::dora_report_scanning(
+                shallow.to_str().unwrap(),
+                Some(90),
+                4_096,
+                ADV_ANCHOR,
+                walk,
+            )
+            .unwrap();
+            assert_eq!(report.cfr_sample_commits, 1, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    /// Cap 1 and cap 0 never panic and always claim the cut when in-window
+    /// commits were left behind; the true count appears only where it is known.
+    #[test]
+    fn dora_caps_of_one_and_zero_report_a_cut_and_do_not_panic() {
+        let dir = adv_repo_with_dates(&[
+            ADV_ANCHOR - 40 * ADV_DAY,
+            ADV_ANCHOR - 30 * ADV_DAY,
+            ADV_ANCHOR - 3 * ADV_DAY,
+            ADV_ANCHOR - 100,
+        ]);
+        for walk in ADV_WALKS {
+            let one = adv_scan(&dir, Some(90), 1, ADV_ANCHOR, walk);
+            assert_eq!(one.cfr_sample_commits, 1, "{walk:?}");
+            assert!(one.commit_scan_truncated, "{walk:?}");
+            let zero = adv_scan(&dir, Some(90), 0, ADV_ANCHOR, walk);
+            assert_eq!(zero.cfr_sample_commits, 0, "{walk:?}");
+            assert!(zero.commit_scan_truncated, "{walk:?}");
+            let exact = adv_scan(&dir, Some(90), 4, ADV_ANCHOR, walk);
+            assert!(
+                !exact.commit_scan_truncated,
+                "cap equal to the window: {walk:?}"
+            );
+        }
+        let known = adv_scan(&dir, Some(90), 1, ADV_ANCHOR, DateWalk::SinceAsFilter);
+        assert_eq!(known.commit_scan_window_commits, Some(4));
+    }
+
+    /// The fallback's truncation test looks only at the row just past the cap.
+    /// When that one row is the inverted-date commit (old), in-window commits
+    /// behind it are cut and the walk reports a complete window.
+    #[test]
+    fn break_the_count_bounded_walk_claims_completeness_when_the_row_past_the_cap_is_inverted() {
+        let anchor = ADV_ANCHOR;
+        let dir = inverted_date_repo(anchor);
+        // Walk order is today, d3, d30, inverted, d40: cap 3 leaves `inverted`
+        // as the probe row and d40 (in the window) unread.
+        let report = adv_scan(&dir, Some(90), 3, anchor, DateWalk::CountBounded);
+        assert_eq!(report.cfr_sample_commits, 3);
+        assert!(
+            report.commit_scan_truncated,
+            "d40 is in the window and was not read, but the report says the scan was complete"
+        );
+        // The filtered walk gets the same history right.
+        let filtered = adv_scan(&dir, Some(90), 3, anchor, DateWalk::SinceAsFilter);
+        assert!(filtered.commit_scan_truncated);
+    }
+
+    /// `now` close to the epoch makes the cutoff negative: both walks must
+    /// still accept the flag and count the same commits.
+    #[test]
+    fn dora_with_a_negative_cutoff_agrees_on_both_walks() {
+        let dir = adv_repo_with_dates(&[ADV_ANCHOR - 2 * ADV_DAY, ADV_ANCHOR]);
+        let counts: Vec<usize> = ADV_WALKS
+            .iter()
+            .map(|walk| adv_scan(&dir, Some(90), 4_096, 100, *walk).cfr_sample_commits)
+            .collect();
+        assert_eq!(counts, vec![2, 2], "{counts:?}");
+    }
+
+    /// Dates that make the committer clock jump back and forth: both walks see
+    /// the same set.
+    #[test]
+    fn dora_zigzag_committer_dates_give_the_same_sample_on_both_walks() {
+        let since = ADV_ANCHOR - 90 * ADV_DAY;
+        let dates: Vec<i64> = (0..40)
+            .map(|n| {
+                if n % 2 == 0 {
+                    since - 1 - n
+                } else {
+                    since + 1 + n
+                }
+            })
+            .collect();
+        let dir = adv_repo_with_dates(&dates);
+        let samples: Vec<usize> = ADV_WALKS
+            .iter()
+            .map(|walk| adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, *walk).cfr_sample_commits)
+            .collect();
+        assert_eq!(samples, vec![20, 20], "{samples:?}");
+    }
 }

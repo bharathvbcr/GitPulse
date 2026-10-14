@@ -382,4 +382,37 @@ mod tests {
         };
         assert!(assess_for_clone(&unreadable, false).is_err());
     }
+
+    /// Adversarial version lines: every one either reads as the version it
+    /// names or fails closed to the count-bounded walk.
+    #[test]
+    fn hostile_version_lines_read_correctly_or_fail_closed() {
+        let says = |line: &str| supports(&preflight_of(line), SINCE_AS_FILTER);
+        for capable in [
+            "git version 2.37.0.windows.1",
+            "git version 2.37.1 (Apple Git-136)",
+            "git version 2.37",
+            "git version 2.37.0-rc1",
+            "git version 3.0.0",
+            "git version 02.037.0",
+            "  git version 2.40.0  ",
+        ] {
+            assert!(says(capable), "{capable:?} should be capable");
+        }
+        for closed in [
+            "",
+            "garbage",
+            "git version",
+            "git version ",
+            "git version banana",
+            "git version .37.0",
+            "git version 99999999999.0.0",
+            "git version 2.36.99.windows.1",
+            "git version 2.36.9 (Apple Git-136)",
+            "version 2.40.0",
+            "Git Version 2.40.0",
+        ] {
+            assert!(!says(closed), "{closed:?} must fail closed");
+        }
+    }
 }

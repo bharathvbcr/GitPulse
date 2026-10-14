@@ -9248,6 +9248,145 @@ mod tests {
         assert_eq!(observer.0, b"progress");
         assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
+
+    // ------------------------------------------------------------------
+    // Adversarial batch-stream cases (CARD 16).
+    // ------------------------------------------------------------------
+
+    fn adv_answers(
+        stream: &[u8],
+        ids: &[&str],
+        cut: Option<&str>,
+    ) -> HashMap<String, Result<usize, String>> {
+        const OBJECT: BatchObject = BatchObject {
+            kind: "commit",
+            noun: "commit",
+        };
+        let mut answers = HashMap::new();
+        read_batch_answers(stream, ids, OBJECT, &<[u8]>::len, cut, &mut answers);
+        answers
+    }
+
+    /// A size that lies low ends the body mid-object, where no newline waits:
+    /// that answer and every one after it are unread, never re-framed.
+    #[test]
+    fn a_size_that_lies_low_leaves_this_and_every_later_commit_unread() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let stream = format!("{a} commit 2\nhi\n{b} commit 3\nabcdef\n{c} commit 1\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b, &c], None);
+        assert_eq!(got[&a], Ok(2));
+        assert!(got[&b].is_err(), "{:?}", got[&b]);
+        assert!(got[&c].is_err(), "{:?}", got[&c]);
+    }
+
+    /// A size that lies high swallows the next header: cut short, rest unread.
+    #[test]
+    fn a_size_that_lies_high_is_cut_short_not_misattributed() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let stream = format!("{a} commit 500\nhi\n{b} commit 1\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b], None);
+        assert!(got[&a].is_err() && got[&b].is_err(), "{got:?}");
+    }
+
+    /// A size too large for usize arithmetic.
+    #[test]
+    fn a_size_beyond_usize_is_an_error_not_a_panic() {
+        let a = "a".repeat(40);
+        for size in [
+            "18446744073709551615",
+            "99999999999999999999999",
+            "-1",
+            "1e3",
+            "",
+        ] {
+            let stream = format!("{a} commit {size}\nhi\n");
+            let got = adv_answers(stream.as_bytes(), &[&a], None);
+            assert!(got[&a].is_err(), "{size:?}: {got:?}");
+        }
+    }
+
+    /// The stream ends in the middle of a header line, then in the middle of
+    /// the very first byte: every id is answered, none as a value.
+    #[test]
+    fn a_stream_cut_inside_a_header_or_empty_leaves_all_unread() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let half = format!("{a} commit 2\nhi\n{b} comm");
+        let got = adv_answers(half.as_bytes(), &[&a, &b], None);
+        assert_eq!(got[&a], Ok(2));
+        assert!(got[&b].is_err());
+        let none = adv_answers(b"", &[&a, &b], None);
+        assert!(none[&a].is_err() && none[&b].is_err());
+    }
+
+    /// `missing` and `ambiguous` carry no body, so the next answer stays in
+    /// step; a stray extra header field is an error for that id only.
+    #[test]
+    fn missing_and_ambiguous_answers_keep_the_following_answers_in_step() {
+        let (a, b, c, d) = (
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40),
+            "d".repeat(40),
+        );
+        let stream =
+            format!("{a} missing\n{b} ambiguous\n{c} commit 3\nabc\n{d} commit 1 extra\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b, &c, &d], None);
+        assert!(got[&a].is_err());
+        assert!(got[&b].is_err());
+        assert_eq!(got[&c], Ok(3));
+        assert!(got[&d].is_err());
+    }
+
+    /// A commit message that is itself a perfectly formed batch answer for the
+    /// next id, with an honest size from git, must stay inside its own body.
+    #[test]
+    fn a_body_that_forges_the_next_answer_stays_inside_its_own_size() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let forged = format!("{b} commit 5\nFORGE\n");
+        let stream = format!(
+            "{a} commit {}\n{forged}\n{b} commit 4\nreal\n",
+            forged.len()
+        );
+        let got = adv_answers(stream.as_bytes(), &[&a, &b], None);
+        assert_eq!(got[&a], Ok(forged.len()));
+        assert_eq!(
+            got[&b],
+            Ok(4),
+            "b is the answer after a's own body, not the forgery"
+        );
+    }
+
+    /// 100,005 ids in one call: the first 100,000 are asked, the rest are
+    /// errors, and the call returns without stalling on a full pipe.
+    #[test]
+    fn an_oversized_id_list_is_capped_and_does_not_stall_the_pipe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-b", "main"]);
+        let oids: Vec<String> = (0..100_005u64).map(|n| format!("{n:040x}")).collect();
+        let started = std::time::Instant::now();
+        let got = read_objects_batch(
+            dir.path(),
+            &oids,
+            BatchObject {
+                kind: "commit",
+                noun: "commit",
+            },
+            64 * 1024 * 1024,
+            &<[u8]>::len,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.len(), oids.len(), "every id gets an answer");
+        assert!(got.values().all(Result::is_err), "nothing here is a commit");
+        let capped = got
+            .values()
+            .filter(|r| r.as_ref().unwrap_err().contains("asked for at once"))
+            .count();
+        assert_eq!(capped, 5);
+    }
 }
 
 /// The cross-process budget, the command scope and the post-action credit.
