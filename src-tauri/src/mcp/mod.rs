@@ -2820,6 +2820,101 @@ mod tests {
         found
     }
 
+    /// Pointer to the non-empty list with the most serialized bytes, at any depth.
+    fn largest_nonempty_list(
+        value: &Value,
+        pointer: &mut String,
+        best: &mut Option<(usize, String)>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                if !items.is_empty() {
+                    let size = value.to_string().len();
+                    if best.as_ref().is_none_or(|(most, _)| size > *most) {
+                        *best = Some((size, pointer.clone()));
+                    }
+                }
+                for (index, item) in items.iter().enumerate() {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{index}"));
+                    largest_nonempty_list(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{}", key.replace('~', "~0").replace('/', "~1")));
+                    largest_nonempty_list(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Inflate the largest list of a real tool payload past 200 KiB and fit it
+    /// to 64 KiB: the result must still meet the tool's `outputSchema`, say it
+    /// was cut, stay inside the budget and keep every top-level key (all seven
+    /// facets of an insights snapshot survive). False when the payload holds no
+    /// list to inflate.
+    fn probe_under_a_small_budget(
+        name: &str,
+        label: &str,
+        schema: &Value,
+        payload: &Value,
+    ) -> bool {
+        const BUDGET: usize = 64 * 1024;
+        let mut inflated = payload.clone();
+        let mut best = None;
+        largest_nonempty_list(&inflated, &mut String::new(), &mut best);
+        let Some((_, pointer)) = best else {
+            return false;
+        };
+        let Some(Value::Array(items)) = inflated.pointer_mut(&pointer) else {
+            return false;
+        };
+        for _ in 0..40 {
+            if serde_json::to_string(&items).map_or(0, |text| text.len()) > 200_000 {
+                break;
+            }
+            let more = items.clone();
+            items.extend(more);
+        }
+        let fitted = budget::fit(true, inflated.clone(), BUDGET)
+            .unwrap_or_else(|error| panic!("{name} on {label}: {error}"));
+        let structured = fitted.structured.expect("modern structured content");
+        let wire = budget::escaped_len(&fitted.text)
+            + serde_json::to_string(&structured)
+                .expect("serializes")
+                .len();
+        assert!(
+            wire <= BUDGET,
+            "{name} on {label}: {wire} bytes for a {BUDGET} byte budget"
+        );
+        assert!(
+            structured[budget::TRUNCATION_KEY].is_object(),
+            "{name} on {label} was cut without saying so"
+        );
+        let violations: Vec<String> = validate::validate(&structured, schema)
+            .iter()
+            .map(validate::Violation::render)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "{name} on {label}: the cut payload violates its outputSchema: {violations:?}"
+        );
+        let nulls = nulls_the_schema_does_not_allow(&structured, schema, "");
+        assert!(nulls.is_empty(), "{name} on {label}: {nulls:?}");
+        for key in payload.as_object().expect("an object payload").keys() {
+            assert!(
+                structured.get(key).is_some(),
+                "{name} on {label}: the cut dropped {key}"
+            );
+        }
+        true
+    }
+
     fn validate_allows_null(schema: &Value) -> bool {
         match schema.get("type") {
             Some(Value::String(name)) => name == "null",
@@ -2945,6 +3040,7 @@ mod tests {
         crate::test_support::trust_repo(indexed_dir.path());
 
         let mut validated = std::collections::BTreeSet::new();
+        let mut probed = std::collections::BTreeSet::<String>::new();
         let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         let mut check =
             |name: &str,
@@ -2980,6 +3076,9 @@ mod tests {
                     "{name} on {label} returns null where its outputSchema forbids it: {nulls:?}"
                 );
                 validated.insert(name.to_string());
+                if probe_under_a_small_budget(name, label, schema, &payload) {
+                    probed.insert(name.to_string());
+                }
             };
         for repo in [&healthy, &broken, &untrusted, &ledgered, &missing, &indexed] {
             for tool in tools() {
@@ -3094,6 +3193,24 @@ mod tests {
                 &mut validated,
             );
         }
+
+        // The budget probe ran on real payloads, not only on the shapes this
+        // test invented: a tool with no list in its payload cannot be probed,
+        // so the ones that must be are named.
+        for name in [
+            "gitpulse_insights",
+            "gitpulse_change_context",
+            "gitpulse_get_task",
+        ] {
+            assert!(
+                probed.contains(name),
+                "{name} was never held to the result budget; probed: {probed:?}"
+            );
+        }
+        assert!(
+            probed.len() >= 5,
+            "only {probed:?} could be inflated and budgeted"
+        );
 
         // Every advertised tool is validated or explicitly exempt. A tool whose
         // every call errored was never checked, and says why.

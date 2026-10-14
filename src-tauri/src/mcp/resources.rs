@@ -543,6 +543,8 @@ mod tests {
         for payload in [
             "\"".repeat(3 * 1024 * 1024),
             "\u{1}".repeat(3 * 1024 * 1024),
+            "é".repeat(3 * 1024 * 1024),
+            "😀".repeat(1024 * 1024 + 7),
         ] {
             let contents = vec![text_content(
                 "gitpulse://insights/tmp/x",

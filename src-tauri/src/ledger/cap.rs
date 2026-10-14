@@ -37,10 +37,13 @@ const ROW_OBJECT_CAP_BYTES: usize = 2 * 1024;
 const MEMBER_CAP_BYTES: usize = 256;
 
 /// Room a page row keeps back for the markers it adds to a cut field.
-const MARKER_RESERVE_BYTES: usize = 512;
+const MARKER_RESERVE_BYTES: usize = 2048;
 
 /// Names of cut members a `gitpulse_truncated` marker lists.
-const MARKER_KEYS: usize = 64;
+const MARKER_KEYS: usize = 32;
+
+/// Longest a cut member's name is listed, in bytes.
+const MARKER_KEY_BYTES: usize = 48;
 
 /// The `detail_json` members that carry event time and the append cut. They
 /// are small, server-built and read by consumers, so a page never drops them.
@@ -130,16 +133,17 @@ pub(crate) fn bound_json_text(text: &str, cap: usize) -> String {
     for (key, value) in members {
         let size = key.len() + value.to_string().len() + 4;
         let essential = KEPT_MEMBERS.contains(&key.as_str());
-        if essential || (size <= MEMBER_CAP_BYTES && used + size <= room) {
+        if size <= MEMBER_CAP_BYTES && (essential || used + size <= room) {
             used += size;
             kept.insert(key, value);
         } else {
             cut_bytes += size;
-            cut_keys.push(key);
+            if cut_keys.len() < MARKER_KEYS {
+                cut_keys.push(key[..key.floor_char_boundary(MARKER_KEY_BYTES)].to_string());
+            }
         }
     }
     if !cut_keys.is_empty() {
-        cut_keys.truncate(MARKER_KEYS);
         kept.insert(
             "gitpulse_truncated".into(),
             json!({ "keys": cut_keys, "bytes": cut_bytes }),
@@ -232,5 +236,185 @@ impl LedgerEvent {
             .verdict_json
             .map(|text| bound_verdict_json(&text, ROW_FIELD_CAP_BYTES));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event() -> LedgerEvent {
+        LedgerEvent {
+            id: 7,
+            ulid: "01J00000000000000000000000".into(),
+            ts_utc: "2026-10-14T00:00:00.000Z".into(),
+            schema_version: 1,
+            repo_path: "/r".into(),
+            worktree_path: None,
+            actor_kind: "agent".into(),
+            actor_id: None,
+            session_id: None,
+            task_id: None,
+            action: "session.command".into(),
+            object: None,
+            argv_json: None,
+            outcome: "ok".into(),
+            verdict_json: None,
+            before_ref: None,
+            after_ref: None,
+            duration_ms: None,
+            detail_json: None,
+        }
+    }
+
+    #[test]
+    fn a_row_under_every_cap_is_returned_exactly() {
+        let mut row = event();
+        row.object = Some("git status".into());
+        row.argv_json = Some(r#"["git","status"]"#.into());
+        row.verdict_json = Some(r#"{"status":"allow"}"#.into());
+        row.detail_json = Some(r#"{"a":1}"#.into());
+        assert_eq!(row.clone().bounded(), row);
+    }
+
+    #[test]
+    fn a_long_detail_keeps_its_small_members_and_names_what_it_cut() {
+        let mut row = event();
+        let big = "b".repeat(40_000);
+        row.detail_json = Some(
+            serde_json::json!({
+                "occurred_at": "2026-09-01T12:00:05.250Z",
+                "occurred_at_basis": "transcript",
+                "task_basis": "bound",
+                "source": "transcript",
+                "payload": big,
+                "object_truncated": { "at": 1, "bytes": 9, "hash": "fnv1a64:0000000000000000" },
+            })
+            .to_string(),
+        );
+        let text = row.bounded().detail_json.unwrap();
+        assert!(text.len() < ROW_FIELD_CAP_BYTES, "{}", text.len());
+        let detail: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(detail["source"], "transcript");
+        for key in KEPT_MEMBERS {
+            assert!(detail.get(key).is_some(), "{key} was cut: {detail}");
+        }
+        assert!(detail.get("payload").is_none());
+        assert_eq!(detail["gitpulse_truncated"]["keys"], json!(["payload"]));
+        assert!(detail["gitpulse_truncated"]["bytes"].as_u64().unwrap() > 40_000);
+    }
+
+    #[test]
+    fn many_small_members_are_kept_only_as_far_as_they_fit() {
+        let members: Map<String, Value> = (0..2000)
+            .map(|n| (format!("key{n:04}"), json!("v".repeat(100))))
+            .collect();
+        let mut row = event();
+        row.detail_json = Some(Value::Object(members).to_string());
+        let text = row.bounded().detail_json.unwrap();
+        assert!(text.len() <= ROW_FIELD_CAP_BYTES, "{}", text.len());
+        let detail: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            detail["gitpulse_truncated"]["keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MARKER_KEYS,
+            "the list of cut names is itself bounded"
+        );
+    }
+
+    #[test]
+    fn a_detail_that_is_not_an_object_is_wrapped_with_a_bounded_head() {
+        for text in [
+            "x".repeat(50_000),
+            format!("[{}]", "1,".repeat(30_000)),
+            "\"é😀\u{1}\"".repeat(9_000),
+        ] {
+            let mut row = event();
+            row.detail_json = Some(text.clone());
+            let cut = row.bounded().detail_json.unwrap();
+            assert!(cut.len() <= ROW_FIELD_CAP_BYTES, "{} bytes", cut.len());
+            let detail: Value = serde_json::from_str(&cut).unwrap();
+            assert_eq!(detail["gitpulse_truncated"]["bytes"], text.len());
+            assert!(text.starts_with(detail["head"].as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn argv_stays_an_array_with_long_elements_cut_and_a_count_of_the_rest() {
+        let mut argv: Vec<String> = vec!["tool".into(), "z".repeat(3000)];
+        argv.extend((0..2000).map(|n| format!("--flag-{n}=value-{n}")));
+        let mut row = event();
+        row.argv_json = Some(serde_json::to_string(&argv).unwrap());
+        let text = row.bounded().argv_json.unwrap();
+        assert!(text.len() <= ROW_FIELD_CAP_BYTES, "{}", text.len());
+        let cut: Vec<String> = serde_json::from_str(&text).unwrap();
+        assert_eq!(cut[0], "tool");
+        assert!(cut[1].len() <= MEMBER_CAP_BYTES * 2 && cut[1].contains("truncated"));
+        let last = cut.last().unwrap();
+        assert!(last.starts_with('…') && last.ends_with(" more]"), "{last}");
+        assert!(cut.len() < argv.len());
+    }
+
+    #[test]
+    fn a_verdict_gains_no_key_and_loses_no_key() {
+        let verdict = json!({
+            "status": "blocked",
+            "checked": true,
+            "target": "t".repeat(40_000),
+            "nested": { "reason": "r".repeat(5_000), "n": 3 },
+            "list": ["a", "b".repeat(5_000)],
+        });
+        let mut row = event();
+        row.verdict_json = Some(verdict.to_string());
+        let text = row.bounded().verdict_json.unwrap();
+        assert!(text.len() < ROW_FIELD_CAP_BYTES, "{}", text.len());
+        let cut: Value = serde_json::from_str(&text).unwrap();
+        let keys =
+            |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
+        assert_eq!(keys(&cut), keys(&verdict), "a key was added or removed");
+        assert_eq!(keys(&cut["nested"]), keys(&verdict["nested"]));
+        assert_eq!(cut["nested"]["n"], 3);
+        assert_eq!(cut["status"], "blocked");
+        assert!(cut["target"].as_str().unwrap().contains("…[truncated "));
+        assert_eq!(cut["list"][0], "a");
+    }
+
+    #[test]
+    fn every_cut_lands_on_a_character_boundary() {
+        for glyph in ["é", "€", "😀"] {
+            for offset in 0..glyph.len() {
+                let text = format!("{}{}", "a".repeat(100 + offset), glyph.repeat(3000));
+                let cut = cut_text(&text, 200);
+                assert!(cut.len() <= 200, "{glyph} +{offset}: {}", cut.len());
+                assert!(cut.contains("…[truncated "));
+            }
+        }
+        let mut row = event();
+        row.object = Some("😀".repeat(2000));
+        assert!(row.bounded().object.unwrap().len() <= ROW_OBJECT_CAP_BYTES);
+    }
+
+    #[test]
+    fn the_object_cap_helper_cuts_only_past_the_cap() {
+        let (kept, cap) = cap_object("a".repeat(OBJECT_CAP_BYTES));
+        assert_eq!(kept.len(), OBJECT_CAP_BYTES);
+        assert!(cap.is_none());
+        let (kept, cap) = cap_object("a".repeat(OBJECT_CAP_BYTES + 1));
+        let cap = cap.expect("a cut");
+        assert!(kept.len() <= OBJECT_CAP_BYTES && kept.ends_with(OBJECT_CUT_SUFFIX));
+        assert!(cap.is_well_formed());
+        assert_eq!(cap.bytes, OBJECT_CAP_BYTES + 1);
+        let forged = ObjectCap {
+            hash: "fnv1a64:\",\"x\":\"".into(),
+            ..cap.clone()
+        };
+        assert!(!forged.is_well_formed());
+        let past = ObjectCap {
+            at: OBJECT_CAP_BYTES + 1,
+            ..cap
+        };
+        assert!(!past.is_well_formed());
     }
 }

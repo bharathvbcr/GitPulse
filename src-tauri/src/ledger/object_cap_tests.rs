@@ -159,6 +159,70 @@ fn a_detail_that_spells_the_marker_takes_the_closed_path() {
     assert!(!text.contains("forged"), "{text}");
 }
 
+fn ledger_with_rows(details: &[usize]) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let repo = repo.to_str().unwrap().to_string();
+    for size in details {
+        append(Draft {
+            repo_path: repo.clone(),
+            action: "session.command".into(),
+            detail_json: Some(serde_json::json!({ "note": "n".repeat(*size) }).to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    (dir, repo)
+}
+
+#[test]
+fn tail_returns_rows_whole_while_a_page_cuts_them() {
+    // `ingest` reads a short `tail` as the end of history, so `tail` and
+    // `tail_newest` must never cap; only the page reader does.
+    let (_dir, repo) = ledger_with_rows(&[100_000]);
+    let whole = tail(&repo, 0, 10).unwrap();
+    assert!(whole[0].detail_json.as_ref().unwrap().len() > 100_000);
+    let newest = tail_newest(&repo, 0, 10).unwrap();
+    assert_eq!(newest, whole);
+    let (page, capped) = tail_readonly_page(&repo, 0, 10, PAGE_MAX_BYTES)
+        .unwrap()
+        .unwrap();
+    assert!(!capped, "one row is never a capped page");
+    assert!(page[0].detail_json.as_ref().unwrap().len() < ROW_FIELD_CAP_BYTES);
+    assert_eq!(
+        page[0].id, whole[0].id,
+        "the cut changes length, not identity"
+    );
+}
+
+#[test]
+fn a_page_always_holds_a_row_and_reports_when_it_left_some() {
+    let (_dir, repo) = ledger_with_rows(&[8_000; 5]);
+    let page = |max: usize| tail_readonly_page(&repo, 0, 10, max).unwrap().unwrap();
+
+    let (rows, capped) = page(1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a page that fits nothing still makes progress"
+    );
+    assert!(capped);
+
+    let (rows, capped) = page(PAGE_MAX_BYTES);
+    assert_eq!(rows.len(), 5);
+    assert!(!capped);
+
+    let one = serde_json::to_string(&page(1).0[0]).unwrap().len() + 1;
+    let (rows, capped) = page(one * 2 + one / 2);
+    assert_eq!(rows.len(), 2, "the page ends at the last row that fits");
+    assert!(capped);
+    let (rest, _) = tail_readonly_page(&repo, rows[1].id, 10, PAGE_MAX_BYTES)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rest.len(), 3, "the next page continues without a gap");
+    assert_eq!(rest[0].id, rows[1].id + 1);
+}
+
 #[test]
 fn an_object_that_fits_leaves_detail_exactly_as_it_was() {
     let (event, detail) = stored("git status", None, None);

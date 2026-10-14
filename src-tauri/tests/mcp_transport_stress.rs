@@ -649,6 +649,40 @@ fn a_slow_but_live_reader_does_not_end_the_session() {
     let _ = server.child.wait();
 }
 
+#[test]
+fn a_client_that_never_reads_ends_the_session_after_the_write_window() {
+    // The other side of the slow reader: past the (configurable) write window
+    // the client is judged stalled, and since a partial line may be on the pipe
+    // the session ends rather than resume mid-line. It must not hang.
+    let (_dir, repo) = repository_with_a_heavy_ledger();
+    let (mut server, stdout) = Server::start_undrained(&[("GITPULSE_MCP_WRITE_TIMEOUT_MS", "300")]);
+    server.write(
+        request(
+            json!("page"),
+            "tools/call",
+            json!({
+                "name": "gitpulse_ledger_events",
+                "arguments": { "repo_path": repo, "limit": 1000 }
+            }),
+        )
+        .as_bytes(),
+    );
+    // The read end stays open and unread, so this is a stall, not a closed pipe.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut status = None;
+    while Instant::now() < deadline {
+        if let Ok(Some(exit)) = server.child.try_wait() {
+            status = Some(exit);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = server.child.kill();
+    drop(stdout);
+    let status = status.expect("the server kept running past its write window");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Fuzzing: no input may kill the server or corrupt the stream
 // ---------------------------------------------------------------------------
