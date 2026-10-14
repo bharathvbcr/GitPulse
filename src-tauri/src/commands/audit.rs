@@ -234,7 +234,7 @@ pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, S
 }
 
 #[cfg(test)]
-mod tests {
+mod catch_up_binding_tests {
     use super::*;
 
     use crate::ingest::CatchUp;

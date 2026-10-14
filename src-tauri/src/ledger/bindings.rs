@@ -486,7 +486,9 @@ impl BindingHistory {
 
     /// What held at `at_ms`, exact to the millisecond.
     pub fn as_of(&self, at_ms: u64) -> TaskAtTime {
-        if self.unreadable {
+        // Nothing to order against: most worktrees were never bound, and this
+        // runs once per call of a corpus.
+        if self.unreadable || self.rows.is_empty() {
             return TaskAtTime::Unresolved;
         }
         let at = super::ids::iso8601_utc(at_ms);
