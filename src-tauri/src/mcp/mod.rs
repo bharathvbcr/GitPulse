@@ -2788,6 +2788,40 @@ mod tests {
         );
     }
 
+    /// What the result budget adds to a call, alone: the budget step on a real
+    /// insights payload, min of 500, with no git underneath. Timing only, so it
+    /// is ignored; run it in release with
+    /// `cargo test --release --lib -- --ignored --nocapture the_budget_step`.
+    #[test]
+    #[ignore = "timing only, no assertion on speed"]
+    fn the_budget_step_alone_on_a_real_insights_payload() {
+        let (dir, repo) = repository_with_ledger_rows(1, 10);
+        let _keep = dir;
+        let payload = handle_tool_call("gitpulse_insights", &json!({ "repo_path": repo }))
+            .expect("insights answers");
+        let bytes = serde_json::to_string(&payload).unwrap().len();
+        let room = budget::tool_budget(&json!(1));
+        let mut least = std::time::Duration::MAX;
+        for _ in 0..500 {
+            let copy = payload.clone();
+            let started = std::time::Instant::now();
+            let fitted = std::hint::black_box(budget::fit(true, copy, room));
+            least = least.min(started.elapsed());
+            assert!(fitted.is_ok());
+        }
+        let mut before = std::time::Duration::MAX;
+        for _ in 0..500 {
+            let started = std::time::Instant::now();
+            let text = std::hint::black_box(serde_json::to_string_pretty(&payload));
+            before = before.min(started.elapsed());
+            assert!(text.is_ok());
+        }
+        println!(
+            "budget::fit on a {bytes} byte insights payload: min {least:?} of 500 \
+             (the pretty-printed text it replaced: min {before:?})"
+        );
+    }
+
     /// A modern client reads `structuredContent`; the text block exists for
     /// clients that read nothing else. Both full-size doubled every large
     /// result on the wire. Modern gets one full copy and a bounded mirror, and a

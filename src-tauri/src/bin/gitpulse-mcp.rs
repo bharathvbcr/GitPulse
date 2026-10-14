@@ -922,6 +922,13 @@ fn main() {
     gitpulse_lib::procguard::exit(code);
 }
 
+/// The library's environment-override guard, compiled into this crate too: the
+/// library's own is `#[cfg(test)]` and `pub(crate)`, so it does not exist from
+/// here (as in `gitpulsed`, which includes it the same way).
+#[cfg(test)]
+#[path = "../test_support/env.rs"]
+mod test_env;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,21 +1024,16 @@ mod tests {
         assert!(!wire.broken.load(Ordering::Acquire));
     }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// Runs `probe` with `name` set to each of `values`, then restores it.
+    ///
+    /// Through the repo's one sanctioned form (`bind_env`, serialized and
+    /// restored on drop, also when a probe panics): raw `set_var` in a test is
+    /// what `hermetic_contract` refuses.
     fn with_env(name: &str, values: &[&str], mut probe: impl FnMut(&str)) {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = std::env::var(name).ok();
+        let serial = crate::test_env::env_serial();
         for value in values {
-            std::env::set_var(name, value);
+            let _binding = crate::test_env::bind_env(&serial).set(name, value);
             probe(value);
-        }
-        match before {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
         }
     }
 
