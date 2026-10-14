@@ -1492,4 +1492,6 @@ mod watermark_tests {
 }
 
 #[cfg(test)]
+mod event_time_tests;
+#[cfg(test)]
 mod family_tests;
