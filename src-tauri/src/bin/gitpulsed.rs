@@ -96,7 +96,14 @@ OPTIONS:
 OUTPUT:
     One NDJSON object per repository per cycle on stdout:
       {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"skipped_lines\":0,
+       \"rehosted_calls\":0,\"departed_overflow\":0,\"family_unresolved\":false,
        \"reflog_entries\":7,\"recording\":true,\"error\":\"\",\"elapsed_ms\":42}
+
+    `rehosted_calls` and `departed_overflow` count transcript calls that needed
+    another worktree's transaction (past the per-pass worktree cap, or from
+    removed worktrees past the per-pass bound). `family_unresolved` is true when
+    the worktree family could not be listed, so no removed worktree was
+    recognised that cycle. None of them is an error; none reads as a clean pass.
 
     `recording` is the ledger's own status. A cycle that recorded nothing
     because the ledger could not be opened is not the same as one that

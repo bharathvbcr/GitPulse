@@ -395,6 +395,19 @@
           "p50_ns": 472977667,
           "p95_ns": 858354833,
           "time_gated": true
+        },
+        "transcript_pass 10k departed cwds": {
+          "counters": {
+            "recorded": 10000,
+            "transcripts": 1
+          },
+          "max_ns": 1104766875,
+          "metrics": {},
+          "min_ns": 473147833,
+          "n": 15,
+          "p50_ns": 497403375,
+          "p95_ns": 761925542,
+          "time_gated": true
         }
       }
     },
