@@ -44,7 +44,7 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_get_status": return statuses;
     case "cmd_stage_file": case "cmd_unstage_file": indexCalls.push({ cmd, ...args }); return guarded;
     case "cmd_discard_changes": discards.push(args); return guarded;
-    case "cmd_write_file_content": writes.push(args); return guarded;
+    case "cmd_create_file": writes.push(args); if (args.filePath === "hidden-on-disk.ts") throw { code: "already_exists", message: "'hidden-on-disk.ts' already exists", path: args.filePath }; return guarded;
     case "cmd_move_path": moves.push(args); if (moveFails) throw new Error("move refused by fixture"); return guarded;
     case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: "a".repeat(40), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
     case "cmd_list_remotes": case "cmd_list_submodules": return [];
@@ -62,7 +62,7 @@ mockIPCWithEvents((cmd, args) => {
 const { mount, tick } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
-const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+const { promptState, promptError, completePrompt } = await import("../src/lib/stores/modalStore");
 const Panel = (await import("../src/lib/components/files/FileTreePanel.svelte")).default;
 const { results, check, stopped } = createChecks();
 const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
@@ -232,7 +232,7 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await until(() => get(promptState), "new file prompt again"); completePrompt("  notes.ts ");
   await until(() => writes.length === 1, "file written");
   await wait(200);
-  check("a name creates that empty file at the root, trimmed, and opens it", () => writes[0].filePath === "notes.ts" && writes[0].content === "" && get(repoStore).selectedFilePath === "notes.ts");
+  check("a name creates that empty file at the root, trimmed, and opens it", () => writes[0].filePath === "notes.ts" && !("content" in writes[0]) && get(repoStore).selectedFilePath === "notes.ts");
   await openMenuFor("docs/guide.md");
   await press(tree(), "Home");
   await closeMenu();
@@ -248,6 +248,23 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await until(() => get(promptState), "new file in folder prompt"); completePrompt("intro.md");
   await until(() => writes.length === 3, "file in folder written");
   check("New File from a folder's menu creates the file inside that folder", () => writes[2].filePath === "docs/intro.md");
+
+  // --- an existing name is refused and nothing is written ------------------------
+  const created = writes.length;
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "new file prompt for an existing name");
+  completePrompt("README.md"); await wait(150);
+  check("a name the listing holds is refused in the dialog, which stays open with the reason", () => get(promptState) !== null && /already exists/.test(get(promptError) ?? ""));
+  check("and nothing was sent to the host", () => writes.length === created);
+  completePrompt(null); await wait(100);
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "new file prompt for a file only the disk has");
+  completePrompt("hidden-on-disk.ts");
+  await until(() => writes.length === created + 1 && get(promptState), "host refusal reopens the prompt");
+  check("a file the listing has not shown is refused by the host and the prompt reopens on the typed name", () => writes.at(-1).filePath === "hidden-on-disk.ts" && get(promptState).options.initialValue === "hidden-on-disk.ts" && /already exists/.test(get(promptState).options.error ?? ""));
+  check("and it is not opened", () => get(repoStore).selectedFilePath !== "hidden-on-disk.ts");
+  completePrompt(null); await wait(100);
+  check("cancelling that prompt creates nothing more", () => writes.length === created + 1);
 
   // --- rename and move --------------------------------------------------------
   await openMenuFor("src/lib/b.ts");
