@@ -5662,7 +5662,7 @@ mod tests {
 
         #[test]
         fn every_integer_argument_at_and_around_its_bounds_as_integer_and_whole_float() {
-            let max_exact: i128 = 9_007_199_254_740_991;
+            let max_exact: i128 = 999_999_999_999_999;
             let mut checked = 0;
             for (name, extract) in extractors() {
                 let schema = schema_of(name);
@@ -5722,7 +5722,7 @@ mod tests {
                 for sent in [int_json(value), json!(value as f64)] {
                     let arguments = base(sent.clone());
                     let validated = validate_arguments("gitpulse_merge_tasks", &arguments);
-                    let float_beyond_exact = sent.is_f64() && value.abs() > 9_007_199_254_740_991;
+                    let float_beyond_exact = sent.is_f64() && value.abs() > 999_999_999_999_999;
                     if ok && !float_beyond_exact {
                         validated.unwrap_or_else(|e| panic!("{sent}: {e}"));
                         let read = extract::<MergeTasksArgs>(&arguments).expect("extracts");
@@ -5936,7 +5936,10 @@ mod tests {
                 }
             }
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(60),
+                started.elapsed()
+                    < crate::test_support::env::coverage_relaxed(std::time::Duration::from_secs(
+                        60
+                    )),
                 "hostile values took {:?}",
                 started.elapsed()
             );

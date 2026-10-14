@@ -220,7 +220,7 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
                             .unwrap_or_default();
                         out.push(Violation::new(
                             join(path, name),
-                            format!("unknown argument; accepted: [{}]", known.join(", ")),
+                            format!("{UNKNOWN_PREFIX}{}]", known.join(", ")),
                         ));
                     }
                 }
@@ -356,8 +356,8 @@ fn describe(value: &Value) -> String {
         Value::Number(n) => {
             if exact_int(n).is_some() {
                 "integer".into()
-            } else if n.as_f64().is_some_and(|f| f.fract() == 0.0) {
-                "integer outside +/-(2^53 - 1)".into()
+            } else if n.as_f64().is_some_and(|f| f.abs() > MAX_EXACT_FLOAT_INT) {
+                "float above 999999999999999; send an integer literal".into()
             } else {
                 "number".into()
             }
@@ -606,17 +606,21 @@ fn bound_note(max: usize, unit: Unit, each_item: bool) -> String {
     }
 }
 
-/// The largest integer a double holds exactly, and so the largest a float-typed
-/// JSON number is trusted to mean.
-const MAX_EXACT_FLOAT_INT: f64 = 9_007_199_254_740_991.0;
+/// The largest whole number a float-typed JSON number is trusted to mean:
+/// 10^15 - 1. serde_json is built without `float_roundtrip`, so a float with 16
+/// or more significant digits (`9007199254740991.0`) can parse one ulp off the
+/// number the client wrote, and converting it would silently name a different
+/// integer. Up to 15 significant digits every spelling takes the correctly
+/// rounded path. Above it the caller is told to send an integer literal, which
+/// is read exactly at any size in range.
+const MAX_EXACT_FLOAT_INT: f64 = 999_999_999_999_999.0;
 
 /// A JSON number as an exact integer, or `None`.
 ///
 /// Integer literals are exact. A float with no fractional part (`5.0`, `1e2`) is
-/// converted when it is within +/-(2^53 - 1), where every integer has exactly
-/// one double; beyond that a double stands for a range of integers and
-/// converting it would pick one of them for the caller. Everything else is not
-/// an integer.
+/// converted when its magnitude is at most 10^15 - 1 (see
+/// [`MAX_EXACT_FLOAT_INT`]); beyond that it is refused rather than misread.
+/// Everything else is not an integer.
 pub fn exact_int(number: &serde_json::Number) -> Option<i128> {
     if let Some(signed) = number.as_i64() {
         return Some(signed.into());
@@ -936,22 +940,61 @@ pub fn unknown_arguments(
         .map(|key| {
             Violation::new(
                 key.as_str(),
-                format!("unknown argument; accepted: [{}]", known.join(", ")),
+                format!("{UNKNOWN_PREFIX}{}]", known.join(", ")),
             )
         })
         .collect()
 }
 
+/// The start of an unknown-argument violation's message, up to the accepted names.
+const UNKNOWN_PREFIX: &str = "unknown argument; accepted: [";
+
+/// How many violations a refusal spells out; the rest are counted.
+const MAX_RENDERED_VIOLATIONS: usize = 20;
+
+/// The longest refusal text. A call with 100,000 unknown keys used to make a
+/// 6.5 MB message that the output bound dropped, so the client got no answer.
+pub const MAX_REFUSAL_BYTES: usize = 8 * 1024;
+
 /// The refusal text for a call that failed validation or extraction.
+///
+/// At most [`MAX_RENDERED_VIOLATIONS`] are spelled out, then "... and N more";
+/// the accepted-names list of an unknown-argument violation is printed once, not
+/// once per key; and the whole text is bounded by [`MAX_REFUSAL_BYTES`].
 pub fn refusal(tool: &str, violations: &[Violation]) -> String {
-    format!(
-        "invalid arguments for {tool}: {}",
-        violations
-            .iter()
-            .map(Violation::render)
-            .collect::<Vec<_>>()
-            .join("; ")
-    )
+    let mut accepted: Option<&str> = None;
+    let spelled: Vec<String> = violations
+        .iter()
+        .take(MAX_RENDERED_VIOLATIONS)
+        .map(
+            |violation| match violation.message.strip_prefix(UNKNOWN_PREFIX) {
+                Some(names) => {
+                    accepted.get_or_insert(names);
+                    format!("{}: unknown argument", violation.path)
+                }
+                None => violation.render(),
+            },
+        )
+        .collect();
+    let mut message = format!("invalid arguments for {tool}: {}", spelled.join("; "));
+    if let Some(names) = accepted {
+        message.push_str(&format!("; accepted: [{names}"));
+    }
+    if violations.len() > MAX_RENDERED_VIOLATIONS {
+        message.push_str(&format!(
+            "; \u{2026} and {} more",
+            violations.len() - MAX_RENDERED_VIOLATIONS
+        ));
+    }
+    if message.len() > MAX_REFUSAL_BYTES {
+        let mut end = MAX_REFUSAL_BYTES - '\u{2026}'.len_utf8();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push('\u{2026}');
+    }
+    message
 }
 
 #[cfg(test)]
@@ -1154,12 +1197,12 @@ mod tests {
             let found = messages(json!({ "repo_path": "/tmp/x", "limit": beyond }));
             assert_eq!(
                 found,
-                vec!["limit: expected integer, got integer outside +/-(2^53 - 1)"],
+                vec!["limit: expected integer, got float above 999999999999999; send an integer literal"],
                 "{beyond}"
             );
         }
         assert!(
-            messages(json!({ "repo_path": "/tmp/x", "limit": 9_007_199_254_740_991.0 }))
+            messages(json!({ "repo_path": "/tmp/x", "limit": 999_999_999_999_999.0 }))
                 .iter()
                 .all(|m| m.contains("<="))
         );
@@ -1193,11 +1236,10 @@ mod tests {
             (json!(-3.0), Some(-3)),
             (json!(-0.0), Some(0)),
             (json!(1e2), Some(100)),
-            (json!(9_007_199_254_740_991.0), Some(9_007_199_254_740_991)),
-            (
-                json!(-9_007_199_254_740_991.0),
-                Some(-9_007_199_254_740_991),
-            ),
+            (json!(999_999_999_999_999.0), Some(999_999_999_999_999)),
+            (json!(9_007_199_254_740_991.0), None),
+            (json!(-999_999_999_999_999.0), Some(-999_999_999_999_999)),
+            (json!(-9_007_199_254_740_991.0), None),
             (json!(9_007_199_254_740_992.0), None),
             (json!(9_007_199_254_740_993.0_f64), None),
             (json!(1e300), None),
@@ -1257,7 +1299,7 @@ mod tests {
             ),
             (
                 json!({ "count": 1, "offset": 9_223_372_036_854_775_808.0 }),
-                "offset: expected integer, got integer outside +/-(2^53 - 1)",
+                "offset: expected integer, got float above 999999999999999; send an integer literal",
             ),
             (
                 json!({ "count": 1, "ratio": "x" }),
@@ -1345,17 +1387,17 @@ mod tests {
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
         let mut wrong = Vec::new();
         let mut cases: Vec<i128> = vec![
-            9_007_199_254_740_991,
-            9_007_199_254_740_990,
-            4_503_599_627_370_497,
-            1_000_000_000_000_001,
+            999_999_999_999_999,
+            999_999_999_999_998,
+            450_359_962_737_049,
+            100_000_000_000_001,
             123_456_789_012_345,
         ];
         for _ in 0..20_000 {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            cases.push(i128::from(state % 9_007_199_254_740_991));
+            cases.push(i128::from(state % 999_999_999_999_999));
         }
         for n in cases {
             for text in [format!("{n}.0"), format!("-{n}.0")] {
@@ -1373,6 +1415,39 @@ mod tests {
         );
     }
 
+    /// Above 10^15 - 1 a float spelling can parse one ulp off what the client
+    /// wrote (serde_json has no `float_roundtrip`), so it is refused, with a
+    /// message that names the argument and says what to send, never converted.
+    #[test]
+    fn a_whole_float_above_the_limit_is_refused_not_misread() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let schema = json!({
+            "type": "object",
+            "properties": { "revision": { "type": "integer" } }
+        });
+        for index in 0..20_000_u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = 1_000_000_000_000_000 + state % 8_000_000_000_000_000;
+            for text in [format!("{n}.0"), format!("-{n}.0")] {
+                assert_eq!(exact_int(&raw_number(&text)), None, "{text}");
+                let call = format!(r#"{{"revision": {text}}}"#);
+                let found = validate(&serde_json::from_str::<Value>(&call).unwrap(), &schema);
+                assert_eq!(found.len(), 1, "{text}");
+                let message = found[0].render();
+                assert!(
+                    message.starts_with("revision:") && message.contains("integer literal"),
+                    "{message}"
+                );
+            }
+            if index == 0 {
+                // The same value as an integer literal is read exactly.
+                assert_eq!(exact_int(&raw_number(&format!("{n}"))), Some(i128::from(n)));
+            }
+        }
+    }
+
     fn raw_number(text: &str) -> Number {
         match serde_json::from_str::<Value>(text).unwrap_or_else(|e| panic!("{text}: {e}")) {
             Value::Number(number) => number,
@@ -1383,7 +1458,7 @@ mod tests {
     /// Raw JSON text, as a client writes it, against what `exact_int` makes of it.
     #[test]
     fn exact_int_reads_every_spelling_a_client_can_write() {
-        let table: [(&str, Option<i128>); 30] = [
+        let table: [(&str, Option<i128>); 33] = [
             ("0", Some(0)),
             ("-0", Some(0)),
             ("-0.0", Some(0)),
@@ -1400,13 +1475,16 @@ mod tests {
             ("-1e300", None),
             ("9007199254740990", Some(9_007_199_254_740_990)),
             ("9007199254740991", Some(9_007_199_254_740_991)),
-            ("9007199254740991.0", Some(9_007_199_254_740_991)),
+            ("999999999999999.0", Some(999_999_999_999_999)),
+            ("1000000000000000.0", None),
+            ("9007199254740991.0", None),
             // A JavaScript client writes 2^53 as an integer literal.
             ("9007199254740992", Some(9_007_199_254_740_992)),
             ("9007199254740992.0", None),
             ("9007199254740993", Some(9_007_199_254_740_993)),
             ("9007199254740993.0", None),
-            ("-9007199254740991.0", Some(-9_007_199_254_740_991)),
+            ("-999999999999999.0", Some(-999_999_999_999_999)),
+            ("-9007199254740991.0", None),
             ("-9007199254740992.0", None),
             ("9223372036854775807", Some(9_223_372_036_854_775_807)),
             ("9223372036854775808", Some(9_223_372_036_854_775_808)),

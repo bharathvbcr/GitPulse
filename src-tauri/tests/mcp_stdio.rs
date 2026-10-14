@@ -559,10 +559,10 @@ fn every_integer_argument_is_held_to_its_advertised_bounds_on_the_wire() {
             let mut expectations = HashMap::new();
             for value in [min - 1, min, max, max + 1] {
                 // The text goes on the wire as written. A float spelling of a
-                // value past 2^53 - 1 is one no client can mean exactly.
+                // value past 10^15 - 1 is one the server refuses rather than misread.
                 let spellings = [
                     (format!("{value}"), true),
-                    (format!("{value}.0"), value.abs() <= 9_007_199_254_740_991),
+                    (format!("{value}.0"), value.abs() <= 999_999_999_999_999),
                 ];
                 for (text, representable) in spellings {
                     let inside = (min..=max).contains(&value) && representable;

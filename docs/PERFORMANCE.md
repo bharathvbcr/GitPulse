@@ -890,7 +890,7 @@ Other benches:
 - **`mcp_protocol`**:
   - `tools/call insights`: min 29.3 ms, 6 git processes.
   - `collision_risk`: min 25.1 ms.
-  - `tools/list`: min 341.3 us, 55.6 KB.
+  - `tools/list`: min 341.3 us, 57.7 KB (57,695 bytes).
 - **`repo_read`**, from the re-run at load 22.5:
   - 1k files: clean 8.3 ms, dirty (50) 23.9 ms.
   - 10k files: clean 25.3 ms, dirty (500) 70.8 ms.
@@ -972,8 +972,8 @@ dirty):
 | commit details | 16.1 ms | 40.8 ms | 50.4 ms | 1 parent, 2 git processes |
 
 `mcp_protocol` (N = 200 protocol rows, 30 work rows): `tools/list` min 349.8 us
-(55.6 KB), `server/discover` 3.3 us, `resources/read server/manifest` 605.8 us
-(120.7 KB), validation 0.4 to 0.8 us; `gitpulse_status` min 69.3 ms,
+(57.7 KB, 57,695 bytes), `server/discover` 3.3 us, `resources/read server/manifest` 605.8 us
+(122.8 KB), validation 0.4 to 0.8 us; `gitpulse_status` min 69.3 ms,
 `collision_risk` 36.0 ms, `insights` 118.8 ms with 11 git processes and 7 facets
 ok. `tools/list` is 339x cheaper than one insights call.
 

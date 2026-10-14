@@ -533,7 +533,7 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, String> {
                 bounds(a.depth, a.min_confidence)
             )))
         }
-        _ => Err(format!("Unknown DevMap tool: {name}")),
+        _ => Err(format!("Unknown tool: {name}")),
     }
 }
 
