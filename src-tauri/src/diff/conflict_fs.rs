@@ -587,10 +587,10 @@ fn digest(bytes: &[u8]) -> u64 {
         0x1000_0000_01b3_0001,
         0x0001_0000_0000_01b3,
     ];
-    let mut blocks = bytes.chunks_exact(32);
-    for block in &mut blocks {
-        for (lane, word) in lanes.iter_mut().zip(block.chunks_exact(8)) {
-            let word = u64::from_le_bytes(word.try_into().expect("an 8-byte chunk"));
+    let (blocks, tail) = bytes.as_chunks::<32>();
+    for block in blocks {
+        for (lane, word) in lanes.iter_mut().zip(block.as_chunks::<8>().0) {
+            let word = u64::from_le_bytes(*word);
             *lane = (*lane ^ word).wrapping_mul(PRIME).rotate_left(29);
         }
         let mix = (lanes[0]
@@ -606,7 +606,7 @@ fn digest(bytes: &[u8]) -> u64 {
     for lane in lanes {
         hash = (hash ^ lane).wrapping_mul(PRIME).rotate_left(31);
     }
-    for byte in blocks.remainder() {
+    for byte in tail {
         hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
     }
     hash ^ (hash >> 32)
@@ -986,12 +986,12 @@ mod write_tests {
         // that lane's word in the earlier block and solve the later block's
         // word in the same lane so that, were the lanes independent, the lane
         // would return to its original state. The token must still differ.
-        for lane in 0..4 {
+        for (lane, seed) in SEEDS.iter().copied().enumerate() {
             for first in 0..4 {
                 for second in first + 1..4 {
                     for edit in [1u64, 0xdead_beef_cafe_f00d, u64::MAX] {
                         let base = vec![0u8; 128];
-                        let (mut u, mut v) = (step(SEEDS[lane], edit), step(SEEDS[lane], 0));
+                        let (mut u, mut v) = (step(seed, edit), step(seed, 0));
                         for _ in first + 1..second {
                             u = step(u, 0);
                             v = step(v, 0);
