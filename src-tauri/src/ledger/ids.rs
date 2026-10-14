@@ -306,6 +306,70 @@ mod tests {
     }
 
     #[test]
+    fn parsing_is_the_inverse_of_formatting() {
+        for ms in [
+            0u64,
+            999,
+            951_782_400_000,   // 2000-02-29, a 400-year leap day
+            1_709_164_800_000, // 2024-02-29
+            1_788_957_296_789,
+            4_107_456_000_123,
+        ] {
+            assert_eq!(parse_event_time(&iso8601_utc(ms)), Some(ms), "{ms}");
+        }
+    }
+
+    #[test]
+    fn offsets_are_converted_and_fractions_truncated_to_milliseconds() {
+        let utc = parse_event_time("2026-09-01T12:00:05.250Z").unwrap();
+        assert_eq!(parse_event_time("2026-09-01T14:00:05.250+02:00"), Some(utc));
+        assert_eq!(parse_event_time("2026-09-01T07:30:05.250-04:30"), Some(utc));
+        assert_eq!(parse_event_time("2026-09-01T12:00:05.2509999Z"), Some(utc));
+        assert_eq!(parse_event_time("2026-09-01T12:00:05.25Z"), Some(utc));
+        assert_eq!(
+            parse_event_time("2026-09-01T12:00:05.123456789Z"),
+            Some(utc - 250 + 123)
+        );
+        assert_eq!(parse_event_time("2026-09-01T12:00:05Z"), Some(utc - 250));
+        // A date line shift through the offset.
+        assert_eq!(
+            parse_event_time("2026-01-01T00:30:00+01:00"),
+            parse_event_time("2025-12-31T23:30:00Z")
+        );
+    }
+
+    #[test]
+    fn anything_else_is_not_a_time() {
+        for bad in [
+            "",
+            "yesterday",
+            "2026-09-01",
+            "2026-09-01T12:00:05",             // local time: no instant
+            "2026-09-01 12:00:05Z",            // not the `T` form
+            "2026-09-01t12:00:05z",            // lowercase
+            "2026-09-01T12:00:05.Z",           // a dot with no digits
+            "2026-09-01T12:00:05.1234567890Z", // ten fraction digits
+            "2026-09-01T12:00:05+0200",        // offset without a colon
+            "2026-09-01T12:00:05+24:00",       // offset past a day
+            "2026-09-01T12:00:05+01:60",
+            "2026-02-29T12:00:05Z", // 2026 is no leap year
+            "2026-13-01T12:00:05Z",
+            "2026-00-10T12:00:05Z",
+            "2026-09-31T12:00:05Z",
+            "2026-09-01T24:00:00Z",
+            "2026-09-01T12:60:00Z",
+            "2026-09-01T12:00:60Z", // a leap second names no millisecond
+            "1969-12-31T23:59:59Z", // before the epoch
+            "2026-09-01T12:00:05Z ",
+            "+2026-09-01T12:00:05Z",
+            "2026-09-01T12:00:05\u{2014}01:00",
+            "\u{1F680}026-09-01T12:00:05Z",
+        ] {
+            assert_eq!(parse_event_time(bad), None, "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
     fn later_milliseconds_sort_after_earlier_ones() {
         let early = ulid(1_000_000_000_000);
         let late = ulid(1_000_000_000_001);

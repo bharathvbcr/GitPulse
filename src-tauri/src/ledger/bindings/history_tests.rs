@@ -1,0 +1,305 @@
+//! `binding_as_of` and `BindingHistory`: what held for a worktree at a moment.
+//!
+//! Rows are written straight into the table so their `ts_utc` and `ulid` are
+//! the test's to choose; `bind` and `unbind` stamp the append clock.
+
+use super::*;
+
+use crate::ledger::ids::{iso8601_utc, parse_event_time};
+use crate::ledger::{latest_binding, with_conn};
+
+/// Year 9999: later than any row a test writes, standing in for "now".
+const FOREVER_MS: u64 = 253_402_300_799_999;
+
+fn repo() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("temp repository");
+    let path = dir.path().canonicalize().expect("canonical path");
+    crate::test_support::git_in(&path, &["init", "-b", "main"]);
+    std::fs::write(path.join("seed.txt"), "seed").expect("seed repository");
+    crate::test_support::git_in(&path, &["add", "seed.txt"]);
+    crate::test_support::git_in(&path, &["commit", "-m", "seed"]);
+    let text = path.to_string_lossy().into_owned();
+    (dir, text)
+}
+
+fn address(repo: &str) -> BindingAddress {
+    BindingAddress {
+        anchor: repo.to_string(),
+        worktree: repo.to_string(),
+    }
+}
+
+/// One bind (`Some(task)`) or unbind (`None`) of the repository itself.
+fn put(repo: &str, ms: u64, ulid: &str, task: Option<&str>) {
+    with_conn(repo, |conn| {
+        conn.execute(
+            "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, task_id,
+                                 action, outcome)
+             VALUES (?1, ?2, ?3, ?3, 'human', ?4, ?5, 'ok')",
+            rusqlite::params![
+                ulid,
+                iso8601_utc(ms),
+                repo,
+                task,
+                if task.is_some() { BIND } else { UNBIND },
+            ],
+        )
+        .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
+        Ok(())
+    })
+    .expect("insert a binding row");
+}
+
+fn ulid(n: usize) -> String {
+    format!("01H{n:023}")
+}
+
+fn bound(task: &str) -> TaskAtTime {
+    TaskAtTime::Bound(task.to_string())
+}
+
+const T0: u64 = 1_790_000_000_000;
+
+#[test]
+fn a_moment_resolves_to_the_newest_row_at_or_before_it() {
+    let (_dir, repo) = repo();
+    put(&repo, T0 + 1_000, &ulid(1), Some("T1"));
+    put(&repo, T0 + 3_000, &ulid(2), None);
+    put(&repo, T0 + 5_000, &ulid(3), Some("T2"));
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+
+    for (at, expected) in [
+        (T0, TaskAtTime::Unresolved),
+        (T0 + 999, TaskAtTime::Unresolved),
+        (T0 + 1_000, bound("T1")),
+        (T0 + 2_999, bound("T1")),
+        (T0 + 3_000, TaskAtTime::Unbound),
+        (T0 + 4_999, TaskAtTime::Unbound),
+        (T0 + 5_000, bound("T2")),
+        (FOREVER_MS, bound("T2")),
+    ] {
+        assert_eq!(history.as_of(at), expected, "history at +{}", at - T0);
+        assert_eq!(
+            binding_as_of(&address(&repo), at).unwrap(),
+            expected,
+            "query at +{}",
+            at - T0
+        );
+    }
+}
+
+#[test]
+fn rows_in_one_millisecond_go_to_the_larger_ulid() {
+    let (_dir, repo) = repo();
+    // Inserted out of order on purpose.
+    put(&repo, T0, &ulid(2), Some("LATER"));
+    put(&repo, T0, &ulid(1), Some("EARLIER"));
+    put(&repo, T0, &ulid(3), None);
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    assert_eq!(history.as_of(T0), TaskAtTime::Unbound);
+    assert_eq!(
+        binding_as_of(&address(&repo), T0).unwrap(),
+        TaskAtTime::Unbound
+    );
+    assert_eq!(history.as_of(T0 - 1), TaskAtTime::Unresolved);
+}
+
+#[test]
+fn a_second_with_a_row_in_it_is_undecidable() {
+    let (_dir, repo) = repo();
+    let second = T0;
+    put(&repo, second - 1_500, &ulid(1), Some("BEFORE"));
+    put(&repo, second + 500, &ulid(2), Some("INSIDE"));
+    put(&repo, second + 2_000, &ulid(3), Some("AFTER"));
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+
+    // The row at +500 may be before or after the event somewhere in the second.
+    assert_eq!(history.as_of_second(second), TaskAtTime::Unresolved);
+    // The seconds on either side have nothing inside them.
+    assert_eq!(history.as_of_second(second - 1_000), bound("BEFORE"));
+    assert_eq!(history.as_of_second(second + 1_000), bound("INSIDE"));
+    assert_eq!(history.as_of_second(second + 2_000), TaskAtTime::Unresolved);
+}
+
+#[test]
+fn a_row_at_either_edge_of_the_second_is_inside_it() {
+    let (_dir, repo) = repo();
+    put(&repo, T0, &ulid(1), Some("AT-START"));
+    put(&repo, T0 + 3_999, &ulid(2), None);
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    assert_eq!(history.as_of_second(T0), TaskAtTime::Unresolved);
+    assert_eq!(history.as_of_second(T0 + 3_000), TaskAtTime::Unresolved);
+    assert_eq!(history.as_of_second(T0 + 1_000), bound("AT-START"));
+}
+
+/// The oracle: the newest `(ts, ulid)` at or before `at`, by brute force.
+fn oracle(rows: &[(u64, String, Option<String>)], at: u64) -> TaskAtTime {
+    match rows
+        .iter()
+        .filter(|(ms, _, _)| *ms <= at)
+        .max_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
+    {
+        None => TaskAtTime::Unresolved,
+        Some((_, _, Some(task))) => TaskAtTime::Bound(task.clone()),
+        Some((_, _, None)) => TaskAtTime::Unbound,
+    }
+}
+
+#[test]
+fn as_of_agrees_with_the_oracle_and_with_the_live_read_at_the_end() {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    for round in 0..12 {
+        let (_dir, repo) = repo();
+        let mut rows = Vec::new();
+        let mut ms = T0;
+        for n in 0..(1 + next(14) as usize) {
+            // Gaps of 0 put several rows in one millisecond.
+            ms += next(3);
+            let task = (next(3) > 0).then(|| format!("T{}", next(4)));
+            let ulid = ulid(1 + (round * 100 + n) * 7 % 997 + next(5) as usize * 1000);
+            if rows.iter().any(|(_, existing, _)| *existing == ulid) {
+                continue;
+            }
+            put(&repo, ms, &ulid, task.as_deref());
+            rows.push((ms, ulid, task));
+        }
+        let history = BindingHistory::load(&repo, &repo).unwrap();
+        for at in T0 - 1..=ms + 2 {
+            let expected = oracle(&rows, at);
+            assert_eq!(history.as_of(at), expected, "round {round}, +{}", at - T0);
+            assert_eq!(
+                binding_as_of(&address(&repo), at).unwrap(),
+                expected,
+                "round {round}, query +{}",
+                at - T0
+            );
+        }
+        // After the last row, "as of" is "now": the live gate's answer.
+        let live = latest_binding(&repo, &repo, &crate::ledger::redact::text(&repo)).unwrap();
+        let end = binding_as_of(&address(&repo), FOREVER_MS).unwrap();
+        assert_eq!(
+            end.task_id().map(str::to_string),
+            live.clone().flatten(),
+            "round {round}: as of the end must be the binding that holds"
+        );
+        assert_eq!(
+            end == TaskAtTime::Unresolved,
+            live.is_none(),
+            "round {round}"
+        );
+        assert_eq!(history.as_of(FOREVER_MS), end, "round {round}");
+    }
+}
+
+#[test]
+fn the_real_clock_agrees_with_the_history() {
+    let (_dir, repo) = repo();
+    bind(&repo, &repo, "T1").unwrap();
+    let live = binding_at(&address(&repo)).unwrap().map(|b| b.task_id);
+    let now = crate::ledger::ids::now_millis();
+    assert_eq!(
+        binding_as_of(&address(&repo), now).unwrap().task_id(),
+        live.as_deref()
+    );
+    assert_eq!(
+        BindingHistory::load(&repo, &repo).unwrap().as_of(now),
+        bound("T1")
+    );
+}
+
+#[test]
+fn a_repository_with_no_ledger_decides_nothing_and_is_not_given_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    let repo = path.to_string_lossy().into_owned();
+    assert_eq!(
+        binding_as_of(&address(&repo), T0).unwrap(),
+        TaskAtTime::Unresolved
+    );
+    assert_eq!(
+        BindingHistory::load(&repo, &repo).unwrap().as_of(T0),
+        TaskAtTime::Unresolved
+    );
+    assert!(!crate::ledger::is_initialised(&repo));
+}
+
+#[test]
+fn a_history_that_could_not_be_read_decides_nothing() {
+    let history = BindingHistory::unreadable();
+    assert_eq!(history.as_of(FOREVER_MS), TaskAtTime::Unresolved);
+    assert_eq!(history.as_of_second(T0), TaskAtTime::Unresolved);
+    assert_eq!(TaskAtTime::Unresolved.basis(), "unresolved");
+    assert_eq!(TaskAtTime::Unbound.basis(), "unbound");
+    assert_eq!(bound("T").basis(), "bound");
+}
+
+#[test]
+fn a_foreign_row_refuses_the_history_as_it_refuses_the_live_read() {
+    let (_dir, repo) = repo();
+    put(&repo, T0, &ulid(1), Some("T1"));
+    with_conn(&repo, |conn| {
+        conn.execute(
+            "UPDATE events SET repo_path = '/somewhere/else' WHERE ulid = ?1",
+            [ulid(1)],
+        )
+        .unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        binding_as_of(&address(&repo), T0).unwrap_err().code,
+        "repository_mismatch"
+    );
+    assert_eq!(
+        BindingHistory::load(&repo, &repo).unwrap_err().code,
+        "repository_mismatch"
+    );
+}
+
+#[test]
+fn both_reads_stay_on_the_binding_index_and_share_one_order() {
+    let (_dir, repo) = repo();
+    bind(&repo, &repo, "T1").unwrap();
+    let explain = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+        with_conn(&repo, |conn| {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt
+                .query_map(params, |row| row.get::<_, String>(3))
+                .unwrap();
+            Ok(rows.map(Result::unwrap).collect::<Vec<_>>().join(" | "))
+        })
+        .unwrap()
+    };
+    let as_of = explain(crate::ledger::BINDING_AS_OF_SQL, &[&"a", &"b", &"c"]);
+    assert!(as_of.contains("idx_events_binding"), "{as_of}");
+    let history = explain(crate::ledger::BINDING_HISTORY_SQL, &[&"a", &"b"]);
+    assert!(history.contains("idx_events_binding"), "{history}");
+
+    // One precedence order: the live read, the as-of read and the history all
+    // sort by `(ts_utc, ulid)`, newest first.
+    for sql in [
+        crate::ledger::BINDING_AS_OF_SQL,
+        crate::ledger::BINDING_HISTORY_SQL,
+    ] {
+        assert!(sql.contains("ORDER BY ts_utc DESC, ulid DESC"), "{sql}");
+    }
+}
+
+#[test]
+fn an_offset_call_time_resolves_at_its_utc_instant() {
+    let (_dir, repo) = repo();
+    // Bound at 12:00:00Z; a call spelled 13:30 +02:00 is 11:30Z, before it.
+    let bound_at = parse_event_time("2026-09-01T12:00:00Z").unwrap();
+    put(&repo, bound_at, &ulid(1), Some("T1"));
+    let history = BindingHistory::load(&repo, &repo).unwrap();
+    let before = parse_event_time("2026-09-01T13:30:00+02:00").unwrap();
+    let after = parse_event_time("2026-09-01T14:30:00+02:00").unwrap();
+    assert_eq!(history.as_of(before), TaskAtTime::Unresolved);
+    assert_eq!(history.as_of(after), bound("T1"));
+}

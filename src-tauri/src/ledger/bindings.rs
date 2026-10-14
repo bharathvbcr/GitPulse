@@ -1820,3 +1820,6 @@ mod family_cost_tests {
         repository_address(&repo).expect("the repository itself still resolves");
     }
 }
+
+#[cfg(test)]
+mod history_tests;
