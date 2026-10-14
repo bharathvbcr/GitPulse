@@ -9468,7 +9468,7 @@ mod tests {
             &<[u8]>::len,
         );
         assert!(
-            started.elapsed() < Duration::from_secs(60),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(60)),
             "{:?}",
             started.elapsed()
         );

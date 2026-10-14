@@ -1497,7 +1497,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(classify_header(&huge), CommitSignature::Unknown);
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
             "{:?}",
             started.elapsed()
         );
@@ -1699,7 +1699,7 @@ mod tests {
         )
         .expect_err("the verifier never answers");
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
             "{:?}",
             started.elapsed()
         );
