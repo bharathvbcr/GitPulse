@@ -368,9 +368,11 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     let removal =
         crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate)
             .expect_err("a worktree was removed under a running agent");
-    let merge =
-        crate::commands::merge_teardown_guarded(&state, repo_path, lane_path, None, false, &gate)
-            .expect_err("a worktree was merged away under a running agent");
+    let merge = crate::commands::merge_teardown_guarded(
+        &state, repo_path, lane_path, None, false, None, &gate,
+    )
+    .expect_err("a worktree was merged away under a running agent")
+    .to_string();
     for refusal in [&removal, &merge] {
         assert!(
             refusal.contains("still working in this worktree")

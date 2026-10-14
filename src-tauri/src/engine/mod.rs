@@ -46,5 +46,6 @@ pub use stash::{StashAction, StashEntry};
 pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleList, SubmoduleState};
 pub use worktree::{
     add_worktree_extended, agent_kind, agent_session_slug, merge_and_teardown_worktree,
-    merge_teardown_argv, MergeTeardownResult, WorktreeDiffStat, WorktreeDivergence, WorktreeInfo,
+    merge_teardown_argv, MergeTeardownError, MergeTeardownResult, WorktreeDiffStat,
+    WorktreeDivergence, WorktreeInfo,
 };

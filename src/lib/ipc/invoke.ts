@@ -11,6 +11,7 @@ import {
 import { withDeadline } from "../async/deadline";
 import { whenDocumentShown } from "../runtime/foreground";
 import { activity, observeSettled } from "../diagnostics/activity";
+import { formatError } from "../ui/formatError";
 
 /**
  * The one IPC entry point the frontend uses.
@@ -124,12 +125,6 @@ export function invalidateSharedReads(): void {
   readGeneration += 1;
 }
 
-function messageOf(error: unknown): string {
-  if (typeof error === "string") return error;
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
 /**
  * A key for calls whose arguments are plain data. `null` for anything else —
  * a `Channel`, a byte buffer, a class instance — which is neither coalesced
@@ -210,7 +205,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       try {
         return await call<T>(cmd, rest);
       } catch (error) {
-        if (!isDeferredUnderLoad(messageOf(error))) throw error;
+        if (!isDeferredUnderLoad(formatError(error))) throw error;
         last = error;
       }
     }
@@ -287,7 +282,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       if (pending) return pending as Promise<T>;
     }
     return call<T>(cmd, rest).catch((error: unknown) => {
-      if (!isDeferredUnderLoad(messageOf(error))) throw error;
+      if (!isDeferredUnderLoad(formatError(error))) throw error;
       if (key === undefined) key = lazyRetryKey(cmd, rest[0]);
       // Not plain data: the deferral is the answer, exactly as if the call
       // had never been eligible for a retry.

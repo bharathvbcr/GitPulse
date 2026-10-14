@@ -25,6 +25,7 @@ import { askConfirm } from "../stores/modalStore";
 import { repoStore, type ResolvedRepo } from "../stores/repoStore";
 import type { Guarded } from "../stores/harnessStore";
 import type { MergeTeardownResult, WorktreeInfo } from "../branches/types";
+import { MergeTeardownFailure, readMergeTeardownError } from "../branches/mergeTeardown";
 import { familyFromCommonDir } from "../repos/repoFamily";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
 import { formatError } from "../ui/formatError";
@@ -141,19 +142,36 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   });
   if (!approved) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
-  const result = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", {
-    repoPath: root,
-    worktreePath: run.cwd,
-    targetBranch: target,
-    squash: false,
-  });
-  await closeStranded(run.cwd);
-  const merged = result.output;
-  const parts = [`Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}.`];
-  parts.push(merged.worktree_removed ? "The worktree was removed." : "The worktree was not removed.");
-  if (!merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept.`);
+  const merged = await mergeAndTeardown(root, run.cwd, target, own.head);
+  if (merged.worktree_removed) await closeStranded(run.cwd);
+  const parts = [mergedSentence(merged)];
+  if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { message: parts.join(" ") };
+}
+
+/**
+ * The one call to `cmd_worktree_merge_teardown`. `expectedTip` is the commit
+ * the caller verified the branch at, and the host merges nothing when the
+ * branch is anywhere else once it holds its lock. The host's typed rejection
+ * (`{code, message, ...}`) is kept as a `MergeTeardownFailure`, so a caller
+ * can tell a conflict from a refusal; any other rejection passes through.
+ */
+async function mergeAndTeardown(root: string, cwd: string, target: string, expectedTip: string): Promise<MergeTeardownResult> {
+  try {
+    const result = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", { repoPath: root, worktreePath: cwd, targetBranch: target, squash: false, expectedTip });
+    return result.output;
+  } catch (cause) {
+    const failure = readMergeTeardownError(cause);
+    throw failure ? new MergeTeardownFailure(failure) : cause;
+  }
+}
+
+/** What landed, and, when the cleanup after it did not finish, that it is pending and why. */
+function mergedSentence(merged: MergeTeardownResult): string {
+  const landed = `Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}`;
+  if (!merged.worktree_removed) return `${landed}; cleanup pending: ${merged.removal_error ?? "the worktree was not removed"}.`;
+  return `${landed}. The worktree was removed.`;
 }
 
 /** What an unattended merge did: the commit it merged and the line the board shows. */
@@ -184,11 +202,11 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (!live.complete) throw new Error("Live attempts could not all be read, so the main checkout cannot be shown free of other sessions.");
   if (liveRunIn(root, live.runs)) throw new Error(`Another attempt is working in the main checkout ${root}, so nothing is merged into it.`);
   if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
-  const result = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", { repoPath: root, worktreePath: run.cwd, targetBranch: target, squash: false });
-  await closeStranded(run.cwd);
-  const merged = result.output;
-  const parts = [`Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}.`];
-  if (!merged.worktree_removed) parts.push("The worktree was not removed.");
+  // The head the verdict was reached for is the tip the host holds the merge to.
+  const merged = await mergeAndTeardown(root, run.cwd, target, expectedHead);
+  if (merged.worktree_removed) await closeStranded(run.cwd);
+  const parts = [mergedSentence(merged)];
+  if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { head: expectedHead, message: parts.join(" ") };
 }

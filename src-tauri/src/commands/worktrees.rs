@@ -1,6 +1,7 @@
 //! Worktree lifecycle commands: list, add, remove, lock, merge teardown, routes, summaries.
 
 use super::*;
+use crate::engine::worktree::MergeTeardownError;
 
 // ---------------------------------------------------------------------------
 // Linked worktrees: how agents parallelize, so they are first-class here.
@@ -184,26 +185,34 @@ pub async fn cmd_prune_worktree(repo_path: String) -> Result<Guarded<()>, String
 
 /// Merges a worktree branch into target_branch (defaulting to main), tears down
 /// the worktree cleanly, and prunes the merged branch.
+///
+/// `expected_tip` is the branch commit the caller verified: when it is given
+/// and the branch is anywhere else once the merge holds its lock, nothing is
+/// merged. The error is the typed [`MergeTeardownError`] (`{code, message,
+/// ...}`), so a caller can tell a conflict from a refusal.
 #[tauri::command(async)]
 pub async fn cmd_worktree_merge_teardown(
     repo_path: String,
     worktree_path: String,
     target_branch: Option<String>,
     squash: Option<bool>,
+    expected_tip: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
-) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
+) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, MergeTeardownError> {
     let workbench = workbench.inner().clone();
+    // The pool carries `String` errors; the typed one rides inside the `Ok`.
     off_thread(move || {
-        merge_teardown_guarded(
+        Ok(merge_teardown_guarded(
             &workbench,
             &repo_path,
             &worktree_path,
             target_branch.as_deref(),
             squash.unwrap_or(false),
+            expected_tip.as_deref(),
             &|repo, argv| guard(repo, argv),
-        )
+        ))
     })
-    .await
+    .await?
 }
 
 /// Body of [`cmd_worktree_merge_teardown`].
@@ -213,8 +222,9 @@ pub(crate) fn merge_teardown_guarded(
     worktree_path: &str,
     target_branch: Option<&str>,
     is_squash: bool,
+    expected_tip: Option<&str>,
     judge: WorktreeGate<'_>,
-) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
+) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, MergeTeardownError> {
     // Before the merge, not only before the removal: merging a branch an
     // agent is still committing to takes half its work.
     workbench.refuse_if_in_use(worktree_path)?;
@@ -233,10 +243,15 @@ pub(crate) fn merge_teardown_guarded(
         worktree_path,
         target_branch,
         is_squash,
+        expected_tip,
         &mut gate,
     )?;
     Ok(Guarded {
-        policy: policy.ok_or("The merge ran without being judged by the policy gate.")?,
+        policy: policy.ok_or_else(|| {
+            MergeTeardownError::from(
+                "The merge ran without being judged by the policy gate.".to_string(),
+            )
+        })?,
         output: result,
     })
 }

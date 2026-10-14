@@ -480,7 +480,10 @@
         worktreePath: wt.path,
         targetBranch: null,
         squash: false,
+        // The commit this row showed: the host merges nothing if the branch moved since.
+        expectedTip: wt.head,
       });
+      // The merge landed: a cleanup that did not finish is a notice below, not a failure.
       mergeCompleted = true;
       harnessStore.recordAction({
         repoPath: repo,
@@ -490,8 +493,9 @@
       });
       for (const notice of worktreeSetupNotices(res.output, "merge")) toastStore.warning(notice);
       // The teardown removed the directory: a tab on it is stranded whether
-      // or not it is the active one (T-F09, same as remove()).
-      const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
+      // or not it is the active one (T-F09, same as remove()). A worktree
+      // that is still there keeps its tab.
+      const stranded = res.output.worktree_removed ? $repoStore.openTabs.find((tab) => tab.path === wt.path) : undefined;
       if (stranded) await repoStore.closeTab(stranded.id);
       if ($repoStore.currentPath !== repo) return;
       await load();

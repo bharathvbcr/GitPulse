@@ -7,6 +7,7 @@
 import { get } from "svelte/store";
 import { withDeadline } from "../async/deadline";
 import { invoke } from "../ipc/invoke";
+import { kindLabel, type RepoOperation } from "../repos/operation";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore } from "../stores/repoStore";
@@ -127,6 +128,14 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       return own.head;
     },
     merge: async ({ runId, cwd, head }) => (await mergeVerifiedAttempt({ id: runId, cwd, state: "exited", expires_at: 0 }, head)).message,
+    mainState: async (signal) => {
+      // The count and the parked operation are the two things that make the main checkout not free to merge into.
+      const listing = await stoppable(invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout, depth: "dirty" }), signal);
+      const main = listing.find((entry) => entry.is_main);
+      if (!main) throw new Error("The repository lists no main checkout.");
+      const parked = await stoppable(invoke<RepoOperation | null>("cmd_repo_operation", { repoPath: main.path }), signal);
+      return { dirty: main.dirty_files, operation: parked ? kindLabel(parked.kind) : null };
+    },
   };
 }
 

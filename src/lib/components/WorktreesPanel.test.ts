@@ -148,6 +148,16 @@ describe("WorktreesPanel removal safety", () => {
     expect(closeIdx).toBeLessThan(staleReturn);
   });
 
+  it("holds the merge to the commit the row showed, and keeps the tab of a worktree that is still there", () => {
+    const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    expect(fn).toMatch(/cmd_worktree_merge_teardown[\s\S]*?expectedTip: wt\.head/);
+    // A merge that landed is recorded as one, whatever became of the cleanup.
+    expect(fn.indexOf("mergeCompleted = true")).toBeLessThan(fn.indexOf("ok: true"));
+    // The tab goes only with a worktree the teardown removed.
+    expect(fn).toMatch(/res\.output\.worktree_removed \? \$repoStore\.openTabs\.find/);
+    expect(fn).toContain('worktreeSetupNotices(res.output, "merge")');
+  });
+
   it("preserves the concurrent-session currentPath guards after the await", () => {
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
     expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(3);

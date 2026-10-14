@@ -22,6 +22,7 @@ import {
 
 const ALL_KINDS: OperationKind[] = [
   "Merge",
+  "SquashMerge",
   "Rebase",
   "RebaseApply",
   "ApplyMailbox",
@@ -63,6 +64,12 @@ describe("labels", () => {
     // "RebaseApply in progress" would be an internals leak.
     expect(kindLabel("Rebase")).toBe("rebase");
     expect(kindLabel("RebaseApply")).toBe("rebase");
+  });
+
+  it("names a parked squash, which has no MERGE_HEAD, and says how it is finished", () => {
+    expect(kindLabel("SquashMerge")).toBe("squash merge");
+    expect(actionLabel("SquashMerge", "continue")).toBe("Commit the squash");
+    expect(actionConsequence("SquashMerge", "continue")).toMatch(/staged changes as one commit/);
   });
 
   it("labels every kind/action pair without repeating git's flag names", () => {

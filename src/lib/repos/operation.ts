@@ -17,6 +17,7 @@
 /** Mirrors the Rust `OperationKind`; serde emits unit variants as their names. */
 export type OperationKind =
   | "Merge"
+  | "SquashMerge"
   | "Rebase"
   | "RebaseApply"
   | "ApplyMailbox"
@@ -63,6 +64,8 @@ export function kindLabel(kind: OperationKind): string {
   switch (kind) {
     case "Merge":
       return "merge";
+    case "SquashMerge":
+      return "squash merge";
     case "Rebase":
     case "RebaseApply":
       return "rebase";
@@ -159,6 +162,7 @@ export function actionLabel(kind: OperationKind, action: OperationAction): strin
       // a user goes looking for the equivalent command.
       return kind === "Bisect" ? "End bisect" : `Abort ${label}`;
     case "continue":
+      if (kind === "SquashMerge") return "Commit the squash";
       return kind === "Merge" ? "Commit the merge" : `Continue ${label}`;
     case "skip":
       return "Skip this commit";
@@ -180,6 +184,7 @@ export function actionConsequence(
         ? "Returns you to the commit you were on before the bisect started."
         : `Undoes the whole ${label} and restores the branch to how it was before it started. Conflict edits made in the working tree are discarded.`;
     case "continue":
+      if (kind === "SquashMerge") return "Records the staged changes as one commit.";
       return kind === "Merge"
         ? "Records the resolved files as a merge commit."
         : `Records the current step and moves the ${label} to the next commit.`;

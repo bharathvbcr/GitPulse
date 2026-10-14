@@ -638,7 +638,7 @@
         await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-run-message"]'));
         const mergeCall=worktreeCalls.find(c=>c.cmd==="cmd_worktree_merge_teardown");
         check("Merge runs against the repository's main checkout, and the host's refusal shows in the row",
-          mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"
+          mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"&&mergeCall.expectedTip==="def5678"
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("still working in this worktree")
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').dataset.tone==="error");
         row(attempt.id).querySelector('[data-testid="agent-discard"]').click();

@@ -53,10 +53,6 @@ pub(crate) struct Facts<'a> {
     pub dirty: Result<bool, String>,
 }
 
-fn is_oid(text: &str) -> bool {
-    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// A status word from the record, kept only if it is a plain lowercase word.
 fn word(text: &str) -> &str {
     let plain = !text.is_empty()
@@ -118,7 +114,7 @@ pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, String> {
     let head = facts.head.as_ref().map_err(|e| {
         format!("the verified worktree's head could not be read, so nothing was posted: {e}")
     })?;
-    if !is_oid(head) {
+    if !crate::engine::git_writer::is_full_oid(head) {
         return Err(
             "the verified worktree's head is not a commit id, so nothing was posted".into(),
         );
@@ -140,7 +136,7 @@ pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, String> {
             word(&record.item_id)
         ));
     }
-    if !is_oid(&record.head) {
+    if !crate::engine::git_writer::is_full_oid(&record.head) {
         return Err("the verification record names no commit, so nothing was posted".into());
     }
     let sha = record.head.as_str();
@@ -237,7 +233,7 @@ fn endpoint(remote: &GitHubRepoRef, tail: &str) -> String {
 
 /// The `gh api` argv (program name omitted) that posts the commit status.
 pub(crate) fn status_argv(remote: &GitHubRepoRef, plan: &Plan) -> Result<Vec<String>, String> {
-    if !is_oid(&plan.sha) {
+    if !crate::engine::git_writer::is_full_oid(&plan.sha) {
         return Err("not a commit id".into());
     }
     if !matches!(plan.state, "success" | "failure" | "error") {
