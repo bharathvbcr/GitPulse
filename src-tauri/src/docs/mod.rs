@@ -279,9 +279,12 @@ pub struct DocsStatus {
     pub truncated: bool,
     pub skipped_oversized: u32,
     pub skipped_unreadable: u32,
-    /// Tracked markdown files the vault does not hold, whatever the reason:
-    /// past the file or byte cap, too large, unreadable, not UTF-8. Anything
-    /// that searched or rewrote across the vault did not see these.
+    /// Markdown files the scan did not cover. From `status`/`refresh` that is
+    /// the tracked files the vault does not hold, whatever the reason: past
+    /// the file or byte cap, too large, unreadable, not UTF-8. In a rename's
+    /// `scan` it also counts the untracked, non-ignored markdown files, which
+    /// the vault never lists. Anything that searched or rewrote across the
+    /// vault did not see these.
     pub not_scanned: u32,
 }
 
@@ -654,7 +657,10 @@ fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
 
 /// Markdown files git does not track and does not ignore. The vault never
 /// holds them, so anything that searches or rewrites across it did not see
-/// them. Listed the same way, and bounded the same way, as the tracked set.
+/// them. Listed the same way as the tracked set (`git ls-files`, same
+/// extension patterns). Only the output stream is bounded, by `git_text`'s cap,
+/// which fails the call when exceeded; unlike the tracked listing there is no
+/// file-count ceiling, since the result is only counted.
 fn list_untracked_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
     ls_files_markdown(repo, &["--others", "--exclude-standard"])
 }

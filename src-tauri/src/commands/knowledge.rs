@@ -337,8 +337,7 @@ done
 
     // ---- adversarial gate cases ------------------------------------------
 
-    /// A sidecar that answers with `reply_for_denied` for requests naming
-    /// `denied` (when `only_op` is set, only for that op) and allows the rest.
+    /// Writes `body` out as an executable stand-in for the `manvi serve` binary.
     fn script_with(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
         let script = dir.path().join("adversarial-manvi");
         std::fs::write(&script, body).unwrap();
@@ -346,6 +345,8 @@ done
         script
     }
 
+    /// A sidecar that records every request and answers `@ACTION@` for a file
+    /// check naming `@PATH@`, and allows everything else.
     const FAKE_ONE_VERDICT: &str = r#"#!/bin/sh
 reply() {
   id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
@@ -356,7 +357,7 @@ reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "@REQUESTS@"
   case "$line" in
-    *'"path":"@PATH@"'*@OPMATCH@)
+    *'"path":"@PATH@"'*)
       reply "$line" '{"action":"@ACTION@","rule":"scope.forbidden","severity":"hard","reason":"adversarial","target":"@PATH@","task_id":"TASK-DOC","demoted":"","degraded":[]}';;
     *)
       reply "$line" '{"action":"allow","rule":"","severity":"","reason":"","target":"","task_id":"","demoted":"","degraded":[]}';;
@@ -369,8 +370,7 @@ done
         let body = FAKE_ONE_VERDICT
             .replace("@REQUESTS@", &requests.display().to_string())
             .replace("@PATH@", path)
-            .replace("@ACTION@", action)
-            .replace("@OPMATCH@", "");
+            .replace("@ACTION@", action);
         script_with(dir, &body)
     }
 
@@ -442,13 +442,7 @@ done
             "docs/Roadmap.md",
             "# Roadmap\n\n[g](Guide.md)\n",
         );
-        let requests = dir.path().join("requests.ndjson");
-        let body = FAKE_ONE_VERDICT
-            .replace("@REQUESTS@", &requests.display().to_string())
-            .replace("@PATH@", "plans/Roadmap.md")
-            .replace("@ACTION@", "deny")
-            .replace("@OPMATCH@", "");
-        let script = script_with(&dir, &body);
+        let script = verdict_script(&dir, "plans/Roadmap.md", "deny");
         let serial = test_serial();
         let _binary = bind_test_binary(&serial, script.to_string_lossy());
 

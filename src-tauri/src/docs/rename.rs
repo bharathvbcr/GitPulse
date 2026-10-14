@@ -51,6 +51,9 @@ pub struct DocRenameOutcome {
     /// Links that resolved before the rename and would not after it, as the
     /// rewritten vault reads them. A reference-style definition
     /// (`[ref]: Note.md`) is the case this exists for: it is not rewritten.
+    /// Not covered: a link to a name holding `#`, `?` or `%`, which is written
+    /// escaped but which the vault does not index, so it is never "broken"
+    /// here either.
     pub left_broken: Vec<BrokenLink>,
     /// What the rename was planned from covered: the vault plus the untracked
     /// markdown files around it. A note it did not
@@ -111,22 +114,22 @@ pub fn rename_doc(
     if vault.notes().iter().any(|n| n.path == to) {
         return Err(format!("destination already exists in vault: {to}"));
     }
-    // The vault names a note by its path without the extension, lowercased, so
-    // `B.md` and `B.mdx` are one name: moving a note onto it would make every
-    // link written for the other note resolve here instead. Asked of the vault
-    // itself (a root-relative destination), not decided by a rule of ours.
+    // The vault registers a note under its path without the extension,
+    // lowercased (`link_key`), so `B.md` and `B.mdx` answer to one name: moving
+    // a note onto it would make every link written for the other note resolve
+    // here instead. Compared by that key itself rather than by resolving the
+    // destination as a link, which would percent-decode it and cut it at `#`
+    // first and so miss a sibling whose own name contains `%41` or `#`.
+    let key = link_key(&to);
     if let Some(other) = vault
-        .resolve_from(&from, &format!("/{to}"), None)
-        .map(|resolved| resolved.path)
-        .filter(|path| {
-            path != &from
-                && strip_markdown_extension(path).to_lowercase()
-                    == strip_markdown_extension(&to).to_lowercase()
-        })
+        .notes()
+        .iter()
+        .find(|note| note.path != from && link_key(&note.path) == key)
     {
         return Err(format!(
-            "destination {to} shares its link name with the existing note {other}; \
-             links to either would resolve to the wrong one"
+            "destination {to} shares its link name with the existing note {}; \
+             links to either would resolve to the wrong one",
+            other.path
         ));
     }
     // Filesystem authority: refuse overwriting an on-disk file the index
@@ -211,7 +214,7 @@ fn write_planned(repo_path: &str, edit: &PlannedEdit, attempt: usize) -> Result<
         return Err("injected write fault".into());
     }
     let _ = attempt;
-    sandbox_write_expecting(repo_path, &edit.path, &edit.original, &edit.text)
+    sandbox_write_expecting(repo_path, &edit.path, Some(&edit.original), &edit.text)
 }
 
 /// Every rewrite the rename makes, against the snapshot, before any is applied.
@@ -482,6 +485,13 @@ fn escape_path(path: &str, escaped: bool, bracketed: bool) -> String {
     out
 }
 
+/// The name the vault files a note's path under: `reindex` registers
+/// `strip_markdown_extension(path).to_lowercase()`. Pinned against the vault's
+/// own behaviour by `the_link_key_matches_the_name_the_vault_resolves_by`.
+fn link_key(path: &str) -> String {
+    strip_markdown_extension(path).to_lowercase()
+}
+
 fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
@@ -579,6 +589,30 @@ mod tests {
         })
         .collect();
         assert!(wrong.is_empty(), "not escaped: {wrong:?}");
+    }
+
+    /// `link_key` equal exactly when the vault answers one name for both paths:
+    /// a vault holding only `held` resolves a link spelled `asked`'s key.
+    #[test]
+    fn the_link_key_matches_the_name_the_vault_resolves_by() {
+        let cases = [
+            ("docs/100%41.mdx", "docs/100%41.md", true),
+            ("docs/B.mdx", "docs/b.MD", true),
+            ("docs/C#1.mdx", "docs/C#1.md", true),
+            ("docs/a.md", "docs/b.md", false),
+            ("docs/a.md", "other/a.md", false),
+        ];
+        for (held, asked, same) in cases {
+            let vault = Vault::build(
+                std::path::PathBuf::from("/vault"),
+                vec![Note::parse(held, "# held\n")],
+            );
+            let resolves = vault
+                .resolve(&strip_markdown_extension(asked).to_lowercase(), None)
+                .is_some_and(|found| found.path == held);
+            assert_eq!(resolves, same, "{held} vs {asked}: vault disagrees");
+            assert_eq!(link_key(held) == link_key(asked), same, "{held} vs {asked}");
+        }
     }
 
     #[test]

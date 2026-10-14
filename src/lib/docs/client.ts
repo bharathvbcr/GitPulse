@@ -10,7 +10,11 @@ export interface DocsStatus {
   truncated: boolean;
   skippedOversized: number;
   skippedUnreadable: number;
-  /** Tracked markdown files the vault does not hold, for any reason. */
+  /**
+   * Markdown files the scan did not cover. From status/refresh: tracked files
+   * the vault does not hold (capped, oversized, unreadable, not UTF-8). In a
+   * rename's `scan` it also counts untracked, non-ignored markdown files.
+   */
   notScanned: number;
 }
 
@@ -74,9 +78,19 @@ export interface DocRenameOutcome {
   skippedConflict: string[];
   /** Could not be written or staged. */
   failed: DocRenameFailure[];
-  /** Links the rename leaves unresolved (reference-style definitions). */
+  /**
+   * Links that resolved before the rename and do not after it, as the
+   * rewritten vault reads them: reference-style definitions, which are not
+   * rewritten. Residual: a destination whose name holds `#`, `?` or `%` is
+   * written escaped, but the vault does not index such a link, so a rename
+   * onto one is neither reported here nor checked.
+   */
   leftBroken: BrokenLink[];
-  /** What the vault the rename was planned from covered. */
+  /**
+   * What the rename was planned from covered: the vault plus the untracked
+   * markdown files around it. A note it did not scan was neither searched for
+   * links nor rewritten.
+   */
   scan: DocsStatus;
 }
 

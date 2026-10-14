@@ -410,14 +410,17 @@ fn an_expecting_write_replaces_only_the_bytes_it_expected() {
     use crate::engine::git_cli::sandbox_write_expecting;
     let dir = repo_with(&[("a.md", "one\n")]);
     let path = dir.path().to_str().unwrap();
-    assert!(sandbox_write_expecting(path, "a.md", "one\n", "two\n").unwrap());
+    assert!(sandbox_write_expecting(path, "a.md", Some("one\n"), "two\n").unwrap());
     assert_eq!(read(&dir, "a.md"), "two\n");
     // Stale expectation: nothing is written.
-    assert!(!sandbox_write_expecting(path, "a.md", "one\n", "three\n").unwrap());
+    assert!(!sandbox_write_expecting(path, "a.md", Some("one\n"), "three\n").unwrap());
     assert_eq!(read(&dir, "a.md"), "two\n");
     // A file that is gone is not "the bytes I expected" either.
-    assert!(!sandbox_write_expecting(path, "gone.md", "one\n", "three\n").unwrap());
+    assert!(!sandbox_write_expecting(path, "gone.md", Some("one\n"), "three\n").unwrap());
     assert!(!dir.path().join("gone.md").exists());
+    // No expectation is `sandbox_write`: written whatever is there.
+    assert!(sandbox_write_expecting(path, "a.md", None, "four\n").unwrap());
+    assert_eq!(read(&dir, "a.md"), "four\n");
 }
 
 #[test]
@@ -1071,6 +1074,26 @@ fn adversarial_moving_onto_a_name_that_already_has_a_sibling_stem_keeps_links() 
 }
 
 #[test]
+fn a_sibling_whose_own_name_holds_a_percent_escape_still_blocks_the_move() {
+    // `docs/100%41.mdx` is filed under `docs/100%41`; as a link destination
+    // `100%41` would decode to `100a` and miss it, so the check compares the
+    // vault's own key.
+    let dir = repo_with(&[
+        ("docs/A.md", "# A\n"),
+        ("docs/100%41.mdx", "# sibling\n"),
+        ("docs/L.md", "[[docs/100%41]] and [[A]]\n"),
+    ]);
+    let path = dir.path().to_str().unwrap();
+    let refused = rename_doc(path, "docs/A.md", "docs/100%41.md", |_| Ok(())).unwrap_err();
+    assert!(
+        refused.contains("shares its link name") && refused.contains("docs/100%41.mdx"),
+        "{refused}"
+    );
+    assert!(dir.path().join("docs/A.md").exists());
+    assert_eq!(read(&dir, "docs/L.md"), "[[docs/100%41]] and [[A]]\n");
+}
+
+#[test]
 fn adversarial_a_previously_broken_link_is_not_blamed_on_the_rename() {
     let dir = repo_with(&[
         ("docs/A.md", "# A\n"),
@@ -1225,8 +1248,6 @@ fn adversarial_a_lock_taken_after_the_move_is_reported_per_file_not_as_an_error(
 
 #[test]
 fn adversarial_destinations_outside_the_repository_are_refused() {
-    let dir = nested_fixture_repo();
-    let path = dir.path().to_str().unwrap();
     let mut accepted = Vec::new();
     for to in [
         "../Out.md",
@@ -1244,7 +1265,6 @@ fn adversarial_destinations_outside_the_repository_are_refused() {
             accepted.push(to);
         }
     }
-    let _ = (&dir, path);
     assert!(accepted.is_empty(), "destinations accepted: {accepted:?}");
 }
 
