@@ -1,6 +1,6 @@
 pub mod conflict;
 mod conflict_fs;
-pub(crate) use conflict_fs::write_regular;
+pub(crate) use conflict_fs::{write_regular, write_regular_expecting};
 pub mod conflict_session;
 pub mod patch_builder;
 pub mod word_diff;

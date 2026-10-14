@@ -277,6 +277,20 @@ pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<
     crate::diff::write_regular(&dest, content.as_bytes())
 }
 
+/// [`sandbox_write`] over `expected` only: `Ok(false)` when the file no longer
+/// holds exactly those bytes (nothing is written), `Ok(true)` once written.
+/// The bytes are compared under the same anchored read the replacement uses.
+pub fn sandbox_write_expecting(
+    repo_path: &str,
+    file_path: &str,
+    expected: &str,
+    content: &str,
+) -> Result<bool, String> {
+    let repo = validate_repo(repo_path)?;
+    let dest = sandbox_join_canonical(&repo, file_path)?;
+    crate::diff::write_regular_expecting(&dest, content.as_bytes(), Some(expected.as_bytes()))
+}
+
 /// Saves text that came out of the file editor. Unlike [`sandbox_write`],
 /// which writes bytes it was given verbatim, this restores the file's CRLF
 /// line endings the editor's textarea dropped, and refuses to overwrite a file

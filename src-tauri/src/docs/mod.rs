@@ -10,15 +10,14 @@
 //! queries read through, so they keep the previous snapshot until the new one
 //! is published.
 
+mod rename;
+
 use crate::engine::git_cli::{
-    git_text, resolve_git_dir, sandbox_join, sandbox_join_canonical, sandbox_write, validate_repo,
+    git_text, resolve_git_dir, sandbox_join, sandbox_join_canonical, validate_repo,
 };
-use crate::engine::git_writer::{GitWriter, MovePlan};
-use markdev_vault::note::{
-    has_markdown_extension, stem, strip_markdown_extension, MARKDOWN_EXTENSIONS,
-};
-use markdev_vault::rename::{rewrite_links_in, ProtectedRanges};
+use markdev_vault::note::{has_markdown_extension, MARKDOWN_EXTENSIONS};
 use markdev_vault::{Backlink, Graph, GraphQuery, Note, SearchHit, Vault, DEFAULT_MAX_NOTE_BYTES};
+pub use rename::{rename_doc, DocRenameFailure, DocRenameOutcome, DocRenamePlan};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -33,6 +32,18 @@ use std::time::{Duration, Instant, SystemTime};
 const MAX_DOC_FILES: usize = 5_000;
 const MAX_DOC_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CACHED_VAULTS: usize = 8;
+
+/// [`MAX_DOC_FILES`], except that a test can lower it for its own thread.
+fn max_doc_files() -> usize {
+    #[cfg(test)]
+    {
+        probe::max_doc_files().unwrap_or(MAX_DOC_FILES)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_DOC_FILES
+    }
+}
 
 /// Default search hit limit (also the UI honesty threshold).
 pub const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -268,17 +279,10 @@ pub struct DocsStatus {
     pub truncated: bool,
     pub skipped_oversized: u32,
     pub skipped_unreadable: u32,
-}
-
-/// Outcome of a link-preserving markdown rename.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct DocRenameOutcome {
-    pub from: String,
-    pub to: String,
-    /// Paths whose link text was rewritten (not including `from`/`to`).
-    pub rewritten_paths: Vec<String>,
-    pub links_rewritten: u32,
+    /// Tracked markdown files the vault does not hold, whatever the reason:
+    /// past the file or byte cap, too large, unreadable, not UTF-8. Anything
+    /// that searched or rewrote across the vault did not see these.
+    pub not_scanned: u32,
 }
 
 /// Builds (or rebuilds) the vault for `repo_path` from tracked markdown files.
@@ -348,125 +352,6 @@ pub fn status(repo_path: &str) -> Result<DocsStatus, String> {
     Ok(load_vault(repo_path, false)?.status.clone())
 }
 
-/// [`GitWriter::move_path`] plus staged link rewrites via `rewrite_links_in`.
-///
-/// Reviewable in the diff viewer before commit. Does **not** call
-/// `Vault::rename_note`. `gate` judges the move `move_path` decided on, before
-/// anything moves.
-pub fn rename_doc(
-    repo_path: &str,
-    from: &str,
-    to: &str,
-    gate: impl FnOnce(&MovePlan) -> Result<(), String>,
-) -> Result<DocRenameOutcome, String> {
-    let repo = validate_repo(repo_path)?;
-    let from = normalize_rel(from)?;
-    let to = normalize_rel(to)?;
-    if from == to {
-        return Err("source and destination paths are the same".into());
-    }
-    if !has_markdown_extension(&from) || !has_markdown_extension(&to) {
-        return Err("doc rename only moves markdown notes".into());
-    }
-
-    // Brought current from the cached snapshot: only files whose stat key
-    // moved since the last refresh are read again.
-    let built = load_vault(repo_path, true)?;
-    let vault = &built.vault;
-    let Some(source_index) = vault.notes().iter().position(|n| n.path == from) else {
-        return Err(format!("note not in vault: {from}"));
-    };
-    if vault.notes().iter().any(|n| n.path == to) {
-        return Err(format!("destination already exists in vault: {to}"));
-    }
-    // Filesystem authority: refuse overwriting an on-disk file the index
-    // somehow missed.
-    let to_abs = sandbox_join(&repo, &to)?;
-    if to_abs.exists() {
-        return Err(format!("destination already exists on disk: {to}"));
-    }
-
-    let old_stem = stem(&from);
-    let new_stem = stem(&to);
-    let new_path = strip_markdown_extension(&to).to_string();
-    let stem_ambushed = vault.notes().iter().enumerate().any(|(index, note)| {
-        index != source_index && stem(&note.path).eq_ignore_ascii_case(&new_stem)
-    });
-
-    let mut edits: Vec<(String, String, u32)> = Vec::new();
-    for (index, note) in vault.notes().iter().enumerate() {
-        if index == source_index {
-            continue;
-        }
-        let source_note_path = note.path.clone();
-        let mut resolve_wiki = |written: &str| -> Option<String> {
-            // Same rule as MarkDev's rename_note: rewrite only when the
-            // written target resolves to the note being moved.
-            let resolved = vault.resolve(written, None)?;
-            if resolved.path != from {
-                return None;
-            }
-            if written.eq_ignore_ascii_case(&old_stem) {
-                (!stem_ambushed)
-                    .then(|| new_stem.clone())
-                    .or(Some(new_path.clone()))
-            } else {
-                Some(new_path.clone())
-            }
-        };
-        let mut resolve_markdown = |written: &str| -> Option<String> {
-            let resolved = vault.resolve_from(&source_note_path, written, None)?;
-            if resolved.path != from {
-                return None;
-            }
-            Some(new_path.clone())
-        };
-
-        let protected = ProtectedRanges::for_document(&note.text);
-        let (text, links) = rewrite_links_in(
-            &note.text,
-            &protected,
-            &mut resolve_wiki,
-            &mut resolve_markdown,
-        );
-        if links > 0 {
-            if text.len() > DEFAULT_MAX_NOTE_BYTES {
-                return Err(format!(
-                    "rewrite of {} exceeds the note size limit",
-                    note.path
-                ));
-            }
-            edits.push((note.path.clone(), text, links as u32));
-        }
-    }
-
-    // Move first so a failed mv leaves rewrites unapplied.
-    GitWriter::move_path(repo_path, &from, &to, gate)?;
-
-    let mut links_rewritten = 0u32;
-    let mut rewritten_paths = Vec::with_capacity(edits.len());
-    for (path, text, links) in edits {
-        sandbox_write(repo_path, &path, &text)?;
-        GitWriter::stage_file(repo_path, &path)?;
-        links_rewritten = links_rewritten.saturating_add(links);
-        rewritten_paths.push(path);
-    }
-
-    // The moved and rewritten notes carry new stat keys, so this re-reads
-    // just those. If it fails, drop the pre-rename snapshot rather than keep
-    // serving it: the next query then builds from disk.
-    if refresh(repo_path).is_err() {
-        invalidate(repo_path);
-    }
-
-    Ok(DocRenameOutcome {
-        from,
-        to,
-        rewritten_paths,
-        links_rewritten,
-    })
-}
-
 fn normalize_rel(path: &str) -> Result<String, String> {
     let trimmed = path.trim().replace('\\', "/");
     if trimmed.is_empty() || trimmed.contains('\0') || trimmed.starts_with('/') {
@@ -532,9 +417,10 @@ fn build_vault(
     probe::note_scan(repo);
     #[cfg(test)]
     probe::pause_point(repo);
-    let mut truncated = paths.len() > MAX_DOC_FILES;
+    let cap = max_doc_files();
+    let mut truncated = paths.len() > cap;
     let mut remaining = MAX_DOC_BYTES;
-    let take = paths.len().min(MAX_DOC_FILES);
+    let take = paths.len().min(cap);
 
     let mut notes = Vec::with_capacity(take);
     let mut skipped_oversized = 0u32;
@@ -670,6 +556,7 @@ fn build_vault(
         truncated,
         skipped_oversized,
         skipped_unreadable,
+        not_scanned: (paths.len() - notes.len()) as u32,
     };
     let unchanged = previous.is_some_and(|cached| {
         parsed == 0 && cached.vault.notes().len() == notes.len() && cached.status == status
@@ -798,6 +685,28 @@ mod probe {
         static FILES_READ: Cell<usize> = const { Cell::new(0) };
         static LISTINGS: Cell<usize> = const { Cell::new(0) };
         static CLOCK_AHEAD: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static MAX_DOC_FILES: Cell<Option<usize>> = const { Cell::new(None) };
+        static WRITE_FAULT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Lowers this thread's file cap, so truncation can be exercised with a
+    /// handful of notes instead of five thousand.
+    pub(super) fn set_max_doc_files(cap: Option<usize>) {
+        MAX_DOC_FILES.set(cap);
+    }
+
+    pub(super) fn max_doc_files() -> Option<usize> {
+        MAX_DOC_FILES.get()
+    }
+
+    /// Makes this thread's rename fail its `attempt`th rewrite (from 0) with
+    /// an injected write error.
+    pub(super) fn set_write_fault_at(attempt: Option<usize>) {
+        WRITE_FAULT.set(attempt);
+    }
+
+    pub(super) fn write_fault_at() -> Option<usize> {
+        WRITE_FAULT.get()
     }
 
     pub(super) fn note_read() {

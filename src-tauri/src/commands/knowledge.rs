@@ -100,19 +100,31 @@ pub async fn cmd_docs_rename(
     from: String,
     to: String,
 ) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
-    off_thread(move || {
-        let mut policy = None;
-        let outcome = crate::docs::rename_doc(&repo_path, &from, &to, |plan| {
-            policy = Some(guard_move(&repo_path, plan)?);
-            Ok(())
-        })?;
-        let policy = policy.ok_or("Doc rename did not produce a verdict")?;
-        Ok(Guarded {
-            policy,
-            output: outcome,
-        })
+    off_thread(move || docs_rename_guarded(&repo_path, &from, &to)).await
+}
+
+/// The body of [`cmd_docs_rename`]. Every path the rename will write is judged
+/// with the move, before the move: one blocked path refuses the whole rename,
+/// so a note the task may not touch is never rewritten behind a verdict that
+/// only looked at the `git mv` line.
+pub(super) fn docs_rename_guarded(
+    repo_path: &str,
+    from: &str,
+    to: &str,
+) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
+    let fold = VerdictFold::default();
+    let outcome = crate::docs::rename_doc(repo_path, from, to, |plan| {
+        fold.record(guard_move(repo_path, plan.mv)?);
+        for path in plan.rewrites {
+            fold.record(guard_file(repo_path, path, "modify")?);
+        }
+        Ok(())
+    })?;
+    let policy = fold.finish().ok_or("Doc rename did not produce a verdict")?;
+    Ok(Guarded {
+        policy,
+        output: outcome,
     })
-    .await
 }
 
 /// Judges what [`GitWriter::move_path`] is about to do: the `git mv` line it
