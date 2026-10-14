@@ -2195,6 +2195,7 @@ fn record_session_spawn(
             after_ref: None,
             duration_ms: None,
             detail_json: None,
+            event_stamp: None,
         });
     };
     if let Err(error) =

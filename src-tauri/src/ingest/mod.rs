@@ -297,11 +297,15 @@ impl EventTime {
         }
     }
 
-    /// Adds the three keys to a detail object.
-    fn stamp(&self, detail: &mut serde_json::Value) {
-        detail["occurred_at"] = self.occurred_at.clone().into();
-        detail["occurred_at_basis"] = self.basis.into();
-        detail["task_basis"] = self.task.basis().into();
+    /// The three keys, for the writer to place in `detail_json`. They are
+    /// built here from a formatter and two fixed vocabularies, and the writer
+    /// checks that before it lets them past the redactor.
+    fn stamp(&self) -> ledger::EventStamp {
+        ledger::EventStamp {
+            occurred_at: self.occurred_at.clone(),
+            occurred_at_basis: self.basis.to_string(),
+            task_basis: self.task.basis().to_string(),
+        }
     }
 }
 
@@ -317,14 +321,13 @@ fn transcript_draft(
         ledger::ids::now_millis(),
         |ms| history.as_of(ms),
     );
-    let mut detail = serde_json::json!({
+    let detail = serde_json::json!({
         "source": "transcript",
         "tool": call.tool,
         "transcript_version": call.version,
         "git_branch": call.git_branch,
-    });
-    when.stamp(&mut detail);
-    let detail = detail.to_string();
+    })
+    .to_string();
     Draft {
         repo_path: ledger_repo.to_string(),
         worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
@@ -342,6 +345,7 @@ fn transcript_draft(
         // is what says so.
         verdict_json: None,
         detail_json: Some(detail),
+        event_stamp: Some(when.stamp()),
         ..Default::default()
     }
 }
@@ -558,13 +562,12 @@ fn replay_reflog(
             now_ms,
             |ms| history.as_of_second(ms),
         );
-        let mut detail = serde_json::json!({
+        let detail = serde_json::json!({
             "source": "reflog",
             "selector": entry.selector,
             "message": entry.message,
-        });
-        when.stamp(&mut detail);
-        let detail = detail.to_string();
+        })
+        .to_string();
         if ledger::record(Draft {
             repo_path: ledger_repo.to_string(),
             worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
@@ -580,6 +583,7 @@ fn replay_reflog(
             outcome: Some(Outcome::Ok),
             verdict_json: None,
             detail_json: Some(detail),
+            event_stamp: Some(when.stamp()),
             ..Default::default()
         })
         .is_some()

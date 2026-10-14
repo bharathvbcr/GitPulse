@@ -248,6 +248,99 @@ pub struct Draft {
     pub after_ref: Option<String>,
     pub duration_ms: Option<i64>,
     pub detail_json: Option<String>,
+    /// When the event happened and how its task was decided, for the writer to
+    /// place in `detail_json`. See [`EventStamp`].
+    pub event_stamp: Option<EventStamp>,
+}
+
+/// The three `detail_json` keys that carry event time: `occurred_at`,
+/// `occurred_at_basis` and `task_basis`.
+///
+/// They are the only keys that skip the redactor, which is what keeps a replay
+/// of a large corpus from redacting three more fields per row. That is safe
+/// only because each value is checked against a closed shape before it is
+/// spliced in ([`EventStamp::is_well_formed`]): a canonical 24-character UTC
+/// timestamp and two words from fixed lists. A stamp that fails the check is
+/// not dropped and not trusted: it is merged into the detail object and
+/// redacted with everything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventStamp {
+    pub occurred_at: String,
+    pub occurred_at_basis: String,
+    pub task_basis: String,
+}
+
+impl EventStamp {
+    /// Whether every value has the shape the writer produces, so none can
+    /// carry text a caller chose.
+    pub fn is_well_formed(&self) -> bool {
+        valid_utc_timestamp(&self.occurred_at)
+            && matches!(
+                self.occurred_at_basis.as_str(),
+                "transcript" | "reflog" | "ingest"
+            )
+            && matches!(self.task_basis.as_str(), "bound" | "unbound" | "unresolved")
+    }
+
+    /// The three members as JSON object text, without braces.
+    fn members(&self) -> String {
+        serde_json::json!({
+            "occurred_at": self.occurred_at,
+            "occurred_at_basis": self.occurred_at_basis,
+            "task_basis": self.task_basis,
+        })
+        .to_string()
+    }
+}
+
+/// `detail` redacted, with `stamp`'s keys in it.
+///
+/// A well-formed stamp is spliced onto the redacted object: the detail is
+/// redacted without the three keys, and their validated members are appended.
+/// Anything else (a stamp that fails validation, or a detail that is not a JSON
+/// object) takes the closed path: the keys go into the object first, and the
+/// whole of it is redacted. A detail that is not an object carries no stamp.
+fn redact_detail(detail: Option<&str>, stamp: Option<&EventStamp>) -> Option<String> {
+    let Some(stamp) = stamp else {
+        return detail.map(redact::text);
+    };
+    // A detail that already names one of the keys would be given it twice.
+    let names_a_key = detail.is_some_and(|text| {
+        ["\"occurred_at", "\"task_basis\""]
+            .iter()
+            .any(|key| text.contains(key))
+    });
+    if stamp.is_well_formed() && !names_a_key {
+        let redacted = detail.map_or_else(|| "{}".to_string(), redact::text);
+        let trimmed = redacted.trim();
+        if let Some(body) = trimmed
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            let members = stamp.members();
+            let members = &members[1..members.len() - 1];
+            let separator = if body.trim().is_empty() { "" } else { "," };
+            return Some(format!("{{{body}{separator}{members}}}"));
+        }
+    }
+    // The closed path: the keys join the object, and all of it is redacted.
+    let object = match detail {
+        None => Some(serde_json::Map::new()),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(map)) => Some(map),
+            _ => None,
+        },
+    };
+    let Some(mut map) = object else {
+        return detail.map(redact::text);
+    };
+    map.insert("occurred_at".into(), stamp.occurred_at.clone().into());
+    map.insert(
+        "occurred_at_basis".into(),
+        stamp.occurred_at_basis.clone().into(),
+    );
+    map.insert("task_basis".into(), stamp.task_basis.clone().into());
+    Some(redact::text(&serde_json::Value::Object(map).to_string()))
 }
 
 /// An event read back, in the shape the frontend consumes.
@@ -1222,7 +1315,7 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         before_ref: draft.before_ref.as_deref().map(redact::text),
         after_ref: draft.after_ref.as_deref().map(redact::text),
         duration_ms: draft.duration_ms,
-        detail: draft.detail_json.as_deref().map(redact::text),
+        detail: redact_detail(draft.detail_json.as_deref(), draft.event_stamp.as_ref()),
     })
 }
 
@@ -4816,3 +4909,6 @@ mod identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stamp_tests;

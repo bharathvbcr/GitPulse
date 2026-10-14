@@ -303,3 +303,90 @@ fn an_offset_call_time_resolves_at_its_utc_instant() {
     assert_eq!(history.as_of(before), TaskAtTime::Unresolved);
     assert_eq!(history.as_of(after), bound("T1"));
 }
+
+/// A bind row naming this worktree's path but written under another repository
+/// identity is not this repository's binding. The history read refuses a ledger
+/// holding one, so a pass stamps `unresolved` and no task rather than using it.
+#[test]
+fn a_bind_row_under_another_repository_identity_is_never_used() {
+    let (_dir, repo) = repo();
+    bind(&repo, &repo, "T-OTHER").unwrap();
+    with_conn(&repo, |conn| {
+        conn.execute(
+            "UPDATE events SET repo_path = '/some/other/repository' WHERE action = 'worktree.bind'",
+            [],
+        )
+        .unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        BindingHistory::load(&repo, &repo).unwrap_err().code,
+        "repository_mismatch"
+    );
+
+    let corpus = tempfile::tempdir().unwrap();
+    let slug = corpus.path().join("slug");
+    std::fs::create_dir_all(&slug).unwrap();
+    let file = format!("{repo}/a.rs");
+    let call = serde_json::json!({
+        "type": "assistant",
+        "sessionId": "ID",
+        "timestamp": iso8601_utc(crate::ledger::ids::now_millis()),
+        "version": "2.1.241",
+        "cwd": repo,
+        "message": { "content": [
+            { "type": "tool_use", "name": "Edit", "input": { "file_path": file } }
+        ]}
+    })
+    .to_string();
+    std::fs::write(slug.join("ID.jsonl"), call + "\n").unwrap();
+    let serial = crate::test_support::env::env_serial();
+    let _env =
+        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", corpus.path());
+    let out = crate::ingest::ingest_transcripts_into(&repo, &repo);
+    assert!(!out.error.is_empty(), "the refusal is reported: {out:?}");
+
+    // The pass fails closed on a ledger holding another repository's rows: it
+    // records nothing, so nothing is filed under the other identity's task.
+    assert_eq!(out.recorded, 0, "{out:?}");
+    let used: i64 = with_conn(&repo, |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE task_id = 'T-OTHER' AND action NOT LIKE 'worktree.%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap())
+    })
+    .unwrap();
+    assert_eq!(used, 0, "the other identity's task was used");
+}
+
+/// The history read is for replayed events. The live gate and the hook still
+/// authenticate the worktree through git: a checkout that is not a registered
+/// member of the repository's family is refused, not answered from its rows.
+#[test]
+fn the_live_gate_and_the_hook_still_authenticate_through_git() {
+    let (dir, repo) = repo();
+    bind(&repo, &repo, "T1").unwrap();
+    let impostor = tempfile::tempdir().unwrap();
+    std::fs::write(
+        impostor.path().join(".git"),
+        format!("gitdir: {}\n", dir.path().join(".git").display()),
+    )
+    .unwrap();
+    crate::test_support::trust_repo(impostor.path());
+    let forged = impostor.path().canonicalize().unwrap();
+    let forged = forged.to_string_lossy().into_owned();
+
+    for error in [
+        resolve_binding(&repo, &forged).expect_err("the gate's resolution"),
+        resolve_binding_readonly(&repo, &forged).expect_err("the hook's resolution"),
+    ] {
+        assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+    // And the registered worktree still resolves through the same path.
+    assert_eq!(resolve(&repo, &repo).unwrap(), Some("T1".into()));
+}
