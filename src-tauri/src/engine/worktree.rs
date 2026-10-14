@@ -1843,6 +1843,12 @@ pub struct MergeTeardownResult {
     /// path. The next teardown retries it.
     #[serde(default)]
     pub cleanup_error: Option<String>,
+    /// Leftovers of earlier teardowns the sweep before this one could not
+    /// clear (a symlink, a directory held back, one that would not delete),
+    /// and a cap that was hit. About the repository, not about this removal,
+    /// so they are not in `cleanup_error`. Bounded: at most 17 short notes.
+    #[serde(default)]
+    pub sweep_problems: Vec<String>,
 }
 
 /// Why a merge and teardown did not merge. It crosses the IPC boundary as
@@ -2077,7 +2083,7 @@ fn merge_and_teardown_with_seams(
 
     // Files an earlier teardown moved aside and did not finish deleting: the
     // sweep is their retry. It takes no lock; it is outside the merge's own.
-    let sweep_note = sweep_teardown_asides(&repo).note();
+    let sweep_problems = sweep_teardown_asides(&repo).notes();
 
     // 1. Resolve branch name
     let branch_raw = git_text(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
@@ -2435,7 +2441,7 @@ fn merge_and_teardown_with_seams(
     drop(_guard);
 
     // The lane's files, moved aside under the lock, are deleted without it.
-    let cleanup_error = join_notes(sweep_note, finish_teardown(aside, delete_aside));
+    let cleanup_error = finish_teardown(aside, delete_aside);
 
     // 7. Post-merge hooks
     let mut hook_error = None;
@@ -2471,6 +2477,7 @@ fn merge_and_teardown_with_seams(
             Some(hook_notices.join(" "))
         },
         cleanup_error,
+        sweep_problems,
     })
 }
 
@@ -2625,6 +2632,20 @@ const SWEEP_CAP: usize = 16;
 /// process may still be deleting it.
 const FOREIGN_ASIDE_MIN_AGE: Duration = Duration::from_secs(30);
 
+/// Written inside a sibling aside (one beside the old place, which a marker
+/// under the git directory names): the git common directory, then the token
+/// the marker holds. The sweep deletes a marker's target only when both match,
+/// so a marker alone, planted or corrupt, cannot point it at a person's folder.
+const SENTINEL_FILE: &str = ".gitpulse-teardown-sentinel";
+/// Written inside an aside that holds a worktree's files whose record is gone
+/// and that could not be put back: the sweep refuses it and says so.
+const HOLD_FILE: &str = ".gitpulse-teardown-hold";
+/// A name dated further ahead than this is a bad clock or a bad name, not
+/// another process still working: the age rule stops holding it off.
+const FUTURE_SLACK: Duration = Duration::from_secs(3600);
+/// Longest note kept per sweep problem.
+const SWEEP_NOTE_LEN: usize = 400;
+
 /// Asides this process is deleting right now; a sweep leaves them alone.
 static ASIDES_IN_FLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static ASIDE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2675,6 +2696,16 @@ fn same_device(_a: &Path, _b: &Path) -> bool {
     false
 }
 
+/// A random token (the standard library's hasher is seeded randomly per
+/// process) for the marker and sentinel of a sibling aside.
+fn new_aside_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(ASIDE_SERIAL.load(std::sync::atomic::Ordering::Relaxed));
+    hasher.write_u32(std::process::id());
+    format!("{:016x}", hasher.finish())
+}
+
 /// `<pid>-<nanos>-<serial>`, the name of an aside and of its marker.
 fn new_aside_name() -> String {
     let nanos = std::time::SystemTime::now()
@@ -2711,8 +2742,29 @@ fn try_rename_aside(
     target_text: &str,
     force: bool,
 ) -> Result<Option<TeardownAside>, String> {
+    try_rename_aside_with(
+        repo,
+        target_text,
+        force,
+        &mut remove_own_worktree_record,
+        &mut |from, to| std::fs::rename(from, to),
+    )
+}
+
+/// [`try_rename_aside`] with the removal of the record and the rename that
+/// puts the directory back passed in, so a test can make the second one fail
+/// after the first has happened.
+fn try_rename_aside_with(
+    repo: &Path,
+    target_text: &str,
+    force: bool,
+    remove_record: &mut dyn FnMut(&Path, &str) -> Result<(), String>,
+    rename_back: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Option<TeardownAside>, String> {
     let target = Path::new(target_text);
-    if !std::fs::symlink_metadata(target).is_ok_and(|meta| meta.is_dir()) {
+    // A relative path would resolve against the working directory, here and
+    // wherever a sweep later reads it back.
+    if !target.is_absolute() || !std::fs::symlink_metadata(target).is_ok_and(|meta| meta.is_dir()) {
         return Ok(None);
     }
     let Some(record) = find_own_worktree_record(repo, target_text).ok().flatten() else {
@@ -2735,6 +2787,7 @@ fn try_rename_aside(
         return Ok(None);
     }
     let name = new_aside_name();
+    let token = new_aside_token();
     let (aside, marker) = match target.file_name() {
         Some(base) if !same_device(target, &holding) => {
             let Some(parent) = target.parent() else {
@@ -2745,7 +2798,10 @@ fn try_rename_aside(
                 base.to_string_lossy()
             ));
             let marker = holding.join(format!("{name}.sibling"));
-            if std::fs::write(&marker, aside.to_string_lossy().as_bytes()).is_err() {
+            // The aside's path, then the token the sentinel inside it repeats:
+            // the sweep deletes what a marker names only when both agree.
+            let text = format!("{}\n{token}", aside.to_string_lossy());
+            if std::fs::write(&marker, text.as_bytes()).is_err() {
                 return Ok(None);
             }
             (aside, Some(marker))
@@ -2767,21 +2823,37 @@ fn try_rename_aside(
         }
         return Ok(None);
     }
-    let put_back = |why: String| -> String {
-        match std::fs::rename(&held.path, target) {
+    let mut put_back = |why: String| -> String {
+        match rename_back(&held.path, target) {
             Ok(()) => {
                 if let Some(marker) = &held.marker {
                     let _ = std::fs::remove_file(marker);
                 }
                 format!("{why}; the worktree was put back")
             }
-            Err(e) => format!(
-                "{why}; and putting the worktree back from {} failed: {e}",
-                held.path.display()
-            ),
+            Err(e) => {
+                // The files are the person's and may no longer have a record:
+                // a sweep must not take them. A hold file says so across
+                // restarts; failing that, this process keeps the aside
+                // registered for as long as it lives.
+                if std::fs::write(held.path.join(HOLD_FILE), why.as_bytes()).is_err() {
+                    std::mem::forget(TeardownAside::register(held.path.clone(), None));
+                }
+                format!(
+                    "{why}; and putting the worktree back from {} failed: {e}. \
+                     Its files are kept there and are not swept",
+                    held.path.display()
+                )
+            }
         }
     };
-    if let Err(e) = remove_own_worktree_record(repo, target_text) {
+    if held.marker.is_some() {
+        let sentinel = format!("{}\n{token}", common.to_string_lossy());
+        if let Err(e) = std::fs::write(held.path.join(SENTINEL_FILE), sentinel) {
+            return Err(put_back(format!("could not mark the aside as ours: {e}")));
+        }
+    }
+    if let Err(e) = remove_record(repo, target_text) {
         return Err(put_back(e));
     }
     match still_listed(repo, target_text) {
@@ -2856,8 +2928,11 @@ struct SweepReport {
 }
 
 impl SweepReport {
-    /// What a person should hear about; `None` for a sweep with nothing to say.
-    fn note(&self) -> Option<String> {
+    /// What a person should hear about: each problem and the cap being hit,
+    /// each bounded to [`SWEEP_NOTE_LEN`] characters. At most `SWEEP_CAP + 1`
+    /// entries, since the sweep stops looking at the cap. Empty for a sweep
+    /// with nothing to say.
+    fn notes(&self) -> Vec<String> {
         let mut parts = self.problems.clone();
         if self.beyond_cap > 0 {
             parts.push(format!(
@@ -2866,14 +2941,20 @@ impl SweepReport {
                 if self.beyond_cap == 1 { "y" } else { "ies" }
             ));
         }
-        (!parts.is_empty()).then(|| parts.join("; "))
+        parts
+            .into_iter()
+            .map(|note| match note.char_indices().nth(SWEEP_NOTE_LEN) {
+                Some((at, _)) => format!("{}...", &note[..at]),
+                None => note,
+            })
+            .collect()
     }
-}
 
-fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (first, second) => first.or(second),
+    /// [`SweepReport::notes`] as one line.
+    #[cfg(test)]
+    fn note(&self) -> Option<String> {
+        let notes = self.notes();
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 }
 
@@ -2938,19 +3019,32 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
             report.beyond_cap += 1;
             continue;
         }
-        // The directory to delete: the entry itself, or what its marker names.
+        // The directory to delete: the entry itself, or what its marker names
+        // (the marker's token is checked against the sentinel further down).
+        let mut marker_token = None;
         let target = match &marker {
             None => entry.clone(),
             Some(marker) => {
-                let named = std::fs::read(marker).ok().filter(|text| text.len() <= 4096);
-                let Some(named) =
-                    named.map(|text| PathBuf::from(String::from_utf8_lossy(&text).into_owned()))
+                let text = std::fs::read(marker).ok().filter(|text| text.len() <= 4096);
+                let text = text.map(|text| String::from_utf8_lossy(&text).into_owned());
+                let Some((named, token)) = text.as_deref().and_then(|text| text.rsplit_once('\n'))
                 else {
-                    report
-                        .problems
-                        .push(format!("could not read the marker {}", marker.display()));
+                    report.problems.push(format!(
+                        "could not read the marker {}, so what it names was left",
+                        marker.display()
+                    ));
                     continue;
                 };
+                marker_token = Some(token.to_string());
+                let named = PathBuf::from(named);
+                // Never resolved against the working directory.
+                if !named.is_absolute() {
+                    report.problems.push(format!(
+                        "the marker {} names a relative path, so it was left",
+                        marker.display()
+                    ));
+                    continue;
+                }
                 let stem = marker
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -2977,7 +3071,12 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
         if in_flight.contains(&target) {
             continue;
         }
-        if pid != std::process::id() && now.saturating_sub(nanos) < FOREIGN_ASIDE_MIN_AGE.as_nanos()
+        // Another process's fresh aside may still be in use by it. One dated
+        // far ahead is not fresh, it is wrong.
+        let dated_ahead = nanos > now.saturating_add(FUTURE_SLACK.as_nanos());
+        if pid != std::process::id()
+            && !dated_ahead
+            && now.saturating_sub(nanos) < FOREIGN_ASIDE_MIN_AGE.as_nanos()
         {
             continue;
         }
@@ -3002,6 +3101,35 @@ fn sweep_teardown_asides(repo: &Path) -> SweepReport {
                 continue;
             }
             Ok(_) => {}
+        }
+        if target.join(HOLD_FILE).exists() {
+            report.problems.push(format!(
+                "{} holds a worktree's files that could not be put back, so it was left",
+                target.display()
+            ));
+            continue;
+        }
+        if let Some(token) = &marker_token {
+            let sentinel = std::fs::read(target.join(SENTINEL_FILE))
+                .ok()
+                .filter(|text| text.len() <= 4096)
+                .map(|text| String::from_utf8_lossy(&text).into_owned());
+            let common = holding
+                .parent()
+                .map(|dir| dir.to_string_lossy().into_owned());
+            let ours = sentinel
+                .as_deref()
+                .and_then(|text| text.rsplit_once('\n'))
+                .is_some_and(|(written, found)| {
+                    found == token && Some(written) == common.as_deref()
+                });
+            if !ours {
+                report.problems.push(format!(
+                    "{} is named by a marker but was not marked as this repository's teardown, so it was left",
+                    target.display()
+                ));
+                continue;
+            }
         }
         let identity = lane_identity(&target);
         if records.iter().any(|(_, gitdir)| {
@@ -3090,6 +3218,10 @@ pub struct WorktreeRemoval {
     /// the next removal retries it.
     #[serde(default)]
     pub cleanup_error: Option<String>,
+    /// What the sweep before this removal could not clear; see
+    /// [`MergeTeardownResult::sweep_problems`].
+    #[serde(default)]
+    pub sweep_problems: Vec<String>,
 }
 
 /// Removes a linked worktree. Git refuses the main worktree itself.
@@ -3115,13 +3247,22 @@ pub fn remove_worktree_with(
     delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<WorktreeRemoval, String> {
     let repo = validate_repo(repo_path)?;
-    let sweep_note = sweep_teardown_asides(&repo).note();
+    let sweep_problems = sweep_teardown_asides(&repo).notes();
     let aside = {
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_target_path(target_path)?;
+        // The directory is gone but its record is not: a teardown that was
+        // cut short after the rename. Finishing it is removing that record;
+        // `validate_repo` below would refuse a path that is not there.
+        if finish_vanished_worktree(&repo, target_path)? {
+            return Ok(WorktreeRemoval {
+                cleanup_error: None,
+                sweep_problems,
+            });
+        }
         let target = validate_repo(target_path)?;
         let target_text = plain_path_text(target.to_str().ok_or("Worktree path is not UTF-8")?);
         remove_worktree_split(&repo, &target_text, force, &mut || {
@@ -3129,8 +3270,31 @@ pub fn remove_worktree_with(
         })?
     };
     Ok(WorktreeRemoval {
-        cleanup_error: join_notes(sweep_note, finish_teardown(aside, delete_aside)),
+        cleanup_error: finish_teardown(aside, delete_aside),
+        sweep_problems,
     })
+}
+
+/// Whether `target_path` is a worktree whose directory is already gone, and
+/// if so removes its record (and nothing else), under the lock the caller
+/// holds. `false` for a path that exists, or that no record names, which the
+/// removal then handles as it always did.
+fn finish_vanished_worktree(repo: &Path, target_path: &str) -> Result<bool, String> {
+    let text = plain_path_text(target_path);
+    let missing = matches!(
+        std::fs::symlink_metadata(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    if !missing || find_own_worktree_record(repo, &text)?.is_none() {
+        return Ok(false);
+    }
+    remove_own_worktree_record(repo, &text)?;
+    if still_listed(repo, &text)? {
+        return Err(format!(
+            "git still lists {text} after its record was removed"
+        ));
+    }
+    Ok(true)
 }
 
 /// [`remove_worktree`] for a caller that already holds `repo`'s mutation lock
@@ -3267,6 +3431,7 @@ pub fn prune_worktree_argv() -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::doc_lazy_continuation)]
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
@@ -5332,6 +5497,7 @@ some-future-field whatever
             hook_error: None,
             hook_notice: None,
             cleanup_error: None,
+            sweep_problems: Vec::new(),
         };
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(
@@ -5349,6 +5515,7 @@ some-future-field whatever
                 "merged",
                 "merged_branch",
                 "removal_error",
+                "sweep_problems",
                 "target_branch",
                 "worktree_removed",
             ]
@@ -7477,10 +7644,99 @@ some-future-field whatever
         let holding = teardown_holding_dir(dir.path());
         std::fs::create_dir_all(&holding).unwrap();
         let marker = holding.join("1-4-4.sibling");
-        std::fs::write(&marker, beside.to_string_lossy().as_bytes()).unwrap();
+        // What a teardown writes: the path and a token in the marker, the
+        // repository's common directory and the same token in the aside.
+        std::fs::write(&marker, format!("{}\n{}", beside.display(), "feed01")).unwrap();
+        std::fs::write(
+            beside.join(SENTINEL_FILE),
+            format!(
+                "{}\n{}",
+                resolve_git_common_dir(dir.path()).unwrap().display(),
+                "feed01"
+            ),
+        )
+        .unwrap();
         let report = sweep_teardown_asides(dir.path());
         assert_eq!(report.removed, 1, "{report:?}");
         assert!(!beside.exists() && !marker.exists());
+    }
+
+    /// A marker and a sentinel that disagree on the token, or a sentinel from
+    /// another repository, delete nothing.
+    #[test]
+    fn the_sweep_needs_the_sentinel_to_match_the_marker() {
+        let (dir, wt) = teardown_fixture(None);
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        let common = resolve_git_common_dir(dir.path()).unwrap();
+        for (stem, written, token) in [
+            ("1-4-5", format!("{}\nother", common.display()), "feed01"),
+            (
+                "1-4-6",
+                "/some/other/repo/.git\nfeed01".to_string(),
+                "feed01",
+            ),
+        ] {
+            let beside = wt
+                .path()
+                .parent()
+                .unwrap()
+                .join(format!(".lane.gitpulse-teardown-{stem}"));
+            std::fs::create_dir_all(&beside).unwrap();
+            std::fs::write(beside.join(SENTINEL_FILE), written).unwrap();
+            std::fs::write(
+                holding.join(format!("{stem}.sibling")),
+                format!("{}\n{token}", beside.display()),
+            )
+            .unwrap();
+            let report = sweep_teardown_asides(dir.path());
+            assert_eq!(report.removed, 0, "{stem}: {report:?}");
+            assert!(
+                beside.exists(),
+                "{stem}: a marker deleted what was not marked"
+            );
+            std::fs::remove_dir_all(&beside).unwrap();
+        }
+    }
+
+    /// The put-back that fails after the record is gone (the second step of
+    /// the rename path) keeps the files: a hold file is written inside them,
+    /// the error says where they are, and the sweep refuses them and says so.
+    #[test]
+    fn a_failed_put_back_keeps_the_files_from_the_sweep() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let lane = wt.path().to_str().unwrap().to_string();
+        let held = try_rename_aside_with(
+            repo,
+            &lane,
+            true,
+            &mut |repo, lane| {
+                // The record goes, then the check that follows fails: the
+                // rename path must undo its rename, and cannot.
+                remove_own_worktree_record(repo, lane)?;
+                Err("injected: the record check failed".to_string())
+            },
+            &mut |_, _| Err(std::io::Error::other("injected: put back failed")),
+        );
+        let why = held.err().expect("the rename path reports the failure");
+        assert!(
+            why.contains("not swept") && why.contains("put back"),
+            "{why}"
+        );
+        let entries = teardown_entries(repo);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let aside = teardown_holding_dir(repo).join(&entries[0]);
+        assert!(aside.join("feature.txt").exists(), "the files were lost");
+        assert!(aside.join(HOLD_FILE).exists());
+        // Old enough that nothing but the hold file protects it.
+        let report = sweep_teardown_asides(repo);
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(
+            aside.join("feature.txt").exists(),
+            "the sweep took held files"
+        );
     }
 
     /// A marker is trusted only for a name that is ours: one pointing at any
@@ -7848,7 +8104,7 @@ some-future-field whatever
         let mut child = std::process::Command::new("sleep")
             .arg("120")
             .current_dir(wt.path())
-            .spawn()
+            .spawn_locked()
             .expect("sleep");
         let (result, asides) = remove_recording(dir.path(), wt.path(), true);
         let _ = child.kill();
@@ -8001,8 +8257,8 @@ some-future-field whatever
         let (second, _) = remove_recording(dir.path(), other.path(), true);
         let second = second.expect("removed");
         assert!(
-            second.cleanup_error.is_some(),
-            "a leftover that cannot be deleted went quiet"
+            !second.sweep_problems.is_empty() && second.cleanup_error.is_none(),
+            "a leftover that cannot be deleted went quiet: {second:?}"
         );
         std::fs::set_permissions(aside.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let third = tempfile::tempdir().unwrap();
@@ -8141,7 +8397,10 @@ some-future-field whatever
         let (result, asides) = remove_recording(dir.path(), wt.path(), true);
         let removal = result.unwrap();
         assert_eq!(asides.len(), 1);
-        assert!(removal.cleanup_error.is_some(), "{removal:?}");
+        // Reported, but in its own field: `cleanup_error` is about this
+        // removal's own files, and this removal's delete succeeded.
+        assert_eq!(removal.cleanup_error, None, "{removal:?}");
+        assert_eq!(removal.sweep_problems.len(), 1, "{removal:?}");
         assert!(target.path().exists());
     }
 
@@ -8224,7 +8483,7 @@ some-future-field whatever
             let run = |args: &[&std::ffi::OsStr]| {
                 let out = std::process::Command::new("hdiutil")
                     .args(args)
-                    .output()
+                    .output_locked()
                     .expect("hdiutil");
                 assert!(
                     out.status.success(),
@@ -8260,7 +8519,7 @@ some-future-field whatever
             let _ = std::process::Command::new("hdiutil")
                 .args(["detach", "-force"])
                 .arg(&self.mount)
-                .output();
+                .output_locked();
         }
     }
 
@@ -8274,13 +8533,7 @@ some-future-field whatever
         let lane = volume.mount.join("lane");
         add_lane_at(dir.path(), &lane, "xdev-lane");
         assert!(
-            !same_device(
-                &lane,
-                &teardown_holding_dir(dir.path())
-                    .parent()
-                    .unwrap()
-                    .to_path_buf()
-            ),
+            !same_device(&lane, teardown_holding_dir(dir.path()).parent().unwrap()),
             "not a cross-device fixture"
         );
         let mut seen = None;

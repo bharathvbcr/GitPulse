@@ -147,6 +147,7 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   const parts = [mergedSentence(merged)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
   if (merged.cleanup_error) parts.push(merged.cleanup_error);
+  if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { message: parts.join(" ") };
 }
@@ -209,6 +210,7 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   const parts = [mergedSentence(merged)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
   if (merged.cleanup_error) parts.push(merged.cleanup_error);
+  if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { head: expectedHead, message: parts.join(" ") };
 }
@@ -236,6 +238,7 @@ export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeA
   await closeStranded(run.cwd);
   const parts = ["The worktree was removed."];
   if (removed?.output?.cleanup_error) parts.push(removed.output.cleanup_error);
+  if (removed?.output?.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${removed.output.sweep_problems.join("; ")}`);
   if (own.branch?.startsWith("gitpulse/")) {
     try {
       await invoke("cmd_delete_branch", { repoPath: root, branchName: own.branch, force: false });

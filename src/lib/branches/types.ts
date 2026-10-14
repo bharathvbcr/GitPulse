@@ -289,6 +289,12 @@ export interface MergeTeardownResult {
    * teardown could not be cleared. Names the path; the next teardown retries.
    */
   cleanup_error?: string | null;
+  /**
+   * Leftovers of earlier teardowns that the sweep before this one could not
+   * clear (and a cap that was hit): about the repository, not this removal.
+   * At most 17 short notes.
+   */
+  sweep_problems?: string[];
 }
 
 /**
@@ -298,6 +304,8 @@ export interface MergeTeardownResult {
  */
 export interface WorktreeRemoval {
   cleanup_error?: string | null;
+  /** As on {@link MergeTeardownResult.sweep_problems}. */
+  sweep_problems?: string[];
 }
 
 /**
@@ -363,11 +371,15 @@ export function worktreeSetupNotices(
     branch_deleted?: boolean;
     branch_error?: string | null;
     cleanup_error?: string | null;
+    sweep_problems?: string[];
   },
   when: "create" | "merge" | "remove",
 ): string[] {
   const notices: string[] = [];
   if (when !== "create" && done.cleanup_error) notices.push(done.cleanup_error);
+  if (when !== "create" && done.sweep_problems?.length) {
+    notices.push(`Leftover files from an earlier worktree removal could not be cleared: ${done.sweep_problems.join("; ")}`);
+  }
   if (when === "merge" && done.worktree_removed === false) {
     notices.push(`Merged, but the worktree was not removed: ${done.removal_error ?? "no reason was given"}. The merge stands; remove the worktree when it is free.`);
   } else if (when === "merge" && done.branch_deleted === false) {

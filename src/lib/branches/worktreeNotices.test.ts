@@ -38,6 +38,13 @@ describe("what a worktree operation left undone", () => {
     expect(worktreeSetupNotices({}, "remove")).toEqual([]);
   });
 
+  it("reports leftovers the sweep could not clear apart from this removal's own cleanup", () => {
+    const notices = worktreeSetupNotices({ sweep_problems: ["could not delete the leftover /r/.git/gitpulse-teardown/1-2-3: busy"] }, "remove");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatch(/earlier worktree removal.*busy/);
+    expect(worktreeSetupNotices({ sweep_problems: ["x"] }, "create")).toEqual([]);
+  });
+
   it("after a teardown, says the merge happened and the cleanup did not", () => {
     expect(worktreeSetupNotices({ hook_error: "exit 4" }, "merge")).toEqual([
       "The merge and teardown finished, but the post_merge hook did not: exit 4",
