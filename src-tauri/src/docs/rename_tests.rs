@@ -1,6 +1,7 @@
 //! Link-preserving rename: what each rewritten link says, where, and to whom.
 
 use super::*;
+use crate::engine::git_writer::MovePlan;
 use crate::test_support::{git_in, git_repo, write};
 
 /// A committed repository holding exactly `files`.
@@ -285,4 +286,210 @@ fn a_case_only_rename_on_a_case_insensitive_volume_is_refused() {
     let refused = rename_doc(path, "docs/Roadmap.md", "docs/ROADMAP.md", |_| Ok(()));
     assert!(refused.is_err(), "{refused:?}");
     assert!(dir.path().join("docs/Roadmap.md").exists());
+}
+
+/// Four notes that all link at `Roadmap.md`, so a rename rewrites four files.
+fn crowded_repo() -> tempfile::TempDir {
+    repo_with(&[
+        ("README.md", "[r](docs/Roadmap.md)\n"),
+        ("docs/A.md", "[r](Roadmap.md)\n"),
+        ("docs/B.md", "[r](Roadmap.md)\n"),
+        ("docs/C.md", "[r](Roadmap.md)\n"),
+        ("docs/Roadmap.md", "# Roadmap\n"),
+    ])
+}
+
+fn staged(dir: &tempfile::TempDir) -> String {
+    git_text(dir.path(), &["diff", "--cached", "--name-status"]).unwrap()
+}
+
+#[test]
+fn a_note_edited_after_the_plan_is_left_as_the_user_wrote_it() {
+    let dir = nested_fixture_repo();
+    let path = dir.path().to_str().unwrap();
+    let guide = dir.path().join("docs/Guide.md");
+    let outcome = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| {
+        std::fs::write(&guide, "# Guide\n\nI was typing [x](Roadmap.md).\n").unwrap();
+        Ok(())
+    })
+    .expect("rename");
+
+    assert_eq!(outcome.skipped_conflict, ["docs/Guide.md"], "{outcome:?}");
+    assert!(!outcome.complete);
+    assert_eq!(
+        std::fs::read_to_string(&guide).unwrap(),
+        "# Guide\n\nI was typing [x](Roadmap.md).\n"
+    );
+    // The rest of the plan still lands.
+    assert_eq!(
+        outcome.rewritten_paths,
+        ["README.md", "plans/Roadmap.md"],
+        "{outcome:?}"
+    );
+    assert!(read(&dir, "README.md").contains("(plans/Roadmap.md)"));
+}
+
+#[test]
+fn an_expecting_write_replaces_only_the_bytes_it_expected() {
+    use crate::engine::git_cli::sandbox_write_expecting;
+    let dir = repo_with(&[("a.md", "one\n")]);
+    let path = dir.path().to_str().unwrap();
+    assert!(sandbox_write_expecting(path, "a.md", "one\n", "two\n").unwrap());
+    assert_eq!(read(&dir, "a.md"), "two\n");
+    // Stale expectation: nothing is written.
+    assert!(!sandbox_write_expecting(path, "a.md", "one\n", "three\n").unwrap());
+    assert_eq!(read(&dir, "a.md"), "two\n");
+    // A file that is gone is not "the bytes I expected" either.
+    assert!(!sandbox_write_expecting(path, "gone.md", "one\n", "three\n").unwrap());
+    assert!(!dir.path().join("gone.md").exists());
+}
+
+#[test]
+fn a_write_fault_on_one_note_is_reported_and_the_others_are_still_written() {
+    let dir = crowded_repo();
+    let path = dir.path().to_str().unwrap();
+    probe::set_write_fault_at(Some(1));
+    let outcome = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(()));
+    probe::set_write_fault_at(None);
+    let outcome = outcome.expect("a partial rename is reported, not an error");
+
+    assert!(!outcome.complete, "{outcome:?}");
+    assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.failed[0].path, "docs/A.md");
+    assert!(outcome.failed[0].error.contains("injected"), "{outcome:?}");
+    assert_eq!(
+        outcome.rewritten_paths,
+        ["README.md", "docs/B.md", "docs/C.md"],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.links_rewritten, 3);
+    assert_eq!(read(&dir, "docs/A.md"), "[r](Roadmap.md)\n");
+    let staged = staged(&dir);
+    for rewritten in ["README.md", "docs/B.md", "docs/C.md"] {
+        assert!(staged.contains(rewritten), "{rewritten} not staged: {staged}");
+    }
+    assert!(!staged.contains("docs/A.md"), "{staged}");
+}
+
+#[test]
+fn a_refused_rewrite_path_refuses_the_whole_rename_before_anything_moves() {
+    let dir = nested_fixture_repo();
+    let path = dir.path().to_str().unwrap();
+    let before = read(&dir, "docs/Guide.md");
+    let refused = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |plan| {
+        if plan.rewrites.iter().any(|p| p == "docs/Guide.md") {
+            Err("docs/Guide.md is outside the task".into())
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(
+        refused.unwrap_err(),
+        "docs/Guide.md is outside the task".to_string()
+    );
+    assert!(dir.path().join("docs/Roadmap.md").exists());
+    assert!(!dir.path().join("plans").exists());
+    assert_eq!(read(&dir, "docs/Guide.md"), before);
+    assert_eq!(git_text(dir.path(), &["status", "--porcelain"]).unwrap(), "");
+}
+
+#[test]
+fn the_gate_is_shown_the_move_and_every_path_the_rename_will_write() {
+    let dir = repo_with(&[
+        ("docs/A.md", "[b](B.md)\n"),
+        ("docs/B.md", "# B\n"),
+        ("docs/C.md", "[a](A.md)\n"),
+    ]);
+    let path = dir.path().to_str().unwrap();
+    let mut seen = Vec::new();
+    rename_doc(path, "docs/A.md", "notes/A.md", |plan| {
+        assert!(matches!(plan.mv, MovePlan::Git { .. }));
+        seen = plan.rewrites.to_vec();
+        Ok(())
+    })
+    .expect("rename");
+    // The moved note under its new path, then the note that links at it.
+    assert_eq!(seen, ["notes/A.md", "docs/C.md"]);
+}
+
+#[test]
+fn a_file_cap_that_hides_notes_is_reported_not_hidden() {
+    let dir = repo_with(&[
+        ("a.md", "[b](b.md)\n"),
+        ("b.md", "# B\n"),
+        ("c.md", "[b](b.md)\n"),
+        ("d.md", "[b](b.md)\n"),
+    ]);
+    let path = dir.path().to_str().unwrap();
+    probe::set_max_doc_files(Some(2));
+    let outcome = rename_doc(path, "b.md", "z.md", |_| Ok(()));
+    probe::set_max_doc_files(None);
+    let outcome = outcome.expect("rename");
+
+    assert!(outcome.scan.truncated, "{outcome:?}");
+    assert_eq!(outcome.scan.note_count, 2);
+    assert_eq!(outcome.scan.not_scanned, 2);
+    assert_eq!(outcome.rewritten_paths, ["a.md"]);
+    // The notes it never saw still point at the old name: that is what the
+    // count is for.
+    assert_eq!(read(&dir, "c.md"), "[b](b.md)\n");
+}
+
+#[test]
+fn a_note_that_is_not_utf8_is_counted_and_never_written() {
+    let dir = repo_with(&[("a.md", "[b](b.md)\n"), ("b.md", "# B\n")]);
+    std::fs::write(dir.path().join("bin.md"), [0xff, 0xfe, b'[', b']']).unwrap();
+    git_in(dir.path(), &["add", "bin.md"]);
+    let path = dir.path().to_str().unwrap();
+    let outcome = rename_doc(path, "b.md", "z.md", |_| Ok(())).expect("rename");
+    assert_eq!(outcome.scan.skipped_unreadable, 1, "{outcome:?}");
+    assert_eq!(outcome.scan.not_scanned, 1, "{outcome:?}");
+    assert_eq!(
+        std::fs::read(dir.path().join("bin.md")).unwrap(),
+        [0xff, 0xfe, b'[', b']']
+    );
+}
+
+#[test]
+fn a_reference_definition_is_reported_because_it_is_not_rewritten() {
+    let dir = repo_with(&[
+        ("docs/Ref.md", "[x][ref]\n\n[ref]: Roadmap.md\n"),
+        ("docs/Roadmap.md", "# Roadmap\n"),
+    ]);
+    let path = dir.path().to_str().unwrap();
+    let outcome = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
+    assert_eq!(
+        outcome.left_broken,
+        [BrokenLink {
+            source: "docs/Ref.md".into(),
+            target: "Roadmap.md".into(),
+        }],
+        "{outcome:?}"
+    );
+    assert_eq!(read(&dir, "docs/Ref.md"), "[x][ref]\n\n[ref]: Roadmap.md\n");
+}
+
+#[test]
+fn a_clean_rename_reports_nothing_left_broken_and_is_complete() {
+    let dir = nested_fixture_repo();
+    let path = dir.path().to_str().unwrap();
+    let outcome = rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
+    assert!(outcome.complete, "{outcome:?}");
+    assert!(outcome.left_broken.is_empty(), "{outcome:?}");
+    assert!(outcome.skipped_conflict.is_empty() && outcome.failed.is_empty());
+    assert_eq!(outcome.scan.not_scanned, 0);
+}
+
+#[test]
+fn a_link_that_cannot_survive_a_title_with_a_paren_still_round_trips() {
+    let dir = repo_with(&[
+        ("docs/A.md", "[r](Roadmap.md \"a)b\") end\n"),
+        ("docs/Roadmap.md", "# Roadmap\n"),
+    ]);
+    let path = dir.path().to_str().unwrap();
+    rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(())).expect("rename");
+    assert_eq!(
+        read(&dir, "docs/A.md"),
+        "[r](../plans/Roadmap.md \"a)b\") end\n"
+    );
 }
