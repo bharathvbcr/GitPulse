@@ -377,7 +377,10 @@ done
         let _binary = bind_test_binary(&serial, dead.to_string_lossy());
 
         let result = docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md");
-        assert!(result.is_err(), "a gate that could not answer must refuse: {result:?}");
+        assert!(
+            result.is_err(),
+            "a gate that could not answer must refuse: {result:?}"
+        );
         assert!(dir.path().join("docs/Roadmap.md").exists());
         assert!(!dir.path().join("plans").exists());
         assert_eq!(
@@ -426,10 +429,14 @@ done
     }
 
     #[test]
-    fn adversarial_a_path_refused_only_for_modify_refuses_a_rename_that_rewrites_it() {
+    fn adversarial_a_denied_moved_note_that_is_rewritten_refuses_the_rename() {
         let (dir, repo, _) = bound_doc_repo("nothing");
         // The moved note links to Guide, so `plans/Roadmap.md` is rewritten.
-        write(dir.path(), "docs/Roadmap.md", "# Roadmap\n\n[g](Guide.md)\n");
+        write(
+            dir.path(),
+            "docs/Roadmap.md",
+            "# Roadmap\n\n[g](Guide.md)\n",
+        );
         let requests = dir.path().join("requests.ndjson");
         let body = FAKE_ONE_VERDICT
             .replace("@REQUESTS@", &requests.display().to_string())

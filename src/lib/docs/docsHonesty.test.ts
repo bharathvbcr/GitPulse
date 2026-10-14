@@ -100,6 +100,46 @@ describe("docsSearchHonesty", () => {
   });
 });
 
+describe("docsRenameHonesty (adversarial)", () => {
+  const scan = { noteCount: 2, truncated: false, skippedOversized: 0, skippedUnreadable: 0, notScanned: 0 };
+  const base: DocRenameOutcome = {
+    from: "a.md",
+    to: "b.md",
+    rewrittenPaths: [],
+    linksRewritten: 0,
+    complete: true,
+    skippedConflict: [],
+    failed: [],
+    leftBroken: [],
+    scan,
+  };
+
+  it("uses the singular for exactly one unscanned note", () => {
+    const line = docsRenameHonesty({ ...base, scan: { ...scan, notScanned: 1 } });
+    expect(line).toContain("1 note was not scanned");
+  });
+
+  it("keeps the line bounded when thousands of links are left behind", () => {
+    const leftBroken = Array.from({ length: 5000 }, (_, i) => ({
+      source: `notes/n${i}.md`,
+      target: "old.md",
+    }));
+    const line = docsRenameHonesty({ ...base, leftBroken });
+    expect(line).not.toBeNull();
+    expect((line ?? "").length).toBeLessThan(2000);
+    expect(line).toContain("5000");
+  });
+
+  it("names a failed rewrite even when the complete flag disagrees", () => {
+    const line = docsRenameHonesty({
+      ...base,
+      complete: true,
+      failed: [{ path: "x.md", error: "disk full" }],
+    });
+    expect(line).toContain("x.md");
+  });
+});
+
 describe("brokenLinksHonesty", () => {
   it("caps the displayed list and says so", () => {
     const links = Array.from({ length: 5 }, (_, i) => ({

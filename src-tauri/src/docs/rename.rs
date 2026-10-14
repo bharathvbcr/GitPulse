@@ -498,6 +498,55 @@ mod tests {
     }
 
     #[test]
+    fn adversarial_a_link_to_the_note_it_sits_in_stays_a_bare_file_name() {
+        assert_eq!(express_link("A.md", "notes", "notes/A.md").unwrap(), "A.md");
+        assert_eq!(
+            express_link("./A.md", "notes", "notes/Z.md").unwrap(),
+            "./Z.md"
+        );
+        assert_eq!(
+            express_link("/old/A.md", "x", "notes/Z.md").unwrap(),
+            "/notes/Z.md"
+        );
+    }
+
+    #[test]
+    fn adversarial_an_upper_case_extension_and_a_dotted_folder_are_read_correctly() {
+        // `.MD` counts as an extension; a `.md` inside a folder name does not.
+        assert_eq!(
+            express_link("Roadmap.MD", "docs", "docs/Plan.md").unwrap(),
+            "Plan.md"
+        );
+        assert_eq!(
+            express_link("Roadmap", "docs", "docs/v1.md/Plan.md").unwrap(),
+            "v1.md/Plan"
+        );
+        assert_eq!(
+            express_link("a..b/Roadmap.md", "docs", "docs/a..b/Plan.md").unwrap(),
+            "a..b/Plan.md"
+        );
+    }
+
+    #[test]
+    fn adversarial_characters_that_would_change_the_meaning_of_a_bare_destination() {
+        // `#` ends the path and starts an anchor, `?` starts a query, and a
+        // backslash is a separator to some readers. A bare link has to carry
+        // them as percent-escapes.
+        let wrong: Vec<(String, String)> = [
+            ("C#1.md", "C%231.md"),
+            ("q?.md", "q%3F.md"),
+            ("a\\b.md", "a%5Cb.md"),
+        ]
+        .into_iter()
+        .filter_map(|(name, want)| {
+            let got = express_link("x.md", "", name).unwrap();
+            (got != want).then(|| (name.to_string(), got))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "not escaped: {wrong:?}");
+    }
+
+    #[test]
     fn an_empty_destination_is_not_a_link_to_rewrite() {
         assert_eq!(express_link("", "docs", "a.md"), None);
         assert_eq!(express_link("<>", "docs", "a.md"), None);
