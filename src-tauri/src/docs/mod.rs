@@ -1635,3 +1635,6 @@ mod tests {
         assert_eq!(reported.skipped_unreadable, refreshed.skipped_unreadable);
     }
 }
+
+#[cfg(test)]
+mod rename_tests;
