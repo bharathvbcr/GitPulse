@@ -6,6 +6,7 @@
     disk,
     draft,
     busy = false,
+    unbased = false,
     onReload,
     onOverwrite,
   }: {
@@ -15,6 +16,8 @@
     /** The unsaved draft, as the textarea holds it (LF). */
     draft: string;
     busy?: boolean;
+    /** The draft has no recorded disk version, so a save cannot say whether the file changed. */
+    unbased?: boolean;
     onReload: () => void;
     onOverwrite: () => void;
   } = $props();
@@ -32,9 +35,14 @@
   data-testid="editor-conflict"
 >
   <div class="flex flex-wrap items-center gap-2">
-    <span class="font-semibold text-amber-300">Changed on disk</span>
+    <span class="font-semibold text-amber-300">{unbased ? "Version unknown" : "Changed on disk"}</span>
     <span class="min-w-0 flex-1 text-textMuted wrap-break-word">
-      {path} was changed after you started editing. Your draft is kept and nothing was written.
+      {#if unbased}
+        {path} has no recorded disk version, so a save cannot tell whether it changed.
+      {:else}
+        {path} was changed after you started editing.
+      {/if}
+      Your draft is kept and nothing was written.
     </span>
     <button type="button" class="gp-btn" disabled={busy} onclick={onReload}>Reload</button>
     <button type="button" class="gp-btn" disabled={busy} aria-pressed={comparing} onclick={() => (comparing = !comparing)}>

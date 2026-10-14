@@ -24,6 +24,13 @@ describe("EditorConflictBanner", () => {
     expect(render(EditorConflictBanner, { props }).body).not.toContain("editor-conflict-compare");
   });
 
+  it("says the version is unknown when the draft has no base", () => {
+    const { body } = render(EditorConflictBanner, { props: { ...props, unbased: true } });
+    expect(body).toContain("Version unknown");
+    expect(body).toContain("no recorded disk version");
+    expect(body).not.toContain("Changed on disk");
+  });
+
   it("disables every action while a save is in flight", () => {
     const { body } = render(EditorConflictBanner, { props: { ...props, busy: true } });
     expect(body.match(/disabled/g)?.length).toBe(3);

@@ -43,6 +43,37 @@ export function readFileWriteError(cause: unknown): FileWriteError | null {
   }
 }
 
+/**
+ * A save of a draft that has no recorded disk version. Saving it would mean
+ * guessing which version it was made from, and the blob on screen may already
+ * be a newer one, so the save is refused instead; only an explicit Overwrite
+ * writes it.
+ */
+export class UnbasedDraft extends Error {
+  constructor(path: string) {
+    super(`${path} has no recorded disk version, so a save cannot tell whether the file changed. Nothing was written.`);
+    this.name = "UnbasedDraft";
+  }
+}
+
+/**
+ * The base a save sends, or why it must not. An explicit `override` wins (it is
+ * Overwrite, naming the version it saw, or null for a confirmed unconditional
+ * write). A draft is judged against the version it was made from and never
+ * against the blob now on screen: falling back to that would accept a file an
+ * agent rewrote after the draft began. Only with no draft is the blob's own
+ * base the one to use.
+ */
+export function saveBase(
+  draft: { base: string | null } | undefined,
+  blobBase: string | null | undefined,
+  override?: string | null,
+): { base: string | null } | "unbased" {
+  if (override !== undefined) return { base: override };
+  if (draft) return draft.base === null ? "unbased" : { base: draft.base };
+  return { base: blobBase ?? null };
+}
+
 /** Every path the listing implies: each path given and each folder above one. */
 export function withAncestors(files: readonly string[]): Set<string> {
   const listed = new Set<string>();

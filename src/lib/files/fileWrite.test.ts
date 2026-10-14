@@ -3,6 +3,8 @@ import {
   FileWriteFailure,
   newPathProblem,
   readFileWriteError,
+  saveBase,
+  UnbasedDraft,
   withAncestors,
 } from "./fileWrite";
 import type { FileWriteError } from "./types";
@@ -67,5 +69,31 @@ describe("newPathProblem", () => {
 describe("withAncestors", () => {
   it("adds every folder above each path", () => {
     expect([...withAncestors(["a/b/c.ts", "d.ts"])].sort()).toEqual(["a", "a/b", "a/b/c.ts", "d.ts"]);
+  });
+});
+
+describe("saveBase", () => {
+  it("judges a draft by the version it was made from, not the blob on screen", () => {
+    expect(saveBase({ base: "3:old" }, "9:newer")).toEqual({ base: "3:old" });
+  });
+
+  it("fails closed for a draft with no base: it never borrows the blob's, which may be newer", () => {
+    expect(saveBase({ base: null }, "9:newer")).toBe("unbased");
+    expect(saveBase({ base: null }, null)).toBe("unbased");
+    expect(saveBase({ base: null }, undefined)).toBe("unbased");
+  });
+
+  it("lets only an explicit override write an unbased draft, or name the version Overwrite saw", () => {
+    expect(saveBase({ base: null }, "9:newer", null)).toEqual({ base: null });
+    expect(saveBase({ base: "3:old" }, "9:newer", "9:newer")).toEqual({ base: "9:newer" });
+  });
+
+  it("uses the blob's own base only when there is no draft", () => {
+    expect(saveBase(undefined, "9:newer")).toEqual({ base: "9:newer" });
+    expect(saveBase(undefined, undefined)).toEqual({ base: null });
+  });
+
+  it("says what was refused", () => {
+    expect(new UnbasedDraft("a.ts").message).toMatch(/a\.ts.*Nothing was written/);
   });
 });

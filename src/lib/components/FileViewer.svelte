@@ -57,7 +57,7 @@
   import { openInDefaultApp } from "../desktop/openInShell";
   import type { Guarded } from "../stores/harnessStore";
   import type { SavedFile } from "../files/types";
-  import { readFileWriteError } from "../files/fileWrite";
+  import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
   import FileTreePanel from "./files/FileTreePanel.svelte";
   import MediaViewer from "./files/MediaViewer.svelte";
@@ -112,7 +112,7 @@
   let viewerLease: LatestOwnerLease | null = null;
 
   /** The disk version a refused save saw, for the file it was refused on. */
-  let saveRefusal = $state<{ path: string; actual: string } | null>(null);
+  let saveRefusal = $state<{ path: string; actual: string | null } | null>(null);
 
   let openTabs = $derived(tabState.tabs);
   let activeTabPath = $derived(tabState.active);
@@ -323,6 +323,9 @@
       if (typed?.code === "changed_on_disk") {
         saveRefusal = { path, actual: typed.actual };
         void loadFileContent(path);
+      } else if (err instanceof UnbasedDraft) {
+        // No version to judge by: the banner offers Overwrite as the way out.
+        saveRefusal = { path, actual: null };
       }
       throw err;
     }
@@ -334,6 +337,19 @@
     const draft = activeDraft;
     const conflict = activeConflict;
     if (!path || !draft || !conflict) return;
+    // With no version on record the write is unconditional, so it is asked for.
+    if (
+      conflict.actual === null &&
+      !(await askConfirm({
+        title: "Overwrite Without a Known Version?",
+        message: `${path} has no recorded disk version. Saving will replace whatever is on disk, including changes made since you started editing.`,
+        confirmLabel: "Overwrite",
+        cancelLabel: "Keep Editing",
+        destructive: true,
+      }))
+    ) {
+      return;
+    }
     try {
       await saveDraft(path, draft.content, conflict.actual);
     } catch (err: unknown) {
@@ -413,11 +429,13 @@
       if ($repoStore.currentPath !== repo) {
         throw new Error("Repository changed before save; the editor draft was kept");
       }
-      const expectedBase =
-        overrideBase !== undefined
-          ? overrideBase
-          : tabCache.get(repo)?.tabs.drafts[path]?.base ??
-            (activeBlob?.path === path ? activeBlob.disk_base ?? null : null);
+      const judged = saveBase(
+        tabCache.get(repo)?.tabs.drafts[path],
+        activeBlob?.path === path ? activeBlob.disk_base : null,
+        overrideBase,
+      );
+      if (judged === "unbased") throw new UnbasedDraft(path);
+      const expectedBase = judged.base;
       const saved = await invoke<Guarded<SavedFile>>("cmd_write_file_content", {
         repoPath: repo,
         filePath: path,
@@ -928,6 +946,7 @@
           {#if activeConflict && activeDraft}
             <EditorConflictBanner
               path={activeTabPath}
+              unbased={activeConflict.actual === null}
               disk={activeBlob.text ?? ""}
               draft={activeDraft.content}
               onReload={() => void reloadFromDisk()}

@@ -222,8 +222,10 @@ describe("FileViewer", () => {
       source.indexOf("function openInDefaultApp"),
     );
     expect(save).toContain("expectedBase,");
-    expect(save).toContain("tabCache.get(repo)?.tabs.drafts[path]?.base");
-    expect(save).toContain("overrideBase !== undefined");
+    expect(save).toContain("tabCache.get(repo)?.tabs.drafts[path]");
+    expect(save).toContain("saveBase(");
+    expect(save).toContain('judged === "unbased"');
+    expect(save).toContain("overrideBase,");
     expect(source).toContain("disk_base: savedBase");
     // The first dirtying keystroke is what records the base.
     expect(source).toContain("updateEditorDraft(tabState, path, newContent, sourceContent, base)");
