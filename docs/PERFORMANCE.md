@@ -1099,35 +1099,85 @@ continuously costs the daemon one event per write).
 `%G?` runs the user's signing program for every signed commit it prints. The
 pulse walk carried it, so its cost was the number of signed commits times the
 verifier (10 s for one PGP commit, measured). The walk now reads whether each
-commit carries a signature from the commit objects, in one
-`git cat-file --batch`, and starts no verifier; the selected commit is verified
-alone by `cmd_verify_commit_signature` (30 s limit, cached for 60 s against the
-config files, the allowed-signers and revocation files and the keyring).
-Commit details keep `git_processes = 1`.
+commit carries a signature from the commit objects and starts no verifier; the
+selected commit is verified alone by `cmd_verify_commit_signature` (30 s limit,
+cached for 60 s against the config files, every file the config includes, the
+allowed-signers and revocation files and the keyring, and coalesced so two
+selects of one commit start one signing program). Commit details keep
+`git_processes = 1`.
 
-`pulse signed N` rows in `command_timings`: three chains of 500 hand-written
-commits carrying 0, 50 and 500 signature headers, and a stand-in signing
-program that counts its calls and sleeps 20 ms per call. A is the base commit
-`8026dd7e` with the same bench file (`GITPULSE_BENCH_ALLOW_VERIFIER=1`, which
-the bench otherwise refuses without); B is this change. Runs were B, A, B, A,
-N = 5 each, min-of-N, on a host at load 27 to 63 on 18 CPUs (so absolute times
-are inflated):
+### How the walk reads signatures
 
-| row | A min (run 1 / 2) | B min (run 1 / 2) | A verifier calls | B verifier calls | A / B git processes |
+Git has no placeholder for "is signed" that does not also verify, so the header
+is read from the object. A first version fed the log's ids to one
+`git cat-file --batch` after the log; that put a whole extra process on the
+critical path (the adversarial pass measured +31 to +34 ms, about +90%, on the unsigned 5,000-commit walk). The walk now runs
+`git rev-list --header` over the same refs **beside** the log, on its own
+thread under the caller's admission class, and parses its stream as it arrives
+(`ProcessObserver::drains_stdout`: each chunk is dropped once the parser has
+seen it, the byte cap still counts it). Per commit only the id and the
+signature kind are kept; per record only the id line and the header run the
+classifier reads (256 KiB at most). `--pretty=raw` would skip `--use-mailmap`,
+so the log keeps its own format. A commit the stream does not hold (output cut
+at its 32 MiB budget, git failed or timed out, refs moved between the two
+reads) is `unknown`, never `none`.
+
+### A/B
+
+Release builds, `command_timings` rows, N = 5, min-of-N, on a loaded host (load
+15 to 33 on 18 CPUs; absolute times are inflated, ratios are the figure). A is
+the base commit `8026dd7e` with the same bench file
+(`GITPULSE_BENCH_ALLOW_VERIFIER=1`, which the bench otherwise refuses without,
+because a walk that starts the signing program at all would be timed as the
+verifier). B is this change. Runs were B, A, B, A (columns are run 1 / run 2).
+
+| row | A min | B min | B vs A (min of both runs) | verifier calls A / B | git processes A / B |
 | --- | --- | --- | --- | --- | --- |
-| pulse signed 0 | 32.2 ms / 28.6 ms | 93.5 ms / 103.7 ms | 0 | 0 | 1 / 2 |
-| pulse signed 50 | 2.31 s / 2.73 s | 75.0 ms / 108.2 ms | 50 | 0 | 1 / 2 |
-| pulse signed 500 | 25.08 s / 29.46 s | 75.1 ms / 121.1 ms | 500 | 0 | 1 / 2 |
+| pulse unsigned 500 | 7.82 / 9.49 ms | 10.96 / 10.91 ms | +3.1 ms (+40%) | 0 / 0 | 1 / 2 |
+| pulse unsigned 5,000 | 28.16 / 29.26 ms | 32.46 / 29.50 ms | +1.3 ms (+4.8%) | 0 / 0 | 1 / 2 |
+| pulse unsigned 25,000 | 119.74 / 132.26 ms | 120.62 / 118.21 ms | -1.5 ms (-1.3%) | 0 / 0 | 1 / 2 |
+| pulse signed 0 | 25.13 / 31.21 ms | 25.57 / 41.75 ms | +0.4 ms (+1.8%) | 0 / 0 | 1 / 2 |
+| pulse signed 50 | 2.06 / 2.20 s | 29.43 / 32.04 ms | 70x faster | 50 / 0 | 1 / 2 |
+| pulse signed 500 | 21.06 / 22.72 s | 28.15 / 46.84 ms | 750x faster | 500 / 0 | 1 / 2 |
 
-A grows with the signed count (about 50 ms per signed commit with the 20 ms
-stand-in, process start-up included); B does not depend on it. The unsigned
-chain is slower in B by about 60 to 70 ms in these runs: it pays one more
-process (the batch read of 500 commits) and a raw `git cat-file --batch` of 500
-commits takes 10 to 20 ms here, so most of the difference is process start-up
-under load, not git's work. That row's time is not a clean number on this host;
-re-take it on a quiet one before reading it as a cost. The three rows are added
-to the baseline (B run 1); no existing row was reseeded.
+A grows with the signed count (about 40 ms per signed commit with the 20 ms
+stand-in verifier, process start-up included); B does not depend on it.
+`commit details` is unchanged (A 139 / 129 us, B 175 / 135 us, 1 process each,
+loaded-host noise).
 
-DORA: `--since-as-filter` walks past the first old committer date instead of
-stopping there, so the scan reads commits plain `--since` skipped. On git
-older than 2.37 the scan is count-bounded (`-n cap+1`, window applied here).
+**The unsigned rows are within 5% of A at 5,000 and 25,000 commits and at 0
+signed, and not at 500.** The 500-commit walk takes 8 ms, and the extra
+`rev-list` child costs about 3 ms of process start-up and gate admission that
+the walk cannot hide behind a log that short (+3.1 ms, +40%). Above 5,000
+commits the log is long enough to cover it. It is a fixed cost per walk, not a
+per-commit one (5,000 commits: +1.3 ms; 25,000: none), it is paid concurrently
+with the log rather than after it, and removing it means not reading signatures
+at all, which the Signed card needs. Accepted. (The first version, a batch read
+after the log, was measured at +31 to +34 ms at 5,000 commits by the adversarial pass.)
+
+### Memory
+
+`peak_rss_mb` is this process's high-water mark, so it is read from
+`GITPULSE_BENCH_ONLY="pulse unsigned 25000"` runs that did nothing else
+(a 500-commit row in the same harness peaks at 12.3 to 13.1 MB, the harness
+baseline). 25,000 commits, two runs each: A 76.1 / 70.3 MB, B 70.7 / 78.0 MB.
+B is within the run-to-run spread of A. The parser keeps an id and a kind per
+commit and one bounded record, and a test feeds it 16 MiB of message and
+asserts the record buffer stays under 257 KiB; the earlier version that
+buffered the whole `rev-list --header` text was measured at about 87 MB against 46 MB for A by the adversarial pass (not re-measured here)
+in that harness. The figure includes the harness's own fixture (the import stream, the
+count pass), which is why it is far above the 12 MB baseline for both builds;
+git's own memory is not in it.
+
+### DORA
+
+`--since-as-filter` walks past the first old committer date instead of stopping
+there, so the scan reads commits plain `--since` skipped. **On a dormant
+repository the filter walks the whole history to find nothing:** with an empty
+window and 25,000 commits the adversarial pass measured about 60 ms where plain `--since` costs
+about 10 ms. That is bounded by the 60 s DORA deadline and by the history size,
+and is the price of not losing the in-window commits behind one inverted date.
+On git older than 2.37 the scan is count-bounded (`-n cap+1`, window applied
+here); a row past the cap is reported as a possibly cut window, because without
+a date bound nothing says the window does not continue behind it, and the
+window's true size is not claimed.

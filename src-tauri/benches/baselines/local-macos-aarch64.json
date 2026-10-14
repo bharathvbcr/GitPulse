@@ -91,7 +91,7 @@
         "pulse signed 0": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 93469750,
+          "min_ns": 25565458,
           "counters": {
             "commits": 500,
             "git_processes": 2,
@@ -101,7 +101,7 @@
         "pulse signed 50": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 74997041,
+          "min_ns": 29432917,
           "counters": {
             "commits": 500,
             "git_processes": 2,
@@ -111,11 +111,38 @@
         "pulse signed 500": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 75072541,
+          "min_ns": 28154875,
           "counters": {
             "commits": 500,
             "git_processes": 2,
             "verifier_spawns": 0
+          }
+        },
+        "pulse unsigned 25000": {
+          "n": 5,
+          "time_gated": true,
+          "min_ns": 120618042,
+          "counters": {
+            "commits": 25000,
+            "git_processes": 2
+          }
+        },
+        "pulse unsigned 500": {
+          "n": 5,
+          "time_gated": true,
+          "min_ns": 10964083,
+          "counters": {
+            "commits": 500,
+            "git_processes": 2
+          }
+        },
+        "pulse unsigned 5000": {
+          "n": 5,
+          "time_gated": true,
+          "min_ns": 32464500,
+          "counters": {
+            "commits": 5000,
+            "git_processes": 2
           }
         }
       }
