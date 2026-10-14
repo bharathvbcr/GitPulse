@@ -20,6 +20,7 @@ mod common;
 
 use common::fixture::{build_repo, count_git_processes, dirty_files, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
+use gitpulse_lib::engine::git_cli::sandbox_write_edited_text;
 use gitpulse_lib::engine::git_reader::GitReader;
 
 struct Shape {
@@ -104,6 +105,52 @@ fn main() {
             })
         })
         .collect();
+
+    // Opening a file and saving it are the two reads of a file's bytes the
+    // editor pays for, and both now also hash those bytes (the base token a
+    // save is judged against). `get_file_blob` reads the working-tree file and
+    // `sandbox_write_edited_text` re-reads it inside the save's entry
+    // transaction; each sample of the save row alternates between two texts of
+    // the same size so the publish is real, never the identical-bytes no-op.
+    let blob_repo = build_repo(
+        &temp.path().join("blobs"),
+        &Spec {
+            files: 10,
+            dirs: 2,
+            extra_commits: 0,
+            touch: 0,
+            linked_worktrees: 0,
+        },
+    );
+    let blob_root = blob_repo.path().to_string();
+    for (label, bytes) in [("1 KB", 1 << 10), ("1 MB", 1 << 20), ("8 MB", 8 << 20)] {
+        let line = "the quick brown fox jumps over the lazy dog 0123456789\n";
+        let text: String = line.repeat(bytes / line.len() + 1)[..bytes].to_string();
+        let name = format!("blob-{bytes}.txt");
+        std::fs::write(std::path::Path::new(&blob_root).join(&name), &text).expect("write blob");
+        let read_root = blob_root.clone();
+        let read_name = name.clone();
+        cases.push(Case::new(format!("get_file_blob {label}"), move || {
+            let blob = GitReader::get_file_blob(&read_root, &read_name, None).expect("blob");
+            let length = blob.text.as_ref().map_or(0, |t| t.len()) as u64;
+            std::hint::black_box(&blob);
+            Sample::default().counter("bytes", length)
+        }));
+        let save_root = blob_root.clone();
+        let (even, odd) = (text.clone(), format!("X{}", &text[1..]));
+        let mut turn = false;
+        cases.push(Case::new(format!("save_edited_text {label}"), move || {
+            turn = !turn;
+            let content = if turn { &odd } else { &even };
+            sandbox_write_edited_text(&save_root, &name, content).expect("save");
+            Sample::default().counter("bytes", content.len() as u64)
+        }));
+    }
+    report.note(
+        "get_file_blob / save_edited_text: one text file of 1 KB, 1 MB and 8 MB in a clean 10-file \
+         repository; the save alternates two same-size texts"
+            .to_string(),
+    );
 
     // The transcript pass reads agent history into the ledger, so it sits with
     // the other reads of what a repository already holds. Two corpora: many

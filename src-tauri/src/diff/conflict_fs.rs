@@ -536,24 +536,54 @@ pub(super) fn replace(
 }
 
 /// A version of a file's content, small enough to carry in an editor draft and
-/// compare on save: `"<len>:<fnv1a64 hex>"` of the raw bytes, or `"absent"`
+/// compare on save: `"<len>:<digest hex>"` of the raw bytes, or `"absent"`
 /// for a path with no file.
 ///
 /// Content rather than mtime and size on purpose. The editor's textarea hands
 /// back LF text while the save re-adds CRLF, so only the backend can say what
 /// the bytes on disk are; and a timestamp misses a same-size rewrite inside
-/// one tick while reporting a conflict for a bare `touch`. FNV is not a
+/// one tick while reporting a conflict for a bare `touch`. The digest is not a
 /// security boundary: this guards against a lost update, and a 2^-64 collision
 /// is the same risk as the write racing in just after the check.
 pub(crate) fn content_token(bytes: Option<&[u8]>) -> String {
     match bytes {
         None => "absent".into(),
-        Some(bytes) => format!(
-            "{}:{:016x}",
-            bytes.len(),
-            crate::ledger::ids::fnv1a64(bytes)
-        ),
+        Some(bytes) => format!("{}:{:016x}", bytes.len(), digest(bytes)),
     }
+}
+
+/// A 64-bit digest of `bytes`, fast enough to run over every file the editor
+/// opens or saves (8 MiB at most).
+///
+/// FNV-1a was the first choice and cost more than reading the file: its one
+/// multiply per byte is a serial dependency chain, so an 8 MiB open took
+/// about 2.3x as long. This takes a word at a time on four independent lanes,
+/// which lets the multiplies overlap, and folds the lanes, the tail bytes and
+/// the length at the end. Tokens are compared within one running app against
+/// bytes it just read, never stored, so the function may change.
+fn digest(bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lanes: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x8422_2325_cbf2_9ce4,
+        0x1000_0000_01b3_0001,
+        0x0001_0000_0000_01b3,
+    ];
+    let mut blocks = bytes.chunks_exact(32);
+    for block in &mut blocks {
+        for (lane, word) in lanes.iter_mut().zip(block.chunks_exact(8)) {
+            let word = u64::from_le_bytes(word.try_into().expect("an 8-byte chunk"));
+            *lane = (*lane ^ word).wrapping_mul(PRIME).rotate_left(29);
+        }
+    }
+    let mut hash = bytes.len() as u64;
+    for lane in lanes {
+        hash = (hash ^ lane).wrapping_mul(PRIME).rotate_left(31);
+    }
+    for byte in blocks.remainder() {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
+    }
+    hash ^ (hash >> 32)
 }
 
 /// What a write requires of the entry it replaces.
@@ -770,7 +800,8 @@ mod write_tests {
         let (_root, root) = dir();
         let target = root.join("a/b/.gitkeep");
         let token = write_regular_expecting(&target, Expect::Absent, |_| Ok(Vec::new())).unwrap();
-        assert_eq!(token, "0:cbf29ce484222325");
+        assert_eq!(token, content_token(Some(b"")));
+        assert_ne!(token, "absent");
         assert_eq!(std::fs::read(&target).unwrap(), b"");
     }
 
@@ -834,6 +865,45 @@ mod write_tests {
             })
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"theirs, longer\n");
+    }
+
+    #[test]
+    fn the_token_tells_apart_every_single_byte_edit_swap_and_length() {
+        // Sizes straddle the 32-byte block and the tail, so each path of the
+        // digest is exercised; a base is only worth sending if one changed
+        // byte, a swapped pair or a changed length always changes it.
+        for size in [0usize, 1, 7, 31, 32, 33, 64, 100, 4096] {
+            let base: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+            let token = content_token(Some(&base));
+            assert_eq!(
+                token,
+                content_token(Some(&base.clone())),
+                "stable at {size}"
+            );
+            for at in 0..size {
+                let mut flipped = base.clone();
+                flipped[at] ^= 1;
+                assert_ne!(token, content_token(Some(&flipped)), "flip {at} of {size}");
+            }
+            let mut longer = base.clone();
+            longer.push(0);
+            assert_ne!(token, content_token(Some(&longer)), "length at {size}");
+        }
+        let (a, b) = (b"AAAAAAAABBBBBBBB".to_vec(), b"BBBBBBBBAAAAAAAA".to_vec());
+        assert_ne!(
+            content_token(Some(&a)),
+            content_token(Some(&b)),
+            "swapped words"
+        );
+        let (a, b) = (
+            [&[0u8; 32][..], &[1u8; 32][..]].concat(),
+            [&[1u8; 32][..], &[0u8; 32][..]].concat(),
+        );
+        assert_ne!(
+            content_token(Some(&a)),
+            content_token(Some(&b)),
+            "swapped blocks"
+        );
     }
 
     #[test]
