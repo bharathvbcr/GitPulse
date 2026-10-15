@@ -210,6 +210,21 @@ impl RefStamp {
     }
 }
 
+/// The state of the files a ref listing over some namespaces is a function of,
+/// for a caller that coalesces concurrent asks itself and needs to know
+/// whether anything moved between two of them. Opaque: the only operation is
+/// equality, and a stamp is returned whether or not it has settled, because a
+/// caller comparing two reads is not storing an answer under it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stamp(RefStamp);
+
+/// [`Stamp`] of `namespaces`; `None` when the walk cannot describe the state
+/// (a symlink, an unreadable entry, too many refs), which is never equal to
+/// anything.
+pub(crate) fn stamp(repo: &Path, namespaces: &[&str]) -> Option<Stamp> {
+    RefStamp::read(repo, namespaces).map(Stamp)
+}
+
 #[derive(Default)]
 struct Walk {
     entries: Vec<(PathBuf, Option<FileIdentity>)>,

@@ -961,7 +961,7 @@ pub enum ScanDepth {
     /// Adds the dirty-file count (`git status`) for each scanned worktree.
     Dirty,
     /// Adds diff stats (a `git diff` only where status found changes),
-    /// divergence from main/master, and portless routes.
+    /// divergence from the default branch, and portless routes.
     Full,
 }
 
@@ -996,70 +996,37 @@ pub fn parse_shortstat(text: &str) -> Option<WorktreeDiffStat> {
     Some(stat)
 }
 
-/// Measures commit divergence (ahead/behind count) compared to default branch (`main` or `master`).
+/// The repository's default base as (short name, commit oid): `None` when no
+/// candidate resolves, `Err` when the lookup itself could not be answered.
+/// The one owner is [`crate::engine::git_reader::default_base`], the same
+/// answer the branch list measures against.
+type BaseRead = Result<Option<(String, String)>, String>;
+
+fn read_base(repo: &Path) -> BaseRead {
+    crate::engine::git_reader::default_base(repo)
+        .checked()
+        .map(|resolved| resolved.base)
+}
+
+/// Measures commit divergence (ahead/behind count) of `branch` from the
+/// repository's default branch, whatever it is named.
 pub fn measure_main_divergence(repo: &Path, branch: Option<&str>) -> Option<WorktreeDivergence> {
     let b = branch?;
-    if is_main_name(b) {
+    let (name, oid) = read_base(repo).ok()??;
+    if b == name {
         return Some(WorktreeDivergence::default());
     }
-    divergence_from(repo, &main_ref(repo), b)
+    divergence_from(repo, &oid, b)
 }
 
-fn is_main_name(branch: &str) -> bool {
-    branch == "main" || branch == "master"
-}
-
-/// Which of `main` / `master` a repository's divergence is measured from.
-/// One answer per listing: it is a property of the repository, and asking it
-/// once per worktree cost two processes a worktree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MainRef {
-    Found(&'static str),
-    Absent,
-    /// The lookup itself failed; carries why, so a scan can say so rather
-    /// than reading "no main branch".
-    Unread(String),
-}
-
-fn main_ref(repo: &Path) -> MainRef {
-    let listed = crate::engine::ref_cache::git_text(
-        repo,
-        &["refs/heads"],
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads/main",
-            "refs/heads/master",
-        ],
-    );
-    match listed {
-        // The patterns also match `refs/heads/main/<x>`, so only an exact
-        // line names the branch itself.
-        Ok(text) => {
-            let has = |name: &str| text.lines().any(|line| line == name);
-            if has("refs/heads/main") {
-                MainRef::Found("main")
-            } else if has("refs/heads/master") {
-                MainRef::Found("master")
-            } else {
-                MainRef::Absent
-            }
-        }
-        Err(reason) => MainRef::Unread(reason),
-    }
-}
-
-fn divergence_from(repo: &Path, main: &MainRef, b: &str) -> Option<WorktreeDivergence> {
-    let MainRef::Found(default_ref) = main else {
-        return None;
-    };
+fn divergence_from(repo: &Path, base_oid: &str, b: &str) -> Option<WorktreeDivergence> {
     let stdout = git_text(
         repo,
         &[
             "rev-list",
             "--left-right",
             "--count",
-            &format!("{default_ref}...{b}"),
+            &format!("{base_oid}...{b}"),
         ],
     )
     .ok()?;
@@ -1069,10 +1036,10 @@ fn divergence_from(repo: &Path, main: &MainRef, b: &str) -> Option<WorktreeDiver
     Some(WorktreeDivergence { ahead, behind })
 }
 
-/// What a listing measures divergence against: main/master, and every scanned
-/// branch's counts from one `for-each-ref` when that could be read.
+/// What a listing measures divergence against: the default base, and every
+/// scanned branch's counts from one `for-each-ref` when that could be read.
 struct Base {
-    main: MainRef,
+    default: BaseRead,
     /// `None` when the batch was not asked or did not answer; each worktree
     /// then measures itself, as it always did.
     batch: Option<HashMap<String, WorktreeDivergence>>,
@@ -1081,32 +1048,29 @@ struct Base {
 impl Base {
     fn none() -> Self {
         Self {
-            main: MainRef::Absent,
+            default: Ok(None),
             batch: None,
         }
     }
 }
 
-/// Every branch's divergence from main in one `for-each-ref`, where the scan
-/// used to run one `rev-list` per worktree. The `ahead-behind` atom needs git
-/// 2.42; an older git, or any other failure, answers `None` and each worktree
-/// falls back to its own `rev-list`.
+/// Every branch's divergence from the base commit `base_oid` in one
+/// `for-each-ref`, where the scan used to run one `rev-list` per worktree. The
+/// `ahead-behind` atom needs git 2.42; an older git, or any other failure,
+/// answers `None` and each worktree falls back to its own `rev-list`.
 ///
-/// A pattern matches its whole namespace (`refs/heads/main` also selects
-/// `refs/heads/main/x`), so a row counts only when its refname is exactly a
+/// A pattern matches its whole namespace (`refs/heads/x` also selects
+/// `refs/heads/x/y`), so a row counts only when its refname is exactly a
 /// branch that was asked for.
 fn batch_divergence(
     repo: &Path,
-    main: &MainRef,
+    base_oid: &str,
     branches: &[&str],
 ) -> Option<HashMap<String, WorktreeDivergence>> {
-    let MainRef::Found(main_name) = main else {
-        return None;
-    };
     if branches.is_empty() {
         return Some(HashMap::new());
     }
-    let format = format!("--format=%(refname)%00%(ahead-behind:refs/heads/{main_name})");
+    let format = format!("--format=%(refname)%00%(ahead-behind:{base_oid})");
     let patterns: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
     let mut args = vec!["for-each-ref", format.as_str()];
     args.extend(patterns.iter().map(String::as_str));
@@ -1362,22 +1326,22 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
     let class = crate::engine::git_cli::current_admission();
     // Asked once for the whole listing, and only when some scanned branch
     // is measured against it.
-    let needs_main = depth == ScanDepth::Full
-        && scan_targets.iter().any(|&idx| {
-            parsed[idx]
-                .branch
-                .as_deref()
-                .is_some_and(|branch| !is_main_name(branch))
-        });
-    let base = if needs_main {
-        let main = main_ref(&repo);
-        let branches: Vec<&str> = scan_targets
-            .iter()
-            .filter_map(|&idx| parsed[idx].branch.as_deref())
-            .filter(|branch| !is_main_name(branch))
-            .collect();
-        let batch = batch_divergence(&repo, &main, &branches);
-        Base { main, batch }
+    let needs_base =
+        depth == ScanDepth::Full && scan_targets.iter().any(|&idx| parsed[idx].branch.is_some());
+    let base = if needs_base {
+        let default = read_base(&repo);
+        let batch = match &default {
+            Ok(Some((name, oid))) => {
+                let branches: Vec<&str> = scan_targets
+                    .iter()
+                    .filter_map(|&idx| parsed[idx].branch.as_deref())
+                    .filter(|branch| branch != name)
+                    .collect();
+                batch_divergence(&repo, oid, &branches)
+            }
+            _ => None,
+        };
+        Base { default, batch }
     } else {
         Base::none()
     };
@@ -1635,14 +1599,17 @@ fn scan_worktree(
     }
     let branch = entry.branch.as_deref();
     let divergence = branch.and_then(|b| {
-        if is_main_name(b) {
+        let Ok(Some((name, oid))) = &base.default else {
+            return None;
+        };
+        if b == name {
             Some(WorktreeDivergence::default())
         } else if let Some(batch) = &base.batch {
             // A branch the batch did not list is not a ref (unborn), which
             // its own `rev-list` could not measure either.
             batch.get(b).cloned()
         } else {
-            divergence_from(repo, &base.main, b)
+            divergence_from(repo, oid, b)
         }
     });
     let mut scan = WorktreeScan {
@@ -1662,12 +1629,11 @@ fn scan_worktree(
         status_read,
         cut: false,
     };
-    // The listing's one main/master lookup failed outside this scan's
-    // failure window, so it is named here or not at all.
-    if let (MainRef::Unread(reason), Some(b)) = (&base.main, branch) {
-        if !is_main_name(b) {
-            scan.note = Some(format!("some measurements were not taken: {reason}"));
-        }
+    // The listing's one default-branch lookup failed outside this scan's
+    // failure window, so it is named here or not at all. Without the base no
+    // branch is known to be it, so every branch's divergence is unmeasured.
+    if let (Err(reason), Some(_)) = (&base.default, branch) {
+        scan.note = Some(format!("some measurements were not taken: {reason}"));
     }
     if crate::engine::git_cli::process_failures() != failures {
         scan.note = Some(format!(
@@ -1972,7 +1938,7 @@ const MAX_REMOVE_ATTEMPTS: usize = 3;
 const REMOVE_BACKOFF: [Duration; MAX_REMOVE_ATTEMPTS - 1] =
     [Duration::from_millis(100), Duration::from_millis(300)];
 
-/// Merges a worktree branch into target_branch (defaulting to main/master) in the primary
+/// Merges a worktree branch into target_branch (defaulting to the repository's default branch) in the primary
 /// repository checkout, tears down the worktree cleanly, and prunes the merged branch.
 ///
 /// `gate` is asked about each git command before it runs, with git's
@@ -2096,14 +2062,28 @@ fn merge_and_teardown_with_seams(
         );
     }
 
-    let default_target = if git_text(&repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
-        "main"
-    } else if git_text(&repo, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
-        "master"
-    } else {
-        "main"
+    // No target means the repository's default branch. This action destroys
+    // the lane, so the default is read uncached: a memoized answer from before
+    // the read started failing, or before the default moved, must not decide
+    // where the merge lands. An unreadable or absent default refuses; nothing
+    // here guesses a branch name. Every check below still runs on the result.
+    let resolved_default;
+    let target = match target_branch {
+        Some(target) => target,
+        None => {
+            let default = crate::engine::git_reader::compute_default_base(&repo)
+                .checked()
+                .map_err(|reason| {
+                    format!("The default branch could not be read: {reason}. Nothing was merged.")
+                })?;
+            let (name, _) = default.base.ok_or_else(|| {
+                "No default branch could be resolved; name a target branch. Nothing was merged."
+                    .to_string()
+            })?;
+            resolved_default = name;
+            resolved_default.as_str()
+        }
     };
-    let target = target_branch.unwrap_or(default_target);
     validate_ref_name(target)?;
 
     // The merge runs in the main checkout, onto whatever it has checked out.
@@ -5830,7 +5810,7 @@ some-future-field whatever
             .count()
     }
 
-    /// The main/master lookup is a property of the repository: one per
+    /// The default-base lookup is a property of the repository: one per
     /// listing, not two processes for every worktree.
     #[test]
     fn a_full_listing_looks_up_main_once_whatever_the_worktree_count() {
@@ -5846,9 +5826,11 @@ some-future-field whatever
             0,
             "per-worktree divergence walks"
         );
-        assert_eq!(
-            spawned_with(std::slice::from_ref(&root), "refs/heads/main"),
-            1
+        // The one lookup is the default base's: the remote HEAD symref is
+        // what every computation of it starts with (git_reader's marker).
+        assert!(
+            spawned_with(std::slice::from_ref(&root), "refs/remotes/origin/HEAD") <= 1,
+            "more than one default-base lookup"
         );
         // And what it measures is what git measures.
         for info in &listed[1..] {
@@ -5885,9 +5867,12 @@ some-future-field whatever
             git_in(&linked[1], &["commit", "-q", "-m", &format!("w{n}")]);
         }
         let batched = list_worktrees(root.to_str().unwrap()).expect("list");
-        let format = "--format=%(refname)%00%(ahead-behind:refs/heads/main)";
+        let format = format!(
+            "--format=%(refname)%00%(ahead-behind:{})",
+            rev(&root, "main")
+        );
         let before = spawned_with(std::slice::from_ref(&root), "rev-list");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(format, || {
+        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -5910,7 +5895,9 @@ some-future-field whatever
     }
 
     /// `refs/heads/main/x` is matched by the `refs/heads/main` pattern but is
-    /// not a branch named main; master is the base then.
+    /// not a branch named main; master is the base then, and `trunk` once
+    /// master is renamed. (Re-homed from the deleted `main_ref`: the exact-name
+    /// rule now lives in the default base the worktree listing reads.)
     #[test]
     fn main_is_an_exact_branch_name_not_a_prefix() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5918,13 +5905,18 @@ some-future-field whatever
         git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
         git_in(dir.path(), &["branch", "main/feature"]);
         let root = plain(dir.path());
-        assert_eq!(main_ref(&root), MainRef::Found("master"));
+        let named = |repo: &Path| {
+            crate::engine::git_reader::compute_default_base(repo)
+                .base
+                .map(|(name, _)| name)
+        };
+        assert_eq!(named(&root).as_deref(), Some("master"));
         git_in(dir.path(), &["branch", "-q", "-m", "master", "trunk"]);
-        assert_eq!(main_ref(&root), MainRef::Absent);
+        assert_eq!(named(&root).as_deref(), Some("trunk"));
     }
 
     /// A lookup that could not run is named on every worktree it would have
-    /// measured, not read as "no main branch".
+    /// measured, not read as "no default branch".
     #[test]
     fn a_failed_main_lookup_is_named_on_the_worktrees_it_left_unmeasured() {
         let (main, _parent, _linked) = repo_with_worktrees(2);
@@ -5933,7 +5925,12 @@ some-future-field whatever
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
-        assert_eq!(listed[0].scan_note, None, "main itself needs no lookup");
+        // Without the base no branch is known to be it, so the primary
+        // checkout is unmeasured too and says why (it used to be exempt as
+        // "main itself", a name this no longer assumes).
+        assert_eq!(listed[0].main_divergence, None);
+        let primary = listed[0].scan_note.as_deref().unwrap_or_default();
+        assert!(primary.contains("forced by test"), "{primary}");
         for info in &listed[1..] {
             assert_eq!(info.main_divergence, None);
             let note = info.scan_note.as_deref().unwrap_or_default();
