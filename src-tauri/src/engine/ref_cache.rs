@@ -210,6 +210,21 @@ impl RefStamp {
     }
 }
 
+/// The state of the files a ref listing over some namespaces is a function of,
+/// for a caller that coalesces concurrent asks itself and needs to know
+/// whether anything moved between two of them. Opaque: the only operation is
+/// equality, and a stamp is returned whether or not it has settled, because a
+/// caller comparing two reads is not storing an answer under it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stamp(RefStamp);
+
+/// [`Stamp`] of `namespaces`; `None` when the walk cannot describe the state
+/// (a symlink, an unreadable entry, too many refs), which is never equal to
+/// anything.
+pub(crate) fn stamp(repo: &Path, namespaces: &[&str]) -> Option<Stamp> {
+    RefStamp::read(repo, namespaces).map(Stamp)
+}
+
 #[derive(Default)]
 struct Walk {
     entries: Vec<(PathBuf, Option<FileIdentity>)>,
@@ -334,12 +349,29 @@ pub(crate) fn through(
     args: &[&str],
     run: impl FnOnce() -> Result<(String, bool), String>,
 ) -> Result<String, String> {
+    through_stamped(repo, args, stamp(repo, namespaces).as_ref(), run)
+}
+
+/// [`through`] with the stamp the caller already read for `namespaces`, so a
+/// caller that compares stamps itself (single-flight coalescing) reads the
+/// files once per call, not twice. `None` is a stamp that could not be read,
+/// as in [`stamp`]: the answer is computed and not kept. Settledness is
+/// judged here, so the clock is still read in one place.
+pub(crate) fn through_stamped(
+    repo: &Path,
+    args: &[&str],
+    stamp: Option<&Stamp>,
+    run: impl FnOnce() -> Result<(String, bool), String>,
+) -> Result<String, String> {
     crate::repository_trust::require(repo)?;
     let key = Key {
         repo: repo.to_path_buf(),
         argv: args.iter().map(|arg| (*arg).to_string()).collect(),
     };
-    let stamp = RefStamp::read(repo, namespaces).filter(|stamp| stamp.settled(SystemTime::now()));
+    let stamp = stamp
+        .map(|stamp| &stamp.0)
+        .filter(|stamp| stamp.settled(SystemTime::now()))
+        .cloned();
     if let Some(stamp) = &stamp {
         let table = kept().lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = table.get(&key) {

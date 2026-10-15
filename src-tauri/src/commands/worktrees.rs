@@ -344,9 +344,9 @@ pub(super) fn worktree_ai_summary(
     }
     if let Some(div) = divergence {
         if div.ahead > 0 || div.behind > 0 {
-            parts.push(format!("main↕: +{} -{}", div.ahead, div.behind));
+            parts.push(format!("base↕: +{} -{}", div.ahead, div.behind));
         } else {
-            parts.push("main↕: synced".to_string());
+            parts.push("base↕: synced".to_string());
         }
     }
     if !last_msg.is_empty() {

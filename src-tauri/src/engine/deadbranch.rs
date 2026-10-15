@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::git_cli::{canonicalize_plain, git_text, validate_repo};
-use crate::engine::git_reader::{default_base, GitReader};
+use crate::engine::git_reader::{compute_default_base, default_base, GitReader};
 use crate::engine::git_writer::{
     checked_out_branches, repo_mutation_lock, validate_oid, validate_ref_name, BranchDeleteJournal,
 };
@@ -417,7 +417,16 @@ pub fn scan_stale_branches(
         ));
         HashSet::new()
     });
-    scan_branches(repo_path, &repo, config, &checked_out, None, warnings).map(|scan| scan.result)
+    scan_branches(
+        repo_path,
+        &repo,
+        config,
+        &checked_out,
+        None,
+        false,
+        warnings,
+    )
+    .map(|scan| scan.result)
 }
 
 /// A scan plus the default branch it was measured against, `None` when no
@@ -430,20 +439,31 @@ struct Scan {
 /// The scan itself. `checked_out` is one `git worktree list` the caller ran;
 /// `only`, when given, limits the result — and the per-branch merge-tree
 /// work — to branches named there by full or short name.
+///
+/// `fresh_base` is for a scan whose default branch protects a delete: the base
+/// is then read from git (`compute_default_base`), not from the ref cache,
+/// whose stamp cannot see an included config file. It is one read per scan.
 fn scan_branches(
     repo_path: &str,
     repo: &Path,
     config: &DeadbranchConfig,
     checked_out: &HashSet<String>,
     only: Option<&HashSet<&str>>,
+    fresh_base: bool,
     mut warnings: Vec<String>,
 ) -> Result<Scan, String> {
     let all_branches = GitReader::list_branches(repo_path)?;
     let total_scanned = all_branches.len();
 
-    // The same memoized resolution `list_branches` just used, so this costs
-    // no process and cannot disagree with the branches' `is_default`.
-    let base = default_base(repo).checked()?.base;
+    // A display scan takes the resolution `list_branches` just used, so it
+    // cannot disagree with the branches' `is_default`; it costs no process
+    // unless a ref was written within the ref cache's racy window.
+    let resolved = if fresh_base {
+        compute_default_base(repo)
+    } else {
+        default_base(repo)
+    };
+    let base = resolved.checked()?.base;
     let default_branch = base.as_ref().map(|(short, _)| short.clone());
     let now_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -753,6 +773,7 @@ where
         },
         &checked_out,
         Some(&target_set),
+        true,
         Vec::new(),
     )?;
     let to_clean = scan.result.branches;
@@ -1496,9 +1517,95 @@ mod tests {
         );
     }
 
-    /// Fifty squash-merged branches: one worktree listing and one default
-    /// branch resolution for the whole clean, and no per-branch fan-out
-    /// beyond the merge-tree that picks `-d`/`-D` and the delete itself.
+    /// Two remotes whose HEADs name `main` and `develop`, with a local branch
+    /// for each. Which one is "the default" is decided by
+    /// `checkout.defaultRemote`, which the caller sets.
+    fn two_default_candidates() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        git_in(&repo, &["branch", "develop"]);
+        for (remote, branch) in [("origin", "main"), ("upstream", "develop")] {
+            git_in(
+                &repo,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/{remote}/{branch}"),
+                    "HEAD",
+                ],
+            );
+            git_in(
+                &repo,
+                &[
+                    "symbolic-ref",
+                    &format!("refs/remotes/{remote}/HEAD"),
+                    &format!("refs/remotes/{remote}/{branch}"),
+                ],
+            );
+        }
+        (dir, repo)
+    }
+
+    /// The clean can run `-D`, and the default branch is what it must never
+    /// delete. The cached default base cannot see an included config file, so
+    /// a default that flips through one just before a clean was unprotected
+    /// for up to the cache's TTL. The protection reads the base fresh.
+    #[test]
+    fn a_default_changed_through_an_include_file_just_before_a_clean_is_protected() {
+        let _kept = crate::engine::ref_cache::retention();
+        let (_dir, repo) = two_default_candidates();
+        let include = tempfile::TempDir::new().unwrap();
+        let inc = include.path().join("inc.cfg");
+        std::fs::write(&inc, "[checkout]\n\tdefaultRemote = origin\n").unwrap();
+        git_in(&repo, &["config", "include.path", inc.to_str().unwrap()]);
+        crate::engine::ref_cache::eager(|| {
+            // Warm: the cached answer says `main` is the default.
+            assert_eq!(
+                default_base(&repo).base.map(|(name, _)| name).as_deref(),
+                Some("main")
+            );
+            std::fs::write(&inc, "[checkout]\n\tdefaultRemote = upstream\n").unwrap();
+            let refused = clean_branches(
+                repo.to_str().unwrap(),
+                &["develop".to_string()],
+                true,
+                false,
+            )
+            .expect_err("develop is now the default branch");
+            assert!(refused.contains("default branch"), "{refused}");
+            assert!(
+                git_text(&repo, &["rev-parse", "--verify", "refs/heads/develop"]).is_ok(),
+                "develop was deleted"
+            );
+        });
+    }
+
+    /// The same flip through the repository's own config, which the ref
+    /// cache's stamp does see: nothing may be deleted either way.
+    #[test]
+    fn a_default_changed_in_the_local_config_just_before_a_clean_is_protected() {
+        let _kept = crate::engine::ref_cache::retention();
+        let (_dir, repo) = two_default_candidates();
+        git_in(&repo, &["config", "checkout.defaultRemote", "origin"]);
+        crate::engine::ref_cache::eager(|| {
+            assert_eq!(
+                default_base(&repo).base.map(|(name, _)| name).as_deref(),
+                Some("main")
+            );
+            git_in(&repo, &["config", "checkout.defaultRemote", "upstream"]);
+            let refused = clean_branches(
+                repo.to_str().unwrap(),
+                &["develop".to_string()],
+                true,
+                false,
+            )
+            .expect_err("develop is now the default branch");
+            assert!(refused.contains("default branch"), "{refused}");
+        });
+    }
+
+    /// Fifty squash-merged branches: one worktree listing and a constant
+    /// number of default-branch resolutions for the whole clean, and no
+    /// per-branch fan-out beyond the merge-tree that picks `-d`/`-D` and the
+    /// delete itself.
     #[test]
     fn a_fifty_branch_clean_spawns_once_per_branch_plus_a_constant() {
         const BRANCHES: usize = 50;
@@ -1542,7 +1649,11 @@ mod tests {
         let deletes = count(&|a| a.iter().any(|x| x == "-D" || x == "-d"));
         assert_eq!(worktree_lists, 2, "worktree listings: {used:#?}");
         assert_eq!(any_worktree, 2, "no other worktree listing: {used:#?}");
-        assert_eq!(default_lookups, 1, "default-branch lookups: {used:#?}");
+        // Two, whatever the number of branches: the branch list's own
+        // (cached) resolution for its labels, and the one fresh read that
+        // protects the default branch from the delete. Previously one,
+        // shared through the memo; the protection no longer trusts it.
+        assert_eq!(default_lookups, 2, "default-branch lookups: {used:#?}");
         assert_eq!(merge_trees, BRANCHES, "merge-tree per target: {used:#?}");
         assert_eq!(deletes, BRANCHES);
         const CONSTANT: usize = 16;

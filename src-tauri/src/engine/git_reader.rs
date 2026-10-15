@@ -7,7 +7,7 @@ use crate::engine::git_cli::{
     sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
-use crate::engine::ref_cache::{self, FileIdentity};
+use crate::engine::ref_cache;
 use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
@@ -2954,18 +2954,18 @@ pub(crate) fn parse_pulse_stream(
 /// upstream remote, a lone configured remote, else "origin".
 #[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
-    default_remote_reads(repo).0
+    default_remote_reads(repo, Reads::Cached).0
 }
 
 /// [`resolve_default_remote`] plus the reason, when a read it depends on
 /// produced no answer (config, the current branch, the remote list). The name
 /// is then a guess built from "not set"; a caller guarding a destructive
 /// action refuses on the reason instead of trusting the guess.
-fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
+fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<String>) {
     let mut unread: Option<String> = None;
     // One read of the effective config answers what used to be two
     // `config --get` processes and, usually, `git remote` too.
-    let config = match config_snapshot(repo) {
+    let config = match config_snapshot_with(repo, reads) {
         Ok(config) => config,
         Err(error) => {
             unread = Some(error);
@@ -2978,7 +2978,7 @@ fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
             return (trimmed.to_string(), unread);
         }
     }
-    let branch = match head_branch_cached(repo) {
+    let branch = match reads.head_branch(repo) {
         Ok(branch) => branch,
         Err(error) => {
             unread.get_or_insert(error);
@@ -3022,7 +3022,40 @@ fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
 /// key winning as it does for `git config --get`. Section and variable names
 /// arrive lowercased; a subsection keeps its case (`branch.Feature.remote`).
 pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, String> {
-    let text = ref_cache::git_text(repo, &[], &["config", "--list", "-z"])?;
+    config_snapshot_with(repo, Reads::Cached)
+}
+
+/// How the default-base lookup reads the two inputs that live outside the
+/// ref store: the effective config and HEAD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reads {
+    /// Through [`ref_cache`]. Its stamp does not see files pulled in by
+    /// `include.path` or the system config. A recompute reads `config --list`
+    /// through its own cache entry, which can itself be up to a TTL old, so a
+    /// change to such a file is seen within about twice the 60 s TTL: the
+    /// display readers' admitted gap. (Reading config fresh on every cached
+    /// recompute would cost a process each time, so the gap is stated.)
+    Cached,
+    /// Straight from git, every time. For a caller that destroys something on
+    /// the answer.
+    Fresh,
+}
+
+impl Reads {
+    fn head_branch(self, repo: &Path) -> Result<Option<String>, String> {
+        match self {
+            Self::Cached => head_branch_cached(repo),
+            Self::Fresh => head_branch_name(repo),
+        }
+    }
+}
+
+fn config_snapshot_with(repo: &Path, reads: Reads) -> Result<HashMap<String, String>, String> {
+    let args = ["config", "--list", "-z"];
+    let text = match reads {
+        Reads::Cached => ref_cache::git_text(repo, &[], &args)?,
+        Reads::Fresh => git_text(repo, &args)?,
+    };
     Ok(parse_config_list(&text))
 }
 
@@ -3113,37 +3146,140 @@ impl DefaultBase {
     }
 }
 
+/// The ref-cache key of the default-base answer. It is not a git argv and
+/// cannot become one: the cached closure owns the spawn, and a NUL cannot be
+/// passed to a process, so it never collides with a listing's key.
+const DEFAULT_BASE_KEY: &str = "\0gitpulse:default-base";
+
+/// What the default base is a function of: every head and remote-tracking ref
+/// (the default may be nested, `release/main`), plus the HEAD, config and
+/// packed-ref files [`ref_cache`] always stamps.
+const DEFAULT_BASE_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
+
+/// A complete answer's text, for the ref cache: six NUL-separated fields (the
+/// remote, then the remote HEAD and the base each as a presence flag followed
+/// by its value). Refnames, remote names and oids contain no NUL. An
+/// incomplete answer is never kept, so it has no encoding.
+fn encode_default_base(value: &DefaultBase) -> String {
+    let (head_flag, head) = match &value.remote_head {
+        Some(head) => ("1", head.as_str()),
+        None => ("0", ""),
+    };
+    let (base_flag, short, oid) = match &value.base {
+        Some((short, oid)) => ("1", short.as_str(), oid.as_str()),
+        None => ("0", "", ""),
+    };
+    [
+        value.remote.as_str(),
+        head_flag,
+        head,
+        base_flag,
+        short,
+        oid,
+    ]
+    .join("\0")
+}
+
+fn decode_default_base(text: &str) -> Option<DefaultBase> {
+    let fields: Vec<&str> = text.split('\0').collect();
+    let [remote, head_flag, head, base_flag, short, oid] = fields.as_slice() else {
+        return None;
+    };
+    let flagged = |flag: &str| match flag {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    };
+    Some(DefaultBase {
+        remote: (*remote).to_string(),
+        remote_head: flagged(head_flag)?.then(|| (*head).to_string()),
+        base: flagged(base_flag)?.then(|| ((*short).to_string(), (*oid).to_string())),
+        incomplete: None,
+    })
+}
+
+/// The default base, answered through [`ref_cache::through_stamped`] with the
+/// stamp [`default_base`] read once for the call: the same stamp
+/// as every other ref listing, so a write anywhere under `refs/heads` or
+/// `refs/remotes` is seen at once, a stamp younger than the racy window is not
+/// trusted, and nothing is served past the cache's TTL. Never kept: an answer
+/// computed while any lookup was refused (it reads a refusal as "not set").
+fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> DefaultBase {
+    let mut computed = None;
+    let answered = ref_cache::through_stamped(repo, &[DEFAULT_BASE_KEY], stamp, || {
+        let value = compute_default_base_with(repo, Reads::Cached);
+        let keep = value.incomplete.is_none();
+        let text = if keep {
+            encode_default_base(&value)
+        } else {
+            String::new()
+        };
+        computed = Some(value);
+        Ok((text, keep))
+    });
+    match (answered, computed) {
+        (Err(reason), _) => DefaultBase {
+            remote: "origin".to_string(),
+            remote_head: None,
+            base: None,
+            incomplete: Some(reason),
+        },
+        (Ok(_), Some(value)) => value,
+        (Ok(text), None) => decode_default_base(&text).unwrap_or_else(|| {
+            debug_assert!(false, "an unreadable kept default base: {text:?}");
+            compute_default_base_with(repo, Reads::Fresh)
+        }),
+    }
+}
+
+/// What a leader computed, kept only to hand to the callers that queued behind
+/// it. Coalescing, not caching: [`ref_cache`] owns what is served later.
+#[derive(Clone)]
+struct SharedBase {
+    generation: u64,
+    stamp: ref_cache::Stamp,
+    value: DefaultBase,
+}
+
 /// One `hydrate` asks for the default base three times at once, and each
-/// answer cost five git processes. The answer is a function of a handful of
-/// files, so it is memoized against their identity rather than against time:
-/// a timer would serve the pre-change answer to the very refresh the change
-/// triggered, and nothing would ever ask again.
+/// answer cost five git processes. The answer is a function of the ref store,
+/// HEAD and config, so it is kept in [`ref_cache`] against the same stamp as
+/// every ref listing. That stamp walks `refs/heads` and `refs/remotes`
+/// recursively (a nested default branch is seen), refuses to trust a stamp
+/// younger than the racy window, and expires after the cache's TTL, which
+/// bounds the inputs no stamp sees (files pulled in by `include.path`).
 ///
-/// Every input is stamped *before* the lookup runs, so a write that races the
-/// lookup leaves a stamp that no longer matches and the next call recomputes.
-/// Git replaces config, HEAD, packed-refs and loose refs by lockfile rename,
-/// which gives each write a new inode and moves the containing directory's
-/// mtime.
+/// Two bounds are deliberate. Files pulled in by `include.path` (and the
+/// system config) are not stamped, so a change to one is seen within about
+/// twice the 60 s TTL (the kept answer, then the kept `config --list` it is
+/// recomputed from), not at once; a destructive caller reads
+/// [`compute_default_base`] instead, which asks git directly. The dead-branch
+/// clean's default-branch protection does. And a stamp whose newest mtime is within
+/// the racy window is never trusted, so sequential callers in the 3 s after a
+/// write each recompute (five processes): serving the last answer there is the
+/// staleness this removes. Callers that arrive together still share one
+/// computation below.
 ///
-/// Known blind spots, seen at the next change to any stamped file: files
-/// pulled in by `include.path`/`includeIf`, the system config, and a default
-/// branch nested below `refs/heads/<dir>/` (only its directory's mtime moves).
+/// A repository with more loose refs than the stamp's bound has no stamp, so
+/// every call computes (five processes), as `list_branches` already does.
+///
+/// Callers for one repository take turns and the stamp is re-read after the
+/// wait, so a caller that queued behind a leader shares its answer, refused
+/// or not, when nothing moved: the lookups would repeat the same refusal in
+/// series otherwise. A caller that arrives after the answer was stored asks
+/// the cache.
 pub(crate) fn default_base(repo: &Path) -> DefaultBase {
     const MAX_MEMOIZED_REPOS: usize = 64;
-    static MEMO: OnceLock<Mutex<HashMap<std::path::PathBuf, MemoizedBase>>> = OnceLock::new();
-    // Process-wide, so a cleared memo can never hand out a generation a
+    static LAST: OnceLock<Mutex<HashMap<std::path::PathBuf, SharedBase>>> = OnceLock::new();
+    // Process-wide, so a cleared table can never hand out a generation a
     // waiting caller already saw.
     static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // `hydrate` asks three times at the same instant, so a memo alone still
-    // computed three times on a cold or changed repository. Callers for one
-    // repository take turns; the stamp is re-read after the wait, so the
-    // second caller is served the first one's answer only if nothing moved.
     static TURNS: OnceLock<Mutex<HashMap<std::path::PathBuf, std::sync::Arc<Mutex<()>>>>> =
         OnceLock::new();
-    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
     // What had been computed when this caller arrived. Anything newer was
     // computed while it waited for its turn.
-    let arrived = memo
+    let arrived = last
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(repo)
@@ -3159,41 +3295,32 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         std::sync::Arc::clone(turns.entry(repo.to_path_buf()).or_default())
     };
     let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-    let stamp = DefaultBaseStamp::read(repo);
+    let stamp = ref_cache::stamp(repo, DEFAULT_BASE_NAMESPACES);
     if let Some(stamp) = &stamp {
-        let cached = memo
+        let shared = last
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(repo)
-            .cloned();
-        // A clean answer serves anyone while its stamp holds. A refused one
-        // serves only the callers that queued behind it: they would have
-        // been refused too, and repeating it in turn cost ~2 s apiece. A
-        // caller that arrives after it was stored asks git again.
-        if let Some(entry) = cached {
-            if &entry.stamp == stamp && (entry.clean || entry.generation > arrived) {
-                return entry.value;
-            }
+            .filter(|entry| entry.generation > arrived && &entry.stamp == stamp)
+            .map(|entry| entry.value.clone());
+        if let Some(value) = shared {
+            return value;
         }
     }
-    // The lookups read a failed spawn as "not set". Under load that is a
-    // refusal, not an answer, so a value computed while any of them failed
-    // is marked unclean: shared with the callers already queued behind it,
-    // never served to one that arrives later.
-    let value = compute_default_base(repo);
-    let clean = value.incomplete.is_none();
+    // Stamped before the lookup: a write that races it leaves a stamp that no
+    // longer matches, so a later caller does not take this answer.
+    let value = default_base_cached(repo, stamp.as_ref());
     if let Some(stamp) = stamp {
-        let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
-        if memo.len() >= MAX_MEMOIZED_REPOS && !memo.contains_key(repo) {
-            memo.clear();
+        let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.len() >= MAX_MEMOIZED_REPOS && !last.contains_key(repo) {
+            last.clear();
         }
-        memo.insert(
+        last.insert(
             repo.to_path_buf(),
-            MemoizedBase {
+            SharedBase {
                 generation: GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 stamp,
                 value: value.clone(),
-                clean,
             },
         );
     }
@@ -3205,9 +3332,20 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
 /// `incomplete`; it never reads as "no remote HEAD". Callers that guard a
 /// destructive action use this directly, so a memoized answer from before the
 /// read started failing cannot stand in for the state they are acting on.
+///
+/// Uncached all the way down: the config listing and HEAD are read from git
+/// here too, not through [`ref_cache`], whose stamp cannot see an
+/// `include.path` file.
 pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+    compute_default_base_with(repo, Reads::Fresh)
+}
+
+/// [`compute_default_base`] with the config and HEAD reads chosen by `reads`.
+/// [`default_base`] computes with [`Reads::Cached`] because its own answer is
+/// already bounded by the ref cache's stamp and TTL.
+fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
     let failures_before = git_cli::process_failures();
-    let (remote, mut unread) = default_remote_reads(repo);
+    let (remote, mut unread) = default_remote_reads(repo, reads);
     let head_ref = remote_head_ref(&remote);
     let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
         Ok(target) => target,
@@ -3230,58 +3368,6 @@ pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
         remote_head,
         base,
         incomplete,
-    }
-}
-
-#[derive(Clone)]
-struct MemoizedBase {
-    generation: u64,
-    stamp: DefaultBaseStamp,
-    value: DefaultBase,
-    /// False when any git process in the lookup was refused or failed to
-    /// start: the value then reads a refusal as "not set".
-    clean: bool,
-}
-
-/// Identity of every file the default-base answer depends on. `None` for a
-/// file that does not exist, which is itself part of the state: creating
-/// `refs/remotes/origin/HEAD` must invalidate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DefaultBaseStamp(Vec<(std::path::PathBuf, Option<FileIdentity>)>);
-
-impl DefaultBaseStamp {
-    /// `None` when the git directories cannot be resolved: no stamp means no
-    /// memo, never a stamp that matches by accident.
-    fn read(repo: &Path) -> Option<Self> {
-        let (private, common) = crate::repository_trust::git_directories(repo).ok()?;
-        let mut paths = vec![
-            private.join("HEAD"),
-            private.join("config.worktree"),
-            common.join("config"),
-            common.join("packed-refs"),
-            common.join("reftable").join("tables.list"),
-            common.join("refs").join("heads"),
-        ];
-        // The primary remote is an output of the lookup, so every remote's
-        // directory is stamped; a repository has a handful.
-        let remotes = common.join("refs").join("remotes");
-        paths.push(remotes.clone());
-        if let Ok(entries) = std::fs::read_dir(&remotes) {
-            let mut dirs: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-            dirs.sort();
-            dirs.truncate(64);
-            paths.extend(dirs);
-        }
-        paths.extend(ref_cache::user_config_paths());
-        Some(Self(
-            paths
-                .into_iter()
-                .map(|path| {
-                    let identity = FileIdentity::at(&path);
-                    (path, identity)
-                })
-                .collect(),
-        ))
     }
 }
 
@@ -6814,6 +6900,13 @@ mod tests {
     /// served from the memo.
     #[test]
     fn unchanged_state_resolves_the_default_base_once_per_change() {
+        // The ref cache does not trust a stamp younger than its racy window,
+        // and this repository was written a moment ago: run with no window.
+        let _kept = ref_cache::retention();
+        ref_cache::eager(unchanged_state_resolves_once_per_change_body);
+    }
+
+    fn unchanged_state_resolves_once_per_change_body() {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_string_lossy().into_owned();
@@ -6860,6 +6953,13 @@ mod tests {
     /// disk to invalidate the stamp.
     #[test]
     fn a_default_base_computed_while_spawns_failed_is_not_memoized() {
+        // No racy window, as above: a written-a-moment-ago repository is
+        // otherwise never kept, and "a clean answer is memoized" is the claim.
+        let _kept = ref_cache::retention();
+        ref_cache::eager(a_refused_default_base_is_not_memoized_body);
+    }
+
+    fn a_refused_default_base_is_not_memoized_body() {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
         let lookups = || {
@@ -7029,6 +7129,52 @@ mod tests {
             reader.join().unwrap();
         }
         assert_eq!(default_base(&repo), uncached(&repo));
+    }
+
+    /// The default branch can be nested (`release/main`). Moving it rewrites a
+    /// file two directories below `refs/heads`, and only that subdirectory's
+    /// mtime moves, so a stamp over the `refs/heads` directory alone served the
+    /// old oid until something else changed. The commit is made with
+    /// `commit-tree` so no top-level ref moves and the nested write is the only
+    /// change the stamp can see.
+    #[test]
+    fn a_nested_default_branch_that_moves_is_seen_at_once() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/release/main", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release/main",
+            ],
+        );
+        git_in(&repo, &["update-ref", "refs/heads/release/main", "HEAD"]);
+        ref_cache::eager(|| {
+            let warm = default_base(&repo);
+            assert_eq!(
+                warm.base.as_ref().map(|(name, _)| name.as_str()),
+                Some("release/main")
+            );
+            let moved = git_stdout(
+                &repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moves"],
+            )
+            .trim()
+            .to_string();
+            git_in(&repo, &["update-ref", "refs/heads/release/main", &moved]);
+            assert_eq!(
+                default_base(&repo).base.map(|(_, oid)| oid),
+                Some(moved),
+                "the memo served the oid from before the nested ref moved"
+            );
+            git_in(&repo, &["branch", "-D", "release/main"]);
+            assert_eq!(default_base(&repo), compute_default_base(&repo));
+        });
     }
 
     /// What `hydrate` actually does: the three readers at the same instant on a
@@ -10698,5 +10844,270 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .map(|walk| adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, *walk).cfr_sample_commits)
             .collect();
         assert_eq!(samples, vec![20, 20], "{samples:?}");
+    }
+
+    // ---- CARD 20 adversarial review ------------------------------------
+
+    fn adv_lookups(repo: &Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
+            .count()
+    }
+
+    /// Attack 1: `include.path` is not stamped. The doc says the 60 s TTL
+    /// bounds it, but a destructive caller's "uncached" compute_default_base
+    /// reads `config --list` and HEAD through the ref cache too.
+    #[test]
+    fn include_file_change_is_seen_by_the_uncached_base_and_bounded_by_the_ttl_on_the_cached() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
+        let include = tempfile::TempDir::new().unwrap();
+        let inc = include.path().join("inc.cfg");
+        std::fs::write(&inc, "[checkout]\n\tdefaultRemote = origin\n").unwrap();
+        git_in(&repo, &["config", "include.path", inc.to_str().unwrap()]);
+        ref_cache::eager(|| {
+            assert_eq!(default_base(&repo).remote, "origin");
+            assert_eq!(compute_default_base(&repo).remote, "origin");
+            std::fs::write(&inc, "[checkout]\n\tdefaultRemote = upstream\n").unwrap();
+            assert_eq!(
+                compute_default_base(&repo).remote,
+                "upstream",
+                "compute_default_base ('uncached', used by the destructive merge) served the pre-include remote"
+            );
+            // Converted by ruling from "the cached path sees the include
+            // change at once": no stamp covers an included file, so the
+            // display path serves the kept answer until its 60 s TTL. That
+            // admitted gap is documented at `default_base`; this pins it, and
+            // the assertion above is what a destructive caller relies on.
+            assert_eq!(
+                default_base(&repo).remote,
+                "origin",
+                "the cached answer is bounded by the TTL, not by the include file"
+            );
+        });
+    }
+
+    /// Attack 1: set-head, local config, packed-refs rewrites and a deleted
+    /// default are each seen while warm.
+    #[test]
+    fn adv_set_head_config_packed_and_delete_are_seen_while_warm() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+        );
+        ref_cache::eager(|| {
+            let name = |r: &Path| default_base(r).base.map(|(n, _)| n);
+            git_in(&repo, &["remote", "set-head", "origin", "main"]);
+            assert_eq!(name(&repo).as_deref(), Some("main"));
+            git_in(&repo, &["remote", "set-head", "origin", "develop"]);
+            assert_eq!(name(&repo).as_deref(), Some("develop"), "set-head not seen");
+            // Packed only, then advanced through packed-refs alone.
+            git_in(&repo, &["pack-refs", "--all"]);
+            assert_eq!(name(&repo).as_deref(), Some("develop"));
+            let moved = git_stdout(
+                &repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "m"],
+            );
+            git_in(&repo, &["update-ref", "refs/heads/develop", &moved]);
+            git_in(&repo, &["pack-refs", "--all"]);
+            assert_eq!(
+                default_base(&repo).base.map(|(_, o)| o),
+                Some(moved.clone()),
+                "packed-refs advance not seen"
+            );
+            git_in(&repo, &["branch", "-D", "develop"]);
+            assert_eq!(
+                default_base(&repo),
+                compute_default_base(&repo),
+                "delete while packed"
+            );
+            git_in(&repo, &["config", "checkout.defaultRemote", "nope"]);
+            assert_eq!(
+                default_base(&repo),
+                compute_default_base(&repo),
+                "config change"
+            );
+        });
+    }
+
+    /// Attack 1: two linked worktrees share a common dir but have private
+    /// HEADs; the answer for one must not be served to the other.
+    #[test]
+    fn adv_linked_worktrees_do_not_share_an_answer() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
+        let parent = tempfile::TempDir::new().unwrap();
+        let linked = parent.path().join("wt");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane",
+                linked.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&linked);
+        let linked = linked.canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.lane.remote", "upstream"]);
+        ref_cache::eager(|| {
+            for _ in 0..2 {
+                let a = default_base(&repo);
+                let b = default_base(&linked);
+                assert_eq!(a.remote, "origin");
+                assert_eq!(
+                    b.remote, "upstream",
+                    "linked worktree got the primary's answer"
+                );
+                assert_eq!(a.base.as_ref().map(|x| x.0.as_str()), Some("main"));
+                assert_eq!(b.base.as_ref().map(|x| x.0.as_str()), Some("develop"));
+            }
+            // Re-point the lane's upstream: only the linked answer moves.
+            git_in(&repo, &["config", "branch.lane.remote", "origin"]);
+            assert_eq!(default_base(&linked), compute_default_base(&linked));
+            assert_eq!(default_base(&repo), compute_default_base(&repo));
+        });
+    }
+
+    /// Attack 2: a refusal of any one of the lookups is never kept, and an
+    /// unresolved default ("none") is not served once the default appears.
+    #[test]
+    fn adv_failed_lookups_and_none_are_not_kept() {
+        let _kept = ref_cache::retention();
+        for needle in ["symbolic-ref", "for-each-ref", "config"] {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            ref_cache::eager(|| {
+                let refused = crate::engine::git_cli::with_forced_spawn_failure_of(needle, || {
+                    default_base(&repo)
+                });
+                assert!(
+                    refused.incomplete.is_some(),
+                    "{needle}: refusal not reported: {refused:?}"
+                );
+                let after = default_base(&repo);
+                assert!(after.incomplete.is_none(), "{needle}: {after:?}");
+                assert_eq!(
+                    after.base.as_ref().map(|b| b.0.as_str()),
+                    Some("main"),
+                    "{needle}: a refused answer was kept"
+                );
+            });
+        }
+        let dir = init_repo_with_remotes(&[], "feature");
+        let repo = dir.path().canonicalize().unwrap();
+        ref_cache::eager(|| {
+            assert_eq!(default_base(&repo).base, None);
+            git_in(&repo, &["branch", "main"]);
+            assert_eq!(
+                default_base(&repo).base.map(|b| b.0),
+                Some("main".to_string()),
+                "a 'no default' answer outlived the default appearing"
+            );
+        });
+    }
+
+    /// Attack 2: many threads at once, each with no racy window: one lookup
+    /// and one answer.
+    #[test]
+    fn adv_sixteen_threads_one_computation_no_torn_answer() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let expected = compute_default_base(&repo);
+        let before = adv_lookups(&repo);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let repo = repo.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ref_cache::eager(|| default_base(&repo))
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), expected, "torn answer");
+        }
+        assert_eq!(adv_lookups(&repo) - before, 1, "more than one computation");
+    }
+
+    /// Attack 5, pinned by ruling as a characterisation (it was asserting one
+    /// lookup): callers that arrive one after another inside the 3 s racy
+    /// window after a write each recompute, because a stamp cannot tell two
+    /// writes in one mtime tick apart and serving the last answer there is the
+    /// staleness the ref cache exists to prevent. The cost is bounded by the
+    /// number of calls, and every answer is correct.
+    #[test]
+    fn sequential_asks_on_a_just_written_repo_recompute_each_time_and_stay_correct() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let expected = compute_default_base(&repo);
+        let before = adv_lookups(&repo);
+        const CALLS: usize = 6;
+        for _ in 0..CALLS {
+            assert_eq!(default_base(&repo), expected);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let recomputed = adv_lookups(&repo) - before;
+        assert!(
+            (1..=CALLS).contains(&recomputed),
+            "{recomputed} computations for {CALLS} sequential asks"
+        );
     }
 }
