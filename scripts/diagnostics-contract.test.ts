@@ -56,6 +56,7 @@ describe("every shipped binary is wired for diagnostics", () => {
       "gitpulse",
       "gitpulse-hook",
       "gitpulse-mcp",
+      "gitpulse-ptyd",
       "gitpulsed",
     ]);
   });

@@ -18,6 +18,11 @@ export interface ConfirmPromptOptions extends PromptBaseOptions {
   mode: "confirm";
   /** Danger confirm (delete). The confirm control uses the danger button. */
   destructive?: boolean;
+  /**
+   * A third answer beside confirm and cancel, shown as a danger button when
+   * set (see {@link askChoice}). Plain confirms never show it.
+   */
+  alternateLabel?: string;
 }
 
 export type PromptOptions = TextPromptOptions | ConfirmPromptOptions;
@@ -60,6 +65,22 @@ export function askText(options: Omit<TextPromptOptions, "mode">): Promise<strin
 /** Resolves true only on explicit confirm; cancel/Escape/backdrop resolve false. */
 export function askConfirm(options: Omit<ConfirmPromptOptions, "mode">): Promise<boolean> {
   return begin({ ...options, mode: "confirm" }).then((value) => value === true);
+}
+
+/** What an alternate press completes a prompt with. */
+export const ALTERNATE_ANSWER = "alternate";
+
+/**
+ * A confirm with a third way out: `"confirm"`, `"alternate"`, or `null` on
+ * cancel/Escape/backdrop. For a question whose two answers both proceed, such
+ * as quitting with terminals that can be left running or stopped.
+ */
+export function askChoice(
+  options: Omit<ConfirmPromptOptions, "mode" | "alternateLabel"> & { alternateLabel: string },
+): Promise<"confirm" | "alternate" | null> {
+  return begin({ ...options, mode: "confirm" }).then((value) =>
+    value === true ? "confirm" : value === ALTERNATE_ANSWER ? "alternate" : null
+  );
 }
 
 /** Completes the open prompt with the user's answer (a string, boolean, or null). */

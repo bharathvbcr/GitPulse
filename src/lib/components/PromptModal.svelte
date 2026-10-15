@@ -5,6 +5,7 @@
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import {
+    ALTERNATE_ANSWER,
     cancelPrompt,
     completePrompt,
     promptState,
@@ -96,6 +97,11 @@
           <button type="button" onclick={cancelPrompt} class="gp-btn">
             {options.cancelLabel ?? "Cancel"}
           </button>
+          {#if options.mode === "confirm" && options.alternateLabel}
+            <button type="button" onclick={() => completePrompt(ALTERNATE_ANSWER)} class="gp-btn-danger">
+              {options.alternateLabel}
+            </button>
+          {/if}
           <button
             bind:this={confirmEl}
             type="submit"

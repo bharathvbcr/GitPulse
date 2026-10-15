@@ -53,7 +53,7 @@ fn harness() -> Harness {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let output = Arc::new(Mutex::new(Vec::new()));
     let captured = output.clone();
     let ack = state.clone();

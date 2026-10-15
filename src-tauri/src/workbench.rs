@@ -27,7 +27,7 @@ pub mod review;
 mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
-mod terminal_run;
+pub(crate) mod terminal_run;
 pub(crate) mod verification_driver;
 pub(crate) mod verification_gate;
 pub(crate) mod verify_status;

@@ -72,7 +72,13 @@ const GENERATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs
 /// The file is named from `current_exe()`, so without this gate every `cargo
 /// test` binary would drop a log into the user's real log directory. Unknown
 /// stems fail closed and get no file; [`LOG_DIR_ENV`] opts anything in.
-const LOGGED_BINARIES: [&str; 4] = ["gitpulse", "gitpulsed", "gitpulse-mcp", "gitpulse-hook"];
+const LOGGED_BINARIES: [&str; 5] = [
+    "gitpulse",
+    "gitpulsed",
+    "gitpulse-mcp",
+    "gitpulse-hook",
+    "gitpulse-ptyd",
+];
 
 /// Lines of panic backtrace kept.
 ///

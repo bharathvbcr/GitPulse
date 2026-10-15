@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 95 contracts over
- * 240 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 96 contracts over
+ * 241 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -115,6 +115,9 @@ export const CONTRACTS = Object.freeze([
   { label: "verify-status", rustPath: rust("workbench", "verify_status.rs"), tsPath: ts("workbench", "verifyStatus.ts"), structs: ["PostedVerifyStatus"] },
   { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
   { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
+  // Which process holds the terminals (`cmd_terminal_backend`): the quit
+  // dialog asks whether to leave sessions running only when it reads "host".
+  { label: "terminal-backend", rustPath: TERMINAL_RUST_SOURCE, tsPath: ts("terminal", "quitChoice.ts"), structs: ["TerminalBackendStatus"] },
   // A mass external-signal death, on the `terminal-incident` event and in
   // `cmd_terminal_incidents`. The offer to resume the dead sessions and the
   // Health list both read it, and `sender` is what keeps "who killed them"

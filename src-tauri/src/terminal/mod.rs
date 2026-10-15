@@ -332,6 +332,16 @@ struct SessionEntry {
     ring: Arc<Mutex<ring::Ring>>,
 }
 
+/// Which backend holds the terminals, as Settings and the quit dialog read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalBackendStatus {
+    /// `host` (`gitpulse-ptyd`; sessions outlive the app) or `in-process`.
+    pub backend: String,
+    /// What is wrong with the host, plainly: version skew, a host that would
+    /// not start. Empty when nothing is known to be wrong.
+    pub trouble: Vec<String>,
+}
+
 /// Thread-safe registry of live PTY sessions.
 #[derive(Clone)]
 pub struct TerminalSessions {
@@ -408,6 +418,17 @@ impl TerminalSessions {
             }
         }
         Self::default()
+    }
+
+    /// The terminal host's pid while connected; `None` in-process. For tests
+    /// that measure what the process holding the PTYs gives back.
+    #[doc(hidden)]
+    pub fn host_pid(&self) -> Option<u32> {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            return host.host_pid();
+        }
+        None
     }
 
     /// Which backend holds the PTYs: `"host"` or `"in-process"`.
@@ -500,9 +521,7 @@ impl TerminalSessions {
     pub fn lane_threads(&self) -> usize {
         #[cfg(unix)]
         if let Some(host) = &self.host {
-            return host.lane_threads().unwrap_or_else(|error| {
-                panic!("the terminal host's lanes could not be counted: {error}")
-            });
+            return host.lane_threads();
         }
         self.lock_sessions()
             .values()
@@ -1861,6 +1880,16 @@ pub struct SpawnRequest {
     pub run_id: Option<String>,
 }
 
+/// One session's lanes: its keystrokes and its resizes, each one thread in
+/// order. The engine's, and the app's in front of a terminal host, so a full
+/// queue and a dropped call behave the same on both backends.
+pub(crate) fn session_lanes() -> (Executor, Executor) {
+    (
+        Executor::new("input", 1, INPUT_QUEUE_CAPACITY, LANE_IDLE),
+        Executor::new("geometry", 1, GEOMETRY_QUEUE_CAPACITY, LANE_IDLE),
+    )
+}
+
 /// A new session id: `term-<this process's pid>-<counter>`. Unique for the
 /// life of this process, and across its restarts because the pid changes.
 pub(crate) fn next_session_id() -> String {
@@ -2154,6 +2183,7 @@ pub(crate) fn start_session(
     let master = Arc::new(Mutex::new(pair.master));
     let closing = Arc::new(AtomicUsize::new(0));
     let ring = Arc::new(Mutex::new(ring::Ring::default()));
+    let (input, geometry) = session_lanes();
     let entry = SessionEntry {
         master: master.clone(),
         writer: Arc::new(Mutex::new(writer)),
@@ -2171,8 +2201,8 @@ pub(crate) fn start_session(
             cwd: start.to_string_lossy().into_owned(),
         },
         repo: repo.clone(),
-        input: Executor::new("input", 1, INPUT_QUEUE_CAPACITY, LANE_IDLE),
-        geometry: Executor::new("geometry", 1, GEOMETRY_QUEUE_CAPACITY, LANE_IDLE),
+        input,
+        geometry,
         events: events.clone(),
         ring: ring.clone(),
     };
@@ -3260,46 +3290,83 @@ const LEADER_HANGUP_WAIT: Duration = Duration::from_millis(200);
 /// `kill(2)`. The caller holds the child's lock and has seen it unreaped, so
 /// the pid is still this child's; the start time read here is what
 /// `signal_process` re-checks at each signal.
+///
+/// The shell is often already on its way out: the hangup of its session's
+/// jobs reaches it too, and on macOS a killed process blocked on a full tty
+/// cannot finish exiting until the reader drains it, which starts only once
+/// this close returns. An exiting process, and a zombie, cannot be described by
+/// the process table, so the guarded primitive refuses to signal it — where a
+/// raw `kill(2)` would have "succeeded" at nothing. This child is unreaped and
+/// its lock is held, so its pid cannot belong to anyone else: one the table
+/// cannot describe is exiting, needs no signal, and is left to the reaper. One
+/// that never finishes is reported by the close's own cleanup deadline.
 #[cfg(unix)]
 fn stop_leader(shell: &mut Box<dyn Child + Send + Sync>) -> Result<(), String> {
     let pid = shell
         .process_id()
         .and_then(|p| i32::try_from(p).ok())
         .ok_or("The terminal process reports no id; it was not signalled")?;
-    let start_of = |pid: i32| crate::sysload::procscan::probe_one(pid).map(|facts| facts.start_us);
     let Some(started) = start_of(pid) else {
-        // An exited child the table no longer describes is not a failure.
-        if shell.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Ok(());
-        }
-        return Err("Could not identify the terminal process to stop it; retry Close".into());
+        log::debug!(target: "terminal", "the terminal process is already exiting; nothing to signal");
+        return Ok(());
     };
-    let send = |signo: libc::c_int| match crate::procguard::signal::signal_process(
-        pid,
-        started,
-        &start_of,
-        signo,
-        "terminal close",
-    ) {
-        Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+    if signal_leader(shell, pid, started, libc::SIGHUP)? {
+        return Ok(());
+    }
+    if reaped_within(shell, LEADER_HANGUP_WAIT)? {
+        return Ok(());
+    }
+    signal_leader(shell, pid, started, libc::SIGKILL).map(|_| ())
+}
+
+/// The start time the process table reports for `pid`, which
+/// `signal_process` compares against the one recorded.
+#[cfg(unix)]
+fn start_of(pid: i32) -> Option<u64> {
+    crate::sysload::procscan::probe_one(pid).map(|facts| facts.start_us)
+}
+
+/// Sends `signo` to the session leader through the guarded primitive.
+/// `Ok(true)` when the child turned out to be gone already.
+#[cfg(unix)]
+fn signal_leader(
+    shell: &mut Box<dyn Child + Send + Sync>,
+    pid: i32,
+    started: u64,
+    signo: libc::c_int,
+) -> Result<bool, String> {
+    match crate::procguard::signal::signal_process(pid, started, &start_of, signo, "terminal close")
+    {
+        Ok(()) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+        // Refused because the table no longer describes it: exiting.
+        Err(_) if start_of(pid).is_none() => Ok(true),
         Err(error) => {
+            if reaped_within(shell, LEADER_HANGUP_WAIT)? {
+                return Ok(true);
+            }
             log::warn!(target: "terminal", "could not signal terminal child: {error}");
             Err(format!("Could not stop terminal process: {error}"))
         }
-    };
-    send(libc::SIGHUP)?;
-    let deadline = Instant::now() + LEADER_HANGUP_WAIT;
+    }
+}
+
+/// Whether the child exits (and is reaped here) within `within`.
+#[cfg(unix)]
+fn reaped_within(
+    shell: &mut Box<dyn Child + Send + Sync>,
+    within: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + within;
     loop {
         if shell.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Ok(());
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            break;
+            return Ok(false);
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
-    send(libc::SIGKILL)
 }
 
 /// One-shot bounded command execution in `repo_path`.

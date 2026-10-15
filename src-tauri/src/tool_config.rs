@@ -1892,6 +1892,42 @@ mod tests {
     /// How many terminal sessions may be open is the user's: stored where the
     /// last release does not look, refused outside the terminal module's
     /// bounds at save, and degraded alone when a hand-edited value is bad.
+    /// "Keep terminals running when GitPulse quits": stored under
+    /// `agent_launch`, off when absent or unreadable, and what picks the
+    /// backend the app's registry is built on.
+    #[test]
+    fn keeping_terminals_running_is_stored_and_selects_the_terminal_host() {
+        with_temp_config(|path| {
+            assert!(!agent_defaults().keeps_terminals_running());
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "in-process"
+            );
+            let on = AgentDefaults {
+                keep_terminals_running: Some(true),
+                ..AgentDefaults::default()
+            };
+            set_agent_defaults(on.clone()).unwrap();
+            assert_eq!(agent_defaults(), on);
+            assert!(agent_defaults().keeps_terminals_running());
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["agent_launch"]["keep_terminals_running"], true);
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
+            );
+            // A value this build cannot read costs this setting alone.
+            let mut text: serde_json::Value = written;
+            text["agent_launch"]["keep_terminals_running"] = serde_json::json!("yes");
+            text["agent_launch"]["max_terminal_sessions"] = serde_json::json!(40);
+            fs::write(path, text.to_string()).unwrap();
+            assert!(!agent_defaults().keeps_terminals_running());
+            assert_eq!(agent_defaults().terminal_sessions(), 40);
+        });
+    }
+
     #[test]
     fn the_terminal_session_limit_is_bounded_and_degrades_alone() {
         assert_eq!(DEFAULT_TERMINAL_SESSIONS, 32);

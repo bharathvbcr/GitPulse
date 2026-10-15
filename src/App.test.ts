@@ -249,7 +249,10 @@ describe("App overlay wiring", () => {
   it("guards browser unload and native quit while editor drafts are dirty", () => {
     expect(source).toContain('listen<void>("gitpulse-exit-requested"');
     expect(source).toContain('invoke("cmd_set_exit_guard_ready")');
-    expect(source).toContain('invoke("cmd_exit_app")');
+    // The quit's choice for sessions the terminal host keeps reaches the
+    // backend with the exit itself (`quitChoice.ts`).
+    expect(source).toContain('invoke("cmd_exit_app", terminals ? { terminals } : {})');
+    expect(source).toContain("decideQuitTerminals({");
     expect(source).toContain('window.addEventListener("beforeunload"');
     expect(source).toContain("await editorFileSaveQueue.whenIdle()");
     expect(source).toContain("hasUnsavedEditorDrafts()");
@@ -259,7 +262,8 @@ describe("App overlay wiring", () => {
     // registry the stores join, not a list App keeps by hand.
     const flushCall = source.indexOf("    flushBeforeExit();\n    exitApproved = true;");
     expect(flushCall).toBeGreaterThan(-1);
-    expect(flushCall).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
+    expect(flushCall).toBeLessThan(source.indexOf('await invoke("cmd_exit_app"'));
+    expect(source.indexOf("decideQuitTerminals({")).toBeLessThan(flushCall);
     expect(source).toContain("for (const failure of flushPendingWrites())");
     expect(source).not.toContain("conflictSessions.flush()");
   });

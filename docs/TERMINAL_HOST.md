@@ -47,26 +47,46 @@ itself dying. Only moving the masters out of the app can.
 
 A unix-domain `SOCK_STREAM` socket, one frame at a time in each direction.
 
-* A frame is a 4-byte big-endian length, that many bytes of JSON (the typed
-  header, at most 64 KiB), and — only when the header carries `"len"` — that
-  many raw bytes (at most 64 KiB). Output and keystrokes travel raw; nothing
-  is base64-encoded (the cost `3b1cf774` removed from the webview hop is not
-  reintroduced on this one).
+* A frame is a 4-byte big-endian header length, that many bytes of JSON (the
+  typed header, at most 512 KiB — a spawn request carries argv and environment,
+  each bounded at 128 KiB by `validate_pty_options`), a 4-byte big-endian
+  payload length, and that many raw bytes (at most 64 KiB). Output and
+  keystrokes travel as the payload; nothing is base64-encoded (the cost
+  `3b1cf774` removed from the webview hop is not reintroduced on this one).
+  A frame out of these bounds, or a header that does not decode, ends the
+  connection. (`terminal/host/proto.rs`)
 * App → host requests carry an `id` and get exactly one reply
-  `{"reply":id,"ok":…}` or `{"reply":id,"error":"…"}`. `ack` is the exception:
-  it is sent per acknowledgement, inline, and never answered.
-  Requests: `hello`, `spawn`, `write`, `resize`, `ack`, `detach`, `detach_all`,
-  `attach`, `attach_tracked`, `kill`, `list`, `context`, `background`,
-  `limit`, `stall`, `receipts`, `forget`, `retire`, and the test-only
-  `wakeups`, `size`, `hold`, `release`.
+  `{"kind":"reply","id":…,"ok":…}` or `{"kind":"reply","id":…,"error":"…"}`.
+  `ack` is answered too, inline in the host's read loop, so an acknowledgement
+  the window refuses (a late one, for a window a detach already forgave) is
+  refused to the view exactly as in-process. Requests: `hello`, `retire`,
+  `spawn`, `write`, `resize`, `ack`, `detach`, `detach_all`, `attach`,
+  `attach_tracked`, `kill`, `stop_all`, `list`, `context`, `background`,
+  `limit`, `stall`, `receipts`, `forget`, and the test-only `wakeups`, `size`,
+  `hold`, `release`.
+* The app keeps each session's input and geometry lanes in front of the host,
+  as in-process: a session's keystrokes go one at a time in order, a full
+  queue is refused at once, and a call dropped before its turn is skipped
+  rather than sent. The host queues what arrives on its own lanes for the
+  session, so a close waiting out its hangup grace never holds up typing.
 * Host → app events: `output` (raw bytes for a session's current view),
   `end` (the session's last byte has been sent), `loss` (output a live view
-  will never see), `notice` (an alert the reader's scanner raised), `exit`
-  (the authoritative exit payload).
-* `hello` is the only frame whose layout is frozen across versions:
-  `{"op":"hello","protocol":N,"build":"…"}` answered with
-  `{"protocol":N,"build":"…","pid":…,"sessions":…}`. Everything else may
-  change with `PROTOCOL`.
+  will never see), `notice` (an alert the reader's scanner raised, its
+  `event` and `channel` read back against their closed vocabularies),
+  `scan_drops`, and `exit` (the authoritative exit payload).
+* `hello` and `retire`, and the reply to each, are the only frames whose
+  layout is frozen across versions: `{"id":…,"op":"hello","protocol":N,"build":"…"}`
+  answered with `{"protocol":N,"build":"…","pid":…,"sessions":…}`, and
+  `{"id":…,"op":"retire"}` answered with `{"retired":…,"sessions":…}`.
+  Everything else may change with `PROTOCOL` (`hello_and_retire_keep_their_frozen_shapes`).
+* The app's calls are bounded: a deadline per call (10 s; 30 s for a spawn,
+  15 s for a close, 30 s to stop everything), failed by a sweeper when it
+  passes, and every call in flight fails at once when the connection drops.
+  The host's writes to the app are bounded too: a write blocked for 5 s
+  (`WRITE_DEADLINE`) means a stopped or wedged app, and its connection is
+  closed — which detaches every view, as the app's death would.
+* One app at a time. A second `hello` while one is connected is refused with
+  a reason; the next is welcome once the first's connection ends.
 
 ## Flow control across two links
 
@@ -110,21 +130,30 @@ Today `OutputFlow::reserve` blocks the reader until the webview repays the
 * **Single instance per protocol:** the host holds the `daemon_lock` lock on
   `ptyd-v<PROTOCOL>.lock` in that directory for its whole life. A second host
   started for the same protocol exits at once and says who holds it.
-* **Start:** the app connects; when nothing answers, it starts
-  `gitpulse-ptyd` from beside its own executable (`resolve_bundled_binary`, the
-  owner that already finds `gitpulse-mcp` and `gitpulse-hook` in
-  `Contents/MacOS`) with `setsid`, its standard streams on `/dev/null` and a log
-  file in the host directory. It is not spawned through `procguard::spawn`:
-  the quit sweep (`procguard::reap_all`) kills what that tracks, and the host
-  must outlive the app. The app never signals the host.
+* **Start:** the app connects at startup (before it reconciles task runs) and
+  on its first terminal call; when nothing answers, it starts `gitpulse-ptyd`
+  from beside its own executable (`insights::bundled_binary`, the owner that
+  already finds `gitpulse-mcp` and `gitpulse-hook` in `Contents/MacOS`, where
+  the bundler places every `[[bin]]`; `GITPULSE_PTYD` overrides it) with
+  `setsid`, stdin and stdout on `/dev/null` and stderr on `ptyd.log` in the
+  host directory. It is not spawned through `procguard::spawn`: the quit sweep
+  (`procguard::reap_all`) kills what that tracks, and the host must outlive the
+  app. The app reaps it if it exits first, and never signals it.
+* **Trust:** the host reads the same trust store the app writes (it inherits
+  `HOME`). A grant the user saved reaches it; a *session-only* grant, which
+  lives in the app's memory and by design never grants another process
+  authority (`repository_trust::grant`), does not. The app's own approval flow
+  always saves (`grant_confirmed`), so this only matters to tests, which save
+  their grants when they run against the host.
 * **Idle exit:** a host with no sessions and no app connected for 30 s exits
   and removes its socket, so a host is never left behind for nothing.
 * **Host SIGTERM / SIGINT / SIGHUP:** the host stops every session with the
   same hangup-grace close the app uses today, records each exit, and exits.
-* **Not done here:** launchd registration (a `KeepAlive` agent). A launchd
-  restart of a crashed host would not bring its sessions back, so it buys
-  nothing for this card's failure; `setsid` is what keeps the app's death from
-  reaching the host. Recorded as a follow-up, not claimed.
+* **Not done here:** launchd registration (a `KeepAlive` agent), which the card
+  asks for. A launchd restart of a crashed host would not bring its sessions
+  back, so it buys nothing for this card's failure; `setsid` is what keeps the
+  app's death from reaching the host, and the SIGKILL test proves that. It
+  remains open, not claimed.
 
 ## Version skew
 
@@ -136,8 +165,9 @@ host of another protocol by accident.
   and every terminal call says so.
 * The app also looks for sockets of *other* protocol versions in the host
   directory and sends each the frozen `hello`. A live host of another protocol
-  is reported loudly — logged, listed in Health as a degraded subsystem, and in
-  the error of any call that cannot proceed — with its session count:
+  is reported loudly — logged as a warning, and shown under Settings → Agents →
+  "Keep terminals running when GitPulse quits" (`cmd_terminal_backend`'s
+  `trouble`) — with its build, pid and session count:
   * with **no sessions**, the app sends it `retire` (also frozen) and it exits;
   * with **sessions**, it is left running, untouched, and the report says how
     many sessions it holds and that this version cannot show them. Nothing is
@@ -148,9 +178,10 @@ host of another protocol by accident.
 ## Durable exit receipts
 
 The host writes one append-only file per session,
-`<host dir>/receipts/<session id>.jsonl` (`0600`): a `spawn` line when the
-child starts (id, run id, program, cwd, pid) and an `exit` line, synced to disk,
-when it is reaped. The exit is then sent to the app as an `exit` event.
+`<host dir>/receipts/<session id>.jsonl` (`0600`, opened `O_NOFOLLOW`, named
+only by a well-formed session id): a `spawn` line just before the child starts
+(id, run id, program, place) and an `exit` line, synced to disk, when it is
+reaped. The exit is then sent to the app as an `exit` event.
 
 * The app processes an exit (run observer, incident, `terminal-exit`) and then
   sends `forget`, which deletes the file. A crash between the two replays the
@@ -161,20 +192,33 @@ when it is reaped. The exit is then sent to the app as an `exit` event.
   receipt goes through the same `receipts::apply` the live observer uses, with
   the owner and start identity read back from the run itself.
 * A `spawn` line with no `exit` line and no live session (the host itself died)
-  is reported as an exit with `reaped: false` and the error "the terminal host
-  ended before this session did", which `receipts::apply` records as
-  `unresolved`, never as a clean exit.
+  is given an exit when the next host starts, with `reaped: false` and the
+  error "The terminal host ended before this session did; its exit status is
+  unknown.", which `receipts::apply` records as `unresolved`, never as a clean
+  exit. A session the app still tracked that neither the host's list nor a
+  receipt accounts for is ended the same way at connect.
+* A run whose own observer died with the app that launched it is observed again
+  by `terminal_run::adopted_observer`, which reads the owner, session and
+  process identity back from the run. It is used for a session the next app
+  adopts and for a receipt it records.
+* An exit can overtake the reply to its own spawn (a program that ends at
+  once). The app holds such an exit until it has recorded the start, so a run
+  is never finished before it is started.
 
 ## Quit
 
 With the host backend a quit no longer has to end anything, so it asks:
 
-* **Cmd-Q with live sessions** shows *Stop sessions and quit*, *Quit and leave
-  them running*, and *Cancel*. *Leave running* disconnects; the next launch
-  lists them as detached sessions and attaches with the ring replayed.
+* **Cmd-Q with live sessions** asks (`quitChoice.ts`): *Quit and Leave
+  Running* (the default button), *Stop Them and Quit*, or *Keep Working*. A
+  session list that cannot be read still asks, saying so. The answer reaches
+  the backend as `cmd_exit_app`'s `terminals` (`"leave"` or `"stop"`).
+  *Leave running* disconnects; the next launch adopts them as detached
+  sessions (`adoptDetachedSessions`) and showing one replays its ring.
+  *Stop* stops every session, records each exit, then disconnects.
 * **SIGTERM / SIGKILL / a crash of the app** leaves sessions running (that is
-  the point of the card). The teardown for a signal disconnects instead of
-  stopping.
+  the point of the card): the teardown for a signal, like a quit that did not
+  choose, disconnects instead of stopping (`teardown::close_terminals`).
 * With the in-process backend nothing changes: quitting stops every session.
 
 ## Signals
@@ -270,12 +314,13 @@ becomes the default (migration step 3). Until then the host is opt-in.
 ## Migration
 
 1. **Done in this change:** the engine is decoupled from Tauri; the host binary,
-   the protocol, the client and the facade exist; the ring and exit receipts
-   exist in the engine for both backends.
+   the protocol, the client and the facade exist; the ring exists in the engine
+   for both backends, and exit receipts in the host.
 2. **Done in this change:** Settings → Agents, "Keep terminals running when
    GitPulse quits", selects the host for the next launch (default off). The
    integration suites run against the host when
-   `GITPULSE_TEST_TERMINAL_BACKEND=host`; CI runs them both ways.
+   `GITPULSE_TEST_TERMINAL_BACKEND=host` (`bun run test:terminal-host`); CI runs
+   them both ways on its macOS and Linux legs, and `ci:local` does too.
 3. **Not in this change:** make the host the default and delete the in-process
    backend (the app constructing the engine itself) in the same commit. Blocked
    on the security sign-off above.

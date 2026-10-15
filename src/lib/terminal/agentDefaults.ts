@@ -109,6 +109,13 @@ export interface AgentDefaults {
    */
   max_terminal_sessions?: number;
   /**
+   * Terminals are held by `gitpulse-ptyd`, a process of their own, and keep
+   * running when GitPulse quits or crashes (`docs/TERMINAL_HOST.md`). Absent
+   * is off. Read by the app when it starts, so a change applies to the next
+   * launch.
+   */
+  keep_terminals_running?: boolean;
+  /**
    * Which model each agent CLI starts with, by launcher. Absent means the
    * CLI's own choice; an entry is never stored empty. Names and levels only —
    * which flag carries them is `model_control` in `terminal_command.rs`.
@@ -314,6 +321,7 @@ export function sanitizeAgentDefaults(
   const sanitized: AgentDefaults = { permission };
   if (isLiveRunLimit(raw.max_live_runs)) sanitized.max_live_runs = raw.max_live_runs;
   if (isTerminalSessionLimit(raw.max_terminal_sessions)) sanitized.max_terminal_sessions = raw.max_terminal_sessions;
+  if (typeof raw.keep_terminals_running === "boolean") sanitized.keep_terminals_running = raw.keep_terminals_running;
   const sources = canonicalSettingSources(raw.claude_setting_sources);
   if (sources) sanitized.claude_setting_sources = sources;
   if (raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)) {

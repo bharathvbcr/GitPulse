@@ -88,15 +88,44 @@ fn open_descriptors() -> usize {
 }
 
 fn threads() -> usize {
-    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+    threads_of(std::process::id())
+}
+
+fn threads_of(pid: u32) -> usize {
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
         return tasks.count();
     }
     // macOS: `ps -M` prints a header and one line per thread.
     let out = std::process::Command::new("ps")
-        .args(["-M", "-p", &std::process::id().to_string()])
+        .args(["-M", "-p", &pid.to_string()])
         .output_locked()
         .expect("ps -M");
     String::from_utf8_lossy(&out.stdout).lines().count() - 1
+}
+
+/// Descriptors another process holds: `/proc` on Linux, `lsof` on macOS (one
+/// header line, then one line per descriptor).
+fn open_descriptors_of(pid: u32) -> usize {
+    if pid == std::process::id() {
+        return open_descriptors();
+    }
+    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        return fds.count();
+    }
+    let out = std::process::Command::new("lsof")
+        .args(["-n", "-P", "-p", &pid.to_string()])
+        .output_locked()
+        .expect("lsof");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+/// The process whose readers and PTYs a registry's sessions use: the terminal
+/// host when there is one, else this one.
+fn engine_pid(state: &TerminalSessions) -> u32 {
+    state.host_pid().unwrap_or_else(std::process::id)
 }
 
 /// Every thread of `tauri::async_runtime`'s blocking pool, occupied until
@@ -298,7 +327,7 @@ fn timed_write(
 #[test]
 fn a_keystroke_is_delivered_while_the_blocking_pool_is_full() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -333,7 +362,7 @@ fn a_keystroke_is_delivered_while_the_blocking_pool_is_full() {
 #[test]
 fn a_resize_does_not_block_the_thread_that_polls_it() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -383,7 +412,7 @@ fn poll_once<F: Future>(call: &mut std::pin::Pin<Box<F>>) -> Poll<F::Output> {
 #[test]
 fn a_full_resize_queue_is_refused_at_once_and_what_was_accepted_still_completes() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -461,7 +490,7 @@ fn a_full_resize_queue_is_refused_at_once_and_what_was_accepted_still_completes(
 #[test]
 fn dropped_calls_do_not_wedge_a_lane() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -505,7 +534,7 @@ fn dropped_calls_do_not_wedge_a_lane() {
 #[test]
 fn a_write_or_resize_to_a_missing_session_is_refused_by_name() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let handle = app.handle().clone();
     let write = tauri::async_runtime::block_on(cmd_terminal_write(
@@ -558,7 +587,7 @@ enum Ending {
 fn writes_queued_or_in_flight_when_a_session_ends_are_answered_as_gone() {
     let _serial = serial();
     for ending in [Ending::Kill, Ending::Shutdown, Ending::SelfExit] {
-        let state = TerminalSessions::default();
+        let state = common::terminals();
         let app = mock_app(&state);
         let _cleanup = TerminalCleanup(state.clone());
         let output = collecting(&app, &state);
@@ -649,7 +678,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
     const SESSIONS: usize = 32;
     const ROUNDS: usize = 200;
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     state.set_session_limit(SESSIONS + 8);
@@ -884,7 +913,7 @@ fn concurrent_writers_to_one_session_keep_each_callers_order_and_every_byte() {
     const WRITERS: usize = 4;
     const ROUNDS: usize = 150;
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -936,7 +965,7 @@ fn concurrent_writers_to_one_session_keep_each_callers_order_and_every_byte() {
 #[test]
 fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -1081,7 +1110,7 @@ fn attach_and_detach_while_writes_are_queued_keep_every_byte_in_order() {
     const WRITERS: usize = 3;
     const ROUNDS: usize = 120;
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -1156,7 +1185,7 @@ fn attach_and_detach_while_writes_are_queued_keep_every_byte_in_order() {
 #[test]
 fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -1217,7 +1246,7 @@ fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
 fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() {
     use gitpulse_lib::commands::{cmd_terminal_context, cmd_terminal_kill};
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     let output = collecting(&app, &state);
@@ -1359,7 +1388,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
 fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
     let sessions = gitpulse_lib::terminal::MAX_PTY_SESSIONS;
     let _serial = serial();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let app = mock_app(&state);
     let _cleanup = TerminalCleanup(state.clone());
     state.set_session_limit(sessions);
@@ -1379,8 +1408,11 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
     // Descriptors are this test's alone. Threads are not: an earlier test's
     // full blocking pool shrinks on tokio's own clock, so the process count
     // is compared only after that has run out (below), and the lanes are
-    // counted by `lane_threads`, which sees nothing else.
-    let fds_before = open_descriptors();
+    // counted by `lane_threads`, which sees nothing else. Both are counted in
+    // the process that holds the PTYs and their readers: this one, or the
+    // terminal host.
+    let engine = engine_pid(&state);
+    let fds_before = open_descriptors_of(engine);
 
     let ids: Vec<String> = (0..sessions)
         .map(|_| start_cat(&app, &state, &output, dir.path()))
@@ -1420,7 +1452,7 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
         "the sessions stayed open"
     );
     // Every pool thread from before this test has had its keep-alive by now.
-    let threads_idle = threads();
+    let threads_idle = threads_of(engine);
     // Typing again starts a lane again.
     write_now(&handle, &ids[0], "y".into()).unwrap();
     assert_eq!(state.lane_threads(), 1);
@@ -1438,18 +1470,19 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
     let slack = 8;
     assert!(
         wait_until(Duration::from_secs(20), || {
-            open_descriptors() <= fds_before + slack && threads() + sessions <= threads_idle + slack
+            open_descriptors_of(engine) <= fds_before + slack
+                && threads_of(engine) + sessions <= threads_idle + slack
         }),
         "descriptors {fds_before} -> {}, threads {threads_idle} with {sessions} idle \
          sessions -> {} after shutdown",
-        open_descriptors(),
-        threads()
+        open_descriptors_of(engine),
+        threads_of(engine)
     );
     println!(
         "threads {threads_idle} with {sessions} idle sessions -> {} after shutdown; \
          descriptors {fds_before} -> {}",
-        threads(),
-        open_descriptors()
+        threads_of(engine),
+        open_descriptors_of(engine)
     );
 }
 

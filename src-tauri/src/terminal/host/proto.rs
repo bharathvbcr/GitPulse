@@ -29,7 +29,7 @@ pub const MAX_HEADER_BYTES: usize = 512 * 1024;
 /// worth of keystrokes (`MAX_PTY_INPUT_BYTES`), whichever is larger.
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
-/// App → host. Every request but [`Request::Ack`] gets exactly one reply.
+/// App → host. Every request gets exactly one reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -53,7 +53,8 @@ pub enum Request {
         rows: u16,
         cols: u16,
     },
-    /// Never answered: sent per acknowledgement, inline.
+    /// The view painted `bytes` of `session`'s output. Answered inline, with
+    /// the window's refusal when it owes nothing that large.
     Ack {
         session: String,
         bytes: usize,
@@ -109,7 +110,6 @@ pub enum Request {
     Release {
         session: String,
     },
-    LaneThreads,
 }
 
 /// A request with the id its reply will carry.
@@ -304,9 +304,8 @@ pub fn write_frame(
 /// end of stream between frames; an end inside one is an error.
 pub fn read_frame(input: &mut impl Read) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let mut length = [0u8; 4];
-    match read_exact_or_eof(input, &mut length)? {
-        false => return Ok(None),
-        true => {}
+    if !read_exact_or_eof(input, &mut length)? {
+        return Ok(None);
     }
     let header_len = u32::from_be_bytes(length) as usize;
     if header_len == 0 || header_len > MAX_HEADER_BYTES {

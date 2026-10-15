@@ -201,6 +201,22 @@ pub async fn cmd_terminal_incidents(
     Ok(state.incidents())
 }
 
+/// Which backend holds this app's terminals, and what is wrong with the
+/// terminal host when one holds them (another version's host still running
+/// sessions, a host that would not start). The quit dialog asks whether to stop
+/// or leave sessions only when they can outlive the app; Settings says which.
+///
+/// Inline: two reads of in-memory state, no I/O.
+#[tauri::command(async)]
+pub async fn cmd_terminal_backend(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<crate::terminal::TerminalBackendStatus, String> {
+    Ok(crate::terminal::TerminalBackendStatus {
+        backend: state.backend().to_owned(),
+        trouble: state.host_trouble(),
+    })
+}
+
 /// Exports user-selected terminal output through the native save dialog.
 #[tauri::command(async)]
 pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {

@@ -16,6 +16,7 @@
 use super::proto::{
     self, Envelope, Hello, HostFrame, Request, Retired, SpawnReply, WireEnded, PROTOCOL,
 };
+use crate::terminal::executor::Executor;
 use crate::terminal::sink::OutputSlot;
 use crate::terminal::{
     MasterHold, OutputSink, SessionEnded, SessionEvents, SessionObserver, SpawnRequest,
@@ -88,6 +89,8 @@ struct Connection {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, (Instant, Waiter)>>,
     closed: AtomicBool,
+    /// The host's pid, from its hello; 0 until it has answered.
+    host_pid: std::sync::atomic::AtomicU32,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -140,25 +143,6 @@ impl Connection {
         answered
             .recv_timeout(within + SWEEP_EVERY * 4)
             .unwrap_or_else(|_| Err(LOST.into()))
-    }
-
-    async fn call_async(
-        &self,
-        request: Request,
-        payload: &[u8],
-    ) -> Result<serde_json::Value, String> {
-        let (answer, mut answered) = tauri::async_runtime::channel(1);
-        self.send(
-            request,
-            payload,
-            Some((
-                CALL_DEADLINE,
-                Box::new(move |result| {
-                    let _ = answer.try_send(result);
-                }),
-            )),
-        )?;
-        answered.recv().await.unwrap_or_else(|| Err(LOST.into()))
     }
 
     fn resolve(&self, id: u64, result: Result<serde_json::Value, String>) {
@@ -219,6 +203,35 @@ struct Proxy {
     failing: Arc<AtomicBool>,
     /// The host's end marker has been passed to the view.
     end_sent: bool,
+    /// This session's keystrokes and resizes, in order, one at a time — the
+    /// app's own lanes, as in-process: a full queue is refused at once, and a
+    /// call dropped before its turn is skipped rather than sent.
+    input: Executor,
+    geometry: Executor,
+}
+
+impl Proxy {
+    fn new(
+        output: OutputSink,
+        observer: Option<Arc<dyn SessionObserver>>,
+        run_id: Option<String>,
+        viewed: bool,
+        starting: bool,
+    ) -> Self {
+        let (input, geometry) = crate::terminal::session_lanes();
+        Self {
+            output: Arc::new(OutputSlot::new(output)),
+            observer,
+            run_id,
+            viewed,
+            starting,
+            deferred_exit: None,
+            failing: Arc::default(),
+            end_sent: false,
+            input,
+            geometry,
+        }
+    }
 }
 
 /// A sink that sends nowhere: a session with no view in this app.
@@ -338,16 +351,7 @@ impl HostClient {
         // ends at once, can arrive before the reply.
         lock(&self.inner.proxies).insert(
             session.clone(),
-            Proxy {
-                output: Arc::new(OutputSlot::new(output)),
-                observer: observer.clone(),
-                run_id: request.run_id.clone(),
-                viewed: true,
-                starting: true,
-                deferred_exit: None,
-                failing: Arc::default(),
-                end_sent: false,
-            },
+            Proxy::new(output, observer.clone(), request.run_id.clone(), true, true),
         );
         let reply = conn
             .call(Request::Spawn { request }, &[], SPAWN_DEADLINE)
@@ -403,6 +407,8 @@ impl HostClient {
         })
     }
 
+    /// Types `bytes` into `session`, answered once the host's lane has
+    /// delivered them. Called on the session's input lane.
     pub fn write_blocking(&self, session: &str, bytes: &[u8]) -> Result<(), String> {
         self.conn()?
             .call(
@@ -415,13 +421,7 @@ impl HostClient {
             .map(|_| ())
     }
 
-    pub async fn write(&self, session: String, bytes: Vec<u8>) -> Result<(), String> {
-        let conn = self.conn()?;
-        conn.call_async(Request::Write { session }, &bytes)
-            .await
-            .map(|_| ())
-    }
-
+    /// Resizes `session`'s PTY. Called on the session's geometry lane.
     pub fn resize_blocking(&self, session: &str, rows: u16, cols: u16) -> Result<(), String> {
         self.call::<serde_json::Value>(
             Request::Resize {
@@ -434,35 +434,57 @@ impl HostClient {
         .map(|_| ())
     }
 
-    pub async fn resize(&self, session: String, rows: u16, cols: u16) -> Result<(), String> {
-        let conn = self.conn()?;
-        conn.call_async(
-            Request::Resize {
-                session,
-                rows,
-                cols,
-            },
-            &[],
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// Repays credit for output the view has painted. Not answered.
+    /// Repays credit for output the view has painted, and says when the
+    /// window refused it.
     pub fn ack(&self, session: &str, bytes: usize) -> Result<(), String> {
         // An acknowledgement after the connection went is for a window the
-        // host has already reset; dropping it loses nothing.
+        // host has already reset when it detached the session; there is
+        // nothing left to repay.
         let Some(conn) = self.inner.current() else {
             return Ok(());
         };
-        conn.send(
+        conn.call(
             Request::Ack {
                 session: session.to_owned(),
                 bytes,
             },
             &[],
-            None,
+            CALL_DEADLINE,
         )
+        .map(|_| ())
+    }
+
+    /// The lane that carries `session`'s keystrokes.
+    pub(crate) fn input_lane(&self, session: &str) -> Result<Executor, String> {
+        lock(&self.inner.proxies)
+            .get(session)
+            .map(|p| p.input.clone())
+            .ok_or_else(|| format!("Terminal session '{session}' not found"))
+    }
+
+    /// The lane that carries `session`'s resizes.
+    pub(crate) fn geometry_lane(&self, session: &str) -> Result<Executor, String> {
+        lock(&self.inner.proxies)
+            .get(session)
+            .map(|p| p.geometry.clone())
+            .ok_or_else(|| format!("Terminal session '{session}' not found"))
+    }
+
+    /// Threads alive on this app's lanes for the sessions it knows.
+    pub fn lane_threads(&self) -> usize {
+        lock(&self.inner.proxies)
+            .values()
+            .map(|p| p.input.workers() + p.geometry.workers())
+            .sum()
+    }
+
+    /// The host process's id, once connected. For tests that measure what
+    /// the process holding the PTYs gives back.
+    pub fn host_pid(&self) -> Option<u32> {
+        self.inner
+            .current()
+            .map(|conn| conn.host_pid.load(Ordering::Acquire))
+            .filter(|pid| *pid > 0)
     }
 
     pub fn list(&self) -> Result<Vec<TerminalListing>, String> {
@@ -697,10 +719,6 @@ impl HostClient {
         }
     }
 
-    pub fn lane_threads(&self) -> Result<usize, String> {
-        self.call(Request::LaneThreads, CALL_DEADLINE)
-    }
-
     /// Sessions this app holds a proxy for.
     pub fn known_sessions(&self) -> usize {
         lock(&self.inner.proxies).len()
@@ -819,6 +837,7 @@ impl Inner {
             next_id: AtomicU64::new(1),
             pending: Mutex::default(),
             closed: AtomicBool::new(false),
+            host_pid: std::sync::atomic::AtomicU32::new(0),
         });
         let reader = {
             let (inner, conn) = (Arc::downgrade(self), conn.clone());
@@ -880,6 +899,7 @@ impl Inner {
             self.note_trouble(trouble.clone());
             return Err(trouble);
         }
+        conn.host_pid.store(hello.pid, Ordering::Release);
         if hello.build != crate::updates::CURRENT_VERSION {
             log::info!(target: "terminal", "terminal host build {} (pid {}) serves app build {}", hello.build, hello.pid, crate::updates::CURRENT_VERSION);
         }
@@ -912,16 +932,7 @@ impl Inner {
                             .and_then(|run| self.adopt_observer(run));
                         proxies.insert(
                             listing.id.clone(),
-                            Proxy {
-                                output: Arc::new(OutputSlot::new(nowhere())),
-                                observer,
-                                run_id: listing.run_id.clone(),
-                                viewed: false,
-                                starting: false,
-                                deferred_exit: None,
-                                failing: Arc::default(),
-                                end_sent: false,
-                            },
+                            Proxy::new(nowhere(), observer, listing.run_id.clone(), false, false),
                         );
                     }
                 }
@@ -1125,6 +1136,39 @@ impl Inner {
         }
     }
 
+    /// One frame a session sent, on the delivery thread, in the order sent.
+    fn deliver(self: &Arc<Self>, conn: &Connection, frame: HostFrame, payload: &[u8]) {
+        match frame {
+            HostFrame::Output { session } => self.output(conn, &session, payload),
+            HostFrame::End { session } => self.end(&session),
+            HostFrame::Loss { loss } => {
+                if let Some(events) = self.events() {
+                    events.loss(loss);
+                }
+            }
+            HostFrame::Notice { notice } => match notice.into_notice() {
+                Ok(notice) => crate::alerts::offer(notice),
+                Err(error) => log::warn!(target: "terminal", "{error}"),
+            },
+            HostFrame::ScanDrops { dropped } => crate::alerts::record_scan_drops(dropped),
+            // Off this thread too: a run's receipt is a store write, and the
+            // output of every other session waits behind delivery.
+            HostFrame::Exit { ended } => {
+                let inner = self.clone();
+                if let Err(error) = crate::supervisor::spawn_one_of_many(
+                    "terminal-host-exit",
+                    "terminal host exit",
+                    move || inner.record_exit(ended),
+                ) {
+                    log::error!(target: "terminal", "a terminal exit could not be recorded now; the host keeps it for the next connect: {error}");
+                }
+            }
+            HostFrame::Reply { id, .. } => {
+                log::warn!(target: "terminal", "reply {id} reached delivery; it is answered on the reader");
+            }
+        }
+    }
+
     fn end(&self, session: &str) {
         let slot = lock(&self.proxies).get_mut(session).map(|p| {
             p.end_sent = true;
@@ -1227,13 +1271,14 @@ impl Inner {
                 });
             }
         }
-        let mut child =
-            crate::procguard::with_inheritance_lock(|| command.spawn()).map_err(|e| {
-                format!(
-                    "The terminal host ({}) could not start: {e}",
-                    binary.display()
-                )
-            })?;
+        // Under the inheritance lock, and not registered with procguard: its
+        // quit sweep must never reach the host.
+        let mut child = crate::procguard::LockedSpawn::spawn_locked(&mut command).map_err(|e| {
+            format!(
+                "The terminal host ({}) could not start: {e}",
+                binary.display()
+            )
+        })?;
         log::info!(target: "terminal", "started the terminal host (pid {})", child.id());
         // Reaped when it ends, so a host that exits while this app runs is not
         // left a zombie. The app never signals it.
@@ -1365,7 +1410,38 @@ fn probe(path: &std::path::Path, request: Request) -> Result<serde_json::Value, 
         .ok_or_else(|| "the host's answer carried nothing".into())
 }
 
+/// Reads the host's frames. Replies are resolved here and nothing else is
+/// done here: everything a session sends — output, its end, a loss, a notice,
+/// its exit — goes, in order, to the connection's delivery thread. A listener
+/// that answers output with a call to the host (an acknowledgement, a write)
+/// then waits on a reply this thread is free to read; done here, it would wait
+/// on itself.
 fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<UnixStream>) {
+    let (deliver, deliveries) = mpsc::channel::<(HostFrame, Vec<u8>)>();
+    let delivering = {
+        let (inner, conn) = (inner.clone(), conn.clone());
+        crate::supervisor::spawn_one_of_many(
+            "terminal-host-delivery",
+            "terminal host delivery",
+            move || {
+                for (frame, payload) in deliveries {
+                    let Some(inner) = inner.upgrade() else {
+                        break;
+                    };
+                    inner.deliver(&conn, frame, &payload);
+                }
+            },
+        )
+    };
+    if let Err(error) = delivering {
+        log::error!(target: "terminal", "the terminal host connection could not deliver output: {error}");
+        if let Some(inner) = inner.upgrade() {
+            inner.lost(&conn);
+        } else {
+            conn.close();
+        }
+        return;
+    }
     loop {
         let frame = match proto::read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
@@ -1377,51 +1453,28 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
                 break;
             }
         };
-        let Some(inner) = inner.upgrade() else {
-            break;
-        };
         let (header, payload) = frame;
-        let frame = match proto::decode::<HostFrame>(&header) {
-            Ok(frame) => frame,
-            Err(error) => {
-                log::warn!(target: "terminal", "the terminal host sent a frame this app cannot read; disconnecting: {error}");
-                break;
-            }
-        };
-        match frame {
-            HostFrame::Reply { id, ok, error } => conn.resolve(
+        match proto::decode::<HostFrame>(&header) {
+            Ok(HostFrame::Reply { id, ok, error }) => conn.resolve(
                 id,
                 match error {
                     Some(error) => Err(error),
                     None => Ok(ok.unwrap_or(serde_json::Value::Null)),
                 },
             ),
-            HostFrame::Output { session } => inner.output(&conn, &session, &payload),
-            HostFrame::End { session } => inner.end(&session),
-            HostFrame::Loss { loss } => {
-                if let Some(events) = inner.events() {
-                    events.loss(loss);
+            Ok(frame) => {
+                if deliver.send((frame, payload)).is_err() {
+                    break;
                 }
             }
-            HostFrame::Notice { notice } => match notice.into_notice() {
-                Ok(notice) => crate::alerts::offer(notice),
-                Err(error) => log::warn!(target: "terminal", "{error}"),
-            },
-            HostFrame::ScanDrops { dropped } => crate::alerts::record_scan_drops(dropped),
-            // Off this thread: a run's receipt is a store write, and output of
-            // every other session waits behind this loop.
-            HostFrame::Exit { ended } => {
-                let inner = inner.clone();
-                if let Err(error) = crate::supervisor::spawn_one_of_many(
-                    "terminal-host-exit",
-                    "terminal host exit",
-                    move || inner.record_exit(ended),
-                ) {
-                    log::error!(target: "terminal", "a terminal exit could not be recorded now; the host keeps it for the next connect: {error}");
-                }
+            Err(error) => {
+                log::warn!(target: "terminal", "the terminal host sent a frame this app cannot read; disconnecting: {error}");
+                break;
             }
         }
     }
+    // What was read is still delivered; the delivery thread ends after it.
+    drop(deliver);
     if let Some(inner) = inner.upgrade() {
         inner.lost(&conn);
     } else {

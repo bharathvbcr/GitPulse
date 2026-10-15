@@ -317,7 +317,6 @@ impl Host {
                 }
                 json(())
             }
-            Request::LaneThreads => json(self.engine.lane_threads()),
             Request::Hello { .. }
             | Request::Retire
             | Request::Write { .. }
@@ -338,10 +337,15 @@ impl Host {
                 id,
                 Err("this connection has already introduced itself".into()),
             ),
+            // Inline: a counter update under a short lock. Answered, so an
+            // acknowledgement the window refuses is refused to the view, as
+            // in-process.
             Request::Ack { session, bytes } => {
-                if let Err(error) = engine::acknowledge_output(&self.engine, &session, bytes) {
-                    log::debug!(target: "terminal_host", "an acknowledgement was refused: {error}");
-                }
+                conn.reply(
+                    id,
+                    engine::acknowledge_output(&self.engine, &session, bytes)
+                        .map(|()| serde_json::Value::Null),
+                );
             }
             Request::Background { sessions } => {
                 engine::set_background_sessions(&self.engine, &sessions);

@@ -30,7 +30,12 @@ async fn write_to_host(
             super::MAX_PTY_INPUT_BYTES
         ));
     }
-    host.write(session_id, bytes).await
+    let lane = host.input_lane(&session_id)?;
+    let host = host.clone();
+    lane.run("terminal_write", move || {
+        host.write_blocking(&session_id, &bytes)
+    })
+    .await
 }
 
 /// Delivers keystrokes to a session, in the order the calls were made.
@@ -65,7 +70,13 @@ pub async fn resize_async(
 ) -> Result<(), String> {
     #[cfg(unix)]
     if let Some(host) = &state.host {
-        return host.resize(session_id, rows, cols).await;
+        let lane = host.geometry_lane(&session_id)?;
+        let host = host.clone();
+        return lane
+            .run("terminal_resize", move || {
+                host.resize_blocking(&session_id, rows, cols)
+            })
+            .await;
     }
     let lane = state.geometry_lane(&session_id)?;
     let state = state.clone();

@@ -66,7 +66,7 @@ impl View {
         let app = tauri::test::mock_builder()
             .build(gitpulse_lib::context())
             .unwrap();
-        let state = TerminalSessions::default();
+        let state = common::terminals();
         state.set_output_stall_timeout(stall);
         let acking = Arc::new(AtomicBool::new(true));
         let owed = Arc::new(Mutex::new(Vec::new()));

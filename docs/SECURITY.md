@@ -267,6 +267,14 @@ flowchart TD
   native launch validation alone does not prove the provider's effective policy.
   See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the verification limits.
 - Model-assisted remediation actions (`cmd_manvi_run_action`) are restricted to a strict command allowlist and require explicit user confirmation.
+- With "Keep terminals running when GitPulse quits" on (off by default), the PTYs live in a
+  separate process, `gitpulse-ptyd`, reached over a unix socket that only the same user can
+  connect to (`0700` directory, `0600` socket, peer uid checked on every connection). Repository
+  validation, trust and `require_unsubstitutable_dir` run in that process, where the fork
+  happens; a session-only trust grant never reaches it. What this widens and why it grants a
+  same-user process nothing it did not already have is the security-impact statement in
+  [Terminal host](TERMINAL_HOST.md#security-impact-statement), which awaits the owner's sign-off
+  before the host becomes the default.
 
 ### GitHub Alert Scans
 - Opening a repository fetches Dependabot and code scanning alerts through the

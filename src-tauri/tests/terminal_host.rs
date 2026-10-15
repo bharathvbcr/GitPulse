@@ -93,12 +93,15 @@ fn trust_is_checked_in_the_host_and_a_session_grant_does_not_reach_it() {
     assert!(list_sessions(&app.state).unwrap().is_empty());
 }
 
+/// Each session's output messages, in arrival order.
+type Output = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
 /// What one app sees: output per session (acknowledged as it arrives, as a
 /// view does), losses and exits.
 struct App {
     app: tauri::App<tauri::test::MockRuntime>,
     state: TerminalSessions,
-    output: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    output: Output,
     losses: Arc<Mutex<Vec<serde_json::Value>>>,
     exits: mpsc::Receiver<serde_json::Value>,
 }
@@ -110,7 +113,7 @@ impl App {
             .unwrap();
         let state = terminals(dir);
         state.bind_app(app.handle());
-        let output: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::default();
+        let output: Output = Arc::default();
         let (seen, acks) = (output.clone(), state.clone());
         app.listen_any("terminal-output", move |event| {
             let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();

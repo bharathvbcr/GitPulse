@@ -53,7 +53,15 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   [
     "Request",
-    "desktop::instance wire type: a second GitPulse launch sends it to the running owner over the profile's unix socket; both ends are Rust, and it never reaches the frontend",
+    "desktop::instance wire type: a second GitPulse launch sends it to the running owner over the profile's unix socket; both ends are Rust, and it never reaches the frontend. The terminal host's `terminal::host::proto::Request` is the same kind of type: app to gitpulse-ptyd, Rust at both ends",
+  ],
+  [
+    "HostFrame",
+    "terminal::host::proto wire type: gitpulse-ptyd to the app over the terminal host socket; both ends are Rust, and the frontend sees only the Tauri events and channel bytes the app makes of it",
+  ],
+  [
+    "Place",
+    "part of a terminal host spawn request (app to gitpulse-ptyd); the frontend spawns with repoPath/startDir or a task run id and never sees it",
   ],
 ]);
 

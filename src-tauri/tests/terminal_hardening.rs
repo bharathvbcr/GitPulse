@@ -125,7 +125,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_session_limit(100);
     let dir = repo();
@@ -213,7 +213,7 @@ fn unread_flood(total: usize, budget: Duration) {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_output_stall_timeout(Duration::from_millis(10));
     let delivered = Arc::new(AtomicUsize::new(0));
@@ -284,7 +284,7 @@ fn invalid_utf8_and_split_multibyte_sequences_arrive_byte_exact_at_every_alignme
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (output, exits) = collecting(&app, &state);
     let dir = repo();
@@ -341,7 +341,7 @@ fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (output, exits) = collecting(&app, &state);
     let dir = repo();
@@ -393,7 +393,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (_output, exits) = collecting(&app, &state);
     let dir = repo();

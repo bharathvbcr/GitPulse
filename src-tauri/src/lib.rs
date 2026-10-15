@@ -166,7 +166,9 @@ pub fn run() {
             Some(vec!["--background"]),
         ))
         .manage(crate::watcher::WatcherState::default())
-        .manage(crate::terminal::TerminalSessions::default())
+        // In the app, or in the terminal host when the user chose to keep
+        // terminals running across quits (Settings → Agents).
+        .manage(crate::terminal::TerminalSessions::from_settings())
         .manage(desktop::DesktopState::default())
         .manage(workbench::WorkbenchState::default())
         .setup(|app| {
@@ -247,13 +249,37 @@ pub fn run() {
                 use tauri::Manager as _;
                 // The user's terminal session limit, before any window can
                 // open a session. A file this cannot read keeps the default.
-                app.state::<terminal::TerminalSessions>().apply_stored_limit();
+                let terminals = app.state::<terminal::TerminalSessions>().inner().clone();
+                terminals.apply_stored_limit();
                 let state = app.state::<workbench::WorkbenchState>().inner().clone();
-                state.attach_terminals(app.state::<terminal::TerminalSessions>().inner().clone());
+                state.attach_terminals(terminals.clone());
+                // Sessions a terminal host kept from an earlier app report
+                // here, and a task run among them is observed again.
+                terminals.bind_app(app.handle());
+                #[cfg(unix)]
+                {
+                    let (handle, runs) = (app.handle().clone(), state.clone());
+                    terminals.set_adopter(std::sync::Arc::new(move |run_id: &str| {
+                        workbench::terminal_run::adopted_observer(&handle, &runs, run_id)
+                    }));
+                }
+                log::info!(target: "terminal", "terminal sessions are held {}", match terminals.backend() {
+                    "host" => "by the terminal host and survive a quit",
+                    _ => "in the app",
+                });
                 if let Err(error) = supervisor::spawn_once(
                     "task-run-reconcile",
                     "task run reconcile",
-                    move || match state.reconcile_stale_runs() {
+                    move || {
+                        // First: what the host holds is adopted and what ended
+                        // while no app was there is recorded, so no run whose
+                        // agent is still alive in the host is released, and an
+                        // agent that finished gets its real exit. A host that
+                        // cannot be reached answers every run as held.
+                        if let Err(error) = terminals.connect_host() {
+                            log::error!(target: "terminal", "the terminal host could not be reached at startup; its runs are left alone: {error}");
+                        }
+                        match state.reconcile_stale_runs() {
                         Ok(0) => {}
                         Ok(released) => {
                             log::info!(target: "workbench", "released {released} task run(s) left behind by an earlier session");
@@ -261,6 +287,7 @@ pub fn run() {
                         Err(error) => {
                             log::warn!(target: "workbench", "task run reconciliation failed: {}: {}", error.code, error.message);
                         }
+                    }
                     })
                 {
                     log::warn!(target: "workbench", "task run reconciliation did not start: {error}");
@@ -496,6 +523,7 @@ pub fn run() {
             cmd_terminal_resize,
             cmd_terminal_kill,
             cmd_terminal_incidents,
+            cmd_terminal_backend,
             cmd_terminal_context,
             cmd_terminal_sessions,
             cmd_terminal_attach,
