@@ -1379,22 +1379,33 @@ impl GitReader {
         Ok(Self::diff_payload(text))
     }
 
+    /// The argv words that make `git show` render a merge as ordinary changes
+    /// against its first parent: the one owner of "how a merge is rendered".
+    /// The default (`--cc`) draws the patch as @@@ hunks the frontend cannot
+    /// number and a clean merge as nothing at all. `--diff-merges=first-parent`
+    /// needs git >= 2.31; an older git gets `-m --first-parent`, which says the
+    /// same but follows `log.diffMerges`, so it is only the fallback.
+    fn merge_render_args(modern: bool) -> &'static [&'static str] {
+        if modern {
+            &["--diff-merges=first-parent"]
+        } else {
+            &["-m", "--first-parent"]
+        }
+    }
+
+    fn merge_render_args_here() -> &'static [&'static str] {
+        Self::merge_render_args(git_cli::git_supports(git_cli::DIFF_MERGES_OPTION))
+    }
+
     /// The one `git show` argv for a commit's patch, whole or narrowed to one
-    /// path. `--diff-merges=first-parent` renders a merge as ordinary hunks
-    /// against its first parent instead of the combined `--cc` format whose
-    /// @@@ headers the frontend cannot number (and which renders a clean
-    /// merge as nothing at all); git >= 2.31. Both commit-diff readers go
-    /// through here so they cannot disagree about a merge.
+    /// path. The file list and the details read below take their merge
+    /// rendering from [`Self::merge_render_args`] too, so the list, the counts
+    /// and the hunks cannot disagree about a merge.
     fn commit_show_args<'a>(commit_id: &'a str, pathspec: Option<&'a str>) -> Vec<&'a str> {
-        let mut args = vec![
-            "-c",
-            "core.quotepath=off",
-            "show",
-            "--unified=3",
-            "--diff-merges=first-parent",
-            "--format=",
-            commit_id,
-        ];
+        let mut args = vec!["-c", "core.quotepath=off", "show", "--unified=3"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.push("--format=");
+        args.push(commit_id);
         if let Some(spec) = pathspec {
             args.push("--");
             args.push(spec);
@@ -1437,10 +1448,10 @@ impl GitReader {
     ) -> Result<Vec<CommitFileChange>, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let stdout = git_text(
-            &repo,
-            &["show", "--pretty=format:", "--numstat", "-z", commit_id],
-        )?;
+        let mut args = vec!["show", "--pretty=format:", "--numstat", "-z"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.push(commit_id);
+        let stdout = git_text(&repo, &args)?;
         // Not capped here: this returns a bare `Vec`, which cannot say it is
         // a prefix, and a cut slice read as the whole list is the failure the
         // payload budgets exist to prevent. The commit pane no longer comes
@@ -1579,17 +1590,14 @@ impl GitReader {
     ) -> Result<CommitDetails, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let args = [
-            "show",
-            "--numstat",
-            "-z",
-            // `%ad`/`%cd` follow `log.date`; pin git's default rendering
-            // so a developer's `relative` or `human` does not stale the
-            // dates the panel shows.
-            "--date=default",
-            COMMIT_SHOW_FORMAT,
-            commit_id,
-        ];
+        let mut args = vec!["show", "--numstat", "-z"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        // `%ad`/`%cd` follow `log.date`; pin git's default rendering
+        // so a developer's `relative` or `human` does not stale the
+        // dates the panel shows.
+        args.push("--date=default");
+        args.push(COMMIT_SHOW_FORMAT);
+        args.push(commit_id);
         let (stdout, cut) = if crate::engine::git_writer::is_full_oid(commit_id) {
             ref_cache::git_text_capped(&repo, &[], &args, cap)?
         } else {
@@ -8951,6 +8959,253 @@ mod tests {
             .text;
         assert!(!one.contains("@@@") && !one.contains("diff --cc"), "{one}");
         assert!(one.contains("new name.txt"), "{one}");
+    }
+
+    /// Without `--diff-merges` (git < 2.31) the same first-parent rendering is
+    /// spelled `-m --first-parent`; the modern spelling must not leak into it.
+    #[test]
+    fn merge_rendering_has_a_spelling_for_git_before_diff_merges() {
+        assert_eq!(
+            GitReader::merge_render_args(true),
+            ["--diff-merges=first-parent"]
+        );
+        assert_eq!(
+            GitReader::merge_render_args(false),
+            ["-m", "--first-parent"]
+        );
+    }
+
+    /// Per-file sections of a patch, keyed by the `b/` path (fixtures use
+    /// names without spaces) with the added and removed line counts.
+    fn patch_file_counts(patch: &str) -> std::collections::BTreeMap<String, (usize, usize)> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut current: Option<String> = None;
+        for line in patch.lines() {
+            if let Some(rest) = line.strip_prefix("diff --git ") {
+                let name = rest.rsplit_once(" b/").map(|(_, b)| b.to_string());
+                if let Some(name) = &name {
+                    out.insert(name.clone(), (0, 0));
+                }
+                current = name;
+            } else if let Some(name) = &current {
+                let entry = out.get_mut(name).expect("section");
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    entry.0 += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    entry.1 += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The row list, the details' rows and the hunks are three reads of one
+    /// commit: for any merge, the files listed are the files whose diff is
+    /// non-empty and the counts are the hunks' counts.
+    fn assert_commit_view_agrees(path: &str, oid: &str, label: &str) {
+        let whole = GitReader::get_commit_diff(path, oid).expect(label).text;
+        let hunks = patch_file_counts(&whole);
+        let listed = GitReader::get_commit_files(path, oid).expect(label);
+        let details = GitReader::get_commit_details(path, oid).expect(label);
+        let from_list: std::collections::BTreeMap<String, (usize, usize)> = listed
+            .iter()
+            .map(|f| (f.path.clone(), (f.additions, f.deletions)))
+            .collect();
+        let from_details: std::collections::BTreeMap<String, (usize, usize)> = details
+            .changed_files
+            .iter()
+            .map(|f| (f.path.clone(), (f.additions, f.deletions)))
+            .collect();
+        assert_eq!(from_list, hunks, "{label}: list vs hunks\n{whole}");
+        assert_eq!(from_details, hunks, "{label}: details vs hunks\n{whole}");
+        for file in hunks.keys() {
+            let one = GitReader::get_commit_file_diff(path, oid, file)
+                .expect(label)
+                .text;
+            assert!(!one.is_empty(), "{label}: {file} row opens an empty diff");
+            assert_eq!(
+                patch_file_counts(&one).get(file.as_str()),
+                hunks.get(file),
+                "{label}: {file}: per-file vs whole\n{one}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_view_list_counts_and_hunks_agree_for_every_merge_shape() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let commit = |file: &str, body: &str, msg: &str| {
+            std::fs::write(dir.path().join(file), body).unwrap();
+            git_in(dir.path(), &["add", "."]);
+            git_in(dir.path(), &["commit", "-m", msg]);
+        };
+        let head = || rev_parse_at(dir.path(), "HEAD");
+        commit("shared.txt", "a\nb\nc\nd\ne\n", "shared");
+
+        // Clean merge where only the second parent added files.
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        commit("side1.txt", "s1\n", "side1");
+        commit("side2.txt", "s2\ns2b\n", "side2");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("main1.txt", "m1\n", "main1");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "side", "-m", "clean"],
+        );
+        assert_commit_view_agrees(path, &head(), "clean merge");
+
+        // Conflict resolved by hand, plus a shared edit both sides made.
+        git_in(dir.path(), &["checkout", "-q", "-b", "c1"]);
+        commit("clash.txt", "one\nsame\n", "c1");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("clash.txt", "two\nsame\n", "c2");
+        let _ = std::process::Command::new("git")
+            .args(["merge", "-q", "c1", "-m", "conflict"])
+            .current_dir(dir.path())
+            .output_locked();
+        std::fs::write(dir.path().join("clash.txt"), "resolved\nsame\nextra\n").unwrap();
+        git_in(dir.path(), &["add", "clash.txt"]);
+        git_in(dir.path(), &["commit", "-q", "-m", "resolved"]);
+        assert_commit_view_agrees(path, &head(), "conflict merge");
+
+        // Evil merge: changes a file neither parent changed.
+        git_in(dir.path(), &["checkout", "-q", "-b", "e1"]);
+        commit("e1.txt", "e1\n", "e1");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("m2.txt", "m2\n", "m2");
+        git_in(dir.path(), &["merge", "--no-ff", "--no-commit", "-q", "e1"]);
+        std::fs::write(dir.path().join("shared.txt"), "a\nEVIL\nc\nd\ne\n").unwrap();
+        git_in(dir.path(), &["add", "shared.txt"]);
+        git_in(dir.path(), &["commit", "-q", "-m", "evil"]);
+        assert_commit_view_agrees(path, &head(), "evil merge");
+
+        // Octopus.
+        for b in ["o1", "o2"] {
+            git_in(dir.path(), &["checkout", "-q", "-b", b, "main"]);
+            commit(&format!("{b}.txt"), &format!("{b}\n"), b);
+        }
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("o3.txt", "o3\n", "o3");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "o1", "o2", "-m", "octopus"],
+        );
+        assert_commit_view_agrees(path, &head(), "octopus");
+    }
+
+    /// Pathspec edges through a merge: a directory, a path renamed on the
+    /// second parent, and a submodule gitlink all open the diff the whole
+    /// commit shows for them.
+    #[test]
+    fn merge_file_diff_pathspec_edges() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "old"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "second"]);
+        git_in(dir.path(), &["mv", "old.txt", "renamed.txt"]);
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/inner.txt"), "inner\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "rename and dir"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "second", "-m", "merge"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+
+        let dir_diff = GitReader::get_commit_file_diff(path, &oid, "pkg")
+            .expect("directory")
+            .text;
+        assert!(dir_diff.contains("+inner"), "{dir_diff}");
+        let renamed = GitReader::get_commit_file_diff(path, &oid, "renamed.txt")
+            .expect("renamed")
+            .text;
+        // The row exists and opens a diff. (Its counts are the rename's 0/0
+        // while the one-path read shows the file as added: a narrowed pathspec
+        // cannot pair the rename, merge or not.)
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        assert!(listed.iter().any(|f| f.path == "renamed.txt"), "{listed:?}");
+        assert!(renamed.contains("renamed.txt"), "{renamed}");
+        assert!(!renamed.contains("@@@"), "{renamed}");
+    }
+
+    /// A submodule added on the second parent: the list row and the per-file
+    /// diff both exist for the gitlink.
+    #[test]
+    fn merge_file_diff_covers_a_submodule_added_on_the_second_parent() {
+        let sub = init_repo_with_remotes(&[], "main");
+        std::fs::write(sub.path().join("f.txt"), "f\n").unwrap();
+        git_in(sub.path(), &["add", "."]);
+        git_in(sub.path(), &["commit", "-m", "sub"]);
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["checkout", "-q", "-b", "second"]);
+        git_in(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.path().to_str().unwrap(),
+                "vendored",
+            ],
+        );
+        git_in(dir.path(), &["commit", "-m", "add submodule"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        // The checked-out submodule is untracked on main and would block the merge.
+        std::fs::remove_dir_all(dir.path().join("vendored")).unwrap();
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "second", "-m", "merge"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        assert!(listed.iter().any(|f| f.path == "vendored"), "{listed:?}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "vendored")
+            .expect("gitlink")
+            .text;
+        assert!(one.contains("Subproject commit"), "{one}");
+    }
+
+    /// A merge whose first-parent diff passes the cap: the per-file read says
+    /// it is cut, like the whole-commit read, while the row list is whole.
+    #[test]
+    fn merge_first_parent_diff_over_the_cap_is_reported_truncated() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["checkout", "-q", "-b", "big"]);
+        let line = "0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        let body = line.repeat(budget::MAX_DIFF_BYTES / line.len() + 4096);
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "big"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "big", "-m", "merge"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole");
+        let one = GitReader::get_commit_file_diff(path, &oid, "big.txt").expect("one");
+        assert!(whole.truncated && one.truncated);
+        assert!(one.truncation_reason.is_some());
+        assert!(one.text.len() <= budget::MAX_DIFF_BYTES);
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
     }
 
     /// Helper for merge_commit_renders_standard_hunks_against_first_parent:
