@@ -53,8 +53,8 @@ pub use governor::{
 #[cfg(test)]
 pub(crate) use governor::{inject as inject_governor, injected_input as injected_governor_input};
 pub use procscan::{
-    terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree, MemguardHealth,
-    Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
+    observe_sessions, terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree,
+    MemguardHealth, Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
 };
 pub use sampler::{
     pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput, Role,

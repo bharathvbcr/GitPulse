@@ -491,6 +491,33 @@ A steady-state tick (warm scan, probe and publish, p95 summed) costs about
 asked for a benchmark on about 1,000 processes; this table had 920, and the
 row says how many it read rather than assuming.
 
+### Hook session scan
+
+`gitpulse-hook` is a new process on every call, so the in-process cold row
+above is not what the collision guard pays. `observe_sessions` — the read
+that guard makes on a file write — used to run the full table scan. It now
+lists pids and reads arguments only for a process whose short name could be
+an agent, or whose name is empty or a version string and whose resolved
+executable could. Footprints and disk writes stay on the sampler's scan.
+
+Measured on 2026-10-14 in fresh release processes, 15 samples each
+(`GITPULSE_HOST_LOAD_ONCE` on the `host_load` bench). The before table had
+1,247–1,250 processes and 33 sessions. The after table had 1,197–1,205
+processes and 35 sessions. Compare the **min**.
+
+| Row | min | p50 | p95 | worst |
+|---|---|---|---|---|
+| before, full scan (what `observe_sessions` paid) | 20.34 ms | 22.95 ms | 29.61 ms | 29.82 ms |
+| after, `observe_sessions` | 3.76 ms | 5.84 ms | 14.02 ms | 15.12 ms |
+| after, full scan (the sampler's path, left as it was) | 17.70 ms | 21.42 ms | 33.82 ms | 34.85 ms |
+
+`collision_risk_for_path` on this checkout, same fresh processes, still
+spends most of its time listing git worktrees. Before: min 377.5 ms, p50
+646.0 ms, p95 969.0 ms, worst 1005.2 ms, 12 worktrees. After: min 287.1 ms,
+p50 340.6 ms, p95 563.7 ms, worst 1049.4 ms, 11 worktrees. `sessions_ok` was
+true on every sample. A scan that cannot list the table is still an error,
+not an empty session list.
+
 ### 10-minute soak
 
 `cargo test --release --manifest-path src-tauri/Cargo.toml --test host_load_soak -- --ignored --nocapture`
