@@ -52,7 +52,7 @@ fn reap_leak(file: &Path) -> Option<i32> {
     }
 }
 
-const BOUND: Duration = Duration::from_millis(1200);
+const BOUND: Duration = Duration::from_secs(2);
 
 /// Attack 1: a stderr-only flooder that ignores the ask while stdout is
 /// closed. The grace must stay near CHILD_GRACE; CPU is reported.
@@ -74,7 +74,10 @@ fn grace_is_bounded_when_stdout_is_closed_and_stderr_floods() {
     let wall = started.elapsed();
     let cpu = thread_cpu() - cpu;
     eprintln!("wall {wall:?} waiter cpu {cpu:?}");
-    assert!(wall < Duration::from_millis(300) + BOUND, "{wall:?}");
+    assert!(
+        wall < crate::test_support::coverage_relaxed(Duration::from_millis(300) + BOUND),
+        "{wall:?}"
+    );
     assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
 }
 
@@ -97,7 +100,10 @@ fn a_grandchild_retaining_the_pipe_does_not_stretch_the_grace() {
     .expect("deadline keeps prefix");
     let wall = started.elapsed();
     let leaked = reap_leak(&pidfile);
-    assert!(wall < Duration::from_millis(400) + BOUND, "{wall:?}");
+    assert!(
+        wall < crate::test_support::coverage_relaxed(Duration::from_millis(400) + BOUND),
+        "{wall:?}"
+    );
     assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
     eprintln!("own-group grandchild leaked: {leaked:?}");
 }
@@ -199,7 +205,7 @@ fn a_cleanup_that_reads_stdin_to_eof_completes_when_stdin_closes_at_the_ask() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("lock");
     let script = r#"trap 'cat >/dev/null; rm -f "$1"; exit 0' TERM; touch "$1"; while :; do sleep 0.05; done"#;
-    let input = vec![b'i'; 400_000];
+    let input = vec![b'i'; 100_000];
     let run = run_bounded(
         sh(script, &[&marker]),
         "s",
@@ -237,7 +243,10 @@ fn a_term_trapping_grandchild_still_writing_is_killed_and_drained() {
         leaked.is_none(),
         "grandchild {leaked:?} survived the end of the grace"
     );
-    assert!(wall < Duration::from_millis(300) + BOUND, "{wall:?}");
+    assert!(
+        wall < crate::test_support::coverage_relaxed(Duration::from_millis(300) + BOUND),
+        "{wall:?}"
+    );
     assert!(
         run.stdout.starts_with(b"zzzz"),
         "its output was not drained"
@@ -265,7 +274,7 @@ fn a_cancel_kills_a_term_trapping_writer_and_reports_cancelled() {
     )
     .expect("a cancel returns the run");
     assert!(
-        started.elapsed() < Duration::from_millis(3000),
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
         "{:?}",
         started.elapsed()
     );

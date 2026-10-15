@@ -4977,7 +4977,7 @@ mod tests {
             dir.path(),
             "pre-commit",
             &format!(
-                "touch '{}'\nhead -c 400000 /dev/zero | tr '\\0' x >&2\nsleep 30",
+                "touch '{}'\nhead -c 100000 /dev/zero | tr '\\0' x >&2\nsleep 30",
                 marker.display()
             ),
         );

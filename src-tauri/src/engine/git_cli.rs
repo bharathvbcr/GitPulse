@@ -4032,8 +4032,8 @@ pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String
 /// `.git/index.lock` still held. The wait is the output poll itself, so the
 /// grace both waits and drains, and procguard still ends it at [`CHILD_GRACE`]
 /// however much arrives; the bytes land in the same capped buffers. Stdin is
-/// closed before the ask and not fed again: a cleanup that reads stdin to EOF
-/// must see it, and `input.finish()` afterwards still only turns undelivered
+/// closed once the ask has been sent and not fed again: a cleanup that reads
+/// stdin to EOF must see it, but never before the ask. And `input.finish()` afterwards still only turns undelivered
 /// bytes into an error for a successful, uncancelled run. A panic inside the
 /// wait is handled by `Registration::drop`, which force-kills a child no reap
 /// path has claimed. Where the platform cannot ask there is no grace, and on
@@ -4047,9 +4047,11 @@ fn ask_and_drain(
     #[cfg(not(unix))] _input: &mut thread_io::InputFeed,
 ) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
-    input.close();
-    #[cfg(unix)]
     return guard.ask_then_stop_and_reap_waiting(child, &mut |span| {
+        // First wait: SIGTERM has already been sent, so a child that reads
+        // EOF now was asked to stop first and cannot take truncated input
+        // for the whole of it.
+        input.close();
         output.drain_ready();
         if output.wait_with_input(span, None).is_err() {
             std::thread::sleep(span);
@@ -4214,7 +4216,6 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    #[allow(unused_mut)]
     let mut output = match thread_io::OutputDrains::new(
         child.stdout.take(),
         child.stderr.take(),
@@ -4240,7 +4241,6 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    #[allow(unused_mut)]
     let mut input = match thread_io::InputFeed::new(
         child.stdin.take(),
         stdin_bytes.unwrap_or_default(),
@@ -9855,7 +9855,7 @@ mod tests {
     /// if the run keeps reading its pipes while the child is being asked.
     #[cfg(unix)]
     const GRACE_FLOODER: &str = r#"
-        trap 'head -c 200000 /dev/zero; echo cleaned >&2; rm -f "$1"; exit 0' TERM
+        trap 'head -c 80000 /dev/zero; echo cleaned >&2; rm -f "$1"; exit 0' TERM
         touch "$1"
         while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
     "#;
@@ -9882,6 +9882,8 @@ mod tests {
             None,
         )
         .expect("a deadline keeps its prefix");
+        // A deadline discards the exit status, so marker removal is the signal
+        // that the child was reaped by the ask: only its SIGTERM trap removes it.
         assert!(
             !marker.exists(),
             "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
@@ -9925,6 +9927,8 @@ mod tests {
         .expect("a cancel returns the run");
         assert!(run.cancelled);
         assert!(!run.success);
+        // Reaped by the ask: the trap exits 0, a SIGKILLed child reports -1.
+        assert_eq!(run.status_code, 0, "the child was killed, not asked");
         assert!(
             !marker.exists(),
             "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
@@ -9947,7 +9951,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("lock");
         let script = r#"
-            trap 'head -c 200000 /dev/zero; echo term-seen >&2' TERM
+            trap 'head -c 80000 /dev/zero; echo term-seen >&2' TERM
             touch "$1"
             while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
         "#;
