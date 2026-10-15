@@ -289,10 +289,22 @@ impl SharedBudget {
         }
         let mut file: &File = &locked.file;
         let record = encode(state);
-        file.seek(SeekFrom::Start(0))
-            .and_then(|_| file.write_all(&record))
-            .and_then(|_| file.set_len(RECORD_LEN as u64))
-            .map_err(|e| format!("could not write {}: {e}", self.path.display()))
+        let mut put = |(at, bytes): (u64, &[u8])| -> std::io::Result<()> {
+            file.seek(SeekFrom::Start(at))?;
+            file.write_all(bytes)
+        };
+        let [blank, body, commit] = commit_steps(&record);
+        // The truncation can fail, so it comes after the record is blanked (a
+        // longer file is undecodable already, and cutting it down to a valid
+        // looking prefix first would make it decodable) and before the byte
+        // that makes the record valid, so nothing can fail once it has landed.
+        let mut write = || -> std::io::Result<()> {
+            put(blank)?;
+            put(body)?;
+            locked.file.set_len(RECORD_LEN as u64)?;
+            put(commit)
+        };
+        write().map_err(|e| format!("could not write {}: {e}", self.path.display()))
     }
 
     /// Makes every later write through this handle fail (or succeed again).
@@ -351,6 +363,23 @@ fn encode(state: State) -> [u8; RECORD_LEN] {
     record[12..16].copy_from_slice(&std::process::id().to_le_bytes());
     record[16..24].copy_from_slice(&state.at_ns.to_le_bytes());
     record
+}
+
+/// The writes that put `record` over the previous one, as `(offset, bytes)` in
+/// the order they reach the file. The result is the record's bytes exactly, so
+/// every layout-2 binary reads it and writes over it as before; only the
+/// order is staged.
+///
+/// One 24-byte `write` can be cut short (a full disk, a signal, a crash), and
+/// a prefix of the new bytes over the old ones is a record no writer made:
+/// the new token count under the old refill anchor decodes as current and
+/// credits time the update had already counted, up to a whole burst. So the
+/// first byte of the magic is blanked first and put back last. Until that
+/// last single byte lands the record is undecodable, and an undecodable
+/// record is read as an empty budget: a cut anywhere costs the next taker its
+/// tokens (they refill at the rate), and can never give any.
+fn commit_steps(record: &[u8; RECORD_LEN]) -> [(u64, &[u8]); 3] {
+    [(0, &[0]), (1, &record[1..]), (0, &record[..1])]
 }
 
 /// The little-endian u32 at `at`, when `buf` is long enough to hold it.
@@ -926,6 +955,120 @@ mod tests {
             std::fs::read(&path).unwrap(),
             newer,
             "the newer record was clobbered"
+        );
+    }
+
+    /// The file after only the first `cut` bytes of `record`'s update (the
+    /// bytes of `commit_steps` in the order they are written) reached `old`.
+    fn torn_after(old: &[u8], record: &[u8; RECORD_LEN], cut: usize) -> Vec<u8> {
+        let mut file = old.to_vec();
+        let mut left = cut;
+        for (at, bytes) in commit_steps(record) {
+            let n = left.min(bytes.len());
+            let at = usize::try_from(at).unwrap();
+            file[at..at + n].copy_from_slice(&bytes[..n]);
+            left -= n;
+        }
+        file
+    }
+
+    fn stream_len(record: &[u8; RECORD_LEN]) -> usize {
+        commit_steps(record).iter().map(|(_, b)| b.len()).sum()
+    }
+
+    /// The record file is shared by every installed binary, so how the update
+    /// is staged must not change what a finished update leaves: byte for byte
+    /// the record `encode` makes, over a valid record, over junk, and over a
+    /// longer file once truncated.
+    #[test]
+    fn a_staged_update_leaves_exactly_the_encoded_record() {
+        let record = encode(State {
+            tokens: 77,
+            at_ns: 123_456_789_012,
+        });
+        let len = stream_len(&record);
+        for old in [
+            vec![0u8; RECORD_LEN],
+            vec![0xFFu8; RECORD_LEN],
+            stamped(VERSION, 5, 9 * S),
+            encode(State {
+                tokens: 1,
+                at_ns: 1,
+            })
+            .to_vec(),
+        ] {
+            assert_eq!(torn_after(&old, &record, len), record.to_vec());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let mut long = stamped(VERSION, 5, 9 * S);
+        long.push(7);
+        write_private(&path, &long);
+        let shared = SharedBudget::open(&path).unwrap();
+        assert_eq!(shared.take_at(0, 192, 8, 9 * S), Take::Denied);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), RECORD_LEN as u64);
+        assert!(matches!(
+            decode(&std::fs::read(&path).unwrap()),
+            Record::Current(State { tokens: 0, .. })
+        ));
+    }
+
+    /// A write cut at every byte of its update, over a previous valid record:
+    /// whatever the next taker finds, it holds no more than the finished
+    /// update would have left it. Decoding a torn record as Current used to
+    /// credit time the finished update had already counted (new token count
+    /// under the previous refill anchor), bounded by the burst. A cut that
+    /// leaves the record undecodable costs the next taker its tokens instead
+    /// (an empty reset, refilling at the rate), which is the safe side.
+    #[test]
+    fn a_write_torn_at_any_byte_never_credits_what_the_record_did_not_have() {
+        let (burst, per_sec) = (192u32, 8u32);
+        let mut over_credits = Vec::new();
+        let mut table = Vec::new();
+        // The second anchor carries across a byte boundary between the
+        // previous record and the new one, so a prefix of its bytes is a
+        // refill anchor from neither.
+        for (scenario, t0) in [
+            ("plain", 1_000 * S + 123_456_789),
+            ("carry", (1u64 << 40) - 2 * S),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let shared = budget(&dir);
+            for _ in 0..182 {
+                assert_eq!(shared.take_at(0, burst, per_sec, t0), Take::Granted);
+            }
+            let old = std::fs::read(shared.path()).unwrap();
+            let t1 = t0 + 10 * S;
+            assert_eq!(shared.take_at(0, burst, per_sec, t1), Take::Granted);
+            let new: [u8; RECORD_LEN] = std::fs::read(shared.path()).unwrap().try_into().unwrap();
+            let full = shared.tokens_now(burst, per_sec, t1);
+            assert_eq!(full, 10 + 80 - 1, "{scenario}: the finished update");
+            for cut in 1..stream_len(&new) {
+                let torn = torn_after(&old, &new, cut);
+                let path = dir.path().join(format!("torn-{cut}"));
+                write_private(&path, &torn);
+                let found = SharedBudget::open(&path).unwrap();
+                let held = found.tokens_now(burst, per_sec, t1);
+                let verdict = match decode(&torn) {
+                    Record::Current(_) => "Current",
+                    Record::Newer(_) => "Newer",
+                    Record::Unreadable => "Unreadable",
+                };
+                let over = i64::from(held) - i64::from(full);
+                table.push(format!(
+                    "{scenario:5} cut {cut:2}: {verdict:10} next taker holds {held:3} \
+                     (finished update: {full}), over-credit {over:+}"
+                ));
+                if over > 0 {
+                    over_credits.push(format!("{scenario} cut {cut}: {over:+}"));
+                }
+            }
+        }
+        println!("{}", table.join("\n"));
+        assert!(
+            over_credits.is_empty(),
+            "torn records credited tokens the finished update did not leave: {over_credits:?}\n{}",
+            table.join("\n")
         );
     }
 
