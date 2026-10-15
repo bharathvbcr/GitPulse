@@ -195,7 +195,7 @@
   const set=(name,value)=>{const el=field(name);if(!el)throw new Error(`Missing ${name}`);el.value=value;el.dispatchEvent(new Event("change",{bubbles:true}));};
   const results=[];
   const check=(name,pass)=>{if(!pass){results.push({name,pass:false});throw new Error(name);}report.checks.push(name);results.push({name,pass:true});show();};
-  const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emitExit(run.session_id,{exit_code:0,signal:"",error:null,reaped:true});}};
+  const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emitExit(run.session_id,{exit_code:0,signal:"",error:null,reaped:true,ended_by_gitpulse:false});}};
   const params=new URLSearchParams(location.search);
   const runChecks=async()=>{
     try {
