@@ -1245,3 +1245,54 @@ On git older than 2.37 the scan is count-bounded (`-n cap+1`, window applied
 here); a row past the cap is reported as a possibly cut window, because without
 a date bound nothing says the window does not continue behind it, and the
 window's true size is not claimed.
+
+## 2026-10-15: hub rename stages in one batch (ft-434d7befe170abdb85cb4e91264d9e6e)
+
+Renaming a note that 5,000 notes link to ran one `git add` per rewritten file
+(`GitWriter::stage_file`, about 16 ms each) and one `guard_file` policy call per
+file. Staging is now one `git add --pathspec-from-file=-` per 2,500 files
+(`GitWriter::stage_files_attributed`, which reuses `change_index_with`), and the
+rewrites are judged together (`harness::guard_files`).
+
+### Measured
+
+`docs_rename_benchmark` row `target=hub`, 5,000-note corpus, 5,000 rewrites,
+release build, **min of 3** end to end (`rename_doc`, gate `|_| Ok(())`), on a
+host with other agents building and testing at the same time. Same benchmark
+body for both rows (only the hub run count and a `runs=` column were added).
+
+| build | `rename_end_to_end_ms` (hub) | `git add` processes |
+| --- | --- | --- |
+| before (`0f0e0b4b`) | 150,106 | 5,000 |
+| after | 44,642 | 2 |
+
+The leaf row (1 rewrite, min of 7) is unchanged within noise: 131.5 ms before,
+152.1 ms after.
+
+### What is left in the 44.6 s
+
+It is not git and not policy. It is the durable write of each rewritten note:
+`write_regular_expecting` calls `sync_all` on the temporary file and on the
+directory, which on macOS is `F_FULLFSYNC`. A throwaway measurement of that
+shape alone (file full-fsync, rename, directory full-fsync) costs 7.95 ms per
+file against 0.27 ms for plain `fsync`, which matches 44.6 s / 5,000 = 8.9 ms.
+Amortizing the directory syncs across files in one folder would need a batched
+variant of that shared write transaction; it was not changed here because the
+conflict-resolution saves rely on it.
+
+### Bounds
+
+- Git processes: `ceil(rewrites / 2,500)` for a clean batch, plus one per 128
+  notes whose path is not ASCII. Those go as arguments, not on stdin: on macOS
+  `git add --pathspec-from-file` exits 0 and stages nothing for a decomposed
+  (NFD) spelling, which would have reported such a note staged while it was not
+  (the old per-file `git add` was unaffected). The same fix covers the
+  file-tree selection that shares `change_index_with`. A batch that fails
+  is halved to find the file at fault, at most 64 extra runs per rename; past
+  that the files still ungrouped each carry the batch's error and say it was
+  not attributed to one path. A held `index.lock` is never halved.
+- Policy: one scope lookup, then at most 8 file checks in flight; the first
+  refusal, or a check that could not run, stops new checks. Verdicts are
+  recorded and gated in order, so the rename refuses on the same file it did
+  before. The sidecar protocol has no batch op (`policy.check.file` takes one
+  path), so each rewrite is still judged on its own.

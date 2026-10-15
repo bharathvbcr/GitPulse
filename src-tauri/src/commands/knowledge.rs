@@ -120,8 +120,17 @@ pub(super) fn docs_rename_guarded(
         // appears whether or not either note has links to rewrite.
         fold.record(guard_file(repo_path, plan.from, "delete")?);
         fold.record(guard_file(repo_path, plan.to, "modify")?);
-        for path in plan.rewrites.iter().filter(|path| path.as_str() != plan.to) {
-            fold.record(guard_file(repo_path, path, "modify")?);
+        // Every rewrite is judged on its own path, but together: one scope
+        // lookup and a bounded fan-out to the sidecar, not a round trip per
+        // note while the repository lock is held.
+        let rewrites: Vec<&str> = plan
+            .rewrites
+            .iter()
+            .map(String::as_str)
+            .filter(|path| *path != plan.to)
+            .collect();
+        for verdict in guard_files(repo_path, &rewrites, "modify")? {
+            fold.record(verdict);
         }
         Ok(())
     })?;
@@ -333,6 +342,74 @@ done
                 "{path} was not judged: {asked:?}"
             );
         }
+    }
+
+    /// `count` more notes that all link at `docs/Roadmap.md`, committed.
+    fn add_linking_notes(dir: &tempfile::TempDir, count: usize) -> Vec<String> {
+        let paths: Vec<String> = (0..count)
+            .map(|i| format!("docs/extra-{i:03}.md"))
+            .collect();
+        for path in &paths {
+            write(dir.path(), path, "[r](Roadmap.md)\n");
+        }
+        git_in(dir.path(), &["add", "docs"]);
+        git_in(dir.path(), &["commit", "-qm", "linking notes"]);
+        paths
+    }
+
+    #[test]
+    fn a_hub_rename_judges_every_rewrite_once_and_stages_in_one_batch() {
+        let (dir, repo, script) = bound_doc_repo("nothing/is/denied.md");
+        let extra = add_linking_notes(&dir, 40);
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let (guarded, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md")
+        });
+        let guarded = guarded.expect("rename");
+        assert!(guarded.output.complete, "{:?}", guarded.output);
+        assert_eq!(
+            guarded.output.rewritten_paths.len(),
+            42,
+            "{:?}",
+            guarded.output
+        );
+
+        let asked: Vec<String> = file_requests(&dir.path().join("requests.ndjson"))
+            .iter()
+            .filter_map(|request| request["params"]["path"].as_str().map(String::from))
+            .collect();
+        for path in extra
+            .iter()
+            .map(String::as_str)
+            .chain(["README.md", "docs/Guide.md"])
+        {
+            assert_eq!(
+                asked.iter().filter(|p| p.as_str() == path).count(),
+                1,
+                "{path} must be judged exactly once: {asked:?}"
+            );
+        }
+        let adds = labels.iter().filter(|l| l.as_str() == "git add").count();
+        assert_eq!(adds, 1, "{labels:?}");
+    }
+
+    #[test]
+    fn a_refusal_in_the_middle_of_a_hub_refuses_the_rename_before_the_move() {
+        let (dir, repo, script) = bound_doc_repo("docs/extra-017.md");
+        add_linking_notes(&dir, 40);
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let refused = docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md");
+        assert!(refused.is_err(), "one denied rewrite refuses the rename");
+        assert!(dir.path().join("docs/Roadmap.md").exists());
+        assert!(!dir.path().join("plans").exists());
+        let staged =
+            crate::engine::git_cli::git_text(dir.path(), &["diff", "--cached", "--name-only"])
+                .unwrap();
+        assert_eq!(staged, "");
     }
 
     // ---- adversarial gate cases ------------------------------------------

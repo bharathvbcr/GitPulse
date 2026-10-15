@@ -1,8 +1,8 @@
 use crate::engine::git_cli::{
     git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
-    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, resolve_git_common_dir,
-    sandbox_join, validate_repo, with_background_processes, BoundedRun, OutputStream,
-    ProcessObserver, NETWORK_TIMEOUT,
+    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, is_transient_git_lock_error,
+    resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
+    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +37,12 @@ const MAX_INDEX_PATH_BYTES: usize = 4 * 1024 * 1024;
 /// Leave room for Git's executable and quoting within Windows' command limit.
 const MAX_INDEX_ARGV_BYTES: usize = 12 * 1024;
 const MAX_INDEX_CHUNK_PATHS: usize = 128;
+/// Files staged by one `git add` in [`GitWriter::stage_files_attributed`]; the
+/// bound on its stdin (about 150 KiB at typical note paths).
+const STAGE_BATCH_PATHS: usize = 2_500;
+/// Extra `git add` runs one call may spend halving failed batches to find the
+/// file at fault. Bounds the cost of many bad files to a constant.
+const STAGE_SPLIT_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -337,6 +343,31 @@ impl IndexAction {
     }
 }
 
+/// `paths` split into argv lines that each begin with `prefix` and stay inside
+/// the command-length and path-count bounds. Always at least one line, so an
+/// empty `paths` yields the bare `prefix`.
+fn index_chunks(prefix: &[String], paths: &[String]) -> Vec<Vec<String>> {
+    let mut chunks = Vec::new();
+    let mut argv = prefix.to_vec();
+    let mut bytes = 128usize;
+    for path in paths {
+        // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
+        let cost = path.len() * 2 + 4;
+        if argv.len() > prefix.len()
+            && (bytes + cost > MAX_INDEX_ARGV_BYTES
+                || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
+        {
+            chunks.push(argv);
+            argv = prefix.to_vec();
+            bytes = 128;
+        }
+        bytes += cost;
+        argv.push(path.clone());
+    }
+    chunks.push(argv);
+    chunks
+}
+
 fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, String> {
     if files.is_empty() || files.len() > MAX_INDEX_PATHS {
         return Err(format!("Select between 1 and {MAX_INDEX_PATHS} paths"));
@@ -483,6 +514,68 @@ impl GitWriter {
         .map(|_| ())
     }
 
+    /// Stages many files in a bounded number of git processes and reports each
+    /// file's own outcome, in the order given.
+    ///
+    /// One `git add` (paths on stdin, literal pathspecs) per
+    /// [`STAGE_BATCH_PATHS`] files (plus one per 128 files whose names are not
+    /// ASCII, see [`Self::change_index_with`]), so a 5,000-file rewrite costs two
+    /// processes where [`Self::stage_file`] in a loop cost 5,000. `git add` is atomic
+    /// over its pathspec set, so a batch that fails staged nothing, and the
+    /// failure is then attributed by halving: a vanished file is isolated in
+    /// about `log2(batch)` extra processes and every other file in the batch is
+    /// still staged. The halving is itself bounded by [`STAGE_SPLIT_BUDGET`];
+    /// past it, the files still ungrouped each carry the batch's error, which is
+    /// true of them (none was staged) but does not say which file caused it.
+    /// A lock held by someone else is not a per-file fault, so it is never
+    /// halved: the whole group reports it after one bounded retry.
+    pub fn stage_files_attributed(repo_path: &str, files: &[String]) -> Vec<Result<(), String>> {
+        let mut outcomes: Vec<Result<(), String>> = vec![Ok(()); files.len()];
+        let mut split_budget = STAGE_SPLIT_BUDGET;
+        for (batch, slots) in files
+            .chunks(STAGE_BATCH_PATHS)
+            .zip(outcomes.chunks_mut(STAGE_BATCH_PATHS))
+        {
+            Self::stage_group(repo_path, batch, slots, &mut split_budget);
+        }
+        outcomes
+    }
+
+    fn stage_group(
+        repo_path: &str,
+        files: &[String],
+        outcomes: &mut [Result<(), String>],
+        split_budget: &mut usize,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let error = match Self::change_index_with(repo_path, files, IndexAction::Stage, |_| Ok(()))
+        {
+            Ok(_) => return,
+            Err(error) => error,
+        };
+        if files.len() > 1 && !is_transient_git_lock_error(&error) && *split_budget > 0 {
+            *split_budget -= 1;
+            let (left_files, right_files) = files.split_at(files.len() / 2);
+            let (left, right) = outcomes.split_at_mut(left_files.len());
+            Self::stage_group(repo_path, left_files, left, split_budget);
+            Self::stage_group(repo_path, right_files, right, split_budget);
+            return;
+        }
+        let error = if files.len() > 1 {
+            format!(
+                "{error} (one batch of {} paths; not attributed to a single path)",
+                files.len()
+            )
+        } else {
+            error
+        };
+        for outcome in outcomes {
+            *outcome = Err(error.clone());
+        }
+    }
+
     pub fn unstage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
         Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Unstage, |_| {
             Ok(())
@@ -493,7 +586,10 @@ impl GitWriter {
     /// One native request and lock for a selection. All paths and all policy
     /// verdicts are checked before the write, then one git process applies the
     /// whole selection (paths on stdin, so no command-length limit applies).
-    /// A Git failure is reported, never presented as success.
+    /// Paths with a non-ASCII character are the exception: they go as
+    /// arguments, in chunks, because git does not precompose a pathspec it
+    /// reads from stdin (see the comment at the write). A Git failure is
+    /// reported, never presented as success.
     pub fn change_index_with<J, V>(
         repo_path: &str,
         files: &[String],
@@ -510,47 +606,49 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefix = action.argv();
-        let mut plans = Vec::new();
-        let mut argv = prefix.clone();
-        let mut bytes = 128usize;
-        for path in &paths {
-            // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
-            let cost = path.len() * 2 + 4;
-            if argv.len() > prefix.len()
-                && (bytes + cost > MAX_INDEX_ARGV_BYTES
-                    || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
-            {
-                plans.push(argv);
-                argv = prefix.clone();
-                bytes = 128;
-            }
-            bytes += cost;
-            argv.push(path.clone());
-        }
-        plans.push(argv);
+        let plans = index_chunks(&prefix, &paths);
         let mut verdicts = Vec::with_capacity(plans.len());
         for plan in &plans {
             let args: Vec<&str> = plan.iter().map(String::as_str).collect();
             verdicts.push(judge(&args)?);
         }
-        // One process for the whole selection, paths on stdin NUL-separated:
-        // git applies the pathspec set to the index under one lock, so a
-        // failure leaves nothing half-applied (the chunked form ran a process
-        // per 128 paths and could stop partway). The judged lines above name
-        // the same pathspecs; only the transport differs.
-        let mut input = Vec::new();
-        for path in &paths {
-            input.extend_from_slice(path.as_bytes());
-            input.push(0);
-        }
-        let mut args: Vec<&str> = prefix[1..prefix.len() - 1]
-            .iter()
-            .map(String::as_str)
-            .collect();
-        args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
-        git_with_stdin(&repo, &args, &input).map_err(|error| {
+        // One process for every ASCII path, paths on stdin NUL-separated: git
+        // applies the pathspec set to the index under one lock, so a failure
+        // leaves nothing half-applied (the chunked form ran a process per 128
+        // paths and could stop partway). The judged lines above name the same
+        // pathspecs; only the transport differs.
+        //
+        // A path with a non-ASCII character does not go this way. On macOS git
+        // precomposes a pathspec it is handed as an argument but not one it
+        // reads from a file, so a decomposed (NFD) spelling given on stdin
+        // matches nothing and `git add` still exits 0: a silent no-op that
+        // would read as staged. Those paths take the argument form, in the
+        // bounded chunks the judge was shown.
+        let (plain, accented): (Vec<&String>, Vec<&String>) =
+            paths.iter().partition(|path| path.is_ascii());
+        let failed = |error: String| {
             format!("Index update failed for the {} selected paths: {error}. Refresh to review the current index.", paths.len())
-        })?;
+        };
+        if !plain.is_empty() {
+            let mut input = Vec::new();
+            for path in &plain {
+                input.extend_from_slice(path.as_bytes());
+                input.push(0);
+            }
+            let mut args: Vec<&str> = prefix[1..prefix.len() - 1]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+            git_with_stdin(&repo, &args, &input).map_err(failed)?;
+        }
+        let accented: Vec<String> = accented.into_iter().cloned().collect();
+        for chunk in index_chunks(&prefix, &accented) {
+            if chunk.len() > prefix.len() {
+                let args: Vec<&str> = chunk.iter().skip(1).map(String::as_str).collect();
+                git_text(&repo, &args).map_err(failed)?;
+            }
+        }
         let completed = paths.len();
         Ok((verdicts, completed))
     }
@@ -5567,6 +5665,188 @@ mod tests {
             "{labels:?}"
         );
         assert_eq!(staged(&dir), 0);
+    }
+
+    fn staged_names(dir: &tempfile::TempDir) -> std::collections::BTreeSet<String> {
+        let out = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only", "-z"])
+            .current_dir(dir.path())
+            .output_locked()
+            .expect("git diff --cached");
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    fn adds(labels: &[String]) -> usize {
+        labels.iter().filter(|l| l.as_str() == "git add").count()
+    }
+
+    /// The hub-rename cost: the number of `git add` processes depends on the
+    /// batch size, never on how many files there are beyond it.
+    #[test]
+    fn staging_many_files_attributed_costs_one_process_per_batch() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::create_dir_all(dir.path().join("n")).unwrap();
+        for (count, expected) in [(0, 0), (1, 1), (10, 1), (2 * STAGE_BATCH_PATHS + 1, 3)] {
+            let files: Vec<String> = (0..count).map(|i| format!("n/{count}-{i}.md")).collect();
+            for file in &files {
+                std::fs::write(dir.path().join(file), "x\n").unwrap();
+            }
+            let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                GitWriter::stage_files_attributed(&path, &files)
+            });
+            assert_eq!(outcomes.len(), count);
+            assert!(outcomes.iter().all(Result::is_ok), "{count}: {outcomes:?}");
+            assert_eq!(adds(&labels), expected, "{count} files: {labels:?}");
+        }
+        assert_eq!(staged_names(&dir).len(), 1 + 10 + 2 * STAGE_BATCH_PATHS + 1);
+    }
+
+    /// One vanished file fails the whole `git add`; it must be named, and the
+    /// files beside it must still be staged.
+    #[test]
+    fn a_failed_batch_reports_each_files_own_outcome() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..40).map(|i| format!("f{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        for gone in [3usize, 17, 39] {
+            std::fs::remove_file(dir.path().join(&files[gone])).unwrap();
+        }
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(
+                outcome.is_err(),
+                [3, 17, 39].contains(&index),
+                "{index}: {outcome:?}"
+            );
+        }
+        let expected: std::collections::BTreeSet<String> = files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| ![3, 17, 39].contains(i))
+            .map(|(_, f)| f.clone())
+            .collect();
+        assert_eq!(staged_names(&dir), expected);
+        assert!(
+            adds(&labels) < files.len(),
+            "attribution is not per-file spawns: {labels:?}"
+        );
+    }
+
+    /// Many bad files cost a constant number of processes, and the files the
+    /// halving never reached say so rather than being reported staged.
+    #[test]
+    fn halving_a_failed_batch_is_bounded() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..400).map(|i| format!("never-written-{i}.md")).collect();
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        assert!(outcomes.iter().all(Result::is_err));
+        assert!(
+            adds(&labels) <= 1 + 2 * STAGE_SPLIT_BUDGET,
+            "{}",
+            adds(&labels)
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.as_ref().unwrap_err().contains("not attributed")),
+            "an unattributed batch is labelled as one"
+        );
+        assert!(staged_names(&dir).is_empty());
+    }
+
+    /// Names git or the shell would read as something else stage as themselves.
+    #[test]
+    fn staging_attributed_treats_exotic_names_literally() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let names = [
+            "-leading-dash.md",
+            ":(top)magic.md",
+            ":(glob)**.md",
+            "star*.md",
+            "two  spaces and 'quote'.md",
+            "line\nbreak.md",
+            "tab\there.md",
+            "caf\u{e9}-nfc.md",
+            "cafe\u{301}-decomposed.md",
+            "#hash?query%41.md",
+        ];
+        let files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        for name in &names {
+            std::fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        // A file that exists but must not be swept in by `*` or `**`.
+        std::fs::write(dir.path().join("bystander.md"), "x\n").unwrap();
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let staged = staged_names(&dir);
+        assert!(!staged.contains("bystander.md"), "{staged:?}");
+        for name in &names {
+            // git on macOS may record a decomposed name precomposed.
+            let precomposed = name.replace("e\u{301}", "\u{e9}");
+            assert!(
+                staged.iter().any(|s| s == name || *s == precomposed),
+                "{name:?} not in {staged:?}"
+            );
+        }
+    }
+
+    /// `git add --pathspec-from-file` exits 0 and stages nothing for a
+    /// decomposed spelling on macOS. Such names must still be staged, in a
+    /// bounded number of processes, never reported staged while absent.
+    #[test]
+    fn decomposed_names_are_staged_not_silently_skipped() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..300).map(|i| format!("cafe\u{301}-{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        assert_eq!(staged_names(&dir).len(), files.len());
+        assert!(
+            adds(&labels) <= 300usize.div_ceil(MAX_INDEX_CHUNK_PATHS),
+            "{labels:?}"
+        );
+    }
+
+    /// A lock someone else holds is not one file's fault: it is reported for
+    /// the group after the bounded retry, not halved into more waiting.
+    #[test]
+    fn a_held_index_lock_is_reported_for_the_group_without_halving() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..8).map(|i| format!("l{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let lock = dir.path().join(".git/index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        std::fs::remove_file(&lock).unwrap();
+        assert!(outcomes.iter().all(Result::is_err), "{outcomes:?}");
+        assert!(staged_names(&dir).is_empty());
+        // The retry loop re-spawns the same one batch; halving would show as
+        // a second, smaller group's worth of spawns.
+        assert!(adds(&labels) <= 4, "{labels:?}");
     }
 }
 

@@ -311,6 +311,8 @@ fn a_case_only_rename_on_a_case_insensitive_volume_is_refused() {
 fn docs_rename_benchmark() {
     use std::time::Instant;
     const RUNS: usize = 7;
+    // A hub rename stages every linking note, so it gets fewer runs than the leaf.
+    const HUB_RUNS: usize = 3;
     fn min_ms(runs: usize, mut run: impl FnMut()) -> f64 {
         (0..runs)
             .map(|_| {
@@ -349,19 +351,58 @@ fn docs_rename_benchmark() {
             super::rename::links_the_rename_breaks(&repo, &built.vault, from, to, &edits);
         });
         let (mut a, mut b) = (from.to_string(), to.to_string());
-        let end_to_end_ms = min_ms(if label == "hub" { 1 } else { RUNS }, || {
+        let runs = if label == "hub" { HUB_RUNS } else { RUNS };
+        let end_to_end_ms = min_ms(runs, || {
             rename_doc(path, &a, &b, |_| Ok(())).unwrap();
             std::mem::swap(&mut a, &mut b);
         });
         println!(
             "docs_rename_bench target={label} notes={} rewrites={} plan_ms={plan_ms:.2} \
-             precheck_ms={precheck_ms:.2} rename_end_to_end_ms={end_to_end_ms:.2} \
+             precheck_ms={precheck_ms:.2} rename_end_to_end_ms={end_to_end_ms:.2} runs={runs} \
              precheck_share={:.1}%",
             built.status.note_count,
             edits.len(),
             100.0 * precheck_ms / end_to_end_ms
         );
     }
+}
+
+/// A repository where `count` notes link at `docs/Roadmap.md`.
+fn hub_repo(count: usize) -> tempfile::TempDir {
+    let dir = git_repo();
+    write(dir.path(), "docs/Roadmap.md", "# Roadmap\n");
+    for i in 0..count {
+        write(dir.path(), &format!("docs/n{i:04}.md"), "[r](Roadmap.md)\n");
+    }
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "-qm", "hub"]);
+    dir
+}
+
+/// The git processes a rename starts do not grow with the notes it rewrites.
+#[test]
+fn a_hub_rename_stages_in_a_bounded_number_of_git_processes() {
+    let mut counts = Vec::new();
+    for notes in [3, 60, 300] {
+        let dir = hub_repo(notes);
+        let path = dir.path().to_str().unwrap();
+        let (outcome, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(()))
+        });
+        let outcome = outcome.expect("rename");
+        assert!(outcome.complete, "{outcome:?}");
+        assert_eq!(outcome.rewritten_paths.len(), notes);
+        let adds = labels.iter().filter(|l| l.as_str() == "git add").count();
+        assert_eq!(adds, 1, "{notes} notes: {labels:?}");
+        // Every rewritten note is in the index with its new content.
+        let index = staged(&dir);
+        assert_eq!(index.lines().count(), notes + 1, "{notes}: {index}");
+        counts.push(labels.len());
+    }
+    assert!(
+        counts.windows(2).all(|pair| pair[0] == pair[1]),
+        "{counts:?}"
+    );
 }
 
 /// Four notes that all link at `Roadmap.md`, so a rename rewrites four files.

@@ -45,6 +45,18 @@ pub(super) fn guard_file(
     crate::harness::guard_file(repo_path, file_path, op)
 }
 
+/// [`guard_file`] for a click that writes many files: one verdict per file, in
+/// order, with the scope resolved once. The promotion is made here, on the
+/// calling thread, before the harness resolves that scope.
+pub(super) fn guard_files(
+    repo_path: &str,
+    file_paths: &[&str],
+    op: &str,
+) -> Result<Vec<crate::harness::PolicyVerdict>, String> {
+    crate::engine::git_cli::mark_user_action(repo_path);
+    crate::harness::guard_files(repo_path, file_paths, op)
+}
+
 /// [`guard`] for a mutation nobody clicked (the auto-fetch timer): the same
 /// write gate, without promoting the command to a user action, so the spawn
 /// gate can still defer or shed it behind the user's own work.

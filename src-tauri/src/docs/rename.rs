@@ -160,22 +160,42 @@ pub fn rename_doc(
         })
     })?;
 
+    // Never `?` here: the move has happened, so one file's failure must not
+    // hide what the others did. Every file is written first and the written
+    // ones are staged together, so staging costs a bounded number of git
+    // processes however many notes link here, and each file still gets its own
+    // outcome.
+    let written: Vec<Result<bool, String>> = edits
+        .iter()
+        .enumerate()
+        .map(|(attempt, edit)| write_planned(repo_path, edit, attempt))
+        .collect();
+    let to_stage: Vec<String> = edits
+        .iter()
+        .zip(&written)
+        .filter(|(_, written)| matches!(written, Ok(true)))
+        .map(|(edit, _)| edit.path.clone())
+        .collect();
+    let mut staged = GitWriter::stage_files_attributed(repo_path, &to_stage).into_iter();
+
     let mut links_rewritten = 0u32;
-    let mut rewritten_paths = Vec::with_capacity(edits.len());
+    let mut rewritten_paths = Vec::with_capacity(to_stage.len());
     let mut skipped_conflict = Vec::new();
     let mut failed = Vec::new();
-    // Never `?` here: the move has happened, so one file's failure must not
-    // hide what the others did.
-    for (attempt, edit) in edits.into_iter().enumerate() {
-        match write_planned(repo_path, &edit, attempt) {
-            Ok(true) => match GitWriter::stage_file(repo_path, &edit.path) {
-                Ok(()) => {
+    for (edit, written) in edits.into_iter().zip(written) {
+        match written {
+            Ok(true) => match staged.next() {
+                Some(Ok(())) => {
                     links_rewritten = links_rewritten.saturating_add(edit.links);
                     rewritten_paths.push(edit.path);
                 }
-                Err(error) => failed.push(DocRenameFailure {
+                Some(Err(error)) => failed.push(DocRenameFailure {
                     path: edit.path,
                     error: format!("rewritten but not staged: {error}"),
+                }),
+                None => failed.push(DocRenameFailure {
+                    path: edit.path,
+                    error: "rewritten but not staged: no staging outcome was reported".into(),
                 }),
             },
             Ok(false) => skipped_conflict.push(edit.path),
