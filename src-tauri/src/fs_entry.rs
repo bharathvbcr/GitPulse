@@ -661,6 +661,26 @@ pub(crate) enum BoundedRead {
 /// a path check that a rename could invalidate before the open.
 pub(crate) fn read_bounded_nofollow(path: &Path, cap: usize) -> Result<Vec<u8>, BoundedRead> {
     use std::io::Read;
+    let (file, len) = open_regular_nofollow(path)?;
+    if len > cap as u64 {
+        return Err(BoundedRead::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BoundedRead::Io)?;
+    if bytes.len() > cap {
+        return Err(BoundedRead::Grew);
+    }
+    Ok(bytes)
+}
+
+/// Open a regular file for reading without following a symlink, returning the
+/// handle and the length it had when opened. The open is non-blocking and the
+/// descriptor's own metadata decides "regular file"; see
+/// [`read_bounded_nofollow`]. For a caller that reads a prefix of the file and
+/// must not pay for the rest.
+pub(crate) fn open_regular_nofollow(path: &Path) -> Result<(std::fs::File, u64), BoundedRead> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -689,17 +709,7 @@ pub(crate) fn read_bounded_nofollow(path: &Path, cap: usize) -> Result<Vec<u8>, 
     if is_link || !meta.is_file() {
         return Err(BoundedRead::NotRegular);
     }
-    if meta.len() > cap as u64 {
-        return Err(BoundedRead::TooLarge);
-    }
-    let mut bytes = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(BoundedRead::Io)?;
-    if bytes.len() > cap {
-        return Err(BoundedRead::Grew);
-    }
-    Ok(bytes)
+    Ok((file, meta.len()))
 }
 
 #[cfg(test)]

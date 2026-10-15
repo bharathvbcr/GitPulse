@@ -59,6 +59,13 @@ export function coverageScanReasons(report: CoverageReport | null, excluded: boo
   if (report.go_modules_partial) reasons.push("the Go module search was cut short");
   const skipped = report.artifacts.filter(a => a.skipped).length;
   if (skipped > 0) reasons.push(`${skipped} coverage ${skipped === 1 ? "artifact was" : "artifacts were"} skipped`);
+  // Only a real positive count adds: a missing, null, NaN or negative value
+  // from a malformed report must neither cancel nor hide another artifact's.
+  const unresolved = report.artifacts.reduce((sum, a) => {
+    const n = a.unresolved_files;
+    return typeof n === "number" && Number.isFinite(n) && n > 0 ? sum + n : sum;
+  }, 0);
+  if (unresolved > 0) reasons.push(`${unresolved} reported ${unresolved === 1 ? "file" : "files"} matched no file in this repository`);
   const missing = report.families.filter(f => !f.found);
   if (missing.length > 0) reasons.push(`no report found for ${missing.map(f => f.family).join(", ")}`);
   if (excluded) reasons.push("a command only passed with files excluded from measurement");
