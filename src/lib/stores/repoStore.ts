@@ -151,10 +151,10 @@ import { flushOnPageHide } from "../async/deferredWrite";
 import type { FilePatch } from "../diff/patchBuilder";
 import type { ReleasePublishResult } from "../ops/model";
 
-import type { MutationOutcome, ResetMode, IndexAction, FileStatus, ResolvedRepo, BranchStatsReport, DiffPayload, RepoSession, RepoState, InternalState, RepoStoreDeps } from "../repos/storeTypes";
+import type { MutationOutcome, MutationTarget, ResetMode, IndexAction, FileStatus, ResolvedRepo, BranchStatsReport, DiffPayload, RepoSession, RepoState, InternalState, RepoStoreDeps } from "../repos/storeTypes";
 import { createProjectionCache, createSession, emptyProjected, project } from "../repos/projection";
 
-export type { MutationOutcome, ResetMode, IndexAction, SelectionKind, FileStatus, ResolvedRepo, BranchStatsReport, OpenRepoTab, DiffPayload, RepoSession, RepoState, RepoStoreDeps } from "../repos/storeTypes";
+export type { MutationOutcome, MutationTarget, ResetMode, IndexAction, SelectionKind, FileStatus, ResolvedRepo, BranchStatsReport, OpenRepoTab, DiffPayload, RepoSession, RepoState, RepoStoreDeps } from "../repos/storeTypes";
 export type { BranchInfo, TagInfo, ViewTab };
 export type { OperationAction, OperationState, RepoOperation };
 export type { StashAction, StashEntry, RemoteChange, SubmoduleChange };
@@ -196,6 +196,8 @@ export const STATS_PUBLISH_EVERY = 8;
  * accepted, because it halves per-mutation load.
  */
 const WATCHER_ECHO_SUPPRESS_MS = 2500;
+/** The refusal a mutation returns when its captured target no longer names the repository. */
+const REPOSITORY_CHANGED = "The repository changed while this was waiting; nothing was run.";
 /**
  * Mutation kinds that rewrite what the open worktree diff pane shows (the
  * staged/unstaged split moves, or the file disappears). After these, the open
@@ -756,6 +758,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   function activeSession(): RepoSession | undefined {
     const id = internal.workspace.activeId;
     return id ? internal.sessions[id] : undefined;
+  }
+
+  /**
+   * The session a captured target still names, or null. A tab id always names
+   * one repository, so a missing session, a different path, a checkout that is
+   * gone and a repository that is no longer trusted are all "the repository
+   * changed" — the mutation is refused, not retargeted at another tab.
+   */
+  function resolveTarget(target: MutationTarget): RepoSession | null {
+    const session = internal.sessions[target.tabId];
+    if (!session || !sameRepo(session.path, target.path, options)) return null;
+    if (session.missing || session.trustRequired) return null;
+    return session;
   }
 
   /**
@@ -1573,6 +1588,58 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return () => { mutations.delete(token); publishActivity(); };
   }
 
+  /**
+   * The one echo rule. Our own `.git` writes bounce back from the watcher, and
+   * they are dropped (the mutation refreshes explicitly) while a mutation holds
+   * the path and for WATCHER_ECHO_SUPPRESS_MS after one SUCCEEDED. A mutation
+   * that failed leaves no window: it never refreshes, so the watcher is what
+   * shows what it left behind.
+   *
+   * An event dropped while a mutation HOLDS the path is remembered, because
+   * the mutation may end without refreshing (a failure, a `skipRefresh`
+   * success, a refusal after queueing); `replayDroppedEchoes` then hands it to
+   * the refresh policy so a change made during the hold is not lost.
+   */
+  function holdsPath(path: string): boolean {
+    for (const entry of mutations.values()) if (entry.path === path) return true;
+    return false;
+  }
+  const droppedWhileHeld = new Set<string>();
+  function isEchoOfOwnWrite(path: string): boolean {
+    if (holdsPath(path)) {
+      droppedWhileHeld.add(path);
+      return true;
+    }
+    const until = mutationEchoUntil.get(path);
+    return until !== undefined && Date.now() < until;
+  }
+  /** Called when a mutation ends: replays a dropped event if nothing refreshed after it. */
+  function replayDroppedEchoes(path: string, refreshed: boolean): void {
+    if (holdsPath(path) || !droppedWhileHeld.delete(path) || refreshed) return;
+    const session = Object.values(internal.sessions).find((item) => sameRepo(item.path, path, options));
+    if (!session || session.trustRequired) return;
+    bindRefreshVisibility();
+    watcherRefreshPolicy.onChange(session.path);
+  }
+
+  /**
+   * One chain of mutations per repository path. Two git commands writing the
+   * same repository at once (a bulk pull and a single pull, two commits) race
+   * on its index and refs, so each waits for the one before it. Another
+   * repository's chain is never involved, so a hung mutation holds up only its
+   * own path.
+   */
+  const pathQueues = new Map<string, Promise<void>>();
+  function enterPathQueue(path: string): Promise<() => void> {
+    const previous = pathQueues.get(path) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => mine);
+    pathQueues.set(path, tail);
+    void tail.then(() => { if (pathQueues.get(path) === tail) pathQueues.delete(path); });
+    return previous.then(() => release);
+  }
+
   const store = {
     subscribe,
     /**
@@ -1591,6 +1658,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     /** The active tab's commit message; see `commitDraftStore`. */
     commitDraft: commitDrafts,
     mutationActivity: { subscribe: mutationActivity.subscribe },
+    /**
+     * The active repository as a mutation target, or null with none open.
+     *
+     * A flow that asks before it acts — a confirm, a name prompt, an Undo
+     * toast — captures this BEFORE it awaits and hands it to the mutation, so
+     * the action lands on the repository that was asked about, or is refused
+     * when that repository changed.
+     */
+    captureTarget: (): MutationTarget | null => {
+      const session = activeSession();
+      return session ? { tabId: session.id, path: session.path } : null;
+    },
     contentRevisions: { subscribe: contentRevisions.subscribe },
     setError: (error: string | null) => {
       // Every user-facing error funnels through here; mirror it into the
@@ -2330,12 +2409,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         sameRepo(item.path, changedPath, options),
       );
       if (!session || session.trustRequired) return;
-      // Drop echoes of our own recent writes: the explicit refresh() in
-      // runMutating already fetched fresh state, so acting on the echo would
-      // refresh the whole session twice per mutation. An unrelated external
-      // change inside the window is picked up by the next poll or event.
-      const echoUntil = mutationEchoUntil.get(session.path);
-      if (echoUntil !== undefined && Date.now() < echoUntil) return;
+      // Drop echoes of our own writes (isEchoOfOwnWrite): the explicit
+      // refresh() in runMutating already fetches fresh state, so acting on the
+      // echo would refresh the whole session twice per mutation. An unrelated
+      // external change inside the window is picked up by the next poll or event.
+      if (isEchoOfOwnWrite(session.path)) return;
       bindRefreshVisibility();
       watcherRefreshPolicy.onChange(session.path);
     },
@@ -2653,9 +2731,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     stageAll: () => runStageBatch("stage"),
     unstageAll: () => runStageBatch("unstage"),
-    discardChanges: async (filePath: string) =>
+    discardChanges: async (filePath: string, target?: MutationTarget | null) =>
       runMutating("discard", filePath, (path) =>
         invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
+        { target },
       ),
     commit: async (message: string, amend: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
@@ -2674,24 +2753,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating("checkout", branchName, (path) =>
         invokeFn("cmd_checkout_branch", { repoPath: path, branchName }),
       ),
-    createBranch: async (branchName: string, startPoint?: string) =>
+    createBranch: async (branchName: string, startPoint?: string, target?: MutationTarget | null) =>
       runMutating("branch", branchName, (path) =>
         invokeFn("cmd_create_branch", {
           repoPath: path,
           branchName,
           startPoint,
         }),
+        { target },
       ),
-    renameBranch: async (oldName: string, newName: string) =>
+    renameBranch: async (oldName: string, newName: string, target?: MutationTarget | null) =>
       runMutating("branch-rename", `${oldName} → ${newName}`, (path) =>
         invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName }),
+        { target },
       ),
-    deleteBranch: async (branchName: string, force: boolean = false) =>
+    deleteBranch: async (branchName: string, force: boolean = false, target?: MutationTarget | null) =>
       runMutating(
         force ? "branch-delete-force" : "branch-delete",
         branchName,
         (path) =>
           invokeFn("cmd_delete_branch", { repoPath: path, branchName, force }),
+        { target },
       ),
     // --- stash ----------------------------------------------------------
 
@@ -2744,9 +2826,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * have confirmed with the user first — this is the last layer that could,
      * and it deliberately does not second-guess an explicit instruction.
      */
-    resetTo: async (mode: ResetMode, target: string) =>
+    resetTo: async (mode: ResetMode, target: string, repository?: MutationTarget | null) =>
       runMutating(`reset-${mode}`, target, (path) =>
         invokeFn("cmd_reset", { repoPath: path, mode, target }),
+        { target: repository },
       ),
 
     // --- remotes and submodules ----------------------------------------
@@ -2785,7 +2868,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         (path) => invokeFn("cmd_submodule_change", { repoPath: path, change }),
       ),
 
-    createTag: async (tagName: string, commitId?: string, message?: string) =>
+    createTag: async (tagName: string, commitId?: string, message?: string, target?: MutationTarget | null) =>
       runMutating("tag", tagName, (path) =>
         invokeFn("cmd_create_tag", {
           repoPath: path,
@@ -2793,11 +2876,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           commitId: commitId ?? null,
           message: message ?? null,
         }),
+        { target },
       ),
 
-    deleteTag: async (tagName: string) =>
+    deleteTag: async (tagName: string, target?: MutationTarget | null) =>
       runMutating("tag-delete", tagName, (path) =>
         invokeFn("cmd_delete_tag", { repoPath: path, tagName }),
+        { target },
       ),
 
     // --- workspace-wide -------------------------------------------------
@@ -2853,39 +2938,66 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           path: tab.path,
           label: byPath.get(tab.path)?.label ?? displayName(tab.path),
         }));
-      const report = await runAcrossRepos(
-        targets,
-        async (target) => {
-          const input = byPath.get(target.path);
-          const skip = input ? bulkSkipReason(input) : "Repository is no longer open.";
-          if (skip) return { skip };
-          // Both commands are named literally rather than selected into a
-          // variable: the IPC contract checker verifies every invoked command
-          // against the Rust registry statically, and a computed name is a
-          // hole in that check rather than a shortcut.
-          if (kind === "fetch") {
-            await invokeFn("cmd_fetch", { repoPath: target.path });
-          } else {
-            await invokeFn("cmd_pull", { repoPath: target.path });
-          }
-          mutationEchoUntil.set(target.path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
-        },
-        options,
-      );
-      // Refresh only what actually ran: re-hydrating a skipped repository would
-      // cost a full snapshot for a repository nothing happened to.
-      //
-      // Bounded, not `Promise.all`. Each refresh is itself five concurrent
-      // commands, so fanning out over all 64 possible repositories issued
-      // ~320 git-spawning calls in one instant and exhausted the process's
-      // file descriptors — every later spawn failing with "Too many open
-      // files" until restart.
-      await mapItems(
-        report.results.filter((result) => result.status === "ok"),
-        DEFAULT_FAN_OUT,
-        (result) => store.refresh(result.path),
-      );
-      return report;
+      const tabIds = new Map(internal.workspace.tabs.map((tab) => [tab.path, tab.id]));
+      // One token for the whole sweep. With a concurrency below the number of
+      // repositories there are gaps between one repository finishing and the
+      // next starting; without this the quit guard would see an idle store in
+      // each. No repository path is "", so no per-repository lookup matches it.
+      const endSweep = beginMutation("", `${kind}-all`);
+      try {
+        const report = await runAcrossRepos(
+          targets,
+          async (target) => {
+            const input = byPath.get(target.path);
+            const skip = input ? bulkSkipReason(input) : "Repository is no longer open.";
+            if (skip) return { skip };
+            // The snapshot above was taken before the sweep began. While this
+            // repository waited its turn the tab may have closed, its checkout
+            // gone missing or its trust been withdrawn: the live answer is the
+            // same one every targeted mutation uses.
+            const tabId = tabIds.get(target.path);
+            const mutationTarget = tabId ? { tabId, path: target.path } : null;
+            if (!mutationTarget || !resolveTarget(mutationTarget)) {
+              return { skip: "Repository is no longer open, or is unavailable." };
+            }
+            // The same wrapper every other mutation uses: activity for the
+            // quit guard, the echo window armed before the work, the policy
+            // verdict and the journal entry. Both commands are named
+            // literally rather than selected into a variable: the IPC
+            // contract checker verifies every invoked command against the
+            // Rust registry statically, and a computed name is a hole in
+            // that check rather than a shortcut.
+            const outcome = await runMutating(
+              kind,
+              target.label,
+              (path) =>
+                kind === "fetch"
+                  ? invokeFn("cmd_fetch", { repoPath: path })
+                  : invokeFn("cmd_pull", { repoPath: path }),
+              { target: mutationTarget, skipRefresh: true },
+            );
+            // The sweep classifies by a throw: that is what makes it "failed".
+            if (!outcome.ok) throw new Error(outcome.error ?? `${kind} failed`);
+          },
+          options,
+        );
+        // Refresh only what actually ran: re-hydrating a skipped repository
+        // would cost a full snapshot for a repository nothing happened to.
+        //
+        // Bounded, not `Promise.all`. Each refresh is itself five concurrent
+        // commands, so fanning out over all 64 possible repositories issued
+        // ~320 git-spawning calls in one instant and exhausted the process's
+        // file descriptors — every later spawn failing with "Too many open
+        // files" until restart.
+        await mapItems(
+          report.results.filter((result) => result.status === "ok"),
+          DEFAULT_FAN_OUT,
+          (result) => store.refresh(result.path),
+        );
+        return report;
+      } finally {
+        endSweep();
+      }
     },
 
     /**
@@ -3271,19 +3383,45 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     kind: string,
     label: string,
     action: (path: string) => Promise<unknown>,
-    opts: { skipRefresh?: boolean; session?: RepoSession; trackActivity?: boolean } = {},
+    opts: {
+      skipRefresh?: boolean;
+      session?: RepoSession;
+      /**
+       * The repository a prompt, confirm or toast was raised for. Given, the
+       * mutation runs there even if another tab is active now, and is refused
+       * when that tab is gone, repo-gone or untrusted. `null` is a caller that
+       * had nothing to capture: refused, never "whichever tab is active".
+       * Omitted, the active tab is the target.
+       */
+      target?: MutationTarget | null;
+      trackActivity?: boolean;
+    } = {},
   ): Promise<MutationOutcome<T>> {
-    const session = opts.session ?? activeSession();
-    if (!session) return { ok: false, error: "No repository is open." };
+    let session: RepoSession | undefined;
+    if (opts.target !== undefined) {
+      session = (opts.target && resolveTarget(opts.target)) || undefined;
+      if (!session) return { ok: false, error: REPOSITORY_CHANGED, refused: true, surfaced: false };
+    } else {
+      session = opts.session ?? activeSession();
+      if (!session) return { ok: false, error: "No repository is open." };
+    }
     const path = session.path;
     const generation = session.generation;
+    // Counted from the moment it is asked for, queued or running, so the quit
+    // guard and the menu see a mutation that is still waiting its turn.
     const finishActivity = opts.trackActivity === false ? () => {} : beginMutation(path, kind);
+    const release = await enterPathQueue(path);
+    let succeeded = false;
+    let refreshed = false;
     try {
+      // The wait may have been long: the tab can be gone or its checkout
+      // missing by now.
+      const stillNamed = opts.target !== undefined
+        ? opts.target !== null && resolveTarget(opts.target) !== null
+        : internal.sessions[session.id] !== undefined;
+      if (!stillNamed) return { ok: false, error: REPOSITORY_CHANGED, refused: true, surfaced: false };
       const result = await action(path);
-      // Arm the echo window BEFORE anything downstream observes the change:
-      // the mutation's own `.git` writes are about to bounce back as watcher
-      // events (see WATCHER_ECHO_SUPPRESS_MS).
-      mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+      succeeded = true;
       const policy = recordPolicyVerdict(result, path);
       harnessStore.recordAction({
         repoPath: path,
@@ -3295,6 +3433,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const still = internal.sessions[session.id];
       if (still && still.generation === generation && !opts.skipRefresh) {
         await store.refresh(path);
+        refreshed = true;
         // The refresh updates statuses/branches but nothing refetches the
         // open diff pane, which would otherwise show pre-mutation content
         // (e.g. after partial staging) until the user clicked elsewhere.
@@ -3324,11 +3463,28 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // a caller that must react to a refusal — the commit box keeping the
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
-      applyToSession(session.id, generation, { error: formatError(err) });
+      const error = formatError(err);
+      applyToSession(session.id, generation, { error });
       harnessStore.recordAction({ repoPath: path, kind, label, ok: false });
-      return { ok: false, error: formatError(err) };
+      // Surfaced when the banner the app toasts from is showing THIS error: a
+      // concurrent failure with the same message shares one banner.
+      return {
+        ok: false,
+        error,
+        surfaced: internal.workspace.activeId === session.id && internal.sessions[session.id]?.error === error,
+      };
     } finally {
-      finishActivity();
+      // The queue is released FIRST: a subscriber that throws while activity
+      // is published below must not strand every later mutation on this path.
+      release();
+      try {
+        // The trailing window opens when the mutation, refresh included, ends,
+        // and only for one that succeeded (see isEchoOfOwnWrite).
+        if (succeeded) mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+        finishActivity();
+      } finally {
+        replayDroppedEchoes(path, refreshed);
+      }
     }
   }
 

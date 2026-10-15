@@ -22,6 +22,7 @@
   } from "../stack/tree";
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
   import { invoke } from "../ipc/invoke";
@@ -138,6 +139,11 @@
    * exactly — and does, rather than reporting a partial cascade as a failure
    * that touched nothing.
    */
+  async function checkout(branch: string) {
+    const outcome = await repoStore.checkoutBranch(branch);
+    reportFailure(outcome, `Could not check out ${branch}`);
+  }
+
   async function restack(node: StackedBranchNode) {
     const repoPath = $repoStore.currentPath;
     if (!repoPath || !node.parent_branch_name) return;
@@ -450,7 +456,7 @@
                 {/if}
                 {#if !isCurrent}
                   <button
-                    onclick={() => repoStore.checkoutBranch(node.branch_name)}
+                    onclick={() => void checkout(node.branch_name)}
                     disabled={restackingKey !== null}
                     class="gp-btn py-1! px-2.5! text-[11px]!"
                   >
@@ -506,7 +512,7 @@
             type="button"
             class="gp-pill text-[10px]! font-mono hover:text-accent"
             disabled={restackingKey !== null}
-            onclick={() => repoStore.checkoutBranch(name)}
+            onclick={() => void checkout(name)}
             title="Checkout {name}"
           >
             {name}

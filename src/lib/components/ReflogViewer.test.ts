@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 
 const source = readFileSync(new URL("./ReflogViewer.svelte", import.meta.url), "utf8");
 
@@ -31,7 +32,20 @@ describe("ReflogViewer interaction contract", () => {
 
   it("creates a branch at an entry's commit through the guarded store action", () => {
     expect(source).toContain("onclick={() => branchHere(entry)}");
-    expect(source).toContain("repoStore.createBranch(trimmed, entry.commit_id)");
+    expect(source).toContain("repoStore.createBranch(trimmed, entry.commit_id, target)");
+  });
+
+  it("names its repository before any prompt and reports a failure it alone can see", () => {
+    const branch = functionBody(source, "branchHere");
+    expect(branch.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(branch.indexOf("repoStore.captureTarget()")).toBeLessThan(branch.indexOf("await askText("));
+    expect(branch).toContain("reportFailure(outcome,");
+    const reset = functionBody(source, "resetHere");
+    expect(reset.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(reset.indexOf("repoStore.captureTarget()")).toBeLessThan(reset.indexOf("cmd_reset_preview"));
+    expect(reset).toContain("reportFailure(outcome,");
+    // The preview belongs to the repository it was read from.
+    expect(reset).toContain("if (repo !== $repoStore.currentPath) return;");
   });
 
   it("previews, confirms, and resets with --keep to the oid it previewed", () => {
@@ -39,7 +53,7 @@ describe("ReflogViewer interaction contract", () => {
     // Read before asking, ask before acting, act on what was read.
     expect(reset.indexOf('invoke<ResetPreview>("cmd_reset_preview"')).toBeGreaterThan(-1);
     expect(reset.indexOf("await askConfirm(")).toBeGreaterThan(reset.indexOf("cmd_reset_preview"));
-    expect(reset.indexOf('repoStore.resetTo("keep", preview.target)')).toBeGreaterThan(
+    expect(reset.indexOf('repoStore.resetTo("keep", preview.target, target)')).toBeGreaterThan(
       reset.indexOf("await askConfirm("),
     );
     expect(reset).toContain("if (!confirmed) return;");

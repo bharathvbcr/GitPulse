@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import BranchList from "./BranchList.svelte";
 
@@ -413,5 +414,33 @@ describe("BranchList freshness badges", () => {
   it("never resets the shared store unconditionally", () => {
     // An unconditional reset dropped the pull-request list's loads too.
     expect(source).not.toContain("freshnessStore.reset(");
+  });
+});
+
+describe("BranchList mutation contract", () => {
+  const firstPrompt = (body: string) => Math.min(...["await askConfirm(", "await askText("].map((p) => body.indexOf(p)).filter((i) => i >= 0));
+
+  it.each([
+    ["runCreateTag", "repoStore.createTag(trimmed, at?.commitId, undefined, target)"],
+    ["runDeleteTag", "repoStore.deleteTag(tag.name, target)"],
+    ["runRename", "repoStore.renameBranch(branch.name, trimmed, target)"],
+    ["runDelete", "repoStore.deleteBranch(branch.name, false, target)"],
+  ])("%s names its repository before the prompt and keeps the outcome", (name, call) => {
+    const body = functionBody(source, name);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeLessThan(firstPrompt(body));
+    expect(body).toContain(call);
+    expect(body).toContain("reportFailure(");
+  });
+
+  it("force-deletes against the same repository", () => {
+    expect(functionBody(source, "runDelete")).toContain("repoStore.deleteBranch(branch.name, true, target)");
+  });
+
+  it("offers Undo through the one owner, bound to the repository it deleted from", () => {
+    const body = functionBody(source, "runDelete");
+    expect(body.match(/offerBranchUndo\(/g)).toHaveLength(2);
+    expect(body).not.toContain("repoStore.createBranch(");
+    expect(body).not.toContain('toastStore.success(`Restored');
   });
 });

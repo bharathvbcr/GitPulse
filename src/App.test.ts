@@ -463,4 +463,11 @@ describe("title-bar overflow", () => {
     expect(row![2]).toMatch(/\sdata-tauri-drag-region(\s|$)/);
     expect(region.match(/data-tauri-drag-region/g)).toHaveLength(1);
   });
+
+  it("refuses the tab-changing native menu items while a prompt is open", () => {
+    const gate = source.slice(source.indexOf("canDispatch: (event) =>"), source.indexOf("open: () => void repoStore.pickAndOpenRepo()"));
+    expect(gate).toContain("!exitRequestPending");
+    expect(gate).toContain("!(isPromptOpen() && blockedWhilePrompting(event.id))");
+    expect(gate.indexOf("blockedWhilePrompting")).toBeLessThan(gate.indexOf("canDispatchMenuEvent("));
+  });
 });

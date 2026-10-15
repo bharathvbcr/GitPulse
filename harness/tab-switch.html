@@ -534,6 +534,67 @@
           // a backend that answers the commit graph. After 8 repositories have
           // been visited the first has been shed; coming back must show its
           // rows again, within a deadline, with the commit that was selected.
+          // ---- 5. a prompt belongs to the tab it was raised on -------------------
+          const { promptState, completePrompt, cancelPrompt } = await import("../src/lib/stores/modalStore.ts");
+          const promptTitle = () => get(promptState)?.options?.title ?? null;
+          const deletes = () => calls.filter((c) => c.cmd === "cmd_delete_branch").map((c) => c.repo);
+          fixtures.cmd_delete_branch = () => "";
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(branchList()).includes("alpha-only"));
+          // Jump-to-tab is a webview shortcut (Ctrl+Alt+digit), so a real
+          // keypress reaches RepoTabBar's window listener here.
+          const betaDigit = get(repoStore).openTabs.findIndex((t) => t.path === BETA) + 1;
+          const jumpToBeta = () => window.dispatchEvent(new KeyboardEvent("keydown", {
+            key: String(betaDigit), code: `Digit${betaDigit}`, ctrlKey: true, altKey: true, bubbles: true, cancelable: true,
+          }));
+          jumpToBeta();
+          await sleepUntil(() => activePath() === BETA);
+          check("prompt: control: Ctrl+Alt+digit with no prompt open jumps to that tab", () => activePath() === BETA);
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(branchList()).includes("alpha-only"));
+          const deleteRow = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
+          deleteRow?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
+          await settle();
+          $$('[role="menuitem"]').find((el) => text(el).startsWith("Delete"))?.click();
+          await settle();
+          check("prompt: deleting a branch on alpha asks first and runs nothing", () => promptTitle() === "Delete branch" && deletes().length === 0);
+          jumpToBeta();
+          await settle();
+          await settle();
+          check("prompt: a Ctrl+Alt+digit jump-to-tab keypress while it is open is ignored", () => activePath() === ALPHA && promptTitle() === "Delete branch");
+          // The tab-changing shortcuts are refused while a prompt is open (unit
+          // and source tests: this page mocks Tauri without its window API, so the
+          // native menu is not subscribed here). Activation by an open event or a
+          // close is not a shortcut: it moves the active tab
+          // under the prompt, and the answer still lands on the tab it asked.
+          await repoStore.activateTab(tabFor(BETA).id);
+          await settle();
+          check("prompt: beta became active under the open prompt", () => activePath() === BETA && promptTitle() === "Delete branch");
+          completePrompt(true);
+          await sleepUntil(() => deletes().length > 0);
+          await settle();
+          check("prompt: confirming deletes on alpha, the tab that asked, never on beta", () => deletes().length === 1 && deletes()[0] === ALPHA);
+          delete fixtures.cmd_delete_branch;
+          await switchTo(ALPHA);
+
+          // ---- 6. quitting during a bulk pull asks before it ends the pull -------
+          fixtures.cmd_pull = () => ({ policy: null, output: "ok" });
+          fixtures.cmd_exit_request_answer = () => null;
+          const releasePull = hold("cmd_pull", ALPHA);
+          const sweep = repoStore.runAcrossOpenRepos("pull", { only: [ALPHA] });
+          await sleepUntil(() => calls.some((c) => c.cmd === "cmd_pull" && c.repo === ALPHA));
+          const { emit } = await import("@tauri-apps/api/event");
+          await emit("gitpulse-exit-requested");
+          await sleepUntil(() => promptTitle() !== null, 3000);
+          check("quit: asking to quit during a bulk pull offers to finish the Git action first", () => promptTitle() === "Finish Git Actions Before Quit?");
+          cancelPrompt();
+          await settle();
+          releasePull();
+          await sweep;
+          await settle();
+          delete fixtures.cmd_pull;
+          delete fixtures.cmd_exit_request_answer;
+
           // Runs last: it leaves 8 more tabs open and answers the graph command
           // with rows, which the checks above do not expect.
           const { graphStore } = await import("../src/lib/stores/graphStore.ts");

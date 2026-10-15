@@ -37,10 +37,13 @@
 
   async function handleAction(toast: ToastItem) {
     if (!toast.action) return;
+    // An action that reports `false` did not complete (an Undo that could not
+    // restore): its offer stays until it succeeds or its clock runs out.
+    let keep = false;
     try {
-      await toast.action.onClick();
+      keep = (await toast.action.onClick()) === false;
     } finally {
-      toastStore.dismiss(toast.id);
+      if (!keep) toastStore.dismiss(toast.id);
     }
   }
 

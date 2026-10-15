@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../../stores/sourceScan";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "LivePulseDashboard.svelte"), "utf8");
@@ -107,5 +108,21 @@ describe("LivePulseDashboard", () => {
     expect(source).toContain('import { currentHeadTip } from "../../stores/headTip";');
     expect(selectionEffect).toContain("void $currentHeadTip;");
     expect(source).not.toContain("cmd_get_head_id");
+  });
+
+  it("discards against the repository it asked about, and keeps every index outcome", () => {
+    const discard = functionBody(source, "discardFile");
+    expect(discard.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(discard.indexOf("repoStore.captureTarget()")).toBeLessThan(discard.indexOf("await askConfirm("));
+    expect(discard).toContain("repoStore.discardChanges(path, target)");
+    expect(discard).toContain("reportFailure(");
+    for (const [fn, call] of [
+      ["stageAll", "repoStore.stageAll()"],
+      ["unstageAll", "repoStore.unstageAll()"],
+      ["stageFile", "repoStore.stageFile(path)"],
+      ["unstageFile", "repoStore.unstageFile(path)"],
+    ]) {
+      expect(functionBody(source, fn)).toContain(`return await ${call};`);
+    }
   });
 });

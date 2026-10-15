@@ -2,6 +2,7 @@
   import type { HarnessPermissionMode } from "../harness/availability";
   import type { CatchUp } from "../ingest/types";
   import type { LedgerStatus } from "../ledger/types";
+  import type { MutationTarget } from "../repos/storeTypes";
   import { redactDiagnosticText } from "../diagnostics/diagnostics";
 
   export type StatusTone = "ready" | "warning" | "error" | "neutral";
@@ -269,6 +270,8 @@
   import { openSetupWizard } from "../tools/onboardingStore";
 
   let branchSuggestion = $state<string>("");
+  /** The repository the suggestion was made for; the branch is created there. */
+  let branchTarget = $state<MutationTarget | null>(null);
   let branchWarnings = $state<string[]>([]);
   let isSuggesting = $state(false);
   let branchError = $state<string | null>(null);
@@ -505,6 +508,7 @@
     isSuggesting = true;
     branchError = null;
     branchSuggestion = "";
+    branchTarget = repoStore.captureTarget();
     branchWarnings = [];
     try {
       const result = await harnessStore.suggestBranchName(path);
@@ -519,11 +523,13 @@
 
   async function createSuggestedBranch() {
     if (!branchSuggestion) return;
-    try {
-      await repoStore.createBranch(branchSuggestion);
+    // createBranch resolves { ok: false } on a refusal or a collision; it never
+    // throws, so the suggestion is kept and the reason shown unless it was made.
+    const outcome = await repoStore.createBranch(branchSuggestion, undefined, branchTarget);
+    if (outcome.ok) {
       branchSuggestion = "";
-    } catch (err: unknown) {
-      branchError = formatError(err);
+    } else {
+      branchError = outcome.error ?? "The branch could not be created.";
     }
   }
 </script>

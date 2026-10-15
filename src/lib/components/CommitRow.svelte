@@ -24,6 +24,7 @@
   } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { repoStore } from "../stores/repoStore";
   import { filterStore } from "../stores/filterStore";
   import { askText } from "../stores/modalStore";
@@ -163,6 +164,8 @@
 
   async function createBranchHere() {
     closeMenu();
+    // The repository this commit belongs to, held across the prompt.
+    const target = repoStore.captureTarget();
     const name = await askText({
       title: "Create Branch at Commit",
       message: `Branch name from ${row.id.slice(0, 7)}:`,
@@ -170,9 +173,16 @@
       confirmLabel: "Create Branch",
     });
     if (name?.trim()) {
-      await repoStore.createBranch(name.trim(), row.id);
+      const outcome = await repoStore.createBranch(name.trim(), row.id, target);
+      if (!reportFailure(outcome, "Could not create the branch")) return;
       toastStore.success(`Created branch "${name.trim()}" at ${row.id.slice(0, 7)}`);
     }
+  }
+
+  async function checkoutHere() {
+    closeMenu();
+    const outcome = await repoStore.checkoutBranch(row.id);
+    reportFailure(outcome, "Could not check out the commit");
   }
 
   function filterByAuthor() {
@@ -417,7 +427,7 @@
     <button
       role="menuitem"
       class="gp-menu-item"
-      onclick={() => { closeMenu(); repoStore.checkoutBranch(row.id); }}
+      onclick={() => void checkoutHere()}
     >
       <GitBranch size={12} class="text-textMuted" />
       <span>Checkout Commit</span>
