@@ -246,16 +246,11 @@ export function serializeSelectivePatch(filePatch: FilePatch, isStaging: boolean
   patchBuffer.push(unifiedPathHeader("+++", "b", filePatch.new_path));
 
   for (const hunk of filePatch.hunks) {
-    const hunkLinesOut: string[] = [];
+    const rows: Array<{ sign: string; line: UnifiedDiffLine }> = [];
     let oldCount = 0;
     let newCount = 0;
-    const emit = (prefix: string, line: UnifiedDiffLine): void => {
-      hunkLinesOut.push(prefix + line.content);
-      // Marker lines describe the newline-ness of the side the row came
-      // from and are not counted toward either side's totals. A del/add
-      // replacement where both sides lack the trailing newline therefore
-      // yields one marker after each of the two emitted lines.
-      if (line.no_newline) hunkLinesOut.push("\\ No newline at end of file");
+    const emit = (sign: string, line: UnifiedDiffLine): void => {
+      rows.push({ sign, line });
     };
 
     for (const line of hunk.lines) {
@@ -304,13 +299,51 @@ export function serializeSelectivePatch(filePatch: FilePatch, isStaging: boolean
       }
     }
 
-    if (hunkLinesOut.length > 0) {
+    if (rows.length > 0) {
       patchBuffer.push(`@@ -${hunk.old_start},${oldCount} +${hunk.new_start},${newCount} @@\n`);
-      for (const out of hunkLinesOut) patchBuffer.push(`${out}\n`);
+      patchBuffer.push(renderRows(rows));
     }
   }
 
   return patchBuffer.join("");
+}
+
+const NO_NEWLINE_MARKER = "\\ No newline at end of file";
+
+/**
+ * Writes one hunk's body rows, placing `\ No newline at end of file` only
+ * where the blob it describes actually ends. Twin of the Rust `render_rows`;
+ * see its comment for the rules. A row's flag records the newline-ness of the
+ * file side it came from, and only the last line of a side can lack one, so a
+ * selection that leaves more result lines after a flagged row must not keep
+ * the marker there (git would join the two lines).
+ */
+function renderRows(rows: ReadonlyArray<{ sign: string; line: UnifiedDiffLine }>): string {
+  let lastNew = -1;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].sign !== "-") {
+      lastNew = i;
+      break;
+    }
+  }
+  let out = "";
+  const push = (sign: string, line: UnifiedDiffLine, marker: boolean): void => {
+    out += `${sign}${line.content}\n`;
+    if (marker) out += `${NO_NEWLINE_MARKER}\n`;
+  };
+  rows.forEach(({ sign, line }, i) => {
+    const flagged = line.no_newline === true;
+    const isLastNew = i === lastNew;
+    if (sign === " " && flagged && !isLastNew) {
+      push("-", line, true);
+      push("+", line, false);
+    } else if (sign === "-") {
+      push(sign, line, flagged);
+    } else {
+      push(sign, line, flagged && isLastNew);
+    }
+  });
+  return out;
 }
 
 /** `--- a/path` / `+++ b/path`, except `/dev/null` which git expects unprefixed. */
