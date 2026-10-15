@@ -157,11 +157,22 @@ impl Retention {
         }
     }
 
+    /// Whether the stamp is due a look at `now`; when it is, records the look.
+    pub(crate) fn due_to_check(&mut self, now: Instant) -> bool {
+        if self
+            .checked
+            .is_some_and(|at| now.saturating_duration_since(at) < CHECK_EVERY)
+        {
+            return false;
+        }
+        self.checked = Some(now);
+        true
+    }
+
     pub(crate) fn tick(&mut self, host: &WorkbenchState) {
-        if self.checked.is_some_and(|at| at.elapsed() < CHECK_EVERY) {
+        if !self.due_to_check(Instant::now()) {
             return;
         }
-        self.checked = Some(Instant::now());
         let Ok(profile) = host.profile_path() else {
             return;
         };

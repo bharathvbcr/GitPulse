@@ -36,9 +36,9 @@
 //! `idle alerts bridge` binds the hook socket and leaves it with no clients (the
 //! 200 ms `wait_readable` accept loop), and `idle host-load sampler` runs the
 //! sampler at its production cadence with `host_load` enabled (the 2 s tick with
-//! a full process scan). The workbench `external_changes` watcher has no row: it
-//! is `pub(crate)` and its loop needs an `AppHandle` window, so a bench cannot
-//! start it without a test seam in production code.
+//! a full process scan). `idle external_changes (hidden)` and `(visible)` run
+//! the workbench commit-counter loop through `workbench::external_changes::
+//! bench_seam`, which swaps only the window system for a flag the row sets.
 //!
 //! The row's time is the idle window itself, so it is not gated; the figure is
 //! the `*_wkups_per_s` metric. Wakeups are tiny numbers on a quiet machine and
@@ -289,7 +289,46 @@ mod imp {
                 .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
                 .elapsed(elapsed)
         };
+        // The workbench external-changes loop, run through its bench seam on a
+        // private profile. Hidden: the window is off screen, so each round is
+        // retention's clock and a presence check. Visible: the 1 Hz pass, two
+        // `stat` calls once the profile has settled past the racy window.
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&external_dir).expect("external dir");
+        let idle_external = |visible: bool| -> Sample {
+            let looped = gitpulse_lib::workbench::external_changes::bench_seam::IdleLoop::start(
+                &external_dir,
+                visible,
+            )
+            .unwrap_or_else(|error| panic!("external_changes loop: {error}"));
+            // The observer's first touch of the profile, and the racy window
+            // that follows it, settle before the window opens.
+            std::thread::sleep(Duration::from_millis(3500));
+            let (before, started, rounds) = (counters(), Instant::now(), looped.rounds());
+            std::thread::sleep(window);
+            let (elapsed, after, rounds) =
+                (started.elapsed(), counters(), looped.rounds() - rounds);
+            looped.stop();
+            let secs = elapsed.as_secs_f64();
+            Sample::default()
+                .counter("rounds", rounds)
+                .metric(NAMES.0, after.0.saturating_sub(before.0) as f64 / secs)
+                .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
+                .elapsed(elapsed)
+        };
         let mut cases = cases;
+        cases.push(
+            Case::new("idle external_changes (hidden)", move || {
+                idle_external(false)
+            })
+            .ungated(),
+        );
+        cases.push(
+            Case::new("idle external_changes (visible)", move || {
+                idle_external(true)
+            })
+            .ungated(),
+        );
         cases.push(Case::new("idle mailbox", idle_mailbox).ungated());
         cases.push(Case::new("idle alerts bridge", idle_alerts_bridge).ungated());
         cases.push(Case::new("idle host-load sampler", idle_host_load).ungated());

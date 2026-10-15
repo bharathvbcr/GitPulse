@@ -14,7 +14,7 @@ pub(crate) mod agent_models;
 mod agent_worktree;
 pub(crate) mod claude_hook;
 pub(crate) mod conversation;
-pub(crate) mod external_changes;
+pub mod external_changes;
 mod in_flight;
 pub(crate) mod intake;
 mod managed_run;

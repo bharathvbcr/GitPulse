@@ -20,6 +20,8 @@
 //! the event loop. Window events say it ([`note_main_window_on_screen`]), and
 //! a real query corrects them every [`VERIFY_EVERY`].
 
+pub mod bench_seam;
+
 use super::WorkbenchState;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,40 +75,50 @@ pub(crate) fn install(app: &tauri::AppHandle) {
     let host = app.state::<WorkbenchState>().inner().clone();
     let app = app.clone();
     if let Err(error) = crate::supervisor::spawn_service("workbench-external-changes", move || {
-        run(host.clone(), app.clone())
+        drive(&mut Live {
+            host: host.clone(),
+            app: app.clone(),
+            watcher: Watcher::default(),
+            retention: super::retention::Retention::new(),
+        })
     }) {
         log::warn!(target: "workbench", "external change watcher did not start: {error}");
     }
 }
 
-fn run(host: WorkbenchState, app: tauri::AppHandle) {
-    let mut watcher = Watcher::default();
-    let mut retention = super::retention::Retention::new();
+/// What the loop needs from the world. The loop is the schedule; this is every
+/// way it touches anything, so a test or a bench can run the schedule without
+/// a window system.
+pub(crate) trait Env {
+    /// False once the task host is shutting down.
+    fn is_open(&self) -> bool;
+    fn now(&self) -> Instant;
+    /// Daily retention's own clock, hidden window or not.
+    fn retention_tick(&mut self, now: Instant);
+    /// The real window state, which events only approximate.
+    fn query_window(&self) -> bool;
+    /// One pass of the commit-counter watcher.
+    fn poll(&mut self) -> Result<bool, String>;
+    /// Tells the frontend another process wrote the profile.
+    fn announce(&self) -> Result<(), String>;
+    fn pause(&self, period: Duration);
+}
+
+/// The loop: retention, then a presence check, then either a pass or a pause.
+pub(crate) fn drive(env: &mut impl Env) {
     let mut last_error: Option<String> = None;
     let mut presence = Presence { verified: None };
-    while host.check_open().is_ok() {
-        // Daily retention, hidden window or not; the pass runs on its own thread.
-        retention.tick(&host);
-        let visible = presence.on_screen(Instant::now(), || {
-            app.get_webview_window("main").is_some_and(|window| {
-                window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
-            })
-        });
-        if !visible {
-            std::thread::sleep(HIDDEN_PERIOD);
+    while env.is_open() {
+        let now = env.now();
+        env.retention_tick(now);
+        if !presence.on_screen(now, || env.query_window()) {
+            env.pause(HIDDEN_PERIOD);
             continue;
         }
-        let path = match host.0.path.clone() {
-            Some(path) => Ok(path),
-            None => super::intake::default_profile_path().map_err(|e| e.message),
-        };
-        match path.and_then(|path| watcher.poll(&path)) {
+        match env.poll() {
             Ok(true) => {
                 last_error = None;
-                if let Err(error) = app.emit(
-                    "workbench-changed",
-                    serde_json::json!({"sequence": null, "source": "external"}),
-                ) {
+                if let Err(error) = env.announce() {
                     log::warn!(target: "workbench", "external change notification failed: {error}");
                 }
             }
@@ -118,7 +130,50 @@ fn run(host: WorkbenchState, app: tauri::AppHandle) {
                 last_error = Some(error);
             }
         }
-        std::thread::sleep(VISIBLE_PERIOD);
+        env.pause(VISIBLE_PERIOD);
+    }
+}
+
+/// The running app's side of [`Env`].
+struct Live {
+    host: WorkbenchState,
+    app: tauri::AppHandle,
+    watcher: Watcher,
+    retention: super::retention::Retention,
+}
+
+impl Env for Live {
+    fn is_open(&self) -> bool {
+        self.host.check_open().is_ok()
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn retention_tick(&mut self, _now: Instant) {
+        self.retention.tick(&self.host);
+    }
+    fn query_window(&self) -> bool {
+        self.app.get_webview_window("main").is_some_and(|window| {
+            window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
+        })
+    }
+    fn poll(&mut self) -> Result<bool, String> {
+        let path = match self.host.0.path.clone() {
+            Some(path) => Ok(path),
+            None => super::intake::default_profile_path().map_err(|e| e.message),
+        };
+        path.and_then(|path| self.watcher.poll(&path))
+    }
+    fn announce(&self) -> Result<(), String> {
+        self.app
+            .emit(
+                "workbench-changed",
+                serde_json::json!({"sequence": null, "source": "external"}),
+            )
+            .map_err(|e| e.to_string())
+    }
+    fn pause(&self, period: Duration) {
+        std::thread::sleep(period);
     }
 }
 
