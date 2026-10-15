@@ -3198,14 +3198,15 @@ fn decode_default_base(text: &str) -> Option<DefaultBase> {
     })
 }
 
-/// The default base, answered through [`ref_cache::through`]: the same stamp
+/// The default base, answered through [`ref_cache::through_stamped`] with the
+/// stamp [`default_base`] read once for the call: the same stamp
 /// as every other ref listing, so a write anywhere under `refs/heads` or
 /// `refs/remotes` is seen at once, a stamp younger than the racy window is not
 /// trusted, and nothing is served past the cache's TTL. Never kept: an answer
 /// computed while any lookup was refused (it reads a refusal as "not set").
-fn default_base_cached(repo: &Path) -> DefaultBase {
+fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> DefaultBase {
     let mut computed = None;
-    let answered = ref_cache::through(repo, DEFAULT_BASE_NAMESPACES, &[DEFAULT_BASE_KEY], || {
+    let answered = ref_cache::through_stamped(repo, &[DEFAULT_BASE_KEY], stamp, || {
         let value = compute_default_base_with(repo, Reads::Cached);
         let keep = value.incomplete.is_none();
         let text = if keep {
@@ -3308,7 +3309,7 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
     }
     // Stamped before the lookup: a write that races it leaves a stamp that no
     // longer matches, so a later caller does not take this answer.
-    let value = default_base_cached(repo);
+    let value = default_base_cached(repo, stamp.as_ref());
     if let Some(stamp) = stamp {
         let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
         if last.len() >= MAX_MEMOIZED_REPOS && !last.contains_key(repo) {
