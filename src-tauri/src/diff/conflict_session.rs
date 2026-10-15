@@ -650,7 +650,7 @@ thread_local! {
 }
 
 const LINK_LIMITATION: &str =
-    "This conflict involves a symbolic link, which GitPulse cannot write into a Windows working tree. Resolve and stage the link externally.";
+    "This conflict involves a symbolic link, which GitPulse cannot write into a Windows working tree. Choose a side that is not a link, or resolve and stage the link externally.";
 
 /// The regular-file mode Git would record for a merge of the two sides: the
 /// side that changed it from the base wins, and ours wins when both changed it
@@ -1312,6 +1312,7 @@ mod tests {
         assert_eq!(snapshot.reason.as_deref(), Some(LINK_LIMITATION));
         assert!(snapshot.document.is_none());
         assert!(!LINK_LIMITATION.contains("preserve"));
+        assert!(LINK_LIMITATION.contains("side that is not a link"));
 
         for choice in [
             ConflictFileChoice::Theirs,
@@ -1337,5 +1338,160 @@ mod tests {
         let outcome = save_choice(&repo, ConflictFileChoice::Chunks(choices)).unwrap();
         assert!(outcome.staged, "{}", outcome.message);
         assert_eq!(index_mode(&repo), "100755");
+    }
+
+    /// A conflict whose sides carry the given executable bits; `None` is absent
+    /// for the base and deleted for a side. Returns `None` when Git merges the
+    /// combination cleanly, since there is then nothing to resolve.
+    fn merge_modes(
+        base: Option<bool>,
+        ours: Option<bool>,
+        theirs: Option<bool>,
+    ) -> Option<tempfile::TempDir> {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().canonicalize().unwrap();
+        crate::test_support::git_in(&repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(&repo, &["config", "core.filemode", "true"]);
+        crate::test_support::git_in(&repo, &["commit", "--allow-empty", "-m", "root"]);
+        if let Some(exec) = base {
+            commit_file(&repo, "base\n", exec, "base");
+        }
+        let apply = |side: Option<bool>, text: &str, message: &str| match side {
+            Some(exec) => commit_file(&repo, text, exec, message),
+            None => {
+                if base.is_some() {
+                    crate::test_support::git_in(&repo, &["rm", "-f", "file"]);
+                }
+                crate::test_support::git_in(&repo, &["commit", "--allow-empty", "-m", message]);
+            }
+        };
+        crate::test_support::git_in(&repo, &["checkout", "-b", "incoming"]);
+        apply(theirs, "theirs\n", "theirs");
+        crate::test_support::git_in(&repo, &["checkout", "main"]);
+        apply(ours, "ours\n", "ours");
+        git(&repo, &["merge", "incoming"]).is_err().then_some(temp)
+    }
+
+    #[test]
+    fn windows_staged_mode_matches_what_git_merge_leaves_in_the_worktree() {
+        // Git's own merge is the oracle: the executable bit it writes to the
+        // working file for each conflict is what a resolution must stage.
+        let states = [None, Some(false), Some(true)];
+        let mut conflicts = 0;
+        for base in states {
+            for ours in states {
+                for theirs in states {
+                    let Some(temp) = merge_modes(base, ours, theirs) else {
+                        continue;
+                    };
+                    let repo = temp.path().canonicalize().unwrap();
+                    use std::os::unix::fs::PermissionsExt;
+                    let oracle = match fs::metadata(repo.join("file")) {
+                        Ok(meta) if meta.permissions().mode() & 0o111 != 0 => "100755",
+                        Ok(_) => "100644",
+                        Err(_) => continue,
+                    };
+                    fs::write(repo.join("file"), "resolved\n").unwrap();
+                    make_worktree_plain(&repo);
+                    let _windows = WindowsWorktree::simulate();
+                    let outcome = save_choice(&repo, ConflictFileChoice::WorkingTree).unwrap();
+                    let case = format!("{base:?} {ours:?} {theirs:?}");
+                    assert!(outcome.staged, "{case}: {}", outcome.message);
+                    assert_eq!(index_mode(&repo), oracle, "{case}");
+                    conflicts += 1;
+                }
+            }
+        }
+        assert!(
+            conflicts >= 15,
+            "the matrix must exercise real conflicts: {conflicts}"
+        );
+    }
+
+    #[test]
+    fn windows_stage_only_takes_the_mode_from_the_stages() {
+        let temp = merge_conflict(false, false, true);
+        let repo = temp.path().canonicalize().unwrap();
+        fs::write(repo.join("file"), "resolved\n").unwrap();
+        make_worktree_plain(&repo);
+        let _windows = WindowsWorktree::simulate();
+        let outcome = save_choice(&repo, ConflictFileChoice::StageOnly).unwrap();
+        assert!(outcome.staged, "{}", outcome.message);
+        assert_eq!(index_mode(&repo), "100755");
+    }
+
+    #[test]
+    fn a_link_that_appears_after_the_snapshot_is_refused_on_save() {
+        let temp = merge_conflict(false, false, false);
+        let repo = temp.path().canonicalize().unwrap();
+        make_worktree_plain(&repo);
+        let _windows = WindowsWorktree::simulate();
+        let repo_path = repo.to_str().unwrap();
+        let loaded = snapshot(repo_path, "file").unwrap();
+        assert_eq!(loaded.reason, None);
+        let blob = String::from_utf8(
+            git_with_stdin(&repo, &["hash-object", "-w", "--stdin"], b"target").unwrap(),
+        )
+        .unwrap();
+        let input = format!(
+            "0 {}\tfile\0120000 {} 3\tfile\0",
+            "0".repeat(40),
+            blob.trim()
+        );
+        git_with_stdin(
+            &repo,
+            &["update-index", "-z", "--index-info"],
+            input.as_bytes(),
+        )
+        .unwrap();
+        let unmerged = git(&repo, &["ls-files", "--stage"]).unwrap();
+        let error = save(
+            repo_path,
+            &ConflictSaveRequest {
+                file_path: "file".into(),
+                revision: loaded.revision,
+                choice: ConflictFileChoice::Theirs,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed since loading"), "{error}");
+        assert_eq!(git(&repo, &["ls-files", "--stage"]).unwrap(), unmerged);
+    }
+
+    #[test]
+    fn windows_submodule_conflict_keeps_the_gitlink_and_refuses_a_working_file() {
+        let temp = merge_conflict(false, false, false);
+        let repo = temp.path().canonicalize().unwrap();
+        let input = format!(
+            "0 {zero}\tfile\0160000 {a} 1\tfile\0160000 {b} 2\tfile\0160000 {c} 3\tfile\0",
+            zero = "0".repeat(40),
+            a = "1".repeat(40),
+            b = "2".repeat(40),
+            c = "3".repeat(40),
+        );
+        git_with_stdin(
+            &repo,
+            &["update-index", "-z", "--index-info"],
+            input.as_bytes(),
+        )
+        .unwrap();
+        fs::remove_file(repo.join("file")).unwrap();
+        fs::create_dir(repo.join("file")).unwrap();
+        let unmerged = git(&repo, &["ls-files", "--stage"]).unwrap();
+        let _windows = WindowsWorktree::simulate();
+        for choice in [
+            ConflictFileChoice::WorkingTree,
+            ConflictFileChoice::StageOnly,
+            ConflictFileChoice::Chunks(vec![ConflictResolutionChoice::AcceptOurs]),
+        ] {
+            assert!(save_choice(&repo, choice).is_err());
+            assert_eq!(git(&repo, &["ls-files", "--stage"]).unwrap(), unmerged);
+        }
+        assert!(
+            save_choice(&repo, ConflictFileChoice::Theirs)
+                .unwrap()
+                .staged
+        );
+        assert_eq!(index_mode(&repo), "160000");
     }
 }
