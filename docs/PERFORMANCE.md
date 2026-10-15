@@ -1288,7 +1288,9 @@ conflict-resolution saves rely on it.
   (NFD) spelling, which would have reported such a note staged while it was not
   (the old per-file `git add` was unaffected). The same fix covers the
   file-tree selection that shares `change_index_with`. A batch that fails
-  is halved to find the file at fault, at most 64 extra runs per rename; past
+  is first cleared of ignored paths (`git add` exits 1 on one but still stages
+  the rest, so those are named by `git check-ignore`, outside the budget), then
+  halved to find the file at fault, at most 64 extra runs per rename; past
   that the files still ungrouped each carry the batch's error and say it was
   not attributed to one path. A held `index.lock` is never halved.
 - Policy: one scope lookup, then at most 8 file checks in flight; the first

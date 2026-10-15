@@ -453,7 +453,11 @@ done
         add_linking_notes(&dir, 30);
         // The same fake, answering "warn" where it would have said "deny".
         let body = std::fs::read_to_string(&script).unwrap();
-        std::fs::write(&script, body.replace("\"action\":\"deny\"", "\"action\":\"warn\"")).unwrap();
+        std::fs::write(
+            &script,
+            body.replace("\"action\":\"deny\"", "\"action\":\"warn\""),
+        )
+        .unwrap();
         let serial = test_serial();
         let _binary = bind_test_binary(&serial, script.to_string_lossy());
         let guarded =

@@ -37,8 +37,10 @@ const MAX_INDEX_PATH_BYTES: usize = 4 * 1024 * 1024;
 /// Leave room for Git's executable and quoting within Windows' command limit.
 const MAX_INDEX_ARGV_BYTES: usize = 12 * 1024;
 const MAX_INDEX_CHUNK_PATHS: usize = 128;
-/// Files staged by one `git add` in [`GitWriter::stage_files_attributed`]; the
-/// bound on its stdin (about 150 KiB at typical note paths).
+/// ASCII files staged by one `git add` in [`GitWriter::stage_files_attributed`];
+/// the bound on its stdin (about 150 KiB at typical note paths). Non-ASCII
+/// names in a batch cost further processes, in chunks of
+/// [`MAX_INDEX_CHUNK_PATHS`].
 const STAGE_BATCH_PATHS: usize = 2_500;
 /// Extra `git add` runs one call may spend halving failed batches to find the
 /// file at fault. Bounds the cost of many bad files to a constant.
@@ -520,15 +522,25 @@ impl GitWriter {
     /// One `git add` (paths on stdin, literal pathspecs) per
     /// [`STAGE_BATCH_PATHS`] files (plus one per 128 files whose names are not
     /// ASCII, see [`Self::change_index_with`]), so a 5,000-file rewrite costs two
-    /// processes where [`Self::stage_file`] in a loop cost 5,000. `git add` is atomic
-    /// over its pathspec set, so a batch that fails staged nothing, and the
-    /// failure is then attributed by halving: a vanished file is isolated in
-    /// about `log2(batch)` extra processes and every other file in the batch is
-    /// still staged. The halving is itself bounded by [`STAGE_SPLIT_BUDGET`];
-    /// past it, the files still ungrouped each carry the batch's error, which is
-    /// true of them (none was staged) but does not say which file caused it.
-    /// A lock held by someone else is not a per-file fault, so it is never
-    /// halved: the whole group reports it after one bounded retry.
+    /// processes where [`Self::stage_file`] in a loop cost 5,000.
+    ///
+    /// Contract of one ASCII stdin batch: `git add` is all-or-nothing over its
+    /// pathspec set (a vanished path is fatal before anything is staged), with
+    /// one exception: an ignored path makes it exit 1 *after* staging every
+    /// other path. A failed group is therefore attributed in two steps. Ignored
+    /// paths are named exactly (`git check-ignore`) and the rest re-staged,
+    /// outside any budget. What remains is halved: a vanished file is isolated
+    /// in about `log2(batch)` extra processes and every other file in the batch
+    /// is still staged. The halving is bounded by [`STAGE_SPLIT_BUDGET`]; past
+    /// it, the files still ungrouped each carry the batch's error, which is true
+    /// of them (a vanished path staged none of the group) but does not say which
+    /// file caused it.
+    ///
+    /// A selection that mixes ASCII and non-ASCII names runs more than one git
+    /// process (stdin first, then argument chunks), so it can be partly
+    /// applied when a later one fails; the error says so. A lock held by
+    /// someone else is not a per-file fault, so it is never halved: the whole
+    /// group reports it after one bounded retry.
     pub fn stage_files_attributed(repo_path: &str, files: &[String]) -> Vec<Result<(), String>> {
         let mut outcomes: Vec<Result<(), String>> = vec![Ok(()); files.len()];
         let mut split_budget = STAGE_SPLIT_BUDGET;
@@ -663,9 +675,12 @@ impl GitWriter {
         }
         // One process for every ASCII path, paths on stdin NUL-separated: git
         // applies the pathspec set to the index under one lock, so a failure
-        // leaves nothing half-applied (the chunked form ran a process per 128
-        // paths and could stop partway). The judged lines above name the same
-        // pathspecs; only the transport differs.
+        // leaves nothing half-applied, except that an ignored path exits 1
+        // after the other paths were staged (the chunked form ran a process per
+        // 128 paths and could stop partway). The non-ASCII paths below run
+        // after it in further processes, so a selection mixing both can be
+        // partly applied. The judged lines above name the same pathspecs; only
+        // the transport differs.
         //
         // A path with a non-ASCII character does not go this way. On macOS git
         // precomposes a pathspec it is handed as an argument but not one it
