@@ -1324,8 +1324,9 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
         .collect();
 
     let class = crate::engine::git_cli::current_admission();
-    // Asked once for the whole listing, and only when some scanned branch
-    // is measured against it.
+    // Asked once for the whole listing, whenever any scanned worktree is on a
+    // branch: without the base no branch is known to be it, so even a lone
+    // checkout of the default needs the answer to be called "no divergence".
     let needs_base =
         depth == ScanDepth::Full && scan_targets.iter().any(|&idx| parsed[idx].branch.is_some());
     let base = if needs_base {
@@ -5829,8 +5830,8 @@ some-future-field whatever
         // The one lookup is the default base's: the remote HEAD symref is
         // what every computation of it starts with (git_reader's marker).
         assert!(
-            spawned_with(std::slice::from_ref(&root), "refs/remotes/origin/HEAD") <= 1,
-            "more than one default-base lookup"
+            spawned_with(std::slice::from_ref(&root), "refs/remotes/origin/HEAD") == 1,
+            "expected exactly one default-base lookup"
         );
         // And what it measures is what git measures.
         for info in &listed[1..] {

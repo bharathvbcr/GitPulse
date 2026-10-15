@@ -3030,8 +3030,11 @@ pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, St
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reads {
     /// Through [`ref_cache`]. Its stamp does not see files pulled in by
-    /// `include.path` or the system config, so those are bounded only by the
-    /// cache's TTL: the display readers' admitted gap.
+    /// `include.path` or the system config. A recompute reads `config --list`
+    /// through its own cache entry, which can itself be up to a TTL old, so a
+    /// change to such a file is seen within about twice the 60 s TTL: the
+    /// display readers' admitted gap. (Reading config fresh on every cached
+    /// recompute would cost a process each time, so the gap is stated.)
     Cached,
     /// Straight from git, every time. For a caller that destroys something on
     /// the answer.
@@ -3246,9 +3249,11 @@ struct SharedBase {
 /// bounds the inputs no stamp sees (files pulled in by `include.path`).
 ///
 /// Two bounds are deliberate. Files pulled in by `include.path` (and the
-/// system config) are not stamped, so a change to one is seen within the 60 s
-/// TTL, not at once; a destructive caller reads [`compute_default_base`]
-/// instead, which asks git directly. And a stamp whose newest mtime is within
+/// system config) are not stamped, so a change to one is seen within about
+/// twice the 60 s TTL (the kept answer, then the kept `config --list` it is
+/// recomputed from), not at once; a destructive caller reads
+/// [`compute_default_base`] instead, which asks git directly. The dead-branch
+/// clean's default-branch protection does. And a stamp whose newest mtime is within
 /// the racy window is never trusted, so sequential callers in the 3 s after a
 /// write each recompute (five processes): serving the last answer there is the
 /// staleness this removes. Callers that arrive together still share one
@@ -10853,7 +10858,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// bounds it, but a destructive caller's "uncached" compute_default_base
     /// reads `config --list` and HEAD through the ref cache too.
     #[test]
-    fn adv_include_file_change_is_seen_by_default_base() {
+    fn include_file_change_is_seen_by_the_uncached_base_and_bounded_by_the_ttl_on_the_cached() {
         let _kept = ref_cache::retention();
         let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
         let repo = dir.path().canonicalize().unwrap();
