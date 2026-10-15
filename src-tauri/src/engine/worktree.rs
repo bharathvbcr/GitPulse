@@ -8909,4 +8909,269 @@ some-future-field whatever
         );
         assert!(!aside.exists());
     }
+
+    // ---- CARD 20 adversarial review ------------------------------------
+
+    /// Primary on `develop` (the remote's default), `main` and `master` as
+    /// worktree branches that collide with the old guess list, a detached
+    /// worktree, and an ordinary lane.
+    fn adv_develop_repo() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, String) {
+        let (main, parent, _) = crate::test_support::repo_with_worktrees(0);
+        let root = plain(main.path());
+        git_in(&root, &["checkout", "-q", "-b", "develop"]);
+        git_in(&root, &["commit", "-q", "--allow-empty", "-m", "develop moves"]);
+        let develop = rev(&root, "develop");
+        git_in(&root, &["remote", "add", "origin", "https://example.com/r.git"]);
+        git_in(&root, &["update-ref", "refs/remotes/origin/develop", &develop]);
+        git_in(
+            &root,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"],
+        );
+        (main, parent, root, develop)
+    }
+
+    /// `git worktree add -q <flags> <path> <tail>`, then `commits` commits in it.
+    fn adv_add(
+        root: &Path,
+        parent: &Path,
+        name: &str,
+        flags: &[&str],
+        tail: &[&str],
+        commits: usize,
+    ) -> PathBuf {
+        let path = parent.join(name);
+        let mut args = vec!["worktree", "add", "-q"];
+        args.extend_from_slice(flags);
+        args.push(path.to_str().unwrap());
+        args.extend_from_slice(tail);
+        git_in(root, &args);
+        crate::test_support::trust_repo(&path);
+        let path = plain(&path);
+        for n in 0..commits {
+            std::fs::write(path.join(format!("{name}-{n}.txt")), "x").unwrap();
+            git_in(&path, &["add", "."]);
+            git_in(&path, &["commit", "-q", "-m", &format!("{name} {n}")]);
+        }
+        path
+    }
+
+    fn adv_measured(list: &[WorktreeInfo], branch: &str) -> Option<(usize, usize)> {
+        list.iter()
+            .find(|w| w.branch.as_deref() == Some(branch))
+            .unwrap_or_else(|| panic!("{branch} not listed"))
+            .main_divergence
+            .clone()
+            .map(|d| (d.ahead, d.behind))
+    }
+
+    /// Attack 3: batched, walked and list_branches must agree for every
+    /// branch, including names that collide with main/master.
+    #[test]
+    fn adv_divergence_parity_with_colliding_names_detached_and_default() {
+        let (main, parent, root, develop) = adv_develop_repo();
+        let _keep = (&main, &parent);
+        adv_add(&root, parent.path(), "wt-main", &[], &["main"], 1);
+        adv_add(&root, parent.path(), "wt-master", &["-b", "master"], &["develop"], 2);
+        adv_add(&root, parent.path(), "wt-lane", &["-b", "feat/x"], &["develop"], 1);
+        adv_add(&root, parent.path(), "wt-det", &["--detach"], &["develop"], 0);
+        let repo = root.to_str().unwrap();
+        let batched = list_worktrees(repo).expect("list");
+        let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
+        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+            list_worktrees(repo)
+        })
+        .expect("list");
+        let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
+        for name in ["main", "master", "feat/x"] {
+            let b = branches.iter().find(|b| b.name == name && !b.is_remote).unwrap();
+            let expected = Some((b.commits_ahead_of_base, b.commits_behind_base));
+            assert_eq!(adv_measured(&batched, name), expected, "batched {name}");
+            assert_eq!(adv_measured(&walked, name), expected, "walked {name}");
+        }
+        assert_eq!(adv_measured(&batched, "develop"), Some((0, 0)), "default itself");
+        assert_eq!(adv_measured(&walked, "develop"), Some((0, 0)), "default itself, walked");
+        for list in [&batched, &walked] {
+            let detached = list.iter().find(|w| w.branch.is_none()).expect("detached listed");
+            assert_eq!(detached.main_divergence, None);
+        }
+    }
+
+    /// Attack 3: an unborn-branch worktree and an unrelated history (the base
+    /// is not an ancestor) in both paths.
+    #[test]
+    fn adv_divergence_parity_unborn_and_unrelated_history() {
+        let (main, parent, root, develop) = adv_develop_repo();
+        let _keep = (&main, &parent);
+        let unborn = parent.path().join("wt-unborn");
+        git_in(
+            &root,
+            &["worktree", "add", "-q", "--orphan", "-b", "unborn", unborn.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&unborn);
+        let unrelated = parent.path().join("wt-unrelated");
+        git_in(
+            &root,
+            &["worktree", "add", "-q", "--orphan", "-b", "unrelated", unrelated.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&unrelated);
+        let unrelated = plain(&unrelated);
+        std::fs::write(unrelated.join("u.txt"), "u").unwrap();
+        git_in(&unrelated, &["add", "."]);
+        git_in(&unrelated, &["commit", "-q", "-m", "unrelated root"]);
+        let repo = root.to_str().unwrap();
+        let batched = list_worktrees(repo).expect("list");
+        let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
+        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+            list_worktrees(repo)
+        })
+        .expect("list");
+        let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
+        let b = branches.iter().find(|b| b.name == "unrelated").unwrap();
+        let expected = Some((b.commits_ahead_of_base, b.commits_behind_base));
+        assert_eq!(adv_measured(&batched, "unrelated"), expected, "batched");
+        assert_eq!(adv_measured(&walked, "unrelated"), expected, "walked");
+        assert_eq!(adv_measured(&batched, "unborn"), adv_measured(&walked, "unborn"), "unborn parity");
+    }
+
+    /// Attack 3: a tag that shares a lane's name. The batched path reads
+    /// `refs/heads/<lane>`; the fallback hands the bare name to rev-list,
+    /// where a tag wins.
+    #[test]
+    fn adv_divergence_fallback_reads_the_branch_not_a_same_named_tag() {
+        let (main, parent, root, develop) = adv_develop_repo();
+        let _keep = (&main, &parent);
+        adv_add(&root, parent.path(), "wt-lane", &["-b", "lane"], &["develop"], 2);
+        git_in(&root, &["tag", "lane", "main"]);
+        let repo = root.to_str().unwrap();
+        let batched = list_worktrees(repo).expect("list");
+        let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
+        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+            list_worktrees(repo)
+        })
+        .expect("list");
+        assert_eq!(adv_measured(&batched, "lane"), Some((2, 0)), "batched");
+        assert_eq!(
+            adv_measured(&walked, "lane"),
+            Some((2, 0)),
+            "the rev-list fallback measured the tag, not the branch"
+        );
+    }
+
+    /// Attack 5: fifty linked worktrees cost one default-base lookup, and a
+    /// second listing with no racy window costs none.
+    #[test]
+    fn adv_fifty_worktrees_one_default_base_lookup_and_warm_costs_none() {
+        let _kept = crate::engine::ref_cache::retention();
+        let (main, parent, linked) = crate::test_support::repo_with_worktrees(50);
+        let _keep = (&main, &parent);
+        let root = plain(main.path());
+        let count = |needle: &str| {
+            crate::engine::git_cli::spawn_log::spawns_in(&root)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == needle))
+                .count()
+        };
+        crate::engine::ref_cache::eager(|| {
+            let cold = list_worktrees(root.to_str().unwrap()).expect("list");
+            assert_eq!(cold.len(), 51);
+            assert_eq!(count("refs/remotes/origin/HEAD"), 1, "cold lookups");
+            let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let _ = list_worktrees(root.to_str().unwrap()).expect("list");
+            assert_eq!(count("refs/remotes/origin/HEAD"), 1, "warm lookups");
+            let again = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            eprintln!("root spawns cold={spawned} warm-extra={}", again - spawned);
+        });
+        let _ = linked;
+    }
+
+    /// Attack 4: the default is a remote-tracking ref with no local head, and
+    /// the primary's HEAD is unborn on that name. Nothing may be touched.
+    #[test]
+    fn adv_null_target_with_a_remote_only_default_touches_nothing() {
+        let (dir, wt) = teardown_fixture_on(None, "main");
+        let repo = dir.path();
+        git_in(repo, &["remote", "add", "origin", "https://example.com/r.git"]);
+        git_in(repo, &["update-ref", "refs/remotes/origin/main", "main"]);
+        git_in(
+            repo,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        );
+        git_in(repo, &["branch", "-m", "main", "work"]);
+        git_in(repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let work_tip = rev(repo, "work");
+        let result = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            None,
+            false,
+            None,
+            &mut allow_all,
+        );
+        let refused = result.expect_err("a remote-only default must not be merged into");
+        eprintln!("refusal: {refused:?}");
+        assert!(wt.path().exists(), "the worktree was removed");
+        assert!(branch_exists(repo, "feature-x"), "the lane branch was deleted");
+        assert_eq!(rev(repo, "work"), work_tip, "work moved");
+        assert!(!branch_exists(repo, "main"), "a local main was created from the merge");
+        assert!(!repo.join("feature.txt").exists());
+    }
+
+    /// Attack 4: the default is the lane's own branch.
+    #[test]
+    fn adv_null_target_equal_to_the_lanes_own_branch_is_refused() {
+        let (dir, wt) = teardown_fixture_on(None, "main");
+        let repo = dir.path();
+        git_in(repo, &["remote", "add", "origin", "https://example.com/r.git"]);
+        git_in(repo, &["update-ref", "refs/remotes/origin/feature-x", "feature-x"]);
+        git_in(
+            repo,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature-x"],
+        );
+        let main_tip = rev(repo, "main");
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            None,
+            false,
+            None,
+            &mut allow_all,
+        )
+        .expect_err("merging a lane into itself");
+        eprintln!("refusal: {refused:?}");
+        assert!(wt.path().exists() && branch_exists(repo, "feature-x"));
+        assert_eq!(rev(repo, "main"), main_tip);
+    }
+
+    /// Attack 4: the default moves after it was resolved (the gate runs the
+    /// move when the merge starts). The merge must stay coherent: it lands in
+    /// the branch it resolved and reports that branch.
+    #[test]
+    fn adv_default_moving_after_resolution_does_not_split_the_merge() {
+        let (dir, wt) = teardown_fixture_on(None, "main");
+        let repo = dir.path().to_path_buf();
+        git_in(&repo, &["remote", "add", "origin", "https://example.com/r.git"]);
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/develop", "develop"]);
+        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        let mut moved = false;
+        let mut gate = |argv: &[&str]| -> Result<(), String> {
+            if !moved && argv.first() == Some(&"merge") {
+                moved = true;
+                git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+            }
+            Ok(())
+        };
+        let merged = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            None,
+            false,
+            None,
+            &mut gate,
+        )
+        .expect("merged");
+        assert_eq!(merged.target_branch, "main");
+        assert!(repo.join("feature.txt").exists());
+    }
 }
