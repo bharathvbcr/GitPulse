@@ -40,11 +40,14 @@ fn host_dir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// A registry on a host in `dir`. The host logs into `dir/logs`
+/// (`GITPULSE_LOG_DIR`), never into the user's real log.
 fn terminals(dir: &Path) -> TerminalSessions {
     TerminalSessions::with_host(HostConfig {
         dir: dir.to_path_buf(),
         binary: Some(host_binary()),
         idle_exit: Some(Duration::from_secs(3)),
+        log_dir: Some(dir.join("logs")),
     })
 }
 

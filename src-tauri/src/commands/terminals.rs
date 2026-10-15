@@ -240,17 +240,26 @@ pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {
 
 /// Releases rendered output bytes so the PTY reader can continue.
 ///
-/// Inline on purpose, unlike the commands above: it is a map lookup and one
-/// counter update under short locks, no I/O and no wait, and it is sent for
-/// every rendered chunk, so a hop to another thread would cost more than the
-/// work. Routing it through the session's input lane would also hold the
-/// release of output behind a write that is waiting on a stuck child.
+/// In-process it runs inline, unlike the commands above: it is a map lookup
+/// and one counter update under short locks, no I/O and no wait, and it is
+/// sent for every rendered chunk, so a hop to another thread would cost more
+/// than the work. With the terminal host it is a round trip to that process
+/// (answered inline there, so a refused acknowledgement is refused here), and a
+/// wait does not belong on an async-runtime worker: it goes to the control
+/// pool. Never the session's input lane, which would hold the release of output
+/// behind a write that is waiting on a stuck child.
 #[tauri::command(async)]
 pub async fn cmd_terminal_ack(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
     bytes: usize,
 ) -> Result<(), String> {
+    if state.backend() == "host" {
+        return crate::terminal::control_async(&state, "terminal_ack", move |state| {
+            crate::terminal::acknowledge_output(state, &session_id, bytes)
+        })
+        .await;
+    }
     crate::terminal::acknowledge_output(&state, &session_id, bytes)
 }
 

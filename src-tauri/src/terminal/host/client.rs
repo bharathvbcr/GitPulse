@@ -63,6 +63,11 @@ pub struct HostConfig {
     pub binary: Option<PathBuf>,
     /// Passed to a host this app starts; `None` is the host's default.
     pub idle_exit: Option<Duration>,
+    /// Where a host this app starts writes its durable log
+    /// (`logging::LOG_DIR_ENV`). `None` is the user's log directory, as for
+    /// every other GitPulse binary; a test names its own, so a test host
+    /// never writes into the real log.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -72,6 +77,7 @@ impl HostConfig {
             dir: super::default_dir().ok_or("Application config directory unavailable")?,
             binary: None,
             idle_exit: None,
+            log_dir: None,
         })
     }
 }
@@ -91,6 +97,15 @@ struct Connection {
     closed: AtomicBool,
     /// The host's pid, from its hello; 0 until it has answered.
     host_pid: std::sync::atomic::AtomicU32,
+    /// Frames the reader has queued for delivery, and how many the delivery
+    /// thread has finished. A reply is resolved on the reader, so a call
+    /// whose answer must not overtake what the host sent before it (an
+    /// attach, whose replay comes first) waits for delivery to catch up.
+    queued: AtomicU64,
+    delivered: Mutex<u64>,
+    caught_up: std::sync::Condvar,
+    /// The delivery thread, which never waits on itself.
+    delivery: std::sync::OnceLock<std::thread::ThreadId>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -143,6 +158,39 @@ impl Connection {
         answered
             .recv_timeout(within + SWEEP_EVERY * 4)
             .unwrap_or_else(|_| Err(LOST.into()))
+    }
+
+    /// [`Connection::call`], answered only once everything the host sent
+    /// before its reply has been delivered.
+    fn call_in_order(
+        &self,
+        request: Request,
+        payload: &[u8],
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        let answer = self.call(request, payload, within)?;
+        if self.delivery.get() != Some(&std::thread::current().id()) {
+            let target = self.queued.load(Ordering::Acquire);
+            let deadline = Instant::now() + within;
+            let mut delivered = lock(&self.delivered);
+            while *delivered < target && !self.is_closed() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("The terminal host answered, but what it sent first was not delivered in time.".into());
+                }
+                delivered = self
+                    .caught_up
+                    .wait_timeout(delivered, left.min(SWEEP_EVERY))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+        Ok(answer)
+    }
+
+    fn mark_delivered(&self) {
+        *lock(&self.delivered) += 1;
+        self.caught_up.notify_all();
     }
 
     fn resolve(&self, id: u64, result: Result<serde_json::Value, String>) {
@@ -543,7 +591,7 @@ impl HostClient {
         let previous = slot.current();
         slot.replace(output);
         let attached = conn
-            .call(
+            .call_in_order(
                 Request::Attach {
                     session: session.to_owned(),
                     rows,
@@ -581,7 +629,7 @@ impl HostClient {
         let previous = slot.current();
         slot.replace(output);
         let attached = conn
-            .call(
+            .call_in_order(
                 Request::AttachTracked {
                     run_id: run_id.to_owned(),
                     rows,
@@ -838,6 +886,10 @@ impl Inner {
             pending: Mutex::default(),
             closed: AtomicBool::new(false),
             host_pid: std::sync::atomic::AtomicU32::new(0),
+            queued: AtomicU64::new(0),
+            delivered: Mutex::new(0),
+            caught_up: std::sync::Condvar::new(),
+            delivery: std::sync::OnceLock::new(),
         });
         let reader = {
             let (inner, conn) = (Arc::downgrade(self), conn.clone());
@@ -1249,6 +1301,9 @@ impl Inner {
         };
         let mut command = std::process::Command::new(&binary);
         command.arg("--dir").arg(&self.config.dir);
+        if let Some(dir) = &self.config.log_dir {
+            command.env(crate::logging::LOG_DIR_ENV, dir);
+        }
         if let Some(idle) = self.config.idle_exit {
             command
                 .arg("--idle-exit-ms")
@@ -1424,11 +1479,13 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
             "terminal-host-delivery",
             "terminal host delivery",
             move || {
+                let _ = conn.delivery.set(std::thread::current().id());
                 for (frame, payload) in deliveries {
                     let Some(inner) = inner.upgrade() else {
                         break;
                     };
                     inner.deliver(&conn, frame, &payload);
+                    conn.mark_delivered();
                 }
             },
         )
@@ -1463,6 +1520,7 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
                 },
             ),
             Ok(frame) => {
+                conn.queued.fetch_add(1, Ordering::AcqRel);
                 if deliver.send((frame, payload)).is_err() {
                     break;
                 }

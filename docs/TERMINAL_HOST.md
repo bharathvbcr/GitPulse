@@ -59,7 +59,10 @@ A unix-domain `SOCK_STREAM` socket, one frame at a time in each direction.
   `{"kind":"reply","id":…,"ok":…}` or `{"kind":"reply","id":…,"error":"…"}`.
   `ack` is answered too, inline in the host's read loop, so an acknowledgement
   the window refuses (a late one, for a window a detach already forgave) is
-  refused to the view exactly as in-process. Requests: `hello`, `retire`,
+  refused to the view exactly as in-process. The cost is the "second
+  flow-control layer" the card warned of: an acknowledgement is a round trip
+  (`cmd_terminal_ack` runs it on the control pool, not on an async-runtime
+  worker). Requests: `hello`, `retire`,
   `spawn`, `write`, `resize`, `ack`, `detach`, `detach_all`, `attach`,
   `attach_tracked`, `kill`, `stop_all`, `list`, `context`, `background`,
   `limit`, `stall`, `receipts`, `forget`, and the test-only `wakeups`, `size`,

@@ -92,8 +92,10 @@ fn admit_is_asked_only_where_a_launch_starts() {
     assert_eq!(
         sites,
         [
-            // The PTY of an agent CLI.
-            "src/terminal/mod.rs:spawn_session_inner",
+            // The PTY of an agent CLI: the app's side of every spawn, whichever
+            // backend holds the PTY, because the governor's "Admit anyway"
+            // override lives in the app (docs/TERMINAL_HOST.md, row 9).
+            "src/terminal/mod.rs:spawn_at",
             // The helper, and its two launch steps: before the checkout
             // probes, and before the capacity check and worktree build.
             "src/workbench/terminal_launch.rs:admit_launch",

@@ -237,6 +237,12 @@ fn read(path: &Path) -> Result<(Option<Spawned>, Option<WireEnded>), String> {
 mod tests {
     use super::*;
 
+    /// A temporary directory with no symlink in its path, as the host's own
+    /// directory has: `private_dir` refuses one (macOS's `/var` is a link).
+    fn private_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
     fn ended(id: &str, code: Option<i32>, run: Option<&str>) -> WireEnded {
         WireEnded {
             payload: TerminalExitPayload {
@@ -255,7 +261,7 @@ mod tests {
 
     #[test]
     fn an_exit_is_kept_until_forgotten_and_a_live_session_is_never_listed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let receipts = Receipts::open(dir.path().join("receipts")).unwrap();
         receipts
             .spawned("term-1-a", Some("run-1"), "claude", "/w")
@@ -281,7 +287,7 @@ mod tests {
 
     #[test]
     fn a_session_its_host_died_under_gets_an_unreaped_exit_and_a_live_one_does_not() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let receipts = Receipts::open(dir.path().to_path_buf()).unwrap();
         receipts
             .spawned("term-1-a", Some("run-1"), "claude", "/w")
@@ -309,7 +315,7 @@ mod tests {
 
     #[test]
     fn names_that_are_not_session_ids_and_torn_lines_are_refused_or_skipped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let receipts = Receipts::open(dir.path().to_path_buf()).unwrap();
         for bad in ["../x", "term-1-a/../../y", "", "term-x-1", "term-1-A"] {
             assert!(receipts.spawned(bad, None, "zsh", "/w").is_err(), "{bad:?}");

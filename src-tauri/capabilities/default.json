@@ -255,6 +255,7 @@
     "allow-cmd-task-view",
     "allow-cmd-terminal-ack",
     "allow-cmd-terminal-attach",
+    "allow-cmd-terminal-backend",
     "allow-cmd-terminal-context",
     "allow-cmd-terminal-detach",
     "allow-cmd-terminal-export",

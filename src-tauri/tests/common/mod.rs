@@ -92,9 +92,11 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
             .keep();
         return gitpulse_lib::terminal::TerminalSessions::with_host(
             gitpulse_lib::terminal::host::client::HostConfig {
-                dir,
                 binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
                 idle_exit: Some(std::time::Duration::from_secs(3)),
+                // GITPULSE_LOG_DIR for the host: never the user's real log.
+                log_dir: Some(dir.join("logs")),
+                dir,
             },
         );
     }

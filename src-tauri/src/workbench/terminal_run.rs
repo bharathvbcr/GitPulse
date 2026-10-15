@@ -973,6 +973,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             binary: Some("/nonexistent/gitpulse-ptyd".into()),
             idle_exit: None,
+            log_dir: None,
         };
         let release = root.path().join("release");
         let program = script(
