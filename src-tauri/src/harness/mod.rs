@@ -14,6 +14,9 @@ pub mod protocol;
 pub(crate) mod review;
 pub mod sidecar;
 
+#[cfg(test)]
+mod concurrent_tests;
+
 use serde::{Deserialize, Serialize};
 
 pub use policy::{
@@ -345,6 +348,18 @@ pub(crate) fn guard_files(
     files: &[&str],
     op: &str,
 ) -> Result<Vec<PolicyVerdict>, String> {
+    guard_files_with(repo_path, files, op, GUARD_FILES_CONCURRENCY)
+}
+
+/// [`guard_files`] with `workers` checks in flight. Production always runs
+/// [`GUARD_FILES_CONCURRENCY`]; the count is a parameter so a test drives the
+/// same concurrent path, not a one-worker stand-in.
+fn guard_files_with(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<PolicyVerdict>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -356,17 +371,19 @@ pub(crate) fn guard_files(
     let action = format!("file.{}", if op.is_empty() { "write" } else { op });
 
     // The test build's one fake sidecar is guarded by a lock that only the
-    // thread that took it may re-enter (see `sidecar::test_serial`), so a test
-    // judges inline. `judge_in_order` is what the tests drive concurrently.
-    let workers = if cfg!(test) {
-        1
-    } else {
-        GUARD_FILES_CONCURRENCY
-    };
+    // thread that took it may re-enter (see `sidecar::test_serial`). This
+    // thread blocks until every worker is done, so it lends what it holds to
+    // them; without a lend a worker would wait on its own spawner.
+    #[cfg(test)]
+    let lent = sidecar::test_serial_held_here();
     let judged = judge_in_order(
         files,
         workers,
-        |file| check_file(repo_path, file, op, scope.as_ref()),
+        |file| {
+            #[cfg(test)]
+            let _lent = sidecar::lend_test_serial(lent);
+            check_file(repo_path, file, op, scope.as_ref())
+        },
         |verdict| verdict.blocks() || verdict.gate_failed(),
     );
 

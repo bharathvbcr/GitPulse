@@ -541,6 +541,28 @@ impl GitWriter {
         outcomes
     }
 
+    /// Which of `files` git would refuse to add because a `.gitignore` rule
+    /// ignores them (tracked paths never are). Empty when none is, or when
+    /// git could not answer: the caller then falls back to halving.
+    fn ignored_among(repo_path: &str, files: &[String]) -> HashSet<String> {
+        let Ok(repo) = validate_repo(repo_path) else {
+            return HashSet::new();
+        };
+        let mut input = Vec::new();
+        for file in files {
+            input.extend_from_slice(file.as_bytes());
+            input.push(0);
+        }
+        match git_with_stdin(&repo, &["check-ignore", "-z", "--stdin"], &input) {
+            Ok(out) => String::from_utf8_lossy(&out)
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(String::from)
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
     fn stage_group(
         repo_path: &str,
         files: &[String],
@@ -555,6 +577,33 @@ impl GitWriter {
             Ok(_) => return,
             Err(error) => error,
         };
+        // `git add` exits 1 for an ignored path yet stages every other path in
+        // the set, so a batch that failed is not always untouched. Ignored
+        // paths are named exactly, outside the halving budget, and the rest are
+        // staged again (a no-op for what git already took).
+        if files.len() > 1 && !is_transient_git_lock_error(&error) {
+            let ignored = Self::ignored_among(repo_path, files);
+            if !ignored.is_empty() && ignored.len() < files.len() {
+                let mut rest = Vec::new();
+                let mut rest_slots = Vec::new();
+                for (index, file) in files.iter().enumerate() {
+                    if ignored.contains(file) {
+                        outcomes[index] = Err(format!(
+                            "Index update failed for the 1 selected paths: {file} is ignored by a .gitignore file; stage it with force to track it."
+                        ));
+                    } else {
+                        rest.push(file.clone());
+                        rest_slots.push(index);
+                    }
+                }
+                let mut rest_outcomes = vec![Ok(()); rest.len()];
+                Self::stage_group(repo_path, &rest, &mut rest_outcomes, split_budget);
+                for (slot, outcome) in rest_slots.into_iter().zip(rest_outcomes) {
+                    outcomes[slot] = outcome;
+                }
+                return;
+            }
+        }
         if files.len() > 1 && !is_transient_git_lock_error(&error) && *split_budget > 0 {
             *split_budget -= 1;
             let (left_files, right_files) = files.split_at(files.len() / 2);
@@ -626,8 +675,18 @@ impl GitWriter {
         // bounded chunks the judge was shown.
         let (plain, accented): (Vec<&String>, Vec<&String>) =
             paths.iter().partition(|path| path.is_ascii());
+        // The ASCII paths are applied before the others, and each argument
+        // chunk before the next, so a failure after a first process succeeded
+        // leaves that part applied; the message says so rather than reading
+        // as all-or-nothing.
+        let applied = std::cell::Cell::new(false);
         let failed = |error: String| {
-            format!("Index update failed for the {} selected paths: {error}. Refresh to review the current index.", paths.len())
+            let partly = if applied.get() {
+                " The selection was partly applied before this failure."
+            } else {
+                ""
+            };
+            format!("Index update failed for the {} selected paths: {error}.{partly} Refresh to review the current index.", paths.len())
         };
         if !plain.is_empty() {
             let mut input = Vec::new();
@@ -641,12 +700,14 @@ impl GitWriter {
                 .collect();
             args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
             git_with_stdin(&repo, &args, &input).map_err(failed)?;
+            applied.set(true);
         }
         let accented: Vec<String> = accented.into_iter().cloned().collect();
         for chunk in index_chunks(&prefix, &accented) {
             if chunk.len() > prefix.len() {
                 let args: Vec<&str> = chunk.iter().skip(1).map(String::as_str).collect();
                 git_text(&repo, &args).map_err(failed)?;
+                applied.set(true);
             }
         }
         let completed = paths.len();
@@ -5847,6 +5908,178 @@ mod tests {
         // The retry loop re-spawns the same one batch; halving would show as
         // a second, smaller group's worth of spawns.
         assert!(adds(&labels) <= 4, "{labels:?}");
+    }
+
+    /// The invariant under every attribution: a file reported staged is in the
+    /// index, and a file reported failed is not (git's own list is the judge).
+    fn assert_outcomes_match_index(
+        dir: &tempfile::TempDir,
+        files: &[String],
+        outcomes: &[Result<(), String>],
+    ) {
+        let staged = staged_names(dir);
+        for (file, outcome) in files.iter().zip(outcomes) {
+            let precomposed = file.replace("e\u{301}", "\u{e9}");
+            let in_index = staged.contains(file) || staged.contains(&precomposed);
+            assert_eq!(
+                outcome.is_ok(),
+                in_index,
+                "{file:?}: reported {outcome:?}, index has it: {in_index}"
+            );
+        }
+    }
+
+    /// `git add` exits 1 for an ignored path yet stages the rest of its
+    /// pathspec set, so a failed batch is not always an untouched index.
+    #[test]
+    fn an_ignored_file_in_a_batch_is_named_and_the_rest_staged() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join(".gitignore"), "skip-*\n").unwrap();
+        let files: Vec<String> = ["a.md", "skip-me.md", "b.md", "skip-too.md", "c.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes[1].is_err() && outcomes[3].is_err());
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok() && outcomes[4].is_ok());
+    }
+
+    /// Past the halving budget no file may read as failed while git staged it,
+    /// nor staged while it is absent from the index.
+    #[test]
+    fn an_exhausted_halving_budget_never_misreports_a_staged_file() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join(".gitignore"), "skip-*\n").unwrap();
+        let files: Vec<String> = (0..600)
+            .map(|i| {
+                if i % 7 == 3 {
+                    format!("skip-{i}.md")
+                } else {
+                    format!("ok-{i}.md")
+                }
+            })
+            .collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+    }
+
+    /// A directory, a symlink and a dangling symlink are paths git can stage;
+    /// each is reported as the index shows it.
+    #[test]
+    fn directories_and_symlinks_are_reported_as_the_index_shows_them() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::create_dir_all(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d/in.md"), "x\n").unwrap();
+        std::fs::write(dir.path().join("t.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink("t.md", dir.path().join("link.md")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.path().join("dangling.md")).unwrap();
+        let files: Vec<String> = ["t.md", "link.md", "dangling.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let dirs = vec!["d".to_string()];
+        let outcomes = GitWriter::stage_files_attributed(&path, &dirs);
+        assert!(outcomes[0].is_ok());
+        assert!(staged_names(&dir).contains("d/in.md"));
+    }
+
+    /// A set mixing ASCII and non-ASCII names with vanished files of each kind:
+    /// the two transports run in sequence, so a failure in the second leaves
+    /// the first applied, and the per-file outcomes must still be exact.
+    #[test]
+    fn a_mixed_batch_with_vanished_files_of_both_kinds_is_attributed_exactly() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = [
+            "a1.md",
+            "cafe\u{301}-1.md",
+            "gone-ascii.md",
+            "a2.md",
+            "cafe\u{301}-gone.md",
+            "cafe\u{301}-2.md",
+            "a3.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for file in &files {
+            if !file.contains("gone") {
+                std::fs::write(dir.path().join(file), "x\n").unwrap();
+            }
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes[2].is_err() && outcomes[4].is_err(), "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 5);
+    }
+
+    /// An error from a mixed selection says what was applied: the plain paths
+    /// went in before the accented ones failed.
+    #[test]
+    fn a_failed_mixed_selection_does_not_claim_nothing_was_applied() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join("plain.md"), "x\n").unwrap();
+        let files = vec!["plain.md".to_string(), "cafe\u{301}-gone.md".to_string()];
+        let result = GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()));
+        let error = result.expect_err("one path is missing");
+        let staged = staged_names(&dir);
+        assert!(
+            !staged.contains("plain.md") || error.contains("partly"),
+            "plain.md is staged but the error reads as all-or-nothing: {error}"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_decomposed_name_unstages_it() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let name = "cafe\u{301}-unstage.md".to_string();
+        std::fs::write(dir.path().join(&name), "x\n").unwrap();
+        GitWriter::stage_file(&path, &name).unwrap();
+        assert_eq!(staged_names(&dir).len(), 1);
+        GitWriter::unstage_file(&path, &name).unwrap();
+        assert!(staged_names(&dir).is_empty(), "{:?}", staged_names(&dir));
+    }
+
+    /// Every argv a chunk becomes stays far from the OS command-length limit,
+    /// whatever the path lengths, and keeps to the path-count bound.
+    #[test]
+    fn index_chunks_bound_both_the_argv_bytes_and_the_path_count() {
+        let prefix: Vec<String> = ["git", "add", "--"].iter().map(|s| s.to_string()).collect();
+        for len in [1usize, 40, 1000, 4000] {
+            let paths: Vec<String> = (0..500)
+                .map(|i| format!(":(literal){}{i}", "\u{e9}".repeat(len / 2)))
+                .collect();
+            let chunks = index_chunks(&prefix, &paths);
+            assert_eq!(
+                chunks.iter().map(|c| c.len() - prefix.len()).sum::<usize>(),
+                paths.len()
+            );
+            for chunk in &chunks {
+                let bytes: usize = chunk.iter().map(|a| a.len() + 1).sum();
+                assert!(chunk.len() - prefix.len() <= MAX_INDEX_CHUNK_PATHS);
+                // One path can exceed the byte budget alone (it is at most
+                // 4096 bytes); several never do.
+                assert!(
+                    bytes <= MAX_INDEX_ARGV_BYTES || chunk.len() - prefix.len() == 1,
+                    "{len}: {bytes}"
+                );
+            }
+        }
     }
 }
 
