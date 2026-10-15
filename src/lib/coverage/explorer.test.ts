@@ -86,6 +86,17 @@ describe("coverage exploration", () => {
     expect(coverageScanStatus({ ...report, artifacts: [withUnresolved(2)] }, false, false, false)).toBe("Partial coverage");
   });
 
+  it("counts only real positive unresolved counts, so a malformed one cannot cancel or hide a real one", () => {
+    const report: CoverageReport = { files: [], families: [], languages: [], artifacts: [], truncated: false, overall: { lines_found: 1, lines_hit: 0, percentage: 0 } };
+    const withUnresolved = (n: unknown): CoverageArtifact => ({ ...artifact(false), unresolved_files: n as number });
+    const reasons = (...counts: unknown[]) => coverageScanReasons({ ...report, artifacts: counts.map(withUnresolved) }, false);
+    expect(reasons(-5, 3)).toEqual(["3 reported files matched no file in this repository"]);
+    expect(reasons(null, 2, Number.NaN)).toEqual(["2 reported files matched no file in this repository"]);
+    expect(reasons(Number.NaN, -1, 0, null)).toEqual([]);
+    expect(reasons("4", 1)).toEqual(["1 reported file matched no file in this repository"]);
+    expect(reasons(Number.MAX_SAFE_INTEGER, 1)).toHaveLength(1);
+  });
+
   it("is never Measured when the existence-probe cap or the scan deadline cut the scan", () => {
     const base: CoverageReport = { files: [], families: [], languages: [], artifacts: [], truncated: false, overall: { lines_found: 5, lines_hit: 5, percentage: 100 } };
     const probes = { resource: "path existence checks", kept: 200000, total: 200431 };

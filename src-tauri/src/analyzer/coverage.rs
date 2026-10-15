@@ -8465,4 +8465,207 @@ mod mapping_tests {
         let unknown = CoverageScanner::file_coverage(path, "src/unknown.rs").unwrap();
         assert!(unknown.lines.is_empty());
     }
+
+    /// What the old whole-file check decided: `Some(last)` when the file ends
+    /// before `highest`, `None` when every recorded line exists.
+    fn eof_reference(bytes: &[u8], highest: usize) -> Option<usize> {
+        let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+        let last = newlines + usize::from(bytes.last().is_some_and(|b| *b != b'\n'));
+        (last < highest).then_some(last)
+    }
+
+    /// Adversarial: `eof_check` must decide exactly what the old whole-file
+    /// count decided, for every shape of file and every recorded line around
+    /// the end, including a newline that falls on a chunk edge.
+    #[test]
+    fn the_eof_check_agrees_with_a_whole_file_count_at_every_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let chunk = EOF_CHUNK_BYTES;
+        let mut shapes: Vec<(String, Vec<u8>)> = Vec::new();
+        for terminator in ["\n", "", "\r\n", "\r"] {
+            for lead in [
+                chunk - 2,
+                chunk - 1,
+                chunk,
+                chunk + 1,
+                2 * chunk - 1,
+                2 * chunk,
+            ] {
+                // One long first line puts the first newline at `lead`, so
+                // line 1 ends on, just before, or just after a chunk edge.
+                let mut bytes = vec![b'x'; lead - 1];
+                bytes.push(b'\n');
+                bytes.extend_from_slice(format!("second{terminator}third{terminator}").as_bytes());
+                shapes.push((format!("lead{lead}-{terminator:?}"), bytes));
+            }
+            shapes.push((
+                format!("short-{terminator:?}"),
+                format!("a{terminator}b{terminator}c").into_bytes(),
+            ));
+            shapes.push((
+                format!("one-{terminator:?}"),
+                format!("a{terminator}").into_bytes(),
+            ));
+        }
+        shapes.push(("empty".into(), Vec::new()));
+        shapes.push(("blank".into(), b"\n".to_vec()));
+        shapes.push(("blanks".into(), b"\n\n\n".to_vec()));
+        for (name, bytes) in &shapes {
+            let path = dir.path().join(name.replace(['\\', '"'], "_"));
+            std::fs::write(&path, bytes).unwrap();
+            let last = eof_reference(bytes, usize::MAX).unwrap_or(0);
+            for highest in [
+                0,
+                1,
+                last.saturating_sub(1),
+                last,
+                last + 1,
+                last + 2,
+                1_000_000,
+            ] {
+                let got = eof_check(&path, highest, MAX_EOF_CHECK_BYTES);
+                assert_eq!(
+                    got.ends_at,
+                    eof_reference(bytes, highest),
+                    "{name} ({} bytes), highest {highest}",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
+    /// Adversarial: a file of exactly the byte cap is decided like any other; one
+    /// byte over is undecided and kept, as the old oversized-file refusal kept it.
+    #[test]
+    fn the_eof_check_decides_a_file_of_exactly_the_cap_and_keeps_one_byte_over() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cap = 3 * EOF_CHUNK_BYTES as u64 + 7;
+        let mut exact = vec![b'x'; cap as usize - 1];
+        exact.push(b'\n');
+        let path = dir.path().join("exact");
+        std::fs::write(&path, &exact).unwrap();
+        assert_eq!(
+            eof_check(&path, 2, cap).ends_at,
+            Some(1),
+            "decided at exactly the cap"
+        );
+        assert_eq!(eof_check(&path, 1, cap).ends_at, None);
+        exact.push(b'\n');
+        let over = dir.path().join("over");
+        std::fs::write(&over, &exact).unwrap();
+        let undecided = eof_check(&over, 5, cap);
+        assert_eq!(undecided.ends_at, None, "one byte over the cap is kept");
+        assert!(undecided.bytes_read <= cap + 1);
+    }
+
+    /// Adversarial: a symlinked source resolves to its target before the check
+    /// (`sandbox_join_canonical`), so lines past the target's end are still
+    /// dropped — the guarantee the old whole-file check gave.
+    #[cfg(unix)]
+    #[test]
+    fn lines_past_the_end_of_a_symlinked_source_are_still_dropped() {
+        let repo = git_repo();
+        write(repo.path(), "src/real.rs", &lines(3));
+        std::os::unix::fs::symlink("real.rs", repo.path().join("src/link.rs")).unwrap();
+        write(repo.path(), "lcov.info", "");
+        let fresh = std::time::SystemTime::now() + Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.path().join("lcov.info"))
+            .unwrap()
+            .set_modified(fresh)
+            .unwrap();
+        let mut map: HashMap<String, BTreeMap<usize, u64>> = HashMap::new();
+        map.insert(
+            "src/link.rs".into(),
+            BTreeMap::from([(1, 1), (2, 1), (500, 1)]),
+        );
+        let (kept, stale, past_eof) = drop_stale_and_out_of_range(
+            repo.path(),
+            "lcov.info",
+            map,
+            &mut budget(None, DEFAULT_MAX_SOURCE_READS),
+        );
+        assert_eq!(stale, 0);
+        assert_eq!(past_eof, 1, "line 500 of a 3-line file");
+        assert_eq!(
+            kept["src/link.rs"].keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// Adversarial: a complete cached scan survives a cut scan of the same
+    /// repository — the cut one neither evicts nor overwrites it, and the next
+    /// scan is a hit on the original entry.
+    #[test]
+    fn a_cut_scan_leaves_a_previous_complete_cache_entry_alone() {
+        let _sequence = CACHE_SEQUENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _frozen = FreezeEvictionGuard::new();
+        let repo = rust_repo_with_lcov(2);
+        let path = repo.path().to_str().unwrap();
+        SCAN_PARSE_COUNT.with(|c| c.set(0));
+        let (full, first) = CoverageScanner::scan_with_limits(path, ScanLimits::default()).unwrap();
+        assert!(!full.truncated);
+        let parsed = SCAN_PARSE_COUNT.with(|c| c.get());
+        for after in 0..6 {
+            let limits = ScanLimits {
+                deadline: Some(crate::deadline::ScanDeadline::after(Duration::from_secs(
+                    600,
+                ))),
+                ..ScanLimits::default()
+            };
+            let _forced = crate::deadline::tests::ExpireAfterChecks::new(after);
+            let (report, maps) = CoverageScanner::scan_with_limits(path, limits).unwrap();
+            drop(_forced);
+            // Either an honest cut, or the cached complete report: never a
+            // partial one that claims to be whole.
+            if report.truncated {
+                assert!(maps.len() <= first.len(), "after {after}");
+            } else {
+                assert_eq!(report.files.len(), full.files.len(), "after {after}");
+            }
+        }
+        let (again, third) =
+            CoverageScanner::scan_with_limits(path, ScanLimits::default()).unwrap();
+        assert!(!again.truncated);
+        assert!(
+            Arc::ptr_eq(&first, &third),
+            "the original entry was replaced"
+        );
+        assert_eq!(SCAN_PARSE_COUNT.with(|c| c.get()), parsed, "no re-parse");
+    }
+
+    /// Adversarial: the existence-probe refusals of one scan must not leak into
+    /// the next scan on the same thread.
+    #[test]
+    fn probe_cap_refusals_do_not_carry_into_the_next_scan_on_the_thread() {
+        let _sequence = CACHE_SEQUENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let over = git_repo();
+        write(over.path(), "src/real.rs", &lines(10));
+        let mut text = String::new();
+        for i in 0..=MAX_EXISTENCE_PROBES {
+            text.push_str(&format!("SF:g/a{i}\nDA:1,1\nend_of_record\n"));
+        }
+        write(over.path(), "lcov.info", &text);
+        let (cut, _) =
+            CoverageScanner::scan_with_limits(over.path().to_str().unwrap(), ScanLimits::default())
+                .unwrap();
+        assert!(cut.truncated, "the first scan is over the cap");
+        let clean = rust_repo_with_lcov(2);
+        let (report, _) = CoverageScanner::scan_with_limits(
+            clean.path().to_str().unwrap(),
+            ScanLimits::default(),
+        )
+        .unwrap();
+        assert!(!report.truncated, "{:?}", report.limit_notices);
+        assert!(
+            report.limit_notices.is_empty(),
+            "{:?}",
+            report.limit_notices
+        );
+    }
 }
