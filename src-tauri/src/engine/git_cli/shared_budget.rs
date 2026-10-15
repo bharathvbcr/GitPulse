@@ -857,6 +857,28 @@ mod tests {
         assert_eq!(admitted, 0);
     }
 
+    /// An unrecorded denial persists neither tokens nor the refill anchor, so
+    /// the next handle that can write credits the elapsed time exactly once:
+    /// the failed handle's refill is recomputed, never double counted.
+    #[test]
+    fn an_unrecorded_denial_does_not_let_the_next_writer_refill_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 1_000 * S;
+        let path = spent_record(&dir, 4, t0);
+        let a = SharedBudget::open(&path).unwrap();
+        let b = SharedBudget::open(&path).unwrap();
+        b.fail_writes(true);
+        // Half a second at 1/s credits nothing; then 2.5 s in, two whole tokens.
+        for at in [t0 + S / 2, t0 + 2 * S + S / 2] {
+            assert!(matches!(b.take_at(2, 4, 1, at), Take::DeniedUnrecorded(_)));
+        }
+        let now = t0 + 3 * S;
+        let granted = (0..10)
+            .filter(|_| a.take_at(0, 4, 1, now) == Take::Granted)
+            .count();
+        assert_eq!(granted, 3, "three seconds of refill, once");
+    }
+
     /// A record renamed over by a directory after this handle opened it: the
     /// handle still holds the original file, so decisions are unchanged.
     #[cfg(unix)]
