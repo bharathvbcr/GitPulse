@@ -39,6 +39,12 @@ export interface CatchUp {
    * grows is a family that never will.
    */
   family_unresolved_cycles?: number;
+  /**
+   * Earlier locations of this repository that its ledger's rows named, taken
+   * over by this pass because the repository was moved or renamed. Non-empty
+   * only on the one pass that did it; not an error.
+   */
+  reanchored_from?: string[];
   reflog_entries: number;
   /** True when the wall-clock deadline stopped the pass early. */
   truncated: boolean;

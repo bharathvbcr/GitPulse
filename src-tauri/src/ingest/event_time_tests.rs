@@ -8,7 +8,7 @@ use crate::ledger::ids;
 use crate::procguard::LockedSpawn;
 use crate::test_support::git_in;
 
-fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
+pub(super) fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
     let serial = crate::test_support::env::env_serial();
     let _env = crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root);
     f()
@@ -18,11 +18,11 @@ fn pause() {
     std::thread::sleep(std::time::Duration::from_millis(20));
 }
 
-fn stamp(ms: u64) -> String {
+pub(super) fn stamp(ms: u64) -> String {
     ids::iso8601_utc(ms)
 }
 
-fn call(cwd: &str, ts: &str, file: &str) -> String {
+pub(super) fn call(cwd: &str, ts: &str, file: &str) -> String {
     serde_json::json!({
         "type": "assistant",
         "sessionId": "ET",
@@ -36,14 +36,14 @@ fn call(cwd: &str, ts: &str, file: &str) -> String {
     .to_string()
 }
 
-fn write_corpus(corpus: &std::path::Path, lines: &[String]) {
+pub(super) fn write_corpus(corpus: &std::path::Path, lines: &[String]) {
     let dir = corpus.join("slug");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("ET.jsonl"), lines.join("\n") + "\n").unwrap();
 }
 
 /// A git checkout with one commit, canonical path.
-fn git_repo() -> (tempfile::TempDir, String) {
+pub(super) fn git_repo() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().canonicalize().unwrap();
     git_in(&path, &["init", "-b", "main"]);
@@ -505,7 +505,7 @@ fn a_crafted_timestamp_reaches_the_row_only_as_a_formatted_instant() {
 
 /// The ledger's own database, opened directly so a test can write rows the
 /// writer would not.
-fn raw_conn<T>(
+pub(super) fn raw_conn<T>(
     repo: &str,
     f: impl FnOnce(&rusqlite::Connection) -> Result<T, ledger::LedgerError>,
 ) -> Result<T, ledger::LedgerError> {
@@ -614,16 +614,23 @@ fn an_agent_chosen_time_chooses_the_task_its_call_is_attributed_to() {
     assert_eq!(detail(&row)["occurred_at_basis"], "transcript");
 }
 
-/// KNOWN LIMIT, older than event time: a repository moved, renamed or copied
-/// with `cp -R` carries its ledger with it, and every row names the old path.
-/// The whole-ledger foreign-row probe then refuses all new ingest. This pins
-/// what happens today: nothing is recorded, and the refusal is reported in
-/// `CatchUp.error` rather than reading as a clean pass. Recovering such a
-/// ledger is the follow-up card filed by the orchestrator.
+/// A repository moved, renamed or copied with `cp -R` carries its ledger with
+/// it, and every row names the old path. This was a known limit: the
+/// whole-ledger foreign-row probe refused all new ingest. The ledger now
+/// records which repository it belongs to, so a pass after the move takes the
+/// old path for an earlier location of the same repository and records.
 #[test]
-fn known_limit_a_ledger_carried_to_a_new_path_refuses_ingest_and_says_so() {
+fn a_ledger_carried_to_a_new_path_keeps_recording() {
     let (_dir, repo) = git_repo();
     ledger::bindings::bind(&repo, &repo, "T1").unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let first = format!("{repo}/before-move.rs");
+    write_corpus(
+        corpus.path(),
+        &[call(&repo, &stamp(ids::now_millis() - 60_000), &first)],
+    );
+    let out = with_transcript_root(corpus.path(), || ingest_transcripts_into(&repo, &repo));
+    assert_eq!(out.recorded, 1, "{out:?}");
     raw_conn(&repo, |conn| {
         conn.execute(
             "UPDATE events SET repo_path = '/old/location/of/the/repo'",
@@ -633,11 +640,10 @@ fn known_limit_a_ledger_carried_to_a_new_path_refuses_ingest_and_says_so() {
         Ok(())
     })
     .unwrap();
-    let corpus = tempfile::tempdir().unwrap();
     let file = format!("{repo}/after-move.rs");
     write_corpus(
         corpus.path(),
-        &[call(&repo, &stamp(ids::now_millis()), &file)],
+        &[call(&repo, &stamp(ids::now_millis() + 2_000), &file)],
     );
     let out = with_transcript_root(corpus.path(), || ingest_transcripts_into(&repo, &repo));
     eprintln!("moved-repo pass: {out:?}");
@@ -650,11 +656,8 @@ fn known_limit_a_ledger_carried_to_a_new_path_refuses_ingest_and_says_so() {
         .map_err(|e| ledger::LedgerError::new("q", e.to_string()))
     })
     .unwrap();
-    assert_eq!(stored, 0, "a refused pass records nothing: {out:?}");
-    assert!(
-        out.error.contains("repository_mismatch") || out.error.contains("different repository"),
-        "the refusal must be surfaced, not silently clean: {out:?}"
-    );
+    assert_eq!(stored, 1, "the call after the move is recorded: {out:?}");
+    assert_eq!(out.error, "", "{out:?}");
 }
 
 /// The reflog selector the pane hands back to git stays a revision that
