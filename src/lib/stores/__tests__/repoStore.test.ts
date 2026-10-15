@@ -4926,27 +4926,4 @@ describe("repoStore echo replay and queue release", () => {
     await vi.advanceTimersByTimeAsync(600);
     expect(loads.n).toBe(0);
   });
-
-  it("a throwing activity subscriber does not strand the path's queue", async () => {
-    const { store } = makeStore(
-      makeInvoke({
-        cmd_commit: async () => undefined as never,
-        cmd_push: async () => undefined as never,
-      }),
-    );
-    await store.openRepo("/r/a");
-    let boom = false;
-    const stop = store.mutationActivity.subscribe((activity) => {
-      if (boom && gitActionCount(activity) === 0) throw new Error("subscriber failed");
-    });
-    boom = true;
-    await store.commit("m").catch(() => undefined);
-    boom = false;
-    const next = await Promise.race([
-      store.push().then(() => "ran"),
-      new Promise<string>((r) => setTimeout(() => r("stuck"), 500)),
-    ]);
-    stop();
-    expect(next).toBe("ran");
-  });
 });

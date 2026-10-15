@@ -130,7 +130,7 @@ describe("attack 1: target identity", () => {
 });
 
 describe("attack 6: bulk fetch/pull", () => {
-  it("a repo that went missing while queued is still pulled (the bulk skip check reads a snapshot taken before the sweep)", async () => {
+  it("a repo that went missing while queued is skipped, not pulled (the bulk skip check is live)", async () => {
     const pulled: string[] = [];
     const holdA = deferred<unknown>();
     const store = makeStore(
@@ -155,7 +155,7 @@ describe("attack 6: bulk fetch/pull", () => {
     expect(report.results.find((r) => r.path === "/r/b")?.status).toBe("skipped");
   });
 
-  it("two bulk pulls (or a bulk pull and a single pull) run git pull on the same repository concurrently", async () => {
+  it("a bulk pull and a single pull on the same repository run one at a time", async () => {
     let inFlight = 0;
     let peak = 0;
     const gate = deferred<unknown>();
@@ -223,7 +223,7 @@ describe("attack 6: bulk fetch/pull", () => {
 });
 
 describe("attack 6: echo window", () => {
-  it("a pull that runs longer than the 2.5s window stops suppressing its own watcher echoes while it is still running", async () => {
+  it("a pull that outlasts the 2.5s window keeps suppressing its own watcher echoes while it runs", async () => {
     vi.useFakeTimers();
     const loads = { n: 0 };
     const hold = deferred<unknown>();
@@ -287,7 +287,7 @@ describe("attack 6: echo window", () => {
 });
 
 describe("attack 7: surfaced", () => {
-  it("concurrent failures with the same message on the active tab report surfaced:false for all but one, so reportFailure toasts N-1 extra times", async () => {
+  it("concurrent failures with the same message on the active tab all report surfaced:true, so reportFailure adds no extra toast", async () => {
     const store = makeStore(
       makeInvoke({
         cmd_create_branch: async () => {
