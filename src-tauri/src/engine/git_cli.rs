@@ -3611,6 +3611,12 @@ fn shared_reads() -> &'static Mutex<HashMap<SharedReadKey, Arc<SharedRead>>> {
 /// queued at the gate. Only for commands that cannot change repository state:
 /// a shared write would report one write's outcome as another's. Commands
 /// without a working directory, or with stdin, are never shared.
+///
+/// `timeout` is this caller's own budget, whichever side of the flight it is
+/// on. A joiner stops waiting for the leader's child when its own deadline
+/// passes, with the timeout a solo call would report, and the leader runs on
+/// untouched. A leader's timeout is the leader's: a joiner with budget left
+/// runs its own read for what remains instead of adopting it.
 fn run_read_shared(
     mut cmd: Command,
     label: &str,
@@ -3618,8 +3624,79 @@ fn run_read_shared(
     stdout_cap: usize,
     gate: &'static SpawnGate,
 ) -> Result<BoundedRun, String> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt = timeout;
+    loop {
+        match run_read_shared_once(&mut cmd, label, attempt, deadline, stdout_cap, gate) {
+            SharedAttempt::Done(result) => return result,
+            SharedAttempt::LeaderTimedOut => {
+                attempt = deadline.saturating_duration_since(Instant::now());
+                if attempt.is_zero() {
+                    return deadline_expired(label, timeout);
+                }
+            }
+        }
+    }
+}
+
+/// How one pass through the shared-read queue ended.
+enum SharedAttempt {
+    Done(Result<BoundedRun, String>),
+    /// The leader this caller joined ran out of its own time while this
+    /// caller's deadline has not come. Its timeout is not this caller's
+    /// answer, so the caller asks again.
+    LeaderTimedOut,
+}
+
+/// Whether a flight's outcome is its leader's deadline rather than an answer.
+fn is_deadline_outcome(outcome: &Result<BoundedRun, String>) -> bool {
+    match outcome {
+        Ok(run) => matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+        Err(message) => is_timed_out(message),
+    }
+}
+
+/// What a solo call that ran out of `timeout` reports: the prefix form for a
+/// caller keeping deadline prefixes, the error otherwise (see
+/// [`run_admitted`]).
+fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, String> {
+    let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
+    if keeping_deadline_prefix() {
+        return Ok(BoundedRun {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            success: false,
+            status_code: -1,
+            incomplete: Some(Incomplete::Deadline {
+                message,
+                over_cap: None,
+            }),
+            stderr_incomplete: None,
+            cancelled: false,
+        });
+    }
+    note_process_failure(&message);
+    Err(message)
+}
+
+fn run_read_shared_once(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    deadline: Instant,
+    stdout_cap: usize,
+    gate: &'static SpawnGate,
+) -> SharedAttempt {
     let Some(cwd) = cmd.get_current_dir().map(Path::to_path_buf) else {
-        return run_with_gate(&mut cmd, label, timeout, None, stdout_cap, &mut (), gate);
+        return SharedAttempt::Done(run_with_gate(
+            cmd,
+            label,
+            timeout,
+            None,
+            stdout_cap,
+            &mut (),
+            gate,
+        ));
     };
     let key = SharedReadKey {
         cwd,
@@ -3651,23 +3728,38 @@ fn run_read_shared(
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The leader always publishes, even when it panics (`Publish`), and
-        // its own wait is bounded by `timeout` twice over: queue, then run.
-        while result.is_none() {
+        // The leader always publishes, even when it panics (`Publish`), but
+        // its child may outlast this caller's deadline: wait no longer than
+        // that. An answer that is there wins over a deadline that has just
+        // passed. There is no cancel on this path to poll: the read runs
+        // without an observer, so only the deadline bounds the wait.
+        let shared = loop {
+            if let Some(shared) = result.as_ref() {
+                break Some(shared.clone());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break None;
+            }
             result = flight
                 .done
-                .wait(result)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(result, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        };
+        drop(result);
+        let Some(shared) = shared else {
+            return SharedAttempt::Done(deadline_expired(label, timeout));
+        };
+        if is_deadline_outcome(&shared) && Instant::now() < deadline {
+            return SharedAttempt::LeaderTimedOut;
         }
-        let shared = result
-            .clone()
-            .unwrap_or_else(|| Err(format!("{label} shared read lost")));
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
         if let Err(message) = &shared {
             note_process_failure(message);
         }
-        return shared;
+        return SharedAttempt::Done(shared);
     }
 
     /// Closes the table entry and publishes whatever the leader ended with,
@@ -3699,7 +3791,7 @@ fn run_read_shared(
         outcome: None,
     };
     let outcome = run_admitted(
-        &mut cmd,
+        cmd,
         label,
         timeout,
         None,
@@ -3710,7 +3802,7 @@ fn run_read_shared(
     );
     publish.outcome = Some(outcome.clone());
     drop(publish);
-    outcome
+    SharedAttempt::Done(outcome)
 }
 
 /// Removes `flight` from the table if it is still the entry for `key`; a
@@ -8974,6 +9066,273 @@ mod tests {
             gate.counters()[super::Admission::Reactive.index()].coalesced,
             0
         );
+    }
+
+    /// The harness for joiner-deadline tests: a gate whose only slot is held,
+    /// so every read queues and the first caller leads a flight the rest join.
+    #[cfg(unix)]
+    struct JoinerRig {
+        gate: &'static SpawnGate,
+        _dir: tempfile::TempDir,
+        cwd: PathBuf,
+        held: Option<super::SpawnPermit<'static>>,
+    }
+
+    #[cfg(unix)]
+    impl JoinerRig {
+        fn new() -> Self {
+            let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(1)));
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().canonicalize().unwrap();
+            let held = Some(
+                gate.acquire(Instant::now() + Duration::from_secs(5))
+                    .unwrap(),
+            );
+            Self {
+                gate,
+                _dir: dir,
+                cwd,
+                held,
+            }
+        }
+
+        /// A read of `script` (run by `sh -c`) in the rig's directory.
+        fn read(
+            &self,
+            script: &str,
+            timeout: Duration,
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+            let (gate, cwd, script) = (self.gate, self.cwd.clone(), script.to_string());
+            thread::spawn(move || {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", script.as_str()]).current_dir(&cwd);
+                let started = Instant::now();
+                let result = super::run_read_shared(cmd, "joined-read", timeout, 4096, gate);
+                (result, started.elapsed())
+            })
+        }
+
+        fn flight_open(&self) -> bool {
+            super::shared_reads()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.cwd == self.cwd)
+        }
+
+        fn wait_for_flight(&self) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !self.flight_open() {
+                assert!(Instant::now() < until, "the leader never queued");
+                thread::yield_now();
+            }
+        }
+
+        fn wait_for_joins(&self, joins: u64) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while self.gate.counters()[super::Admission::Reactive.index()].coalesced < joins {
+                assert!(Instant::now() < until, "the joiners never queued");
+                thread::yield_now();
+            }
+        }
+
+        fn release(&mut self) {
+            self.held = None;
+        }
+    }
+
+    /// A joiner returns by its own deadline, not the leader's child's, and the
+    /// leader neither dies nor loses its answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_returns_by_its_own_deadline_while_the_leader_runs_on() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 2; echo leader-done", Duration::from_secs(10));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 2; echo leader-done", Duration::from_millis(200));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (joined, waited) = joiner.join().unwrap();
+        let error = joined.expect_err("the joiner's 200 ms ran out");
+        assert_eq!(error, format!("joined-read{TIMEOUT_MARKER}0.2s"));
+        assert!(is_timed_out(&error));
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(1200)),
+            "the joiner sat for {waited:?}"
+        );
+        let (led, _) = leader.join().unwrap();
+        let led = led.expect("the leader was not disturbed");
+        assert!(led.success && led.incomplete.is_none(), "{led:?}");
+        assert_eq!(String::from_utf8_lossy(&led.stdout).trim(), "leader-done");
+    }
+
+    /// The leader's deadline is the leader's: a joiner with budget left runs
+    /// its own read instead of being handed the leader's timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_with_budget_left_does_not_inherit_the_leaders_timeout() {
+        let mut rig = JoinerRig::new();
+        let script = "if [ -e ran ]; then echo second; else touch ran; sleep 5; fi";
+        let leader = rig.read(script, Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read(script, Duration::from_secs(10));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (led, _) = leader.join().unwrap();
+        let error = led.expect_err("the leader's 300 ms ran out");
+        assert!(is_timed_out(&error), "{error}");
+        let (joined, _) = joiner.join().unwrap();
+        let run = joined.expect("the joiner had budget to run its own read");
+        assert!(run.success && run.incomplete.is_none(), "{run:?}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "second");
+    }
+
+    /// The leader's deadline error is a joiner's answer once the joiner's own
+    /// budget is gone too: it does not loop on a clock that has already run.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_whose_budget_also_ran_out_reports_its_own_timeout() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 5", Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 5", Duration::from_millis(350));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (led, _) = leader.join().unwrap();
+        assert!(is_timed_out(&led.expect_err("leader deadline")));
+        let (joined, waited) = joiner.join().unwrap();
+        let error = joined.expect_err("joiner deadline");
+        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
+            "{waited:?}"
+        );
+    }
+
+    /// Many joiners with mixed deadlines each leave at their own, and the
+    /// joiner that outlasts the child shares it: one process in all.
+    #[cfg(unix)]
+    #[test]
+    fn joiners_with_mixed_deadlines_each_leave_at_their_own() {
+        let mut rig = JoinerRig::new();
+        let script = format!(
+            "echo $$ >> '{}/pids'; sleep 1.5; echo shared",
+            rig.cwd.display()
+        );
+        let leader = rig.read(&script, Duration::from_secs(10));
+        rig.wait_for_flight();
+        let short: Vec<_> = [150u64, 300, 450, 150, 300]
+            .iter()
+            .map(|ms| (*ms, rig.read(&script, Duration::from_millis(*ms))))
+            .collect();
+        let long = rig.read(&script, Duration::from_secs(10));
+        rig.wait_for_joins(6);
+        rig.release();
+        for (ms, joiner) in short {
+            let (joined, waited) = joiner.join().unwrap();
+            let error = joined.expect_err("a short joiner outlasted by the child");
+            assert!(is_timed_out(&error), "{error}");
+            assert!(
+                waited
+                    < Duration::from_millis(ms)
+                        + crate::test_support::coverage_relaxed(Duration::from_millis(900)),
+                "{ms} ms joiner took {waited:?}"
+            );
+        }
+        for handle in [leader, long] {
+            let (run, _) = handle.join().unwrap();
+            let run = run.expect("the shared read finished");
+            assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "shared");
+        }
+        let started = std::fs::read_to_string(rig.cwd.join("pids")).unwrap();
+        assert_eq!(started.lines().count(), 1, "one child for all: {started}");
+    }
+
+    /// A joiner still hears a leader that panics: the wait is bounded, but the
+    /// wake from `Publish` stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_leader_that_panics_still_wakes_a_joiner_before_its_deadline() {
+        let rig = JoinerRig::new();
+        let (gate, cwd) = (rig.gate, rig.cwd.clone());
+        let leader = thread::spawn(move || {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "true"]).current_dir(&cwd);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::with_forced_spawn_failure_then(
+                    move || {
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while gate.counters()[super::Admission::Reactive.index()].coalesced < 1
+                            && Instant::now() < until
+                        {
+                            thread::yield_now();
+                        }
+                        panic!("the leader's read panicked");
+                    },
+                    || {
+                        super::run_read_shared(
+                            cmd,
+                            "joined-read",
+                            Duration::from_secs(10),
+                            4096,
+                            gate,
+                        )
+                    },
+                )
+            }));
+        });
+        rig.wait_for_flight();
+        let joiner = rig.read("true", Duration::from_secs(10));
+        let (joined, waited) = joiner.join().unwrap();
+        leader.join().unwrap();
+        let error = joined.expect_err("a panicked leader has no answer");
+        assert!(error.contains("ended without a result"), "{error}");
+        assert!(waited < Duration::from_secs(4), "{waited:?}");
+    }
+
+    /// A joiner handed almost no time, as a lock retry passes, answers with
+    /// its timeout at once instead of waiting on the leader.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_with_almost_no_time_left_does_not_wait_for_the_leader() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 1.5; echo done", Duration::from_secs(10));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 1.5; echo done", Duration::from_millis(1));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (joined, waited) = joiner.join().unwrap();
+        assert!(is_timed_out(&joined.expect_err("1 ms")));
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(800)),
+            "{waited:?}"
+        );
+        assert!(leader.join().unwrap().0.expect("leader").success);
+    }
+
+    /// A joiner whose deadline falls exactly when the leader publishes gets
+    /// one coherent answer, never a hang and never a torn result.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_deadline_racing_the_publish_gets_one_coherent_answer() {
+        for round in 0..10u64 {
+            let mut rig = JoinerRig::new();
+            let leader = rig.read("sleep 0.3; echo raced", Duration::from_secs(10));
+            rig.wait_for_flight();
+            let joiner = rig.read(
+                "sleep 0.3; echo raced",
+                Duration::from_millis(300 + round * 3),
+            );
+            rig.wait_for_joins(1);
+            rig.release();
+            let (joined, waited) = joiner.join().unwrap();
+            match joined {
+                Ok(run) => assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "raced"),
+                Err(error) => assert!(is_timed_out(&error), "{error}"),
+            }
+            assert!(waited < Duration::from_secs(3), "{waited:?}");
+            assert!(leader.join().unwrap().0.expect("leader").success);
+        }
     }
 
     /// A rate-limit refusal after ~2s used to print the command's own 30s or
