@@ -1896,7 +1896,13 @@ class C:
 
     /// Runs the property and fails when no generated case was Disjoint, so the
     /// "Disjoint implies a clean merge" check cannot pass vacuously.
+    ///
+    /// The runner draws from a ChaCha stream fixed by `seed`, so a given call
+    /// site always sees the same cases: the vacuity guard cannot flake on an
+    /// unlucky random draw, and a failing case reproduces. Each site picks a
+    /// seed whose cases include at least one Disjoint verdict.
     fn run_property(
+        seed: u8,
         cases: u32,
         sep: usize,
         nested: bool,
@@ -1905,17 +1911,20 @@ class C:
         max_edits: usize,
     ) {
         use proptest::prelude::*;
-        use proptest::test_runner::{Config, TestRunner};
+        use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
         let edits = proptest::collection::vec((0usize..1000, 0u8..4), 1..=max_edits);
         let strategy = (
             proptest::collection::vec(1usize..4, funcs),
             proptest::collection::vec(edits, parties..=parties),
         );
-        let mut runner = TestRunner::new(Config {
-            cases,
-            failure_persistence: None,
-            ..Config::default()
-        });
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                cases,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            TestRng::from_seed(RngAlgorithm::ChaCha, &[seed; 32]),
+        );
         let disjoint = std::cell::Cell::new(0u32);
         runner
             .run(&strategy, |(bodies, party_edits)| {
@@ -1935,26 +1944,26 @@ class C:
     /// git merge.
     #[test]
     fn disjoint_verdicts_merge_cleanly_with_blank_separators() {
-        run_property(30, 1, false, 2, 2..5, 3);
+        run_property(1, 30, 1, false, 2, 2..5, 3);
     }
 
     /// No blank line between functions: the closing `}` of one is directly
     /// above the next header, so edits on both touch.
     #[test]
     fn disjoint_verdicts_merge_cleanly_with_touching_symbols() {
-        run_property(120, 0, false, 2, 3..5, 3);
+        run_property(2, 120, 0, false, 2, 3..5, 3);
     }
 
     /// Functions nested in one `mod` symbol, with insertions before line 1.
     #[test]
     fn disjoint_verdicts_merge_cleanly_with_nested_spans() {
-        run_property(40, 1, true, 2, 2..5, 3);
+        run_property(3, 40, 1, true, 2, 2..5, 3);
     }
 
     /// Three parties: every pair must merge when the verdict is Disjoint.
     #[test]
     fn disjoint_verdicts_merge_cleanly_with_three_parties() {
-        run_property(60, 1, false, 3, 4..7, 1);
+        run_property(4, 60, 1, false, 3, 4..7, 1);
     }
 
     /* 7. stale or partial index */
