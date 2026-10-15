@@ -152,6 +152,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )
+    .unwrap()
     .is_empty()));
     std::thread::sleep(Duration::from_millis(500));
     let (fds_before, threads_before) = (open_descriptors(), threads());
@@ -163,7 +164,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
                 .collect();
             launches.into_iter().map(|l| l.join().unwrap()).collect()
         });
-        assert_eq!(list_sessions(&state).len(), 100, "round {round}");
+        assert_eq!(list_sessions(&state).unwrap().len(), 100, "round {round}");
         std::thread::scope(|scope| {
             for id in &ids {
                 let state = &state;
@@ -171,7 +172,9 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
             }
         });
         assert!(
-            wait_until(Duration::from_secs(20), || list_sessions(&state).is_empty()),
+            wait_until(Duration::from_secs(20), || list_sessions(&state)
+                .unwrap()
+                .is_empty()),
             "round {round}: sessions left after every close returned"
         );
     }
@@ -266,7 +269,10 @@ fn unread_flood(total: usize, budget: Duration) {
         "an unacknowledged view was sent {} bytes; the window is 512 KiB",
         delivered.load(Ordering::SeqCst)
     );
-    assert!(list_sessions(&state).iter().all(|s| s.id != spawned.id));
+    assert!(list_sessions(&state)
+        .unwrap()
+        .iter()
+        .all(|s| s.id != spawned.id));
 }
 
 /// Output is bytes, not text. Invalid UTF-8, and multi-byte sequences cut at

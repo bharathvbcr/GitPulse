@@ -610,6 +610,7 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
     );
     assert!(
         gitpulse_lib::terminal::list_sessions(&h.state)
+            .unwrap()
             .iter()
             .any(|listing| listing.id == bystander.id),
         "closing one session ended another"
@@ -653,6 +654,7 @@ fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
             std::thread::sleep(Duration::from_millis(5));
         }
         let ending = gitpulse_lib::terminal::list_sessions(&h.state)
+            .unwrap()
             .iter()
             .any(|listing| listing.id == session.id && listing.ending);
         assert!(

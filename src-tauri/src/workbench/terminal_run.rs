@@ -1,6 +1,6 @@
 use super::{
-    announce, claude_hook, process_birth, query, receipts, terminal_command, terminal_launch,
-    WorkbenchError, WorkbenchState,
+    announce, claude_hook, query, receipts, terminal_command, terminal_launch, WorkbenchError,
+    WorkbenchState,
 };
 use crate::terminal::{
     self, SessionObserver, TerminalExitPayload, TerminalSessions, TerminalSpawned,
@@ -276,11 +276,8 @@ impl<R: tauri::Runtime> SessionObserver for RunObserver<R> {
         announce(&self.app, &result);
         Ok(())
     }
-    fn started(&self, session: &str, pid: Option<u32>) -> Result<(), String> {
-        let pid = pid
-            .filter(|pid| *pid > 0)
-            .ok_or("PTY did not report a process ID")?;
-        let birth = process_birth::read(pid)?;
+    fn started(&self, session: &str, process: Result<(u32, String), String>) -> Result<(), String> {
+        let (pid, birth) = process?;
         self.observe(|observed| {
             observed.session = session.to_owned();
             observed.start = Some((pid, birth));

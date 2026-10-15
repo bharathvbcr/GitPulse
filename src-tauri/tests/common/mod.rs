@@ -58,11 +58,47 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 /// The test owns this fixture and explicitly admits it through the real trust
-/// boundary. This is a session grant, never a bypass or a user's saved grant.
+/// boundary. This is a session grant, never a bypass or a user's saved grant —
+/// unless the terminal suites run against the terminal host: a session grant
+/// never reaches another process, so there it is saved, in the hermetic home
+/// both processes read.
 pub fn trust_repo(repo: &Path) {
     let path = repo.to_str().expect("fixture path");
     let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect fixture");
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
+    gitpulse_lib::repository_trust::grant(path, &preview.identity, terminal_host_selected())
+        .expect("approve fixture");
+}
+
+/// Which backend the terminal suites run against:
+/// `GITPULSE_TEST_TERMINAL_BACKEND=host` runs each of them against a real
+/// `gitpulse-ptyd`; anything else, in-process.
+pub fn terminal_host_selected() -> bool {
+    std::env::var("GITPULSE_TEST_TERMINAL_BACKEND").as_deref() == Ok("host")
+}
+
+/// A session registry on the selected backend. A host registry gets a host of
+/// its own, in a directory of its own, so suites running side by side never
+/// share sessions.
+pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
+    #[cfg(unix)]
+    if terminal_host_selected() {
+        let base = std::env::temp_dir().canonicalize().expect("temp dir");
+        // Kept for the life of the test process: the host exits on its own
+        // once its registry is gone and it holds no session.
+        let dir = tempfile::Builder::new()
+            .prefix("ph")
+            .tempdir_in(base)
+            .expect("host dir")
+            .keep();
+        return gitpulse_lib::terminal::TerminalSessions::with_host(
+            gitpulse_lib::terminal::host::client::HostConfig {
+                dir,
+                binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
+                idle_exit: Some(std::time::Duration::from_secs(3)),
+            },
+        );
+    }
+    gitpulse_lib::terminal::TerminalSessions::default()
 }
 
 /// Every shipped binary's entry file, relative to the crate, derived two

@@ -51,6 +51,22 @@ pub fn peer_identity_is_checkable() -> bool {
     ))
 }
 
+/// Creates `dir` (and what is missing above it) and makes it `0700`, refusing
+/// it if any component is a symlink: where a socket, or anything else only this
+/// user may reach, is kept.
+pub fn private_dir(dir: &Path) -> Result<(), String> {
+    for ancestor in dir.ancestors() {
+        if ancestor.try_exists().map_err(|e| e.to_string())? {
+            crate::storage::hygiene::tree::no_symlinks(ancestor)?;
+            break;
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::storage::hygiene::tree::no_symlinks(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", dir.display()))
+}
+
 /// Binds a private, non-blocking listener at `path`. `what` names the
 /// endpoint in errors ("notification socket").
 pub fn bind_private(path: &Path, what: &str) -> Result<UnixListener, String> {
@@ -69,18 +85,8 @@ pub fn bind_private(path: &Path, what: &str) -> Result<UnixListener, String> {
     }
     let dir = path
         .parent()
-        .ok_or_else(|| format!("The {what} path has no directory: {}", path.display()))?
-        .to_path_buf();
-    for ancestor in dir.ancestors() {
-        if ancestor.try_exists().map_err(|e| e.to_string())? {
-            crate::storage::hygiene::tree::no_symlinks(ancestor)?;
-            break;
-        }
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    crate::storage::hygiene::tree::no_symlinks(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
+        .ok_or_else(|| format!("The {what} path has no directory: {}", path.display()))?;
+    private_dir(dir)?;
 
     // A stale socket from a killed process would make `bind` fail with
     // EADDRINUSE forever. Remove only a socket, never a regular file someone

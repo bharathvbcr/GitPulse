@@ -43,11 +43,31 @@ pub(crate) fn steps(terminals: &TerminalSessions, deadline: Duration, sweep: imp
     crate::desktop::launch::shutdown();
     // Before anything that can stall, so a hung terminal shutdown cannot lose it.
     crate::logging::performance::flush();
-    stop_terminals(terminals, deadline);
+    close_terminals_within(terminals, deadline);
     // The sidecar is asked to finish (it closes its runs) before the sweep
     // would kill it outright; the call gives up on its own after ~1.2 s.
     crate::harness::sidecar::shutdown();
     sweep();
+}
+
+/// The terminals' part of every exit: stop them, or — when a terminal host
+/// holds them and the quit did not choose to stop them (a crash, a signal, or
+/// "Quit and leave them running") — let the host go with every session still
+/// running, for the next launch to find.
+pub fn close_terminals(terminals: &TerminalSessions) {
+    close_terminals_within(terminals, TERMINAL_DEADLINE);
+}
+
+fn close_terminals_within(terminals: &TerminalSessions, deadline: Duration) {
+    if terminals.leaves_sessions_running() {
+        terminals.disconnect_host();
+        log::info!(target: "terminal", "quitting with every terminal left running in the terminal host");
+        return;
+    }
+    stop_terminals(terminals, deadline);
+    // Nothing is left to hold the connection for; the next launch must not
+    // find a host still talking to an app that is leaving.
+    terminals.disconnect_host();
 }
 
 fn stop_terminals(terminals: &TerminalSessions, deadline: Duration) {

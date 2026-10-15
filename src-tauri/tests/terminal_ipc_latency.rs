@@ -364,7 +364,7 @@ fn a_resize_does_not_block_the_thread_that_polls_it() {
     // Once the lock is let go the same future completes.
     tauri::async_runtime::block_on(resize).unwrap();
     releaser.join().unwrap();
-    assert!(list_sessions(&state).iter().any(|s| s.id == id));
+    assert!(list_sessions(&state).unwrap().iter().any(|s| s.id == id));
     kill_session(&state, &id).unwrap();
 }
 
@@ -671,6 +671,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )
+    .unwrap()
     .is_empty()));
 
     let pool = SaturatedPool::new();
@@ -684,7 +685,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
         .iter()
         .map(|file| start_cat_to_file(&app, &state, &output, dir.path(), file))
         .collect();
-    assert_eq!(list_sessions(&state).len(), SESSIONS);
+    assert_eq!(list_sessions(&state).unwrap().len(), SESSIONS);
 
     let took_all: Mutex<Vec<Duration>> = Mutex::default();
     let failures: Mutex<Vec<String>> = Mutex::default();
@@ -804,7 +805,9 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
         }
     });
     assert!(
-        wait_until(Duration::from_secs(30), || list_sessions(&state).is_empty()),
+        wait_until(Duration::from_secs(30), || list_sessions(&state)
+            .unwrap()
+            .is_empty()),
         "sessions left after every close returned"
     );
     // Lane and reader threads end just after the entry leaves the map.
@@ -1370,6 +1373,7 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )
+    .unwrap()
     .is_empty()));
     std::thread::sleep(Duration::from_millis(500));
     // Descriptors are this test's alone. Threads are not: an earlier test's
@@ -1411,7 +1415,7 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
         "lanes retired before their idle time: the count is not measuring them"
     );
     assert_eq!(
-        list_sessions(&state).len(),
+        list_sessions(&state).unwrap().len(),
         sessions,
         "the sessions stayed open"
     );

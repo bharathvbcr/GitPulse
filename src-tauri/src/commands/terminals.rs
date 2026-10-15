@@ -114,7 +114,7 @@ pub async fn cmd_terminal_sessions(
     state: State<'_, crate::terminal::TerminalSessions>,
 ) -> Result<Vec<crate::terminal::TerminalListing>, String> {
     crate::terminal::control_async(&state, "terminal_sessions", |state| {
-        Ok(crate::terminal::list_sessions(state))
+        crate::terminal::list_sessions(state)
     })
     .await
 }

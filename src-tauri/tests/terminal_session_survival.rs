@@ -266,7 +266,7 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
     let (id, pid) = view.flood(dir.path(), "detach");
 
     assert!(detach_session(&view.state, &id).unwrap());
-    let listed = list_sessions(&view.state);
+    let listed = list_sessions(&view.state).unwrap();
     assert!(
         listed.iter().any(|s| s.id == id && s.detached),
         "{listed:?}"
@@ -363,5 +363,5 @@ fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
     for (_, pid) in &sessions {
         assert!(wait_until(Duration::from_secs(2), || !alive(*pid)));
     }
-    assert!(list_sessions(&view.state).is_empty());
+    assert!(list_sessions(&view.state).unwrap().is_empty());
 }

@@ -542,6 +542,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     );
     assert!(
         gitpulse_lib::terminal::list_sessions(&state)
+            .unwrap()
             .iter()
             .any(|s| s.id == id && s.detached),
         "the process must still be running, detached"
