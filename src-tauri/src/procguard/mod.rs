@@ -266,9 +266,31 @@ impl Registration {
     /// answer has stopped mattering because the child is out of budget or its
     /// pipes have already faulted.
     pub fn stop_and_reap(&self, child: &mut Child, grace: Duration) -> io::Result<ExitStatus> {
+        self.stop_and_reap_waiting(child, grace, &mut std::thread::sleep)
+    }
+
+    /// [`Self::stop_and_reap`] whose wait is the caller's: `wait(span)` is
+    /// called in place of each sleep, with `span` at most [`LIVENESS_POLL`] and
+    /// never past the end of the grace, and must return within `span`.
+    ///
+    /// For an owner that reads the child's pipes. A child asked to stop often
+    /// writes while it cleans up, and one blocked on a full pipe cannot finish,
+    /// so a grace spent sleeping hands it to SIGKILL half-cleaned. The owner
+    /// drains inside `wait`; the grace stays bounded by `grace` regardless of
+    /// how much arrives, because the clock here is not the owner's.
+    pub fn stop_and_reap_waiting(
+        &self,
+        child: &mut Child,
+        grace: Duration,
+        wait: &mut dyn FnMut(Duration),
+    ) -> io::Result<ExitStatus> {
         let deadline = Instant::now() + grace;
-        while Instant::now() < deadline && !self.exited(child) {
-            std::thread::sleep(LIVENESS_POLL);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || self.exited(child) {
+                break;
+            }
+            wait(remaining.min(LIVENESS_POLL));
         }
         self.kill_tree(child);
         self.reap(|| child.wait())
@@ -284,6 +306,17 @@ impl Registration {
     /// in the same group and is asked too. Where the platform cannot ask
     /// (Windows) there is nothing to wait for, so the grace is skipped.
     pub fn ask_then_stop_and_reap(&self, child: &mut Child) -> io::Result<ExitStatus> {
+        self.ask_then_stop_and_reap_waiting(child, &mut std::thread::sleep)
+    }
+
+    /// [`Self::ask_then_stop_and_reap`] with the grace spent in the caller's
+    /// `wait` (see [`Self::stop_and_reap_waiting`]), so its owner can keep
+    /// reading the child's pipes while the child is being asked to stop.
+    pub fn ask_then_stop_and_reap_waiting(
+        &self,
+        child: &mut Child,
+        wait: &mut dyn FnMut(Duration),
+    ) -> io::Result<ExitStatus> {
         let grace = if sys::CAN_ASK_TO_STOP {
             if let Some(pid) = *lock(&self.slot.pid) {
                 let _ = sys::request_stop(pid, &self.slot.label);
@@ -292,7 +325,7 @@ impl Registration {
         } else {
             Duration::ZERO
         };
-        self.stop_and_reap(child, grace)
+        self.stop_and_reap_waiting(child, grace, wait)
     }
 
     /// True once the child has exited, **without** reaping it.

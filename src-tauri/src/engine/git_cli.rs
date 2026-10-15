@@ -4022,6 +4022,34 @@ pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String
     (result, seen)
 }
 
+/// Asks `child` to stop and spends the grace reading its pipes.
+///
+/// A child told to stop writes while it cleans up, and one blocked on a full
+/// pipe cannot finish, so a sleeping grace gets it SIGKILLed with its
+/// `.git/index.lock` still held. The wait is the output poll itself, so the
+/// grace both waits and drains, and procguard still ends it at [`CHILD_GRACE`]
+/// however much arrives; the bytes land in the same capped buffers. Stdin is
+/// not fed: the child has been asked to stop and the feed is bounded by the
+/// run, not the grace. Where the platform cannot ask there is no grace, and on
+/// non-Unix the pipe workers already read on their own threads.
+fn ask_and_drain(
+    guard: &crate::procguard::Registration,
+    child: &mut std::process::Child,
+    #[cfg(unix)] output: &mut pipe_drain::OutputDrains,
+    #[cfg(not(unix))] _output: &mut thread_io::OutputDrains,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    return guard.ask_then_stop_and_reap_waiting(child, &mut |span| {
+        output.drain_ready();
+        if output.wait_with_input(span, None).is_err() {
+            std::thread::sleep(span);
+        }
+        output.drain_ready();
+    });
+    #[cfg(not(unix))]
+    guard.ask_then_stop_and_reap(child)
+}
+
 /// [`run_with_gate`] with `on_admitted` called after the gate admits the
 /// child and before it is spawned — the last moment at which nothing has been
 /// read yet, which is what [`run_read_shared`] needs to stop new joiners.
@@ -4176,7 +4204,8 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    let output = match thread_io::OutputDrains::new(
+    #[allow(unused_mut)]
+    let mut output = match thread_io::OutputDrains::new(
         child.stdout.take(),
         child.stderr.take(),
         stdout_cap,
@@ -4231,7 +4260,7 @@ fn run_admitted_inner(
         if observer.cancelled() {
             // Asked first: git removes its own `.git/index.lock` when asked and
             // cannot when killed, so a cancelled commit would block the next.
-            break match guard.ask_then_stop_and_reap(&mut child) {
+            break match ask_and_drain(&guard, &mut child, &mut output) {
                 Ok(status) => Halt::Exited(status, true),
                 Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
             };
@@ -4249,7 +4278,7 @@ fn run_admitted_inner(
                     // release `.git/index.lock`; a child that ignores it is
                     // killed after [`CHILD_GRACE`], which a child that exits
                     // sooner does not wait out.
-                    guard.ask_then_stop_and_reap(&mut child).ok();
+                    ask_and_drain(&guard, &mut child, &mut output).ok();
                     break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
