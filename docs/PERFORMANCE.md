@@ -1151,8 +1151,14 @@ misses the rule, the branch is dropped together with the dependency.
   This is what proves the brief's inferred claim that xterm reverts to its
   DOM renderer when the addon is disposed. With the capture listener removed,
   the run fails at "a lost context is disposed at once".
+* A host with no GPU was reproduced with `--disable-gpu`. Chrome then
+  refused WebGL2 and the page stopped at its WebGL2 check. With
+  `--enable-unsafe-swiftshader`, which the runner now always passes, the page
+  passed 137 of 137 on software GL. This was not run on the CI Linux runner
+  itself.
 * The other checks on that page read xterm's DOM rows, so the page runs them
-  with the setting off and turns it on only for the GPU block.
+  with the setting off and turns it on only for the GPU block. As a result,
+  hover, link and search behaviour **under WebGL** is not exercised.
 
 ### The bench, and why it has not run
 
