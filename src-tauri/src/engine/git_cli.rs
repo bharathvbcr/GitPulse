@@ -2203,8 +2203,15 @@ fn next_poll_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(POLL_BACKOFF_MAX)
 }
 
+/// True when `err` says a command ended because its own timeout elapsed,
+/// whether it ran out of time while running or while waiting for a process
+/// slot. A load deferral never carries the marker, so it is not one.
+pub(crate) fn is_timed_out(err: &str) -> bool {
+    err.contains(TIMEOUT_MARKER)
+}
+
 fn is_timeout_error(program: &str, err: &str) -> bool {
-    err.starts_with(program) && err.contains(TIMEOUT_MARKER)
+    err.starts_with(program) && is_timed_out(err)
 }
 
 /// What one pipe drain produced.

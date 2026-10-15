@@ -23,8 +23,9 @@ use crate::analyzer::cargo_supply::{
 use crate::analyzer::language::LanguageDetector;
 use crate::deadline::{ScanDeadline, AUDIT_TIMEOUT};
 use crate::engine::git_cli::{
-    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_in,
-    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, PathSource, ToolProbe,
+    capture_command_with_env, classify_tool_probe, git_text, is_timed_out,
+    resolve_spawn_program_in, sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput,
+    PathSource, ToolProbe,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -342,9 +343,6 @@ struct ScanEnv {
 /// What a refused spawn's error starts with, so a probe can tell "the deadline
 /// would not let it start" from a tool that is absent.
 const DEADLINE_REFUSED: &str = "the scan deadline passed before ";
-/// The phrase `engine::git_cli` puts in the error of a command a timeout
-/// killed. The hung-auditor test pins it end to end.
-const TIMED_OUT_MARKER: &str = " timed out after ";
 
 /// The one deadline of a dependency scan and the record of what it cut.
 ///
@@ -399,7 +397,7 @@ impl ScanClock {
     /// True when a probe's timeout error happened with the deadline gone: the
     /// deadline shortened it, or it ran out at the same moment.
     fn deadline_cut_probe(&self, error: &str) -> bool {
-        error.contains(TIMED_OUT_MARKER) && self.deadline.remaining().is_zero()
+        is_timed_out(error) && self.deadline.remaining().is_zero()
     }
 
     /// True once a version probe was refused or cut by the deadline.
@@ -433,11 +431,7 @@ impl ScanClock {
     /// timeout and it then timed out. One that failed for its own reason —
     /// however close to the deadline — is reported by its own failure.
     fn note_finished<T>(&self, outcome: &Result<T, String>, what: &str, shortened: bool) {
-        if shortened
-            && outcome
-                .as_ref()
-                .is_err_and(|e| e.contains(TIMED_OUT_MARKER))
-        {
+        if shortened && outcome.as_ref().is_err_and(|e| is_timed_out(e)) {
             self.note_not_run(&format!("{what} (cut off at the deadline)"));
         }
     }
@@ -7796,6 +7790,27 @@ mod fail_closed_tests {
             "npm audit",
             true,
         );
+        assert_eq!(clock.state().not_run.len(), 1);
+    }
+
+    /// A load deferral did not run and is not a timeout, so it is never a
+    /// deadline cut; a slot-wait timeout under a clamped deadline is one.
+    #[test]
+    fn a_load_deferral_is_not_a_deadline_cut_but_a_slot_wait_timeout_is() {
+        let deferred = "npm deferred under load after 0.000s: background work is shed";
+        assert!(crate::engine::git_cli::is_deferred_under_load(deferred));
+        let clock = ScanClock::new(crate::deadline::ScanDeadline::after(Duration::from_secs(
+            60,
+        )));
+        clock.note_finished::<()>(&Err(deferred.into()), "npm audit", true);
+        assert!(
+            clock.state().not_run.is_empty(),
+            "{:?}",
+            clock.state().not_run
+        );
+        let slot = "npm timed out after 1.000s waiting for a process slot";
+        assert!(crate::engine::git_cli::is_slot_wait_timeout(slot));
+        clock.note_finished::<()>(&Err(slot.into()), "npm audit", true);
         assert_eq!(clock.state().not_run.len(), 1);
     }
 
