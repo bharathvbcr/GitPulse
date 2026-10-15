@@ -925,6 +925,7 @@ Other benches:
     | idle mailbox | 2.20 | 2.00 | 2.20 | 2.00/s | none |
     | idle 8 / 24 watches | 2.20 / 2.40 | 2.20 / 2.20 | 2.20 / 2.40 | 2.20/s | none |
     | **idle alerts bridge** | 6.99 | 7.00 | 7.19 | **6.99/s** | about +4.6/s, the 200 ms `wait_readable` accept loop (5/s) |
+    | idle alerts bridge, after the self-pipe accept loop (`pf/79394019-bridge`) | 2.20 | 2.20 | 2.20 | **2.20/s** | none: the accept loop blocks in `wait_readable_or_woken` and is woken only by a connection or by `stop`/`start`; 6.99/s before. Measured at load average 56.8 / 78.1 / 23.7 on 18 cpus, with the floor at 2.40 and the idle mailbox at 2.20/2.20/2.20 in the same runs |
     | **idle host-load sampler** | 2.80 | 2.80 | 2.80 | **2.80/s** | about +0.4/s, the 2 s tick |
     | workbench `external_changes` | not measured | | | | no entry point from a bench (see below) |
 

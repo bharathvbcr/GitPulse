@@ -18,6 +18,7 @@
 //!   report it is not bound at all — a check that cannot run must not be
 //!   reported as a check that passed.
 
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -256,6 +257,58 @@ pub fn wait_readable_or_woken(fd: RawFd, wake: RawFd) -> Ready {
     Ready {
         listener: descriptors[0].revents & any != 0,
         woken: descriptors[1].revents & any != 0,
+    }
+}
+
+/// The two ends of a wake pipe: how a thread blocked in
+/// [`wait_readable_or_woken`] is told to look again.
+///
+/// One owner for every accept loop that waits with no timeout. The waiter polls
+/// [`Self::reader_fd`]; whoever retires it calls [`Self::notify`].
+pub(crate) struct Wake {
+    reader: OwnedFd,
+    writer: OwnedFd,
+}
+
+impl Wake {
+    /// Fails if the pipe cannot be made. Callers must not fall back to polling
+    /// on a timeout, which is the cost this type exists to remove.
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let (reader, writer) = crate::procguard::wake_pipe()?;
+        Ok(Self { reader, writer })
+    }
+
+    /// The descriptor to hand to [`wait_readable_or_woken`].
+    pub(crate) fn reader_fd(&self) -> RawFd {
+        self.reader.as_raw_fd()
+    }
+
+    /// Makes the reader readable. Never blocks: the pipe is non-blocking, and a
+    /// full pipe already is readable.
+    pub(crate) fn notify(&self) {
+        let byte = 1u8;
+        // SAFETY: one byte from a live local to a descriptor `self` keeps
+        // open; the result is deliberately ignored (see above).
+        unsafe { libc::write(self.writer.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1) };
+    }
+
+    /// Empties the pipe so the next wait blocks again.
+    pub(crate) fn drain(&self) {
+        let mut buffer = [0u8; 64];
+        loop {
+            // SAFETY: reads into a live local buffer of the length given, from
+            // a non-blocking descriptor `self` keeps open.
+            let read = unsafe {
+                libc::read(
+                    self.reader.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if read < buffer.len() as isize {
+                return;
+            }
+        }
     }
 }
 
