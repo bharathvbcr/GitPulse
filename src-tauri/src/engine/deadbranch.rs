@@ -441,8 +441,9 @@ fn scan_branches(
     let all_branches = GitReader::list_branches(repo_path)?;
     let total_scanned = all_branches.len();
 
-    // The same memoized resolution `list_branches` just used, so this costs
-    // no process and cannot disagree with the branches' `is_default`.
+    // The same resolution `list_branches` just used, so it cannot disagree
+    // with the branches' `is_default`. It costs no process unless a ref was
+    // written within the ref cache's racy window, when it is read again.
     let base = default_base(repo).checked()?.base;
     let default_branch = base.as_ref().map(|(short, _)| short.clone());
     let now_sec = SystemTime::now()
@@ -1521,7 +1522,14 @@ mod tests {
 
         let spawned = || crate::engine::git_cli::spawn_log::spawns_in(&repo);
         let before = spawned().len();
-        let result = clean_branches(repo.to_str().unwrap(), &names, false, true);
+        // The default base is kept in the ref cache, which does not trust a
+        // stamp younger than its racy window; these fifty refs were written a
+        // moment ago. The claim is one resolution for the clean, so it runs
+        // with no window (the clean's list and its scan both ask).
+        let _kept = crate::engine::ref_cache::retention();
+        let result = crate::engine::ref_cache::eager(|| {
+            clean_branches(repo.to_str().unwrap(), &names, false, true)
+        });
         let used: Vec<Vec<String>> = spawned()[before..].to_vec();
         let result = result.unwrap();
         assert_eq!(result.deleted.len(), BRANCHES, "{result:?}");
