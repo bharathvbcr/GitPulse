@@ -1168,3 +1168,337 @@ fn a_third_background_job_waits_until_one_of_the_first_two_ends() {
     }
     assert!(third_started.load(Ordering::SeqCst));
 }
+
+// ---------------------------------------------------------------------------
+// Stack refresh: the repair pass for branches beyond the history window
+// ---------------------------------------------------------------------------
+
+/// A repository whose `main` is `commits` linear empty commits, with a branch
+/// at each `(name, index)` and, when `orphan` is set, a branch `orphan` that
+/// shares no history with `main`. Written by one `git fast-import`, so a
+/// fixture of hundreds of commits costs one spawn.
+fn stack_chain(
+    commits: usize,
+    branches: &[(String, usize)],
+    orphan: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::io::Write;
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    let mut stream = String::new();
+    let commit = |stream: &mut String, refname: &str, mark: usize, from: Option<usize>| {
+        let message = format!("c{mark}\n");
+        stream.push_str(&format!("commit refs/heads/{refname}\nmark :{mark}\n"));
+        stream.push_str(&format!(
+            "committer T <t@t> {} +0000\ndata {}\n{message}",
+            1_700_000_000 + mark,
+            message.len()
+        ));
+        if let Some(from) = from {
+            stream.push_str(&format!("from :{from}\n"));
+        }
+        stream.push('\n');
+    };
+    for n in 1..=commits {
+        commit(&mut stream, "main", n, (n > 1).then(|| n - 1));
+    }
+    if orphan {
+        commit(&mut stream, "orphan", commits + 1, None);
+        commit(&mut stream, "orphan", commits + 2, Some(commits + 1));
+    }
+    for (name, index) in branches {
+        stream.push_str(&format!("reset refs/heads/{name}\nfrom :{}\n\n", index + 1));
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(&repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn fast-import");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stream.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "fast-import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    crate::test_support::trust_repo(&repo);
+    (dir, repo)
+}
+
+/// Twenty branches `b00`..`b19` at main commits 10, 13, ... 67: far below a
+/// 60-commit window over 150 commits, each sitting on the one under it.
+fn twenty_deep_branches() -> Vec<(String, usize)> {
+    (0..20).map(|i| (format!("b{i:02}"), 10 + 3 * i)).collect()
+}
+
+/// Rows of the spawn log for `repo` from `since` on.
+fn spawns_since(repo: &std::path::Path, since: usize) -> Vec<Vec<String>> {
+    crate::engine::git_cli::spawn_log::spawns_in(repo)[since..].to_vec()
+}
+
+fn first_parent_walks(spawns: &[Vec<String>]) -> usize {
+    spawns
+        .iter()
+        .filter(|argv| {
+            argv.iter().any(|a| a == "rev-list") && argv.iter().any(|a| a == "--first-parent")
+        })
+        .count()
+}
+
+fn parent_of(payload: &crate::stack::StackHierarchyPayload, branch: &str) -> Option<String> {
+    payload
+        .nodes
+        .iter()
+        .find(|n| n.branch_name == branch)
+        .unwrap_or_else(|| panic!("no node for {branch}"))
+        .parent_branch_name
+        .clone()
+}
+
+const FIXTURE_WINDOW: usize = 60;
+
+/// S4-03: every branch the window cannot place used to get its own
+/// `rev-list --first-parent` walk of up to 100,000 commits.
+#[test]
+fn a_stack_refresh_repairs_twenty_branches_beyond_the_window_in_one_walk() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+    let payload = crate::engine::ref_cache::eager(|| {
+        stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+    })
+    .expect("stack loads");
+    let spawned = spawns_since(&repo, before);
+    assert_eq!(
+        first_parent_walks(&spawned),
+        1,
+        "one shared pass, not one per branch: {spawned:#?}"
+    );
+    assert_eq!(parent_of(&payload, "b00"), None, "nothing is below b00");
+    for i in 1..20 {
+        assert_eq!(
+            parent_of(&payload, &format!("b{i:02}")),
+            Some(format!("b{:02}", i - 1)),
+            "b{i:02} sits on the previous branch"
+        );
+    }
+    assert_eq!(
+        payload.unresolved_branches, 0,
+        "b00 reached the root: settled"
+    );
+    assert!(!payload.walk_incomplete);
+}
+
+/// S4-03: with no ref movement the next tick is answered from the kept
+/// answers: no process at all.
+#[test]
+fn a_stack_refresh_with_no_ref_movement_spawns_nothing() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    crate::engine::ref_cache::eager(|| {
+        let first =
+            stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION).expect("first tick");
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+        let second = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+            .expect("second tick");
+        let spawned = spawns_since(&repo, before);
+        assert!(
+            spawned.is_empty(),
+            "an idle repository was walked again: {spawned:#?}"
+        );
+        assert_eq!(first, second);
+    });
+}
+
+/// A tick after a ref moved is answered from git again, and the new base shows.
+#[test]
+fn a_ref_that_moves_between_ticks_is_walked_again() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    crate::engine::ref_cache::eager(|| {
+        let first =
+            stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION).expect("first tick");
+        assert_eq!(parent_of(&first, "b00"), None);
+        // b05 moves below b00: b00 now sits on it.
+        let target = crate::engine::git_cli::git_text(&repo, &["rev-parse", "main~145"]).unwrap();
+        run_git(&repo, &["update-ref", "refs/heads/b05", target.trim()]);
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+        let second = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+            .expect("second tick");
+        assert_eq!(parent_of(&second, "b00"), Some("b05".to_string()));
+        let spawned = spawns_since(&repo, before);
+        assert_eq!(
+            first_parent_walks(&spawned),
+            1,
+            "a moved ref must not be answered from the old walk"
+        );
+        // The card's bound: the history walks a refresh over twenty unresolved
+        // branches starts are the window's `log` and the one pass (was
+        // 1 + 20). The branch listing and its default-branch probes are
+        // other spawns, unchanged by this card, and are not counted here.
+        let history_walks = spawned
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "log" || a == "rev-list"))
+            .count();
+        assert!(
+            history_walks <= 3,
+            "a refresh after a ref moved started {history_walks} history walks: {spawned:#?}"
+        );
+    });
+}
+
+/// A pass that hits its commit cap labels what it could not settle: the
+/// branches it did place stay placed, the rest are counted, and the payload
+/// says the walk was cut short.
+#[test]
+fn a_walk_that_exhausts_its_budget_counts_what_it_left_unresolved() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    let budget = StackWalkBudget {
+        max_commits: 5,
+        ..StackWalkBudget::PRODUCTION
+    };
+    let payload = crate::engine::ref_cache::eager(|| stack_hierarchy(path, FIXTURE_WINDOW, budget))
+        .expect("a partial walk is an answer, not a failure");
+    assert!(payload.walk_incomplete, "the cap was hit");
+    // The five newest commits are b19's tip down to b18's: b19 is placed.
+    assert_eq!(parent_of(&payload, "b19"), Some("b18".to_string()));
+    assert_eq!(
+        payload.unresolved_branches, 19,
+        "b00..b18 were not reached; b00 is not reported as a settled root"
+    );
+    assert_eq!(payload.nodes.len(), 21, "every branch is still listed");
+}
+
+/// A deadline that expires before the pass finishes leaves every candidate
+/// unresolved and says so; the rest of the payload still loads.
+#[test]
+fn a_walk_whose_deadline_expires_is_labelled_not_failed() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    let budget = StackWalkBudget {
+        deadline: std::time::Duration::ZERO,
+        ..StackWalkBudget::PRODUCTION
+    };
+    let payload = stack_hierarchy(path, FIXTURE_WINDOW, budget)
+        .expect("a deadline in the repair pass must not fail the load");
+    assert!(payload.walk_incomplete);
+    assert_eq!(payload.unresolved_branches, 20);
+    assert_eq!(payload.nodes.len(), 21);
+}
+
+/// Shapes that need no pass, or whose pass has nothing to find.
+#[test]
+fn stack_shapes_that_need_no_walk_spawn_none_and_report_nothing_unresolved() {
+    let _held = crate::engine::ref_cache::retention();
+    // No branches besides main.
+    let (_a, repo_a) = stack_chain(30, &[], false);
+    // A branch on main's tip is placed from the window alone.
+    let (_b, repo_b) = stack_chain(30, &[("twin".to_string(), 29)], false);
+    for (repo, nodes) in [(&repo_a, 1), (&repo_b, 2)] {
+        let before = crate::engine::git_cli::spawn_log::spawns_in(repo).len();
+        let payload = crate::engine::ref_cache::eager(|| {
+            stack_hierarchy(
+                repo.to_str().unwrap(),
+                FIXTURE_WINDOW,
+                StackWalkBudget::PRODUCTION,
+            )
+        })
+        .expect("stack loads");
+        assert_eq!(payload.nodes.len(), nodes);
+        assert_eq!(
+            first_parent_walks(&spawns_since(repo, before)),
+            0,
+            "nothing to repair, nothing walked"
+        );
+        assert_eq!(payload.unresolved_branches, 0);
+        assert!(!payload.walk_incomplete);
+    }
+}
+
+/// A branch with no common history reaches its own root without meeting a
+/// tip: a settled, honest root, not an unresolved one.
+#[test]
+fn a_branch_with_no_common_history_is_a_settled_root() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &[("b00".to_string(), 10)], true);
+    let payload = crate::engine::ref_cache::eager(|| {
+        stack_hierarchy(
+            repo.to_str().unwrap(),
+            FIXTURE_WINDOW,
+            StackWalkBudget::PRODUCTION,
+        )
+    })
+    .expect("stack loads");
+    assert_eq!(parent_of(&payload, "orphan"), None);
+    assert_eq!(parent_of(&payload, "b00"), None);
+    assert_eq!(payload.unresolved_branches, 0);
+    assert!(!payload.walk_incomplete);
+}
+
+/// A detached HEAD has no current branch; the repair pass and the breadcrumb
+/// must not depend on one.
+#[test]
+fn a_detached_head_still_repairs_the_stack() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    run_git(&repo, &["checkout", "-q", "--detach", "main~3"]);
+    let payload = stack_hierarchy(
+        repo.to_str().unwrap(),
+        FIXTURE_WINDOW,
+        StackWalkBudget::PRODUCTION,
+    )
+    .expect("stack loads on a detached HEAD");
+    assert_eq!(payload.default_branch, "main");
+    assert_eq!(parent_of(&payload, "b07"), Some("b06".to_string()));
+    assert_eq!(payload.unresolved_branches, 0);
+}
+
+/// S4-04 at the command's own arithmetic: the page the graph asks for at a
+/// cap that equals one history chunk (the default 5,000 over a 5,000-row
+/// chunk) is one `git log`, probe row included.
+#[test]
+fn the_default_graph_page_is_one_history_walk() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(40, &[], false);
+    let path = repo.to_str().unwrap();
+    let chunk = 10;
+    let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+    let rows = crate::engine::git_reader::with_history_chunk(chunk, || {
+        crate::engine::ref_cache::eager(|| {
+            GitReader::read_commit_history_paged(
+                path,
+                0,
+                graph_fetch_limit(chunk),
+                None,
+                None,
+                RefScope::Named,
+            )
+        })
+    })
+    .expect("page loads");
+    assert_eq!(
+        rows.len(),
+        chunk + 1,
+        "the page plus the has_more probe row"
+    );
+    let logs = spawns_since(&repo, before)
+        .iter()
+        .filter(|argv| argv.iter().any(|a| a == "log"))
+        .count();
+    assert_eq!(logs, 1, "cap + 1 rows over a chunk of cap rows");
+}

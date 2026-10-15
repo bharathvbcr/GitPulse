@@ -26,6 +26,16 @@ pub struct StackHierarchyPayload {
     pub nodes: Vec<StackedBranchNode>,
     pub default_branch: String,
     pub breadcrumb: BranchAncestryChain,
+    /// Branches left parentless because the first-parent repair pass ran out
+    /// of budget (commit cap or deadline) or failed, not because they sit on
+    /// no other tip: an unanswered question, never reported as an answer.
+    /// `default` keeps payloads from before the field deserializable.
+    #[serde(default)]
+    pub unresolved_branches: usize,
+    /// True when the repair pass was cut short, so `unresolved_branches` may
+    /// hide branches whose real base the pass did not reach.
+    #[serde(default)]
+    pub walk_incomplete: bool,
 }
 
 pub struct StackTreeEngine;

@@ -28,7 +28,7 @@
  */
 
 import type { BranchInfo } from "../branches/types";
-import type { StackedBranchNode } from "./types";
+import type { StackHierarchyPayload, StackedBranchNode } from "./types";
 
 /** One rendered line of the stack tree. */
 export interface StackTreeRow {
@@ -275,6 +275,30 @@ export function rootlessBranches(
     .map((b) => b.name)
     .filter((name) => name !== defaultBranch && !placed.has(name))
     .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The sentence for branches whose base the backend could not determine because
+ * its first-parent pass ran out of budget (commit cap or deadline), or null
+ * when every branch was settled.
+ *
+ * This is not the same thing as [`rootlessBranches`]: a rootless branch was
+ * looked at and met no tip. An unresolved branch was not finished being
+ * looked at, so showing it as a root would present an unanswered question as
+ * an answer.
+ */
+export function unresolvedStackNotice(
+  payload: Pick<StackHierarchyPayload, "unresolved_branches" | "walk_incomplete"> | null,
+): string | null {
+  if (!payload || payload.unresolved_branches <= 0) return null;
+  const n = payload.unresolved_branches;
+  const plural = n === 1 ? "" : "es";
+  const why = payload.walk_incomplete
+    ? "the history walk stopped at its budget before reaching their base"
+    : "their history could not be read";
+  return `${n} branch${plural} could not be placed on a stack: ${why}. ${
+    n === 1 ? "It is" : "They are"
+  } listed as unplaced rather than guessed.`;
 }
 
 /**

@@ -1289,3 +1289,38 @@ of this bench counted the warm row in one block and printed the cold figure,
 Baselines were built from the unmodified tree at `cd52ff3c` plus this bench file
 only (`src-tauri/src` and `src-tauri/tests` checked out from `HEAD`), and run
 interleaved with the fixed build (A B A B) so host load lands on both.
+
+### After
+
+| row | git processes, before to after | min of 2 runs, before to after | after, run 1 min / p50 | after, run 2 min / p50 | load1 at start (run 1, run 2) |
+| --- | --- | --- | --- | --- | --- |
+| S4-04 graph default page | 12 to **11** | 61.3 to 35.4 ms | 40.7 / 63.0 ms | 35.4 / 45.6 ms | 47.8, 43.6 |
+| S4-03 stack refresh, 20 branches beyond the window, cold | 28 to **9** | 237.6 to 19.4 ms | 23.4 / 27.5 ms | 19.4 / 22.3 ms | 47.8, 43.6 |
+| S4-03 stack refresh, refs unmoved (warm) | 20 to **0** | 236.3 to 2.1 ms | 2.1 / 3.5 ms | 2.2 / 3.0 ms | 47.8, 43.6 |
+
+The counters are the result; the times are recorded beside load 44 to 50 on 18
+cores and gate nothing. What changed:
+
+* **S4-04.** A kept history chunk is `chunk` rows plus the first row of the next
+  one, so a window of n rows needs ceil((n - 1) / chunk) chunks. The default
+  page is 5,000 rows plus the has_more probe: one `git log -n5001` instead of
+  `-n5000` and a second `--skip=5000 -n5000` walk for one row. Chunks stay
+  aligned and kept, so growing the window still reads only the chunks it has
+  not held (`chunk_windows_around_every_boundary_read_the_fewest_walks` pins
+  c, c+1, 2c, 2c+1 and 2c+2, and the existing grow test is unchanged). The
+  one process saved is the 5,000-row walk and parse, not the whole page; the
+  other 11 are not touched by this change (inferred: the graph's ref, HEAD and
+  default-branch reads, and one more).
+* **S4-03.** The 20 per-branch `rev-list --first-parent --max-count=100000`
+  walks are one `rev-list --first-parent --parents` over every unresolved tip,
+  read through the ref cache over `refs/heads`, with a 20 s deadline and the
+  same 100,000-commit cap shared across the tips. An idle repository's next tick
+  is answered without a process. `--not` is deliberately not used: the default
+  branch's tip descends from every branch below the window, so excluding it
+  removes the commits the pass is looking for. A branch the pass could not
+  finish (cap, deadline, a failed git) is counted in the payload as
+  `unresolved_branches`, with `walk_incomplete`, and shown in the Stack view;
+  it was previously left parentless without saying so.
+* **Not changed.** The default-branch probes (`config --list`, two
+  `symbolic-ref`, `remote`, one `for-each-ref`) run again after any ref moves,
+  5 of the 9 remaining cold spawns. They are outside this card.

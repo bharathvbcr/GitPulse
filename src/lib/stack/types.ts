@@ -30,4 +30,11 @@ export interface StackHierarchyPayload {
   nodes: StackedBranchNode[];
   default_branch: string;
   breadcrumb: BranchAncestryChain;
+  /**
+   * Branches left parentless because the first-parent pass could not finish
+   * (commit cap or deadline), not because they genuinely sit on no other tip.
+   */
+  unresolved_branches: number;
+  /** True when the pass was cut short by its commit cap or deadline. */
+  walk_incomplete: boolean;
 }

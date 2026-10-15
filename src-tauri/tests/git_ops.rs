@@ -2,6 +2,7 @@ use gitpulse_lib::analyzer::CoverageScanner;
 use gitpulse_lib::diff::PatchBuilder;
 use gitpulse_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLine};
 use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
+use gitpulse_lib::engine::git_reader::FirstParentChain;
 use gitpulse_lib::engine::git_writer::MergeMode;
 use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
 use gitpulse_lib::github::parse_github_remote_url;
@@ -2464,19 +2465,47 @@ fn first_parent_chain_stops_at_known_tip_oldest_first() {
     repo.commit_all("top");
     let tip = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
 
+    let pass = GitReader::first_parent_pass(
+        &repo.path_str(),
+        std::slice::from_ref(&tip),
+        100,
+        std::time::Duration::from_secs(30),
+    )
+    .expect("pass succeeds");
     let stop: std::collections::HashSet<String> = [root.clone()].into_iter().collect();
-    let chain = GitReader::first_parent_chain(&repo.path_str(), &tip, &stop, 100)
-        .expect("walk succeeds")
-        .expect("stop id is reachable");
     // Oldest-first: root (the stop id) -> mid -> tip.
     let mid = git_out(repo.dir.path(), &["rev-parse", "HEAD~"]);
-    assert_eq!(chain, vec![root.clone(), mid, tip.clone()]);
+    assert_eq!(
+        pass.chain(&tip, &stop),
+        FirstParentChain::Reached(vec![root.clone(), mid, tip.clone()])
+    );
 
-    // A stop set that never matches exhausts the cap and reports None —
-    // "no discoverable base", never a fabricated root.
+    // A stop set that never matches reaches the root and reports it as such —
+    // "no discoverable base", never a fabricated one.
     let miss: std::collections::HashSet<String> = ["deadbeef".to_string()].into_iter().collect();
-    let unresolved = GitReader::first_parent_chain(&repo.path_str(), &tip, &miss, 100).unwrap();
-    assert!(unresolved.is_none());
+    assert_eq!(pass.chain(&tip, &miss), FirstParentChain::Rooted);
+    assert!(!pass.truncated());
+
+    // A pass cut by its commit cap says so, and a chain it did not finish is
+    // unknown, not rooted.
+    let cut = GitReader::first_parent_pass(
+        &repo.path_str(),
+        std::slice::from_ref(&tip),
+        1,
+        std::time::Duration::from_secs(30),
+    )
+    .expect("capped pass succeeds");
+    assert!(cut.truncated());
+    assert_eq!(cut.chain(&tip, &stop), FirstParentChain::Unfinished);
+
+    // An argument that is not a commit id never reaches git.
+    let hostile = GitReader::first_parent_pass(
+        &repo.path_str(),
+        &["--all".to_string()],
+        100,
+        std::time::Duration::from_secs(30),
+    );
+    assert!(hostile.is_err());
 }
 
 /// Regression (audit dirty-tree): restacking with uncommitted changes used to
