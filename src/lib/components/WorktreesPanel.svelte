@@ -178,7 +178,7 @@
     isLoading = true;
     error = null;
     try {
-      // The rows render diff stats, divergence from main and dev-server
+      // The rows render diff stats, divergence from the default branch and dev-server
       // routes, which only the full scan measures; a listing that does not
       // ask is the cheap one.
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo, depth: "full" });
@@ -750,8 +750,8 @@
               <button
                 onclick={() => void mergeTeardown(wt)}
                 disabled={mergingPath === wt.path}
-                title={mergingPath === wt.path ? "Merging…" : "Merge into main and remove this worktree"}
-                aria-label="Merge {wt.name} into main and remove it"
+                title={mergingPath === wt.path ? "Merging…" : "Merge into the default branch and remove this worktree"}
+                aria-label="Merge {wt.name} into the default branch and remove it"
                 class="p-0.5 rounded-full {mergingPath === wt.path ? 'opacity-50 cursor-not-allowed' : mergeConfirmPath === wt.path ? 'text-amber-400' : 'hover:bg-surfaceHover hover:text-accent'}"
               >
                 <GitMerge size={11} class={mergingPath === wt.path ? "animate-spin" : ""} />
@@ -889,7 +889,7 @@
             </div>
           {/if}
 
-          <!-- High-density status board metrics: HEAD± uncommitted diff & main↕ divergence -->
+          <!-- High-density status board metrics: HEAD± uncommitted diff & base↕ divergence -->
           {#if wt.diff_stat || wt.main_divergence}
             <div class="flex items-center gap-2 text-[9px] font-mono text-textMuted pt-0.5 min-w-0">
               {#if wt.diff_stat && (wt.diff_stat.insertions > 0 || wt.diff_stat.deletions > 0)}
@@ -898,8 +898,8 @@
                 </span>
               {/if}
               {#if wt.main_divergence && (wt.main_divergence.ahead > 0 || wt.main_divergence.behind > 0)}
-                <span title="main↕ divergence: {wt.main_divergence.ahead} ahead, {wt.main_divergence.behind} behind">
-                  main↕ <span class="text-accent font-semibold">↑{wt.main_divergence.ahead}</span> <span class="text-amber-400 font-semibold">↓{wt.main_divergence.behind}</span>
+                <span title="divergence from the default branch: {wt.main_divergence.ahead} ahead, {wt.main_divergence.behind} behind">
+                  base↕ <span class="text-accent font-semibold">↑{wt.main_divergence.ahead}</span> <span class="text-amber-400 font-semibold">↓{wt.main_divergence.behind}</span>
                 </span>
               {/if}
             </div>
@@ -907,7 +907,7 @@
 
           {#if mergeConfirmPath === wt.path}
             <div class="text-[9px] font-semibold text-amber-400 pt-0.5" role="status">
-              Merge {wt.branch ?? wt.name} into main and remove this worktree? Press merge again to confirm.
+              Merge {wt.branch ?? wt.name} into the default branch and remove this worktree? Press merge again to confirm.
             </div>
           {/if}
 

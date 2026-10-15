@@ -406,7 +406,7 @@ pub struct WorktreeDiffStat {
     pub deletions: usize,
 }
 
-/// Divergence stats between worktree branch and default/main branch (`main↕`).
+/// Divergence stats between a worktree branch and the repository's default branch (`base↕`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeDivergence {
     pub ahead: usize,
