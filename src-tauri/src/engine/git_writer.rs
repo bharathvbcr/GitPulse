@@ -4965,6 +4965,67 @@ mod tests {
         assert_no_stale_index_lock_and_next_commit_lands(&dir);
     }
 
+    /// R2-02 adversarial: a hook that has written far more than a pipe holds
+    /// (git relays hook output to stderr) and is cancelled mid-sleep leaves no
+    /// lock behind, and the next commit lands first try.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_commit_whose_hook_flooded_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        let marker = dir.path().join(".git/hook-started");
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            &format!(
+                "touch '{}'\nhead -c 400000 /dev/zero | tr '\\0' x >&2\nsleep 30",
+                marker.display()
+            ),
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let canonical = dir.path().canonicalize().unwrap();
+        let canceller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline, "hook never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Let the hook fill its pipe and block before the cancel lands.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::engine::git_cli::cancel_hooked_git(&canonical)
+        });
+        let err = GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()])
+            .unwrap_err();
+        assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
+        assert!(
+            crate::engine::git_cli::is_hooked_git_cancelled(&err),
+            "{err}"
+        );
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
+    /// R2-02 adversarial: the same flood, stopped by the hook deadline, with a
+    /// hook that traps the ask and keeps writing.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_commit_whose_hook_traps_term_and_floods_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            "trap '' TERM\nwhile :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx >&2; done",
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let err = crate::engine::git_cli::hooks::with_hook_timeout(
+            std::time::Duration::from_secs(2),
+            || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
     /// Overrides any global identity with an empty one, which git refuses
     /// to commit under, so the repository has no usable identity at all.
     fn blank_identity(dir: &std::path::Path) {
