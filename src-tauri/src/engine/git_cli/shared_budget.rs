@@ -11,21 +11,28 @@
 //! (`run_process_with_shared_spawn_budget`); a test or bench process that
 //! links the same engine keeps to its own bucket.
 //!
-//! A record it cannot reach fails open, and says so. One that cannot be
-//! opened safely leaves the process on its own bucket with a logged reason; a
-//! lock another process or thread holds past [`LOCK_PATIENCE`] lets this one
-//! decision fall back to the process bucket, counted. Failing closed there
-//! would let one stopped process — a debugger, a `SIGSTOP` — defer every read
-//! in every other GitPulse process.
+//! A record it cannot reach fails open, and says so, in exactly two cases
+//! beyond one that cannot be opened safely (which leaves the process on its
+//! own bucket with a logged reason). A lock another process or thread holds
+//! past [`LOCK_PATIENCE`] lets this one decision fall back to the process
+//! bucket, counted. Failing closed there would let one stopped process — a
+//! debugger, a `SIGSTOP` — defer every read in every other GitPulse process.
+//! And a record of a newer layout is its writer's: this one leaves it
+//! untouched and falls back for the decision as for a held lock. Only a whole
+//! [`RECORD_LEN`]-byte record can be a newer layout. (A grant whose write then
+//! fails is the record unreachable for that decision and falls back likewise;
+//! the process bucket still caps this process.)
 //!
-//! A record it reaches but cannot decode fails closed. Torn, foreign or of
-//! another layout, it is rewritten as an EMPTY budget that refills at the rate
-//! from now: it grants nothing, because a reset to a full burst is a fresh
-//! burst for every process that meets it — which is how layout 1, resetting
-//! to full, handed out 192-spawn bursts over a hundred times in three hours.
-//! The warning names the bytes and the writer pid they carry. A record of a
-//! newer layout is its writer's: this one leaves it untouched and falls back
-//! for the decision as for a held lock.
+//! Everything else fails closed. A record it reaches but cannot decode —
+//! torn at any length, a newer version word on a short buffer included,
+//! foreign or of another layout — is rewritten as an EMPTY budget that
+//! refills at the rate from now: it grants nothing, because a reset to a full
+//! burst is a fresh burst for every process that meets it — which is how
+//! layout 1, resetting to full, handed out 192-spawn bursts over a hundred
+//! times in three hours. The warning names the bytes and the writer pid they
+//! carry. And a denial stays a denial when the record cannot be rewritten
+//! ([`Take::DeniedUnrecorded`]): the decision came from a record that was
+//! reached, so a failed write must not turn it into an admit.
 //!
 //! The layout is versioned twice, in the header and in the file name, and the
 //! name moves with the layout. Binaries of two layouts coexist until every
@@ -77,6 +84,10 @@ pub(super) struct SharedBudget {
     /// that excludes other processes.
     file: Mutex<File>,
     path: PathBuf,
+    /// Makes [`SharedBudget::write_state`] fail, as a full disk or a revoked
+    /// record would. One handle's, never a global.
+    #[cfg(test)]
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 /// What the shared record said about one spawn.
@@ -86,6 +97,9 @@ pub(super) enum Take {
     Granted,
     /// The shared budget is spent down to the caller's floor.
     Denied,
+    /// Spent down to the floor, but the record could not be rewritten to say
+    /// so (the reason). Still a denial: the record was reached and answered.
+    DeniedUnrecorded(String),
     /// The record could not be consulted for this decision.
     Unavailable(String),
 }
@@ -133,6 +147,8 @@ impl SharedBudget {
         Ok(Self {
             file: Mutex::new(file),
             path: path.to_path_buf(),
+            #[cfg(test)]
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -160,14 +176,15 @@ impl SharedBudget {
         if granted {
             state.tokens -= 1;
         }
-        // Written even on a denial: the refill anchor moved.
-        if let Err(reason) = self.write_state(&locked, state) {
-            return Take::Unavailable(reason);
-        }
-        if granted {
-            Take::Granted
-        } else {
-            Take::Denied
+        // Written even on a denial: the refill anchor moved. A failed write
+        // changes only what the record says afterwards, not this decision: a
+        // grant it could not record is the record unreachable (fail open, the
+        // process bucket still caps this process), but a denial stays one.
+        match (granted, self.write_state(&locked, state)) {
+            (true, Ok(())) => Take::Granted,
+            (false, Ok(())) => Take::Denied,
+            (true, Err(reason)) => Take::Unavailable(reason),
+            (false, Err(reason)) => Take::DeniedUnrecorded(reason),
         }
     }
 
@@ -263,12 +280,26 @@ impl SharedBudget {
     }
 
     fn write_state(&self, locked: &Locked<'_>, state: State) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_writes.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(format!(
+                "could not write {}: injected failure",
+                self.path.display()
+            ));
+        }
         let mut file: &File = &locked.file;
         let record = encode(state);
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&record))
             .and_then(|_| file.set_len(RECORD_LEN as u64))
             .map_err(|e| format!("could not write {}: {e}", self.path.display()))
+    }
+
+    /// Makes every later write through this handle fail (or succeed again).
+    #[cfg(test)]
+    pub(super) fn fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -338,7 +369,9 @@ fn claimed_version(buf: &[u8]) -> Option<u32> {
 
 fn decode(buf: &[u8]) -> Record {
     match claimed_version(buf) {
-        Some(version) if version > VERSION => Record::Newer(version),
+        // Only a whole record can be another layout's: a shorter or longer
+        // buffer with a newer version word is torn, and says nothing.
+        Some(version) if version > VERSION && buf.len() == RECORD_LEN => Record::Newer(version),
         Some(VERSION) if buf.len() == RECORD_LEN => {
             let (Some(tokens), Some(at_ns)) = (
                 word_at(buf, 8),
@@ -634,15 +667,254 @@ mod tests {
         assert_eq!(shared.tokens_now(burst, 1, now), 0);
     }
 
+    /// Whether the gate would let a spawn start on this answer: a grant, or a
+    /// record it could not consult (fail open).
+    fn admits(outcome: &Take) -> bool {
+        matches!(outcome, Take::Granted | Take::Unavailable(_))
+    }
+
+    /// A record spent down to its floor at `now`, written by a handle that is
+    /// then dropped.
+    fn spent_record(dir: &tempfile::TempDir, burst: u32, now: u64) -> PathBuf {
+        let shared = budget(dir);
+        for _ in 0..burst {
+            assert_eq!(shared.take_at(0, burst, 1, now), Take::Granted);
+        }
+        shared.path().to_path_buf()
+    }
+
+    /// The denial was decided in memory; the record then could not be
+    /// rewritten. A denial that is not recorded is still a denial: reporting
+    /// the record as unreachable instead lets the gate admit, and every
+    /// process that meets the same failure spends past the shared budget.
+    #[test]
+    fn a_denial_stays_a_denial_when_the_record_cannot_be_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000 * S;
+        let path = spent_record(&dir, 4, now);
+        let shared = SharedBudget::open(&path).unwrap();
+        shared.fail_writes(true);
+        let before = std::fs::read(&path).unwrap();
+        for floor in [0, 2] {
+            let outcome = shared.take_at(floor, 4, 1, now);
+            assert!(
+                matches!(&outcome, Take::DeniedUnrecorded(reason) if reason.contains("could not write")),
+                "floor {floor}: {outcome:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+        // Once the record is writable again the denial is an ordinary one.
+        shared.fail_writes(false);
+        assert_eq!(shared.take_at(0, 4, 1, now), Take::Denied);
+    }
+
+    /// A grant whose record write fails is the documented fail-open: the
+    /// record could not be reached for this decision, the process bucket still
+    /// caps this process, and the record keeps the tokens it had.
+    #[test]
+    fn a_grant_whose_record_cannot_be_rewritten_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = budget(&dir);
+        let now = 1_000 * S;
+        assert_eq!(shared.take_at(0, 4, 1, now), Take::Granted);
+        shared.fail_writes(true);
+        let outcome = shared.take_at(0, 4, 1, now);
+        assert!(
+            matches!(&outcome, Take::Unavailable(reason) if reason.contains("could not write")),
+            "{outcome:?}"
+        );
+        shared.fail_writes(false);
+        assert_eq!(
+            shared.tokens_now(4, 1, now),
+            3,
+            "the failed take spent nothing"
+        );
+    }
+
+    /// The same denial through a real write error, not the injected one: a
+    /// handle opened read-only fails `write_all` with EBADF.
+    #[cfg(unix)]
+    #[test]
+    fn a_denial_on_a_read_only_handle_is_not_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000 * S;
+        let path = spent_record(&dir, 4, now);
+        let shared = SharedBudget {
+            file: Mutex::new(File::open(&path).unwrap()),
+            path: path.clone(),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+        };
+        let before = std::fs::read(&path).unwrap();
+        let outcome = shared.take_at(0, 4, 1, now);
+        assert!(!admits(&outcome), "{outcome:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A buffer that carries the magic and a newer version word but is not a
+    /// whole record is torn, not a newer layout: nothing can be said of what
+    /// it holds, so it is unreadable.
+    #[test]
+    fn a_short_buffer_claiming_a_newer_version_is_unreadable_not_newer() {
+        let full = stamped(VERSION + 1, 3, 9 * S);
+        for len in 1..RECORD_LEN {
+            assert_eq!(decode(&full[..len]), Record::Unreadable, "{len} bytes");
+        }
+        let mut long = full.clone();
+        long.push(0);
+        assert_eq!(decode(&long), Record::Unreadable, "one byte too long");
+        assert_eq!(decode(&full), Record::Newer(VERSION + 1));
+        assert_eq!(decode(b"GPSB\x03\x00\x00\x00"), Record::Unreadable);
+    }
+
+    /// The 8-byte magic-plus-newer-version file, with the reset write
+    /// failing, must not admit; with it working, it is the empty reset.
+    #[test]
+    fn an_eight_byte_newer_stub_is_reset_empty_and_never_admits_unreset() {
+        let now = 9 * S;
+        let stub = b"GPSB\x03\x00\x00\x00";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        write_private(&path, stub);
+        let shared = SharedBudget::open(&path).unwrap();
+        shared.fail_writes(true);
+        let outcome = shared.take_at(0, 192, 8, now);
+        assert!(!admits(&outcome), "{outcome:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), stub, "unwritable: untouched");
+        shared.fail_writes(false);
+        assert_eq!(shared.take_at(0, 192, 8, now), Take::Denied);
+        assert_eq!(shared.tokens_now(192, 8, now), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), RECORD_LEN as u64);
+    }
+
+    /// A file cut at every length: empty is a never-written record and a full
+    /// burst; every other length (of either layout) is torn, grants nothing,
+    /// and is not admitted when the reset cannot be persisted.
+    #[test]
+    fn a_file_truncated_at_every_length_is_a_burst_or_an_empty_reset() {
+        let burst = 8;
+        let now = 9 * S;
+        for version in [VERSION, VERSION + 1] {
+            let full = stamped(version, burst, now);
+            for len in 0..RECORD_LEN {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(FILE_NAME);
+                write_private(&path, &full[..len]);
+                let shared = SharedBudget::open(&path).unwrap();
+
+                shared.fail_writes(true);
+                let unwritable = shared.take_at(0, burst, 1, now);
+                if len == 0 {
+                    assert!(
+                        matches!(unwritable, Take::Unavailable(_)),
+                        "len 0 grant, record unreachable: {unwritable:?}"
+                    );
+                } else {
+                    assert!(!admits(&unwritable), "v{version} len {len}: {unwritable:?}");
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), &full[..len]);
+
+                shared.fail_writes(false);
+                let writable = shared.take_at(0, burst, 1, now);
+                if len == 0 {
+                    assert_eq!(writable, Take::Granted);
+                    assert_eq!(shared.tokens_now(burst, 1, now), burst - 1);
+                } else {
+                    assert_eq!(writable, Take::Denied, "v{version} len {len}");
+                    assert_eq!(shared.tokens_now(burst, 1, now), 0);
+                }
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), RECORD_LEN as u64);
+            }
+        }
+    }
+
+    /// Two handles (two processes) on a record at its floor, one of which
+    /// cannot write, hammered from several threads: nothing is admitted.
+    #[test]
+    fn concurrent_takers_on_a_spent_record_are_never_admitted_by_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000 * S;
+        let path = spent_record(&dir, 6, now);
+        let a = SharedBudget::open(&path).unwrap();
+        let b = SharedBudget::open(&path).unwrap();
+        b.fail_writes(true);
+        let admitted: usize = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|i| {
+                    let handle = if i % 2 == 0 { &a } else { &b };
+                    scope.spawn(move || {
+                        (0..200)
+                            .filter(|_| {
+                                // Unavailable here is a held lock, not a
+                                // write failure: the record is spent either way.
+                                matches!(handle.take_at(0, 6, 1, now), Take::Granted)
+                            })
+                            .count()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).sum()
+        });
+        assert_eq!(admitted, 0);
+    }
+
+    /// An unrecorded denial persists neither tokens nor the refill anchor, so
+    /// the next handle that can write credits the elapsed time exactly once:
+    /// the failed handle's refill is recomputed, never double counted.
+    #[test]
+    fn an_unrecorded_denial_does_not_let_the_next_writer_refill_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 1_000 * S;
+        let path = spent_record(&dir, 4, t0);
+        let a = SharedBudget::open(&path).unwrap();
+        let b = SharedBudget::open(&path).unwrap();
+        b.fail_writes(true);
+        // Half a second at 1/s credits nothing; then 2.5 s in, two whole tokens.
+        for at in [t0 + S / 2, t0 + 2 * S + S / 2] {
+            assert!(matches!(b.take_at(2, 4, 1, at), Take::DeniedUnrecorded(_)));
+        }
+        let now = t0 + 3 * S;
+        let granted = (0..10)
+            .filter(|_| a.take_at(0, 4, 1, now) == Take::Granted)
+            .count();
+        assert_eq!(granted, 3, "three seconds of refill, once");
+    }
+
+    /// A record renamed over by a directory after this handle opened it: the
+    /// handle still holds the original file, so decisions are unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_replaced_by_a_directory_does_not_change_an_open_handles_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000 * S;
+        let path = spent_record(&dir, 4, now);
+        let shared = SharedBudget::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(shared.take_at(0, 4, 1, now), Take::Denied);
+        assert!(SharedBudget::open(&path).is_err(), "a directory is refused");
+    }
+
+    /// A read-only record is refused at open, so the gate stays on its own
+    /// bucket with the reason, rather than meeting write errors per decision.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_record_is_refused_at_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        write_private(&path, b"");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(SharedBudget::open(&path).is_err());
+    }
+
     /// A record from a newer build is that build's to rewrite. This one steps
     /// aside for the decision (the gate's counted fallback) and leaves every
-    /// byte where it was.
+    /// byte where it was, whether or not the write would have worked.
     #[test]
     fn a_newer_record_is_left_alone_and_the_decision_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        let mut newer = stamped(VERSION + 1, 3, 9 * S);
-        newer.extend_from_slice(b"appended by a later layout");
+        let newer = stamped(VERSION + 1, 3, 9 * S);
         write_private(&path, &newer);
         let shared = SharedBudget::open(&path).unwrap();
         let outcome = shared.take_at(0, 192, 8, 9 * S);

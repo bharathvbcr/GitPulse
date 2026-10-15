@@ -2987,13 +2987,18 @@ impl SpawnGate {
     }
 
     /// Applies [`Self::ask_shared`]'s answer under the gate lock: `true` when
-    /// the token was granted or could not be asked (counted, and logged at
-    /// most every [`REFUSAL_REPORT_INTERVAL`]); `false` when the processes
-    /// together have spent it.
+    /// the token was granted or the record could not be consulted (counted,
+    /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when the
+    /// processes together have spent it, whether or not the record could be
+    /// rewritten to say so.
     fn settle_shared(&self, state: &mut GateState, taken: shared_budget::Take) -> bool {
         match taken {
             shared_budget::Take::Granted => true,
             shared_budget::Take::Denied => false,
+            shared_budget::Take::DeniedUnrecorded(reason) => {
+                log_unrecorded_denial(&reason);
+                false
+            }
             shared_budget::Take::Unavailable(reason) => {
                 state.shared_fallbacks = state.shared_fallbacks.saturating_add(1);
                 log_shared_fallback(&reason, state.shared_fallbacks);
@@ -3744,20 +3749,40 @@ fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str, top: impl FnOn
 /// running total at most every [`REFUSAL_REPORT_INTERVAL`].
 fn log_shared_fallback(reason: &str, total: u64) {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let now = Instant::now();
-    {
-        let mut last = LAST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_REPORT_INTERVAL) {
-            return;
-        }
-        *last = Some(now);
+    if !report_due(&LAST) {
+        return;
     }
     log::warn!(
         target: "spawn_gate",
         "shared spawn budget unavailable for a decision ({total} so far); used this process's own: {reason}"
     );
+}
+
+/// A denial the shared record could not persist, logged at most every
+/// [`REFUSAL_REPORT_INTERVAL`]. The spawn was refused all the same.
+fn log_unrecorded_denial(reason: &str) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    if !report_due(&LAST) {
+        return;
+    }
+    log::warn!(
+        target: "spawn_gate",
+        "shared spawn budget denied a decision it could not record; refused: {reason}"
+    );
+}
+
+/// Whether `last` is older than [`REFUSAL_REPORT_INTERVAL`]; if so, now is
+/// recorded as the latest report.
+fn report_due(last: &Mutex<Option<Instant>>) -> bool {
+    let now = Instant::now();
+    let mut last = last
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_REPORT_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 const REFUSAL_REPORT_INTERVAL: Duration = Duration::from_secs(30);
@@ -10232,6 +10257,35 @@ mod admission_scope_tests {
         });
         assert_eq!(shed.err(), Some(Refusal::Shed));
         assert!(admits(b), "a reactive read still has the reserve");
+    }
+
+    /// B has every process-bucket token, and the shared record is spent. When
+    /// B cannot rewrite the record the denial is still a denial: no
+    /// non-interactive spawn starts and it is not counted as a fallback.
+    /// A user action never asks the record, so it still starts.
+    #[test]
+    fn a_denial_the_record_cannot_persist_does_not_admit_a_background_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let a = shared_gate(&path, 8, 1);
+        let b = shared_gate(&path, 8, 1);
+        while admits(a) {}
+        b.shared.as_ref().unwrap().fail_writes(true);
+        assert!(
+            !admits(b),
+            "a reactive spawn rode a failed write past the budget"
+        );
+        let shed = with_admission(Admission::Background, || {
+            b.acquire_until(Instant::now() + Duration::from_millis(50), &|| false)
+                .map(|_| ())
+        });
+        assert_eq!(shed.err(), Some(Refusal::Shed));
+        assert_eq!(b.state.lock().unwrap().shared_fallbacks, 0);
+        let clicked = with_admission(Admission::Interactive, || {
+            b.acquire_until(Instant::now() + Duration::from_millis(50), &|| false)
+                .map(|_| ())
+        });
+        assert_eq!(clicked, Ok(()), "a user action does not ask the record");
     }
 
     #[test]
