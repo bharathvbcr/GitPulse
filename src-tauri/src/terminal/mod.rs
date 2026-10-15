@@ -271,6 +271,13 @@ pub struct TerminalExitPayload {
     pub signal: String,
     pub error: Option<String>,
     pub reaped: bool,
+    /// GitPulse ended it: a Close (from its tab or from Sessions), the app's
+    /// shutdown, or the reader stopping a session it could no longer serve
+    /// (then `error` says why). False for an end nobody here asked for: the
+    /// program exiting on its own, or a signal from outside. A view offers to
+    /// resume a conversation only for the second kind, and only when GitPulse
+    /// did not end it deliberately.
+    pub ended_by_gitpulse: bool,
 }
 
 /// Task-run bookkeeping at the existing PTY boundary. The observer cannot
@@ -1011,6 +1018,8 @@ where
         signal,
         error,
         reaped,
+        // Set by the reader, which alone knows who ended the session.
+        ended_by_gitpulse: false,
     });
 }
 
@@ -1027,9 +1036,12 @@ fn reader_failure_payload(
         signal: String::new(),
         error: None,
         reaped: false,
+        ended_by_gitpulse: true,
     };
     finalize_pty_session(session_id, || exit, |p| payload = p);
     payload.error = Some(format!("PTY reader failed: {reason}"));
+    // GitPulse stopped the child: nothing could have read it.
+    payload.ended_by_gitpulse = true;
     payload
 }
 
@@ -2057,6 +2069,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     if payload.error.is_none() {
                         payload.error = failure.take();
                     }
+                    payload.ended_by_gitpulse = ended_by_gitpulse;
                     // Every end is on record with its cause. A session that
                     // vanished with nothing in the log was undiagnosable.
                     log::info!(

@@ -13,7 +13,7 @@
 //! Claude Code tab with `--resume <id>` in the attempt's checkout.
 
 use super::{query, terminal_command::is_canonical_uuid, WorkbenchError, WorkbenchState};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -225,6 +225,66 @@ pub(super) fn search(home: &Path, session: &str) -> Transcript {
     Transcript::Absent
 }
 
+/// Most ids one [`transcripts`] call answers: an incident's whole list
+/// (`MAX_INCIDENT_SESSIONS` in the renderer's `incident.ts`).
+pub(crate) const MAX_TRANSCRIPT_QUERIES: usize = 512;
+
+/// Whether Claude Code saved one hosted conversation, as
+/// `cmd_terminal_conversations` answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConversationTranscript {
+    pub session_id: String,
+    /// `found`, `absent` or `unknown`: a plain word rather than a serialized
+    /// enum, because the renderer branches on it and holds it to its own union.
+    pub transcript: String,
+    /// Why it could not be checked, for `unknown`; `None` otherwise.
+    pub reason: Option<String>,
+}
+
+/// Whether Claude Code saved each of these conversations: the same evidence
+/// an attempt's "Resume conversation" is decided on (`search` in
+/// `claude_home`), for the plain Claude tabs GitPulse hosts. Holding an id is
+/// not evidence of a conversation: a session killed before its first message
+/// has none. Read-only.
+///
+/// Every id must be a canonical session id; anything else is refused whole,
+/// because it can only come from a caller that is not the renderer's own.
+pub(crate) fn transcripts(session_ids: &[String]) -> Result<Vec<ConversationTranscript>, String> {
+    if session_ids.len() > MAX_TRANSCRIPT_QUERIES {
+        return Err(format!(
+            "At most {MAX_TRANSCRIPT_QUERIES} conversations can be checked at once."
+        ));
+    }
+    if let Some(bad) = session_ids.iter().find(|id| !is_canonical_uuid(id)) {
+        let shown: String = bad.chars().take(64).collect();
+        return Err(format!("{shown:?} is not a Claude Code session id."));
+    }
+    let home = claude_home();
+    Ok(session_ids
+        .iter()
+        .map(|session| {
+            let found = match &home {
+                Some(home) => search(home, session),
+                None => Transcript::Unknown("no home directory to find Claude Code's in".into()),
+            };
+            answer(session, found)
+        })
+        .collect())
+}
+
+fn answer(session: &str, found: Transcript) -> ConversationTranscript {
+    let (transcript, reason) = match found {
+        Transcript::Found => ("found", None),
+        Transcript::Absent => ("absent", None),
+        Transcript::Unknown(why) => ("unknown", Some(why)),
+    };
+    ConversationTranscript {
+        session_id: session.to_owned(),
+        transcript: transcript.into(),
+        reason,
+    }
+}
+
 pub(super) fn find(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
     if input.len() > 1024 {
         return Err(WorkbenchError::new(
@@ -254,7 +314,7 @@ pub(super) fn find(state: &WorkbenchState, input: &str) -> Result<Value, Workben
 
 #[cfg(test)]
 mod tests {
-    use super::{judge, search, Transcript};
+    use super::{answer, judge, search, transcripts, Transcript, MAX_TRANSCRIPT_QUERIES};
     use serde_json::json;
 
     const ID: &str = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
@@ -380,5 +440,34 @@ mod tests {
         let found = search(home.path(), ID);
         std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(found, Transcript::Unknown(_)), "{found:?}");
+    }
+
+    /// The hosted-tab answer is the attempt's evidence in three words, and
+    /// only a canonical id, in a bounded list, is ever looked for.
+    #[test]
+    fn a_hosted_conversation_is_answered_found_absent_or_unknown_and_bad_ids_are_refused() {
+        assert_eq!(
+            answer(ID, Transcript::Found),
+            super::ConversationTranscript {
+                session_id: ID.into(),
+                transcript: "found".into(),
+                reason: None
+            }
+        );
+        assert_eq!(answer(ID, Transcript::Absent).transcript, "absent");
+        let unknown = answer(ID, Transcript::Unknown("denied".into()));
+        assert_eq!(unknown.transcript, "unknown");
+        assert_eq!(unknown.reason.as_deref(), Some("denied"));
+
+        for bad in [
+            "",
+            "../../etc/passwd",
+            "6F1C2A7E-0D4B-4C1E-9A55-3B0E8F2D9C11x",
+            "not-a-uuid",
+        ] {
+            assert!(transcripts(&[ID.into(), bad.into()]).is_err(), "{bad:?}");
+        }
+        assert!(transcripts(&vec![ID.to_string(); MAX_TRANSCRIPT_QUERIES + 1]).is_err());
+        assert!(transcripts(&[]).unwrap().is_empty());
     }
 }

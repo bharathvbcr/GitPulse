@@ -6,6 +6,7 @@ vi.mock("../ipc/invoke", () => ({ invoke: vi.fn() }));
 
 const { adoptDetachedSessions, handOverDetachedRun, keepDetached, parseListing, stopQuestion, DETACHED_STATUS, ENDING_STATUS } = await import("./detachedSessions");
 const { createSessionRegistry } = await import("./sessionRegistry");
+const { createHostedClaudeStore } = await import("./hostedClaude");
 const { taskTerminalRequests, consumeTaskTerminalRequest } = await import("./taskLaunches");
 import type { PtyBus, PtySessionHandlers } from "./ptyBus";
 import type { TerminalListing } from "./runResult";
@@ -110,7 +111,7 @@ describe("sessions a reloaded page left running", () => {
   it("leave the list when their process ends on its own", async () => {
     const { registry, handlers, adopt } = setup([row()]);
     await adopt();
-    handlers.get("term-1-a")?.onExit({ id: "term-1-a", exit_code: 0, signal: "", error: null, reaped: true } as never);
+    handlers.get("term-1-a")?.onExit({ id: "term-1-a", exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false } as never);
     expect(get(registry)).toEqual([]);
   });
 
@@ -207,9 +208,39 @@ describe("a tab's process kept after its view went away", () => {
     expect(get(registry)).toHaveLength(1);
     expect(() => tabSlot.handOver({ key: "x", repoPath: "/r", label: "l", status: "s", close: async () => {} })).toThrow();
     // Exit removes it; Stop really stops it.
-    handlers.get("term-1-a")?.onExit({ id: "term-1-a", exit_code: 0, signal: "", error: null, reaped: true });
+    handlers.get("term-1-a")?.onExit({ id: "term-1-a", exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
     expect(get(registry)).toHaveLength(0);
     expect(calls).toEqual([]);
+  });
+
+  // S2-02: the view going away is not an end; the process's end is.
+  it("keeps its Claude conversation's record past the view, marks an outside signal, and forgets it on Stop", async () => {
+    const conversation = "6f0a6d1e-1111-4222-8333-444455556666";
+    const keep = (id: string) => {
+      const registry = createSessionRegistry();
+      const { bus, handlers } = fakeBus();
+      const conversations = createHostedClaudeStore(null);
+      conversations.begin({ sessionId: conversation, repoPath: "/repos/app", startDir: null, mode: null, startedAt: 1 });
+      conversations.bind(conversation, id);
+      const slot = registry.reserve({ key: "tab-a", repoPath: "/repos/app", label: "Claude", status: "running", sessionId: id, close: async () => {} });
+      const invoke = async <T,>(): Promise<T> => null as T;
+      keepDetached(row({ id }), slot, { invoke, bus, confirm: async () => true, conversations });
+      return { registry, handlers, conversations };
+    };
+
+    const signalled = keep("term-1-a");
+    // The next tab to show it finds the conversation by its PTY.
+    expect(signalled.conversations.byTerminal("term-1-a")?.sessionId).toBe(conversation);
+    signalled.handlers.get("term-1-a")?.onExit({ id: "term-1-a", exit_code: null, signal: "Terminated: 15", error: null, reaped: true, ended_by_gitpulse: false });
+    expect(signalled.conversations.get(conversation)?.endedSignal).toBe("Terminated: 15");
+
+    const stopped = keep("term-1-b");
+    await get(stopped.registry)[0].close();
+    expect(stopped.conversations.get(conversation)).toBeUndefined();
+
+    const finished = keep("term-1-c");
+    finished.handlers.get("term-1-c")?.onExit({ id: "term-1-c", exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
+    expect(finished.conversations.get(conversation)).toBeUndefined();
   });
 
   it("is stopped for real from Sessions", async () => {

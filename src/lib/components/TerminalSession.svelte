@@ -89,7 +89,8 @@
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs } from "../terminal/launchRequests";
-  import { hostedClaude, resumers, withSessionId } from "../terminal/hostedClaude";
+  import { hostedClaude, resumers, settleConversation, withSessionId, type ExitFacts, type ResumeOutcome } from "../terminal/hostedClaude";
+  import { checkTranscripts } from "../terminal/transcripts";
   import {
     effectiveMode,
     PERMISSION_LABELS,
@@ -590,6 +591,17 @@
    * id the backend assigns) and a `--continue` launch.
    */
   let hostedId: string | null = null;
+  /**
+   * The process running `hostedId` has started and not been seen to end. A
+   * view going away while it runs leaves the record (the process is kept, and
+   * the next tab to show it finds the record by its PTY).
+   */
+  let hostedLive = false;
+  /**
+   * Why a conversation a signal ended is not offered: its transcript is not
+   * there, or could not be checked. Shown in place of Resume.
+   */
+  let transcriptNote = $state<string | null>(null);
   /** Set to relaunch the conversation a signal ended; consumed by the next spawn. */
   let resumeOverride: string | null = null;
   /** The conversation a signal ended in this tab, which Resume relaunches. */
@@ -601,6 +613,37 @@
     if (offerTerminal) resumers.unregister(offerTerminal);
     offerTerminal = null;
     resumeOffer = null;
+    transcriptNote = null;
+  }
+
+  /**
+   * What the end of this tab's process does to its conversation's record
+   * (`settleConversation`, the one decision every place that sees the end
+   * shares). An end from outside keeps the record and, once Claude Code's
+   * transcript of it is found, offers Resume here and to an incident's
+   * "Resume N". Absent offers nothing; Unknown says it could not check.
+   */
+  function settleHosted(end: ExitFacts | "closed", terminalId: string | null) {
+    const conversation = hostedId;
+    hostedLive = false;
+    if (!conversation) return;
+    if (!settleConversation(hostedClaude, conversation, end) || !terminalId) return;
+    void checkTranscripts([conversation]).then((answers) => {
+      // A restart, a new process or this view going away while the check ran:
+      // the offer belongs to a session that is no longer this tab's.
+      if (disposed || hostedId !== conversation || nativeSessionId !== terminalId || hostedLive) return;
+      const answer = answers.get(conversation) ?? { state: "unknown" as const, reason: "no answer" };
+      if (answer.state === "found") {
+        resumeOffer = conversation;
+        offerTerminal = terminalId;
+        resumers.register(terminalId, resumeEnded);
+      } else if (answer.state === "absent") {
+        transcriptNote = "Claude Code saved no conversation for this session, so there is nothing to resume.";
+        hostedClaude.forget(conversation);
+      } else {
+        transcriptNote = `Could not check whether Claude Code saved this conversation: ${answer.reason ?? "unknown"}`;
+      }
+    });
   }
 
   /**
@@ -608,12 +651,12 @@
    * directory and permission mode (this tab's own, read once at mount), by
    * the same `--resume <id>` launch a resumed attempt uses.
    */
-  async function resumeEnded() {
+  async function resumeEnded(): Promise<ResumeOutcome> {
     const id = resumeOffer;
-    if (!id || disposed) return;
+    if (!id || disposed || !lifecycle) return "failed";
     withdrawOffer();
     resumeOverride = id;
-    await lifecycle?.restart();
+    return lifecycle.restart();
   }
 
   /** The session this tab is still to take over, until its first start. */
@@ -651,12 +694,24 @@
           // `null` on the wire and the backend's u16 refuses the spawn.
           const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions(), hasRenderedBox(container));
           const cfg = launcherConfig(launcher);
+          hostedId = null;
+          // Once: a later restart of this tab starts a fresh process the
+          // ordinary way, because the session it took over has ended.
+          if (attachPending) {
+            const sessionId = attachPending;
+            attachPending = null;
+            // Taking over a process another view started: its conversation is
+            // the one already on record for that PTY, if any. Nothing new is
+            // recorded — a fresh id here would name a conversation that does
+            // not exist, and a later signal would offer to resume it.
+            if (launcher === "claude" && !taskRunId) hostedId = hostedClaude.byTerminal(sessionId)?.sessionId ?? null;
+            return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols, onOutput }));
+          }
           // A conversation GitPulse can name is one it can resume. Every
           // fresh Claude launch is given an id, a task attempt excepted: its
           // run id is already its session id, assigned by the backend.
           const resumeId = resumeOverride;
           resumeOverride = null;
-          hostedId = null;
           if (launcher === "claude" && !taskRunId) {
             const hosted = withSessionId(resumeId ? ["--resume", resumeId] : cfg.args);
             cfg.args = hosted.args;
@@ -665,13 +720,6 @@
               sessionId: hostedId, repoPath: workPath, startDir: startDir ?? null,
               mode: permissionMode, startedAt: Date.now(),
             });
-          }
-          // Once: a later restart of this tab starts a fresh process the
-          // ordinary way, because the session it took over has ended.
-          if (attachPending) {
-            const sessionId = attachPending;
-            attachPending = null;
-            return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols, onOutput }));
           }
           if (taskRunId) return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
             input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),
@@ -730,7 +778,10 @@
           // left behind it pushes the live one out of the bounded report.
           if (nativeSessionId && nativeSessionId !== spawned.id) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
           nativeSessionId = spawned.id;
-          if (hostedId) hostedClaude.bind(hostedId, spawned.id);
+          if (hostedId) {
+            hostedClaude.bind(hostedId, spawned.id);
+            hostedLive = true;
+          }
           terminalAttendance.report(nativeSessionId, onscreen);
           startedIn = spawned.cwd;
           // A session taken over after a reload was already recorded as
@@ -764,20 +815,16 @@
           }
         },
         exit(event) {
-          // A signal that was not this app's own close (which never reaches
-          // here) is an external kill: the conversation is intact on disk and
-          // this tab offers to pick it back up.
-          if (hostedId) {
-            hostedClaude.ended(hostedId, event.signal || null);
-            if (event.signal) {
-              resumeOffer = hostedId;
-              offerTerminal = event.id;
-              resumers.register(event.id, resumeEnded);
-            }
-          }
+          // GitPulse's own Close does reach here when its exit event lands
+          // before the close is acknowledged, and it says so
+          // (`ended_by_gitpulse`): only a signal from outside leaves a
+          // conversation to offer back, and only one Claude Code saved.
+          settleHosted(event, event.id);
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
           term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
         },
+        // The close was acknowledged; its exit event may not come at all.
+        closed() { settleHosted("closed", null); },
         reset() {
           return new Promise<void>((resolve) => {
             if (!term || disposed) { resolve(); return; }
@@ -1184,9 +1231,11 @@
       for (const timer of armTimers) clearTimeout(timer);
       armTimers.clear();
       disposed = true;
-      // Closing the tab is the reader's own end of it, not an incident.
+      // Closing the tab is the reader's own end of it, not an incident. A
+      // process still running is kept (`lifecycle.dispose`), and so is its
+      // conversation's record: the tab that shows it next finds it there.
       withdrawOffer();
-      if (hostedId) hostedClaude.forget(hostedId);
+      if (hostedId && !hostedLive) hostedClaude.forget(hostedId);
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
       // Before `lifecycle` goes: nothing owed waits for a frame this view
       // will not see, and a failure is still reported against the session.
@@ -1386,6 +1435,9 @@
           <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
             Open task
           </button>
+        {/if}
+        {#if transcriptNote}
+          <span class="text-textMuted text-[11px]" data-testid="terminal-resume-unavailable">{transcriptNote}</span>
         {/if}
         {#if resumeOffer}
           <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title="Relaunch this Claude Code conversation with --resume, in the same directory and permission mode">

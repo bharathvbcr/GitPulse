@@ -24,7 +24,7 @@ function fixture(overrides: Partial<SessionTransport> = {}, registry = createSes
   const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks, singleAttempt, ...extras,
     bus: { prepare, pendingCount: () => 0, openOutput: () => ({ channel: {}, bind: () => {}, release: () => {} }), subscribe(_id, h) { handlers = h; return unsubscribe; } },
   });
-  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string) => handlers?.onOutput(new TextEncoder().encode(s)), error: (message: string) => handlers?.onError?.(message), notice: (message: string) => handlers?.onNotice?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
+  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string) => handlers?.onOutput(new TextEncoder().encode(s)), error: (message: string) => handlers?.onError?.(message), notice: (message: string) => handlers?.onNotice?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false }) };
 }
 
 describe("the session record", () => {
@@ -458,7 +458,7 @@ describe("a hosted session's record", () => {
 });
 
 describe("admission to a session slot", () => {
-  function owner(registry: ReturnType<typeof createSessionRegistry>, key: string, hooks: { admitted?: () => void; refused?: (m: string) => boolean }) {
+  function owner(registry: ReturnType<typeof createSessionRegistry>, key: string, hooks: { admitted?: () => void; refused?: (m: string) => boolean; closed?: () => void }) {
     const transport = { spawn: vi.fn(async () => ({ id: `native-${key}`, shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}), detach: vi.fn(async () => true) };
     const state = vi.fn();
     const lifecycle = createSessionLifecycle({ key, repoPath: "/repo", label: "Claude", registry, transport,
@@ -476,6 +476,44 @@ describe("admission to a session slot", () => {
     await a.lifecycle.start();
     expect(order).toEqual(["admitted", "spawn"]);
     a.lifecycle.dispose(); await flush();
+  });
+
+  // S2-04: a relaunch counted as "resumed" must be one that started.
+  it("restart says what it did: started, deferred behind a full registry, failed on a rejecting transport", async () => {
+    const registry = createSessionRegistry();
+    const ok = owner(registry, "ok", {});
+    await ok.lifecycle.start();
+    expect(await ok.lifecycle.restart()).toBe("started");
+
+    const broken = owner(registry, "broken", {});
+    broken.transport.spawn.mockImplementation(async () => { throw new Error("CLI missing"); });
+    expect(await broken.lifecycle.restart()).toBe("failed");
+    expect(broken.state).toHaveBeenCalledWith("error", expect.stringContaining("CLI missing"));
+
+    ok.lifecycle.dispose(); broken.lifecycle.dispose(); await flush();
+    const full = createSessionRegistry();
+    const held = Array.from({ length: DEFAULT_TERMINAL_SESSIONS }, (_, i) => full.reserve({ key: `held-${i}`, repoPath: "/repo", label: "Shell", status: "running", close: async () => {} }));
+    const waiting = owner(full, "waiting", { refused: () => true });
+    expect(await waiting.lifecycle.restart()).toBe("deferred");
+    expect(waiting.transport.spawn).not.toHaveBeenCalled();
+    for (const slot of held) slot.release();
+    waiting.lifecycle.dispose(); await flush();
+  });
+
+  it("an acknowledged close is reported once, even after the view went away", async () => {
+    const registry = createSessionRegistry();
+    const closed = vi.fn();
+    const tab = owner(registry, "c", { closed });
+    await tab.lifecycle.start();
+    await tab.lifecycle.close();
+    expect(closed).toHaveBeenCalledTimes(1);
+
+    const gone = owner(registry, "g", { closed });
+    await gone.lifecycle.start();
+    const closing = gone.lifecycle.close();
+    gone.lifecycle.dispose();
+    await closing; await flush();
+    expect(closed).toHaveBeenCalledTimes(2);
   });
 
   it("hands a refusal for capacity back to a caller that will retry, and starts nothing", async () => {

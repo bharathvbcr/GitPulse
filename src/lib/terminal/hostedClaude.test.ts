@@ -4,7 +4,9 @@ import {
   carriesSession,
   createHostedClaudeStore,
   createResumers,
+  endedFromOutside,
   readHostedClaude,
+  settleConversation,
   withSessionId,
   type HostedStorage,
 } from "./hostedClaude";
@@ -167,10 +169,42 @@ describe("the hosted conversation store", () => {
 describe("resumers", () => {
   it("offers a relaunch per dead tab until the tab takes it back", () => {
     const resumers = createResumers();
-    resumers.register("term-1", () => {});
+    resumers.register("term-1", async () => "started" as const);
     expect(resumers.has("term-1")).toBe(true);
     resumers.unregister("term-1");
     expect(resumers.has("term-1")).toBe(false);
     expect(resumers.size()).toBe(0);
+  });
+});
+
+describe("what a PTY's end does to its conversation", () => {
+  const exit = (overrides: Partial<{ signal: string; ended_by_gitpulse: boolean; error: string | null }> = {}) => ({
+    signal: "", ended_by_gitpulse: false, error: null, ...overrides,
+  });
+
+  // S2-08: GitPulse's own Close never offers Resume; a signal from outside does.
+  it("only a signal GitPulse did not send counts as an end from outside", () => {
+    expect(endedFromOutside(exit({ signal: "Terminated: 15" }))).toBe(true);
+    expect(endedFromOutside(exit({ signal: "Hangup: 1", ended_by_gitpulse: true }))).toBe(false);
+    expect(endedFromOutside(exit())).toBe(false);
+    expect(endedFromOutside(exit({ ended_by_gitpulse: true }))).toBe(false);
+    // GitPulse stopped a session it could not serve: not what the person asked for.
+    expect(endedFromOutside(exit({ signal: "Hangup: 1", ended_by_gitpulse: true, error: "Terminal output could not be read" }))).toBe(true);
+  });
+
+  // S2-02: a Close or a clean exit ends the record; an outside signal keeps it, marked.
+  it("forgets on a Close or a clean exit and keeps, marked, an end from outside", () => {
+    const store = createHostedClaudeStore(null);
+    store.begin(launch(ID));
+    store.bind(ID, "term-1");
+    expect(settleConversation(store, ID, exit({ signal: "Terminated: 15" }))).toBe(true);
+    expect(store.byTerminal("term-1")?.endedSignal).toBe("Terminated: 15");
+    expect(store.resumable().map((r) => r.sessionId)).toEqual([ID]);
+
+    for (const end of ["closed", exit({ signal: "Hangup: 1", ended_by_gitpulse: true }), exit()] as const) {
+      store.begin(launch(OTHER));
+      expect(settleConversation(store, OTHER, end)).toBe(false);
+      expect(store.get(OTHER)).toBeUndefined();
+    }
   });
 });

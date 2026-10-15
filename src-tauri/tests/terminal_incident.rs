@@ -86,9 +86,11 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
     )
     .unwrap();
     kill_session(&state, &warm.id).unwrap();
-    exits
+    let closed = exits
         .recv_timeout(Duration::from_secs(10))
         .expect("the warm-up session reports its end");
+    // GitPulse's own Close says so, and a view offers no Resume for it.
+    assert_eq!(closed["ended_by_gitpulse"], true, "{closed}");
     let fds_before = open_fds();
     let mut ids = Vec::new();
     let mut pids = Vec::new();
@@ -121,6 +123,8 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
             .recv_timeout(Duration::from_secs(10))
             .expect("every session reports its end");
         assert!(!exit["signal"].as_str().unwrap_or("").is_empty(), "{exit}");
+        // A signal from outside is not GitPulse's end: Resume is offered.
+        assert_eq!(exit["ended_by_gitpulse"], false, "{exit}");
         exited.push(exit["id"].as_str().unwrap().to_string());
     }
 

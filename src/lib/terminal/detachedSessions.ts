@@ -26,6 +26,7 @@ import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
 import { FAMILY_LOOKUP_MS, terminalDeadline } from "./inputQueue";
 import type { TerminalListing } from "./runResult";
+import { hostedClaude, settleConversation, type createHostedClaudeStore, type ExitFacts } from "./hostedClaude";
 import { terminalSessions, type createSessionRegistry, type TerminalSessionRecord } from "./sessionRegistry";
 import { enqueueTaskTerminal } from "./taskLaunches";
 import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
@@ -103,13 +104,27 @@ type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
  * (`keepDetached`). The exit watch is subscribed before `take` returns, so
  * an exit cannot fall between the old owner and this one.
  */
+/** Where hosted Claude conversations are recorded (`hostedClaude`); a seam for tests. */
+type Conversations = Pick<ReturnType<typeof createHostedClaudeStore>, "byTerminal" | "ended" | "forget">;
+
 function listDetached(
   listing: TerminalListing,
   family: string | null,
   take: (record: TerminalSessionRecord) => Slot,
-  deps: { invoke: Invoke; confirm: Confirm; bus: PtyBus },
+  deps: { invoke: Invoke; confirm: Confirm; bus: PtyBus; conversations?: Conversations },
 ): void {
   const { invoke, confirm, bus } = deps;
+  const conversations = deps.conversations ?? hostedClaude;
+  /**
+   * The end of this process settles its Claude conversation's record, as the
+   * tab that ran it would have (`settleConversation`): a Stop or a clean end
+   * forgets it, a signal from outside keeps it for an incident's "Resume N".
+   * Showing it again does not end anything and settles nothing.
+   */
+  function settle(end: ExitFacts | "closed") {
+    const record = conversations.byTerminal(listing.id);
+    if (record) settleConversation(conversations, record.sessionId, end);
+  }
   const launcher = launcherOf(listing);
   const key = `${KEY_PREFIX}${listing.id}`;
   const label = launcherLabel(launcher);
@@ -125,6 +140,7 @@ function listDetached(
     sessionId: listing.id,
     async close() {
       await invoke("cmd_terminal_kill", { sessionId: listing.id });
+      settle("closed");
       drop();
     },
     confirmClose: () => confirm({ ...stopQuestion(listing, label), confirmLabel: "Stop", destructive: true }),
@@ -151,7 +167,13 @@ function listDetached(
     slot?.release(); slot = null;
   }
   slot.identify(listing.id);
-  unsubscribe = bus.subscribe(listing.id, { onOutput() {}, onExit: drop });
+  unsubscribe = bus.subscribe(listing.id, {
+    onOutput() {},
+    onExit(event) {
+      settle(event);
+      drop();
+    },
+  });
 }
 
 /**
@@ -163,12 +185,13 @@ function listDetached(
 export function keepDetached(
   listing: TerminalListing,
   slot: Slot,
-  deps: { invoke?: Invoke; confirm?: Confirm; bus?: PtyBus; family?: string | null } = {},
+  deps: { invoke?: Invoke; confirm?: Confirm; bus?: PtyBus; family?: string | null; conversations?: Conversations } = {},
 ): void {
   listDetached(listing, deps.family ?? null, (record) => slot.handOver(record), {
     invoke: deps.invoke ?? (tauriInvoke as Invoke),
     confirm: deps.confirm ?? askConfirm,
     bus: deps.bus ?? tauriBus,
+    ...(deps.conversations ? { conversations: deps.conversations } : {}),
   });
 }
 
