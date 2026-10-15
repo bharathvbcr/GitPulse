@@ -9810,6 +9810,132 @@ mod tests {
         assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 
+    /// A child that floods stdout and, once asked to stop, writes a large
+    /// cleanup burst before releasing its marker. The marker is only removed
+    /// if the run keeps reading its pipes while the child is being asked.
+    #[cfg(unix)]
+    const GRACE_FLOODER: &str = r#"
+        trap 'head -c 200000 /dev/zero; echo cleaned >&2; rm -f "$1"; exit 0' TERM
+        touch "$1"
+        while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
+    "#;
+
+    #[cfg(unix)]
+    fn grace_flooder(script: &str, marker: &Path) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).arg("sh").arg(marker);
+        cmd
+    }
+
+    /// R2-02: the grace after a deadline reads the pipes, so a child blocked
+    /// on a full pipe can run its SIGTERM cleanup instead of being killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_grace_keeps_draining_so_cleanup_after_sigterm_completes() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let run = run_bounded(
+            grace_flooder(GRACE_FLOODER, &marker),
+            "flooder",
+            Duration::from_millis(600),
+            None,
+        )
+        .expect("a deadline keeps its prefix");
+        assert!(
+            !marker.exists(),
+            "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cleaned"),
+            "the cleanup line was not read: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(!run.success, "a deadline is never success");
+        assert!(!run.cancelled);
+        assert!(
+            matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+            "{:?}",
+            run.incomplete
+        );
+    }
+
+    /// R2-02, cancel path: the same shape, reached through the observer.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_grace_keeps_draining_so_cleanup_after_sigterm_completes() {
+        struct CancelOnceStarted(PathBuf);
+        impl ProcessObserver for CancelOnceStarted {
+            fn cancelled(&self) -> bool {
+                self.0.exists()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let mut observer = CancelOnceStarted(marker.clone());
+        let mut cmd = grace_flooder(GRACE_FLOODER, &marker);
+        let run = run_observed(
+            &mut cmd,
+            "flooder",
+            Duration::from_secs(20),
+            None,
+            MAX_OUTPUT_BYTES,
+            &mut observer,
+        )
+        .expect("a cancel returns the run");
+        assert!(run.cancelled);
+        assert!(!run.success);
+        assert!(
+            !marker.exists(),
+            "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cleaned"),
+            "the cleanup line was not read: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// R2-02: a child that ignores the ask is still killed once the grace is
+    /// spent, however much it writes meanwhile, and what it wrote while being
+    /// asked is read. The ask is observed (the trap runs) only because the
+    /// pipes are drained.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_at_the_end_of_a_drained_grace() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let script = r#"
+            trap 'head -c 200000 /dev/zero; echo term-seen >&2' TERM
+            touch "$1"
+            while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
+        "#;
+        let started = Instant::now();
+        let run = run_bounded(
+            grace_flooder(script, &marker),
+            "stubborn",
+            Duration::from_millis(300),
+            None,
+        )
+        .expect("a deadline keeps its prefix");
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(
+                    Duration::from_millis(300) + Duration::from_secs(2)
+                ),
+            "the grace must stay bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
+        assert!(!run.success);
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("term-seen"),
+            "the trap could not run while the pipe was full: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn audit_observer_cancellation_preserves_progress_and_kills_child() {
