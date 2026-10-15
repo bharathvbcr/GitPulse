@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { discardedMutations, mutationNames, scanSvelte, scanTypeScript, untargetedAfterPrompt } from "./mutationScan";
+import { directMutatingInvokes, directMutatingInvokesSvelte, discardedMutations, mutatingCommands, mutationNames, scanSvelte, scanTypeScript, untargetedAfterPrompt } from "./mutationScan";
 import { svelteFiles, tsSourceFiles } from "./sourceScan";
 
 /**
@@ -160,10 +160,109 @@ describe("components never drop a mutation outcome", () => {
     ];
     const at = (file: string, line: number) => `${relative(SRC, file)}:${line}`;
     expect(scans.flatMap(({ file, discarded }) => discarded.map((line) => at(file, line)))).toEqual([]);
-    // The palette guards its post-prompt calls with `checkOrigin` instead of a
-    // target (catalog.ts); moving it onto a target is a recorded follow-up, so
-    // the target rule covers the components this card converted.
-    const covered = scans.filter(({ file }) => !relative(SRC, file).startsWith(join("lib", "palette")));
-    expect(covered.flatMap(({ file, untargeted }) => untargeted.map((line) => at(file, line)))).toEqual([]);
+    // The palette is held to the target rule like every component: its
+    // post-prompt calls name the repository the palette was built for.
+    expect(scans.flatMap(({ file, untargeted }) => untargeted.map((line) => at(file, line)))).toEqual([]);
+  }, 60_000);
+});
+
+describe("components never send a mutating command themselves", () => {
+  const commands = mutatingCommands(STORE_SOURCE);
+
+  it("derives the commands from the store's mutations", () => {
+    for (const routed of [
+      "cmd_prune_worktree",
+      "cmd_worktree_cow_sync",
+      "cmd_move_path",
+      "cmd_delete_path",
+      "cmd_create_file",
+      "cmd_deadbranch_clean",
+      "cmd_deadbranch_restore",
+      "cmd_discard_changes",
+      "cmd_push",
+    ]) {
+      expect(commands.has(routed), routed).toBe(true);
+    }
+    for (const read of ["cmd_list_worktrees", "cmd_deadbranch_scan", "cmd_list_repo_files", "cmd_get_status"]) {
+      expect(commands.has(read), read).toBe(false);
+    }
   });
+
+  it("flags a planted direct invoke, however it is spelled", () => {
+    expect(directMutatingInvokes('await invoke("cmd_prune_worktree", { repoPath });', commands)).toEqual([1]);
+    expect(directMutatingInvokes('const r = await invoke<Guarded<null>>("cmd_move_path", { repoPath, from, to });', commands)).toEqual([1]);
+    expect(directMutatingInvokes("const go = safeInvoke;\nawait go(`cmd_delete_path`, { repoPath, path });", commands)).toEqual([2]);
+    expect(directMutatingInvokes('await tauri.core.invoke("cmd_create_file", {});', commands)).toEqual([1]);
+    expect(directMutatingInvokes('await invoke("cmd_list_worktrees", { repoPath });', commands)).toEqual([]);
+    expect(directMutatingInvokes('// await invoke("cmd_prune_worktree");\nconst s = "cmd_prune_worktree";', commands)).toEqual([]);
+  });
+
+  it("flags a planted direct invoke in a component's script and in its markup", () => {
+    const script = '<script lang="ts">\n  import { invoke } from "../ipc/invoke";\n  async function prune() {\n    await invoke("cmd_prune_worktree", { repoPath: "/r" });\n  }\n</script>\n<button onclick={prune}>Prune</button>';
+    expect(directMutatingInvokesSvelte(script, commands)).toEqual([4]);
+    const markup = '<script lang="ts">\n  import { invoke } from "../ipc/invoke";\n</script>\n<button onclick={() => invoke("cmd_delete_path", { repoPath: "/r", path: "a" })}>Delete</button>';
+    expect(directMutatingInvokesSvelte(markup, commands)).toEqual([4]);
+    expect(directMutatingInvokesSvelte('<script lang="ts">\n  const n = 1;\n</script>', commands)).toEqual([]);
+  });
+
+  it("reads a command name held in a same-file constant, or built from a cmd_ prefix", () => {
+    expect(directMutatingInvokes('const PRUNE = "cmd_prune_worktree";\nawait invoke(PRUNE, { repoPath });', commands)).toEqual([2]);
+    expect(directMutatingInvokes('const PRUNE = `cmd_prune_worktree` as const;\nawait invoke(PRUNE);', commands)).toEqual([2]);
+    expect(directMutatingInvokes('await invoke("cmd_" + verb, { repoPath });', commands)).toEqual([1]);
+    expect(directMutatingInvokes("await invoke(`cmd_${verb}`, { repoPath });", commands)).toEqual([1]);
+    expect(directMutatingInvokes('await invoke("cmd_list_" + what, { repoPath });', commands)).toEqual([]);
+    expect(directMutatingInvokes('const READ = "cmd_list_worktrees";\nawait invoke(READ);', commands)).toEqual([]);
+  });
+
+  it("flags an invoke whose command cannot be read, through every spelling of the bridge", () => {
+    expect(directMutatingInvokes('import { invoke as call } from "@tauri-apps/api/core";\nawait call(cmdName, {});', commands)).toEqual([2]);
+    expect(directMutatingInvokes('import { invoke } from "../ipc/invoke";\nawait invoke(cmdName, {});', commands)).toEqual([2]);
+    expect(directMutatingInvokes("await window.__TAURI__.core.invoke(cmdName, {});", commands)).toEqual([1]);
+    expect(directMutatingInvokes('await window.__TAURI__.core["invoke"](cmdName, {});', commands)).toEqual([1]);
+    expect(directMutatingInvokes('const { invoke: go } = await import("@tauri-apps/api/core");\nawait go(cmdName);', commands)).toEqual([2]);
+    expect(directMutatingInvokes('const m = await import("../ipc/invoke");\nawait m.invoke(cmdName);', commands)).toEqual([2]);
+    expect(directMutatingInvokes("const call = window.__TAURI__.core.invoke;\nawait call(cmdName);", commands)).toEqual([2]);
+    // A call that is not the bridge is not read for a command it cannot name.
+    expect(directMutatingInvokes("await save(fileName, {});", commands)).toEqual([]);
+  });
+
+  it("reads a component whose script holds the command and whose markup sends it", () => {
+    const held = '<script lang="ts">\n  import { invoke as call } from "../ipc/invoke";\n  const PRUNE = "cmd_prune_worktree";\n</script>\n<button onclick={() => call(PRUNE, {})}>Prune</button>';
+    expect(directMutatingInvokesSvelte(held, commands)).toEqual([5]);
+    const unread = '<script lang="ts">\n  import { invoke } from "../ipc/invoke";\n  let name = $state("x");\n</script>\n<button onclick={() => invoke(name)}>Go</button>';
+    expect(directMutatingInvokesSvelte(unread, commands)).toEqual([5]);
+    expect(directMutatingInvokesSvelte('<script lang="ts">\n  import { listen } from "@tauri-apps/api/event";\n  listen(EVENT, () => {});\n</script>', commands)).toEqual([]);
+  });
+
+  it("reads a command named in any argument, not only the first", () => {
+    expect(directMutatingInvokes('await sendWithRetry(3, "cmd_push", { repoPath });', commands)).toEqual([1]);
+  });
+
+  it("cannot see a mutating command the store does not send, and says so", () => {
+    // The scanner's set is the store's. These are sent from WorktreesPanel
+    // itself; until the store owns them they are invisible here by design.
+    for (const outside of ["cmd_add_worktree", "cmd_remove_worktree", "cmd_lock_worktree", "cmd_unlock_worktree", "cmd_merge_and_teardown"]) {
+      expect(commands.has(outside), outside).toBe(false);
+    }
+  });
+
+  it("holds for every production module under src/lib, except the known unrouted ones", () => {
+    const owners = new Set([join(SRC, "lib", "stores", "repoStore.ts")]);
+    const hits = tsSourceFiles(join(SRC, "lib"))
+      .filter((file) => !owners.has(file))
+      .flatMap((file) => directMutatingInvokes(readFileSync(file, "utf8"), commands).map((line) => `${relative(SRC, file)}:${line}`));
+    // attemptWorktree deletes the agent branch with a direct cmd_delete_branch:
+    // a known bypass outside the scanned component dirs, left for its own task.
+    expect(hits.map((hit) => hit.replace(/:\d+$/, ""))).toEqual(["lib/workbench/attemptWorktree.ts"]);
+  }, 60_000);
+
+  it("holds for every component and palette module", () => {
+    const files = [
+      ...svelteFiles(SRC).map((file) => ({ file, lines: directMutatingInvokesSvelte(readFileSync(file, "utf8"), commands) })),
+      ...[join(SRC, "lib", "components"), join(SRC, "lib", "palette")]
+        .flatMap(tsSourceFiles)
+        .map((file) => ({ file, lines: directMutatingInvokes(readFileSync(file, "utf8"), commands) })),
+    ];
+    expect(files.flatMap(({ file, lines }) => lines.map((line) => `${relative(SRC, file)}:${line}`))).toEqual([]);
+  }, 60_000);
 });

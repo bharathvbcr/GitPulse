@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { functionBody } from "../../stores/sourceScan";
 import { compile } from "svelte/compiler";
@@ -43,7 +45,13 @@ describe("FileTreePanel source contracts", () => {
    * explorer.
    */
   it("creates through the create-only command and never the overwrite one", () => {
-    expect(source).toContain('"cmd_create_file"');
+    // The store owns the command; the panel asks it to create and reads the
+    // typed refusal off the outcome.
+    const store = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "stores", "repoStore.ts"), "utf8");
+    expect(store).toContain('"cmd_create_file"');
+    expect(store).not.toContain("cmd_write_file_content");
+    expect(source).toContain("repoStore.createFile(path, target)");
+    expect(source).not.toContain("cmd_create_file");
     expect(source).not.toContain("cmd_write_file_content");
     expect(source).toContain("validate: (value) => newPathProblem(");
     expect(source).toContain('typedError?.code === "already_exists"');

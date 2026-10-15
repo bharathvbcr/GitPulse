@@ -10,6 +10,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { repoScope } from "../repos/repoScope.svelte";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     FolderGit2,
@@ -319,17 +320,16 @@
   }
 
   async function prune() {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
+    // The repository the click was made in, held across the queue.
+    const target = repoStore.captureTarget();
+    if (!target) return;
     const epoch = tabScope.epoch;
-    try {
-      await invoke("cmd_prune_worktree", { repoPath: repo });
-      if (!tabScope.isCurrent(epoch)) return;
-      await load();
-    } catch (err: unknown) {
-      const message = reportPanelError("worktrees", err);
-      if (tabScope.isCurrent(epoch)) error = message;
-    }
+    const outcome = await repoStore.pruneWorktrees(target);
+    if (!reportFailure(outcome, "Could not prune worktrees")) return;
+    // `load()` reads the ACTIVE repository; after a switch that is not the
+    // one this prune was for.
+    if (!tabScope.isCurrent(epoch)) return;
+    await load();
   }
 
   async function create() {
@@ -539,17 +539,13 @@
   }
 
   async function syncCowCaches(wt: WorktreeInfo) {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
+    const target = repoStore.captureTarget();
+    if (!target) return;
     const epoch = tabScope.epoch;
-    try {
-      await invoke("cmd_worktree_cow_sync", { repoPath: repo, targetPath: wt.path });
-      if (!tabScope.isCurrent(epoch)) return;
-      await load();
-    } catch (err: unknown) {
-      const message = reportPanelError("worktrees", err);
-      if (tabScope.isCurrent(epoch)) error = message;
-    }
+    const outcome = await repoStore.worktreeCowSync(wt.path, target);
+    if (!reportFailure(outcome, "Could not sync the build cache")) return;
+    if (!tabScope.isCurrent(epoch)) return;
+    await load();
   }
 
   async function refreshRoutes(wt: WorktreeInfo) {

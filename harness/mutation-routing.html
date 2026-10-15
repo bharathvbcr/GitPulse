@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mutation routing checks</title>
+<style>body{margin:0}#host{width:360px;padding:8px}#result{position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100;white-space:pre}</style></head>
+<body><div id="host"></div><div id="toasts"></div><pre id="result"></pre>
+<script type="module">
+/**
+ * Worktree prune and cache sync, and branch cleanup, driven through the real
+ * components against fixture IPC.
+ *
+ * What these settle is the repoStore mutation contract (ft-1629347b) for the
+ * paths that sat outside it: each one is counted by the quit guard while it is
+ * queued or running, runs one at a time per repository, lands in the policy
+ * journal, says a failure once, and — for the cleanup dialog — acts only on the
+ * repository whose branches it is showing.
+ * Nothing here executes git.
+ */
+import "../src/app.css";
+import { mockIPCWithEvents } from "./tauriMocks";
+import { createChecks } from "./checks.ts";
+
+const errors = [];
+addEventListener("error", event => errors.push(event.message));
+addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+const A = "/fixture/mr-a", B = "/fixture/mr-b";
+const unexpected = [];
+/** Every invoke of a mutating command, in order, with the repository it named. */
+const sent = [];
+/** `held[cmd]` parks that command until its release function is called. */
+const held = {};
+const hold = cmd => { held[cmd] = []; };
+const releaseAll = (cmd, value) => { const parked = held[cmd] ?? []; delete held[cmd]; parked.forEach(release => release(value)); };
+const failNext = {};
+const parkIfHeld = async cmd => { if (held[cmd]) await new Promise(resolve => held[cmd].push(resolve)); };
+const branchOf = name => ({ name, short_name: name, age_days: 90, severity: "stale", is_merged: true, merged_by_tree: false, is_remote: false, is_protected: false, is_wip: false, is_current_or_worktree: false, last_commit_sha: "a".repeat(40), last_commit_timestamp: 0, last_author: "Ada", last_summary: "old work" });
+const scanFor = repo => ({ default_branch: "main", branches: [branchOf(repo === A ? "stale/from-a" : "stale/from-b")], total_scanned: 1, stale_count: 1, merged_count: 1, squash_merged_count: 0, warnings: [] });
+const backupsFor = repo => [{ filename: `${repo === A ? "a" : "b"}.json`, path: `${repo}/.backup/1.json`, timestamp: 1700000000, branch_count: 1, repo_name: repo }];
+const guarded = output => ({ policy: null, output });
+mockIPCWithEvents(async (cmd, args) => {
+  switch (cmd) {
+    case "cmd_resolve_repo": return { path: args.repoPath ?? args.path, name: "repo", is_bare: false };
+    case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: "a".repeat(40), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
+    case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": case "cmd_list_repo_files": return [];
+    case "cmd_stash_list": return { entries: [], truncated: false };
+    case "cmd_list_tags": return { tags: [], truncated: false };
+    case "cmd_branch_stats": return {};
+    case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_watch_repo": case "cmd_unwatch_repo": case "cmd_note_tab_activated": case "cmd_last_fetch_at": case "cmd_set_recent_menu": return null;
+    case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
+    case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
+    case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
+    case "cmd_task_view": return { available: false, store_path: "", leases: [], error: "" };
+    case "cmd_worktree_task": return null;
+    case "cmd_list_worktrees": return [
+      { path: args.repoPath, name: "main", branch: "main", head: "f".repeat(40), is_main: true, is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 0 },
+      { path: `${args.repoPath}/.claude/worktrees/lane`, name: "lane", branch: "claude/lane", head: "b".repeat(40), is_main: false, is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 0 },
+    ];
+    case "cmd_prune_worktree": case "cmd_worktree_cow_sync": case "cmd_deadbranch_clean": case "cmd_deadbranch_restore": {
+      sent.push({ cmd, repoPath: args.repoPath, ...args });
+      await parkIfHeld(cmd);
+      if (failNext[cmd]) { delete failNext[cmd]; throw new Error(`${cmd} refused by fixture`); }
+      if (cmd === "cmd_deadbranch_clean") return guarded({ deleted: args.branches, failed: [], backup_path: args.createBackup ? `${args.repoPath}/.backup/new.json` : null, message: "Cleaned" });
+      if (cmd === "cmd_deadbranch_restore") return guarded({ restored: ["stale/from-a"], failed: [], message: "Restored" });
+      return guarded(null);
+    }
+    case "cmd_deadbranch_scan": await parkIfHeld(`scan:${args.repoPath}`); return scanFor(args.repoPath);
+    case "cmd_deadbranch_list_backups": await parkIfHeld(`backups:${args.repoPath}`); return backupsFor(args.repoPath);
+    default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
+  }
+});
+const { mount, tick } = await import("svelte");
+const { get } = await import("svelte/store");
+const { repoStore } = await import("../src/lib/stores/repoStore");
+const { harnessStore } = await import("../src/lib/stores/harnessStore");
+const { toastStore } = await import("../src/lib/stores/toastStore");
+const { gitActionCount } = await import("../src/lib/desktop/exitGuard");
+const WorktreesPanel = (await import("../src/lib/components/WorktreesPanel.svelte")).default;
+const BranchCleanupModal = (await import("../src/lib/components/BranchCleanupModal.svelte")).default;
+const ToastContainer = (await import("../src/lib/components/ToastContainer.svelte")).default;
+const { results, check, stopped } = createChecks();
+const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
+const until = async (test, label) => { const end = Date.now() + 8000; while (!test() && Date.now() < end) await wait(); if (!test()) throw new Error("Timed out: " + label); };
+const host = document.getElementById("host");
+const button = label => [...document.querySelectorAll("button")].find(b => b.getAttribute("aria-label") === label || b.textContent.trim().startsWith(label));
+const busy = () => gitActionCount(get(repoStore.mutationActivity));
+const journal = () => get(harnessStore).actions;
+const ownedBy = (entry, repo) => JSON.parse(entry.identity)[1] === repo;
+const tabId = path => get(repoStore).openTabs.find(tab => tab.path === path)?.id;
+const toasts = () => get(toastStore).map(t => `${t.kind}: ${t.message}`);
+const sentTo = cmd => sent.filter(s => s.cmd === cmd);
+
+(async () => { try {
+  await repoStore.openRepo(A);
+  await repoStore.openRepo(B);
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  mount(ToastContainer, { target: document.getElementById("toasts") });
+  const wtHost = document.createElement("div");
+  host.append(wtHost);
+  mount(WorktreesPanel, { target: wtHost });
+  await until(() => button("Sync build cache"), "worktree rows");
+
+  // --- prune -----------------------------------------------------------------
+  hold("cmd_prune_worktree");
+  button("Prune stale worktree metadata").click();
+  await until(() => sentTo("cmd_prune_worktree").length === 1, "prune sent");
+  check("a pending prune is counted by the quit guard", () => busy() === 1);
+  check("and it names the repository the click was made in", () => sentTo("cmd_prune_worktree")[0].repoPath === A);
+  button("Prune stale worktree metadata").click();
+  await wait(150);
+  check("a second click queues behind the first instead of running beside it", () => sentTo("cmd_prune_worktree").length === 1 && busy() === 2);
+  releaseAll("cmd_prune_worktree");
+  await until(() => sentTo("cmd_prune_worktree").length === 2, "queued prune runs after the first");
+  await until(() => busy() === 0, "prune settled");
+  check("both prunes ran, one at a time, and the quit guard is idle again", () => sentTo("cmd_prune_worktree").length === 2 && busy() === 0);
+  check("each prune is in the policy journal for its repository", () => journal().filter(a => /prune/.test(a.kind) && a.ok && ownedBy(a, A)).length === 2);
+
+  // --- cache sync: a failure is said once and journalled ---------------------------
+  failNext.cmd_worktree_cow_sync = true;
+  button("Sync build cache").click();
+  await until(() => sentTo("cmd_worktree_cow_sync").length === 1, "cow sync sent");
+  await until(() => busy() === 0, "cow sync settled");
+  await wait(150);
+  check("a refused cache sync is journalled as failed", () => journal().some(a => /cow/.test(a.kind) && a.ok === false && ownedBy(a, A)));
+  check("and its failure is shown once: on the session banner the app toasts from, or as a toast, not both", () => toasts().filter(t => t.startsWith("error") && /refused by fixture/.test(t)).length + (/refused by fixture/.test(get(repoStore).error ?? "") ? 1 : 0) === 1);
+  button("Sync build cache").click();
+  await until(() => sentTo("cmd_worktree_cow_sync").length === 2, "second cow sync sent");
+  await until(() => busy() === 0, "second cow sync settled");
+  check("a successful cache sync is journalled as done", () => journal().some(a => /cow/.test(a.kind) && a.ok === true && ownedBy(a, A)));
+
+  // --- a pending cache sync, and a tab switch while one is queued ---------------------
+  hold("cmd_worktree_cow_sync");
+  button("Sync build cache").click();
+  await until(() => sentTo("cmd_worktree_cow_sync").length === 3, "held cow sync sent");
+  check("a pending cache sync is counted by the quit guard", () => busy() === 1);
+  check("and it names the worktree's own repository and the worktree", () => sentTo("cmd_worktree_cow_sync")[2].repoPath === A && sentTo("cmd_worktree_cow_sync")[2].targetPath === `${A}/.claude/worktrees/lane`);
+  button("Sync build cache").click();
+  hold("cmd_prune_worktree");
+  button("Prune stale worktree metadata").click();
+  await wait(100);
+  await repoStore.activateTab(tabId(B));
+  harnessStore.activateRepository(B);
+  releaseAll("cmd_worktree_cow_sync");
+  await until(() => sentTo("cmd_worktree_cow_sync").length === 4 && sentTo("cmd_prune_worktree").length === 3, "queued work drained");
+  check("work queued in A and released after switching to B still runs in A, never B", () => sent.filter(s => s.repoPath === B).length === 0);
+  releaseAll("cmd_prune_worktree");
+  await until(() => busy() === 0, "queued work settled");
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  await wait(100);
+  check("and the quit guard is idle once it has", () => busy() === 0);
+
+  // --- branch cleanup: acts only on the repository whose branches it shows ----------
+  const modalHost = document.createElement("div");
+  host.append(modalHost);
+  mount(BranchCleanupModal, { target: modalHost, props: { isOpen: true } });
+  await until(() => button("Clean Selected (1)"), "scan of A shown");
+  hold(`scan:${B}`);
+  await repoStore.openRepo(B);
+  await wait(200);
+  check("the dialog still offers A's selection while B's scan is out", () => Boolean(button("Clean Selected (1)")));
+  button("Clean Selected (1)").click();
+  await wait(300);
+  check("Clean sends nothing: the branches shown belong to a repository that is no longer in front", () => sentTo("cmd_deadbranch_clean").length === 0);
+  check("and says the repository changed", () => toasts().some(t => t.startsWith("error") && /repository changed/.test(t)));
+  releaseAll(`scan:${B}`);
+  await until(() => document.body.textContent.includes("stale/from-b"), "B's scan lands");
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  await until(() => document.body.textContent.includes("stale/from-a") && button("Clean Selected (1)"), "A rescanned");
+
+  hold("cmd_deadbranch_clean");
+  button("Clean Selected (1)").click();
+  await until(() => sentTo("cmd_deadbranch_clean").length === 1, "clean sent");
+  check("a pending clean is counted by the quit guard and names A", () => busy() === 1 && sentTo("cmd_deadbranch_clean")[0].repoPath === A);
+  check("and sends the branches shown, with the backup on and force off as the dialog had them", () => JSON.stringify(sentTo("cmd_deadbranch_clean")[0].branches) === '["stale/from-a"]' && sentTo("cmd_deadbranch_clean")[0].force === false && sentTo("cmd_deadbranch_clean")[0].createBackup === true);
+  check("a second click while it runs sends nothing more", () => { button("Cleaning...")?.click(); return sentTo("cmd_deadbranch_clean").length === 1; });
+  releaseAll("cmd_deadbranch_clean");
+  await until(() => busy() === 0, "clean settled");
+  check("the clean is in the policy journal for A", () => journal().some(a => /clean/.test(a.kind) && a.ok && ownedBy(a, A)));
+
+  // --- restore after a repository switch -----------------------------------------------
+  [...document.querySelectorAll("button")].find(b => b.textContent.includes("Backups")).click();
+  await until(() => button("Restore All"), "A's backups listed");
+  hold(`backups:${B}`);
+  await repoStore.openRepo(B);
+  await wait(200);
+  button("Restore All").click();
+  await wait(300);
+  check("Restore sends nothing for a backup that belongs to the repository left behind", () => sentTo("cmd_deadbranch_restore").length === 0);
+  check("and says the repository changed", () => toasts().filter(t => t.startsWith("error") && /Could not restore/.test(t) && /repository changed/.test(t)).length === 1);
+  releaseAll(`backups:${B}`);
+  await until(() => document.body.textContent.includes("b.json"), "B's backups land");
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  await until(() => document.body.textContent.includes("a.json") && button("Restore All"), "A's backups back");
+  button("Restore All").click();
+  await until(() => sentTo("cmd_deadbranch_restore").length === 1, "restore sent");
+  await until(() => busy() === 0, "restore settled");
+  check("a restore in the repository that listed the backup runs there", () => sentTo("cmd_deadbranch_restore")[0].repoPath === A && sentTo("cmd_deadbranch_restore")[0].backupPath === `${A}/.backup/1.json`);
+  check("and is journalled", () => journal().some(a => /restore/.test(a.kind) && a.ok && ownedBy(a, A)));
+  check("a refused clean or restore is not journalled: nothing ran", () => journal().filter(a => /deadbranch/.test(a.kind)).length === 2);
+
+  // --- a clean that finishes after the repository changed ---------------------------------
+  [...document.querySelectorAll("button")].find(b => b.textContent.includes("Scan & Clean")).click();
+  await until(() => button("Clean Selected (1)"), "A's list back on the clean tab");
+  hold("cmd_deadbranch_clean");
+  button("Clean Selected (1)").click();
+  await until(() => sentTo("cmd_deadbranch_clean").length === 2, "second clean sent");
+  await repoStore.activateTab(tabId(B));
+  harnessStore.activateRepository(B);
+  await until(() => document.body.textContent.includes("stale/from-b"), "B's list shown");
+  releaseAll("cmd_deadbranch_clean");
+  await until(() => busy() === 0, "second clean settled");
+  await wait(200);
+  check("A's clean result is not drawn over B's list", () => !host.textContent.includes("Cleaned"));
+  check("and B's list cannot offer to restore A's backup into B", () => !button("Undo / Restore Branches") && sentTo("cmd_deadbranch_restore").length === 1);
+  check("the result still reaches the user, naming A", () => toasts().some(t => /mr-a/.test(t) && /Cleaned/.test(t)));
+
+  check("No unexpected commands", () => unexpected.length === 0);
+  check("No unhandled runtime errors", () => errors.length === 0);
+} catch (error) { stopped(error); }
+  document.getElementById("result").textContent = results.map(r => (r.pass ? "ok   " : "FAIL ") + r.name).join("\n");
+  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected }));
+  const reportPath = new URLSearchParams(location.search).get("report");
+  if (reportPath?.startsWith("/__gp_result/")) await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+})();
+</script></body></html>

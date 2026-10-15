@@ -38,7 +38,12 @@ describe("WorktreesPanel agent worktree affordances", () => {
   it("exposes lock, unlock, and prune commands", () => {
     expect(source).toContain("cmd_lock_worktree");
     expect(source).toContain("cmd_unlock_worktree");
-    expect(source).toContain("cmd_prune_worktree");
+    // Prune and cache sync are repoStore mutations: the store owns the command
+    // (repoStore.test.ts) and the contract test keeps the panel from sending it.
+    expect(source).toContain("repoStore.pruneWorktrees(target)");
+    expect(source).toContain("repoStore.worktreeCowSync(wt.path, target)");
+    expect(source).not.toContain("cmd_prune_worktree");
+    expect(source).not.toContain("cmd_worktree_cow_sync");
     expect(source).not.toContain("expire:");
   });
 

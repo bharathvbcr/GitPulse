@@ -1,6 +1,6 @@
 import { get } from "svelte/store";
 import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
-import { repoStore, type RepoState } from "../stores/repoStore";
+import { repoStore, type MutationTarget, type RepoState } from "../stores/repoStore";
 import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
 import { askText } from "../stores/modalStore";
@@ -35,8 +35,12 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
   const unavailable = repoUnavailable(state);
   const worktree = worktreeUnavailable(state);
   const active = state.openTabs.find(tab => tab.isActive);
+  // The repository this palette was built for. Every command that mutates it
+  // passes this to the store, which runs there or refuses; a command that does
+  // not go through the store (the terminal launch) checks it with `checkOrigin`.
+  const target: MutationTarget | null = state.activeTabId && state.currentPath ? { tabId: state.activeTabId, path: state.currentPath } : null;
   const checkOrigin = () => {
-    if (get(repoStore).activeTabId !== state.activeTabId || get(repoStore).currentPath !== state.currentPath) {
+    if (!repoStore.targetIsActive(target)) {
       throw Error("The active repository changed. Run the command again in the intended repository.");
     }
   };
@@ -99,25 +103,23 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "new_branch", label: "Create New Branch…", category: "Git actions", icon: Plus, closeBefore: true, disabledReason: worktree, action: async () => {
       const name = await askText({ title: "Create New Branch", message: "New branch name", placeholder: "feat/name", confirmLabel: "Create" });
       if (!name?.trim()) return { ok: false };
-      checkOrigin();
-      return repoStore.createBranch(name.trim());
+      return repoStore.createBranch(name.trim(), undefined, target);
     } },
     { id: "rename_branch", label: "Rename Current Branch…", description: state.currentBranch ?? "Detached HEAD", category: "Git actions", icon: GitBranch, closeBefore: true, disabledReason: worktree ?? (!state.currentBranch ? "Check out a local branch first." : undefined), action: async () => {
       const current = state.currentBranch;
       if (!current) return { ok: false };
       const name = await askText({ title: "Rename branch", message: current, initialValue: current, confirmLabel: "Rename" });
       if (!name?.trim() || name.trim() === current) return { ok: false };
-      checkOrigin();
-      return repoStore.renameBranch(current, name.trim());
+      return repoStore.renameBranch(current, name.trim(), target);
     } },
-    { id: "fetch", label: "Fetch All Remotes", category: "Git actions", icon: Download, disabledReason: unavailable, action: () => repoStore.fetch() },
-    { id: "pull", label: "Pull (fast-forward)", category: "Git actions", icon: Download, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.pull() },
-    { id: "pull-rebase", label: "Pull (rebase local commits)", description: "git pull --rebase: replay your unpushed commits on top of the upstream instead of merging", category: "Git actions", icon: Download, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.pull(undefined, undefined, true) },
-    { id: "push", label: "Push Current Branch", category: "Git actions", icon: Upload, disabledReason: unavailable ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.push() },
+    { id: "fetch", label: "Fetch All Remotes", category: "Git actions", icon: Download, disabledReason: unavailable, action: () => repoStore.fetch(undefined, target) },
+    { id: "pull", label: "Pull (fast-forward)", category: "Git actions", icon: Download, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.pull(undefined, undefined, undefined, target) },
+    { id: "pull-rebase", label: "Pull (rebase local commits)", description: "git pull --rebase: replay your unpushed commits on top of the upstream instead of merging", category: "Git actions", icon: Download, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.pull(undefined, undefined, true, target) },
+    { id: "push", label: "Push Current Branch", category: "Git actions", icon: Upload, disabledReason: unavailable ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.push(undefined, undefined, false, target) },
     { id: "rebase", label: "Interactive Rebase…", description: "Open the rebase planner to review commits before applying changes", category: "Git actions", icon: GitBranch, closeBefore: true, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : !host.onRebase ? "The rebase planner is unavailable in this window." : undefined), action: () => host.onRebase?.() },
     { id: "clean_branches", label: "Clean Stale / Dead Branches…", description: "Identify and safely prune merged and stale branches with deadbranch", category: "Git actions", icon: Trash2, closeBefore: true, disabledReason: unavailable, action: () => dispatch("gitpulse:branch-cleanup") },
-    { id: "stash", label: "Stash Working Tree", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.statuses.length ? undefined : "The working tree is clean."), action: () => repoStore.stashSave() },
-    { id: "stash_pop", label: "Pop Stash", description: state.stashEntries[0]?.subject ?? "Apply and remove the latest stash", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.stashFailed ? "Stash status is unavailable. Refresh first." : !state.stashEntries.length ? "No stash entries in this repository." : undefined), action: () => repoStore.stashPop() },
+    { id: "stash", label: "Stash Working Tree", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.statuses.length ? undefined : "The working tree is clean."), action: () => repoStore.stashSave(undefined, undefined, target) },
+    { id: "stash_pop", label: "Pop Stash", description: state.stashEntries[0]?.subject ?? "Apply and remove the latest stash", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.stashFailed ? "Stash status is unavailable. Refresh first." : !state.stashEntries.length ? "No stash entries in this repository." : undefined), action: () => repoStore.stashPop(target) },
     ...views,
     ...PALETTE_MODES.filter(entry => entry.mode !== "commands").map(entry => ({ id: `search:${entry.mode}`, label: `Search ${entry.label}`, description: entry.hint, category: "Search", icon: Search, keepOpen: true, action: () => changeMode(entry.mode) })),
     { id: "close_tab", label: "Close Repository Tab", category: "Repositories", icon: X, shortcut: "⌘⇧W", disabledReason: unavailable, action: () => repoStore.closeActiveTab() },

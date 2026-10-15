@@ -16,7 +16,11 @@ vi.mock("../tools/onboardingStore", () => ({ openSetupWizard: vi.fn() }));
 vi.mock("../commit/quickCommit", () => ({ promptQuickCommit: vi.fn().mockResolvedValue({ ok: true }) }));
 
 const snapshot = (patch: Partial<RepoState> = {}): RepoState => ({ ...get(repoStore), ...patch });
-const ready = () => snapshot({ currentPath: "/repo", currentBranch: "main", isLoading: false, isBare: false, operation: { operation: null, probeFailed: false } });
+const TARGET = { tabId: "tab-1", path: "/repo" };
+// The store answers whether a target is still in front; these tests drive the
+// published state by hand, so the answer is read from it.
+const inFront = () => vi.spyOn(repoStore, "targetIsActive").mockImplementation(target => Boolean(target) && get(repoStore).currentPath === target?.path && get(repoStore).activeTabId === target?.tabId);
+const ready = () => snapshot({ activeTabId: "tab-1", currentPath: "/repo", currentBranch: "main", isLoading: false, isBare: false, operation: { operation: null, probeFailed: false } });
 afterEach(() => { cancelPrompt(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("command catalog and context", () => {
@@ -151,6 +155,12 @@ describe("command catalog and context", () => {
       await commands.find(command => command.id === id)?.action();
       expect(spy, id).toHaveBeenCalledOnce();
     }
+    // Every repository command names the repository the palette was built for.
+    expect(fetch).toHaveBeenCalledWith(undefined, TARGET);
+    expect(pull).toHaveBeenCalledWith(undefined, undefined, undefined, TARGET);
+    expect(push).toHaveBeenCalledWith(undefined, undefined, false, TARGET);
+    expect(stash).toHaveBeenCalledWith(undefined, undefined, TARGET);
+    expect(pop).toHaveBeenCalledWith(TARGET);
     expect(fleet).toHaveBeenCalledWith(true);
     for (const preference of ["system", "light", "dark"] as const) {
       await commands.find(command => command.id === `theme_${preference}`)?.action();
@@ -169,7 +179,7 @@ describe("command catalog and context", () => {
     await commands.find(command => command.id === "optional_tools_setup")?.action();
     expect(openSetupWizard).toHaveBeenCalledWith("devmap", "explain");
   });
-  it("prompts before branch changes, propagates outcomes, and rejects a changed repository", async () => {
+  it("prompts before branch changes, propagates outcomes, and hands the store the repository the palette was built for", async () => {
     let current = ready();
     vi.spyOn(repoStore, "subscribe").mockImplementation(listener => { listener(current); return () => {}; });
     const create = vi.spyOn(repoStore, "createBranch").mockResolvedValue({ ok: true });
@@ -179,20 +189,25 @@ describe("command catalog and context", () => {
     let action = startCreate?.action();
     expect(get(promptState)?.options.title).toBe("Create New Branch");
     completePrompt(" feature/new "); await expect(action).resolves.toEqual({ ok: true });
-    expect(create).toHaveBeenCalledWith("feature/new");
+    expect(create).toHaveBeenCalledWith("feature/new", undefined, TARGET);
     action = commands.find(command => command.id === "rename_branch")?.action();
     completePrompt(" renamed "); await expect(action).resolves.toEqual({ ok: false, error: "Branch exists" });
-    expect(rename).toHaveBeenCalledWith("main", "renamed");
+    expect(rename).toHaveBeenCalledWith("main", "renamed", TARGET);
     action = startCreate?.action(); cancelPrompt(); await expect(action).resolves.toEqual({ ok: false });
-    action = startCreate?.action(); current = { ...current, currentPath: "/other" }; completePrompt("wrong-repo");
-    await expect(action).rejects.toThrow("active repository changed");
-    expect(create).toHaveBeenCalledOnce();
+    // A repository that changed while the prompt was open is the store's to
+    // refuse (repoStore.test.ts): the palette names the one it was built for
+    // and never "whichever is in front now".
+    action = startCreate?.action(); current = { ...current, activeTabId: "tab-2", currentPath: "/other" }; completePrompt("wrong-repo");
+    await action;
+    expect(create).toHaveBeenLastCalledWith("wrong-repo", undefined, TARGET);
+    expect(create).toHaveBeenCalledTimes(2);
   });
   it("offers a command for every launcher, opening the dock on the repository it was run in", async () => {
     // Starting a session used to require opening the dock and then finding
     // the launcher dropdown and the + beside it.
     const current = ready();
     vi.spyOn(repoStore, "subscribe").mockImplementation((listener) => { listener(current); return () => {}; });
+    inFront();
     const open = vi.spyOn(repoStore, "setTerminalOpen").mockImplementation(() => true);
     const requested: { path: string; launcher: string; prompt: string | undefined }[] = [];
     vi.spyOn(terminalLaunchRequests, "request").mockImplementation(async (path, launcher, prompt) => {
@@ -215,6 +230,7 @@ describe("command catalog and context", () => {
   it("refuses to start a session in a repository the user has since switched away from", async () => {
     let current = ready();
     vi.spyOn(repoStore, "subscribe").mockImplementation((listener) => { listener(current); return () => {}; });
+    inFront();
     const open = vi.spyOn(repoStore, "setTerminalOpen").mockImplementation(() => true);
     const request = vi.spyOn(terminalLaunchRequests, "request").mockResolvedValue(undefined);
 

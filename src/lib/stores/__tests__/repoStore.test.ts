@@ -4927,3 +4927,234 @@ describe("repoStore echo replay and queue release", () => {
     expect(loads.n).toBe(0);
   });
 });
+
+describe("file, worktree and branch-cleanup mutations (ft-d61584de)", () => {
+  const guarded = (output: unknown) => ({ policy: null, output }) as never;
+  const sent: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+  const record = (cmd: string, output: unknown = null) =>
+    async (_c: string, args?: Record<string, unknown>) => {
+      sent.push({ cmd, args: args ?? {} });
+      return guarded(output);
+    };
+  afterEach(() => {
+    sent.length = 0;
+    vi.restoreAllMocks();
+  });
+
+  it("each is counted by the quit guard while it is pending, and journalled once it settles", async () => {
+    const hold = deferred<unknown>();
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({ cmd_prune_worktree: async () => hold.promise as never }));
+    await store.openRepo("/r/a");
+    const target = store.captureTarget();
+    const pending = store.pruneWorktrees(target);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(gitActionCount(get(store.mutationActivity))).toBe(1);
+    expect(get(store.mutationActivity)["/r/a"]).toEqual(["worktree-prune"]);
+    hold.resolve({ policy: null, output: null });
+    expect((await pending).ok).toBe(true);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ repoPath: "/r/a", kind: "worktree-prune", ok: true }));
+  });
+
+  it("queue behind one another per repository", async () => {
+    const holds = [deferred<unknown>(), deferred<unknown>()];
+    let started = 0;
+    const { store } = makeStore(makeInvoke({ cmd_prune_worktree: async () => holds[started++].promise as never }));
+    await store.openRepo("/r/a");
+    const target = store.captureTarget();
+    const first = store.pruneWorktrees(target);
+    const second = store.pruneWorktrees(target);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(started).toBe(1);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(2);
+    holds[0].resolve(guarded(null));
+    await first;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(started).toBe(2);
+    holds[1].resolve(guarded(null));
+    await second;
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+  });
+
+  it("a worktree cache sync that fails is journalled as failed and returns the failure", async () => {
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({ cmd_worktree_cow_sync: async () => { throw new Error("cow refused"); } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.worktreeCowSync("/r/a/.claude/worktrees/x", store.captureTarget());
+    expect(outcome).toMatchObject({ ok: false, error: expect.stringContaining("cow refused") });
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ kind: "worktree-cow-sync", ok: false }));
+  });
+
+  it("move, delete and create send their arguments to the target's repository and return the delete outcome", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_move_path: record("cmd_move_path"),
+      cmd_delete_path: record("cmd_delete_path", { left_behind: true }),
+      cmd_create_file: record("cmd_create_file"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    expect((await store.movePath("x.ts", "y.ts", a)).ok).toBe(true);
+    const deleted = await store.deletePath("old.ts", a);
+    expect(deleted).toMatchObject({ ok: true, output: { left_behind: true } });
+    expect((await store.createFile("new.ts", a)).ok).toBe(true);
+    expect(sent).toEqual([
+      { cmd: "cmd_move_path", args: { repoPath: "/r/a", from: "x.ts", to: "y.ts" } },
+      { cmd: "cmd_delete_path", args: { repoPath: "/r/a", path: "old.ts" } },
+      { cmd: "cmd_create_file", args: { repoPath: "/r/a", filePath: "new.ts" } },
+    ]);
+  });
+
+  it("an already-existing file comes back on cause and is not filed as the session's error", async () => {
+    const refusal = { code: "already_exists", message: "'a.ts' already exists", path: "a.ts" };
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome).toMatchObject({ ok: false, cause: refusal, surfaced: false });
+    expect(get(store).error).toBeNull();
+  });
+
+  it("an already_exists for a different path than the one created is not expected: it is filed", async () => {
+    const refusal = { code: "already_exists", message: "'other.ts' already exists", path: "other.ts" };
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome.ok).toBe(false);
+    expect(get(store).error).toContain("other.ts");
+  });
+
+  it("a refused or changed_on_disk create is filed, not treated as the name prompt's retry", async () => {
+    for (const refusal of [
+      { code: "refused", message: "outside the repository" },
+      { code: "changed_on_disk", message: "changed", path: "a.ts", expected: "x", actual: "y" },
+    ]) {
+      const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+      await store.openRepo("/r/a");
+      await store.createFile("a.ts", store.captureTarget());
+      expect(get(store).error, refusal.code).toContain(refusal.message);
+    }
+  });
+
+  it("an exception thrown synchronously by the wrapped call, and a failed delete, release the quit guard", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_delete_path: () => { throw new Error("sync boom"); },
+      cmd_move_path: async () => { throw new Error("async boom"); },
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget();
+    expect(await store.deletePath("x", a)).toMatchObject({ ok: false });
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    expect(await store.movePath("x", "y", a)).toMatchObject({ ok: false });
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    // A later mutation on the same repository is not stranded behind the failed one.
+    expect(await store.deletePath("z", a)).toMatchObject({ ok: false });
+  });
+
+  it("fetch, pull and push with no target pin the repository in front when they are CALLED, not when they finish", async () => {
+    for (const run of [
+      (s: ReturnType<typeof makeStore>["store"]) => s.fetch(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.pull(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.push(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.stashSave(),
+    ]) {
+      const hold = deferred<unknown>();
+      const paths: unknown[] = [];
+      const gate = async (_c: string, args?: Record<string, unknown>) => {
+        paths.push(args?.repoPath);
+        return hold.promise as never;
+      };
+      const { store } = makeStore(makeInvoke({ cmd_fetch: gate, cmd_pull: gate, cmd_push: gate, cmd_stash_save: gate }));
+      await store.openRepo("/r/a");
+      const pending = run(store);
+      await store.openRepo("/r/b");
+      hold.resolve(guarded(null));
+      await pending;
+      expect(paths).toEqual(["/r/a"]);
+    }
+  });
+
+  it("any other create failure is filed as an error", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw new Error("disk full"); } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome.ok).toBe(false);
+    expect(get(store).error).toContain("disk full");
+  });
+
+  it("deadbranch clean and restore send what the dialog had and unwrap the guarded result", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_deadbranch_clean: record("cmd_deadbranch_clean", { deleted: ["a"], failed: [], backup_path: null, message: "ok" }),
+      cmd_deadbranch_restore: record("cmd_deadbranch_restore", { restored: ["a"], failed: [], message: "ok" }),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    const cleaned = await store.deadbranchClean(["a"], true, false, a);
+    expect(cleaned.output?.deleted).toEqual(["a"]);
+    const restored = await store.deadbranchRestore("/b/1.json", a);
+    expect(restored.output?.restored).toEqual(["a"]);
+    expect(sent).toEqual([
+      { cmd: "cmd_deadbranch_clean", args: { repoPath: "/r/a", branches: ["a"], force: true, createBackup: false } },
+      { cmd: "cmd_deadbranch_restore", args: { repoPath: "/r/a", backupPath: "/b/1.json", branches: null } },
+    ]);
+  });
+
+  it("a failed deadbranch clean is not an empty success", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_deadbranch_clean: async () => { throw new Error("guard refused"); } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.deadbranchClean(["a"], false, true, store.captureTarget());
+    expect(outcome).toMatchObject({ ok: false, error: expect.stringContaining("guard refused") });
+    expect(outcome.output).toBeUndefined();
+  });
+
+  it("a restore after the tab closed is refused in the repository left behind and runs nothing", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_deadbranch_restore: record("cmd_deadbranch_restore") }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    await store.closeTab(a.tabId);
+    const outcome = await store.deadbranchRestore("/b/1.json", a);
+    expect(outcome).toMatchObject({ ok: false, refused: true });
+    expect(sent).toEqual([]);
+  });
+
+  it("targetIsActive is true only for the tab in front", async () => {
+    const { store } = makeStore();
+    expect(store.targetIsActive(null)).toBe(false);
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    expect(store.targetIsActive(a)).toBe(true);
+    await store.openRepo("/r/b");
+    expect(store.targetIsActive(a)).toBe(false);
+    expect(store.targetIsActive(store.captureTarget())).toBe(true);
+    await store.closeTab(a.tabId);
+    expect(store.targetIsActive(a)).toBe(false);
+  });
+
+  it("the palette's commands run in the target's repository after another tab became active, or are refused", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_fetch: record("cmd_fetch"),
+      cmd_pull: record("cmd_pull"),
+      cmd_push: record("cmd_push"),
+      cmd_stash_save: record("cmd_stash_save"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    await store.fetch(undefined, a);
+    await store.pull(undefined, undefined, undefined, a);
+    await store.push(undefined, undefined, false, a);
+    await store.stashSave(undefined, undefined, a);
+    expect(sent.map((s) => s.args.repoPath)).toEqual(["/r/a", "/r/a", "/r/a", "/r/a"]);
+    await store.closeTab(a.tabId);
+    sent.length = 0;
+    for (const outcome of [
+      await store.fetch(undefined, a),
+      await store.push(undefined, undefined, false, a),
+      await store.stashPop(a),
+    ]) {
+      expect(outcome).toMatchObject({ ok: false, refused: true });
+    }
+    expect(sent).toEqual([]);
+  });
+});
