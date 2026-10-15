@@ -170,6 +170,10 @@
       await repoStore.openRepo("/fixture/GitPulse");
       interfaceStore.setTerminalFontSize(12);
       interfaceStore.setTerminalDockHeight(400);
+      // The checks read the grid back from xterm's DOM rows (hover targets,
+      // row heights, rendered text), which only the DOM renderer writes. The
+      // GPU block turns WebGL on for itself and off again when it is done.
+      interfaceStore.setTerminalGpu(false);
       // Per repository tab: this opens the dock on /fixture/GitPulse, the tab
       // that is active, and deliberately NOT on /fixture/Other.
       repoStore.setTerminalOpen(true);
@@ -400,6 +404,71 @@
           button("Repository GitPulse").click(); await wait();
           check("returning restores both original tabs", () => visible('[role="tab"]').length === 2 && report.killed === 0);
           check("returning restores this repository's own dock", () => visible("[data-terminal-dock]").length === 1);
+
+          // ---- GPU renderer: attended sessions only, DOM after a loss.
+          {
+            const sessionsAll = () => [...document.querySelectorAll("[data-terminal-session]")];
+            const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
+            const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
+            const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
+            check("this browser can create a WebGL2 context (the GPU checks below need one)",
+              () => !!document.createElement("canvas").getContext("webgl2"));
+            check("with the setting off, no session holds a WebGL context",
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            interfaceStore.setTerminalGpu(true); await wait();
+            check("the session on screen draws through WebGL", () => {
+              const [el] = shown();
+              if (shown().length !== 1) throw new Error(`${shown().length} sessions on screen`);
+              return el.dataset.renderer === "webgl" && el.querySelectorAll("canvas").length > 0;
+            });
+            check("sessions that are not on screen hold no WebGL context", () => {
+              const rows = hidden().map((el) => `${el.dataset.renderer}/${el.querySelectorAll("canvas").length}`);
+              if (rows.length < 2) throw new Error(`expected the other tab and the other repository's session hidden, saw ${rows.length}`);
+              return rows.every((row) => row === "dom/0");
+            });
+            button("Hide the terminal dock").click(); await wait();
+            check("hiding the dock releases the on-screen session's context too",
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            button("Show terminal").click(); await wait();
+            const [target] = shown();
+            check("showing the dock again attaches a fresh context", () => target?.dataset.renderer === "webgl");
+            // The addon also adds a 2D link layer (`xterm-link-layer`); the
+            // WebGL canvas is the one without a layer class.
+            const canvas = [...target.querySelectorAll("canvas")].find((el) => ![...el.classList].some((name) => name.endsWith("-layer")));
+            const gl = canvas?.getContext("webgl2");
+            check("the on-screen session's canvas holds a live WebGL2 context", () => !!gl && !gl.isContextLost());
+            // Resolves on the canvas's own target phase, after the session's
+            // capture listener has already reacted to the loss.
+            const lostAt = new Promise((resolve) => canvas.addEventListener("webglcontextlost", () => resolve(performance.now()), { once: true }));
+            gl.getExtension("WEBGL_lose_context").loseContext();
+            const lost = await lostAt;
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const settled = performance.now() - lost;
+            check("a lost context is disposed at once: no canvas left in the pane", () => !target.querySelector("canvas"));
+            check("the session is marked lost", () => target.dataset.renderer === "lost");
+            check("the DOM renderer draws the same rows on the next frame, so the pane never blanks", () => {
+              const text = domText(target);
+              if (!text) throw new Error("no DOM rows two frames after the loss");
+              // Not the addon's own three-second wait for a restore.
+              if (settled > 1000) throw new Error(`DOM rows took ${Math.round(settled)} ms`);
+              return true;
+            });
+            button("Hide the terminal dock").click(); await wait();
+            button("Show terminal").click(); await wait();
+            check("a lost session is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
+            check("another session still gets WebGL when it comes on screen",
+              () => shown().length === 1 && shown()[0] !== target && shown()[0].dataset.renderer === "webgl");
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
+            check("switching back leaves the other session without a context and this one on the DOM",
+              () => shown()[0] === target && target.dataset.renderer === "lost" && hidden().every((el) => !el.querySelector("canvas")));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
+            interfaceStore.setTerminalGpu(false); await wait();
+            check("turning the setting off returns a live WebGL session to the DOM renderer",
+              () => shown()[0] !== target && shown()[0].dataset.renderer === "dom" && !!domText(shown()[0])
+                && sessionsAll().every((el) => !el.querySelector("canvas")));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
+          }
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);

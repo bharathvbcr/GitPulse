@@ -691,6 +691,30 @@ it("keeps terminal scrollback within bounds, with a smaller default for agents",
   interfaceStore.reset();
 });
 
+it("treats GPU terminal rendering as on by default, switchable, and falls back to on for a corrupt value", async () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalGpu).toBe(true);
+  interfaceStore.setTerminalGpu(false);
+  expect(get(interfaceStore).terminalGpu).toBe(false);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalGpu).toBe(true);
+
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalGpu: false }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalGpu).toBe(false);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalGpu: "no" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalGpu).toBe(true);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("treats Option as Meta as on by default, switchable, and falls back to on for a corrupt value", async () => {
   interfaceStore.reset();
   expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);

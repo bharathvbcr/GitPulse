@@ -69,6 +69,7 @@
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
+  import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
   import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
   import { get } from "svelte/store";
@@ -99,6 +100,7 @@
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
   import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
   import { sessionActivity } from "../terminal/sessionActivity";
+  import { createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -252,9 +254,14 @@
   /** What the pointer is currently over, shown in the footer so the target is
    * readable before the click rather than only after it. */
   let hoveredLink = $state<string | null>(null);
+  /** Set once xterm is open in its container; a renderer can only attach after. */
+  let opened = $state(false);
+  /** How this session draws now; on the container as `data-renderer`. */
+  let renderer = $state<GpuState>("dom");
 
   /** Non-reactive handles: observers and the emulator must not tear down with runes. */
   let term: XTerm | null = null;
+  let gpu: GpuRenderer | null = null;
   let fitAddon: FitAddon | null = null;
   let searchAddon: SearchAddon | null = null;
   let searchKey: string | null = null;
@@ -403,9 +410,10 @@
       convertEol: false,
       theme: termTheme(),
       // Required before `open()` for a non-opaque background, and not
-      // changeable afterwards. Its documented cost is the texture-atlas
-      // renderers; this terminal loads fit/search addons, so the DOM renderer
-      // draws the background as a plain CSS colour.
+      // changeable afterwards. Its documented cost falls on the texture-atlas
+      // renderer, which an on-screen session now uses (`gpuRenderer.ts`); the
+      // DOM renderer a hidden or lost session falls back to draws the
+      // background as a plain CSS colour.
       allowTransparency: true,
       scrollback: sessionScrollback(),
       screenReaderMode: get(interfaceStore).terminalScreenReader,
@@ -1057,6 +1065,13 @@
     const onHelperBlur = () => eraseGuard.reset();
     let observedHelper: HTMLTextAreaElement | null = null;
     /**
+     * The canvas reports a lost context the moment it happens. The addon's own
+     * `onContextLoss` waits three seconds for a restore first, with a blank
+     * canvas on screen meanwhile; this falls back to the DOM renderer at once.
+     * Captured on the host because the event does not bubble.
+     */
+    const onContextLost = () => gpu?.lose();
+    /**
      * Every paste goes through `planPaste`: bracketed-paste markers inside the
      * clipboard are removed, and a paste that would run before it is read asks
      * first. Ahead of xterm's own listeners, which never strip the markers.
@@ -1131,8 +1146,20 @@
       // reaches xterm, including the keyCode 229 path that resends the textarea.
       for (const type of ERASE_CAPTURE_EVENTS) host.addEventListener(type, onEraseCapture, true);
       host.addEventListener("paste", onPasteCapture, true);
+      host.addEventListener("webglcontextlost", onContextLost, true);
       const t = ensureTerm();
       t?.open(host);
+      if (t) {
+        gpu = createGpuRenderer({
+          attach: () => {
+            const addon = new WebglAddon();
+            t.loadAddon(addon);
+            return addon;
+          },
+          onChange: (state) => (renderer = state),
+        });
+        opened = true;
+      }
       host.querySelectorAll("textarea.xterm-helper-textarea").forEach((node) => {
         if (node instanceof HTMLTextAreaElement) hardenHelper(node);
       });
@@ -1177,6 +1204,7 @@
       if (host) {
         for (const type of ERASE_CAPTURE_EVENTS) host.removeEventListener(type, onEraseCapture, true);
         host.removeEventListener("paste", onPasteCapture, true);
+        host.removeEventListener("webglcontextlost", onContextLost, true);
       }
       observedHelper?.removeEventListener("keydown", onXtermKeydown, true);
       observedHelper?.removeEventListener("blur", onHelperBlur);
@@ -1200,6 +1228,9 @@
       stopResize = null;
       themeObserver?.disconnect();
       themeObserver = null;
+      // Before the terminal: the addon gives its slot back to the shared pool.
+      gpu?.dispose();
+      gpu = null;
       term?.dispose();
       term = null;
       fitAddon = null;
@@ -1287,6 +1318,16 @@
     if (!nativeSessionId) return;
     terminalAttendance.report(nativeSessionId, visible);
   });
+
+  /**
+   * WebGL only while attended: the same `onscreen` the notifier is told, so a
+   * hidden tab, a collapsed dock or another repository's dock holds no
+   * context. See `terminal/gpuRenderer.ts` for the cap and the loss rule.
+   */
+  $effect(() => {
+    const want = opened && onscreen && $interfaceStore.terminalGpu;
+    untrack(() => gpu?.sync(want));
+  });
 </script>
 
 <div class="h-full w-full flex flex-col min-h-0 min-w-0">
@@ -1317,6 +1358,7 @@
       bind:this={container}
       class="h-full w-full bg-surface overflow-hidden"
       data-terminal-session
+      data-renderer={renderer}
     ></div>
     {#if scrolledBack}
       <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>

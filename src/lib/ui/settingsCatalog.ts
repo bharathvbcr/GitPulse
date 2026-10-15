@@ -114,6 +114,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     requires: "macos",
   },
   {
+    id: "terminal-gpu",
+    section: "appearance",
+    label: "GPU terminal rendering",
+    keywords: "terminal gpu webgl hardware acceleration renderer rendering draw cpu performance glitch shell console",
+  },
+  {
     id: "terminal-scrollback",
     section: "appearance",
     label: "Terminal scrollback",

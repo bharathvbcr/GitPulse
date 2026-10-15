@@ -276,6 +276,13 @@ export interface InterfacePrefs {
    * German keyboard. Applied to live terminals.
    */
   terminalOptionAsMeta: boolean;
+  /**
+   * Draw terminals on screen through WebGL rather than the DOM (see
+   * `terminal/gpuRenderer.ts`). On by default; turning it off returns every
+   * live session to the DOM renderer at once, for a GPU or driver that draws
+   * it wrong. Hidden sessions never hold a context either way.
+   */
+  terminalGpu: boolean;
   terminalLauncher: LauncherKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
@@ -354,6 +361,7 @@ const DEFAULTS: InterfacePrefs = {
   terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
   terminalScreenReader: false,
   terminalOptionAsMeta: true,
+  terminalGpu: true,
   terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
@@ -509,6 +517,7 @@ function readPrefs(): InterfacePrefs {
       ),
       terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
       terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
+      terminalGpu: bool(parsed.terminalGpu, DEFAULTS.terminalGpu),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -754,6 +763,7 @@ function createInterfaceStore() {
       patch({ terminalAgentScrollback: clampTerminalScrollback(rows, TERMINAL_AGENT_SCROLLBACK_DEFAULT) }),
     setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
     setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
+    setTerminalGpu: (on: boolean) => patch({ terminalGpu: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),
