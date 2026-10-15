@@ -926,16 +926,44 @@ Other benches:
     | idle 8 / 24 watches | 2.20 / 2.40 | 2.20 / 2.20 | 2.20 / 2.40 | 2.20/s | none |
     | **idle alerts bridge** | 6.99 | 7.00 | 7.19 | **6.99/s** | about +4.6/s, the 200 ms `wait_readable` accept loop (5/s) |
     | **idle host-load sampler** | 2.80 | 2.80 | 2.80 | **2.80/s** | about +0.4/s, the 2 s tick |
-    | workbench `external_changes` | not measured | | | | no entry point from a bench (see below) |
+    | workbench `external_changes`, window hidden | see the table below | | | | |
+    | workbench `external_changes`, window visible | see the table below | | | | |
 
     The bridge row binds the listener under a throwaway `HOME` with no
     clients; the sampler row is `sysload::start` with `SamplerOptions::new`
     (`host_load` enabled, 2 s cadence, a full process scan per tick) after
     its first tick has settled. The sampler's 2 s scan adds only about one
     wakeup per tick; the CPU it costs is not what this bench counts. The
-    external_changes watcher (1 s visible, 2 s hidden) has no row: the module
-    is `pub(crate)` and `run` needs a Tauri `AppHandle` with a real `main`
-    window, so a bench cannot start it, and a seam would be production code.
+    external_changes watcher (1 s visible, 2 s hidden) had no row in wave 0:
+    `run` needed a Tauri `AppHandle` with a real `main` window. Its schedule is
+    now `external_changes::drive` over an `Env` trait, and
+    `external_changes::bench_seam::IdleLoop` runs it on a real clock and a
+    private profile with the window as a flag; that is what the rows below
+    measure.
+
+    **external_changes cadence, before and after (ft-79394019, wave 1, lane
+    B2).** Before is `503761fd` (the seam as a pure refactor: 2 s hidden sleep,
+    1 s visible sleep); after is `c0c037eb` (hidden loop blocks on a beacon,
+    bounded by the 30 s window check and retention's 10 min clock). Three full
+    runs each, N = 3 windows of 5 s, `ri_interrupt_wkups`, `ri_pkg_idle_wkups` 0
+    throughout; each cell is that run's median of its 3 windows. Host load
+    average (1 min) when each run started: before 142 (taken before its build;
+    the bench itself reported 26.7 once running) / 52 / 51, after 81 / 45 / 75
+    on 18 cpus (the runs were not alternated one-for-one: before first, after second,
+    because each needs its own release build).
+
+    | row | before runs 1 / 2 / 3 | after runs 1 / 2 / 3 | floor in the same runs (0 sessions) |
+    | --- | --- | --- | --- |
+    | idle external_changes (hidden) | 2.80 / 2.80 / 2.80 | 2.20 / 2.20 / 2.20 | 2.40 / 2.40 / 2.40 before; 2.40 / 2.40 / 2.20 after |
+    | idle external_changes (visible) | 3.20 / 3.20 / 3.20 | 3.20 / 3.20 / 3.20 | same |
+
+    Hidden: min 2.80/s down to 2.20/s, from +0.4/s over the floor (the 2 s
+    sleep, 0.5/s computed) to none; the row's own round counter (last window of
+    each run) went from 3 to 0 per 5 s, as the loop now wakes about twice a
+    minute. Visible: unchanged at +0.8/s, the
+    1 Hz pass the UX latency contract needs (an external task appears within
+    about a second); it is deliberately not slower. One wakeup is 0.2/s at
+    this window length, so differences below 0.4/s are one event.
 
 ### Pre-fix baseline (`a92e40fb`, loaded host), superseded
 
