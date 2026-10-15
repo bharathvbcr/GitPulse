@@ -62,9 +62,13 @@ export function offerBranchUndo(message: string, tips: readonly DeletedBranchTip
         }
         return true;
       }
-      toastStore.error(
-        `Restored ${restored} of ${total} ${branches(total)}. Failed: ${failures.join("; ")}${skipped ? `. ${skipped}` : ""}`,
-      );
+      const headline =
+        restored > 0
+          ? `Restored ${restored} of ${total} ${branches(total)}.`
+          : total === 1
+            ? "Could not restore the branch."
+            : `Could not restore any of the ${total} branches.`;
+      toastStore.error(`${headline} Failed: ${failures.join("; ")}${skipped ? `. ${skipped}` : ""}`);
       // The offer is still the way back: it gets a full clock from this failure.
       toastStore.restart(id);
       return false;

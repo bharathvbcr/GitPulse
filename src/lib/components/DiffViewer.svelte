@@ -163,6 +163,7 @@
   import AgentCommitMenu from "./AgentCommitMenu.svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { observeResize } from "../dom/observeResize";
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
@@ -970,6 +971,13 @@
     dragAnchor = null;
   }
 
+  async function toggleSelectedFileStaged() {
+    const path = $repoStore.selectedFilePath;
+    if (!path) return;
+    const outcome = await (isStaged ? repoStore.unstageFile(path) : repoStore.stageFile(path));
+    reportFailure(outcome, isStaged ? "Could not unstage the file" : "Could not stage the file");
+  }
+
   async function stageHunk(hunkIndex: number) {
     if (!$repoStore.selectedFilePath) return;
     const patch = buildFilePatchForHunk(lines, $repoStore.selectedFilePath, hunkIndex);
@@ -1349,7 +1357,7 @@
 
       {#if isWorkingTreeFile}
         <button
-          onclick={() => $repoStore.selectedFilePath && (isStaged ? repoStore.unstageFile($repoStore.selectedFilePath) : repoStore.stageFile($repoStore.selectedFilePath))}
+          onclick={() => void toggleSelectedFileStaged()}
           class="gp-btn-primary py-1!"
         >
           <Check size={13} />

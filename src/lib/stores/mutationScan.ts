@@ -158,14 +158,18 @@ export function mutationNames(storeSource: string): Set<string> {
 interface Aliases {
   /** Identifiers that are the store itself: `repoStore` and what it was assigned to. */
   stores: Set<string>;
-  /** Identifiers bound to one of its mutation methods. */
-  methods: Set<string>;
+  /** Identifiers bound to one of its mutation methods, mapped to the member's name. */
+  methods: Map<string, string>;
+  /** Local names of askConfirm / askText, including import aliases. */
+  prompts: Set<string>;
 }
+
+const newAliases = (): Aliases => ({ stores: new Set(["repoStore"]), methods: new Map(), prompts: new Set(PROMPTS) });
 
 /** The mutation a callee names, `"*"` for one that cannot be named, or null. */
 function mutationOf(callee: ts.Expression, aliases: Aliases, names: ReadonlySet<string>): string | null {
   const target = unwrap(callee);
-  if (ts.isIdentifier(target)) return aliases.methods.has(target.text) ? target.text : null;
+  if (ts.isIdentifier(target)) return aliases.methods.get(target.text) ?? null;
   if (ts.isPropertyAccessExpression(target)) {
     const owner = unwrap(target.expression);
     return ts.isIdentifier(owner) && aliases.stores.has(owner.text) && names.has(target.name.text) ? target.name.text : null;
@@ -189,30 +193,39 @@ function mutationOf(callee: ts.Expression, aliases: Aliases, names: ReadonlySet<
 function collectAliases(
   sf: ts.SourceFile,
   names: ReadonlySet<string>,
-  aliases: Aliases = { stores: new Set(["repoStore"]), methods: new Set() },
+  aliases: Aliases = newAliases(),
 ): Aliases {
   let grew = true;
   const visit = (node: ts.Node) => {
+    if (ts.isImportSpecifier(node) && PROMPTS.has((node.propertyName ?? node.name).text) && !aliases.prompts.has(node.name.text)) {
+      aliases.prompts.add(node.name.text);
+      grew = true;
+    }
     if (ts.isVariableDeclaration(node) && node.initializer) {
       const init = unwrap(node.initializer);
       if (ts.isIdentifier(node.name)) {
         if (ts.isIdentifier(init) && aliases.stores.has(init.text) && !aliases.stores.has(node.name.text)) {
           aliases.stores.add(node.name.text);
           grew = true;
+        } else if (ts.isIdentifier(init) && aliases.prompts.has(init.text) && !aliases.prompts.has(node.name.text)) {
+          aliases.prompts.add(node.name.text);
+          grew = true;
         } else if (
           (ts.isPropertyAccessExpression(init) || ts.isElementAccessExpression(init)) &&
-          mutationOf(init, aliases, names) !== null &&
           !aliases.methods.has(node.name.text)
         ) {
-          aliases.methods.add(node.name.text);
-          grew = true;
+          const member = mutationOf(init, aliases, names);
+          if (member !== null) {
+            aliases.methods.set(node.name.text, member);
+            grew = true;
+          }
         }
       } else if (ts.isObjectBindingPattern(node.name) && ts.isIdentifier(init) && aliases.stores.has(init.text)) {
         for (const element of node.name.elements) {
           const source = element.propertyName ?? element.name;
           const sourceName = ts.isIdentifier(source) || ts.isStringLiteralLike(source) ? source.text : "";
           if (ts.isIdentifier(element.name) && names.has(sourceName) && !aliases.methods.has(element.name.text)) {
-            aliases.methods.add(element.name.text);
+            aliases.methods.set(element.name.text, sourceName);
             grew = true;
           }
         }
@@ -238,7 +251,7 @@ function isPromiseCombinator(call: ts.CallExpression): boolean {
 }
 
 /** Whether the value of `call` reaches nothing that can read it. */
-function isDiscarded(call: ts.CallExpression): boolean {
+function isDiscarded(call: ts.CallExpression, handler = false): boolean {
   let node: ts.Node = call;
   for (;;) {
     const parent: ts.Node = node.parent;
@@ -308,7 +321,9 @@ function isDiscarded(call: ts.CallExpression): boolean {
           continue;
         }
       }
-      return false;
+      // An arrow that IS an event handler (`onclick={() => repoStore.x()}`)
+      // returns its value to the event system, which reads nothing.
+      return handler && ts.isParenthesizedExpression(parent.parent) && ts.isExpressionStatement(parent.parent.parent);
     }
     return false;
   }
@@ -323,10 +338,11 @@ function discardedIn(
   sf: ts.SourceFile,
   names: ReadonlySet<string>,
   aliases: Aliases = collectAliases(sf, names),
+  handler = false,
 ): number[] {
   const lines: number[] = [];
   const visit = (node: ts.Node) => {
-    if (ts.isCallExpression(node) && mutationOf(node.expression, aliases, names) !== null && isDiscarded(node)) {
+    if (ts.isCallExpression(node) && mutationOf(node.expression, aliases, names) !== null && isDiscarded(node, handler)) {
       lines.push(lineOf(sf, node));
     }
     ts.forEachChild(node, visit);
@@ -336,7 +352,7 @@ function discardedIn(
 }
 
 /** Whether a prompt, or a toast's action, stands between the start of the flow and `call`. */
-function followsPrompt(call: ts.CallExpression): boolean {
+function followsPrompt(call: ts.CallExpression, aliases: Aliases): boolean {
   for (let node: ts.Node | undefined = call.parent; node; node = node.parent) {
     if (!ts.isFunctionLike(node)) continue;
     const user = node.parent;
@@ -349,7 +365,7 @@ function followsPrompt(call: ts.CallExpression): boolean {
       if (prompted) return;
       if (ts.isAwaitExpression(child) && child.end <= call.getStart()) {
         const asked = unwrap(child.expression);
-        if (ts.isCallExpression(asked) && ts.isIdentifier(asked.expression) && PROMPTS.has(asked.expression.text)) prompted = true;
+        if (ts.isCallExpression(asked) && ts.isIdentifier(asked.expression) && aliases.prompts.has(asked.expression.text)) prompted = true;
       }
       ts.forEachChild(child, visit);
     };
@@ -366,24 +382,22 @@ function followsPrompt(call: ts.CallExpression): boolean {
  * active when the answer arrives.
  */
 export function untargetedAfterPrompt(code: string): number[] {
-  return untargetedIn(parseSource("scan.ts", code));
+  const sf = parseSource("scan.ts", code);
+  const names = new Set(Object.keys(TARGET_ARG_INDEX));
+  return untargetedIn(sf, names, collectAliases(sf, names));
 }
 
-function untargetedIn(sf: ts.SourceFile): number[] {
+function untargetedIn(sf: ts.SourceFile, names: ReadonlySet<string>, aliases: Aliases): number[] {
   const lines: number[] = [];
   const visit = (node: ts.Node) => {
     if (ts.isCallExpression(node)) {
-      const callee = unwrap(node.expression);
-      if (
-        ts.isPropertyAccessExpression(callee) &&
-        ts.isIdentifier(callee.expression) &&
-        callee.expression.text === "repoStore" &&
-        Object.hasOwn(TARGET_ARG_INDEX, callee.name.text)
-      ) {
-        const at = TARGET_ARG_INDEX[callee.name.text];
+      // Through aliases too: `const s = repoStore`, `const { createBranch } = repoStore`.
+      const member = mutationOf(node.expression, aliases, names);
+      if (member !== null && Object.hasOwn(TARGET_ARG_INDEX, member)) {
+        const at = TARGET_ARG_INDEX[member];
         const given = node.arguments[at];
         const absent = given === undefined || (ts.isIdentifier(given) && given.text === "undefined");
-        if (absent && followsPrompt(node)) lines.push(lineOf(sf, node));
+        if (absent && followsPrompt(node, aliases)) lines.push(lineOf(sf, node));
       }
     }
     ts.forEachChild(node, visit);
@@ -399,19 +413,23 @@ interface Range {
   end: number;
 }
 
+interface HandlerRange extends Range {
+  handler: boolean;
+}
+
 const isRange = (value: unknown): value is Range =>
   typeof value === "object" && value !== null &&
   typeof (value as Range).start === "number" && typeof (value as Range).end === "number";
 
 /** The source ranges of a component's scripts and of every expression in its markup. */
-function svelteRanges(source: string): { scripts: Range[]; expressions: Range[] } {
+function svelteRanges(source: string): { scripts: Range[]; expressions: HandlerRange[] } {
   const root = parse(source, { modern: true }) as unknown as Record<string, unknown>;
   const scripts: Range[] = [];
   for (const key of ["instance", "module"]) {
     const script = root[key] as { content?: Range } | null | undefined;
     if (script?.content && isRange(script.content)) scripts.push({ start: script.content.start, end: script.content.end });
   }
-  const expressions = new Map<number, Range>();
+  const expressions = new Map<number, HandlerRange>();
   const seen = new Set<unknown>();
   // Template nodes are walked; the estree expressions hanging off them are
   // taken whole and never entered, so `void f()` is read as a unit.
@@ -425,10 +443,21 @@ function svelteRanges(source: string): { scripts: Range[]; expressions: Range[] 
     }
     const record = value as Record<string, unknown>;
     if (typeof record.type !== "string" || !templateType.test(record.type)) return;
+    // An event attribute (`onclick={…}`) or directive (`on:click={…}`): its
+    // expression is a handler, and a handler's return value goes nowhere.
+    const handler =
+      record.type === "OnDirective" ||
+      (record.type === "Attribute" && typeof record.name === "string" && /^on/.test(record.name));
     for (const key of ["expression", "test"]) {
       const inner = record[key];
       if (isRange(inner) && !templateType.test(String((inner as { type?: unknown }).type))) {
-        expressions.set(inner.start, { start: inner.start, end: inner.end });
+        expressions.set(inner.start, { start: inner.start, end: inner.end, handler: expressions.get(inner.start)?.handler === true || record.type === "OnDirective" });
+      }
+    }
+    if (handler && record.type === "Attribute") {
+      const tag = record.value as { type?: string; expression?: unknown } | null | undefined;
+      if (tag && !Array.isArray(tag) && tag.type === "ExpressionTag" && isRange(tag.expression)) {
+        expressions.set(tag.expression.start, { start: tag.expression.start, end: tag.expression.end, handler: true });
       }
     }
     for (const [key, child] of Object.entries(record)) {
@@ -447,20 +476,25 @@ export function scanSvelte(source: string, names: ReadonlySet<string>): { discar
   const untargeted: number[] = [];
   if (!source.includes("repoStore")) return { discarded, untargeted };
   const { scripts, expressions } = svelteRanges(source);
-  const parsed = scripts.map((range) =>
-    parseSource("component.ts", padding(source.slice(0, range.start)) + source.slice(range.start, range.end)));
+  const parsed = scripts.map((range) => ({
+    sf: parseSource("component.ts", padding(source.slice(0, range.start)) + source.slice(range.start, range.end)),
+    handler: false,
+  }));
   // What the scripts alias is visible to the markup too.
-  const aliases: Aliases = { stores: new Set(["repoStore"]), methods: new Set() };
-  for (const sf of parsed) collectAliases(sf, names, aliases);
-  const mentions = [...aliases.stores, ...aliases.methods];
+  const aliases = newAliases();
+  for (const { sf } of parsed) collectAliases(sf, names, aliases);
+  const mentions = [...aliases.stores, ...aliases.methods.keys()];
   for (const range of expressions) {
     const text = source.slice(range.start, range.end);
     if (!mentions.some((name) => text.includes(name))) continue;
-    parsed.push(parseSource("component.ts", `${padding(source.slice(0, range.start - 1))}(${text});`));
+    parsed.push({
+      sf: parseSource("component.ts", `${padding(source.slice(0, range.start - 1))}(${text});`),
+      handler: range.handler,
+    });
   }
-  for (const sf of parsed) {
-    discarded.push(...discardedIn(sf, names, aliases));
-    untargeted.push(...untargetedIn(sf));
+  for (const { sf, handler } of parsed) {
+    discarded.push(...discardedIn(sf, names, aliases, handler));
+    untargeted.push(...untargetedIn(sf, names, aliases));
   }
   return { discarded: [...new Set(discarded)].sort((a, b) => a - b), untargeted: [...new Set(untargeted)].sort((a, b) => a - b) };
 }
@@ -468,5 +502,6 @@ export function scanSvelte(source: string, names: ReadonlySet<string>): { discar
 /** The same scan for a plain TypeScript module. */
 export function scanTypeScript(source: string, names: ReadonlySet<string>): { discarded: number[]; untargeted: number[] } {
   const sf = parseSource("module.ts", source);
-  return { discarded: discardedIn(sf, names), untargeted: untargetedIn(sf) };
+  const aliases = collectAliases(sf, names);
+  return { discarded: discardedIn(sf, names, aliases), untargeted: untargetedIn(sf, names, aliases) };
 }

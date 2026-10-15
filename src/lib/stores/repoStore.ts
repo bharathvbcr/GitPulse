@@ -1594,11 +1594,32 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * the path and for WATCHER_ECHO_SUPPRESS_MS after one SUCCEEDED. A mutation
    * that failed leaves no window: it never refreshes, so the watcher is what
    * shows what it left behind.
+   *
+   * An event dropped while a mutation HOLDS the path is remembered, because
+   * the mutation may end without refreshing (a failure, a `skipRefresh`
+   * success, a refusal after queueing); `replayDroppedEchoes` then hands it to
+   * the refresh policy so a change made during the hold is not lost.
    */
-  function isEchoOfOwnWrite(path: string): boolean {
+  function holdsPath(path: string): boolean {
     for (const entry of mutations.values()) if (entry.path === path) return true;
+    return false;
+  }
+  const droppedWhileHeld = new Set<string>();
+  function isEchoOfOwnWrite(path: string): boolean {
+    if (holdsPath(path)) {
+      droppedWhileHeld.add(path);
+      return true;
+    }
     const until = mutationEchoUntil.get(path);
     return until !== undefined && Date.now() < until;
+  }
+  /** Called when a mutation ends: replays a dropped event if nothing refreshed after it. */
+  function replayDroppedEchoes(path: string, refreshed: boolean): void {
+    if (holdsPath(path) || !droppedWhileHeld.delete(path) || refreshed) return;
+    const session = Object.values(internal.sessions).find((item) => sameRepo(item.path, path, options));
+    if (!session || session.trustRequired) return;
+    bindRefreshVisibility();
+    watcherRefreshPolicy.onChange(session.path);
   }
 
   /**
@@ -3391,6 +3412,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const finishActivity = opts.trackActivity === false ? () => {} : beginMutation(path, kind);
     const release = await enterPathQueue(path);
     let succeeded = false;
+    let refreshed = false;
     try {
       // The wait may have been long: the tab can be gone or its checkout
       // missing by now.
@@ -3411,6 +3433,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const still = internal.sessions[session.id];
       if (still && still.generation === generation && !opts.skipRefresh) {
         await store.refresh(path);
+        refreshed = true;
         // The refresh updates statuses/branches but nothing refetches the
         // open diff pane, which would otherwise show pre-mutation content
         // (e.g. after partial staging) until the user clicked elsewhere.
@@ -3451,11 +3474,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         surfaced: internal.workspace.activeId === session.id && internal.sessions[session.id]?.error === error,
       };
     } finally {
-      // The trailing window opens when the mutation, refresh included, ends,
-      // and only for one that succeeded (see isEchoOfOwnWrite).
-      if (succeeded) mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
-      finishActivity();
+      // The queue is released FIRST: a subscriber that throws while activity
+      // is published below must not strand every later mutation on this path.
       release();
+      try {
+        // The trailing window opens when the mutation, refresh included, ends,
+        // and only for one that succeeded (see isEchoOfOwnWrite).
+        if (succeeded) mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+        finishActivity();
+      } finally {
+        replayDroppedEchoes(path, refreshed);
+      }
     }
   }
 

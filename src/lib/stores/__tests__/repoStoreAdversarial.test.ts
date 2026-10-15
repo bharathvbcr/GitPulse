@@ -130,7 +130,7 @@ describe("attack 1: target identity", () => {
 });
 
 describe("attack 6: bulk fetch/pull", () => {
-  it("BREAK: a repo that went missing while queued is still pulled (the bulk skip check reads a snapshot taken before the sweep)", async () => {
+  it("a repo that went missing while queued is still pulled (the bulk skip check reads a snapshot taken before the sweep)", async () => {
     const pulled: string[] = [];
     const holdA = deferred<unknown>();
     const store = makeStore(
@@ -155,7 +155,7 @@ describe("attack 6: bulk fetch/pull", () => {
     expect(report.results.find((r) => r.path === "/r/b")?.status).toBe("skipped");
   });
 
-  it("BREAK: two bulk pulls (or a bulk pull and a single pull) run git pull on the same repository concurrently", async () => {
+  it("two bulk pulls (or a bulk pull and a single pull) run git pull on the same repository concurrently", async () => {
     let inFlight = 0;
     let peak = 0;
     const gate = deferred<unknown>();
@@ -223,7 +223,7 @@ describe("attack 6: bulk fetch/pull", () => {
 });
 
 describe("attack 6: echo window", () => {
-  it("BREAK: a pull that runs longer than the 2.5s window stops suppressing its own watcher echoes while it is still running", async () => {
+  it("a pull that runs longer than the 2.5s window stops suppressing its own watcher echoes while it is still running", async () => {
     vi.useFakeTimers();
     const loads = { n: 0 };
     const hold = deferred<unknown>();
@@ -248,12 +248,14 @@ describe("attack 6: echo window", () => {
     await running;
   });
 
-  it("BREAK: a mutation that failed leaves the echo window armed, so a real external change right after it is dropped and nothing refreshes", async () => {
+  it("a mutation that failed leaves no echo window, and a change made during its hold is replayed, so nothing is dropped unseen", async () => {
     vi.useFakeTimers();
     const loads = { n: 0 };
+    const hold = deferred<unknown>();
     const store = makeStore(
       makeInvoke({
         cmd_pull: async () => {
+          await hold.promise;
           throw new Error("CONFLICT: merge stopped half way");
         },
         cmd_list_branches: async () => {
@@ -263,7 +265,19 @@ describe("attack 6: echo window", () => {
       }),
     );
     await store.openRepo("/r/a");
-    await store.pull();
+    loads.n = 0;
+    // A real change lands while the pull is held, then the pull fails: the
+    // failure never refreshes, so the dropped event is replayed.
+    const running = store.pull();
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBe(0);
+    hold.resolve(undefined);
+    await running;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBeGreaterThan(0);
+    // ...and a change right after the failure is not suppressed either.
     loads.n = 0;
     await store.handleRepoChanged("/r/a");
     await vi.advanceTimersByTimeAsync(600);
@@ -273,7 +287,7 @@ describe("attack 6: echo window", () => {
 });
 
 describe("attack 7: surfaced", () => {
-  it("BREAK: concurrent failures with the same message on the active tab report surfaced:false for all but one, so reportFailure toasts N-1 extra times", async () => {
+  it("concurrent failures with the same message on the active tab report surfaced:false for all but one, so reportFailure toasts N-1 extra times", async () => {
     const store = makeStore(
       makeInvoke({
         cmd_create_branch: async () => {

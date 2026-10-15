@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { isDeferredUnderLoad } from "../async/deferral";
 
 export type ToastKind = "success" | "info" | "warning" | "error";
@@ -125,11 +125,7 @@ function createToastStore() {
    * as long as a fresh one would, not for whatever was left of its clock.
    */
   function restart(id: string) {
-    let duration = 0;
-    update((toasts) => {
-      duration = toasts.find((t) => t.id === id)?.duration ?? 0;
-      return toasts;
-    });
+    const duration = get({ subscribe }).find((t) => t.id === id)?.duration ?? 0;
     if (duration <= 0) return;
     const timer = timers.get(id);
     if (timer) clearTimeout(timer);

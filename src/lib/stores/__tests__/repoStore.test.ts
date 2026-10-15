@@ -4850,3 +4850,103 @@ describe("repoStore per-path mutation queue", () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe("repoStore echo replay and queue release", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function reloading(pull: InvokeFn, loads: { n: number }) {
+    return makeStore(
+      makeInvoke({
+        cmd_pull: pull,
+        cmd_list_branches: async () => {
+          loads.n += 1;
+          return [] as never;
+        },
+      }),
+    );
+  }
+
+  it("replays a change made during a held pull that then fails", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = reloading(async () => {
+      await hold.promise;
+      throw new Error("conflict");
+    }, loads);
+    await store.openRepo("/r/a");
+    loads.n = 0;
+    const running = store.pull();
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBe(0);
+    hold.resolve(undefined);
+    await running;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBeGreaterThan(0);
+  });
+
+  it("replays a change dropped during a bulk pull, which skips its own refresh", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = reloading(async () => {
+      await hold.promise;
+      return { policy: null, output: "ok" } as never;
+    }, loads);
+    await store.openRepo("/r/a");
+    const run = store.runAcrossOpenRepos("pull", { only: ["/r/a"] });
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    hold.resolve(undefined);
+    await run;
+    loads.n = 0;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBeGreaterThan(0);
+  });
+
+  it("does not replay when the mutation refreshed itself", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = reloading(async () => {
+      await hold.promise;
+      return { policy: null, output: "ok" } as never;
+    }, loads);
+    await store.openRepo("/r/a");
+    const running = store.pull();
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    hold.resolve(undefined);
+    await running;
+    loads.n = 0;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBe(0);
+  });
+
+  it("a throwing activity subscriber does not strand the path's queue", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => undefined as never,
+        cmd_push: async () => undefined as never,
+      }),
+    );
+    await store.openRepo("/r/a");
+    let boom = false;
+    const stop = store.mutationActivity.subscribe((activity) => {
+      if (boom && gitActionCount(activity) === 0) throw new Error("subscriber failed");
+    });
+    boom = true;
+    await store.commit("m").catch(() => undefined);
+    boom = false;
+    const next = await Promise.race([
+      store.push().then(() => "ran"),
+      new Promise<string>((r) => setTimeout(() => r("stuck"), 500)),
+    ]);
+    stop();
+    expect(next).toBe("ran");
+  });
+});

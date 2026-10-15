@@ -79,6 +79,16 @@ describe("discarded mutation outcomes", () => {
     expect(scanSvelte(component, FIXTURE_NAMES).discarded).toEqual([3]);
   });
 
+  it("flags a one-line arrow that is a markup event handler, and accepts its voided and handled forms", () => {
+    const scanMarkup = (markup: string) => scanSvelte(`<script>\n</script>\n${markup}`, FIXTURE_NAMES).discarded;
+    expect(scanMarkup("<button onclick={() => repoStore.checkoutBranch(x)}>x</button>")).toEqual([3]);
+    expect(scanMarkup("<button on:click={() => repoStore.checkoutBranch(x)}>x</button>")).toEqual([3]);
+    expect(scanMarkup("<button onclick={() => void repoStore.checkoutBranch(x)}>x</button>")).toEqual([]);
+    expect(scanMarkup("<button onclick={() => handle(x)}>x</button>")).toEqual([]);
+    // Not a handler: the value is rendered or passed on.
+    expect(scanMarkup("<Row action={() => repoStore.checkoutBranch(x)} />")).toEqual([]);
+  });
+
   it("accepts a kept, returned, tested or explicitly abandoned outcome", () => {
     expect(scan("const o = await repoStore.createBranch(name);")).toEqual([]);
     expect(scan("o = await repoStore.createBranch(name);")).toEqual([]);
@@ -124,6 +134,13 @@ describe("a mutation after a prompt names its repository", () => {
     expect(untargetedAfterPrompt("async function f() {\n  const n = await askText({});\n  await repoStore.createBranch(n, sha);\n}")).toEqual([3]);
     expect(untargetedAfterPrompt("async function f() {\n  await askConfirm({});\n  const o = await repoStore.discardChanges(path, undefined);\n}")).toEqual([3]);
     expect(untargetedAfterPrompt("toastStore.action('x', 'Undo', async () => {\n  await repoStore.createBranch(n, sha);\n});")).toEqual([2]);
+  });
+
+  it("sees through an aliased store, a destructured method and an aliased prompt", () => {
+    expect(untargetedAfterPrompt("async function f() {\n  const s = repoStore;\n  await askConfirm({});\n  await s.discardChanges(path);\n}")).toEqual([4]);
+    expect(untargetedAfterPrompt("async function f() {\n  const { deleteBranch: del } = repoStore;\n  await askConfirm({});\n  await del(name);\n}")).toEqual([4]);
+    expect(untargetedAfterPrompt("import { askConfirm as ask } from './modalStore';\nasync function f() {\n  await ask({});\n  await repoStore.discardChanges(path);\n}")).toEqual([4]);
+    expect(untargetedAfterPrompt("async function f(target) {\n  const s = repoStore;\n  await askConfirm({});\n  await s.discardChanges(path, target);\n}")).toEqual([]);
   });
 
   it("accepts a captured target, and a call that follows no prompt", () => {

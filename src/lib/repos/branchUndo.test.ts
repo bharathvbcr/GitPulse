@@ -66,7 +66,7 @@ describe("offerBranchUndo", () => {
     offerBranchUndo('Deleted branch "x"', [{ name: "x", tip: "abc" }], target);
     expect(await clickUndo()).toBe(false);
     const error = get(toastStore).find((t) => t.kind === "error");
-    expect(error?.message).toContain("Restored 0 of 1 branch");
+    expect(error?.message).toContain("Could not restore the branch.");
     expect(error?.message).toContain("x at abc");
     expect(error?.message).toContain("repository changed");
   });
