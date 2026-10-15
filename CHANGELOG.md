@@ -174,6 +174,25 @@ before that tag is pushed.
 
 ### Fixed
 
+- **A dependency or coverage scan returns by one deadline, and a partial
+  coverage scan no longer reads as Measured.**
+  - The whole dependency scan has one `AUDIT_TIMEOUT` (90 s) deadline, checked
+    before each auditor and each npm root. A command still running at it is cut
+    at it (its timeout is what is left of the deadline). The report comes back
+    with `audit_complete: false`, a limit notice and a `scan_deadline` issue
+    naming each step that did not run. A fast repository is still complete.
+  - The coverage scan checks the same deadline before each artifact and each
+    source read; a cut report is `truncated`, names what it did not read, and is
+    not cached.
+  - When the path-existence memo fills (200,000 probes), the report is
+    `truncated` with a "path existence checks" notice, and the Coverage header
+    says Partial coverage. It also counts reported files that matched nothing in
+    the repository as a reason.
+  - The end-of-file check reads a source only as far as the highest line the
+    report recorded for it (never out to 2 MiB for a file with early hits), and
+    at most 8,000 source reads per scan; past that the report is `truncated`.
+  - A coverage cache hit shares the stored hit maps instead of copying them.
+
 - **Ledger rows say when the thing happened, and which task was bound then.**
   A transcript or reflog row used to be stamped when a catch-up pass read it, so
   twelve rows from two sessions sat within 5 ms of one another, and every one of

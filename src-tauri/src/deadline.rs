@@ -114,3 +114,124 @@ impl<S: Timed + Write> Write for DeadlineStream<S> {
         self.stream.flush()
     }
 }
+
+/// How long one analyzer command may run, and — by the card's decision — how
+/// long one whole dependency or coverage scan may run. The scan deadline is
+/// this one number, not a second product budget.
+pub(crate) const AUDIT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// One wall-clock deadline for a scan made of many small pieces of work
+/// (auditors, artifacts, source reads).
+///
+/// A per-piece timeout bounds each piece, so a scan's worst case is their
+/// sum. A scan that checks one `ScanDeadline` before starting each piece, and
+/// hands the piece what is left of it as its own timeout, is bounded by the
+/// deadline plus the grace of whatever piece was already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanDeadline {
+    at: Instant,
+}
+
+impl ScanDeadline {
+    /// A deadline `budget` from now.
+    pub fn after(budget: Duration) -> Self {
+        Self {
+            at: Instant::now() + budget,
+        }
+    }
+
+    /// A deadline of one [`AUDIT_TIMEOUT`] from now.
+    pub fn audit() -> Self {
+        Self::after(AUDIT_TIMEOUT)
+    }
+
+    /// What is left of the budget; zero once it has passed.
+    pub fn remaining(&self) -> Duration {
+        #[cfg(test)]
+        if tests::forced_exhausted() {
+            return Duration::ZERO;
+        }
+        self.at.saturating_duration_since(Instant::now())
+    }
+
+    /// True once the budget has passed. Checked before starting each piece of
+    /// work, never after, so a scan that finishes in time is never reported
+    /// as cut.
+    pub fn expired(&self) -> bool {
+        #[cfg(test)]
+        if tests::forced_check() {
+            return true;
+        }
+        self.at <= Instant::now()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `Some(n)`: the next `n` `expired()` checks on this thread answer
+        /// "no", every later one answers "yes" — whatever the clock says. Lets
+        /// a test cut a scan between two exact pieces of work without a sleep.
+        static FORCED_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn forced_check() -> bool {
+        FORCED_AFTER.with(|c| match c.get() {
+            Some(0) => true,
+            Some(n) => {
+                c.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+
+    pub(crate) fn forced_exhausted() -> bool {
+        FORCED_AFTER.with(|c| c.get() == Some(0))
+    }
+
+    /// Restores real-clock behaviour when dropped.
+    pub(crate) struct ExpireAfterChecks;
+
+    impl ExpireAfterChecks {
+        pub(crate) fn new(checks: usize) -> Self {
+            FORCED_AFTER.with(|c| c.set(Some(checks)));
+            Self
+        }
+    }
+
+    impl Drop for ExpireAfterChecks {
+        fn drop(&mut self) {
+            FORCED_AFTER.with(|c| c.set(None));
+        }
+    }
+
+    #[test]
+    fn a_fresh_deadline_is_open_and_a_zero_budget_is_expired() {
+        let open = ScanDeadline::after(Duration::from_secs(60));
+        assert!(!open.expired());
+        assert!(open.remaining() > Duration::from_secs(50));
+        let spent = ScanDeadline::after(Duration::ZERO);
+        assert!(spent.expired());
+        assert_eq!(spent.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_forced_countdown_expires_exactly_after_n_checks() {
+        let open = ScanDeadline::after(Duration::from_secs(60));
+        let _forced = ExpireAfterChecks::new(2);
+        assert!(!open.expired());
+        assert!(!open.expired());
+        assert!(open.expired());
+        assert_eq!(open.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_audit_deadline_is_one_audit_timeout() {
+        assert_eq!(AUDIT_TIMEOUT, Duration::from_secs(90));
+        assert!(ScanDeadline::audit().remaining() <= AUDIT_TIMEOUT);
+    }
+}

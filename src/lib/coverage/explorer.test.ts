@@ -74,4 +74,35 @@ describe("coverage exploration", () => {
     expect(coverageScanReasons(report, false)).toEqual([]);
     expect(coverageScanStatus(report, false, false, false)).toBe("Measured");
   });
+
+  it("counts reported files that matched nothing in the repository as a reason, not a Measured scan", () => {
+    const report: CoverageReport = { files: [], families: [], languages: [], artifacts: [], truncated: false, overall: { lines_found: 1, lines_hit: 0, percentage: 0 } };
+    const withUnresolved = (n?: number): CoverageArtifact => ({ ...artifact(false), unresolved_files: n });
+    expect(coverageScanReasons({ ...report, artifacts: [withUnresolved(0), withUnresolved(undefined)] }, false)).toEqual([]);
+    expect(coverageScanReasons({ ...report, artifacts: [withUnresolved(1)] }, false))
+      .toEqual(["1 reported file matched no file in this repository"]);
+    expect(coverageScanReasons({ ...report, artifacts: [withUnresolved(3), withUnresolved(4)] }, false))
+      .toEqual(["7 reported files matched no file in this repository"]);
+    expect(coverageScanStatus({ ...report, artifacts: [withUnresolved(2)] }, false, false, false)).toBe("Partial coverage");
+  });
+
+  it("is never Measured when the existence-probe cap or the scan deadline cut the scan", () => {
+    const base: CoverageReport = { files: [], families: [], languages: [], artifacts: [], truncated: false, overall: { lines_found: 5, lines_hit: 5, percentage: 100 } };
+    const probes = { resource: "path existence checks", kept: 200000, total: 200431 };
+    const deadline = { resource: "coverage artifacts read before the scan deadline", kept: 2, total: 5 };
+    const cases: Array<[Partial<CoverageReport>, string, string[]]> = [
+      [{}, "Measured", []],
+      [{ truncated: true }, "Partial coverage", ["the scan did not read every artifact"]],
+      [{ limit_notices: [probes] }, "Partial coverage", ["only 200000 of 200431 path existence checks were kept"]],
+      [{ truncated: true, limit_notices: [probes, deadline] }, "Partial coverage", ["the scan did not read every artifact", "only 200000 of 200431 path existence checks were kept", "only 2 of 5 coverage artifacts read before the scan deadline were kept"]],
+      [{ limit_notices: [{ ...probes, total: 200000 }] }, "Measured", []],
+    ];
+    for (const [patch, status, reasons] of cases) {
+      const report = { ...base, ...patch };
+      expect(coverageScanStatus(report, false, false, false)).toBe(status);
+      expect(coverageScanReasons(report, false)).toEqual(reasons);
+    }
+    const unmeasured = { ...base, truncated: true, overall: { lines_found: 0, lines_hit: 0, percentage: 0 } };
+    expect(coverageScanStatus(unmeasured, false, false, false)).toBe("Unmeasured · partial scan");
+  });
 });
