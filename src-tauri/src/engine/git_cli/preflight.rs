@@ -199,6 +199,10 @@ pub(crate) fn assess_for_clone(preflight: &GitPreflight, submodules: bool) -> Re
 /// kept beside the probe until that table exists, so the two are one move.
 pub(crate) const SINCE_AS_FILTER: (u32, u32, u32) = (2, 37, 0);
 
+/// Oldest git that accepts `--diff-merges=<format>`. A feature floor, not the
+/// app's: a caller below it spells first-parent rendering `-m --first-parent`.
+pub(crate) const DIFF_MERGES_OPTION: (u32, u32, u32) = (2, 31, 0);
+
 /// Whether `preflight`'s git is at least `min`. Fails closed: a git that was
 /// not probed (`Unchecked`), is missing or broken, or whose version line cannot
 /// be read is not "new enough", so the caller takes its fallback rather than
