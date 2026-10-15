@@ -290,6 +290,8 @@ impl WorkbenchState {
 
     pub(crate) fn shutdown(&self) {
         self.0.closed.store(true, Ordering::Release);
+        // The external-changes loop may be waiting out a hidden window.
+        external_changes::wake();
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }

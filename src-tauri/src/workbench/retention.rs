@@ -169,6 +169,14 @@ impl Retention {
         true
     }
 
+    /// How long until [`Retention::due_to_check`] next says yes: nothing for a
+    /// loop that has not looked yet, then what is left of [`CHECK_EVERY`].
+    pub(crate) fn next_check_in(&self, now: Instant) -> Duration {
+        self.checked.map_or(Duration::ZERO, |at| {
+            CHECK_EVERY.saturating_sub(now.saturating_duration_since(at))
+        })
+    }
+
     pub(crate) fn tick(&mut self, host: &WorkbenchState) {
         if !self.due_to_check(Instant::now()) {
             return;

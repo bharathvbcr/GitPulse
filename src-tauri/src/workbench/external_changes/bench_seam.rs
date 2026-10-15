@@ -4,22 +4,29 @@
 //! The running app starts the loop with an `AppHandle`, which needs a window
 //! system a bench does not have, and what that bench measures is the loop's
 //! schedule. [`IdleLoop`] runs the same [`drive`] over a real clock, a real
-//! [`Watcher`] on a private profile, and a window that is whatever the caller
-//! says. It adds no logic of its own; the window's answer, the clock and the
-//! announcement are the only things replaced.
+//! [`Watcher`] on a private profile and a [`Beacon`] of its own, with a window
+//! that is whatever the caller says. It adds no logic of its own; the window's
+//! answer and the announcement are the only things replaced. The unit tests use
+//! it too, for the properties that need a real thread and a real wait.
 
-use super::{drive, Env, Watcher};
+use super::{drive, Beacon, Env, Watcher};
 use crate::workbench::retention::Retention;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
+struct Counts {
+    waits: AtomicU64,
+    polls: AtomicU64,
+}
+
 struct Idle {
     profile: PathBuf,
     open: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
-    pauses: Arc<AtomicU64>,
+    counts: Arc<Counts>,
     watcher: Watcher,
     retention: Retention,
 }
@@ -36,25 +43,31 @@ impl Env for Idle {
         // what a wakeup count is about.
         self.retention.due_to_check(now);
     }
+    fn retention_next_in(&self, now: Instant) -> Duration {
+        self.retention.next_check_in(now)
+    }
     fn query_window(&self) -> bool {
         self.visible.load(Ordering::Acquire)
     }
     fn poll(&mut self) -> Result<bool, String> {
+        self.counts.polls.fetch_add(1, Ordering::Relaxed);
         self.watcher.poll(&self.profile)
     }
     fn announce(&self) -> Result<(), String> {
         Ok(())
     }
-    fn pause(&self, period: Duration) {
-        self.pauses.fetch_add(1, Ordering::Relaxed);
-        std::thread::sleep(period);
+    fn wait(&mut self, beacon: &Beacon, seen: u64, timeout: Duration) {
+        self.counts.waits.fetch_add(1, Ordering::Relaxed);
+        beacon.wait(seen, timeout);
     }
 }
 
 /// A running loop over a private profile, with a window the caller controls.
 pub struct IdleLoop {
     open: Arc<AtomicBool>,
-    pauses: Arc<AtomicU64>,
+    visible: Arc<AtomicBool>,
+    beacon: Arc<Beacon>,
+    counts: Arc<Counts>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -69,34 +82,55 @@ impl IdleLoop {
             .map_err(|e| e.to_string())?;
         drop(connection);
         let open = Arc::new(AtomicBool::new(true));
-        let pauses = Arc::new(AtomicU64::new(0));
+        let visible = Arc::new(AtomicBool::new(visible));
+        let beacon = Arc::new(Beacon::new(visible.load(Ordering::Acquire)));
+        let counts = Arc::new(Counts::default());
         let mut env = Idle {
             profile,
             open: Arc::clone(&open),
-            visible: Arc::new(AtomicBool::new(visible)),
-            pauses: Arc::clone(&pauses),
+            visible: Arc::clone(&visible),
+            counts: Arc::clone(&counts),
             watcher: Watcher::default(),
             retention: Retention::new(),
         };
-        let thread = std::thread::Builder::new()
-            .name("bench-external-changes".into())
-            .spawn(move || drive(&mut env))
-            .map_err(|e| e.to_string())?;
+        let thread = crate::supervisor::spawn_once(
+            "bench-external-changes",
+            "workbench external changes (bench)",
+            {
+                let beacon = Arc::clone(&beacon);
+                move || drive(&mut env, &beacon)
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             open,
-            pauses,
+            visible,
+            beacon,
+            counts,
             thread: Some(thread),
         })
     }
 
-    /// How many times the loop has gone round: one per pause it took.
-    pub fn rounds(&self) -> u64 {
-        self.pauses.load(Ordering::Relaxed)
+    /// The window was shown or hidden, as an event says it.
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+        self.beacon.set_on_screen(visible);
     }
 
-    /// Asks the loop to end and waits for it.
+    /// How many times the loop has gone to wait: one per round.
+    pub fn rounds(&self) -> u64 {
+        self.counts.waits.load(Ordering::Relaxed)
+    }
+
+    /// How many watcher passes the loop has made.
+    pub fn passes(&self) -> u64 {
+        self.counts.polls.load(Ordering::Relaxed)
+    }
+
+    /// Closes the host and waits for the loop to notice.
     pub fn stop(mut self) {
         self.open.store(false, Ordering::Release);
+        self.beacon.wake();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
