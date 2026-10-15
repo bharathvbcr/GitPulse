@@ -15,6 +15,18 @@ import { terminalSessions } from "../terminal/sessionRegistry";
 const source = readFileSync(new URL("./RepoTabBar.svelte", import.meta.url), "utf8");
 
 describe("RepoTabBar", () => {
+  it("ignores the tab-changing shortcuts while a prompt is open, before any of them runs", () => {
+    const handler = source.slice(source.indexOf("function handleKey"), source.indexOf("onMount("));
+    const guard = handler.indexOf("isPromptOpen()");
+    expect(guard).toBeGreaterThan(-1);
+    // Escape still closes the tab menus; every switch happens after the guard.
+    expect(guard).toBeGreaterThan(handler.indexOf('e.key === "Escape"'));
+    expect(guard).toBeLessThan(handler.indexOf("switch (classifyShortcut(e))"));
+    expect(guard).toBeLessThan(handler.indexOf("repoStore.activateTabAt"));
+    expect(guard).toBeLessThan(handler.indexOf("repoStore.closeActiveTab"));
+    expect(guard).toBeLessThan(handler.indexOf("onOpen?.()"));
+  });
+
   it("keeps global Tasks and Fleet reachable when no repositories are open", () => {
     const { body } = render(RepoTabBar);
     expect(body).toContain('data-testid="tasks-tab-chip"');

@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../../stores/sourceScan";
 import { compile } from "svelte/compiler";
 
 const source = readFileSync(new URL("./FileTreePanel.svelte", import.meta.url), "utf8");
@@ -46,5 +47,15 @@ describe("FileTreePanel source contracts", () => {
     expect(source).not.toContain("cmd_write_file_content");
     expect(source).toContain("validate: (value) => newPathProblem(");
     expect(source).toContain('typedError?.code === "already_exists"');
+  });
+
+  it("discards against the repository it asked about, and keeps every index outcome", () => {
+    const discard = functionBody(source, "discardFile");
+    expect(discard.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(discard.indexOf("repoStore.captureTarget()")).toBeLessThan(discard.indexOf("await askConfirm("));
+    expect(discard).toContain("repoStore.discardChanges(path, target)");
+    expect(discard).toContain("reportFailure(");
+    expect(functionBody(source, "stageFile")).toContain("return await repoStore.stageFile(path);");
+    expect(functionBody(source, "unstageFile")).toContain("return await repoStore.unstageFile(path);");
   });
 });

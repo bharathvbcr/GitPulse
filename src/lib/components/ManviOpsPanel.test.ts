@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import ManviOpsPanel from "./ManviOpsPanel.svelte";
 
@@ -199,5 +200,25 @@ describe("ManviOpsPanel issue monitor task integration", () => {
     expect(source).toContain("if (!opts.background || !tasksFollowChanges) void loadRepoTasks(repo);");
     expect(source).toContain("tasksFollowChanges = true;");
     expect(source).toContain("createAdaptiveTimer(() => {");
+  });
+});
+
+describe("ManviOpsPanel cleanup runs against the repository it asked about", () => {
+  it.each([
+    ["cleanTags", "repoStore.deleteTag(name, target)"],
+    ["cleanBranches", "repoStore.deleteBranch(candidate.name, false, target)"],
+  ])("%s names its repository before the confirm and stops on a refusal", (name, call) => {
+    const body = functionBody(source, name);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeLessThan(body.indexOf("await askConfirm("));
+    expect(body).toContain(call);
+    expect(body).toContain("outcome.refused");
+    expect(body).not.toMatch(/\$repoStore\.currentPath !== repo\) break/);
+  });
+
+  it("offers every Undo through the one owner and never restores by hand", () => {
+    expect(functionBody(source, "cleanBranches")).toContain("offerBranchUndo(");
+    expect(source).not.toContain("repoStore.createBranch(");
+    expect(source).not.toContain("Restored ${restoredTips.length}");
   });
 });

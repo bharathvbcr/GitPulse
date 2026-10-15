@@ -4,6 +4,7 @@ import {
   askText,
   cancelPrompt,
   completePrompt,
+  isPromptOpen,
   promptState,
 } from "../modalStore";
 import { get } from "svelte/store";
@@ -67,5 +68,14 @@ describe("modalStore prompts", () => {
     expect(() => completePrompt("x")).not.toThrow();
     expect(() => cancelPrompt()).not.toThrow();
     expect(get(promptState)).toBeNull();
+  });
+
+  it("isPromptOpen follows the open prompt", async () => {
+    expect(isPromptOpen()).toBe(false);
+    const pending = askConfirm({ title: "t" });
+    expect(isPromptOpen()).toBe(true);
+    completePrompt(true);
+    await pending;
+    expect(isPromptOpen()).toBe(false);
   });
 });

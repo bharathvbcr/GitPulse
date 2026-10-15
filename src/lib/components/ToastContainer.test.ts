@@ -93,4 +93,10 @@ describe("the live region exists before the content lands in it", () => {
     const style = source.slice(source.indexOf("<style>"));
     expect(style).not.toMatch(/background(?:-color)?:\s*rgb\(var\(--c-(?:bg|surface|surface-hover)\)\)/);
   });
+
+  it("keeps an action's toast when the action reports it did not complete", () => {
+    const handler = source.slice(source.indexOf("async function handleAction"), source.indexOf("let expanded"));
+    expect(handler).toContain("=== false");
+    expect(handler).toMatch(/if \(!keep\)\s*{?\s*toastStore\.dismiss\(toast\.id\)/);
+  });
 });

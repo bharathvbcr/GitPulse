@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import ManviHarnessPane, {
   activityHistoryPresentations,
@@ -207,5 +208,16 @@ describe("ManviHarnessPane capability truth", () => {
       ]),
     );
     expect(source).toContain("activityHistoryPresentations(");
+  });
+
+  it("creates the suggested branch in the repository it was suggested for, and keeps it on failure", () => {
+    expect(functionBody(source, "suggestBranch")).toContain("branchTarget = repoStore.captureTarget();");
+    const create = functionBody(source, "createSuggestedBranch");
+    // createBranch resolves {ok:false}; it never throws, so no try can catch it.
+    expect(create).not.toContain("try {");
+    expect(create).toContain("await repoStore.createBranch(branchSuggestion, undefined, branchTarget)");
+    expect(create).toContain("if (outcome.ok)");
+    expect(create).toMatch(/branchError = outcome\.error/);
+    expect(create.indexOf('branchSuggestion = ""')).toBeGreaterThan(create.indexOf("if (outcome.ok)"));
   });
 });
