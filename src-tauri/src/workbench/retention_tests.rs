@@ -135,3 +135,42 @@ fn a_real_profile_compacts_through_store_compact() {
     });
     assert!(matches!(outcome, Outcome::Ran(_)), "{outcome:?}");
 }
+
+/// The loop's clock must agree with the one `tick` used to keep: a look when
+/// none has been made, none until a whole window has passed, one at exactly it.
+#[test]
+fn the_check_clock_is_due_first_then_exactly_at_the_window() {
+    let start = Instant::now();
+    let mut retention = Retention::new();
+    assert_eq!(retention.next_check_in(start), Duration::ZERO);
+    assert!(retention.due_to_check(start), "the first look is due");
+    assert_eq!(retention.next_check_in(start), CHECK_EVERY);
+    let almost = start + CHECK_EVERY - Duration::from_nanos(1);
+    assert_eq!(retention.next_check_in(almost), Duration::from_nanos(1));
+    assert!(!retention.due_to_check(almost), "a nanosecond early");
+    assert_eq!(retention.next_check_in(start + CHECK_EVERY), Duration::ZERO);
+    assert!(retention.due_to_check(start + CHECK_EVERY), "exactly due");
+    assert_eq!(
+        retention.next_check_in(start + CHECK_EVERY),
+        CHECK_EVERY,
+        "a look restarts the window"
+    );
+}
+
+#[test]
+fn the_check_clock_survives_a_clock_that_reads_earlier_and_a_huge_jump() {
+    let start = Instant::now() + Duration::from_secs(3600);
+    let mut retention = Retention::new();
+    assert!(retention.due_to_check(start));
+    // A reading before the last look: not due, and a full window still to go
+    // rather than an underflow.
+    let before = start - Duration::from_secs(3600);
+    assert!(!retention.due_to_check(before));
+    assert_eq!(retention.next_check_in(before), CHECK_EVERY);
+    // A suspend that lasted days: due once, then not again at the same reading.
+    let later = start + Duration::from_secs(5 * 86_400);
+    assert_eq!(retention.next_check_in(later), Duration::ZERO);
+    assert!(retention.due_to_check(later));
+    assert!(!retention.due_to_check(later), "one look per window");
+    assert_eq!(retention.next_check_in(later), CHECK_EVERY);
+}

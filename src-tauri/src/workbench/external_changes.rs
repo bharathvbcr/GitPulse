@@ -27,6 +27,7 @@
 //! signals, bounded by the next real window check and the next retention look,
 //! and wakes about twice a minute instead of every two seconds.
 
+#[doc(hidden)]
 pub mod bench_seam;
 
 use super::WorkbenchState;
@@ -231,9 +232,15 @@ pub(crate) trait Env {
 pub(crate) fn drive(env: &mut impl Env, beacon: &Beacon) {
     let mut last_error: Option<String> = None;
     let mut presence = Presence { verified: None };
-    while env.is_open() {
-        // Before the window is looked at, so no event can slip between.
+    loop {
+        // Before the host is asked whether it is open and before the window is
+        // looked at, so nothing can slip between: a close that lands after this
+        // read ends the wait at once, and one that landed before it is seen by
+        // `is_open`.
         let seen = beacon.generation();
+        if !env.is_open() {
+            break;
+        }
         let now = env.now();
         env.retention_tick(now);
         if !presence.on_screen(beacon, seen, now, || env.query_window()) {
@@ -672,6 +679,13 @@ mod tests {
         waits: Vec<Duration>,
         polls: u32,
         first_poll_at: Option<Duration>,
+        /// A real watcher over a profile, for the tests that need a commit to
+        /// be seen; `poll` answers `false` without one.
+        watch: Option<(std::path::PathBuf, Watcher)>,
+        /// Commits another process makes: offset from the start, and the value.
+        writes: Vec<(Duration, i64)>,
+        /// When each announcement was made, as an offset from the start.
+        announced: std::cell::RefCell<Vec<Duration>>,
     }
 
     impl<'a> Sim<'a> {
@@ -691,6 +705,9 @@ mod tests {
                 waits: Vec::new(),
                 polls: 0,
                 first_poll_at: None,
+                watch: None,
+                writes: Vec::new(),
+                announced: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -726,13 +743,30 @@ mod tests {
             self.polls += 1;
             self.first_poll_at
                 .get_or_insert(self.now.duration_since(self.start));
-            Ok(false)
+            match self.watch.as_mut() {
+                Some((path, watcher)) => watcher.poll(path),
+                None => Ok(false),
+            }
         }
         fn announce(&self) -> Result<(), String> {
+            self.announced
+                .borrow_mut()
+                .push(self.now.duration_since(self.start));
             Ok(())
         }
         fn wait(&mut self, beacon: &Beacon, seen: u64, timeout: Duration) {
             self.waits.push(timeout);
+            // Commits land as virtual time passes, wherever the loop was.
+            let reach = self.now + timeout;
+            while let Some(&(offset, value)) = self.writes.first() {
+                if self.start + offset > reach {
+                    break;
+                }
+                self.writes.remove(0);
+                if let Some((path, _)) = &self.watch {
+                    write(path, value);
+                }
+            }
             if beacon.generation() != seen {
                 return;
             }
@@ -887,5 +921,291 @@ mod tests {
             "the loop took {:?} to notice the close",
             stopping.elapsed()
         );
+    }
+
+    /// A host whose close lands right after the loop was told it was open.
+    struct Closing<'a> {
+        beacon: &'a Beacon,
+        asked: Cell<u32>,
+        blocked: Cell<u32>,
+    }
+
+    impl Env for Closing<'_> {
+        fn is_open(&self) -> bool {
+            let asked = self.asked.get();
+            self.asked.set(asked + 1);
+            if asked == 0 {
+                // `shutdown` sets the flag and wakes, in that order; the loop
+                // had already been told "open".
+                self.beacon.wake();
+                return true;
+            }
+            false
+        }
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn retention_tick(&mut self, _now: Instant) {}
+        fn retention_next_in(&self, _now: Instant) -> Duration {
+            Duration::from_secs(600)
+        }
+        fn query_window(&self) -> bool {
+            false
+        }
+        fn poll(&mut self) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn announce(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&mut self, beacon: &Beacon, seen: u64, _timeout: Duration) {
+            if beacon.generation() == seen {
+                self.blocked.set(self.blocked.get() + 1);
+            }
+        }
+    }
+
+    /// A close that lands between the loop's "is the host open" and its read
+    /// of the counter must still end the wait it goes on to make.
+    #[test]
+    fn a_close_after_the_open_check_does_not_leave_the_loop_waiting() {
+        let beacon = Beacon::new(false);
+        let mut env = Closing {
+            beacon: &beacon,
+            asked: Cell::new(0),
+            blocked: Cell::new(0),
+        };
+        super::drive(&mut env, &beacon);
+        assert_eq!(
+            env.blocked.get(),
+            0,
+            "the loop went to sleep on a host that had already closed"
+        );
+    }
+
+    #[test]
+    fn the_counter_wraps_without_losing_a_wakeup() {
+        let beacon = Beacon::new(false);
+        *beacon.generation.lock().unwrap() = u64::MAX;
+        let seen = beacon.generation();
+        beacon.wake();
+        assert_eq!(beacon.generation(), 0);
+        assert!(beacon.wait(seen, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_poisoned_beacon_still_wakes_and_waits() {
+        let beacon = std::sync::Arc::new(Beacon::new(false));
+        let poisoner = std::sync::Arc::clone(&beacon);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.generation.lock().unwrap();
+            panic!("poison the beacon");
+        })
+        .join();
+        assert!(beacon.generation.is_poisoned());
+        let seen = beacon.generation();
+        assert!(!beacon.wait(seen, Duration::from_millis(5)));
+        beacon.set_on_screen(true);
+        assert!(beacon.wait(seen, Duration::from_secs(60)));
+        assert!(beacon.on_screen());
+        beacon.wake();
+    }
+
+    #[test]
+    fn a_zero_and_an_unbounded_wait_are_both_safe() {
+        let beacon = std::sync::Arc::new(Beacon::new(false));
+        let seen = beacon.generation();
+        let started = Instant::now();
+        assert!(!beacon.wait(seen, Duration::ZERO));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
+        let waker = std::sync::Arc::clone(&beacon);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waker.wake();
+        });
+        assert!(
+            beacon.wait(seen, Duration::MAX),
+            "an unbounded wait ends on a wake"
+        );
+        thread.join().unwrap();
+    }
+
+    /// Whatever the window does, the loop's rounds are bounded by the clock and
+    /// by events: a simulated hour hidden is about two a minute, not a spin.
+    #[test]
+    fn an_hour_hidden_is_about_two_rounds_a_minute() {
+        let beacon = Beacon::new(false);
+        let mut sim = Sim::new(&beacon, false, Duration::from_secs(3600));
+        super::drive(&mut sim, &beacon);
+        assert!(
+            sim.waits.len() <= 125,
+            "{} rounds in a simulated hour hidden",
+            sim.waits.len()
+        );
+        assert!(sim.waits.iter().all(|wait| *wait >= super::MIN_WAIT));
+        assert_eq!(sim.polls, 0);
+    }
+
+    /// The real window says visible while the events say hidden, over and
+    /// over: the disagreement costs passes at the visible rate, no more.
+    #[test]
+    fn a_window_that_disagrees_with_its_events_costs_no_more_than_the_visible_rate() {
+        let beacon = Beacon::new(false);
+        let mut sim = Sim::new(&beacon, true, Duration::from_secs(3600));
+        for minute in 1..60 {
+            sim.events.push((Duration::from_secs(60 * minute), false));
+        }
+        super::drive(&mut sim, &beacon);
+        assert!(sim.polls <= 3600, "{} passes in an hour", sim.polls);
+        assert!(
+            sim.waits.len() <= 3600 + 60,
+            "{} rounds in an hour",
+            sim.waits.len()
+        );
+    }
+
+    /// A clock that says a retention look is always due cannot make the loop
+    /// spin faster than the shortest wait.
+    #[test]
+    fn a_retention_clock_that_is_always_due_is_held_to_the_shortest_wait() {
+        let beacon = Beacon::new(false);
+        let sim = Sim::new(&beacon, false, Duration::from_secs(60));
+        // Never records a look, so `retention_next_in` stays zero.
+        struct NeverLooked<'a>(Sim<'a>);
+        impl Env for NeverLooked<'_> {
+            fn is_open(&self) -> bool {
+                self.0.is_open()
+            }
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn retention_tick(&mut self, _now: Instant) {}
+            fn retention_next_in(&self, _now: Instant) -> Duration {
+                Duration::ZERO
+            }
+            fn query_window(&self) -> bool {
+                false
+            }
+            fn poll(&mut self) -> Result<bool, String> {
+                self.0.poll()
+            }
+            fn announce(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait(&mut self, beacon: &Beacon, seen: u64, timeout: Duration) {
+                self.0.wait(beacon, seen, timeout);
+            }
+        }
+        let mut env = NeverLooked(sim);
+        super::drive(&mut env, &beacon);
+        assert!(
+            env.0.waits.iter().all(|wait| *wait >= super::MIN_WAIT),
+            "a wait shorter than the floor: {:?}",
+            env.0.waits.iter().min()
+        );
+        assert!(env.0.waits.len() <= 60_000 + 1, "{}", env.0.waits.len());
+    }
+
+    /// A day hidden: retention looks exactly as often as it did when the loop
+    /// woke every two seconds, once a window.
+    #[test]
+    fn retention_looks_once_a_window_over_a_simulated_day_hidden() {
+        let beacon = Beacon::new(false);
+        let mut sim = Sim::new(&beacon, false, Duration::from_secs(24 * 3600));
+        super::drive(&mut sim, &beacon);
+        assert_eq!(sim.retention_checks, 144);
+        assert_eq!(sim.polls, 0);
+    }
+
+    fn profile_in(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("workbench.sqlite");
+        write(&path, 1);
+        path
+    }
+
+    /// An external write shows within about a second while visible.
+    #[test]
+    fn an_external_write_while_visible_is_announced_within_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let beacon = Beacon::new(true);
+        let mut sim = Sim::new(&beacon, true, Duration::from_secs(30));
+        sim.watch = Some((profile_in(dir.path()), Watcher::default()));
+        sim.writes.push((Duration::from_millis(7_300), 2));
+        super::drive(&mut sim, &beacon);
+        let announced = sim.announced.borrow().clone();
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert!(
+            announced[0] >= Duration::from_millis(7_300)
+                && announced[0] <= Duration::from_millis(7_300) + VISIBLE_PERIOD,
+            "announced at {:?}",
+            announced[0]
+        );
+    }
+
+    /// Visible, then hidden, then visible: a commit made while hidden is
+    /// announced by the first pass after the show, not lost and not late.
+    #[test]
+    fn a_write_made_while_hidden_is_announced_on_the_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let beacon = Beacon::new(true);
+        let mut sim = Sim::new(&beacon, true, Duration::from_secs(60));
+        sim.watch = Some((profile_in(dir.path()), Watcher::default()));
+        sim.events.push((Duration::from_secs(5), false));
+        sim.events.push((Duration::from_secs(40), true));
+        sim.writes.push((Duration::from_secs(20), 2));
+        super::drive(&mut sim, &beacon);
+        assert_eq!(
+            *sim.announced.borrow(),
+            vec![Duration::from_secs(40)],
+            "one announcement, at the show"
+        );
+    }
+
+    /// Show, hide, show inside a millisecond, and a burst of them: the last
+    /// event decides, and nothing waits on the earlier ones.
+    #[test]
+    fn a_burst_of_window_events_settles_on_the_last_one() {
+        let beacon = Beacon::new(false);
+        let seen = beacon.generation();
+        for on in [true, false, true, false, true] {
+            beacon.set_on_screen(on);
+        }
+        assert!(beacon.on_screen());
+        assert!(beacon.wait(seen, Duration::from_secs(60)));
+        let seen = beacon.generation();
+        beacon.set_on_screen(false);
+        beacon.set_on_screen(true);
+        // A real query that read the state before those events is older.
+        beacon.correct(seen, false);
+        assert!(beacon.on_screen(), "a stale query overwrote a newer event");
+    }
+
+    /// Threaded: events hammered from another thread while the loop runs never
+    /// leave it asleep through a final show.
+    #[test]
+    fn hide_then_show_in_a_millisecond_never_strands_a_hidden_loop() {
+        use super::bench_seam::IdleLoop;
+        use crate::test_support::coverage_relaxed;
+        let dir = tempfile::tempdir().unwrap();
+        let looped = IdleLoop::start(dir.path(), true).unwrap();
+        for _ in 0..200 {
+            looped.set_visible(false);
+            looped.set_visible(true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        looped.set_visible(false);
+        assert!(until(coverage_relaxed(Duration::from_secs(10)), || {
+            looped.rounds() >= 1
+        }));
+        std::thread::sleep(Duration::from_millis(50));
+        let before = looped.passes();
+        looped.set_visible(true);
+        assert!(
+            until(coverage_relaxed(Duration::from_millis(50)), || {
+                looped.passes() > before
+            }),
+            "the show after the burst was slept through"
+        );
+        looped.stop();
     }
 }
