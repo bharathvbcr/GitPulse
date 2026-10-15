@@ -179,6 +179,12 @@
     }
   }
 
+  async function checkoutHere() {
+    closeMenu();
+    const outcome = await repoStore.checkoutBranch(row.id);
+    reportFailure(outcome, "Could not check out the commit");
+  }
+
   function filterByAuthor() {
     closeMenu();
     if (row.author_name) {
@@ -421,7 +427,7 @@
     <button
       role="menuitem"
       class="gp-menu-item"
-      onclick={() => { closeMenu(); repoStore.checkoutBranch(row.id); }}
+      onclick={() => void checkoutHere()}
     >
       <GitBranch size={12} class="text-textMuted" />
       <span>Checkout Commit</span>

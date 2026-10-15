@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { codeOnly, svelteFiles, tsSourceFiles } from "./sourceScan";
+import { discardedMutations, mutationNames, scanSvelte, scanTypeScript, untargetedAfterPrompt } from "./mutationScan";
+import { svelteFiles, tsSourceFiles } from "./sourceScan";
 
 /**
  * A repoStore mutation's outcome is never thrown away.
@@ -15,62 +16,20 @@ import { codeOnly, svelteFiles, tsSourceFiles } from "./sourceScan";
  * an explicit `void repoStore.x()`, whose failure still reaches the session's
  * error banner.
  *
- * The mutation names are derived from repoStore.ts — the members whose body
- * runs `runMutating(` or `runStageBatch(` — so a new mutation is covered the
- * day it is written.
+ * The scanner (mutationScan.ts) reads the TypeScript syntax tree, and the
+ * mutation names are derived from repoStore.ts by return type — members that
+ * return `MutationOutcome` — so a new mutation is covered the day it is
+ * written, however it reaches the wrapper.
+ *
+ * A mutation that follows a prompt, a confirm or a toast action must also name
+ * the repository it was asked about: without a target it lands on whichever
+ * tab is active when the answer arrives.
  */
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const STORE_SOURCE = readFileSync(join(SRC, "lib", "stores", "repoStore.ts"), "utf8");
 
-/** Members of the store literal whose body runs one of the mutation wrappers. */
-function mutationNames(storeSource: string): Set<string> {
-  const start = storeSource.indexOf("const store = {");
-  const end = storeSource.indexOf("return store;", start);
-  const literal = storeSource.slice(start, end);
-  const heads = [...literal.matchAll(/^ {4}(\w+): /gm)];
-  const names = new Set<string>();
-  heads.forEach((head, index) => {
-    const body = literal.slice(head.index, heads[index + 1]?.index ?? literal.length);
-    if (/\b(?:runMutating|runStageBatch)\(/.test(body)) names.add(head[1]);
-  });
-  return names;
-}
-
-/**
- * `.svelte` source with each `<script>` body reduced to its code (comments and
- * strings blanked) and each `<style>` body blanked. Offsets are preserved.
- */
-function svelteCode(source: string): string {
-  return source
-    .replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/g, (_all, open, body, close) => open + codeOnly(body) + close)
-    .replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/g, (_all, open, body, close) => open + body.replace(/[^\n]/g, " ") + close);
-}
-
-/** Lines of statement-level `await repoStore.<mutation>(…)` whose value is dropped. */
-function discardedMutations(code: string, names: ReadonlySet<string>): number[] {
-  const lines: number[] = [];
-  for (const call of code.matchAll(/\bawait\s+repoStore\.(\w+)\s*\(/g)) {
-    if (!names.has(call[1])) continue;
-    const before = code.slice(0, call.index).trimEnd();
-    const startsStatement =
-      before === "" || ";{})".includes(before.slice(-1)) || /\b(?:else|do)$/.test(before);
-    if (!startsStatement) continue;
-    let at = (call.index ?? 0) + call[0].length;
-    for (let depth = 1; at < code.length && depth > 0; at += 1) {
-      if (code[at] === "(") depth += 1;
-      else if (code[at] === ")") depth -= 1;
-    }
-    // Anything still chained on the line (`.ok`, `?.`, `&&`, `,`) uses the value.
-    const next = /^[ \t]*(.?)/.exec(code.slice(at))?.[1] ?? "";
-    if (next === "" || next === ";" || next === "}") {
-      lines.push(code.slice(0, call.index).split("\n").length);
-    }
-  }
-  return lines;
-}
-
-const FIXTURE_NAMES = new Set(["createBranch", "discardChanges"]);
+const FIXTURE_NAMES = new Set(["createBranch", "discardChanges", "checkoutBranch", "deleteBranch"]);
 
 describe("mutation names are derived from repoStore.ts", () => {
   it("includes every mutation callers use, and none of the reads", () => {
@@ -98,14 +57,14 @@ describe("mutation names are derived from repoStore.ts", () => {
       "fetch",
     ];
     expect(floor.filter((name) => !names.has(name))).toEqual([]);
-    for (const read of ["refresh", "openRepo", "closeTab", "selectFileDiff", "trustRepo"]) {
+    for (const read of ["refresh", "openRepo", "closeTab", "selectFileDiff", "trustRepo", "setAmending"]) {
       expect(names.has(read)).toBe(false);
     }
   });
 });
 
 describe("discarded mutation outcomes", () => {
-  const scan = (script: string) => discardedMutations(codeOnly(script), FIXTURE_NAMES);
+  const scan = (script: string) => discardedMutations(script, FIXTURE_NAMES);
 
   it("flags a bare awaited statement, however it is introduced", () => {
     expect(scan("await repoStore.createBranch(name, sha);")).toEqual([1]);
@@ -116,8 +75,8 @@ describe("discarded mutation outcomes", () => {
   });
 
   it("flags a bare awaited statement in markup", () => {
-    const code = svelteCode("<button onclick={async () => { await repoStore.createBranch(n); }}>x</button>");
-    expect(discardedMutations(code, FIXTURE_NAMES)).toEqual([1]);
+    const component = "<script>\n</script>\n<button onclick={async () => { await repoStore.createBranch(n); }}>x</button>";
+    expect(scanSvelte(component, FIXTURE_NAMES).discarded).toEqual([3]);
   });
 
   it("accepts a kept, returned, tested or explicitly abandoned outcome", () => {
@@ -129,6 +88,28 @@ describe("discarded mutation outcomes", () => {
     expect(scan("const f = () => repoStore.createBranch(name);")).toEqual([]);
     expect(scan("void repoStore.createBranch(name);")).toEqual([]);
     expect(scan("const f = async () => await repoStore.createBranch(name);")).toEqual([]);
+    expect(scan("repoStore.createBranch(name).then((o) => report(o));")).toEqual([]);
+  });
+
+  it("flags the shapes that hide a discard", () => {
+    expect(scan("repoStore.checkoutBranch(id);")).toEqual([1]);
+    expect(scan("repoStore.createBranch(name).then(() => ok());")).toEqual([1]);
+    expect(scan("repoStore.createBranch(name).catch(() => {});")).toEqual([1]);
+    expect(scan("const { deleteBranch: del } = repoStore;\nawait del(name);")).toEqual([2]);
+    expect(scan("const s = repoStore;\nawait s.createBranch(name);")).toEqual([2]);
+    expect(scan("const go = repoStore.createBranch;\nawait go(name);")).toEqual([2]);
+    expect(scan("await repoStore.createBranch?.(name);")).toEqual([1]);
+    expect(scan("await repoStore['createBranch'](name);")).toEqual([1]);
+    expect(scan("(await repoStore.createBranch(name));")).toEqual([1]);
+    expect(scan("await repoStore\n  .createBranch(name);")).toEqual([1]);
+    expect(scan("await repoStore.createBranch(name), done();")).toEqual([1]);
+    expect(scan("await Promise.all(names.map((n) => repoStore.deleteBranch(n)));")).toEqual([1]);
+    expect(scan("names.forEach((n) => repoStore.deleteBranch(n));")).toEqual([1]);
+    expect(scan("ready && (await repoStore.createBranch(name));")).toEqual([1]);
+  });
+
+  it("accepts a combinator whose results are kept", () => {
+    expect(scan("const all = await Promise.all(names.map((n) => repoStore.deleteBranch(n)));")).toEqual([]);
   });
 
   it("ignores reads, comments and strings", () => {
@@ -138,18 +119,34 @@ describe("discarded mutation outcomes", () => {
   });
 });
 
+describe("a mutation after a prompt names its repository", () => {
+  it("flags a post-prompt call with no target, and a target that is explicitly undefined", () => {
+    expect(untargetedAfterPrompt("async function f() {\n  const n = await askText({});\n  await repoStore.createBranch(n, sha);\n}")).toEqual([3]);
+    expect(untargetedAfterPrompt("async function f() {\n  await askConfirm({});\n  const o = await repoStore.discardChanges(path, undefined);\n}")).toEqual([3]);
+    expect(untargetedAfterPrompt("toastStore.action('x', 'Undo', async () => {\n  await repoStore.createBranch(n, sha);\n});")).toEqual([2]);
+  });
+
+  it("accepts a captured target, and a call that follows no prompt", () => {
+    expect(untargetedAfterPrompt("async function f() {\n  const target = repoStore.captureTarget();\n  await askConfirm({});\n  await repoStore.discardChanges(path, target);\n}")).toEqual([]);
+    expect(untargetedAfterPrompt("async function f() {\n  await repoStore.createBranch(name);\n}")).toEqual([]);
+  });
+});
+
 describe("components never drop a mutation outcome", () => {
   it("holds for every component and palette module", () => {
     const names = mutationNames(STORE_SOURCE);
-    const sources = [
-      ...svelteFiles(SRC).map((file) => ({ file, code: svelteCode(readFileSync(file, "utf8")) })),
+    const scans = [
+      ...svelteFiles(SRC).map((file) => ({ file, ...scanSvelte(readFileSync(file, "utf8"), names) })),
       ...[join(SRC, "lib", "components"), join(SRC, "lib", "palette")]
         .flatMap(tsSourceFiles)
-        .map((file) => ({ file, code: codeOnly(readFileSync(file, "utf8")) })),
+        .map((file) => ({ file, ...scanTypeScript(readFileSync(file, "utf8"), names) })),
     ];
-    const offenders = sources.flatMap(({ file, code }) =>
-      discardedMutations(code, names).map((line) => `${relative(SRC, file)}:${line}`),
-    );
-    expect(offenders).toEqual([]);
+    const at = (file: string, line: number) => `${relative(SRC, file)}:${line}`;
+    expect(scans.flatMap(({ file, discarded }) => discarded.map((line) => at(file, line)))).toEqual([]);
+    // The palette guards its post-prompt calls with `checkOrigin` instead of a
+    // target (catalog.ts); moving it onto a target is a recorded follow-up, so
+    // the target rule covers the components this card converted.
+    const covered = scans.filter(({ file }) => !relative(SRC, file).startsWith(join("lib", "palette")));
+    expect(covered.flatMap(({ file, untargeted }) => untargeted.map((line) => at(file, line)))).toEqual([]);
   });
 });

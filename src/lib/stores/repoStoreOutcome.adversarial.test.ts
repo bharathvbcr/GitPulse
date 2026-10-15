@@ -3,50 +3,17 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { codeOnly, svelteFiles, tsSourceFiles } from "./sourceScan";
+import { discardedMutations, mutationNames } from "./mutationScan";
 
 /**
  * Adversarial review of repoStoreOutcome.contract.test.ts (ft-1629347b).
  *
- * `mutationNames` and `discardedMutations` below are verbatim copies of the
- * contract test's private helpers (they are not exported; importing the test
- * file would re-run it). If the contract is hardened these copies should be
- * replaced by imports from a shared module.
+ * `mutationNames` and `discardedMutations` are the contract test's own
+ * scanner, imported from mutationScan.ts (they were verbatim copies of its
+ * old private helpers until the scanner was rebuilt on the compiler API).
  */
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-
-function mutationNames(storeSource: string): Set<string> {
-  const start = storeSource.indexOf("const store = {");
-  const end = storeSource.indexOf("return store;", start);
-  const literal = storeSource.slice(start, end);
-  const heads = [...literal.matchAll(/^ {4}(\w+): /gm)];
-  const names = new Set<string>();
-  heads.forEach((head, index) => {
-    const body = literal.slice(head.index, heads[index + 1]?.index ?? literal.length);
-    if (/\b(?:runMutating|runStageBatch)\(/.test(body)) names.add(head[1]);
-  });
-  return names;
-}
-
-function discardedMutations(code: string, names: ReadonlySet<string>): number[] {
-  const lines: number[] = [];
-  for (const call of code.matchAll(/\bawait\s+repoStore\.(\w+)\s*\(/g)) {
-    if (!names.has(call[1])) continue;
-    const before = code.slice(0, call.index).trimEnd();
-    const startsStatement = before === "" || ";{})".includes(before.slice(-1)) || /\b(?:else|do)$/.test(before);
-    if (!startsStatement) continue;
-    let at = (call.index ?? 0) + call[0].length;
-    for (let depth = 1; at < code.length && depth > 0; at += 1) {
-      if (code[at] === "(") depth += 1;
-      else if (code[at] === ")") depth -= 1;
-    }
-    const next = /^[ \t]*(.?)/.exec(code.slice(at))?.[1] ?? "";
-    if (next === "" || next === ";" || next === "}") {
-      lines.push(code.slice(0, call.index).split("\n").length);
-    }
-  }
-  return lines;
-}
 
 const NAMES = new Set(["createBranch", "deleteBranch", "discardChanges", "checkoutBranch"]);
 const scan = (script: string) => discardedMutations(codeOnly(script), NAMES);
