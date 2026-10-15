@@ -10,6 +10,11 @@
 //! then drops the permit. The parent closes nothing a worker uses: closing a
 //! descriptor does not wake a blocked read, and a recycled number could close
 //! someone else's file.
+//!
+//! The `poll` branch is compiled for Unix test builds only: it is the host
+//! stand-in that exercises the same worker, permit and cancel logic as the
+//! Windows overlapped-I/O branch, not a production path. Production Unix uses
+//! `pipe_drain`; `git_cli.rs` compiles this module only for `not(unix)` or test.
 
 use super::{Drained, ProcessObserver, SpawnPermit, Stop};
 use std::io;
@@ -57,7 +62,7 @@ impl Cancel {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 mod sys {
     use super::{Cancel, CancelRead, CancelWrite};
     use std::io::{self, Read, Write};
@@ -203,6 +208,21 @@ mod sys {
     impl CancelWrite for ChildStdin {
         fn write_cancellable(&mut self, buf: &[u8], cancel: &Cancel) -> io::Result<usize> {
             write_fd(self, buf, cancel)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{wait, Cancel};
+
+        /// POLLNVAL on the data descriptor is a readiness event, not a cancel:
+        /// the caller goes on to read or write and sees the real error.
+        #[test]
+        fn an_invalid_descriptor_reports_ready_not_cancelled() {
+            let cancel = Cancel::new().unwrap();
+            // Far above any descriptor this process can have open.
+            assert!(wait(900_000, libc::POLLIN, &cancel).unwrap());
+            assert!(!cancel.is_set());
         }
     }
 }
@@ -389,6 +409,9 @@ mod sys {
                     wait_error = Some(io::Error::last_os_error());
                 }
                 // Not found just means it completed first; the drain reports.
+                // Any other failure leaves the request in flight, so the drain
+                // below can block until the pipe closes. That is acceptable:
+                // the blocked worker keeps its spawn permit until it returns.
                 // SAFETY: cancels exactly this request on this handle.
                 unsafe { CancelIoEx(handle, &mut *overlapped) };
             }
@@ -462,7 +485,7 @@ mod sys {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(all(unix, test), windows)))]
 mod sys {
     use super::{Cancel, CancelRead, CancelWrite};
     use std::io::{self, Read, Write};
@@ -794,7 +817,7 @@ impl InputFeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{reader, Cancel, CancelRead, Drained, InputFeed, OutputDrains, Stop, Worker};
+    use super::{reader, Cancel, CancelRead, Done, Drained, InputFeed, OutputDrains, Stop, Worker};
     use crate::engine::git_cli::{SpawnGate, SpawnPermit};
     use crate::procguard::LockedSpawn;
     use std::io::{self, Read};
@@ -1178,5 +1201,216 @@ mod tests {
             thread::yield_now();
         }
         assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(unix)]
+    fn exited(args: &[&str]) -> (std::process::ChildStdin, ChildStdout) {
+        let mut child = Command::new("sh")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        // `Child::wait` closes stdin, so keep it open on the parent's side.
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        child.wait().unwrap();
+        (stdin, stdout)
+    }
+
+    /// POLLHUP on a closed write end is EOF, never a cancel.
+    #[test]
+    #[cfg(unix)]
+    fn a_hung_up_pipe_reads_as_eof_not_cancelled() {
+        let (_stdin, mut stdout) = exited(&["-c", "exit 0"]);
+        let cancel = Cancel::new().unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(stdout.read_cancellable(&mut buf, &cancel).unwrap(), 0);
+        assert!(!cancel.is_set());
+    }
+
+    /// POLLERR on a write whose reader is gone is a broken pipe, never a cancel.
+    #[test]
+    #[cfg(unix)]
+    fn a_write_to_a_closed_reader_is_broken_not_cancelled() {
+        use super::CancelWrite;
+        let (mut stdin, _stdout) = exited(&["-c", "exit 0"]);
+        let cancel = Cancel::new().unwrap();
+        let error = stdin.write_cancellable(b"x", &cancel).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(!cancel.is_set());
+    }
+
+    /// O_NONBLOCK lands on the parent's own open file description only: the
+    /// child's end of the pipe is a different description and stays blocking,
+    /// so a child outrunning a slow reader waits instead of failing EAGAIN.
+    #[test]
+    #[cfg(unix)]
+    fn nonblocking_mode_never_reaches_the_childs_end() {
+        struct Slow(ChildStdout);
+        impl CancelRead for Slow {
+            fn read_cancellable(&mut self, buf: &mut [u8], cancel: &Cancel) -> io::Result<usize> {
+                thread::sleep(Duration::from_millis(20));
+                self.0.read_cancellable(buf, cancel)
+            }
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "head -c 400000 /dev/zero"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let worker = reader(Some(Slow(child.stdout.take().unwrap())), 1 << 20, permit()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !worker.finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            child.wait().unwrap().success(),
+            "child saw a non-blocking pipe"
+        );
+        let (drained, finished) = worker.take();
+        assert!(finished && drained.stop.is_none());
+        assert_eq!(drained.bytes.len(), 400_000);
+    }
+
+    #[test]
+    fn cancel_is_idempotent_and_never_blocks_on_a_full_signal_pipe() {
+        let cancel = Cancel::new().unwrap();
+        // Far more raises than any pipe buffer holds; a blocking raise hangs.
+        for _ in 0..200_000 {
+            cancel.set();
+        }
+        assert!(cancel.is_set());
+    }
+
+    #[test]
+    fn cancel_after_eof_and_a_second_cancel_are_harmless() {
+        let gate = gate(4);
+        let worker = reader(Some(io::Cursor::new(b"abc")), 64, take_permit(gate)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        worker.cancel();
+        worker.cancel();
+        let (drained, finished) = worker.take();
+        assert!(finished);
+        assert_eq!(drained.bytes, b"abc");
+        assert!(drained.stop.is_none() && !drained.truncated);
+        settle_or_report(gate, &mut [], "cancel after EOF");
+    }
+
+    #[test]
+    fn a_panicking_worker_still_releases_its_permit_and_marks_done() {
+        let permit = permit();
+        let weak = Arc::downgrade(&permit);
+        let worker = Worker::start((), permit, |_, _| panic!("worker fault")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            worker.wait_until(deadline),
+            "done flag never set after a panic"
+        );
+        assert!(worker.finished());
+        assert!(weak.upgrade().is_none(), "panic leaked the permit");
+        let (_, clean) = worker.take();
+        assert!(!clean, "a panicked worker is not a clean finish");
+    }
+
+    /// Wakeups that do not set the flag must not end the wait early.
+    #[test]
+    fn spurious_wakeups_do_not_end_wait_until_early() {
+        let done = Arc::new(Done::default());
+        let poke = done.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopper = stop.clone();
+        let poker = thread::spawn(move || {
+            while !stopper.load(std::sync::atomic::Ordering::Acquire) {
+                poke.changed.notify_all();
+                thread::yield_now();
+            }
+        });
+        let started = Instant::now();
+        let ended = done.wait_until(started + Duration::from_millis(150));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        poker.join().unwrap();
+        assert!(!ended);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_cap_at_an_exact_chunk_boundary_is_not_truncated_one_byte_more_is() {
+        for (len, cap, truncated) in [
+            (16_384usize, 16_384usize, false),
+            (16_385, 16_384, true),
+            (32_768, 32_768, false),
+            (32_768, 16_384, true),
+        ] {
+            let worker = reader(Some(io::Cursor::new(vec![7u8; len])), cap, permit()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.finished() && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            let (drained, finished) = worker.take();
+            assert!(finished);
+            assert_eq!(drained.truncated, truncated, "len {len} cap {cap}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_empty_payload_closes_stdin_so_the_child_sees_eof() {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let feed = InputFeed::new(child.stdin.take(), &[], permit()).unwrap();
+        feed.finish().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().ok();
+                child.wait().ok();
+                panic!("stdin stayed open after an empty payload");
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_closes_stdin_early_fails_the_feed_with_a_broken_pipe_not_a_hang() {
+        let gate = gate(4);
+        let mut child = Command::new("sh")
+            .args(["-c", "exec 0<&-; sleep 30"])
+            .stdin(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        // Give the shell time to close its end before the writer starts.
+        thread::sleep(Duration::from_millis(200));
+        let feed =
+            InputFeed::new(child.stdin.take(), &vec![1; 1024 * 1024], take_permit(gate)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !feed.0.as_ref().unwrap().finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let finished = feed.0.as_ref().unwrap().finished();
+        let message = feed.finish().err();
+        settle_or_report(
+            gate,
+            std::slice::from_mut(&mut child),
+            "child closed stdin early",
+        );
+        assert!(finished, "writer hung on a closed reader");
+        assert!(
+            message.is_some_and(|m| m.contains("Broken pipe")),
+            "expected a broken pipe error"
+        );
     }
 }
