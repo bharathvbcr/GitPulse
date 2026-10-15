@@ -650,3 +650,257 @@ fn concurrent_first_passes_after_a_move_reanchor_once() {
     );
     assert_eq!(count_action(&new, "ledger.reanchor"), 1);
 }
+
+/// A shallow trusted clone (depth 1) of a two-commit repository.
+fn shallow_clone_at(parent: &Path, name: &str) -> String {
+    let source = repo_at(parent, &format!("{name}-src"), "one");
+    std::fs::write(Path::new(&source).join("two.txt"), "two").unwrap();
+    git_in(Path::new(&source), &["add", "two.txt"]);
+    git_in(Path::new(&source), &["commit", "-m", "two"]);
+    let path = parent.canonicalize().unwrap().join(name);
+    git_in(
+        parent,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{source}"),
+            path.to_str().unwrap(),
+        ],
+    );
+    trust_repo(&path);
+    path.to_string_lossy().into_owned()
+}
+
+/// Threat (pinned, not endorsed): a different repository that merged this
+/// one's whole history has every root this ledger recorded, so once the source
+/// is gone the carried ledger reads as a move. The rule says "recorded roots
+/// are still roots": it cannot tell a merged-in history from a root added by an
+/// orphan branch, and refusing the first refuses the second.
+#[test]
+fn a_repository_that_merged_the_source_history_takes_the_carried_ledger() {
+    let parent = tempfile::tempdir().unwrap();
+    let a = repo_at(parent.path(), "a", "alpha");
+    let mut corpus = Corpus::new();
+    corpus.edit(&a);
+    assert_eq!(corpus.pass(&a).recorded, 1);
+
+    let b = parent.path().canonicalize().unwrap().join("b");
+    std::fs::create_dir(&b).unwrap();
+    git_in(&b, &["init", "-b", "main"]);
+    std::fs::write(b.join("other.txt"), "b").unwrap();
+    git_in(&b, &["add", "other.txt"]);
+    git_in(&b, &["commit", "-m", "beta"]);
+    git_in(&b, &["fetch", "-q", &a, "main:from-a"]);
+    git_in(
+        &b,
+        &[
+            "merge",
+            "-q",
+            "--allow-unrelated-histories",
+            "-m",
+            "fold",
+            "from-a",
+        ],
+    );
+    trust_repo(&b);
+    let b = b.to_string_lossy().into_owned();
+    carry_ledger(&a, &b);
+    std::fs::remove_dir_all(&a).unwrap();
+    corpus.edit(&b);
+    let out = corpus.pass(&b);
+    assert_eq!(out.reanchored_from, vec![a], "{out:?}");
+}
+
+/// A remote carrying a credential in any spelling is never written to the
+/// ledger, in the identity records or anywhere else.
+#[test]
+fn no_remote_credential_reaches_the_ledger() {
+    let parent = tempfile::tempdir().unwrap();
+    let repo = repo_at(parent.path(), "repo", "seed");
+    let dir = Path::new(&repo);
+    git_in(
+        dir,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://user:SECRETtok@host.test/a/b.git?token=SECRETtok#SECRETtok",
+        ],
+    );
+    git_in(
+        dir,
+        &["remote", "add", "up.stream", "SECRETtok@host2.test:a/b.git"],
+    );
+    git_in(
+        dir,
+        &[
+            "remote",
+            "add",
+            "v6",
+            "ssh://git:SECRETtok@[::1]:2222/a/b.git",
+        ],
+    );
+    git_in(
+        dir,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://SECRETtok@push.test/a",
+        ],
+    );
+    git_in(
+        dir,
+        &[
+            "config",
+            "url.https://SECRETtok@rewrite.test/.insteadOf",
+            "rw:",
+        ],
+    );
+    let mut corpus = Corpus::new();
+    corpus.edit(&repo);
+    assert_eq!(corpus.pass(&repo).recorded, 1);
+    let conn = rusqlite::Connection::open(ledger::ledger_path(&repo)).unwrap();
+    let mut stmt = conn.prepare("SELECT * FROM events").unwrap();
+    let width = stmt.column_count();
+    let mut rows = stmt.query([]).unwrap();
+    let mut anchors = 0;
+    while let Some(row) = rows.next().unwrap() {
+        for column in 0..width {
+            let text = match row.get_ref(column).unwrap() {
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    String::from_utf8_lossy(bytes).to_string()
+                }
+                _ => continue,
+            };
+            assert!(
+                !text.to_lowercase().contains("secrettok"),
+                "column {column} holds a credential: {text}"
+            );
+        }
+        anchors += 1;
+    }
+    assert!(anchors >= 2, "the anchor row and the transcript row exist");
+}
+
+/// Remotes with a credential or query in them are compared as recorded, so a
+/// moved repository whose remote carries one is still taken over, and a fork
+/// behind a different such remote is still not.
+#[test]
+fn a_remote_with_a_credential_in_it_still_identifies_a_moved_repository() {
+    let parent = tempfile::tempdir().unwrap();
+    let repo = repo_at(parent.path(), "repo", "seed");
+    let remote = "https://user:SECRETtok@host.test/a/b.git?token=SECRETtok#frag";
+    git_in(Path::new(&repo), &["remote", "add", "origin", remote]);
+    let mut corpus = Corpus::new();
+    corpus.edit(&repo);
+    assert_eq!(corpus.pass(&repo).recorded, 1);
+    let moved = mv(&repo, &parent.path().canonicalize().unwrap().join("moved"));
+    corpus.edit(&moved);
+    let out = corpus.pass(&moved);
+    assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
+    assert_eq!(out.reanchored_from, vec![repo.clone()], "{out:?}");
+
+    let other = repo_at(parent.path(), "other", "seed");
+    git_in(
+        Path::new(&other),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://host.test/a/b.git?token=SECRETtok",
+        ],
+    );
+    corpus.edit(&other);
+    assert_eq!(corpus.pass(&other).recorded, 1);
+    let moved = mv(
+        &other,
+        &parent.path().canonicalize().unwrap().join("other-moved"),
+    );
+    git_in(
+        Path::new(&moved),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://host.test/a/other.git?token=SECRETtok",
+        ],
+    );
+    corpus.edit(&moved);
+    assert_refused(&corpus.pass(&moved), "remotes");
+}
+
+/// Threat to availability: unshallowing a clone that did not move changes its
+/// roots. The ledger is at home, so nothing is refused, and the record follows.
+#[test]
+fn unshallowing_a_repository_that_did_not_move_keeps_recording() {
+    let parent = tempfile::tempdir().unwrap();
+    let repo = shallow_clone_at(parent.path(), "shallow");
+    let mut corpus = Corpus::new();
+    corpus.edit(&repo);
+    assert_eq!(corpus.pass(&repo).recorded, 1);
+    git_in(Path::new(&repo), &["fetch", "-q", "--unshallow"]);
+    ledger::forget_identity_state(&repo);
+    corpus.edit(&repo);
+    let out = corpus.pass(&repo);
+    assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
+    assert_eq!(count_action(&repo, "ledger.anchor"), 2, "the roots changed");
+}
+
+/// A history rewrite that changes the root, with no move, is not a reason to
+/// refuse the repository its own ledger.
+#[test]
+fn a_rewritten_root_without_a_move_keeps_recording() {
+    let parent = tempfile::tempdir().unwrap();
+    let repo = repo_at(parent.path(), "repo", "seed");
+    let mut corpus = Corpus::new();
+    corpus.edit(&repo);
+    assert_eq!(corpus.pass(&repo).recorded, 1);
+    git_in(
+        Path::new(&repo),
+        &["commit", "--amend", "-m", "rewritten root"],
+    );
+    ledger::forget_identity_state(&repo);
+    corpus.edit(&repo);
+    let out = corpus.pass(&repo);
+    assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
+    // And the rewritten identity is the one a later move is judged against.
+    let moved = mv(&repo, &parent.path().canonicalize().unwrap().join("moved"));
+    corpus.edit(&moved);
+    let out = corpus.pass(&moved);
+    assert_eq!(out.reanchored_from, vec![repo], "{out:?}");
+}
+
+/// A shallow repository that moves is the same repository; one unshallowed in
+/// the same breath has other roots than the ledger recorded and is refused
+/// (fail closed: the roots are what identify it).
+#[test]
+fn a_moved_shallow_repository_is_taken_over_unless_it_was_unshallowed_too() {
+    let parent = tempfile::tempdir().unwrap();
+    let mut corpus = Corpus::new();
+
+    let plain = shallow_clone_at(parent.path(), "plain");
+    corpus.edit(&plain);
+    assert_eq!(corpus.pass(&plain).recorded, 1);
+    let moved = mv(
+        &plain,
+        &parent.path().canonicalize().unwrap().join("plain-moved"),
+    );
+    corpus.edit(&moved);
+    let out = corpus.pass(&moved);
+    assert_eq!(out.reanchored_from, vec![plain], "{out:?}");
+
+    let deep = shallow_clone_at(parent.path(), "deep");
+    corpus.edit(&deep);
+    assert_eq!(corpus.pass(&deep).recorded, 1);
+    let moved = mv(
+        &deep,
+        &parent.path().canonicalize().unwrap().join("deep-moved"),
+    );
+    git_in(Path::new(&moved), &["fetch", "-q", "--unshallow"]);
+    corpus.edit(&moved);
+    assert_refused(&corpus.pass(&moved), "root commit");
+}

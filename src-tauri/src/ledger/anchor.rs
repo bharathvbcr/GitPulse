@@ -56,8 +56,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use super::redact;
 use super::{
     canonical_repo, foreign_row_sql, home_spellings, insert, prepare, write_tx, ActorKind, Draft,
     LedgerError,
@@ -74,6 +76,15 @@ const MARKER: &str = "gitpulse-ledger-identity";
 /// More prior paths than any real history has. A ledger naming more is not
 /// one repository that moved.
 const MAX_PRIOR_PATHS: usize = 64;
+/// More re-anchor rows addressed to one repository than any real history has,
+/// and more prior paths in total. Past either, the ledger is not one
+/// repository that moved, and a list this long would also outgrow what one
+/// SQL expression may hold.
+const MAX_ALIAS_ROWS: usize = 256;
+const MAX_ALIASES: usize = 256;
+/// Bound on checking whether the prior paths are still repositories. A path
+/// comes from ledger content and may sit on a mount that never answers.
+const OCCUPIED_BUDGET: Duration = Duration::from_secs(5);
 /// How long a repository whose identity could not be settled is left alone.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Bound on the one `git rev-list` that reads the roots.
@@ -167,7 +178,11 @@ fn remotes_in(config: &str) -> BTreeSet<String> {
         .filter_map(|line| {
             let (key, value) = line.split_once('=')?;
             let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
-            (!name.is_empty()).then(|| normalise_url(value))
+            // Redacted here, not only when the row is written: the ledger
+            // stores what the redactor leaves, and a remote it would alter
+            // must compare equal to its own stored form or a moved repository
+            // is refused as a fork of itself.
+            (!name.is_empty()).then(|| redact::text(&normalise_url(value)))
         })
         .filter(|url| !url.is_empty())
         .collect()
@@ -176,7 +191,10 @@ fn remotes_in(config: &str) -> BTreeSet<String> {
 /// A remote URL with credentials, case, a trailing slash and `.git` removed,
 /// so the same upstream spelled two ways is one remote and no secret is kept.
 fn normalise_url(url: &str) -> String {
+    // A query or fragment is never part of where a repository lives, and is
+    // where tokens go: `https://host/x.git?token=...`.
     let url = url.trim();
+    let url = url.split(['?', '#']).next().unwrap_or_default();
     let without_user = match url.split_once("://") {
         Some((scheme, rest)) => {
             let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -192,12 +210,14 @@ fn normalise_url(url: &str) -> String {
             _ => url.to_string(),
         },
     };
-    let trimmed = without_user.trim_end_matches('/');
+    // Lowercased before `.git` is cut: `REPO.GIT` is the same upstream.
+    let lowered = without_user.to_ascii_lowercase();
+    let trimmed = lowered.trim_end_matches('/');
     trimmed
         .strip_suffix(".git")
         .unwrap_or(trimmed)
         .trim_end_matches('/')
-        .to_ascii_lowercase()
+        .to_string()
 }
 
 fn mismatch(reason: impl std::fmt::Display) -> LedgerError {
@@ -223,30 +243,58 @@ fn foreign_paths(conn: &Connection, allowed: &[String]) -> Result<Vec<String>, L
     rows.collect::<Result<Vec<String>, _>>().map_err(failed)
 }
 
+/// The SQL that finds the re-anchor rows addressed to a repository's spellings.
+fn aliases_sql() -> String {
+    format!(
+        "SELECT detail_json FROM events
+         WHERE session_id = ?1 AND action = ?2 AND repo_path IN (?3, ?4)
+         ORDER BY id LIMIT {}",
+        MAX_ALIAS_ROWS + 1
+    )
+}
+
 /// The prior locations of the repository at `home`, as its re-anchor rows
 /// recorded them. Seeks `idx_events_session`; reads nothing else.
+///
+/// Bounded: no move writes more than [`MAX_PRIOR_PATHS`] paths in a row, and
+/// no history has more than [`MAX_ALIAS_ROWS`] such rows or [`MAX_ALIASES`]
+/// paths. A ledger that does is refused as foreign, not read to the end. A row
+/// whose detail is not what [`settle`] writes grants nothing.
 pub(super) fn aliases(conn: &Connection, home: &[String]) -> Result<Vec<String>, LedgerError> {
     let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
-    let mut stmt = conn
-        .prepare("SELECT repo_path, detail_json FROM events WHERE session_id = ?1 AND action = ?2")
-        .map_err(failed)?;
+    let Some(first) = home.first() else {
+        return Ok(Vec::new());
+    };
+    let second = home.get(1).unwrap_or(first);
+    let mut stmt = conn.prepare(&aliases_sql()).map_err(failed)?;
     let rows = stmt
-        .query_map(params![MARKER, REANCHOR], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        .query_map(params![MARKER, REANCHOR, first, second], |row| {
+            Ok(match row.get_ref(0)? {
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+                _ => None,
+            })
         })
         .map_err(failed)?;
     let mut prior = BTreeSet::new();
-    for row in rows {
-        let (to, detail) = row.map_err(failed)?;
-        if !home.contains(&to) {
-            continue;
+    for (seen, row) in rows.enumerate() {
+        let detail = row.map_err(failed)?;
+        if seen >= MAX_ALIAS_ROWS {
+            return Err(mismatch(format!(
+                "it holds more than {MAX_ALIAS_ROWS} re-anchor records for this repository"
+            )));
         }
         let from = detail
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|value| value.get("from").cloned())
             .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
             .unwrap_or_default();
+        let too_long = from.len() > MAX_PRIOR_PATHS;
         prior.extend(from);
+        if too_long || prior.len() > MAX_ALIASES {
+            return Err(mismatch(
+                "a re-anchor record names more locations than a repository has had",
+            ));
+        }
     }
     Ok(prior.into_iter().collect())
 }
@@ -275,6 +323,35 @@ fn occupied(prior: &str, home: &Path) -> bool {
         Ok(real) => real != home && crate::engine::git_cli::is_git_repository(&real),
         Err(_) => false,
     }
+}
+
+/// Whether a prior path names a place a repository could have been: absolute
+/// and free of control characters, as `git_cli::validate_repo_path` demands.
+/// A relative path would be resolved against this process's working directory.
+fn is_location(prior: &str) -> bool {
+    Path::new(prior).is_absolute() && !prior.chars().any(char::is_control)
+}
+
+/// The first of `paths` that `probe` reports occupied, or `Err` when the probe
+/// did not finish within `budget` (or died): an unanswered question is a
+/// refusal, never "vacant". The probe runs on its own thread so a mount that
+/// never answers cannot hold the pass; the thread is left to finish on its own.
+fn first_occupied(
+    paths: Vec<String>,
+    budget: Duration,
+    probe: impl Fn(&str) -> bool + Send + 'static,
+) -> Result<Option<String>, String> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("ledger-anchor-occupied".into())
+        .spawn(move || {
+            let found = paths.into_iter().find(|path| probe(path));
+            let _ = send.send(found);
+        })
+        .map_err(|e| format!("could not check the earlier locations: {e}"))?;
+    receive
+        .recv_timeout(budget)
+        .map_err(|_| format!("the earlier locations could not be checked within {budget:?}"))
 }
 
 fn record(
@@ -330,27 +407,36 @@ fn states() -> &'static Mutex<std::collections::HashMap<PathBuf, State>> {
 /// (removing the stale copy) heals it without a restart.
 pub(crate) fn settle(repo_path: &str) -> Result<Option<Vec<String>>, LedgerError> {
     let db = super::ledger_path(repo_path);
-    {
+    // Read under the lock, acted on outside it: the probe below waits for the
+    // ledger's own lock, and that wait must not hold every other repository's
+    // settle behind this map.
+    let cached = {
         let states = states()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match states.get(&db) {
-            // Settled once is not settled for good: a repository moved back to a
-            // path this process already saw has foreign rows again. One indexed
-            // probe tells the two apart without Git.
-            Some(State::Settled)
-                if super::with_conn(repo_path, |conn| {
-                    super::refuse_foreign_rows(conn, repo_path)
-                })
-                .is_ok() =>
-            {
-                return Ok(None)
-            }
+            Some(State::Settled) => Some(None),
             Some(State::Waiting { until, refusal }) if Instant::now() < *until => {
-                return refusal.clone().map_or(Ok(None), Err);
+                Some(Some(refusal.clone()))
             }
-            _ => {}
+            _ => None,
         }
+    };
+    match cached {
+        // Settled once is not settled for good: a repository moved back to a
+        // path this process already saw has foreign rows again. One indexed
+        // probe tells the two apart without Git.
+        Some(None) => {
+            if super::with_conn(repo_path, |conn| {
+                super::refuse_foreign_rows(conn, repo_path)
+            })
+            .is_ok()
+            {
+                return Ok(None);
+            }
+        }
+        Some(Some(refusal)) => return refusal.map_or(Ok(None), Err),
+        None => {}
     }
     // Git runs before the ledger's lock is taken, never under it.
     let current = Identity::read(repo_path);
@@ -422,8 +508,17 @@ fn settle_in(
             "it names more than {MAX_PRIOR_PATHS} other repository locations"
         )));
     }
-    let home_dir = Path::new(&canonical);
-    if let Some(live) = foreign.iter().find(|prior| occupied(prior, home_dir)) {
+    if let Some(odd) = foreign.iter().find(|prior| !is_location(prior)) {
+        return Err(mismatch(format!(
+            "it names {odd:?}, which is no absolute repository path"
+        )));
+    }
+    let home_dir = PathBuf::from(&canonical);
+    if let Some(live) = first_occupied(foreign.clone(), OCCUPIED_BUDGET, move |prior| {
+        occupied(prior, &home_dir)
+    })
+    .map_err(mismatch)?
+    {
         return Err(mismatch(format!(
             "{live} is still a Git repository: this is a copy or another clone, not a move"
         )));
@@ -477,7 +572,7 @@ mod tests {
         let plans = super::super::with_conn(&repo, |conn| {
             let mut plans = Vec::new();
             for sql in [
-                "SELECT repo_path, detail_json FROM events WHERE session_id = ?1 AND action = ?2",
+                &aliases_sql(),
                 "SELECT detail_json FROM events WHERE session_id = ?1 AND action IN (?2, ?3)
                  ORDER BY id DESC LIMIT 1",
             ] {
@@ -498,6 +593,373 @@ mod tests {
             assert!(plan.contains("idx_events_session"), "{plan}");
             assert!(!plan.contains("SCAN"), "{plan}");
         }
+    }
+
+    /// A fresh repository directory name and the open ledger of it.
+    fn home() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        (dir, path)
+    }
+
+    /// An ordinary event row of `repo_path`, stored under that spelling as is.
+    fn row_of(conn: &Connection, repo_path: &str) -> i64 {
+        let id = insert(
+            conn,
+            &prepare(&Draft {
+                repo_path: "/placeholder".into(),
+                action: "git.commit".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE events SET repo_path = ?1 WHERE id = ?2",
+            params![repo_path, id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn reanchor_to(conn: &Connection, to: &str, from: &[String]) -> i64 {
+        record(conn, to, REANCHOR, Identity::default().to_detail(from)).unwrap()
+    }
+
+    fn refusal(conn: &Connection, repo: &str) -> Option<String> {
+        super::super::refuse_foreign_rows(conn, repo)
+            .err()
+            .map(|e| e.code.to_string())
+    }
+
+    /// Threat: a forged ledger lists thousands of prior paths. The guard must
+    /// answer "foreign" (repository_mismatch), not die inside SQLite's
+    /// expression-depth limit with a different error, and must not honour a
+    /// record no real move could have written.
+    #[test]
+    fn a_re_anchor_naming_thousands_of_paths_is_refused_as_foreign() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            let from: Vec<String> = (0..10_000).map(|i| format!("/gone/{i}")).collect();
+            reanchor_to(conn, &repo, &from);
+            row_of(conn, "/gone/0");
+            assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_re_anchor_naming_more_paths_than_a_move_can_is_not_honoured() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            let from: Vec<String> = (0..=MAX_PRIOR_PATHS)
+                .map(|i| format!("/gone/{i}"))
+                .collect();
+            reanchor_to(conn, &repo, &from);
+            row_of(conn, "/gone/0");
+            assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn thousands_of_re_anchor_rows_to_this_repository_are_refused_as_foreign() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            for i in 0..(2 * MAX_ALIAS_ROWS) {
+                reanchor_to(conn, &repo, &[format!("/gone/{i}")]);
+            }
+            row_of(conn, "/gone/0");
+            assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A re-anchor row addressed to another repository grants this one nothing,
+    /// however many there are, and one addressed here still does.
+    #[test]
+    fn re_anchor_rows_for_another_repository_grant_nothing() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            for i in 0..1_000 {
+                reanchor_to(conn, &format!("/other/{i}"), &["/elsewhere".to_string()]);
+            }
+            assert_eq!(
+                aliases(conn, std::slice::from_ref(&repo)).unwrap(),
+                Vec::<String>::new()
+            );
+            reanchor_to(conn, &repo, &["/elsewhere".to_string()]);
+            assert_eq!(
+                aliases(conn, std::slice::from_ref(&repo)).unwrap(),
+                vec!["/elsewhere"]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A re-anchor row whose detail is not what this module writes grants
+    /// nothing and never breaks the answer: refused as foreign, not a query error.
+    #[test]
+    fn a_re_anchor_with_unreadable_detail_grants_nothing() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            row_of(conn, "/gone");
+            let details: [&str; 4] = [
+                "CAST(x'ff66' AS TEXT)",
+                "'{\"from\": \"/gone\"}'",
+                "'{\"from\": [1, \"/gone\"]}'",
+                "'not json'",
+            ];
+            for detail in details {
+                let id = reanchor_to(conn, &repo, &[]);
+                conn.execute(
+                    &format!("UPDATE events SET detail_json = {detail} WHERE id = {id}"),
+                    [],
+                )
+                .unwrap();
+            }
+            assert_eq!(refusal(conn, &repo).as_deref(), Some("repository_mismatch"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Threat: a prior path that is not an absolute path is resolved against the
+    /// process's working directory (or not at all) and so says nothing about
+    /// whether the old location is gone: it is never a location of a repository.
+    #[test]
+    fn a_prior_path_that_is_no_absolute_path_is_never_taken_over() {
+        for hostile in ["relative/dir", ".", "/old\nrepo", "/old\0repo", ""] {
+            let (_dir, repo) = home();
+            let recorded = identity(&["r1"], &[]);
+            super::super::with_conn(&repo, |conn| {
+                record(conn, &repo, ANCHOR, recorded.to_detail(&[])).unwrap();
+                row_of(conn, hostile);
+                let out = settle_in(conn, &repo, &Ok(recorded.clone()));
+                assert_eq!(
+                    out.err().map(|e| e.code.to_string()).as_deref(),
+                    Some("repository_mismatch"),
+                    "{hostile:?} was taken for an earlier location"
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    /// Threat: a prior path on a mount that never answers must not hang a pass.
+    #[test]
+    fn a_probe_that_never_answers_is_a_refusal_not_a_hang() {
+        let started = Instant::now();
+        let out = first_occupied(
+            vec!["/net/slow".to_string(), "/fast".to_string()],
+            Duration::from_millis(150),
+            |path| {
+                if path == "/net/slow" {
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+                false
+            },
+        );
+        assert!(out.is_err(), "{out:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let out = first_occupied(
+            vec!["/a".to_string(), "/b".to_string()],
+            Duration::from_secs(5),
+            |path| path == "/b",
+        );
+        assert_eq!(out, Ok(Some("/b".to_string())));
+        assert_eq!(
+            first_occupied(vec!["/a".to_string()], Duration::from_secs(5), |_| false),
+            Ok(None)
+        );
+    }
+
+    /// Two processes settling one moved ledger: the second finds the first's
+    /// re-anchor and adds nothing, on its own connection to the same file.
+    #[test]
+    fn a_second_connection_settling_a_moved_ledger_adds_no_second_record() {
+        let (_dir, repo) = home();
+        let recorded = identity(&["r1"], &["https://h/a"]);
+        super::super::with_conn(&repo, |conn| {
+            record(conn, &repo, ANCHOR, recorded.to_detail(&[])).unwrap();
+            row_of(conn, "/gone");
+            Ok(())
+        })
+        .unwrap();
+        let db = super::super::ledger_path(&repo);
+        let first = Connection::open(&db).unwrap();
+        let second = Connection::open(&db).unwrap();
+        let current = Ok(recorded.clone());
+        assert_eq!(
+            settle_in(&first, &repo, &current).unwrap(),
+            Some(vec!["/gone".to_string()])
+        );
+        assert_eq!(settle_in(&second, &repo, &current).unwrap(), None);
+        let count: i64 = first
+            .query_row(
+                "SELECT count(*) FROM events WHERE action = ?1",
+                [REANCHOR],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The foreign-row probe must keep seeking when the allowed list is as long
+    /// as a ledger may legitimately make it.
+    #[test]
+    fn the_foreign_row_probe_seeks_with_a_full_prior_path_list() {
+        let (_dir, repo) = home();
+        for n in [3, 2 + MAX_PRIOR_PATHS, 2 + MAX_ALIASES] {
+            let plan = super::super::with_conn(&repo, |conn| {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE {} LIMIT 1",
+                        foreign_row_sql(n)
+                    ))
+                    .unwrap();
+                let args: Vec<String> = (0..n).map(|i| format!("/p/{i:05}")).collect();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(args), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap();
+                Ok(rows.map(Result::unwrap).collect::<Vec<_>>().join(" | "))
+            })
+            .unwrap();
+            assert!(plan.contains("idx_events_repo_ts"), "n={n}: {plan}");
+            assert!(!plan.contains("SCAN"), "n={n}: {plan}");
+        }
+    }
+
+    /// Every spelling of a credential is dropped, and nothing of it reaches the
+    /// ledger row, whatever the redactor does afterwards.
+    #[test]
+    fn no_spelling_of_a_credential_survives_normalisation() {
+        for url in [
+            "https://user:SECRETtok@host.test/x/y.git",
+            "https://SECRETtok@host.test/x/y",
+            "https://SECRETtok@host.test",
+            "ssh://git:SECRETtok@host.test:22/x/y.git",
+            "SECRETtok@host.test:x/y.git",
+            "https://host.test/x/y.git?token=SECRETtok",
+            "https://host.test/x/y.git#SECRETtok",
+            "https://host.test/x/y.git?a=1#SECRETtok",
+            "HTTPS://user:SECRETtok@[::1]:8443/x/y.git?access_token=SECRETtok",
+            "file:///srv/git/y.git?token=SECRETtok",
+        ] {
+            let normal = normalise_url(url);
+            assert!(!normal.contains("secrettok"), "{url} -> {normal}");
+            assert!(!normal.contains("user"), "{url} -> {normal}");
+            let config = format!("remote.up.stream.url={url}\nremote.o.pushurl={url}\n");
+            let detail = Identity {
+                roots: ["r1".to_string()].into(),
+                remotes: remotes_in(&config),
+            }
+            .to_detail(&[]);
+            assert!(
+                !detail.to_lowercase().contains("secrettok"),
+                "{url}: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn spellings_of_one_upstream_are_equal_and_two_upstreams_are_not() {
+        let one = [
+            "https://user:tok@GitHub.com/Acme/Repo.git",
+            "https://tok@github.com/acme/repo/",
+            "https://github.com/acme/repo?x=1#frag",
+            "HTTPS://GITHUB.COM/ACME/REPO.GIT/",
+        ];
+        for url in one {
+            assert_eq!(normalise_url(url), "https://github.com/acme/repo", "{url}");
+        }
+        let different = [
+            "https://github.com/acme/other",
+            "https://gitlab.com/acme/repo",
+            "https://github.com:8443/acme/repo",
+            "ssh://github.com/acme/repo",
+        ];
+        for url in different {
+            assert_ne!(normalise_url(url), "https://github.com/acme/repo", "{url}");
+        }
+    }
+
+    /// What `settle` records must survive the write boundary's redactor: a
+    /// remote that was altered on the way in would never again equal the live
+    /// remote, and the moved repository would be refused for it.
+    #[test]
+    fn a_recorded_identity_reads_back_equal_after_the_redactor() {
+        let identity = Identity {
+            roots: ["4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()].into(),
+            remotes: remotes_in(
+                "remote.origin.url=https://gitlab.test/group/9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c/app.git\nremote.b.url=git@host.test:Team/Some-Repo_01.git\n",
+            ),
+        };
+        let prepared = prepare(&Draft {
+            repo_path: "/placeholder".into(),
+            action: ANCHOR.into(),
+            detail_json: Some(identity.to_detail(&[])),
+            ..Default::default()
+        })
+        .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&prepared.detail.unwrap()).unwrap();
+        assert_eq!(Identity::from_detail(&stored), Some(identity));
+    }
+
+    /// A trusted repository of one commit, in a fresh directory.
+    fn git_repo() -> (tempfile::TempDir, String) {
+        let (dir, path) = home();
+        let root = Path::new(&path);
+        crate::test_support::git_in(root, &["init", "-b", "main"]);
+        std::fs::write(root.join("seed.txt"), &path).unwrap();
+        crate::test_support::git_in(root, &["add", "seed.txt"]);
+        crate::test_support::git_in(root, &["commit", "-m", "seed"]);
+        crate::test_support::trust_repo(root);
+        (dir, path)
+    }
+
+    /// Threat to availability: one repository's busy ledger must not hold every
+    /// other repository's identity check behind the process-wide state map.
+    #[test]
+    fn a_busy_ledger_does_not_stall_another_repositorys_settle() {
+        let (_da, a) = git_repo();
+        let (_db, b) = git_repo();
+        settle(&a).unwrap();
+        settle(&b).unwrap();
+        let (locked_send, locked) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                super::super::with_conn(&b, |_| {
+                    locked_send.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(2_000));
+                    Ok(())
+                })
+                .unwrap();
+            });
+            locked.recv().unwrap();
+            // Waits for b's ledger, as any pass over b does while it is busy.
+            scope.spawn(|| settle(&b).unwrap());
+            std::thread::sleep(Duration::from_millis(300));
+            let started = Instant::now();
+            settle(&a).unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(1_000),
+                "a's settle waited {:?} behind b",
+                started.elapsed()
+            );
+        });
     }
 
     #[test]
