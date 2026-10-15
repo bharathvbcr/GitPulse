@@ -13,6 +13,8 @@ import { type OperationState } from "./operation";
 export interface MutationOutcome<T = unknown> {
   ok: boolean;
   error?: string;
+  /** On a failure: what was thrown, for a caller that reads a typed reason out of it. */
+  cause?: unknown;
   policy?: PolicyVerdict;
   output?: T;
   /**

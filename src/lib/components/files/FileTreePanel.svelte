@@ -55,8 +55,7 @@
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
   import { askConfirm, askText } from "../../stores/modalStore";
   import { reportFailure } from "../../stores/mutationOutcome";
-  import { harnessStore, type Guarded } from "../../stores/harnessStore";
-  import type { DeleteOutcome } from "../../files/types";
+  import type { MutationTarget } from "../../repos/storeTypes";
   import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
   import { newPathProblem, readFileWriteError, withAncestors } from "../../files/fileWrite";
   import Skeleton from "../Skeleton.svelte";
@@ -514,6 +513,7 @@
    */
   async function promptAndCreate(
     repo: string,
+    target: MutationTarget,
     parentDir: string,
     prompt: { title: string; message: string; placeholder: string; confirmLabel: string },
     toPath: (name: string) => string,
@@ -530,31 +530,28 @@
       if (!name?.trim()) return null;
       if (repo !== $repoStore.currentPath) return null;
       const path = toPath(name.trim());
-      try {
-        const result = await invoke<Guarded<null>>("cmd_create_file", { repoPath: repo, filePath: path });
-        harnessStore.recordVerdict(result.policy, repo);
-        harnessStore.recordAction({ repoPath: repo, kind: "create", label: path, ok: true });
-        return path;
-      } catch (err: unknown) {
-        const typedError = readFileWriteError(err);
-        if (typedError?.code === "already_exists") {
-          typed = name;
-          refusal = typedError.message;
-          continue;
-        }
-        harnessStore.recordAction({ repoPath: repo, kind: "create", label: path, ok: false });
-        repoStore.setError(formatError(err));
-        return null;
+      const outcome = await repoStore.createFile(path, target);
+      if (outcome.ok) return path;
+      const typedError = readFileWriteError(outcome.cause);
+      if (typedError?.code === "already_exists") {
+        typed = name;
+        refusal = typedError.message;
+        continue;
       }
+      reportFailure(outcome, "Could not create the file");
+      return null;
     }
   }
 
   async function createNewFile(parentDir: string = "") {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    // The repository the prompt is raised for, held across it.
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const created = await promptAndCreate(
       repo,
+      target,
       parentDir,
       {
         title: "New File",
@@ -566,16 +563,18 @@
     );
     if (!created) return;
     await loadFiles(repo);
-    await repoStore.refresh();
     chooseFile(created);
   }
 
   async function createNewFolder(parentDir: string = "") {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    // The repository the prompt is raised for, held across it.
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const created = await promptAndCreate(
       repo,
+      target,
       parentDir,
       {
         title: "New Folder",
@@ -587,7 +586,6 @@
     );
     if (!created) return;
     await loadFiles(repo);
-    await repoStore.refresh();
   }
 
   /**
@@ -598,7 +596,8 @@
   async function movePath(row: FileRow) {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const answer = await askText({
       title: row.kind === "dir" ? "Rename or Move Folder" : "Rename or Move File",
       message: `New repository-relative path for ${row.path}`,
@@ -607,18 +606,13 @@
     });
     const to = answer?.trim().replace(/\/+$/, "");
     if (!to || to === row.path) return;
-    try {
-      const result = await invoke<Guarded<null>>("cmd_move_path", { repoPath: repo, from: row.path, to });
-      harnessStore.recordVerdict(result.policy, repo);
-      harnessStore.recordAction({ repoPath: repo, kind: "move", label: `${row.path} → ${to}`, ok: true });
-    } catch (err: unknown) {
-      harnessStore.recordAction({ repoPath: repo, kind: "move", label: `${row.path} → ${to}`, ok: false });
-      repoStore.setError(formatError(err));
-      return;
-    }
+    const moved = await repoStore.movePath(row.path, to, target);
+    if (!reportFailure(moved, "Could not move it")) return;
+    // The mutation ran in the repository asked about; what follows reads the
+    // one in front.
+    if (repo !== $repoStore.currentPath) return;
     const selected = $repoStore.selectedFilePath;
     await loadFiles(repo);
-    await repoStore.refresh();
     if (row.kind === "file") chooseFile(to);
     else if (selected && isAtOrUnder(selected, row.path)) chooseFile(remapPath(selected, row.path, to));
   }
@@ -631,7 +625,8 @@
   async function deletePath(row: FileRow) {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const untracked = new Set(
       $repoStore.statuses.filter((s) => isUntrackedStatusCode(s.status_code)).map((s) => s.path),
     );
@@ -642,24 +637,16 @@
       destructive: true,
     });
     if (!confirmed || repo !== $repoStore.currentPath) return;
-    let outcome: DeleteOutcome;
-    try {
-      const result = await invoke<Guarded<DeleteOutcome>>("cmd_delete_path", { repoPath: repo, path: row.path });
-      harnessStore.recordVerdict(result.policy, repo);
-      harnessStore.recordAction({ repoPath: repo, kind: "delete", label: row.path, ok: true });
-      outcome = result.output;
-    } catch (err: unknown) {
-      harnessStore.recordAction({ repoPath: repo, kind: "delete", label: row.path, ok: false });
-      repoStore.setError(formatError(err));
-      return;
-    }
+    const deleted = await repoStore.deletePath(row.path, target);
+    if (!reportFailure(deleted, "Could not delete it")) return;
+    if (repo !== $repoStore.currentPath) return;
+    const outcome = deleted.output;
     const selected = $repoStore.selectedFilePath;
     if (selected && isAtOrUnder(selected, row.path) && typeof onSelectFile !== "function") {
       repoStore.selectFilePath(null);
     }
     await loadFiles(repo);
-    await repoStore.refresh();
-    if (outcome.left_behind) {
+    if (outcome?.left_behind) {
       repoStore.setError(`${row.path} still holds ignored files, which GitPulse does not delete.`);
     }
   }

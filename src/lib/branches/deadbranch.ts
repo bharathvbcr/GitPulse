@@ -1,18 +1,11 @@
 import { invoke } from "../ipc/invoke";
 import type {
   DeadbranchBackupInfo,
-  DeadbranchCleanResult,
   DeadbranchConfig,
-  DeadbranchRestoreResult,
   DeadbranchScanResult,
   DeadbranchSeverity,
   StaleBranchInfo,
 } from "./types";
-
-interface Guarded<T> {
-  policy: unknown;
-  output: T;
-}
 
 /**
  * Scans a repository for stale branches, ancestry merges, and squash/rebase merges via `git merge-tree`.
@@ -28,24 +21,6 @@ export async function deadbranchScan(
 }
 
 /**
- * Safely cleans selected branches with pre-deletion backups and guard verification.
- */
-export async function deadbranchClean(
-  repoPath: string,
-  branches: string[],
-  force = false,
-  createBackup = true,
-): Promise<DeadbranchCleanResult> {
-  const guarded = await invoke<Guarded<DeadbranchCleanResult>>("cmd_deadbranch_clean", {
-    repoPath,
-    branches,
-    force,
-    createBackup,
-  });
-  return guarded.output;
-}
-
-/**
  * Lists available branch backup files for the repository.
  */
 export async function deadbranchListBackups(
@@ -54,22 +29,6 @@ export async function deadbranchListBackups(
   return invoke<DeadbranchBackupInfo[]>("cmd_deadbranch_list_backups", {
     repoPath,
   });
-}
-
-/**
- * Restores branches from a saved backup file.
- */
-export async function deadbranchRestore(
-  repoPath: string,
-  backupPath: string,
-  branches?: string[],
-): Promise<DeadbranchRestoreResult> {
-  const guarded = await invoke<Guarded<DeadbranchRestoreResult>>("cmd_deadbranch_restore", {
-    repoPath,
-    backupPath,
-    branches: branches ?? null,
-  });
-  return guarded.output;
 }
 
 /**

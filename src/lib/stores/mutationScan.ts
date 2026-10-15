@@ -26,6 +26,18 @@ export const TARGET_ARG_INDEX: Readonly<Record<string, number>> = {
   resetTo: 2,
   createTag: 3,
   deleteTag: 1,
+  createFile: 1,
+  movePath: 2,
+  deletePath: 1,
+  pruneWorktrees: 0,
+  worktreeCowSync: 1,
+  deadbranchClean: 3,
+  deadbranchRestore: 1,
+  fetch: 1,
+  pull: 3,
+  push: 3,
+  stashSave: 2,
+  stashPop: 0,
 };
 
 const PROMPTS = new Set(["askConfirm", "askText"]);
@@ -404,6 +416,79 @@ function untargetedIn(sf: ts.SourceFile, names: ReadonlySet<string>, aliases: Al
   };
   visit(sf);
   return lines;
+}
+
+// ---- direct invokes of a mutating command ------------------------------------
+
+/** The text of a string-literal argument, or null for anything computed. */
+function literalText(node: ts.Node | undefined): string | null {
+  if (!node) return null;
+  const inner = unwrap(node as ts.Expression);
+  return ts.isStringLiteral(inner) || ts.isNoSubstitutionTemplateLiteral(inner) ? inner.text : null;
+}
+
+/**
+ * The `cmd_*` commands the store's mutations send: every command named by a
+ * string literal inside a member that `mutationNames` derives. A component
+ * that sends one of these itself has stepped around the wrapper — the quit
+ * guard, the per-repository queue, the journal and the echo rule — so the set
+ * follows the store: a mutation added there is covered the day it is written.
+ */
+export function mutatingCommands(storeSource: string): Set<string> {
+  const names = mutationNames(storeSource);
+  const commands = new Set<string>();
+  const sf = parseSource("repoStore.ts", storeSource);
+  const literal = storeLiteral(sf);
+  if (!literal) return commands;
+  const collect = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const command = literalText(node.arguments[0]);
+      if (command !== null && command.startsWith("cmd_")) commands.add(command);
+    }
+    ts.forEachChild(node, collect);
+  };
+  for (const member of literal.properties) {
+    if (member.name && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)) && names.has(member.name.text)) collect(member);
+  }
+  return commands;
+}
+
+function directInvokesIn(sf: ts.SourceFile, commands: ReadonlySet<string>): number[] {
+  const lines: number[] = [];
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const command = literalText(node.arguments[0]);
+      if (command !== null && commands.has(command)) lines.push(lineOf(sf, node));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return lines;
+}
+
+/**
+ * Lines of a call whose first argument names a mutating command. A direct,
+ * generic, aliased or wrapped call to the IPC bridge are all alike, since the
+ * command name is what is read, not the callee. A command that is not a literal cannot
+ * be read here; the IPC contract check (`check:ipc`) fails every such call site.
+ */
+export function directMutatingInvokes(code: string, commands: ReadonlySet<string>): number[] {
+  return directInvokesIn(parseSource("scan.ts", code), commands);
+}
+
+/** The same scan over a component's scripts and markup expressions. */
+export function directMutatingInvokesSvelte(source: string, commands: ReadonlySet<string>): number[] {
+  if (![...commands].some((command) => source.includes(command))) return [];
+  const { scripts, expressions } = svelteRanges(source);
+  const lines: number[] = [];
+  for (const range of scripts) {
+    lines.push(...directInvokesIn(parseSource("component.ts", padding(source.slice(0, range.start)) + source.slice(range.start, range.end)), commands));
+  }
+  for (const range of expressions) {
+    const text = source.slice(range.start, range.end);
+    lines.push(...directInvokesIn(parseSource("component.ts", `${padding(source.slice(0, range.start - 1))}(${text});`), commands));
+  }
+  return [...new Set(lines)].sort((a, b) => a - b);
 }
 
 // ---- Svelte ----------------------------------------------------------------
