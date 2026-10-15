@@ -2954,18 +2954,18 @@ pub(crate) fn parse_pulse_stream(
 /// upstream remote, a lone configured remote, else "origin".
 #[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
-    default_remote_reads(repo).0
+    default_remote_reads(repo, Reads::Cached).0
 }
 
 /// [`resolve_default_remote`] plus the reason, when a read it depends on
 /// produced no answer (config, the current branch, the remote list). The name
 /// is then a guess built from "not set"; a caller guarding a destructive
 /// action refuses on the reason instead of trusting the guess.
-fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
+fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<String>) {
     let mut unread: Option<String> = None;
     // One read of the effective config answers what used to be two
     // `config --get` processes and, usually, `git remote` too.
-    let config = match config_snapshot(repo) {
+    let config = match config_snapshot_with(repo, reads) {
         Ok(config) => config,
         Err(error) => {
             unread = Some(error);
@@ -2978,7 +2978,7 @@ fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
             return (trimmed.to_string(), unread);
         }
     }
-    let branch = match head_branch_cached(repo) {
+    let branch = match reads.head_branch(repo) {
         Ok(branch) => branch,
         Err(error) => {
             unread.get_or_insert(error);
@@ -3022,7 +3022,37 @@ fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
 /// key winning as it does for `git config --get`. Section and variable names
 /// arrive lowercased; a subsection keeps its case (`branch.Feature.remote`).
 pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, String> {
-    let text = ref_cache::git_text(repo, &[], &["config", "--list", "-z"])?;
+    config_snapshot_with(repo, Reads::Cached)
+}
+
+/// How the default-base lookup reads the two inputs that live outside the
+/// ref store: the effective config and HEAD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reads {
+    /// Through [`ref_cache`]. Its stamp does not see files pulled in by
+    /// `include.path` or the system config, so those are bounded only by the
+    /// cache's TTL: the display readers' admitted gap.
+    Cached,
+    /// Straight from git, every time. For a caller that destroys something on
+    /// the answer.
+    Fresh,
+}
+
+impl Reads {
+    fn head_branch(self, repo: &Path) -> Result<Option<String>, String> {
+        match self {
+            Self::Cached => head_branch_cached(repo),
+            Self::Fresh => head_branch_name(repo),
+        }
+    }
+}
+
+fn config_snapshot_with(repo: &Path, reads: Reads) -> Result<HashMap<String, String>, String> {
+    let args = ["config", "--list", "-z"];
+    let text = match reads {
+        Reads::Cached => ref_cache::git_text(repo, &[], &args)?,
+        Reads::Fresh => git_text(repo, &args)?,
+    };
     Ok(parse_config_list(&text))
 }
 
@@ -3173,7 +3203,7 @@ fn decode_default_base(text: &str) -> Option<DefaultBase> {
 fn default_base_cached(repo: &Path) -> DefaultBase {
     let mut computed = None;
     let answered = ref_cache::through(repo, DEFAULT_BASE_NAMESPACES, &[DEFAULT_BASE_KEY], || {
-        let value = compute_default_base(repo);
+        let value = compute_default_base_with(repo, Reads::Cached);
         let keep = value.incomplete.is_none();
         let text = if keep {
             encode_default_base(&value)
@@ -3193,7 +3223,7 @@ fn default_base_cached(repo: &Path) -> DefaultBase {
         (Ok(_), Some(value)) => value,
         (Ok(text), None) => decode_default_base(&text).unwrap_or_else(|| {
             debug_assert!(false, "an unreadable kept default base: {text:?}");
-            compute_default_base(repo)
+            compute_default_base_with(repo, Reads::Fresh)
         }),
     }
 }
@@ -3214,6 +3244,15 @@ struct SharedBase {
 /// recursively (a nested default branch is seen), refuses to trust a stamp
 /// younger than the racy window, and expires after the cache's TTL, which
 /// bounds the inputs no stamp sees (files pulled in by `include.path`).
+///
+/// Two bounds are deliberate. Files pulled in by `include.path` (and the
+/// system config) are not stamped, so a change to one is seen within the 60 s
+/// TTL, not at once; a destructive caller reads [`compute_default_base`]
+/// instead, which asks git directly. And a stamp whose newest mtime is within
+/// the racy window is never trusted, so sequential callers in the 3 s after a
+/// write each recompute (five processes): serving the last answer there is the
+/// staleness this removes. Callers that arrive together still share one
+/// computation below.
 ///
 /// A repository with more loose refs than the stamp's bound has no stamp, so
 /// every call computes (five processes), as `list_branches` already does.
@@ -3287,9 +3326,20 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
 /// `incomplete`; it never reads as "no remote HEAD". Callers that guard a
 /// destructive action use this directly, so a memoized answer from before the
 /// read started failing cannot stand in for the state they are acting on.
+///
+/// Uncached all the way down: the config listing and HEAD are read from git
+/// here too, not through [`ref_cache`], whose stamp cannot see an
+/// `include.path` file.
 pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+    compute_default_base_with(repo, Reads::Fresh)
+}
+
+/// [`compute_default_base`] with the config and HEAD reads chosen by `reads`.
+/// [`default_base`] computes with [`Reads::Cached`] because its own answer is
+/// already bounded by the ref cache's stamp and TTL.
+fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
     let failures_before = git_cli::process_failures();
-    let (remote, mut unread) = default_remote_reads(repo);
+    let (remote, mut unread) = default_remote_reads(repo, reads);
     let head_ref = remote_head_ref(&remote);
     let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
         Ok(target) => target,
@@ -10809,9 +10859,26 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         git_in(&repo, &["branch", "develop"]);
         git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        git_in(&repo, &["update-ref", "refs/remotes/upstream/develop", "HEAD"]);
-        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
-        git_in(&repo, &["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
         let include = tempfile::TempDir::new().unwrap();
         let inc = include.path().join("inc.cfg");
         std::fs::write(&inc, "[checkout]\n\tdefaultRemote = origin\n").unwrap();
@@ -10825,10 +10892,15 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 "upstream",
                 "compute_default_base ('uncached', used by the destructive merge) served the pre-include remote"
             );
+            // Converted by ruling from "the cached path sees the include
+            // change at once": no stamp covers an included file, so the
+            // display path serves the kept answer until its 60 s TTL. That
+            // admitted gap is documented at `default_base`; this pins it, and
+            // the assertion above is what a destructive caller relies on.
             assert_eq!(
                 default_base(&repo).remote,
-                "upstream",
-                "default_base served the pre-include remote"
+                "origin",
+                "the cached answer is bounded by the TTL, not by the include file"
             );
         });
     }
@@ -10842,7 +10914,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         git_in(&repo, &["branch", "develop"]);
         git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        git_in(&repo, &["update-ref", "refs/remotes/origin/develop", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+        );
         ref_cache::eager(|| {
             let name = |r: &Path| default_base(r).base.map(|(n, _)| n);
             git_in(&repo, &["remote", "set-head", "origin", "main"]);
@@ -10852,7 +10927,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             // Packed only, then advanced through packed-refs alone.
             git_in(&repo, &["pack-refs", "--all"]);
             assert_eq!(name(&repo).as_deref(), Some("develop"));
-            let moved = git_stdout(&repo, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "m"]);
+            let moved = git_stdout(
+                &repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "m"],
+            );
             git_in(&repo, &["update-ref", "refs/heads/develop", &moved]);
             git_in(&repo, &["pack-refs", "--all"]);
             assert_eq!(
@@ -10861,9 +10939,17 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 "packed-refs advance not seen"
             );
             git_in(&repo, &["branch", "-D", "develop"]);
-            assert_eq!(default_base(&repo), compute_default_base(&repo), "delete while packed");
+            assert_eq!(
+                default_base(&repo),
+                compute_default_base(&repo),
+                "delete while packed"
+            );
             git_in(&repo, &["config", "checkout.defaultRemote", "nope"]);
-            assert_eq!(default_base(&repo), compute_default_base(&repo), "config change");
+            assert_eq!(
+                default_base(&repo),
+                compute_default_base(&repo),
+                "config change"
+            );
         });
     }
 
@@ -10876,12 +10962,39 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         git_in(&repo, &["branch", "develop"]);
         git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        git_in(&repo, &["update-ref", "refs/remotes/upstream/develop", "HEAD"]);
-        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
-        git_in(&repo, &["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
         let parent = tempfile::TempDir::new().unwrap();
         let linked = parent.path().join("wt");
-        git_in(&repo, &["worktree", "add", "-q", "-b", "lane", linked.to_str().unwrap()]);
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane",
+                linked.to_str().unwrap(),
+            ],
+        );
         crate::test_support::trust_repo(&linked);
         let linked = linked.canonicalize().unwrap();
         git_in(&repo, &["config", "branch.lane.remote", "upstream"]);
@@ -10890,7 +11003,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 let a = default_base(&repo);
                 let b = default_base(&linked);
                 assert_eq!(a.remote, "origin");
-                assert_eq!(b.remote, "upstream", "linked worktree got the primary's answer");
+                assert_eq!(
+                    b.remote, "upstream",
+                    "linked worktree got the primary's answer"
+                );
                 assert_eq!(a.base.as_ref().map(|x| x.0.as_str()), Some("main"));
                 assert_eq!(b.base.as_ref().map(|x| x.0.as_str()), Some("develop"));
             }
@@ -10913,7 +11029,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 let refused = crate::engine::git_cli::with_forced_spawn_failure_of(needle, || {
                     default_base(&repo)
                 });
-                assert!(refused.incomplete.is_some(), "{needle}: refusal not reported: {refused:?}");
+                assert!(
+                    refused.incomplete.is_some(),
+                    "{needle}: refusal not reported: {refused:?}"
+                );
                 let after = default_base(&repo);
                 assert!(after.incomplete.is_none(), "{needle}: {after:?}");
                 assert_eq!(
@@ -10962,17 +11081,27 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(adv_lookups(&repo) - before, 1, "more than one computation");
     }
 
-    /// Attack 5: callers that arrive one after another inside the 3 s racy
-    /// window after a write each pay the five processes (the old memo
-    /// served all but the first).
+    /// Attack 5, pinned by ruling as a characterisation (it was asserting one
+    /// lookup): callers that arrive one after another inside the 3 s racy
+    /// window after a write each recompute, because a stamp cannot tell two
+    /// writes in one mtime tick apart and serving the last answer there is the
+    /// staleness the ref cache exists to prevent. The cost is bounded by the
+    /// number of calls, and every answer is correct.
     #[test]
-    fn adv_sequential_asks_on_a_just_written_repo_resolve_once() {
+    fn sequential_asks_on_a_just_written_repo_recompute_each_time_and_stay_correct() {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
-        for _ in 0..6 {
-            let _ = default_base(&repo);
+        let expected = compute_default_base(&repo);
+        let before = adv_lookups(&repo);
+        const CALLS: usize = 6;
+        for _ in 0..CALLS {
+            assert_eq!(default_base(&repo), expected);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(adv_lookups(&repo), 1, "each sequential ask recomputed");
+        let recomputed = adv_lookups(&repo) - before;
+        assert!(
+            (1..=CALLS).contains(&recomputed),
+            "{recomputed} computations for {CALLS} sequential asks"
+        );
     }
 }

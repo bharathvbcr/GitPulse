@@ -1026,7 +1026,7 @@ fn divergence_from(repo: &Path, base_oid: &str, b: &str) -> Option<WorktreeDiver
             "rev-list",
             "--left-right",
             "--count",
-            &format!("{base_oid}...{b}"),
+            &format!("{base_oid}...refs/heads/{b}"),
         ],
     )
     .ok()?;
@@ -8919,13 +8919,26 @@ some-future-field whatever
         let (main, parent, _) = crate::test_support::repo_with_worktrees(0);
         let root = plain(main.path());
         git_in(&root, &["checkout", "-q", "-b", "develop"]);
-        git_in(&root, &["commit", "-q", "--allow-empty", "-m", "develop moves"]);
-        let develop = rev(&root, "develop");
-        git_in(&root, &["remote", "add", "origin", "https://example.com/r.git"]);
-        git_in(&root, &["update-ref", "refs/remotes/origin/develop", &develop]);
         git_in(
             &root,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"],
+            &["commit", "-q", "--allow-empty", "-m", "develop moves"],
+        );
+        let develop = rev(&root, "develop");
+        git_in(
+            &root,
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        );
+        git_in(
+            &root,
+            &["update-ref", "refs/remotes/origin/develop", &develop],
+        );
+        git_in(
+            &root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/develop",
+            ],
         );
         (main, parent, root, develop)
     }
@@ -8971,27 +8984,61 @@ some-future-field whatever
         let (main, parent, root, develop) = adv_develop_repo();
         let _keep = (&main, &parent);
         adv_add(&root, parent.path(), "wt-main", &[], &["main"], 1);
-        adv_add(&root, parent.path(), "wt-master", &["-b", "master"], &["develop"], 2);
-        adv_add(&root, parent.path(), "wt-lane", &["-b", "feat/x"], &["develop"], 1);
-        adv_add(&root, parent.path(), "wt-det", &["--detach"], &["develop"], 0);
+        adv_add(
+            &root,
+            parent.path(),
+            "wt-master",
+            &["-b", "master"],
+            &["develop"],
+            2,
+        );
+        adv_add(
+            &root,
+            parent.path(),
+            "wt-lane",
+            &["-b", "feat/x"],
+            &["develop"],
+            1,
+        );
+        adv_add(
+            &root,
+            parent.path(),
+            "wt-det",
+            &["--detach"],
+            &["develop"],
+            0,
+        );
         let repo = root.to_str().unwrap();
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
-            list_worktrees(repo)
-        })
-        .expect("list");
+        let walked =
+            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+                .expect("list");
         let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
         for name in ["main", "master", "feat/x"] {
-            let b = branches.iter().find(|b| b.name == name && !b.is_remote).unwrap();
+            let b = branches
+                .iter()
+                .find(|b| b.name == name && !b.is_remote)
+                .unwrap();
             let expected = Some((b.commits_ahead_of_base, b.commits_behind_base));
             assert_eq!(adv_measured(&batched, name), expected, "batched {name}");
             assert_eq!(adv_measured(&walked, name), expected, "walked {name}");
         }
-        assert_eq!(adv_measured(&batched, "develop"), Some((0, 0)), "default itself");
-        assert_eq!(adv_measured(&walked, "develop"), Some((0, 0)), "default itself, walked");
+        assert_eq!(
+            adv_measured(&batched, "develop"),
+            Some((0, 0)),
+            "default itself"
+        );
+        assert_eq!(
+            adv_measured(&walked, "develop"),
+            Some((0, 0)),
+            "default itself, walked"
+        );
         for list in [&batched, &walked] {
-            let detached = list.iter().find(|w| w.branch.is_none()).expect("detached listed");
+            let detached = list
+                .iter()
+                .find(|w| w.branch.is_none())
+                .expect("detached listed");
             assert_eq!(detached.main_divergence, None);
         }
     }
@@ -9005,13 +9052,29 @@ some-future-field whatever
         let unborn = parent.path().join("wt-unborn");
         git_in(
             &root,
-            &["worktree", "add", "-q", "--orphan", "-b", "unborn", unborn.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--orphan",
+                "-b",
+                "unborn",
+                unborn.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&unborn);
         let unrelated = parent.path().join("wt-unrelated");
         git_in(
             &root,
-            &["worktree", "add", "-q", "--orphan", "-b", "unrelated", unrelated.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--orphan",
+                "-b",
+                "unrelated",
+                unrelated.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&unrelated);
         let unrelated = plain(&unrelated);
@@ -9021,16 +9084,19 @@ some-future-field whatever
         let repo = root.to_str().unwrap();
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
-            list_worktrees(repo)
-        })
-        .expect("list");
+        let walked =
+            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+                .expect("list");
         let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
         let b = branches.iter().find(|b| b.name == "unrelated").unwrap();
         let expected = Some((b.commits_ahead_of_base, b.commits_behind_base));
         assert_eq!(adv_measured(&batched, "unrelated"), expected, "batched");
         assert_eq!(adv_measured(&walked, "unrelated"), expected, "walked");
-        assert_eq!(adv_measured(&batched, "unborn"), adv_measured(&walked, "unborn"), "unborn parity");
+        assert_eq!(
+            adv_measured(&batched, "unborn"),
+            adv_measured(&walked, "unborn"),
+            "unborn parity"
+        );
     }
 
     /// Attack 3: a tag that shares a lane's name. The batched path reads
@@ -9040,15 +9106,21 @@ some-future-field whatever
     fn adv_divergence_fallback_reads_the_branch_not_a_same_named_tag() {
         let (main, parent, root, develop) = adv_develop_repo();
         let _keep = (&main, &parent);
-        adv_add(&root, parent.path(), "wt-lane", &["-b", "lane"], &["develop"], 2);
+        adv_add(
+            &root,
+            parent.path(),
+            "wt-lane",
+            &["-b", "lane"],
+            &["develop"],
+            2,
+        );
         git_in(&root, &["tag", "lane", "main"]);
         let repo = root.to_str().unwrap();
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
-            list_worktrees(repo)
-        })
-        .expect("list");
+        let walked =
+            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+                .expect("list");
         assert_eq!(adv_measured(&batched, "lane"), Some((2, 0)), "batched");
         assert_eq!(
             adv_measured(&walked, "lane"),
@@ -9090,11 +9162,18 @@ some-future-field whatever
     fn adv_null_target_with_a_remote_only_default_touches_nothing() {
         let (dir, wt) = teardown_fixture_on(None, "main");
         let repo = dir.path();
-        git_in(repo, &["remote", "add", "origin", "https://example.com/r.git"]);
+        git_in(
+            repo,
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        );
         git_in(repo, &["update-ref", "refs/remotes/origin/main", "main"]);
         git_in(
             repo,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
         );
         git_in(repo, &["branch", "-m", "main", "work"]);
         git_in(repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -9110,9 +9189,15 @@ some-future-field whatever
         let refused = result.expect_err("a remote-only default must not be merged into");
         eprintln!("refusal: {refused:?}");
         assert!(wt.path().exists(), "the worktree was removed");
-        assert!(branch_exists(repo, "feature-x"), "the lane branch was deleted");
+        assert!(
+            branch_exists(repo, "feature-x"),
+            "the lane branch was deleted"
+        );
         assert_eq!(rev(repo, "work"), work_tip, "work moved");
-        assert!(!branch_exists(repo, "main"), "a local main was created from the merge");
+        assert!(
+            !branch_exists(repo, "main"),
+            "a local main was created from the merge"
+        );
         assert!(!repo.join("feature.txt").exists());
     }
 
@@ -9121,11 +9206,21 @@ some-future-field whatever
     fn adv_null_target_equal_to_the_lanes_own_branch_is_refused() {
         let (dir, wt) = teardown_fixture_on(None, "main");
         let repo = dir.path();
-        git_in(repo, &["remote", "add", "origin", "https://example.com/r.git"]);
-        git_in(repo, &["update-ref", "refs/remotes/origin/feature-x", "feature-x"]);
         git_in(
             repo,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature-x"],
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        );
+        git_in(
+            repo,
+            &["update-ref", "refs/remotes/origin/feature-x", "feature-x"],
+        );
+        git_in(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/feature-x",
+            ],
         );
         let main_tip = rev(repo, "main");
         let refused = merge_and_teardown_worktree(
@@ -9149,16 +9244,36 @@ some-future-field whatever
     fn adv_default_moving_after_resolution_does_not_split_the_merge() {
         let (dir, wt) = teardown_fixture_on(None, "main");
         let repo = dir.path().to_path_buf();
-        git_in(&repo, &["remote", "add", "origin", "https://example.com/r.git"]);
+        git_in(
+            &repo,
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        );
         git_in(&repo, &["branch", "develop"]);
         git_in(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
-        git_in(&repo, &["update-ref", "refs/remotes/origin/develop", "develop"]);
-        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/develop", "develop"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
         let mut moved = false;
         let mut gate = |argv: &[&str]| -> Result<(), String> {
             if !moved && argv.first() == Some(&"merge") {
                 moved = true;
-                git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+                git_in(
+                    &repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/develop",
+                    ],
+                );
             }
             Ok(())
         };
