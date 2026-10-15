@@ -101,6 +101,7 @@
   import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
   import { sessionActivity } from "../terminal/sessionActivity";
   import { createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
+  import { createFrameProbe, FRAME_PROBE_OSC, handleFrameProbeCommand } from "../diagnostics/frameProbe";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -262,6 +263,8 @@
   /** Non-reactive handles: observers and the emulator must not tear down with runes. */
   let term: XTerm | null = null;
   let gpu: GpuRenderer | null = null;
+  /** Frame pacing on request from the program in this terminal (OSC 7700). */
+  const frameProbe = createFrameProbe();
   let fitAddon: FitAddon | null = null;
   let searchAddon: SearchAddon | null = null;
   let searchKey: string | null = null;
@@ -488,6 +491,14 @@
       lifecycle?.write(data);
     });
     created.onBinary((data) => { lifecycle?.write(data, true); });
+    // The renderer benches (scripts/tui-redraw-bench.mjs) ask for frame
+    // pacing from inside the session. The answer goes back as the terminal's
+    // own reply, not as typing; see diagnostics/frameProbe.ts.
+    created.parser.registerOscHandler(FRAME_PROBE_OSC, (payload) => {
+      const reply = handleFrameProbeCommand(frameProbe, payload);
+      if (reply) created.input(reply, false);
+      return true;
+    });
     created.onResize(({ cols, rows }) => {
       lifecycle?.resize(rows, cols);
     });
@@ -1231,6 +1242,7 @@
       // Before the terminal: the addon gives its slot back to the shared pool.
       gpu?.dispose();
       gpu = null;
+      frameProbe.stop();
       term?.dispose();
       term = null;
       fitAddon = null;

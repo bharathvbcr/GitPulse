@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { countDsrReplies, frame, MIN_RUNS, parseClock, parseThreads, verdict } from "./tui-redraw-bench.mjs";
+import { createFrameProbe, handleFrameProbeCommand } from "../src/lib/diagnostics/frameProbe";
+import { countDsrReplies, frame, MIN_RUNS, parseClock, parseFrameReplies, parseThreads, verdict } from "./tui-redraw-bench.mjs";
 
 // Shaped from a real `ps -M -p <pid>` of a WebContent process on 2026-10-14:
 // only the first row carries USER and COMMAND, and the thread rows end in a
@@ -35,6 +36,23 @@ describe("tui-redraw bench: sampling", () => {
     expect(countDsrReplies("\u001b[12;1R")).toBe(1);
     expect(countDsrReplies("x\u001b[1;80R\u001b[24;1Ry")).toBe(2);
     expect(countDsrReplies("\u001b[6n")).toBe(0);
+  });
+
+  it("reads the answer the terminal's own frame probe writes, among other replies", () => {
+    // Produced by the module TerminalSession runs, so a change to the OSC
+    // number or the reply's shape on either side fails here.
+    let pending: ((time: number) => void) | null = null;
+    const probe = createFrameProbe({ raf: (callback) => { pending = callback; return 1; }, cancel: () => { pending = null; } });
+    handleFrameProbeCommand(probe, "frames-start;period=16.67");
+    for (const time of [0, 16.67, 33.34, 66.68]) { const run = pending as ((time: number) => void) | null; pending = null; run?.(time); }
+    const reply = handleFrameProbeCommand(probe, "frames-stop") ?? "";
+    const empty = handleFrameProbeCommand(createFrameProbe({ raf: () => 1, cancel: () => {} }), "frames-stop") ?? "";
+    const replies = parseFrameReplies(`\u001b[3;1R${reply}\u001b[4;1R${empty}`);
+    expect(replies).toEqual([
+      { n: 3, dropped: 1, fraction: 0.3333, period: 16.67, p50: 16.67, p95: 33.34, ms: 67 },
+      { n: 0 },
+    ]);
+    expect(parseFrameReplies("\u001b]7700;frames;n=3")).toEqual([]);
   });
 
   it("repaints every row of the screen in place, without scrolling it", () => {

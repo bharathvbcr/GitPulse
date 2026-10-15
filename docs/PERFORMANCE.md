@@ -1181,16 +1181,32 @@ file. `--summarize` applies the win rule and fails closed:
 * exit 1: misses;
 * exit 2: undecided, with every missing piece named.
 
-It has not run, for three reasons:
+**The frame probe.** `redraw` also records `dropped_frame_fraction` and
+`frame_p95_ms` from inside the page. The bench asks the session's terminal
+over a private OSC: `OSC 7700 ; frames-start [; period=<ms>]`, then
+`OSC 7700 ; frames-stop`. The terminal answers through the PTY as a terminal
+reply, as it does for a cursor-position report
+(`src/lib/diagnostics/frameProbe.ts`).
+
+* Before the CPU sample starts, 2 s of idle frames measure the page's own
+  rAF period. WebKit can run rAF slower than the display (60 Hz on a 120 Hz
+  panel), so the display's refresh rate would be the wrong yardstick.
+* A dropped frame is an interval longer than 1.5× that period, the
+  definition ft-cc4be67b uses. That card can drive the same probe.
+* The harness checks the probe answers exactly once, through the PTY, and
+  draws nothing on the grid (139 of 139 in Chrome and in WKWebView). With
+  the reply removed, the check fails.
+* What a program in a terminal can learn this way: the page's frame-interval
+  statistics over a window of at most 120 s. It gets no content, no other
+  session's data and no input.
+
+It has not run, for two reasons:
 
 1. **`allowTransparency` is undecided.** ft-cc4be67b is still in backlog. Both
    arms must use the value it decides, and that card has to run first.
 2. **It needs an attended window and a quiet host.** The installed app must
    be quit, and no other WebKit host app can be running. On 2026-10-14 the
    load average was 32 on 18 cores, with 10 agent sessions live.
-3. **One metric has no probe yet.** The rAF dropped-frame fraction needs an
-   in-page probe, which ft-cc4be67b also needs. The summary reports
-   "undecided" until records carry `dropped_frame_fraction`.
 
 Known limits of the apparatus, as built:
 

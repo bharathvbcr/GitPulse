@@ -469,6 +469,24 @@
                 && sessionsAll().every((el) => !el.querySelector("canvas")));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
           }
+
+          // ---- Frame probe (OSC 7700), as scripts/tui-redraw-bench.mjs drives it.
+          {
+            const writesBeforeProbe = written.length;
+            await output("fixture-1", "\u001b]7700;frames-start\u0007");
+            await wait(500);
+            await output("fixture-1", "\u001b]7700;frames-stop\u0007");
+            await wait();
+            const replies = written.slice(writesBeforeProbe).filter((data) => data.startsWith("\u001b]7700;frames;"));
+            check("the frame probe answers a stop through the PTY, once", () => {
+              if (replies.length !== 1) throw new Error(`${replies.length} replies: ${JSON.stringify(replies)}`);
+              return /^\u001b\]7700;frames;n=[1-9]\d*;dropped=\d+;fraction=[\d.]+;period=[\d.]+;p50=[\d.]+;p95=[\d.]+;ms=\d+\u0007$/.test(replies[0]);
+            });
+            check("the probe's sequences draw nothing on the grid",
+              () => !visible(".xterm-rows").some((rows) => /7700|frames/.test(rows.textContent ?? "")));
+            // The reply above is this block's own write, not a control's.
+            writesBefore = report.writes;
+          }
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);

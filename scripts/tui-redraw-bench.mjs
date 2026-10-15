@@ -30,11 +30,16 @@
  * waits for. It is a PROXY for keystroke-echo p95 — it does not include the
  * keydown or the final paint — and the summary labels it so.
  *
- * Not measured here: the rAF dropped-frame fraction, which needs an in-page
- * probe (planned with ft-cc4be67b). `--summarize` therefore never answers
- * "ships" unless records carry `dropped_frame_fraction`; it says what is
- * missing instead. `--arm` and `--transparency` are declared by the person
- * running it (Settings > GPU terminal rendering; the allowTransparency build);
+ * `redraw` also reads frame pacing from the page through the terminal's
+ * frame probe (OSC 7700, `src/lib/diagnostics/frameProbe.ts`). Before the CPU
+ * sample starts, 2 s of idle frames give the page's own rAF period, which can
+ * be slower than the display (WebKit runs rAF at 60 Hz on a 120 Hz panel).
+ * The redraw is then probed against that period, and the run records
+ * `dropped_frame_fraction` (frames longer than 1.5x the period) and
+ * `frame_p95_ms`. A terminal that does not answer the probe (an older build,
+ * or not GitPulse) leaves them out, and `--summarize` is then undecided and
+ * says why. `--arm` and `--transparency` are declared by the person running
+ * the bench (Settings > GPU terminal rendering; the allowTransparency build);
  * the script cannot observe them.
  */
 import { execFileSync } from "node:child_process";
@@ -50,6 +55,10 @@ export const MIN_RUNS = 7;
 const DSR = "\u001b[6n";
 const DSR_EVERY_MS = 250;
 const DSR_DRAIN_MS = 10_000;
+/** The terminal's frame probe; must match `FRAME_PROBE_OSC` in frameProbe.ts. */
+const FRAME_OSC = 7700;
+const FRAME_CALIBRATE_MS = 2_000;
+const FRAME_REPLY_MS = 5_000;
 
 /**
  * One run, as appended to the results file.
@@ -123,6 +132,27 @@ export function countDsrReplies(text) {
   return (text.match(/\u001b\[\d+;\d+R/g) ?? []).length;
 }
 
+/**
+ * The frame probe's answers (`OSC 7700 ; frames ; n=… ; … BEL`) in a chunk of
+ * stdin, as numbers by field name. An answer for no frames is `{ n: 0 }`.
+ * @param {string} text @returns {Record<string, number>[]}
+ */
+export function parseFrameReplies(text) {
+  /** @type {Record<string, number>[]} */
+  const replies = [];
+  for (const match of text.matchAll(new RegExp(`\\u001b\\]${FRAME_OSC};frames;([^\\u0007\\u001b]*)\\u0007`, "g"))) {
+    /** @type {Record<string, number>} */
+    const fields = {};
+    for (const pair of match[1].split(";")) {
+      const [key, value] = pair.split("=");
+      const number = Number(value);
+      if (key && value !== undefined && Number.isFinite(number)) fields[key] = number;
+    }
+    replies.push(fields);
+  }
+  return replies;
+}
+
 /** @param {number[]} sorted @param {number} q @returns {number | null} */
 export function quantile(sorted, q) {
   if (!sorted.length) return null;
@@ -177,15 +207,71 @@ function dsrProbe(stdin, stdout) {
 }
 
 /**
+ * Drives the terminal's frame probe. `stop` resolves with its answer, or null
+ * when none arrives in time (a terminal without the probe).
+ * @param {NodeJS.ReadStream} stdin @param {NodeJS.WriteStream} stdout
+ */
+function frameProbe(stdin, stdout) {
+  let buffer = "";
+  /** @type {Record<string, number>[]} */
+  const replies = [];
+  /** @param {Buffer} chunk */
+  const onData = (chunk) => {
+    buffer += chunk.toString("latin1");
+    const found = parseFrameReplies(buffer);
+    if (found.length) {
+      replies.push(...found);
+      buffer = buffer.slice(buffer.lastIndexOf("\u0007") + 1);
+    }
+    // A reply is under 200 bytes; anything older is DSR traffic.
+    if (buffer.length > 4096) buffer = buffer.slice(-512);
+  };
+  stdin.on("data", onData);
+  return {
+    /** @param {number} [periodMs] */
+    start(periodMs) {
+      stdout.write(`\u001b]${FRAME_OSC};frames-start${periodMs ? `;period=${periodMs.toFixed(2)}` : ""}\u0007`);
+    },
+    /** @returns {Promise<Record<string, number> | null>} */
+    async stop() {
+      const before = replies.length;
+      stdout.write(`\u001b]${FRAME_OSC};frames-stop\u0007`);
+      const deadline = performance.now() + FRAME_REPLY_MS;
+      while (replies.length === before && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      return replies.length > before ? replies[replies.length - 1] : null;
+    },
+    close() { stdin.off("data", onData); },
+  };
+}
+
+/**
+ * The page's rAF period while nothing is drawn: the median of 2 s of idle
+ * frames. Null when the terminal has no probe or ran no frames.
+ * @param {NodeJS.ReadStream} stdin @param {NodeJS.WriteStream} stdout
+ * @returns {Promise<number | null>}
+ */
+async function calibrateFrames(stdin, stdout) {
+  const probe = frameProbe(stdin, stdout);
+  probe.start();
+  await new Promise((resolve) => setTimeout(resolve, FRAME_CALIBRATE_MS));
+  const reply = await probe.stop();
+  probe.close();
+  return reply && reply.n > 0 && reply.p50 > 0 ? reply.p50 : null;
+}
+
+/**
  * @param {Record<string, string>} args @param {NodeJS.ReadStream} stdin @param {NodeJS.WriteStream} stdout
+ * @param {number | null} periodMs the idle rAF period, from `calibrateFrames`
  * @returns {Promise<ModeResult>}
  */
-async function runRedraw(args, stdin, stdout) {
+async function runRedraw(args, stdin, stdout, periodMs) {
   const seconds = Number(args.seconds ?? 30);
   const hz = Number(args.hz);
   const cols = stdout.columns;
   const rows = stdout.rows;
   stdout.write("\u001b[?1049h\u001b[?25l");
+  const frames = periodMs === null ? null : frameProbe(stdin, stdout);
+  frames?.start(periodMs ?? undefined);
   const probe = dsrProbe(stdin, stdout);
   const period = 1000 / hz;
   const start = performance.now();
@@ -207,8 +293,20 @@ async function runRedraw(args, stdin, stdout) {
   }
   const lost = await probe.drain();
   const wall = (performance.now() - start) / 1000;
+  const paced = await frames?.stop();
+  frames?.close();
   stdout.write("\u001b[?25h\u001b[?1049l");
-  return { wall_s: wall, cols, rows, hz, frames_written: written, frames_skipped: skipped, bytes, dsr: probe.samples, dsr_lost: lost };
+  /** @type {ModeResult} */
+  const result = { wall_s: wall, cols, rows, hz, frames_written: written, frames_skipped: skipped, bytes, dsr: probe.samples, dsr_lost: lost };
+  if (paced && paced.n > 0) {
+    Object.assign(result, {
+      dropped_frame_fraction: paced.fraction,
+      frame_p95_ms: paced.p95,
+      frame_period_ms: paced.period,
+      frame_intervals: paced.n,
+    });
+  }
+  return result;
 }
 
 /**
@@ -257,12 +355,14 @@ async function measure(args) {
   if (!stdin.isTTY || !stdout.isTTY) throw new Error("run this inside a GitPulse terminal session, not through a pipe");
   stdin.setRawMode(true);
   stdin.resume();
+  // Outside the CPU window: idle frames are not part of the redraw's cost.
+  const periodMs = args.mode === "redraw" ? await calibrateFrames(stdin, stdout) : null;
   const load = loadavg()[0];
   const before = readWebContent(pid);
   /** @type {ModeResult} */
   let result;
   try {
-    result = args.mode === "redraw" ? await runRedraw(args, stdin, stdout)
+    result = args.mode === "redraw" ? await runRedraw(args, stdin, stdout, periodMs)
       : args.mode === "flood" ? await runFlood(args, stdin, stdout)
         : await runIdle(args, stdout);
   } finally {
@@ -351,7 +451,7 @@ export function verdict(records) {
   for (const [name, { dom, webgl }] of Object.entries(figures)) {
     if (dom !== null && webgl !== null) continue;
     missing.push(name === "dropped_frame_fraction"
-      ? "dropped-frame fraction not measured (needs the rAF probe planned with ft-cc4be67b)"
+      ? "dropped-frame fraction not measured (the terminal did not answer the OSC 7700 frame probe)"
       : `${name}: no figure for ${dom === null ? "dom" : "webgl"}`);
   }
   if (missing.length) return { decided: false, ships: null, reasons: missing, figures };

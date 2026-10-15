@@ -290,6 +290,22 @@ session at once, for hardware that draws terminal text wrongly. It is on by
 default. Whether the renderer ships at all is decided by the TUI-redraw A/B in
 `docs/PERFORMANCE.md`.
 
+### Frame probe (OSC 7700)
+
+A program in a session can ask for the page's frame pacing:
+
+* `ESC ] 7700 ; frames-start [; period=<ms>] BEL` starts recording the
+  interval between animation frames.
+* `ESC ] 7700 ; frames-stop BEL` stops it. The terminal answers through the
+  PTY, as it answers a cursor-position report:
+  `ESC ] 7700 ; frames ; n= ; dropped= ; fraction= ; period= ; p50= ; p95= ; ms= BEL`.
+
+A dropped frame is one longer than 1.5× `period`, or 1.5× the run's median
+when no period is given. `scripts/tui-redraw-bench.mjs` uses the probe. It
+reveals the page's frame timing only, stops itself after 120 s, and its
+sequences draw nothing. The answer is classed as a terminal reply, so it
+never counts as the reader answering an agent.
+
 ## Screen reader support
 
 **Settings → Appearance → Terminal screen reader support** builds xterm's
