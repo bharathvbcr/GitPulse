@@ -5896,7 +5896,7 @@ some-future-field whatever
 
     /// `refs/heads/main/x` is matched by the `refs/heads/main` pattern but is
     /// not a branch named main; master is the base then, and `trunk` once
-    /// master is renamed. (Re-homed from the deleted `main_ref`: the exact-name
+    /// master is renamed. (Re-homed from the deleted main-probe helper: the exact-name
     /// rule now lives in the default base the worktree listing reads.)
     #[test]
     fn main_is_an_exact_branch_name_not_a_prefix() {
