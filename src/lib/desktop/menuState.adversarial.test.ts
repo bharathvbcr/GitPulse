@@ -11,7 +11,7 @@ const NATIVE_ACTIONS = readFileSync(join(HERE, "nativeActions.ts"), "utf8");
 /** Native menu ids paired with the handler they run, read from dispatchNativeMenu. */
 function idsByHandler(): Map<string, string[]> {
   const out = new Map<string, string[]>();
-  for (const m of NATIVE_ACTIONS.matchAll(/case "([\w-]+)":\s*(?:if \([^)]*\)[^;]*;\s*)?handlers\.(\w+)\(/g)) {
+  for (const m of NATIVE_ACTIONS.matchAll(/case "([\w-]+)":\s*(?:if \([^)]*\)(?:[^;]*;)?\s*)?handlers\.(\w+)\(/g)) {
     out.set(m[2], [...(out.get(m[2]) ?? []), m[1]]);
   }
   return out;
