@@ -119,6 +119,25 @@ function createToastStore() {
     return id;
   }
 
+  /**
+   * Gives a toast its full duration again, counted from now. An offer whose
+   * action failed (an Undo that could not restore) has to stay reachable for
+   * as long as a fresh one would, not for whatever was left of its clock.
+   */
+  function restart(id: string) {
+    let duration = 0;
+    update((toasts) => {
+      duration = toasts.find((t) => t.id === id)?.duration ?? 0;
+      return toasts;
+    });
+    if (duration <= 0) return;
+    const timer = timers.get(id);
+    if (timer) clearTimeout(timer);
+    // Frozen while the user is on the stack: resumeAll restarts it.
+    if (paused.has(id)) return;
+    timers.set(id, setTimeout(() => dismiss(id), duration));
+  }
+
   function clear() {
     timers.forEach((t) => clearTimeout(t));
     timers.clear();
@@ -165,6 +184,7 @@ function createToastStore() {
     subscribe,
     add,
     dismiss,
+    restart,
     clear,
     pauseAll,
     resumeAll,

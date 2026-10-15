@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { get, writable } from "svelte/store";
 import { createRepoStore, type InvokeFn } from "../repoStore";
 import { memoryStorage } from "../../repos/persist";
-import { cancelPrompt, completePrompt, isPromptOpen, askText, promptState } from "../modalStore";
+import { cancelPrompt, completePrompt, isPromptOpen, askText, promptError, promptState } from "../modalStore";
 import type { FilterState } from "../filterStore";
 import { gitActionCount } from "../../desktop/exitGuard";
 
@@ -83,7 +83,7 @@ afterEach(() => {
 });
 
 describe("attack 1: target identity", () => {
-  it("CHARACTERIZATION: a tab closed and reopened at the same path shares its tabId, so the old target runs against the new session", async () => {
+  it("PINNED: a tab closed and reopened at the same path shares its tabId, so the old target runs against the new session — the same path is the same repository", async () => {
     const calls: string[] = [];
     const store = makeStore(makeInvoke({ cmd_discard_changes: async (_c, a) => void calls.push(String(a?.repoPath)) as never }));
     await store.openRepo("/r/a");
@@ -92,7 +92,8 @@ describe("attack 1: target identity", () => {
     await store.closeTab(a.tabId);
     await store.openRepo("/r/a");
     expect(store.captureTarget()!.tabId).toBe(a.tabId);
-    // The contract says a closed target is refused; here it is silently accepted because identity is path-derived.
+    // Ruled correct: a closed target is refused only while the repository is
+    // not open; reopening the path restores it, and the user's intent holds.
     const outcome = await store.discardChanges("f", a);
     expect(outcome.ok).toBe(true);
     expect(calls).toEqual(["/r/a"]);
@@ -289,7 +290,7 @@ describe("attack 7: surfaced", () => {
 });
 
 describe("attack 4: prompts", () => {
-  it("CHARACTERIZATION: a validate() that throws leaves the prompt open and the tab guard armed until Escape (cancel skips validate)", async () => {
+  it("RULED: a validate() that throws is shown in the prompt rather than thrown; the prompt stays open until answered or cancelled", async () => {
     const asked = askText({
       title: "t",
       message: "m",
@@ -298,7 +299,8 @@ describe("attack 4: prompts", () => {
       },
     } as never);
     expect(isPromptOpen()).toBe(true);
-    expect(() => completePrompt("typed")).toThrow("validator bug");
+    expect(() => completePrompt("typed")).not.toThrow();
+    expect(get(promptError)).toContain("validator bug");
     expect(isPromptOpen()).toBe(true);
     cancelPrompt();
     expect(await asked).toBeNull();

@@ -57,4 +57,16 @@ describe("RepoPanel submodules", () => {
     expect(source).toContain("isDestructiveSubmoduleChange");
     expect(source).toContain("Confirm deinit");
   });
+
+  it("disarms a pending destructive confirm when the repository changes", () => {
+    // `armed` names a row, not a repository, so a second click after a tab
+    // switch would otherwise confirm an action armed against the old tab.
+    const reset = source.slice(source.indexOf("$effect(() => {\n    const path = repoPath;"), source.indexOf("function resetForRepository"));
+    expect(reset).toContain("untrack(() => resetForRepository(path))");
+    const body = source.slice(source.indexOf("function resetForRepository"), source.indexOf("stashMessage = \"\";"));
+    expect(body).toContain("armed = null;");
+    // Arming and confirming are both clicks on the active repository; neither awaits a prompt.
+    const flows = source.slice(source.indexOf("function activateStash"), source.indexOf("function submitAddRemote"));
+    expect(flows).not.toContain("askConfirm");
+  });
 });

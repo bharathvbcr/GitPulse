@@ -9,6 +9,7 @@ export interface DeletedBranchTip {
 }
 
 const branches = (count: number) => (count === 1 ? "branch" : "branches");
+const described = (tip: DeletedBranchTip) => `${tip.name} at ${tip.tip}`;
 
 /**
  * Tells the user a branch delete went through and offers to undo it.
@@ -18,8 +19,12 @@ const branches = (count: number) => (count === 1 ? "branch" : "branches");
  * delete), and only claims what it did: every branch is attempted, a failure
  * does not stop the rest, and a partial or refused restore is an error that
  * names each branch that is still missing with its sha — enough to recreate it
- * by hand. The offer stays on the toast after a failed restore and a retry
- * restores only what is still missing.
+ * by hand. The offer stays on the toast after a failed restore, with a fresh
+ * clock, and a retry restores only what is still missing.
+ *
+ * Two entries with one name can never both be restored. The newest (the last
+ * listed) is the one offered; the other is reported by name and sha as not
+ * restorable, and the offer never waits on it.
  */
 export function offerBranchUndo(message: string, tips: readonly DeletedBranchTip[], target: MutationTarget | null): void {
   if (tips.length === 0) {
@@ -27,9 +32,12 @@ export function offerBranchUndo(message: string, tips: readonly DeletedBranchTip
     return;
   }
   const total = tips.length;
-  let missing = [...tips];
+  const newest = new Map<string, DeletedBranchTip>();
+  for (const tip of tips) newest.set(tip.name, tip);
+  const unrestorable = tips.filter((tip) => newest.get(tip.name) !== tip);
+  let missing = [...newest.values()];
   let running = false;
-  toastStore.action(message, "Undo", async () => {
+  const id = toastStore.action(message, "Undo", async () => {
     if (running) return false;
     running = true;
     try {
@@ -39,16 +47,26 @@ export function offerBranchUndo(message: string, tips: readonly DeletedBranchTip
         const outcome = await repoStore.createBranch(tip.name, tip.tip, target);
         if (outcome.ok) continue;
         stillMissing.push(tip);
-        failures.push(`${tip.name} at ${tip.tip} (${outcome.error ?? "failed"})`);
+        failures.push(`${described(tip)} (${outcome.error ?? "failed"})`);
       }
       missing = stillMissing;
+      const restored = total - unrestorable.length - missing.length;
+      const skipped = unrestorable.length
+        ? `Not restorable: ${unrestorable.map((tip) => `${described(tip)} (a newer deleted branch has the same name)`).join("; ")}`
+        : "";
       if (failures.length === 0) {
-        toastStore.success(total === 1 ? `Restored branch "${tips[0].name}"` : `Restored ${total} branches`);
+        if (!skipped) {
+          toastStore.success(total === 1 ? `Restored branch "${tips[0].name}"` : `Restored ${total} branches`);
+        } else {
+          toastStore.warning(`Restored ${restored} of ${total} ${branches(total)}. ${skipped}`);
+        }
         return true;
       }
       toastStore.error(
-        `Restored ${total - missing.length} of ${total} ${branches(total)}. Failed: ${failures.join("; ")}`,
+        `Restored ${restored} of ${total} ${branches(total)}. Failed: ${failures.join("; ")}${skipped ? `. ${skipped}` : ""}`,
       );
+      // The offer is still the way back: it gets a full clock from this failure.
+      toastStore.restart(id);
       return false;
     } finally {
       running = false;

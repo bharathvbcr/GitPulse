@@ -86,7 +86,15 @@ export function askConfirm(options: Omit<ConfirmPromptOptions, "mode">): Promise
 export function completePrompt(value: string | boolean | null): void {
   const current = get(promptState);
   if (current && typeof value === "string" && current.options.mode === "text") {
-    const problem = current.options.validate?.(value) ?? null;
+    // A validator that throws is a refusal too, shown in the prompt: letting it
+    // escape would leave the prompt open with the tab guard armed and nothing
+    // on screen saying why.
+    let problem: string | null;
+    try {
+      problem = current.options.validate?.(value) ?? null;
+    } catch (err: unknown) {
+      problem = `This answer could not be checked: ${err instanceof Error ? err.message : String(err)}`;
+    }
     if (problem !== null) {
       promptError.set(problem);
       return;

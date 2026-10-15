@@ -481,9 +481,15 @@ export function statusKeyAction(
   return null;
 }
 
-/** Menu items that change which tab is open or active. */
-const TAB_CHANGING_EVENTS: ReadonlySet<string> = new Set([
-  "activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab",
+/**
+ * Menu items that wait while a prompt is open: the ones that change which tab
+ * is open or active (a finished clone opens one), and the ones that start a
+ * prompt of their own, because a second prompt retires the first as cancelled.
+ */
+const HELD_WHILE_PROMPTING: ReadonlySet<string> = new Set([
+  "activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone",
+  "create-branch", "rename-branch", "quick-commit", "stash", "stash-pop",
+  "operation-continue", "operation-abort", "operation-skip",
 ]);
 
 /**
@@ -493,7 +499,7 @@ const TAB_CHANGING_EVENTS: ReadonlySet<string> = new Set([
  * prompt cannot swallow them and the dispatcher refuses them instead.
  */
 export function blockedWhilePrompting(eventId: string): boolean {
-  return TAB_CHANGING_EVENTS.has(eventId);
+  return HELD_WHILE_PROMPTING.has(eventId);
 }
 
 /**

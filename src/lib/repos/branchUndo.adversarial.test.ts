@@ -48,7 +48,7 @@ describe("attack 5: Undo", () => {
     expect(message).toContain("y at b2");
   });
 
-  it("CHARACTERIZATION: two tips with the same branch name can never both be restored, so the retained Undo can never finish", async () => {
+  it("RULED: two tips with one name restore the newest, report the other as not restorable, and the offer finishes", async () => {
     const made = new Set<string>();
     createBranch.mockImplementation(async (name) => {
       if (made.has(name)) return { ok: false, error: "already exists" };
@@ -56,9 +56,10 @@ describe("attack 5: Undo", () => {
       return { ok: true };
     });
     offerBranchUndo("Deleted", [{ name: "x", tip: "a" }, { name: "x", tip: "b" }], target);
-    expect(await undoToast()!.action!.onClick()).toBe(false);
-    expect(await undoToast()!.action!.onClick()).toBe(false);
-    expect(get(toastStore).find((t) => t.kind === "error")!.message).toContain("Restored 1 of 2");
+    expect(await undoToast()!.action!.onClick()).toBe(true);
+    expect(createBranch.mock.calls.map((c) => [c[0], c[1]])).toEqual([["x", "b"]]);
+    const report = get(toastStore).find((t) => t.message.startsWith("Restored 1 of 2"))!;
+    expect(report.message).toContain("Not restorable: x at a");
   });
 
   it("BREAK: a restore that fails just before the 12 s clock ends leaves no offer to retry, though the contract says Undo stays available", async () => {

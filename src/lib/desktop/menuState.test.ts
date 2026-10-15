@@ -245,12 +245,12 @@ describe("agents waiting on the reader", () => {
 });
 
 describe("blockedWhilePrompting", () => {
-  it.each(["activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab"])(
-    "blocks %s, a menu item that changes the open tabs",
+  it.each(["activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone", "create-branch", "rename-branch", "quick-commit", "stash"])(
+    "blocks %s while a prompt is open",
     (id) => expect(blockedWhilePrompting(id)).toBe(true),
   );
 
-  it.each(["stage-all", "create-branch", "zoom-in", "check-updates", "fleet"])(
+  it.each(["stage-all", "zoom-in", "check-updates", "fleet"])(
     "leaves %s alone",
     (id) => expect(blockedWhilePrompting(id)).toBe(false),
   );

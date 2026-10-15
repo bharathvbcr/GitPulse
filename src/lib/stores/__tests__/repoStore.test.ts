@@ -4780,3 +4780,73 @@ describe("repoStore bulk operations go through runMutating", () => {
     expect(report.results.find((r) => r.path === "/r/b")?.status).toBe("skipped");
   });
 });
+
+describe("repoStore per-path mutation queue", () => {
+  it("runs two mutations on one repository one after the other and counts the queued one", async () => {
+    const order: string[] = [];
+    const first = deferred<unknown>();
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => {
+          order.push("commit:start");
+          await first.promise;
+          order.push("commit:end");
+          return undefined as never;
+        },
+        cmd_push: async () => {
+          order.push("push:start");
+          return undefined as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const commit = store.commit("m");
+    const push = store.push();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(order).toEqual(["commit:start"]);
+    expect(get(store.mutationActivity)["/r/a"]).toEqual(["commit", "push"]);
+    first.resolve(undefined);
+    await Promise.all([commit, push]);
+    expect(order).toEqual(["commit:start", "commit:end", "push:start"]);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+  });
+
+  it("a hung mutation holds up its own repository only", async () => {
+    const hang = deferred<unknown>();
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => hang.promise as never,
+        cmd_create_branch: async () => undefined as never,
+      }),
+    );
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    const hung = store.commit("m");
+    await new Promise((r) => setTimeout(r, 0));
+    expect((await store.createBranch("n", "abc", a)).ok).toBe(true);
+    hang.resolve(undefined);
+    await hung;
+  });
+
+  it("refuses a queued mutation whose tab closed while it waited", async () => {
+    const first = deferred<unknown>();
+    const calls: string[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => first.promise as never,
+        cmd_delete_branch: async (_c, args) => void calls.push(String(args?.repoPath)) as never,
+      }),
+    );
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    const running = store.commit("m");
+    const queued = store.deleteBranch("x", false, a);
+    await store.openRepo("/r/b");
+    await store.closeTab(a.tabId);
+    first.resolve(undefined);
+    await running;
+    expect(await queued).toMatchObject({ ok: false, refused: true });
+    expect(calls).toEqual([]);
+  });
+});

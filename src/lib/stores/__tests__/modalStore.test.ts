@@ -5,6 +5,7 @@ import {
   cancelPrompt,
   completePrompt,
   isPromptOpen,
+  promptError,
   promptState,
 } from "../modalStore";
 import { get } from "svelte/store";
@@ -68,6 +69,15 @@ describe("modalStore prompts", () => {
     expect(() => completePrompt("x")).not.toThrow();
     expect(() => cancelPrompt()).not.toThrow();
     expect(get(promptState)).toBeNull();
+  });
+
+  it("a validator that throws shows its message in the prompt instead of escaping", async () => {
+    const pending = askText({ title: "t", validate: () => { throw new Error("bad validator"); } });
+    expect(() => completePrompt("x")).not.toThrow();
+    expect(get(promptError)).toContain("bad validator");
+    expect(isPromptOpen()).toBe(true);
+    cancelPrompt();
+    await pending;
   });
 
   it("isPromptOpen follows the open prompt", async () => {

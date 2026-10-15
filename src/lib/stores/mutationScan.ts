@@ -353,7 +353,8 @@ function followsPrompt(call: ts.CallExpression): boolean {
       }
       ts.forEachChild(child, visit);
     };
-    if (node.body) visit(node.body);
+    const body = (node as ts.FunctionLikeDeclaration).body;
+    if (body) visit(body);
     if (prompted) return true;
   }
   return false;

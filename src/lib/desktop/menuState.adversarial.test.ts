@@ -36,14 +36,16 @@ describe("attack 4: native menu ids while a prompt is open", () => {
     }
   });
 
-  it("CHARACTERIZATION: clone is not held, though a finished clone opens and activates a new tab under the open prompt", () => {
-    expect(blockedWhilePrompting("clone")).toBe(false);
+  it("RULED: clone is held, because a finished clone opens and activates a new tab under the open prompt", () => {
+    expect(blockedWhilePrompting("clone")).toBe(true);
   });
 
-  it("CHARACTERIZATION: prompt-starting ids (create-branch, rename-branch, quick-commit, stash) are not held, and a second prompt silently cancels the first", async () => {
-    for (const id of ["create-branch", "rename-branch", "quick-commit", "stash"]) {
-      expect(blockedWhilePrompting(id)).toBe(false);
+  it("RULED: prompt-starting ids are held, so a second prompt never silently cancels the first", async () => {
+    for (const id of ["create-branch", "rename-branch", "quick-commit", "stash", "stash-pop", "operation-abort", "operation-skip", "operation-continue"]) {
+      expect(blockedWhilePrompting(id)).toBe(true);
     }
+    // The store itself still retires an older prompt when asked directly; the
+    // dispatcher is what keeps the menu from asking.
     const first = askConfirm({ title: "Delete branch", message: "m" } as never);
     void askText({ title: "Create Branch", message: "m" } as never);
     expect(await first).toBe(false);

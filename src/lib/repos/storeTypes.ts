@@ -30,6 +30,16 @@ export interface MutationOutcome<T = unknown> {
  * confirm or the toast that precedes it. A tab id always names the same
  * repository, so identity is tab id plus path, never a generation: activation
  * bumps the generation, which would refuse every Undo made after a tab switch.
+ *
+ * Path-derived identity has one consequence, and it is intended: closing a tab
+ * and reopening the same path gives the same tab id, so a target captured
+ * before the close names the reopened repository again. The same path is the
+ * same repository, and the user's intent still holds. While the tab is closed
+ * (or the checkout is gone or untrusted) the target is refused.
+ *
+ * `captureTarget()` returns a target or `null`, never `undefined`: passing
+ * `undefined` to a mutation means "no target, use the active tab", and `null`
+ * means "nothing was captured, refuse".
  */
 export interface MutationTarget {
   readonly tabId: string;
