@@ -819,6 +819,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
+| `graph_spawns` | `cmd_get_commit_graph` at the default 5,000-row cap on 6,000 commits; `cmd_get_stack_hierarchy` with 20 branches beyond its 2,000-commit window, cold and with refs unmoved; each with git processes | ft-9cfa4f74 (S4-03, S4-04) |
 
 `src/watcher/bench_seam.rs` is a `#[doc(hidden)]` module that builds the same
 `IgnoreRules` (through the same `parse_ignored_directories`) and calls the same
@@ -1245,3 +1246,46 @@ On git older than 2.37 the scan is count-bounded (`-n cap+1`, window applied
 here); a row past the cap is reported as a possibly cut window, because without
 a date bound nothing says the window does not continue behind it, and the
 window's true size is not claimed.
+
+## 2026-10-15: graph and stack history walks (ft-9cfa4f74, S4-03 and S4-04)
+
+Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench graph_spawns`.
+Rows and fixtures are described in the bench's header. The cold rows move a tag
+before every timed call so the ref cache cannot answer; the warm row reads a
+repository whose refs have been idle for longer than the cache's racy window.
+
+**The spawn counters are the gate.** This host runs at load 40 to 200 on 18
+cores, so the time columns are recorded with the load beside them and do not
+pass or fail anything.
+
+### Baseline (unmodified `cd52ff3c`)
+
+| row | git processes | min of 2 runs | run 1 min / p50 | run 2 min / p50 | load1 at start (run 1, run 2) |
+| --- | --- | --- | --- | --- | --- |
+| S4-04 graph default page, 5,000 rows of 6,000 commits | **12** | 61.3 ms | 70.0 / 91.1 ms | 61.3 / 73.6 ms | 49.3, 49.5 |
+| S4-03 stack refresh, 20 branches beyond the window, cold | **28** | 237.6 ms | 237.6 / 286.6 ms | 264.6 / 315.8 ms | 49.3, 49.5 |
+| S4-03 stack refresh, refs unmoved (warm) | **20** | 236.3 ms | 236.3 / 289.7 ms | 255.4 / 295.6 ms | 49.3, 49.5 |
+
+N = 9 per row after one warmup, two runs. The warm stack row still spawns 20
+processes: the first-parent repairs bypass the ref cache, so an idle repository
+pays one walk per unresolved branch on every tick, and nothing else (the branch
+listing, the history read and the default-branch probes are answered from the
+cache). The cold row's 28 are 20 walks and 8 others. A spawn log of the same
+refresh in a unit test names 7 of the 8: the default-branch probes (`config
+--list`, two `symbolic-ref`, `remote`, a `for-each-ref` over the conventional
+names), the branch listing and the history read. The eighth is not identified
+(trace2 counts every process, including ones git starts itself).
+
+**Counting the warm row.** `count_git_processes` rewrites the hermetic global
+git config, and the ref cache stamps that file, so the first call inside a
+counted block is always cold and nothing is kept until the new file is older
+than the 3 s racy window. The warm count is the difference between two counted
+blocks that wait that window out: one call, and two calls. (The first version
+of this bench counted the warm row in one block and printed the cold figure,
+28, beside a warm time; the pre-fix test
+`a_stack_refresh_with_no_ref_movement_spawns_nothing` independently saw 20
+`rev-list` walks and nothing else on a warm tick.)
+
+Baselines were built from the unmodified tree at `cd52ff3c` plus this bench file
+only (`src-tauri/src` and `src-tauri/tests` checked out from `HEAD`), and run
+interleaved with the fixed build (A B A B) so host load lands on both.

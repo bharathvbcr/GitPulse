@@ -347,6 +347,11 @@ name = "analyzer_scans"
 harness = false
 test = false
 
+[[bench]]
+name = "graph_spawns"
+harness = false
+test = false
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"
