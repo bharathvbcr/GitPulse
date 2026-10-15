@@ -4544,6 +4544,14 @@ some-future-field whatever
     /// on `feature-x` holding one more commit. Returns (repo dir, worktree
     /// dir); both are trusted.
     fn teardown_fixture(hooks: Option<&str>) -> (tempfile::TempDir, tempfile::TempDir) {
+        teardown_fixture_on(hooks, "main")
+    }
+
+    /// [`teardown_fixture`] on a repository whose only branch is `default`.
+    fn teardown_fixture_on(
+        hooks: Option<&str>,
+        default: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         let git = |cwd: &Path, args: &[&str]| {
@@ -4558,7 +4566,7 @@ some-future-field whatever
                 String::from_utf8_lossy(&out.stderr)
             );
         };
-        git(repo, &["init", "-b", "main", "."]);
+        git(repo, &["init", "-b", default, "."]);
         git(repo, &["config", "user.email", "test@gitpulse.local"]);
         git(repo, &["config", "user.name", "GitPulse Tester"]);
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();
@@ -5389,6 +5397,136 @@ some-future-field whatever
         let (dir, wt) = teardown_fixture(None);
         let merged = teardown(&dir, &wt, false, None).unwrap();
         assert_eq!(merged.base_oid, None);
+    }
+
+    /// The panel passes no target. On a repository whose default branch is
+    /// `develop`, with no `main` or `master` at all, that is the resolved
+    /// default, not a refusal for "main".
+    #[test]
+    fn a_null_target_merges_into_the_resolved_default() {
+        let (dir, wt) = teardown_fixture_on(None, "develop");
+        let merged = merge_and_teardown_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            None,
+            false,
+            None,
+            &mut allow_all,
+        )
+        .expect("merged into the default branch");
+        assert!(merged.merged);
+        assert_eq!(merged.target_branch, "develop");
+        assert!(dir.path().join("feature.txt").exists());
+    }
+
+    /// A destructive merge never guesses its target: a default that cannot be
+    /// read, or that does not exist, refuses and leaves the lane whole.
+    #[test]
+    fn a_null_target_with_no_resolvable_default_is_refused() {
+        let kept = |dir: &tempfile::TempDir, wt: &tempfile::TempDir| {
+            assert!(wt.path().exists(), "the worktree was removed");
+            assert!(
+                branch_exists(dir.path(), "feature-x"),
+                "the branch was deleted"
+            );
+            assert!(!dir.path().join("feature.txt").exists(), "something merged");
+        };
+        let merge = |dir: &tempfile::TempDir, wt: &tempfile::TempDir| {
+            merge_and_teardown_worktree(
+                dir.path().to_str().unwrap(),
+                wt.path().to_str().unwrap(),
+                None,
+                false,
+                None,
+                &mut allow_all,
+            )
+        };
+
+        let (dir, wt) = teardown_fixture_on(None, "develop");
+        let refused = crate::engine::git_cli::with_forced_spawn_failure_of(
+            "refs/remotes/origin/HEAD",
+            || merge(&dir, &wt),
+        )
+        .expect_err("an unreadable default is not a default");
+        let MergeTeardownError::Refused { message } = &refused else {
+            panic!("{refused:?}")
+        };
+        assert!(message.contains("forced by test"), "{message}");
+        assert!(message.contains("Nothing was merged"), "{message}");
+        kept(&dir, &wt);
+
+        let (dir, wt) = teardown_fixture_on(None, "develop");
+        git_text(dir.path(), &["branch", "-m", "develop", "x"]).unwrap();
+        let refused = merge(&dir, &wt).expect_err("no default branch resolves");
+        let MergeTeardownError::Refused { message } = &refused else {
+            panic!("{refused:?}")
+        };
+        assert!(message.contains("name a target"), "{message}");
+        assert!(branch_exists(dir.path(), "x"));
+        assert!(wt.path().exists() && branch_exists(dir.path(), "feature-x"));
+    }
+
+    /// The listing measures every worktree against the same base the branch
+    /// list does. With `develop` as the remote's default and a `main` on a
+    /// different commit, the two used to disagree.
+    #[test]
+    fn worktree_divergence_equals_the_branch_list_against_develop() {
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let root = plain(main.path());
+        git_in(&root, &["checkout", "-q", "-b", "develop"]);
+        git_in(
+            &root,
+            &["commit", "-q", "--allow-empty", "-m", "develop moves"],
+        );
+        git_in(&root, &["checkout", "-q", "main"]);
+        let develop = rev(&root, "develop");
+        git_in(
+            &root,
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        );
+        git_in(
+            &root,
+            &["update-ref", "refs/remotes/origin/develop", &develop],
+        );
+        git_in(
+            &root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/develop",
+            ],
+        );
+        for n in 0..2 {
+            std::fs::write(linked[0].join(format!("w{n}.txt")), "x").unwrap();
+            git_in(&linked[0], &["add", "."]);
+            git_in(&linked[0], &["commit", "-q", "-m", &format!("w{n}")]);
+        }
+
+        let branches = crate::engine::git_reader::GitReader::list_branches(root.to_str().unwrap())
+            .expect("branches");
+        let lane = branches
+            .iter()
+            .find(|b| b.name == "agent/00")
+            .expect("lane listed");
+        assert_eq!(lane.compared_to.as_deref(), Some("develop"));
+        let expected = (lane.commits_ahead_of_base, lane.commits_behind_base);
+        assert_eq!(expected, (2, 1));
+
+        let measured = |list: &[WorktreeInfo]| {
+            list.iter()
+                .find(|w| w.branch.as_deref() == Some("agent/00"))
+                .and_then(|w| w.main_divergence.clone())
+                .map(|d| (d.ahead, d.behind))
+        };
+        let batched = list_worktrees(root.to_str().unwrap()).expect("list");
+        assert_eq!(measured(&batched), Some(expected), "batched");
+        // The same counts when the batch is refused and each worktree walks.
+        let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
+        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+            list_worktrees(root.to_str().unwrap())
+        })
+        .expect("list");
+        assert_eq!(measured(&walked), Some(expected), "walked");
     }
 
     /// The test checkout's pre-commit guard, and the identity it refuses.

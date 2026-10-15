@@ -7031,6 +7031,52 @@ mod tests {
         assert_eq!(default_base(&repo), uncached(&repo));
     }
 
+    /// The default branch can be nested (`release/main`). Moving it rewrites a
+    /// file two directories below `refs/heads`, and only that subdirectory's
+    /// mtime moves, so a stamp over the `refs/heads` directory alone served the
+    /// old oid until something else changed. The commit is made with
+    /// `commit-tree` so no top-level ref moves and the nested write is the only
+    /// change the stamp can see.
+    #[test]
+    fn a_nested_default_branch_that_moves_is_seen_at_once() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/release/main", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release/main",
+            ],
+        );
+        git_in(&repo, &["update-ref", "refs/heads/release/main", "HEAD"]);
+        ref_cache::eager(|| {
+            let warm = default_base(&repo);
+            assert_eq!(
+                warm.base.as_ref().map(|(name, _)| name.as_str()),
+                Some("release/main")
+            );
+            let moved = git_stdout(
+                &repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moves"],
+            )
+            .trim()
+            .to_string();
+            git_in(&repo, &["update-ref", "refs/heads/release/main", &moved]);
+            assert_eq!(
+                default_base(&repo).base.map(|(_, oid)| oid),
+                Some(moved),
+                "the memo served the oid from before the nested ref moved"
+            );
+            git_in(&repo, &["branch", "-D", "release/main"]);
+            assert_eq!(default_base(&repo), compute_default_base(&repo));
+        });
+    }
+
     /// What `hydrate` actually does: the three readers at the same instant on a
     /// repository nobody has asked about yet.
     #[test]
