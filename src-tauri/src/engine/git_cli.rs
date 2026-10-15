@@ -11109,6 +11109,57 @@ mod admission_scope_tests {
         println!("{}", rows.join("\n"));
     }
 
+    /// The two counters are separate, add exactly under concurrent deciders of
+    /// one gate, and saturate rather than wrap; the reason (which names the
+    /// path) is only logged, never part of the report's counts.
+    #[test]
+    fn unrecorded_denials_and_fallbacks_count_apart_exactly_and_saturate() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = shared_gate(&dir.path().join("budget"), 8, 1);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for i in 0..500 {
+                        let taken = if i % 5 == 0 {
+                            shared_budget::Take::Unavailable("held".into())
+                        } else {
+                            shared_budget::Take::DeniedUnrecorded("full".into())
+                        };
+                        let mut state = gate.state.lock().unwrap();
+                        assert_eq!(gate.settle_shared(&mut state, taken), i % 5 == 0);
+                    }
+                });
+            }
+        });
+        let (fallbacks, unrecorded) = {
+            let state = gate.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert_eq!((fallbacks, unrecorded), (200, 800));
+
+        let mut state = gate.state.lock().unwrap();
+        state.shared_unrecorded_denials = u64::MAX;
+        state.shared_fallbacks = u64::MAX;
+        assert!(!gate.settle_shared(
+            &mut state,
+            shared_budget::Take::DeniedUnrecorded("x".into())
+        ));
+        assert!(gate.settle_shared(&mut state, shared_budget::Take::Unavailable("x".into())));
+        assert_eq!(
+            (state.shared_fallbacks, state.shared_unrecorded_denials),
+            (u64::MAX, u64::MAX)
+        );
+        let report = gate.sharing_report(state.shared_fallbacks, state.shared_unrecorded_denials);
+        assert!(
+            report.ends_with(&format!(
+                "unrecorded_denials={} fallbacks={}",
+                u64::MAX,
+                u64::MAX
+            )),
+            "{report}"
+        );
+    }
+
     #[test]
     fn a_user_action_neither_waits_for_nor_spends_the_shared_budget() {
         let dir = tempfile::tempdir().unwrap();
