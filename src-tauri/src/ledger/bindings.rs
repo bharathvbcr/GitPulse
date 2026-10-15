@@ -827,12 +827,14 @@ mod tests {
         let plan = super::super::with_conn(&repo, |conn| {
             let mut stmt = conn
                 .prepare(&format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    super::super::FOREIGN_ROW_SQL
+                    "EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE {} LIMIT 1",
+                    super::super::foreign_row_sql(3)
                 ))
                 .unwrap();
             let rows = stmt
-                .query_map(rusqlite::params!["a", "b"], |row| row.get::<_, String>(3))
+                .query_map(rusqlite::params!["a", "b", "c"], |row| {
+                    row.get::<_, String>(3)
+                })
                 .unwrap();
             Ok(rows.map(Result::unwrap).collect::<Vec<_>>().join(" | "))
         })

@@ -113,6 +113,16 @@ fn ingest_family(
     expired: &mut dyn FnMut(&CatchUp) -> bool,
 ) -> CatchUp {
     let mut out = CatchUp::default();
+    // Before anything reads the ledger: a repository that was moved carries a
+    // ledger whose rows name its old path, which every read below refuses until
+    // the ledger is taken over (or, for another repository's ledger, never).
+    match ledger::settle_identity(ledger_repo) {
+        Ok(reanchored) => out.reanchored_from = reanchored.unwrap_or_default(),
+        Err(e) => {
+            out.error = format!("the ledger's repository could not be confirmed: {e}");
+            return out;
+        }
+    }
     let Some(root) = super::transcript_root() else {
         out.error = super::NO_TRANSCRIPT_ROOT.into();
         return out;
