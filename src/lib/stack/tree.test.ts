@@ -265,6 +265,19 @@ describe("unresolvedStackNotice", () => {
     expect(text).toContain("budget");
   });
 
+  it("is silent, not NaN, for a payload that carries no count", () => {
+    // A cached or older payload has neither field: `undefined <= 0` is false.
+    expect(unresolvedStackNotice({} as never)).toBeNull();
+  });
+
+  it("does not claim only a budget: the backend also sets walk_incomplete when git failed", () => {
+    const text = unresolvedStackNotice({ unresolved_branches: 2, walk_incomplete: true });
+    expect(text).toContain("git failed");
+    // Unresolved branches are shown as parentless nodes, not as an unplaced list:
+    // one with a child on it is placed as a parent.
+    expect(text).not.toContain("unplaced");
+  });
+
   it("does not claim a budget when the history could not be read", () => {
     const text = unresolvedStackNotice({ unresolved_branches: 1, walk_incomplete: false });
     expect(text).toContain("1 branch could not be placed");

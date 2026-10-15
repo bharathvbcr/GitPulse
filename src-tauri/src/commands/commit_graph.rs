@@ -591,13 +591,35 @@ pub(super) fn stack_hierarchy(
             .iter()
             .map(|node| node.tip_commit_id.clone())
             .collect();
+        let started = std::time::Instant::now();
         match GitReader::first_parent_pass(repo_path, &tips, budget.max_commits, budget.deadline) {
             Ok(pass) => {
                 cut_short = pass.truncated();
                 for node in &candidates {
                     let mut stop_at = tip_oids.clone();
                     stop_at.remove(&node.tip_commit_id);
-                    match pass.chain(&node.tip_commit_id, &stop_at) {
+                    let mut outcome = pass.chain(&node.tip_commit_id, &stop_at);
+                    // The commit cap is shared, and a pass is read newest
+                    // first across every tip, so one deep unrelated branch
+                    // can spend the cap before a shallow branch's fork point
+                    // is reached. The per-branch walks this pass replaced
+                    // would have placed that branch, so a chain the shared
+                    // cap cut gets its own pass over the time that is left.
+                    // Only reached once the shared cap is exhausted.
+                    if outcome == FirstParentChain::Unfinished && pass.truncated() {
+                        let left = budget.deadline.saturating_sub(started.elapsed());
+                        if !left.is_zero() {
+                            if let Ok(own) = GitReader::first_parent_pass(
+                                repo_path,
+                                std::slice::from_ref(&node.tip_commit_id),
+                                budget.max_commits,
+                                left,
+                            ) {
+                                outcome = own.chain(&node.tip_commit_id, &stop_at);
+                            }
+                        }
+                    }
+                    match outcome {
                         FirstParentChain::Reached(chain) => {
                             for edge in chain.windows(2) {
                                 // Never overwrite richer multi-parent data

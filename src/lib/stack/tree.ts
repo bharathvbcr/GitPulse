@@ -290,15 +290,16 @@ export function rootlessBranches(
 export function unresolvedStackNotice(
   payload: Pick<StackHierarchyPayload, "unresolved_branches" | "walk_incomplete"> | null,
 ): string | null {
-  if (!payload || payload.unresolved_branches <= 0) return null;
+  // `!(n > 0)`, not `n <= 0`: a payload without the count is silent, not "NaN".
+  if (!payload || !(payload.unresolved_branches > 0)) return null;
   const n = payload.unresolved_branches;
   const plural = n === 1 ? "" : "es";
   const why = payload.walk_incomplete
-    ? "the history walk stopped at its budget before reaching their base"
+    ? "the history walk did not finish (its commit or time budget ran out, or git failed) before reaching their base"
     : "their history could not be read";
   return `${n} branch${plural} could not be placed on a stack: ${why}. ${
     n === 1 ? "It is" : "They are"
-  } listed as unplaced rather than guessed.`;
+  } shown without a base rather than guessed.`;
 }
 
 /**

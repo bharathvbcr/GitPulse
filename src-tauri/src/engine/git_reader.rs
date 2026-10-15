@@ -10057,6 +10057,77 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(ids(&mid), ids(&whole[9..22]));
     }
 
+    /// Every (chunk size, history length, skip, count) over a small repository
+    /// reads exactly the rows one unchunked walk holds: no boundary row is
+    /// doubled by the overlap, none dropped, and a history shorter than a
+    /// chunk, or ending on a chunk boundary, is exact. Chunk size 1 makes the
+    /// overlap row the whole of every chunk.
+    #[test]
+    fn chunked_history_equals_one_walk_for_every_window_and_skip() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..7 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        // A branch at three depths: `h{k}` has 8 - k commits of history (the
+        // fixture repository starts with one commit of its own).
+        for k in [0, 3, 5] {
+            git_in(
+                dir.path(),
+                &["branch", &format!("h{k}"), &format!("main~{k}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let ids = |rows: Vec<RawCommitNode>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let mut checked = 0;
+        for k in [0, 3, 5] {
+            let rev = format!("h{k}");
+            let len = 8 - k;
+            let whole = ids(with_history_chunk(usize::MAX, || {
+                GitReader::read_commit_history_paged(
+                    path,
+                    0,
+                    len + 5,
+                    Some(&rev),
+                    None,
+                    RefScope::Named,
+                )
+            })
+            .unwrap());
+            assert_eq!(whole.len(), len);
+            for chunk in [1, 2, 3] {
+                for skip in 0..=len + 1 {
+                    for count in 1..=len + 2 {
+                        let got = ids(with_history_chunk(chunk, || {
+                            GitReader::read_commit_history_paged(
+                                path,
+                                skip,
+                                count,
+                                Some(&rev),
+                                None,
+                                RefScope::Named,
+                            )
+                        })
+                        .unwrap());
+                        let from = skip.min(len);
+                        let to = (skip + count).min(len);
+                        assert_eq!(
+                            got,
+                            whole[from..to].to_vec(),
+                            "chunk {chunk} history {len} skip {skip} count {count}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 400, "{checked}");
+    }
+
     #[test]
     fn dora_report_computes_release_metrics_from_tags() {
         let dir = init_repo_with_remotes(&[], "main");

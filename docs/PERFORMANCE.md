@@ -1314,10 +1314,16 @@ cores and gate nothing. What changed:
 * **S4-03.** The 20 per-branch `rev-list --first-parent --max-count=100000`
   walks are one `rev-list --first-parent --parents` over every unresolved tip,
   read through the ref cache over `refs/heads`, with a 20 s deadline and the
-  same 100,000-commit cap shared across the tips. An idle repository's next tick
-  is answered without a process. `--not` is deliberately not used: the default
-  branch's tip descends from every branch below the window, so excluding it
-  removes the commits the pass is looking for. A branch the pass could not
+  same 100,000-commit cap shared across the tips. The cap is read newest first
+  across every tip, so a deep unrelated branch can spend it before a shallow
+  branch's fork point is reached; a chain the shared cap cut therefore gets its
+  own single-tip pass over the deadline that is left, as the per-branch walks
+  had (only after the shared cap is exhausted, so it costs nothing in the
+  common case). An idle repository's next tick
+  is answered without a process. `--not` is deliberately not used: excluding
+  the other tips also excludes whatever a tip sitting mid-chain can reach
+  (`excluding_other_tips_would_cut_a_chain_a_mid_chain_tip_shares`), and the
+  window's own commits cannot be excluded for the same reason. A branch the pass could not
   finish (cap, deadline, a failed git) is counted in the payload as
   `unresolved_branches`, with `walk_incomplete`, and shown in the Stack view;
   it was previously left parentless without saying so.
