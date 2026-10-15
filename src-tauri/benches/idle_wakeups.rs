@@ -33,6 +33,12 @@
 //! a 200 ms timer per watch), and `idle mailbox` claims a profile as `Primary`
 //! (the single-instance accept loop that polled its listener every 500 ms).
 //! Their difference from the 0-session floor is the cost of that poller.
+//! `idle alerts bridge` binds the hook socket and leaves it with no clients (the
+//! 200 ms `wait_readable` accept loop), and `idle host-load sampler` runs the
+//! sampler at its production cadence with `host_load` enabled (the 2 s tick with
+//! a full process scan). The workbench `external_changes` watcher has no row: it
+//! is `pub(crate)` and its loop needs an `AppHandle` window, so a bench cannot
+//! start it without a test seam in production code.
 //!
 //! The row's time is the idle window itself, so it is not gated; the figure is
 //! the `*_wkups_per_s` metric. Wakeups are tiny numbers on a quiet machine and
@@ -95,6 +101,11 @@ mod imp {
     const NAMES: (&str, &str) = ("interrupt_wkups_per_s", "pkg_idle_wkups_per_s");
     #[cfg(target_os = "linux")]
     const NAMES: (&str, &str) = ("ctx_switches_per_s", "unused");
+
+    #[cfg(target_os = "macos")]
+    const SHORT_TMP: &str = "/private/tmp";
+    #[cfg(target_os = "linux")]
+    const SHORT_TMP: &str = "/tmp";
 
     pub fn main() {
         gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
@@ -220,8 +231,68 @@ mod imp {
                 .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
                 .elapsed(elapsed)
         };
+        // The alerts bridge listens under `$HOME/Library/Application Support/
+        // GitPulse` (`default_config_dir`), so the row points HOME at a short
+        // private directory (a unix socket path is capped near 104 bytes, and
+        // `bind_private` refuses a symlinked `/tmp`, hence `/private/tmp`) for
+        // the window only and puts it back.
+        let idle_alerts_bridge = || -> Sample {
+            let home = tempfile::Builder::new()
+                .prefix("gpb")
+                .tempdir_in(SHORT_TMP)
+                .expect("short home");
+            let saved = std::env::var_os("HOME");
+            std::env::set_var("HOME", home.path());
+            gitpulse_lib::alerts::bridge::apply(true);
+            let status = gitpulse_lib::alerts::bridge::status();
+            assert!(
+                status.listening,
+                "the alerts bridge did not bind: {:?}",
+                status.error
+            );
+            std::thread::sleep(Duration::from_millis(600));
+            let (before, started) = (counters(), Instant::now());
+            std::thread::sleep(window);
+            let (elapsed, after) = (started.elapsed(), counters());
+            gitpulse_lib::alerts::bridge::apply(false);
+            std::thread::sleep(Duration::from_millis(500));
+            match saved {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            let secs = elapsed.as_secs_f64();
+            Sample::default()
+                .counter("bridge", 1)
+                .metric(NAMES.0, after.0.saturating_sub(before.0) as f64 / secs)
+                .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
+                .elapsed(elapsed)
+        };
+        let sampler_dir = temp.path().join("sampler");
+        std::fs::create_dir_all(&sampler_dir).expect("sampler dir");
+        let idle_host_load = || -> Sample {
+            let handle = gitpulse_lib::sysload::start(gitpulse_lib::sysload::SamplerOptions::new(
+                sampler_dir.clone(),
+            ))
+            .unwrap_or_else(|error| panic!("host-load sampler: {error}"));
+            // The first tick (full process scan, writer election) settles first.
+            std::thread::sleep(Duration::from_millis(3000));
+            assert!(handle.status().is_some(), "the sampler never ticked");
+            let (before, started) = (counters(), Instant::now());
+            std::thread::sleep(window);
+            let (elapsed, after) = (started.elapsed(), counters());
+            handle.stop();
+            std::thread::sleep(Duration::from_millis(300));
+            let secs = elapsed.as_secs_f64();
+            Sample::default()
+                .counter("sampler", 1)
+                .metric(NAMES.0, after.0.saturating_sub(before.0) as f64 / secs)
+                .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
+                .elapsed(elapsed)
+        };
         let mut cases = cases;
         cases.push(Case::new("idle mailbox", idle_mailbox).ungated());
+        cases.push(Case::new("idle alerts bridge", idle_alerts_bridge).ungated());
+        cases.push(Case::new("idle host-load sampler", idle_host_load).ungated());
         for n in [8usize, 24] {
             cases.push(Case::new(format!("idle {n} watches"), move || idle_watches(n)).ungated());
         }
