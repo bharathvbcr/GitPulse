@@ -1588,6 +1588,37 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return () => { mutations.delete(token); publishActivity(); };
   }
 
+  /**
+   * The one echo rule. Our own `.git` writes bounce back from the watcher, and
+   * they are dropped (the mutation refreshes explicitly) while a mutation holds
+   * the path and for WATCHER_ECHO_SUPPRESS_MS after one SUCCEEDED. A mutation
+   * that failed leaves no window: it never refreshes, so the watcher is what
+   * shows what it left behind.
+   */
+  function isEchoOfOwnWrite(path: string): boolean {
+    for (const entry of mutations.values()) if (entry.path === path) return true;
+    const until = mutationEchoUntil.get(path);
+    return until !== undefined && Date.now() < until;
+  }
+
+  /**
+   * One chain of mutations per repository path. Two git commands writing the
+   * same repository at once (a bulk pull and a single pull, two commits) race
+   * on its index and refs, so each waits for the one before it. Another
+   * repository's chain is never involved, so a hung mutation holds up only its
+   * own path.
+   */
+  const pathQueues = new Map<string, Promise<void>>();
+  function enterPathQueue(path: string): Promise<() => void> {
+    const previous = pathQueues.get(path) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => mine);
+    pathQueues.set(path, tail);
+    void tail.then(() => { if (pathQueues.get(path) === tail) pathQueues.delete(path); });
+    return previous.then(() => release);
+  }
+
   const store = {
     subscribe,
     /**
@@ -2357,12 +2388,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         sameRepo(item.path, changedPath, options),
       );
       if (!session || session.trustRequired) return;
-      // Drop echoes of our own recent writes: the explicit refresh() in
-      // runMutating already fetched fresh state, so acting on the echo would
-      // refresh the whole session twice per mutation. An unrelated external
-      // change inside the window is picked up by the next poll or event.
-      const echoUntil = mutationEchoUntil.get(session.path);
-      if (echoUntil !== undefined && Date.now() < echoUntil) return;
+      // Drop echoes of our own writes (isEchoOfOwnWrite): the explicit
+      // refresh() in runMutating already fetches fresh state, so acting on the
+      // echo would refresh the whole session twice per mutation. An unrelated
+      // external change inside the window is picked up by the next poll or event.
+      if (isEchoOfOwnWrite(session.path)) return;
       bindRefreshVisibility();
       watcherRefreshPolicy.onChange(session.path);
     },
@@ -2900,9 +2930,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             const input = byPath.get(target.path);
             const skip = input ? bulkSkipReason(input) : "Repository is no longer open.";
             if (skip) return { skip };
-            // The tab may have closed while this repository waited its turn.
-            const session = internal.sessions[tabIds.get(target.path) ?? ""];
-            if (!session) return { skip: "Repository is no longer open." };
+            // The snapshot above was taken before the sweep began. While this
+            // repository waited its turn the tab may have closed, its checkout
+            // gone missing or its trust been withdrawn: the live answer is the
+            // same one every targeted mutation uses.
+            const tabId = tabIds.get(target.path);
+            const mutationTarget = tabId ? { tabId, path: target.path } : null;
+            if (!mutationTarget || !resolveTarget(mutationTarget)) {
+              return { skip: "Repository is no longer open, or is unavailable." };
+            }
             // The same wrapper every other mutation uses: activity for the
             // quit guard, the echo window armed before the work, the policy
             // verdict and the journal entry. Both commands are named
@@ -2917,7 +2953,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
                 kind === "fetch"
                   ? invokeFn("cmd_fetch", { repoPath: path })
                   : invokeFn("cmd_pull", { repoPath: path }),
-              { session, skipRefresh: true },
+              { target: mutationTarget, skipRefresh: true },
             );
             // The sweep classifies by a throw: that is what makes it "failed".
             if (!outcome.ok) throw new Error(outcome.error ?? `${kind} failed`);
@@ -3350,15 +3386,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
     const path = session.path;
     const generation = session.generation;
+    // Counted from the moment it is asked for, queued or running, so the quit
+    // guard and the menu see a mutation that is still waiting its turn.
     const finishActivity = opts.trackActivity === false ? () => {} : beginMutation(path, kind);
-    // Arm the echo window BEFORE the work: a long fetch or pull writes `.git`
-    // the whole time, and every one of those events bounces back from the
-    // watcher (see WATCHER_ECHO_SUPPRESS_MS). It is armed again after, so the
-    // window also covers the refresh that follows a slow action.
-    mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+    const release = await enterPathQueue(path);
+    let succeeded = false;
     try {
+      // The wait may have been long: the tab can be gone or its checkout
+      // missing by now.
+      const stillNamed = opts.target !== undefined
+        ? opts.target !== null && resolveTarget(opts.target) !== null
+        : internal.sessions[session.id] !== undefined;
+      if (!stillNamed) return { ok: false, error: REPOSITORY_CHANGED, refused: true, surfaced: false };
       const result = await action(path);
-      mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+      succeeded = true;
       const policy = recordPolicyVerdict(result, path);
       harnessStore.recordAction({
         repoPath: path,
@@ -3399,15 +3440,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // a caller that must react to a refusal — the commit box keeping the
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
-      const filed = applyToSession(session.id, generation, { error: formatError(err) });
+      const error = formatError(err);
+      applyToSession(session.id, generation, { error });
       harnessStore.recordAction({ repoPath: path, kind, label, ok: false });
+      // Surfaced when the banner the app toasts from is showing THIS error: a
+      // concurrent failure with the same message shares one banner.
       return {
         ok: false,
-        error: formatError(err),
-        surfaced: filed && internal.workspace.activeId === session.id,
+        error,
+        surfaced: internal.workspace.activeId === session.id && internal.sessions[session.id]?.error === error,
       };
     } finally {
+      // The trailing window opens when the mutation, refresh included, ends,
+      // and only for one that succeeded (see isEchoOfOwnWrite).
+      if (succeeded) mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
       finishActivity();
+      release();
     }
   }
 
