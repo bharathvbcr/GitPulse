@@ -69,6 +69,14 @@ impl<'a> InputFeed<'a> {
         }
     }
 
+    /// Closes the child's stdin now, so a child that reads stdin to EOF sees
+    /// it. Undelivered bytes stay counted as pending: [`Self::finish`] still
+    /// reports them, and the run only turns that into an error for a
+    /// successful, uncancelled exit, which a close at the ask never is.
+    pub(super) fn close(&mut self) {
+        self.pipe = None;
+    }
+
     pub(super) fn finish(self) -> Result<(), String> {
         if self.pending.is_empty() {
             return Ok(());

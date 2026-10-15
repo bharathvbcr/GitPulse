@@ -64,8 +64,13 @@ fn grace_is_bounded_when_stdout_is_closed_and_stderr_floods() {
     let script = r#"trap '' TERM; exec 1>&-; touch "$1"; while :; do echo yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy >&2; done"#;
     let cpu = thread_cpu();
     let started = Instant::now();
-    let run = run_bounded(sh(script, &[&marker]), "f", Duration::from_millis(300), None)
-        .expect("deadline keeps prefix");
+    let run = run_bounded(
+        sh(script, &[&marker]),
+        "f",
+        Duration::from_millis(300),
+        None,
+    )
+    .expect("deadline keeps prefix");
     let wall = started.elapsed();
     let cpu = thread_cpu() - cpu;
     eprintln!("wall {wall:?} waiter cpu {cpu:?}");
@@ -80,10 +85,16 @@ fn a_grandchild_retaining_the_pipe_does_not_stretch_the_grace() {
     let _kept = KeepDeadlinePrefix::enter();
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("pid");
-    let script = r#"set -m; sleep 30 & echo $! > "$1"; trap 'exit 0' TERM; while :; do sleep 0.05; done"#;
+    let script =
+        r#"set -m; sleep 30 & echo $! > "$1"; trap 'exit 0' TERM; while :; do sleep 0.05; done"#;
     let started = Instant::now();
-    let run = run_bounded(sh(script, &[&pidfile]), "g", Duration::from_millis(400), None)
-        .expect("deadline keeps prefix");
+    let run = run_bounded(
+        sh(script, &[&pidfile]),
+        "g",
+        Duration::from_millis(400),
+        None,
+    )
+    .expect("deadline keeps prefix");
     let wall = started.elapsed();
     let leaked = reap_leak(&pidfile);
     assert!(wall < Duration::from_millis(400) + BOUND, "{wall:?}");
@@ -137,8 +148,13 @@ fn a_clean_exit_inside_a_deadline_grace_is_still_a_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("m");
     let script = r#"trap 'echo bye; exit 0' TERM; touch "$1"; while :; do sleep 0.05; done"#;
-    let run = run_bounded(sh(script, &[&marker]), "d", Duration::from_millis(300), None)
-        .expect("deadline keeps prefix");
+    let run = run_bounded(
+        sh(script, &[&marker]),
+        "d",
+        Duration::from_millis(300),
+        None,
+    )
+    .expect("deadline keeps prefix");
     assert!(!run.success);
     assert!(!run.cancelled);
     assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
@@ -208,8 +224,13 @@ fn a_term_trapping_grandchild_still_writing_is_killed_and_drained() {
     let pidfile = dir.path().join("pid");
     let script = r#"sh -c 'trap "" TERM; while :; do echo zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz; done' & echo $! > "$1"; wait"#;
     let started = Instant::now();
-    let run = run_bounded(sh(script, &[&pidfile]), "h", Duration::from_millis(300), None)
-        .expect("deadline keeps prefix");
+    let run = run_bounded(
+        sh(script, &[&pidfile]),
+        "h",
+        Duration::from_millis(300),
+        None,
+    )
+    .expect("deadline keeps prefix");
     let wall = started.elapsed();
     let leaked = reap_leak(&pidfile);
     assert!(
@@ -217,7 +238,10 @@ fn a_term_trapping_grandchild_still_writing_is_killed_and_drained() {
         "grandchild {leaked:?} survived the end of the grace"
     );
     assert!(wall < Duration::from_millis(300) + BOUND, "{wall:?}");
-    assert!(run.stdout.starts_with(b"zzzz"), "its output was not drained");
+    assert!(
+        run.stdout.starts_with(b"zzzz"),
+        "its output was not drained"
+    );
     assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
 }
 
@@ -226,7 +250,8 @@ fn a_term_trapping_grandchild_still_writing_is_killed_and_drained() {
 fn a_cancel_kills_a_term_trapping_writer_and_reports_cancelled() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("m");
-    let script = r#"trap '' TERM; touch "$1"; while :; do echo zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz; done"#;
+    let script =
+        r#"trap '' TERM; touch "$1"; while :; do echo zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz; done"#;
     let mut cmd = sh(script, &[&marker]);
     let mut observer = CancelWhenExists(marker.clone());
     let started = Instant::now();

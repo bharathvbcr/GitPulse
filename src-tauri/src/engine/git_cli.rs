@@ -4032,15 +4032,22 @@ pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String
 /// `.git/index.lock` still held. The wait is the output poll itself, so the
 /// grace both waits and drains, and procguard still ends it at [`CHILD_GRACE`]
 /// however much arrives; the bytes land in the same capped buffers. Stdin is
-/// not fed: the child has been asked to stop and the feed is bounded by the
-/// run, not the grace. Where the platform cannot ask there is no grace, and on
+/// closed before the ask and not fed again: a cleanup that reads stdin to EOF
+/// must see it, and `input.finish()` afterwards still only turns undelivered
+/// bytes into an error for a successful, uncancelled run. A panic inside the
+/// wait is handled by `Registration::drop`, which force-kills a child no reap
+/// path has claimed. Where the platform cannot ask there is no grace, and on
 /// non-Unix the pipe workers already read on their own threads.
 fn ask_and_drain(
     guard: &crate::procguard::Registration,
     child: &mut std::process::Child,
     #[cfg(unix)] output: &mut pipe_drain::OutputDrains,
     #[cfg(not(unix))] _output: &mut thread_io::OutputDrains,
+    #[cfg(unix)] input: &mut pipe_drain::InputFeed<'_>,
+    #[cfg(not(unix))] _input: &mut thread_io::InputFeed,
 ) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    input.close();
     #[cfg(unix)]
     return guard.ask_then_stop_and_reap_waiting(child, &mut |span| {
         output.drain_ready();
@@ -4233,7 +4240,8 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    let input = match thread_io::InputFeed::new(
+    #[allow(unused_mut)]
+    let mut input = match thread_io::InputFeed::new(
         child.stdin.take(),
         stdin_bytes.unwrap_or_default(),
         _permit.clone(),
@@ -4263,7 +4271,7 @@ fn run_admitted_inner(
         if observer.cancelled() {
             // Asked first: git removes its own `.git/index.lock` when asked and
             // cannot when killed, so a cancelled commit would block the next.
-            break match ask_and_drain(&guard, &mut child, &mut output) {
+            break match ask_and_drain(&guard, &mut child, &mut output, &mut input) {
                 Ok(status) => Halt::Exited(status, true),
                 Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
             };
@@ -4281,7 +4289,7 @@ fn run_admitted_inner(
                     // release `.git/index.lock`; a child that ignores it is
                     // killed after [`CHILD_GRACE`], which a child that exits
                     // sooner does not wait out.
-                    ask_and_drain(&guard, &mut child, &mut output).ok();
+                    ask_and_drain(&guard, &mut child, &mut output, &mut input).ok();
                     break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
