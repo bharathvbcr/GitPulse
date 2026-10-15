@@ -23,6 +23,9 @@ pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 mod pipe_drain;
 
+#[cfg(all(test, unix))]
+mod grace_adversarial;
+
 #[cfg(any(not(unix), test))]
 mod thread_io;
 
@@ -4022,6 +4025,43 @@ pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String
     (result, seen)
 }
 
+/// Asks `child` to stop and spends the grace reading its pipes.
+///
+/// A child told to stop writes while it cleans up, and one blocked on a full
+/// pipe cannot finish, so a sleeping grace gets it SIGKILLed with its
+/// `.git/index.lock` still held. The wait is the output poll itself, so the
+/// grace both waits and drains, and procguard still ends it at [`CHILD_GRACE`]
+/// however much arrives; the bytes land in the same capped buffers. Stdin is
+/// closed once the ask has been sent and not fed again: a cleanup that reads
+/// stdin to EOF must see it, but never before the ask. And `input.finish()` afterwards still only turns undelivered
+/// bytes into an error for a successful, uncancelled run. A panic inside the
+/// wait is handled by `Registration::drop`, which force-kills a child no reap
+/// path has claimed. Where the platform cannot ask there is no grace, and on
+/// non-Unix the pipe workers already read on their own threads.
+fn ask_and_drain(
+    guard: &crate::procguard::Registration,
+    child: &mut std::process::Child,
+    #[cfg(unix)] output: &mut pipe_drain::OutputDrains,
+    #[cfg(not(unix))] _output: &mut thread_io::OutputDrains,
+    #[cfg(unix)] input: &mut pipe_drain::InputFeed<'_>,
+    #[cfg(not(unix))] _input: &mut thread_io::InputFeed,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    return guard.ask_then_stop_and_reap_waiting(child, &mut |span| {
+        // First wait: SIGTERM has already been sent, so a child that reads
+        // EOF now was asked to stop first and cannot take truncated input
+        // for the whole of it.
+        input.close();
+        output.drain_ready();
+        if output.wait_with_input(span, None).is_err() {
+            std::thread::sleep(span);
+        }
+        output.drain_ready();
+    });
+    #[cfg(not(unix))]
+    guard.ask_then_stop_and_reap(child)
+}
+
 /// [`run_with_gate`] with `on_admitted` called after the gate admits the
 /// child and before it is spawned — the last moment at which nothing has been
 /// read yet, which is what [`run_read_shared`] needs to stop new joiners.
@@ -4176,7 +4216,7 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    let output = match thread_io::OutputDrains::new(
+    let mut output = match thread_io::OutputDrains::new(
         child.stdout.take(),
         child.stderr.take(),
         stdout_cap,
@@ -4201,7 +4241,7 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    let input = match thread_io::InputFeed::new(
+    let mut input = match thread_io::InputFeed::new(
         child.stdin.take(),
         stdin_bytes.unwrap_or_default(),
         _permit.clone(),
@@ -4231,7 +4271,7 @@ fn run_admitted_inner(
         if observer.cancelled() {
             // Asked first: git removes its own `.git/index.lock` when asked and
             // cannot when killed, so a cancelled commit would block the next.
-            break match guard.ask_then_stop_and_reap(&mut child) {
+            break match ask_and_drain(&guard, &mut child, &mut output, &mut input) {
                 Ok(status) => Halt::Exited(status, true),
                 Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
             };
@@ -4249,7 +4289,7 @@ fn run_admitted_inner(
                     // release `.git/index.lock`; a child that ignores it is
                     // killed after [`CHILD_GRACE`], which a child that exits
                     // sooner does not wait out.
-                    guard.ask_then_stop_and_reap(&mut child).ok();
+                    ask_and_drain(&guard, &mut child, &mut output, &mut input).ok();
                     break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
@@ -9808,6 +9848,136 @@ mod tests {
                 .contains("timed out")
         );
         assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
+    }
+
+    /// A child that floods stdout and, once asked to stop, writes a large
+    /// cleanup burst before releasing its marker. The marker is only removed
+    /// if the run keeps reading its pipes while the child is being asked.
+    #[cfg(unix)]
+    const GRACE_FLOODER: &str = r#"
+        trap 'head -c 80000 /dev/zero; echo cleaned >&2; rm -f "$1"; exit 0' TERM
+        touch "$1"
+        while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
+    "#;
+
+    #[cfg(unix)]
+    fn grace_flooder(script: &str, marker: &Path) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).arg("sh").arg(marker);
+        cmd
+    }
+
+    /// R2-02: the grace after a deadline reads the pipes, so a child blocked
+    /// on a full pipe can run its SIGTERM cleanup instead of being killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_grace_keeps_draining_so_cleanup_after_sigterm_completes() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let run = run_bounded(
+            grace_flooder(GRACE_FLOODER, &marker),
+            "flooder",
+            Duration::from_millis(600),
+            None,
+        )
+        .expect("a deadline keeps its prefix");
+        // A deadline discards the exit status, so marker removal is the signal
+        // that the child was reaped by the ask: only its SIGTERM trap removes it.
+        assert!(
+            !marker.exists(),
+            "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cleaned"),
+            "the cleanup line was not read: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(!run.success, "a deadline is never success");
+        assert!(!run.cancelled);
+        assert!(
+            matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+            "{:?}",
+            run.incomplete
+        );
+    }
+
+    /// R2-02, cancel path: the same shape, reached through the observer.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_grace_keeps_draining_so_cleanup_after_sigterm_completes() {
+        struct CancelOnceStarted(PathBuf);
+        impl ProcessObserver for CancelOnceStarted {
+            fn cancelled(&self) -> bool {
+                self.0.exists()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let mut observer = CancelOnceStarted(marker.clone());
+        let mut cmd = grace_flooder(GRACE_FLOODER, &marker);
+        let run = run_observed(
+            &mut cmd,
+            "flooder",
+            Duration::from_secs(20),
+            None,
+            MAX_OUTPUT_BYTES,
+            &mut observer,
+        )
+        .expect("a cancel returns the run");
+        assert!(run.cancelled);
+        assert!(!run.success);
+        // Reaped by the ask: the trap exits 0, a SIGKILLed child reports -1.
+        assert_eq!(run.status_code, 0, "the child was killed, not asked");
+        assert!(
+            !marker.exists(),
+            "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cleaned"),
+            "the cleanup line was not read: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// R2-02: a child that ignores the ask is still killed once the grace is
+    /// spent, however much it writes meanwhile, and what it wrote while being
+    /// asked is read. The ask is observed (the trap runs) only because the
+    /// pipes are drained.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_at_the_end_of_a_drained_grace() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let script = r#"
+            trap 'head -c 80000 /dev/zero; echo term-seen >&2' TERM
+            touch "$1"
+            while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
+        "#;
+        let started = Instant::now();
+        let run = run_bounded(
+            grace_flooder(script, &marker),
+            "stubborn",
+            Duration::from_millis(300),
+            None,
+        )
+        .expect("a deadline keeps its prefix");
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(
+                    Duration::from_millis(300) + Duration::from_secs(2)
+                ),
+            "the grace must stay bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
+        assert!(!run.success);
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("term-seen"),
+            "the trap could not run while the pipe was full: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 
     #[test]
