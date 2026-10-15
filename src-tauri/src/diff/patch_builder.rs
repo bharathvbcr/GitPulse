@@ -666,4 +666,82 @@ mod tests {
         assert!(patch.contains("--- a/gone.txt\n"), "got:\n{patch}");
         assert!(patch.contains("+++ /dev/null\n"), "got:\n{patch}");
     }
+
+    fn git_in(dir: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
+        use crate::procguard::LockedSpawn;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .expect("git spawns");
+        let mut pipe = child.stdin.take().expect("stdin piped");
+        if let Some(text) = stdin {
+            pipe.write_all(text.as_bytes()).expect("patch written");
+        }
+        drop(pipe);
+        child.wait_with_output().expect("git finishes")
+    }
+
+    /// A hunk ending in a context row plus the marker, built by the Rust
+    /// renderer, applied by real git onto a blob with no trailing newline: the
+    /// index blob must keep the missing newline.
+    #[test]
+    fn context_marker_patch_keeps_the_index_blob_without_a_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-q", "-b", "main"], None);
+        git_in(p, &["config", "core.autocrlf", "false"], None);
+        std::fs::write(p.join("ctx.txt"), "one\ntwo\nthree").unwrap();
+        git_in(p, &["add", "--", "ctx.txt"], None);
+
+        let patch_for = |flag_context: bool| {
+            let mut last = line(DiffLineType::Context, "three", false);
+            last.no_newline = flag_context;
+            let fp = FilePatch {
+                old_path: "ctx.txt".to_string(),
+                new_path: "ctx.txt".to_string(),
+                hunks: vec![UnifiedDiffHunk {
+                    old_start: 1,
+                    old_lines: 3,
+                    new_start: 1,
+                    new_lines: 3,
+                    header: String::new(),
+                    lines: vec![
+                        line(DiffLineType::Deletion, "one", true),
+                        line(DiffLineType::Addition, "ONE", true),
+                        line(DiffLineType::Context, "two", false),
+                        last,
+                    ],
+                }],
+            };
+            PatchBuilder::build_selective_patch(&fp, true)
+        };
+        let apply = ["apply", "--cached", "--unidiff-zero", "--recount", "-"];
+
+        // Control: without the flag git cannot match the no-newline preimage.
+        let unflagged = patch_for(false);
+        assert!(
+            !git_in(p, &apply, Some(&unflagged)).status.success(),
+            "a missing marker must be rejected by git:\n{unflagged}"
+        );
+
+        let flagged = patch_for(true);
+        assert!(
+            flagged.ends_with(&format!(" three\n{MARKER}\n")),
+            "{flagged}"
+        );
+        let out = git_in(p, &apply, Some(&flagged));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let blob = git_in(p, &["show", ":ctx.txt"], None).stdout;
+        assert_eq!(blob, b"ONE\ntwo\nthree");
+    }
 }

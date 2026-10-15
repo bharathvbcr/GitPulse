@@ -176,6 +176,24 @@ describe.skipIf(!gitAvailable)("git apply --cached contract (real git)", () => {
     expect(staged.endsWith("\n")).toBe(false);
   });
 
+  it("keeps a missing trailing newline when the marker follows a context row", () => {
+    const dir = initRepo();
+    commitFile(dir, "ctx.txt", "one\ntwo\nthree");
+    writeFileSync(join(dir, "ctx.txt"), "ONE\ntwo\nthree");
+
+    const lines = parseUnifiedDiff(git(dir, "diff"));
+    const ctx = lines.filter((l) => l.type === "ctx");
+    expect(ctx[ctx.length - 1].noNewline).toBe(true);
+
+    const patch = buildFilePatchForHunk(lines, "ctx.txt", indexOfHunkHeader(lines))!;
+    const text = serializeSelectivePatch(patch, true);
+    expect(text.endsWith(" three\n\\ No newline at end of file\n")).toBe(true);
+    gitApplyToIndex(dir, text);
+    const staged = git(dir, "show", ":ctx.txt");
+    expect(staged).toBe("ONE\ntwo\nthree");
+    expect(staged.endsWith("\n")).toBe(false);
+  });
+
   it("keeps CRLF bytes intact through the whole pipeline", () => {
     const dir = initRepo();
     commitFile(dir, "crlf.txt", "one\r\ntwo\r\nthree\r\n");

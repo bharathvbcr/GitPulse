@@ -119,7 +119,8 @@ export interface AnnotatedDiffLine {
   segments?: DiffSegment[];
   /**
    * True when git's `\ No newline at end of file` marker followed this
-   * add/del row: the file side this row belongs to lacks a trailing newline.
+   * add/del/context row: the file side(s) this row belongs to lack a trailing
+   * newline (both, for a context row).
    * The patch builder turns this back into the marker text so EOF-hunk
    * staging produces byte-exact blobs.
    */
@@ -248,7 +249,12 @@ export function parseUnifiedDiff(raw: string | null | undefined): AnnotatedDiffL
       // missing trailing newline exactly.
       if (inHunk) {
         const prev = out[out.length - 1];
-        if (prev && (prev.type === "add" || prev.type === "del")) prev.noNewline = true;
+        // Any body row can carry it: a context row is "no newline" on both
+        // sides, and dropping the flag there makes `git apply` reject the
+        // hunk or write the newline back.
+        if (prev && (prev.type === "add" || prev.type === "del" || prev.type === "ctx")) {
+          prev.noNewline = true;
+        }
       }
       out.push({ type: "hdr", content: line });
     } else if (inHunk) {
