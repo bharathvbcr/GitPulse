@@ -541,12 +541,27 @@
           fixtures.cmd_delete_branch = () => "";
           await switchTo(ALPHA);
           await sleepUntil(() => text(branchList()).includes("alpha-only"));
+          // Jump-to-tab is a webview shortcut (Ctrl+Alt+digit), so a real
+          // keypress reaches RepoTabBar's window listener here.
+          const betaDigit = get(repoStore).openTabs.findIndex((t) => t.path === BETA) + 1;
+          const jumpToBeta = () => window.dispatchEvent(new KeyboardEvent("keydown", {
+            key: String(betaDigit), code: `Digit${betaDigit}`, ctrlKey: true, altKey: true, bubbles: true, cancelable: true,
+          }));
+          jumpToBeta();
+          await sleepUntil(() => activePath() === BETA);
+          check("prompt: control: Ctrl+Alt+digit with no prompt open jumps to that tab", () => activePath() === BETA);
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(branchList()).includes("alpha-only"));
           const deleteRow = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
           deleteRow?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
           await settle();
           $$('[role="menuitem"]').find((el) => text(el).startsWith("Delete"))?.click();
           await settle();
           check("prompt: deleting a branch on alpha asks first and runs nothing", () => promptTitle() === "Delete branch" && deletes().length === 0);
+          jumpToBeta();
+          await settle();
+          await settle();
+          check("prompt: a Ctrl+Alt+digit jump-to-tab keypress while it is open is ignored", () => activePath() === ALPHA && promptTitle() === "Delete branch");
           // The tab-changing shortcuts are refused while a prompt is open (unit
           // and source tests: this page mocks Tauri without its window API, so the
           // native menu is not subscribed here). Activation by an open event or a
