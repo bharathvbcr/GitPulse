@@ -10789,4 +10789,190 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .collect();
         assert_eq!(samples, vec![20, 20], "{samples:?}");
     }
+
+    // ---- CARD 20 adversarial review ------------------------------------
+
+    fn adv_lookups(repo: &Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
+            .count()
+    }
+
+    /// Attack 1: `include.path` is not stamped. The doc says the 60 s TTL
+    /// bounds it, but a destructive caller's "uncached" compute_default_base
+    /// reads `config --list` and HEAD through the ref cache too.
+    #[test]
+    fn adv_include_file_change_is_seen_by_default_base() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(&repo, &["update-ref", "refs/remotes/upstream/develop", "HEAD"]);
+        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        git_in(&repo, &["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop"]);
+        let include = tempfile::TempDir::new().unwrap();
+        let inc = include.path().join("inc.cfg");
+        std::fs::write(&inc, "[checkout]\n\tdefaultRemote = origin\n").unwrap();
+        git_in(&repo, &["config", "include.path", inc.to_str().unwrap()]);
+        ref_cache::eager(|| {
+            assert_eq!(default_base(&repo).remote, "origin");
+            assert_eq!(compute_default_base(&repo).remote, "origin");
+            std::fs::write(&inc, "[checkout]\n\tdefaultRemote = upstream\n").unwrap();
+            assert_eq!(
+                compute_default_base(&repo).remote,
+                "upstream",
+                "compute_default_base ('uncached', used by the destructive merge) served the pre-include remote"
+            );
+            assert_eq!(
+                default_base(&repo).remote,
+                "upstream",
+                "default_base served the pre-include remote"
+            );
+        });
+    }
+
+    /// Attack 1: set-head, local config, packed-refs rewrites and a deleted
+    /// default are each seen while warm.
+    #[test]
+    fn adv_set_head_config_packed_and_delete_are_seen_while_warm() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/develop", "HEAD"]);
+        ref_cache::eager(|| {
+            let name = |r: &Path| default_base(r).base.map(|(n, _)| n);
+            git_in(&repo, &["remote", "set-head", "origin", "main"]);
+            assert_eq!(name(&repo).as_deref(), Some("main"));
+            git_in(&repo, &["remote", "set-head", "origin", "develop"]);
+            assert_eq!(name(&repo).as_deref(), Some("develop"), "set-head not seen");
+            // Packed only, then advanced through packed-refs alone.
+            git_in(&repo, &["pack-refs", "--all"]);
+            assert_eq!(name(&repo).as_deref(), Some("develop"));
+            let moved = git_stdout(&repo, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "m"]);
+            git_in(&repo, &["update-ref", "refs/heads/develop", &moved]);
+            git_in(&repo, &["pack-refs", "--all"]);
+            assert_eq!(
+                default_base(&repo).base.map(|(_, o)| o),
+                Some(moved.clone()),
+                "packed-refs advance not seen"
+            );
+            git_in(&repo, &["branch", "-D", "develop"]);
+            assert_eq!(default_base(&repo), compute_default_base(&repo), "delete while packed");
+            git_in(&repo, &["config", "checkout.defaultRemote", "nope"]);
+            assert_eq!(default_base(&repo), compute_default_base(&repo), "config change");
+        });
+    }
+
+    /// Attack 1: two linked worktrees share a common dir but have private
+    /// HEADs; the answer for one must not be served to the other.
+    #[test]
+    fn adv_linked_worktrees_do_not_share_an_answer() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(&repo, &["update-ref", "refs/remotes/upstream/develop", "HEAD"]);
+        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        git_in(&repo, &["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        let linked = parent.path().join("wt");
+        git_in(&repo, &["worktree", "add", "-q", "-b", "lane", linked.to_str().unwrap()]);
+        crate::test_support::trust_repo(&linked);
+        let linked = linked.canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.lane.remote", "upstream"]);
+        ref_cache::eager(|| {
+            for _ in 0..2 {
+                let a = default_base(&repo);
+                let b = default_base(&linked);
+                assert_eq!(a.remote, "origin");
+                assert_eq!(b.remote, "upstream", "linked worktree got the primary's answer");
+                assert_eq!(a.base.as_ref().map(|x| x.0.as_str()), Some("main"));
+                assert_eq!(b.base.as_ref().map(|x| x.0.as_str()), Some("develop"));
+            }
+            // Re-point the lane's upstream: only the linked answer moves.
+            git_in(&repo, &["config", "branch.lane.remote", "origin"]);
+            assert_eq!(default_base(&linked), compute_default_base(&linked));
+            assert_eq!(default_base(&repo), compute_default_base(&repo));
+        });
+    }
+
+    /// Attack 2: a refusal of any one of the lookups is never kept, and an
+    /// unresolved default ("none") is not served once the default appears.
+    #[test]
+    fn adv_failed_lookups_and_none_are_not_kept() {
+        let _kept = ref_cache::retention();
+        for needle in ["symbolic-ref", "for-each-ref", "config"] {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            ref_cache::eager(|| {
+                let refused = crate::engine::git_cli::with_forced_spawn_failure_of(needle, || {
+                    default_base(&repo)
+                });
+                assert!(refused.incomplete.is_some(), "{needle}: refusal not reported: {refused:?}");
+                let after = default_base(&repo);
+                assert!(after.incomplete.is_none(), "{needle}: {after:?}");
+                assert_eq!(
+                    after.base.as_ref().map(|b| b.0.as_str()),
+                    Some("main"),
+                    "{needle}: a refused answer was kept"
+                );
+            });
+        }
+        let dir = init_repo_with_remotes(&[], "feature");
+        let repo = dir.path().canonicalize().unwrap();
+        ref_cache::eager(|| {
+            assert_eq!(default_base(&repo).base, None);
+            git_in(&repo, &["branch", "main"]);
+            assert_eq!(
+                default_base(&repo).base.map(|b| b.0),
+                Some("main".to_string()),
+                "a 'no default' answer outlived the default appearing"
+            );
+        });
+    }
+
+    /// Attack 2: many threads at once, each with no racy window: one lookup
+    /// and one answer.
+    #[test]
+    fn adv_sixteen_threads_one_computation_no_torn_answer() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let expected = compute_default_base(&repo);
+        let before = adv_lookups(&repo);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let repo = repo.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ref_cache::eager(|| default_base(&repo))
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), expected, "torn answer");
+        }
+        assert_eq!(adv_lookups(&repo) - before, 1, "more than one computation");
+    }
+
+    /// Attack 5: callers that arrive one after another inside the 3 s racy
+    /// window after a write each pay the five processes (the old memo
+    /// served all but the first).
+    #[test]
+    fn adv_sequential_asks_on_a_just_written_repo_resolve_once() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        for _ in 0..6 {
+            let _ = default_base(&repo);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(adv_lookups(&repo), 1, "each sequential ask recomputed");
+    }
 }
