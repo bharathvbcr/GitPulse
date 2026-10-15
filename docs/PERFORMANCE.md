@@ -819,6 +819,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
+| `graph_spawns` | `cmd_get_commit_graph` at the default 5,000-row cap on 6,000 commits; `cmd_get_stack_hierarchy` with 20 branches beyond its 2,000-commit window, cold and with refs unmoved; each with git processes | ft-9cfa4f74 (S4-03, S4-04) |
 
 `src/watcher/bench_seam.rs` is a `#[doc(hidden)]` module that builds the same
 `IgnoreRules` (through the same `parse_ignored_directories`) and calls the same
@@ -1245,3 +1246,87 @@ On git older than 2.37 the scan is count-bounded (`-n cap+1`, window applied
 here); a row past the cap is reported as a possibly cut window, because without
 a date bound nothing says the window does not continue behind it, and the
 window's true size is not claimed.
+
+## 2026-10-15: graph and stack history walks (ft-9cfa4f74, S4-03 and S4-04)
+
+Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench graph_spawns`.
+Rows and fixtures are described in the bench's header. The cold rows move a tag
+before every timed call so the ref cache cannot answer; the warm row reads a
+repository whose refs have been idle for longer than the cache's racy window.
+
+**The spawn counters are the gate.** This host runs at load 40 to 200 on 18
+cores, so the time columns are recorded with the load beside them and do not
+pass or fail anything.
+
+### Baseline (unmodified `cd52ff3c`)
+
+| row | git processes | min of 2 runs | run 1 min / p50 | run 2 min / p50 | load1 at start (run 1, run 2) |
+| --- | --- | --- | --- | --- | --- |
+| S4-04 graph default page, 5,000 rows of 6,000 commits | **12** | 61.3 ms | 70.0 / 91.1 ms | 61.3 / 73.6 ms | 49.3, 49.5 |
+| S4-03 stack refresh, 20 branches beyond the window, cold | **28** | 237.6 ms | 237.6 / 286.6 ms | 264.6 / 315.8 ms | 49.3, 49.5 |
+| S4-03 stack refresh, refs unmoved (warm) | **20** | 236.3 ms | 236.3 / 289.7 ms | 255.4 / 295.6 ms | 49.3, 49.5 |
+
+N = 9 per row after one warmup, two runs. The warm stack row still spawns 20
+processes: the first-parent repairs bypass the ref cache, so an idle repository
+pays one walk per unresolved branch on every tick, and nothing else (the branch
+listing, the history read and the default-branch probes are answered from the
+cache). The cold row's 28 are 20 walks and 8 others. A spawn log of the same
+refresh in a unit test names 7 of the 8: the default-branch probes (`config
+--list`, two `symbolic-ref`, `remote`, a `for-each-ref` over the conventional
+names), the branch listing and the history read. The eighth is not identified
+(trace2 counts every process, including ones git starts itself).
+
+**Counting the warm row.** `count_git_processes` rewrites the hermetic global
+git config, and the ref cache stamps that file, so the first call inside a
+counted block is always cold and nothing is kept until the new file is older
+than the 3 s racy window. The warm count is the difference between two counted
+blocks that wait that window out: one call, and two calls. (The first version
+of this bench counted the warm row in one block and printed the cold figure,
+28, beside a warm time; the pre-fix test
+`a_stack_refresh_with_no_ref_movement_spawns_nothing` independently saw 20
+`rev-list` walks and nothing else on a warm tick.)
+
+Baselines were built from the unmodified tree at `cd52ff3c` plus this bench file
+only (`src-tauri/src` and `src-tauri/tests` checked out from `HEAD`), and run
+interleaved with the fixed build (A B A B) so host load lands on both.
+
+### After
+
+| row | git processes, before to after | min of 2 runs, before to after | after, run 1 min / p50 | after, run 2 min / p50 | load1 at start (run 1, run 2) |
+| --- | --- | --- | --- | --- | --- |
+| S4-04 graph default page | 12 to **11** | 61.3 to 35.4 ms | 40.7 / 63.0 ms | 35.4 / 45.6 ms | 47.8, 43.6 |
+| S4-03 stack refresh, 20 branches beyond the window, cold | 28 to **9** | 237.6 to 19.4 ms | 23.4 / 27.5 ms | 19.4 / 22.3 ms | 47.8, 43.6 |
+| S4-03 stack refresh, refs unmoved (warm) | 20 to **0** | 236.3 to 2.1 ms | 2.1 / 3.5 ms | 2.2 / 3.0 ms | 47.8, 43.6 |
+
+The counters are the result; the times are recorded beside load 44 to 50 on 18
+cores and gate nothing. What changed:
+
+* **S4-04.** A kept history chunk is `chunk` rows plus the first row of the next
+  one, so a window of n rows needs ceil((n - 1) / chunk) chunks. The default
+  page is 5,000 rows plus the has_more probe: one `git log -n5001` instead of
+  `-n5000` and a second `--skip=5000 -n5000` walk for one row. Chunks stay
+  aligned and kept, so growing the window still reads only the chunks it has
+  not held (`chunk_windows_around_every_boundary_read_the_fewest_walks` pins
+  c, c+1, 2c, 2c+1 and 2c+2, and the existing grow test is unchanged). The
+  one process saved is the 5,000-row walk and parse, not the whole page; the
+  other 11 are not touched by this change (inferred: the graph's ref, HEAD and
+  default-branch reads, and one more).
+* **S4-03.** The 20 per-branch `rev-list --first-parent --max-count=100000`
+  walks are one `rev-list --first-parent --parents` over every unresolved tip,
+  read through the ref cache over `refs/heads`, with a 20 s deadline and the
+  same 100,000-commit cap shared across the tips. The cap is read newest first
+  across every tip, so a deep unrelated branch can spend it before a shallow
+  branch's fork point is reached; a chain the shared cap cut therefore gets its
+  own single-tip pass over the deadline that is left, as the per-branch walks
+  had (only after the shared cap is exhausted, so it costs nothing in the
+  common case). An idle repository's next tick
+  is answered without a process. `--not` is deliberately not used: excluding
+  the other tips also excludes whatever a tip sitting mid-chain can reach
+  (`excluding_other_tips_would_cut_a_chain_a_mid_chain_tip_shares`), and the
+  window's own commits cannot be excluded for the same reason. A branch the pass could not
+  finish (cap, deadline, a failed git) is counted in the payload as
+  `unresolved_branches`, with `walk_incomplete`, and shown in the Stack view;
+  it was previously left parentless without saying so.
+* **Not changed.** The default-branch probes (`config --list`, two
+  `symbolic-ref`, `remote`, one `for-each-ref`) run again after any ref moves,
+  5 of the 9 remaining cold spawns. They are outside this card.

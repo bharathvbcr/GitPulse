@@ -1,6 +1,8 @@
 //! Commit graph assembly: the payload, mainline anchoring, lane solving, stack hierarchy.
 
 use super::*;
+use crate::engine::git_reader::FirstParentChain;
+use crate::stack::StackedBranchNode;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,92 +502,166 @@ pub(super) fn graph_fetch_limit(max_commits: usize) -> usize {
     max_commits.clamp(1, GitReader::MAX_HISTORY_COMMITS) + 1
 }
 
+/// Commits the stack's first read takes from the global history. Older forks
+/// are found by the repair pass in [`stack_hierarchy`].
+const STACK_HISTORY_WINDOW: usize = 2000;
+
+/// Limits on the stack's repair pass. `max_commits` bounds the commits one
+/// pass may emit; `deadline` bounds how long it may run.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StackWalkBudget {
+    pub max_commits: usize,
+    pub deadline: std::time::Duration,
+}
+
+impl StackWalkBudget {
+    /// A far-beyond-any-real-stack ceiling, and a deadline that turns a
+    /// pathological history into a labelled partial answer.
+    pub(super) const PRODUCTION: Self = Self {
+        max_commits: GitReader::MAX_HISTORY_COMMITS,
+        deadline: std::time::Duration::from_secs(20),
+    };
+}
+
 #[tauri::command(async)]
 pub async fn cmd_get_stack_hierarchy(
     repo_path: String,
 ) -> Result<crate::stack::StackHierarchyPayload, String> {
     off_thread(move || {
-        let branches = GitReader::list_branches(&repo_path)?;
-        // Ground truth for the root designation comes from the backend, not a
-        // frontend guess: list_branches already resolved the default branch
-        // from the primary remote's HEAD (origin, gitlab, company forks all
-        // resolve). A nonexistent name here would leave every node rootless.
-        let locals: Vec<&BranchInfo> = branches.iter().filter(|b| !b.is_remote).collect();
-        let default_branch = locals
-            .iter()
-            .find(|b| b.is_default)
-            .or_else(|| locals.iter().find(|b| b.is_current))
-            .map(|b| b.name.clone())
-            .unwrap_or_else(|| "main".to_string());
-
-        let mut branch_tips = HashMap::new();
-        for b in &locals {
-            branch_tips.insert(b.name.clone(), b.tip_commit_id.clone());
-        }
-
-        let raw_commits = GitReader::read_commit_history(&repo_path, 2000, None)?;
-        let mut commit_parents = HashMap::new();
-        for c in raw_commits {
-            commit_parents.insert(c.id, c.parent_ids);
-        }
-
-        let mut nodes =
-            StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
-
-        // Deep-history repair: the global window truncates long-lived repos,
-        // which used to silently misreport deep-stacked branches as roots.
-        // Each still-unresolved branch gets ONE bounded first-parent walk that
-        // stops at any known tip; discovered edges are merged into the parent
-        // map and the hierarchy is rebuilt once. A walk that exhausts its cap
-        // leaves the branch honestly parentless — no invented hierarchy.
-        const WALK_CAP: usize = GitReader::MAX_HISTORY_COMMITS;
-        let tip_oids: HashSet<String> = branch_tips.values().cloned().collect();
-        let mut enriched = false;
-        for node in &nodes {
-            if node.parent_branch_name.is_some() || node.branch_name == default_branch {
-                continue;
-            }
-            let mut stop_at = tip_oids.clone();
-            stop_at.remove(&node.tip_commit_id);
-            if let Ok(Some(chain)) =
-                GitReader::first_parent_chain(&repo_path, &node.tip_commit_id, &stop_at, WALK_CAP)
-            {
-                for edge in chain.windows(2) {
-                    // Never overwrite richer multi-parent data already
-                    // present from the global window.
-                    commit_parents
-                        .entry(edge[1].clone())
-                        .or_insert_with(|| vec![edge[0].clone()]);
-                }
-                enriched = true;
-                // Ok(None) (cap exhausted) and Err (git failed) leave the
-                // branch honestly parentless rather than inventing a base.
-            }
-        }
-        if enriched {
-            nodes = StackTreeEngine::build_stack_hierarchy(
-                &branch_tips,
-                &commit_parents,
-                &default_branch,
-            );
-        }
-
-        // The breadcrumb trail describes the checked-out branch's ancestry;
-        // with nothing checked out it degrades to the default branch.
-        let focus = locals
-            .iter()
-            .find(|b| b.is_current)
-            .map(|b| b.name.as_str())
-            .unwrap_or(default_branch.as_str());
-        let breadcrumb = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, focus);
-
-        Ok(crate::stack::StackHierarchyPayload {
-            nodes,
-            breadcrumb,
-            default_branch,
-        })
+        stack_hierarchy(
+            &repo_path,
+            STACK_HISTORY_WINDOW,
+            StackWalkBudget::PRODUCTION,
+        )
     })
     .await
+}
+
+pub(super) fn stack_hierarchy(
+    repo_path: &str,
+    window: usize,
+    budget: StackWalkBudget,
+) -> Result<crate::stack::StackHierarchyPayload, String> {
+    let branches = GitReader::list_branches(repo_path)?;
+    // Ground truth for the root designation comes from the backend, not a
+    // frontend guess: list_branches already resolved the default branch
+    // from the primary remote's HEAD (origin, gitlab, company forks all
+    // resolve). A nonexistent name here would leave every node rootless.
+    let locals: Vec<&BranchInfo> = branches.iter().filter(|b| !b.is_remote).collect();
+    let default_branch = locals
+        .iter()
+        .find(|b| b.is_default)
+        .or_else(|| locals.iter().find(|b| b.is_current))
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| "main".to_string());
+
+    let mut branch_tips = HashMap::new();
+    for b in &locals {
+        branch_tips.insert(b.name.clone(), b.tip_commit_id.clone());
+    }
+
+    let raw_commits = GitReader::read_commit_history(repo_path, window, None)?;
+    let mut commit_parents = HashMap::new();
+    for c in raw_commits {
+        commit_parents.insert(c.id, c.parent_ids);
+    }
+
+    let mut nodes =
+        StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+
+    // Deep-history repair: the global window truncates long-lived repos,
+    // which used to silently misreport deep-stacked branches as roots. Every
+    // branch the window left parentless is resolved from ONE shared
+    // first-parent pass that stops at any known tip; the discovered edges are
+    // merged into the parent map and the hierarchy is rebuilt once. A branch
+    // whose chain reaches a root without meeting a tip stays honestly
+    // parentless. A branch the pass could not finish (commit cap, deadline,
+    // or a failed git) also stays parentless, but is COUNTED, so "we did not
+    // get to it" never reads as "it sits on nothing".
+    let tip_oids: HashSet<String> = branch_tips.values().cloned().collect();
+    let candidates: Vec<&StackedBranchNode> = nodes
+        .iter()
+        .filter(|node| node.parent_branch_name.is_none() && node.branch_name != default_branch)
+        .collect();
+    let mut unresolved_branches = 0;
+    let mut cut_short = false;
+    let mut enriched = false;
+    if !candidates.is_empty() {
+        let tips: Vec<String> = candidates
+            .iter()
+            .map(|node| node.tip_commit_id.clone())
+            .collect();
+        let started = std::time::Instant::now();
+        match GitReader::first_parent_pass(repo_path, &tips, budget.max_commits, budget.deadline) {
+            Ok(pass) => {
+                cut_short = pass.truncated();
+                for node in &candidates {
+                    let mut stop_at = tip_oids.clone();
+                    stop_at.remove(&node.tip_commit_id);
+                    let mut outcome = pass.chain(&node.tip_commit_id, &stop_at);
+                    // The commit cap is shared, and a pass is read newest
+                    // first across every tip, so one deep unrelated branch
+                    // can spend the cap before a shallow branch's fork point
+                    // is reached. The per-branch walks this pass replaced
+                    // would have placed that branch, so a chain the shared
+                    // cap cut gets its own pass over the time that is left.
+                    // Only reached once the shared cap is exhausted.
+                    if outcome == FirstParentChain::Unfinished && pass.truncated() {
+                        let left = budget.deadline.saturating_sub(started.elapsed());
+                        if !left.is_zero() {
+                            if let Ok(own) = GitReader::first_parent_pass(
+                                repo_path,
+                                std::slice::from_ref(&node.tip_commit_id),
+                                budget.max_commits,
+                                left,
+                            ) {
+                                outcome = own.chain(&node.tip_commit_id, &stop_at);
+                            }
+                        }
+                    }
+                    match outcome {
+                        FirstParentChain::Reached(chain) => {
+                            for edge in chain.windows(2) {
+                                // Never overwrite richer multi-parent data
+                                // already present from the global window.
+                                commit_parents
+                                    .entry(edge[1].clone())
+                                    .or_insert_with(|| vec![edge[0].clone()]);
+                            }
+                            enriched = true;
+                        }
+                        FirstParentChain::Rooted => {}
+                        FirstParentChain::Unfinished => unresolved_branches += 1,
+                    }
+                }
+            }
+            Err(_) => {
+                cut_short = true;
+                unresolved_branches = candidates.len();
+            }
+        }
+    }
+    if enriched {
+        nodes =
+            StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+    }
+
+    // The breadcrumb trail describes the checked-out branch's ancestry;
+    // with nothing checked out it degrades to the default branch.
+    let focus = locals
+        .iter()
+        .find(|b| b.is_current)
+        .map(|b| b.name.as_str())
+        .unwrap_or(default_branch.as_str());
+    let breadcrumb = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, focus);
+
+    Ok(crate::stack::StackHierarchyPayload {
+        nodes,
+        breadcrumb,
+        default_branch,
+        unresolved_branches,
+        walk_incomplete: cut_short && unresolved_branches > 0,
+    })
 }
 
 #[tauri::command(async)]

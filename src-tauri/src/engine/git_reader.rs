@@ -900,7 +900,14 @@ impl GitReader {
             None => None,
         };
         let chunk = history_chunk_size();
-        let mut commits = if count <= chunk {
+        // Each kept chunk is `chunk` rows plus the first row of the next one.
+        // The graph asks for cap + 1 rows (the has_more probe), and a window
+        // of one chunk plus that probe used to cost a second
+        // `--skip=chunk -n chunk` walk for a single row. With the overlap a
+        // window of n rows needs ceil((n - 1) / chunk) chunks, so chunk + 1
+        // rows is one walk, and the chunks stay aligned (and kept) as before.
+        let wire = chunk.saturating_add(1);
+        let mut commits = if count <= wire {
             Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
         } else {
             // A long window is read as aligned chunks, each kept on its own.
@@ -911,14 +918,17 @@ impl GitReader {
             // the earlier commits for a new chunk: `--skip` has to walk them.)
             let end = skipped.saturating_add(count);
             let mut start = skipped - skipped % chunk;
+            let mut taken_to = skipped;
             let mut commits = Vec::with_capacity(count);
-            while start < end {
+            while start.saturating_add(1) < end {
                 let rows =
-                    Self::history_chunk(&repo, start, chunk, revision, spec.as_deref(), scope)?;
-                let ended = rows.len() < chunk;
-                let from = skipped.saturating_sub(start).min(rows.len());
-                let to = (end - start).min(rows.len());
-                commits.extend(rows.into_iter().skip(from).take(to - from));
+                    Self::history_chunk(&repo, start, wire, revision, spec.as_deref(), scope)?;
+                let ended = rows.len() < wire;
+                let to = end.min(start + rows.len());
+                if to > taken_to {
+                    commits.extend(rows.into_iter().skip(taken_to - start).take(to - taken_to));
+                    taken_to = to;
+                }
                 if ended {
                     break;
                 }
@@ -1022,47 +1032,65 @@ impl GitReader {
         max_count.clamp(1, Self::MAX_HISTORY_COMMITS.saturating_add(1))
     }
 
-    /// Walks the first-parent chain from `tip_oid` NEWEST-first, stopping at
-    /// (and including) the first commit whose id is in `stop_at`, and returns
-    /// the visited ids OLDEST-first so consecutive pairs are first-parent
-    /// edges. `None` when the walk exhausted `max_commits` without reaching a
-    /// stop id — the caller must treat that as "no discoverable base", never
-    /// as "rooted at the default branch".
+    /// Most branch tips one [`Self::first_parent_pass`] takes on its command
+    /// line. More than this is refused (every branch is then reported
+    /// unresolved), never silently truncated.
+    pub const MAX_PASS_TIPS: usize = 2_048;
+
+    /// One shared first-parent pass over every tip in `tips`: a single
+    /// `rev-list --first-parent --parents`, so the first-parent chains of any
+    /// number of branches cost one process instead of one each.
     ///
     /// This repairs the stack hierarchy on long-lived repositories where the
-    /// global `--all` history window ends before a branch's fork point: one
-    /// bounded subprocess per unresolved branch instead of lifting the global
-    /// cap for every request.
-    pub fn first_parent_chain(
+    /// global history window ends before a branch's fork point. The pass is
+    /// bounded twice: by `max_commits` commits in all (shared between the
+    /// tips, since their chains overlap) and by `deadline`. A pass that hits
+    /// the commit cap says so ([`FirstParentPass::truncated`]) and a chain it
+    /// did not finish is [`FirstParentChain::Unfinished`]; a deadline or a
+    /// failed git is an `Err`. Neither is ever read as "rooted".
+    ///
+    /// The answer is a function of the refs the tips came from, so it goes
+    /// through [`ref_cache`] over `refs/heads`: a tick with no ref movement is
+    /// answered without a process. Nothing is excluded with `--not`: a tip
+    /// that descends from another branch (the default branch, usually) would
+    /// remove the very commits the walk is looking for.
+    pub fn first_parent_pass(
         repo_path: &str,
-        tip_oid: &str,
-        stop_at: &HashSet<String>,
+        tips: &[String],
         max_commits: usize,
-    ) -> Result<Option<Vec<String>>, String> {
-        if stop_at.contains(tip_oid) {
-            // The tip itself is another branch's tip; there is nothing to walk.
-            return Ok(Some(vec![tip_oid.to_string()]));
-        }
+        deadline: Duration,
+    ) -> Result<FirstParentPass, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_commits.clamp(1, Self::MAX_HISTORY_COMMITS).to_string();
-        let count_arg = format!("--max-count={}", count);
-        let stdout = git_text(
-            &repo,
-            &["rev-list", "--first-parent", count_arg.as_str(), tip_oid],
-        )?;
-        let mut walked: Vec<String> = Vec::new();
-        for line in stdout.lines() {
-            let oid = line.trim();
-            if oid.is_empty() {
-                continue;
-            }
-            walked.push(oid.to_string());
-            if stop_at.contains(oid) {
-                walked.reverse();
-                return Ok(Some(walked));
-            }
+        let mut unique: Vec<&str> = tips.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() > Self::MAX_PASS_TIPS {
+            return Err(format!(
+                "{} branch tips exceed the {} one first-parent pass takes",
+                unique.len(),
+                Self::MAX_PASS_TIPS
+            ));
         }
-        Ok(None)
+        for tip in &unique {
+            validate_oid(tip)?;
+        }
+        let cap = max_commits.clamp(1, Self::MAX_HISTORY_COMMITS);
+        let count_arg = format!("--max-count={cap}");
+        let mut args: Vec<&str> = vec!["rev-list", "--first-parent", "--parents", &count_arg];
+        args.extend(unique);
+        let stdout = ref_cache::through(&repo, &["refs/heads"], &args, || {
+            git_text_with_timeout(&repo, &args, deadline).map(|text| (text, true))
+        })?;
+        let mut parents = HashMap::new();
+        for line in stdout.lines() {
+            let mut ids = line.split_whitespace();
+            let Some(commit) = ids.next() else { continue };
+            parents.insert(commit.to_string(), ids.next().map(str::to_string));
+        }
+        Ok(FirstParentPass {
+            truncated: parents.len() >= cap,
+            parents,
+        })
     }
 
     /// Porcelain status. This argv does not set `core.fsmonitor=false`.
@@ -4080,6 +4108,64 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err("Git object size did not match cat-file".into());
     }
     Ok(bytes)
+}
+
+/// What one [`GitReader::first_parent_pass`] saw: every commit it emitted and
+/// that commit's first parent.
+#[derive(Debug, Default)]
+pub struct FirstParentPass {
+    /// Emitted commit -> its first parent (`None` for a root commit).
+    parents: HashMap<String, Option<String>>,
+    /// The pass stopped at its commit cap, so a commit missing from
+    /// `parents` may still exist below the cut.
+    truncated: bool,
+}
+
+/// How one tip's first-parent chain ended inside a [`FirstParentPass`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum FirstParentChain {
+    /// Oldest-first ids from the first stop id met up to the tip, so
+    /// consecutive pairs are first-parent edges.
+    Reached(Vec<String>),
+    /// The chain ended at a root commit without meeting a stop id: a settled
+    /// "no discoverable base", never a fabricated root.
+    Rooted,
+    /// The pass ended (commit cap) before this chain did: unknown, not rooted.
+    Unfinished,
+}
+
+impl FirstParentPass {
+    /// True when the pass was cut by its commit cap.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Follows `tip` down its first-parent chain, stopping at (and including)
+    /// the first commit whose id is in `stop_at`.
+    pub fn chain(&self, tip: &str, stop_at: &HashSet<String>) -> FirstParentChain {
+        if stop_at.contains(tip) {
+            // The tip itself is another branch's tip; there is nothing to walk.
+            return FirstParentChain::Reached(vec![tip.to_string()]);
+        }
+        let mut walked = vec![tip.to_string()];
+        let mut at = tip;
+        // A chain cannot be longer than the commits the pass emitted.
+        while walked.len() <= self.parents.len() {
+            match self.parents.get(at) {
+                None => return FirstParentChain::Unfinished,
+                Some(None) => return FirstParentChain::Rooted,
+                Some(Some(parent)) => {
+                    walked.push(parent.clone());
+                    if stop_at.contains(parent) {
+                        walked.reverse();
+                        return FirstParentChain::Reached(walked);
+                    }
+                    at = parent;
+                }
+            }
+        }
+        FirstParentChain::Unfinished
+    }
 }
 
 /// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
@@ -9851,6 +9937,195 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         .unwrap();
         assert_eq!(ids(&mid), ids(&direct));
         assert_eq!(mid.len(), 18);
+    }
+
+    /// The graph asks for cap + 1 rows (the has_more probe). A window of one
+    /// chunk plus that row must be ONE `git log`, not a second walk for a
+    /// single row (S4-04): the default page is 5,000 rows plus the probe over a
+    /// 5,000-row chunk.
+    #[test]
+    fn a_window_of_one_chunk_plus_the_probe_row_is_one_log() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..30 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let logs = || -> usize {
+            git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .count()
+        };
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 11, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let before = logs();
+        let rows = with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                GitReader::read_commit_history_paged(path, 0, 11, None, None, RefScope::Named)
+            })
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 11);
+        assert_eq!(
+            rows.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            whole.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            logs() - before,
+            1,
+            "chunk + 1 rows was read as more than one walk"
+        );
+    }
+
+    /// Windows of c, c+1, 2c, 2c+1, 2c+2 and 3c+2 rows, grown one after the
+    /// other: each reads only the chunks it has not held, a chunk covers its
+    /// own rows plus the first of the next, and every window equals one walk.
+    #[test]
+    fn chunk_windows_around_every_boundary_read_the_fewest_walks() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let logs = || -> usize {
+            git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .count()
+        };
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 45);
+        let expected = [
+            (10, 1),
+            (11, 1),
+            (20, 1),
+            (21, 0),
+            (22, 1),
+            (32, 1),
+            (45, 1),
+        ];
+        let mut seen = Vec::new();
+        with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                for (window, _) in expected {
+                    let before = logs();
+                    let rows = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        window,
+                        None,
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    assert_eq!(ids(&rows), ids(&whole[..window]), "window {window}");
+                    seen.push((window, logs() - before));
+                }
+            })
+        });
+        assert_eq!(seen, expected.to_vec(), "(window, new log walks) per step");
+        // A window that ends exactly on a chunk, and one past the end of
+        // history, are both exact.
+        for window in [40, 41, 44, 45, 46, 60] {
+            let rows = with_history_chunk(10, || {
+                GitReader::read_commit_history_paged(path, 0, window, None, None, RefScope::Named)
+            })
+            .unwrap();
+            assert_eq!(ids(&rows), ids(&whole[..window.min(45)]), "window {window}");
+        }
+        // Paging from the middle of a chunk across the overlap row.
+        let mid = with_history_chunk(10, || {
+            GitReader::read_commit_history_paged(path, 9, 13, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(ids(&mid), ids(&whole[9..22]));
+    }
+
+    /// Every (chunk size, history length, skip, count) over a small repository
+    /// reads exactly the rows one unchunked walk holds: no boundary row is
+    /// doubled by the overlap, none dropped, and a history shorter than a
+    /// chunk, or ending on a chunk boundary, is exact. Chunk size 1 makes the
+    /// overlap row the whole of every chunk.
+    #[test]
+    fn chunked_history_equals_one_walk_for_every_window_and_skip() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..7 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        // A branch at three depths: `h{k}` has 8 - k commits of history (the
+        // fixture repository starts with one commit of its own).
+        for k in [0, 3, 5] {
+            git_in(
+                dir.path(),
+                &["branch", &format!("h{k}"), &format!("main~{k}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let ids = |rows: Vec<RawCommitNode>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let mut checked = 0;
+        for k in [0, 3, 5] {
+            let rev = format!("h{k}");
+            let len = 8 - k;
+            let whole = ids(with_history_chunk(usize::MAX, || {
+                GitReader::read_commit_history_paged(
+                    path,
+                    0,
+                    len + 5,
+                    Some(&rev),
+                    None,
+                    RefScope::Named,
+                )
+            })
+            .unwrap());
+            assert_eq!(whole.len(), len);
+            for chunk in [1, 2, 3] {
+                for skip in 0..=len + 1 {
+                    for count in 1..=len + 2 {
+                        let got = ids(with_history_chunk(chunk, || {
+                            GitReader::read_commit_history_paged(
+                                path,
+                                skip,
+                                count,
+                                Some(&rev),
+                                None,
+                                RefScope::Named,
+                            )
+                        })
+                        .unwrap());
+                        let from = skip.min(len);
+                        let to = (skip + count).min(len);
+                        assert_eq!(
+                            got,
+                            whole[from..to].to_vec(),
+                            "chunk {chunk} history {len} skip {skip} count {count}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 400, "{checked}");
     }
 
     #[test]
