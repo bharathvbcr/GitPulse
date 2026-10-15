@@ -1,6 +1,14 @@
 //! Blocking-platform fallback. Workers retain the spawn permit until their
 //! descriptors close, even if an OS refuses cancellation. Captured prefixes
 //! live in shared bounded storage, not an all-or-nothing completion channel.
+//!
+//! A reader never parks inside `read` on a pipe that has no data: it waits for
+//! readability in short slices and checks its cancel flag between them. A
+//! detached reader whose pipe is still held open (a daemonized grandchild)
+//! therefore observes the cancellation `Worker::drop` leaves behind, returns,
+//! closes its own descriptor and only then drops the permit. The parent never
+//! closes a descriptor a worker is reading: closing an fd does not wake a read
+//! blocked on it, and a recycled fd number could close someone else's file.
 
 use super::{Drained, ProcessObserver, SpawnPermit, Stop};
 use std::io::{self, Read, Write};
@@ -11,6 +19,81 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const CANCEL_GRACE: Duration = Duration::from_millis(50);
+/// How long a reader waits for data before it re-checks cancellation. Bounds
+/// how long an abandoned reader keeps its permit after the parent gives up.
+const READ_SLICE: Duration = Duration::from_millis(10);
+
+/// Waits up to `timeout` for `pipe` to have data or reach EOF. `Ok(false)`
+/// means nothing arrived; `Ok(true)` means a `read` will not block.
+#[cfg(unix)]
+fn readable(pipe: &impl std::os::fd::AsRawFd, timeout: Duration) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd that outlives the call; the caller owns the fd.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+    match ready {
+        n if n > 0 => Ok(true),
+        0 => Ok(false),
+        _ => {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Windows has no poll for anonymous pipes; `PeekNamedPipe` reports buffered
+/// bytes without blocking. Any failure (a broken pipe is EOF, a non-pipe
+/// handle cannot be peeked) hands the decision to `read`, which reports it.
+#[cfg(windows)]
+fn readable(pipe: &impl std::os::windows::io::AsRawHandle, timeout: Duration) -> io::Result<bool> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn PeekNamedPipe(
+            pipe: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            size: u32,
+            read: *mut u32,
+            available: *mut u32,
+            left: *mut u32,
+        ) -> i32;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut available = 0u32;
+        // SAFETY: the handle is owned by the caller for the whole call; every
+        // out-pointer is null or points at a live local.
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || available > 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn readable<P>(_: &P, _: Duration) -> io::Result<bool> {
+    Ok(true)
+}
 
 struct Worker<T> {
     state: Arc<Mutex<T>>,
@@ -31,6 +114,8 @@ impl<T: Send + 'static> Worker<T> {
         let handle = thread::Builder::new()
             .name("gitpulse-pipe".into())
             .spawn(move || {
+                // Declared first so it drops last: `work` owns the descriptor
+                // and closes it before the permit is released.
                 let _permit = permit;
                 work(&worker_cancelled, &worker_state);
             })?;
@@ -116,6 +201,7 @@ fn reader<R: Read + Send + 'static>(
     pipe: Option<R>,
     cap: usize,
     permit: Arc<SpawnPermit<'static>>,
+    readable: fn(&R, Duration) -> io::Result<bool>,
 ) -> io::Result<Worker<Drained>> {
     Worker::start(Drained::default(), permit, move |cancelled, state| {
         let Some(mut pipe) = pipe else { return };
@@ -127,6 +213,17 @@ fn reader<R: Read + Send + 'static>(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .stop = Some(Stop::Undelivered("output read cancelled before EOF".into()));
                 break;
+            }
+            match readable(&pipe, READ_SLICE) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .stop = Some(Stop::Broken(e.to_string()));
+                    break;
+                }
             }
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
@@ -165,8 +262,8 @@ impl OutputDrains {
         permit: Arc<SpawnPermit<'static>>,
     ) -> io::Result<Self> {
         Ok(Self {
-            stdout: reader(stdout, cap, permit.clone())?,
-            stderr: reader(stderr, 4 * 1024 * 1024, permit)?,
+            stdout: reader(stdout, cap, permit.clone(), readable)?,
+            stderr: reader(stderr, 4 * 1024 * 1024, permit, readable)?,
         })
     }
 
@@ -348,9 +445,192 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn holder(seconds: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg(seconds)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn in_flight(gate: &super::super::SpawnGate) -> usize {
+        gate.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .in_flight
+    }
+
+    /// Polls for the gate to empty. On timeout the holders are killed first so
+    /// a failing run never leaves processes or blocked threads behind.
+    #[cfg(unix)]
+    fn settle_or_report(
+        gate: &super::super::SpawnGate,
+        children: &mut [std::process::Child],
+        why: &str,
+    ) {
+        let deadline =
+            Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        while in_flight(gate) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let left = in_flight(gate);
+        for child in children.iter_mut() {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        assert_eq!(left, 0, "{why}: spawn slots still held after the settle");
+    }
+
+    #[cfg(unix)]
+    fn abandon(
+        child: &mut std::process::Child,
+        gate: &'static super::super::SpawnGate,
+    ) -> (super::Drained, super::Drained) {
+        let permit = Arc::new(
+            gate.acquire(Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+        );
+        let drains =
+            OutputDrains::new(child.stdout.take(), child.stderr.take(), 64, permit).unwrap();
+        // Let both workers reach their blocked read first; an early cancel is
+        // seen before the first read and proves nothing.
+        thread::sleep(Duration::from_millis(150));
+        drains.finish(Instant::now())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_reader_behind_a_live_pipe_holder_releases_its_slot() {
+        let gate: &'static super::super::SpawnGate =
+            Box::leak(Box::new(super::super::SpawnGate::new(4)));
+        let mut child = holder("60");
+        let (stdout, _) = abandon(&mut child, gate);
+        assert!(matches!(stdout.stop, Some(super::Stop::Undelivered(_))));
+        settle_or_report(
+            gate,
+            std::slice::from_mut(&mut child),
+            "live holder keeps the pipe open",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_reader_releases_its_slot_when_the_write_end_closes() {
+        let gate: &'static super::super::SpawnGate =
+            Box::leak(Box::new(super::super::SpawnGate::new(4)));
+        let mut child = holder("60");
+        let _ = abandon(&mut child, gate);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        settle_or_report(gate, &mut [], "write end closed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sixteen_abandoned_holders_cannot_pin_the_gate_at_its_limit() {
+        let gate: &'static super::super::SpawnGate =
+            Box::leak(Box::new(super::super::SpawnGate::new(16)));
+        let mut children: Vec<_> = (0..16).map(|_| holder("60")).collect();
+        for child in &mut children {
+            let _ = abandon(child, gate);
+        }
+        let deadline =
+            Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        let mut admitted = None;
+        while admitted.is_none() && Instant::now() < deadline {
+            admitted = gate.acquire(Instant::now() + Duration::from_millis(50));
+        }
+        let held = in_flight(gate);
+        let ok = admitted.is_some();
+        drop(admitted);
+        for child in &mut children {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        assert!(ok, "gate pinned at {held} of 16 by abandoned readers");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_worker_that_already_saw_eof_races_finish_cleanly() {
+        let gate: &'static super::super::SpawnGate =
+            Box::leak(Box::new(super::super::SpawnGate::new(4)));
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf abc"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let permit = Arc::new(
+            gate.acquire(Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+        );
+        let drains =
+            OutputDrains::new(child.stdout.take(), child.stderr.take(), 64, permit).unwrap();
+        child.wait().unwrap();
+        let (stdout, stderr) = drains.finish(Instant::now() + Duration::from_secs(5));
+        assert_eq!(stdout.bytes, b"abc");
+        assert!(stdout.stop.is_none() && stderr.stop.is_none());
+        settle_or_report(gate, &mut [], "clean EOF");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cap_reached_mid_read_still_releases_after_abandonment() {
+        let gate: &'static super::super::SpawnGate =
+            Box::leak(Box::new(super::super::SpawnGate::new(4)));
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "head -c 100000 /dev/zero; exec sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let permit = Arc::new(
+            gate.acquire(Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+        );
+        let drains =
+            OutputDrains::new(child.stdout.take(), child.stderr.take(), 10, permit).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let (stdout, _) = drains.finish(Instant::now());
+        assert_eq!(stdout.bytes.len(), 10);
+        assert!(stdout.truncated);
+        settle_or_report(
+            gate,
+            std::slice::from_mut(&mut child),
+            "cap reached then abandoned",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_the_drains_without_finish_releases_the_slot() {
+        let gate: &'static super::super::SpawnGate =
+            Box::leak(Box::new(super::super::SpawnGate::new(4)));
+        let mut child = holder("60");
+        let permit = Arc::new(
+            gate.acquire(Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+        );
+        let drains =
+            OutputDrains::new(child.stdout.take(), child.stderr.take(), 64, permit).unwrap();
+        drop(drains);
+        settle_or_report(
+            gate,
+            std::slice::from_mut(&mut child),
+            "dropped without finish",
+        );
+    }
+
     #[test]
     fn worker_keeps_prefix_and_distinguishes_cap_from_read_failure() {
-        let worker = reader(Some(io::Cursor::new(b"abcdef")), 3, permit()).unwrap();
+        let worker = reader(Some(io::Cursor::new(b"abcdef")), 3, permit(), |_, _| {
+            Ok(true)
+        })
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !worker.finished() && Instant::now() < deadline {
             thread::yield_now();
