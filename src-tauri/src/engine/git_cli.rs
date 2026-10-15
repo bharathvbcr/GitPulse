@@ -23,6 +23,9 @@ pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 mod pipe_drain;
 
+#[cfg(all(test, unix))]
+mod grace_adversarial;
+
 #[cfg(any(not(unix), test))]
 mod thread_io;
 
