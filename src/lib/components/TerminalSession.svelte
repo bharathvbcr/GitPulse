@@ -89,7 +89,7 @@
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs } from "../terminal/launchRequests";
-  import { hostedClaude, resumers, settleConversation, withSessionId, type ExitFacts, type ResumeOutcome } from "../terminal/hostedClaude";
+  import { conversationForStart, hostedClaude, resumers, settleConversation, type ExitFacts, type ResumeOutcome } from "../terminal/hostedClaude";
   import { checkTranscripts } from "../terminal/transcripts";
   import {
     effectiveMode,
@@ -694,32 +694,28 @@
           // `null` on the wire and the backend's u16 refuses the spawn.
           const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions(), hasRenderedBox(container));
           const cfg = launcherConfig(launcher);
-          hostedId = null;
           // Once: a later restart of this tab starts a fresh process the
           // ordinary way, because the session it took over has ended.
-          if (attachPending) {
-            const sessionId = attachPending;
-            attachPending = null;
-            // Taking over a process another view started: its conversation is
-            // the one already on record for that PTY, if any. Nothing new is
-            // recorded — a fresh id here would name a conversation that does
-            // not exist, and a later signal would offer to resume it.
-            if (launcher === "claude" && !taskRunId) hostedId = hostedClaude.byTerminal(sessionId)?.sessionId ?? null;
-            return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols, onOutput }));
-          }
-          // A conversation GitPulse can name is one it can resume. Every
-          // fresh Claude launch is given an id, a task attempt excepted: its
-          // run id is already its session id, assigned by the backend.
+          const attachTo = attachPending;
+          attachPending = null;
           const resumeId = resumeOverride;
           resumeOverride = null;
+          hostedId = null;
+          // A conversation GitPulse can name is one it can resume. A fresh
+          // Claude launch is given an id and a resumed one keeps its own; a
+          // takeover keeps whatever is on record for its PTY and records
+          // nothing (`conversationForStart`). A task attempt's run id is its
+          // session id, assigned by the backend.
           if (launcher === "claude" && !taskRunId) {
-            const hosted = withSessionId(resumeId ? ["--resume", resumeId] : cfg.args);
-            cfg.args = hosted.args;
-            hostedId = hosted.sessionId;
-            if (hostedId) hostedClaude.begin({
-              sessionId: hostedId, repoPath: workPath, startDir: startDir ?? null,
-              mode: permissionMode, startedAt: Date.now(),
+            const decided = conversationForStart(hostedClaude, {
+              attach: attachTo, resumeId, args: cfg.args,
+              record: { repoPath: workPath, startDir: startDir ?? null, mode: permissionMode, startedAt: Date.now() },
             });
+            cfg.args = decided.args;
+            hostedId = decided.sessionId;
+          }
+          if (attachTo) {
+            return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId: attachTo, rows, cols, onOutput }));
           }
           if (taskRunId) return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
             input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),

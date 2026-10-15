@@ -63,6 +63,33 @@ export function withSessionId(
   return { args: ["--session-id", sessionId, ...given], sessionId };
 }
 
+/**
+ * The conversation a Claude tab's next process runs, decided where the
+ * process starts and recorded only when the start makes one.
+ *
+ * Taking over a running PTY (`attach`) makes nothing: the conversation is
+ * whichever is already on record for that PTY, or none — a fresh id there
+ * would name a conversation that does not exist, and a later signal would
+ * offer to resume it. A fresh launch, or a `--resume <id>`, records exactly
+ * one. Returns the arguments to launch with (unchanged for an attach) and the
+ * conversation's id, or null when it cannot be named.
+ */
+export function conversationForStart(
+  store: Pick<ReturnType<typeof createHostedClaudeStore>, "begin" | "byTerminal">,
+  start: {
+    attach: string | null;
+    resumeId: string | null;
+    args: string[] | undefined;
+    record: Omit<HostedClaude, "sessionId" | "terminalId" | "endedSignal">;
+    newId?: () => string;
+  },
+): { args: string[] | undefined; sessionId: string | null } {
+  if (start.attach) return { args: start.args, sessionId: store.byTerminal(start.attach)?.sessionId ?? null };
+  const hosted = withSessionId(start.resumeId ? ["--resume", start.resumeId] : start.args, start.newId);
+  if (hosted.sessionId) store.begin({ ...start.record, sessionId: hosted.sessionId });
+  return hosted;
+}
+
 /** One hosted Claude conversation, as it is kept between app runs. */
 export interface HostedClaude {
   /** Claude Code's session id: what `--resume` takes. */

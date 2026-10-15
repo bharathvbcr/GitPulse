@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_HOSTED_CLAUDE,
   carriesSession,
+  conversationForStart,
   createHostedClaudeStore,
   createResumers,
   endedFromOutside,
@@ -206,5 +207,38 @@ describe("what a PTY's end does to its conversation", () => {
       expect(settleConversation(store, OTHER, end)).toBe(false);
       expect(store.get(OTHER)).toBeUndefined();
     }
+  });
+});
+
+// S2-01: what a start records, by how the process starts.
+describe("the conversation a start records", () => {
+  const record = { repoPath: "/r", startDir: null, mode: null, startedAt: 5 };
+
+  it("a takeover of a PTY with a record keeps it, unchanged, and records nothing", () => {
+    const store = createHostedClaudeStore(null);
+    store.begin(launch(ID));
+    store.bind(ID, "term-1");
+    const before = store.list();
+    const decided = conversationForStart(store, { attach: "term-1", resumeId: null, args: ["--model", "opus"], record, newId: () => OTHER });
+    expect(decided).toEqual({ args: ["--model", "opus"], sessionId: ID });
+    expect(store.list()).toEqual(before);
+    expect(store.byTerminal("term-1")?.sessionId).toBe(ID);
+  });
+
+  it("a takeover of a PTY with no record names nothing and records nothing", () => {
+    const store = createHostedClaudeStore(null);
+    const decided = conversationForStart(store, { attach: "term-9", resumeId: null, args: undefined, record, newId: () => OTHER });
+    expect(decided.sessionId).toBeNull();
+    expect(store.list()).toEqual([]);
+  });
+
+  it("a fresh launch and a --resume launch each record exactly one", () => {
+    const store = createHostedClaudeStore(null);
+    const fresh = conversationForStart(store, { attach: null, resumeId: null, args: ["--model", "opus"], record, newId: () => OTHER });
+    expect(fresh).toEqual({ args: ["--session-id", OTHER, "--model", "opus"], sessionId: OTHER });
+    expect(store.list().map((r) => r.sessionId)).toEqual([OTHER]);
+    const resumed = conversationForStart(store, { attach: null, resumeId: ID, args: undefined, record, newId: () => "unused" });
+    expect(resumed).toEqual({ args: ["--resume", ID], sessionId: ID });
+    expect(store.list().map((r) => r.sessionId).sort()).toEqual([ID, OTHER].sort());
   });
 });
