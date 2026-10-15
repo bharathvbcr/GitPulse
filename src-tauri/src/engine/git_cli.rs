@@ -2830,6 +2830,11 @@ struct GateState {
     /// Decisions that could not consult the shared budget and fell back to
     /// this process's own (a lock held past its patience, an I/O error).
     shared_fallbacks: u64,
+    /// Decisions the shared budget denied but could not record. Refused like
+    /// any denial (and so also in `shed` / `deferred`), counted here as well so
+    /// a record that has stopped taking writes shows in the report instead of
+    /// only in a log line that is throttled.
+    shared_unrecorded_denials: u64,
     /// Admitted children by what they were (`git status`, `gh`, ...). The
     /// class totals said the budget was spent; this says on what, which is
     /// the question every refusal raised and no log could answer.
@@ -2997,13 +3002,14 @@ impl SpawnGate {
     /// the token was granted or the record could not be consulted (counted,
     /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when the
     /// processes together have spent it, whether or not the record could be
-    /// rewritten to say so.
+    /// rewritten to say so (counted apart, in `shared_unrecorded_denials`).
     fn settle_shared(&self, state: &mut GateState, taken: shared_budget::Take) -> bool {
         match taken {
             shared_budget::Take::Granted => true,
             shared_budget::Take::Denied => false,
             shared_budget::Take::DeniedUnrecorded(reason) => {
-                log_unrecorded_denial(&reason);
+                state.shared_unrecorded_denials = state.shared_unrecorded_denials.saturating_add(1);
+                log_unrecorded_denial(&reason, state.shared_unrecorded_denials);
                 false
             }
             shared_budget::Take::Unavailable(reason) => {
@@ -3015,10 +3021,10 @@ impl SpawnGate {
     }
 
     /// One line on where this gate's rate budget lives, for the report.
-    fn sharing_report(&self, fallbacks: u64) -> String {
+    fn sharing_report(&self, fallbacks: u64, unrecorded_denials: u64) -> String {
         match (&self.shared, &self.shared_note) {
             (Some(shared), _) => format!(
-                "budget=shared({}) fallbacks={fallbacks}",
+                "budget=shared({}) unrecorded_denials={unrecorded_denials} fallbacks={fallbacks}",
                 shared.path().display()
             ),
             (None, Some(note)) => format!("budget=per-process ({note})"),
@@ -3241,7 +3247,8 @@ impl SpawnGate {
         if let Err(refusal) = outcome {
             state.counters[class.index()].count(refusal);
             let counters = state.counters;
-            let sharing = self.sharing_report(state.shared_fallbacks);
+            let sharing =
+                self.sharing_report(state.shared_fallbacks, state.shared_unrecorded_denials);
             drop(state);
             // A refused waiter must release its reservation.
             self.released.notify_all();
@@ -3985,15 +3992,16 @@ fn log_shared_fallback(reason: &str, total: u64) {
 }
 
 /// A denial the shared record could not persist, logged at most every
-/// [`REFUSAL_REPORT_INTERVAL`]. The spawn was refused all the same.
-fn log_unrecorded_denial(reason: &str) {
+/// [`REFUSAL_REPORT_INTERVAL`], with the running total. The spawn was refused
+/// all the same.
+fn log_unrecorded_denial(reason: &str, total: u64) {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     if !report_due(&LAST) {
         return;
     }
     log::warn!(
         target: "spawn_gate",
-        "shared spawn budget denied a decision it could not record; refused: {reason}"
+        "shared spawn budget denied a decision it could not record ({total} so far); refused: {reason}"
     );
 }
 
@@ -10998,11 +11006,158 @@ mod admission_scope_tests {
         });
         assert_eq!(shed.err(), Some(Refusal::Shed));
         assert_eq!(b.state.lock().unwrap().shared_fallbacks, 0);
+        // The report counts those denials on their own line, apart from the
+        // ordinary denial A met when it spent the record and from fallbacks.
+        let (fallbacks, unrecorded) = {
+            let state = b.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert!(unrecorded >= 2, "the reactive and the background denial");
+        let report = b.sharing_report(fallbacks, unrecorded);
+        assert!(
+            report.ends_with(&format!("unrecorded_denials={unrecorded} fallbacks=0")),
+            "{report}"
+        );
+        let ordinary = {
+            let state = a.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert_eq!(ordinary, (0, 0), "a recorded denial is neither");
         let clicked = with_admission(Admission::Interactive, || {
             b.acquire_until(Instant::now() + Duration::from_millis(50), &|| false)
                 .map(|_| ())
         });
         assert_eq!(clicked, Ok(()), "a user action does not ask the record");
+    }
+
+    /// Spawns `gate` admits in `class` before it refuses, its own bucket
+    /// frozen so only the budgets decide.
+    fn drain(gate: &SpawnGate, class: Admission) -> usize {
+        let mut admitted = 0;
+        while with_admission(class, || {
+            gate.acquire(Instant::now() + Duration::from_millis(20))
+                .is_some()
+        }) {
+            admitted += 1;
+        }
+        admitted
+    }
+
+    /// CHARACTERIZATION, awaiting the owner's ruling (ft-d41b8491, part 2): a
+    /// grant whose record write fails is the documented fail-open, so when
+    /// writes fail on every take the record never decrements and the shared
+    /// cap is gone: each of N processes is granted its own whole bucket. This
+    /// pins the aggregate as it is, with the healthy record beside it, so a
+    /// ruling that bounds it (a fixed floor after repeated write failures)
+    /// has to change this test on purpose.
+    #[test]
+    fn writes_failing_on_every_take_grant_each_process_its_own_bucket() {
+        let (burst, rate) = production_spawn_rate();
+        let reserve = (burst / 4) as usize;
+        let burst = burst as usize;
+        let mut rows = Vec::new();
+        for processes in [1usize, 2, 4, 8] {
+            let mut aggregate = [0usize; 4];
+            for (slot, (writes_fail, class)) in [
+                (false, Admission::Reactive),
+                (true, Admission::Reactive),
+                (false, Admission::Background),
+                (true, Admission::Background),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("budget");
+                let gates: Vec<_> = (0..processes)
+                    .map(|_| {
+                        let gate =
+                            SpawnGate::with_rate(16, burst as u32, rate).sharing(Ok(path.clone()));
+                        let gate = frozen(gate);
+                        gate.shared.as_ref().unwrap().fail_writes(writes_fail);
+                        gate
+                    })
+                    .collect();
+                let started = Instant::now();
+                aggregate[slot] = gates.iter().map(|gate| drain(gate, class)).sum();
+                // The shared record refills in real time at `rate`.
+                let refill =
+                    (started.elapsed().as_secs_f64() * f64::from(rate)).ceil() as usize + 1;
+                let (own, shared) = match class {
+                    Admission::Background => (burst - reserve, burst - reserve),
+                    _ => (burst, burst),
+                };
+                if writes_fail {
+                    assert_eq!(
+                        aggregate[slot],
+                        processes * own,
+                        "{processes} processes, {class:?}: each its own bucket"
+                    );
+                } else {
+                    assert!(
+                        (shared..=shared + refill).contains(&aggregate[slot]),
+                        "{processes} processes, {class:?}: {} for one shared bucket",
+                        aggregate[slot]
+                    );
+                }
+            }
+            rows.push(format!(
+                "N={processes}: reactive healthy {} / writes failing {}; background healthy {} / writes failing {}",
+                aggregate[0], aggregate[1], aggregate[2], aggregate[3]
+            ));
+        }
+        println!("{}", rows.join("\n"));
+    }
+
+    /// The two counters are separate, add exactly under concurrent deciders of
+    /// one gate, and saturate rather than wrap; the reason (which names the
+    /// path) is only logged, never part of the report's counts.
+    #[test]
+    fn unrecorded_denials_and_fallbacks_count_apart_exactly_and_saturate() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = shared_gate(&dir.path().join("budget"), 8, 1);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for i in 0..500 {
+                        let taken = if i % 5 == 0 {
+                            shared_budget::Take::Unavailable("held".into())
+                        } else {
+                            shared_budget::Take::DeniedUnrecorded("full".into())
+                        };
+                        let mut state = gate.state.lock().unwrap();
+                        assert_eq!(gate.settle_shared(&mut state, taken), i % 5 == 0);
+                    }
+                });
+            }
+        });
+        let (fallbacks, unrecorded) = {
+            let state = gate.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert_eq!((fallbacks, unrecorded), (200, 800));
+
+        let mut state = gate.state.lock().unwrap();
+        state.shared_unrecorded_denials = u64::MAX;
+        state.shared_fallbacks = u64::MAX;
+        assert!(!gate.settle_shared(
+            &mut state,
+            shared_budget::Take::DeniedUnrecorded("x".into())
+        ));
+        assert!(gate.settle_shared(&mut state, shared_budget::Take::Unavailable("x".into())));
+        assert_eq!(
+            (state.shared_fallbacks, state.shared_unrecorded_denials),
+            (u64::MAX, u64::MAX)
+        );
+        let report = gate.sharing_report(state.shared_fallbacks, state.shared_unrecorded_denials);
+        assert!(
+            report.ends_with(&format!(
+                "unrecorded_denials={} fallbacks={}",
+                u64::MAX,
+                u64::MAX
+            )),
+            "{report}"
+        );
     }
 
     #[test]
@@ -11083,13 +11238,16 @@ mod admission_scope_tests {
         // A directory where the record should be.
         let gate = leak(SpawnGate::with_rate(16, 4, 1).sharing(Ok(dir.path().to_path_buf())));
         assert!(gate.shared.is_none());
-        let report = gate.sharing_report(0);
+        let report = gate.sharing_report(0, 0);
         assert!(report.starts_with("budget=per-process ("), "{report}");
         let admitted = (0..8).filter(|_| admits(gate)).count();
         assert_eq!(admitted, 4, "the process bucket still holds");
 
         let unpathed = SpawnGate::with_rate(16, 4, 1).sharing(Err("no home".into()));
-        assert_eq!(unpathed.sharing_report(0), "budget=per-process (no home)");
+        assert_eq!(
+            unpathed.sharing_report(0, 0),
+            "budget=per-process (no home)"
+        );
         // The unlimited test gate has nothing to share, and says that.
         let unlimited = SpawnGate::new(4).sharing(Ok(dir.path().join("x")));
         assert!(unlimited.shared.is_none());
@@ -11110,7 +11268,7 @@ mod admission_scope_tests {
         assert!(admits(gate), "a stopped holder must not stop this process");
         let fallbacks = gate.state.lock().unwrap().shared_fallbacks;
         assert_eq!(fallbacks, 1);
-        assert!(gate.sharing_report(fallbacks).ends_with("fallbacks=1"));
+        assert!(gate.sharing_report(fallbacks, 0).ends_with("fallbacks=1"));
         holder.unlock().unwrap();
     }
 
@@ -11119,7 +11277,7 @@ mod admission_scope_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("budget");
         let gate = shared_gate(&path, 4, 1);
-        let report = gate.sharing_report(0);
+        let report = gate.sharing_report(0, 0);
         assert!(report.starts_with("budget=shared("), "{report}");
         assert!(report.contains(&path.display().to_string()), "{report}");
     }
