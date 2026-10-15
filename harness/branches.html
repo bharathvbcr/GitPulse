@@ -342,6 +342,24 @@ if(params.has("check")) {
     await menuFor(rowFor(target));await click("Delete…");await answer(true);await settle();await settle();
     check("a refusal force cannot fix offers no force prompt",branchDeletes.length===4&&branchDeletes[3].force===false&&!prompt());
     deleteRefusal="";repoStore.setError(null);
+    // Undo of a delete that cannot be restored must not claim it was, and must stay offered.
+    toastStore.clear();
+    const createsBeforeUndo=branchCreates.length;
+    await menuFor(rowFor(target));await click("Delete…");await answer(true);await settle();await settle();
+    check("an ok delete offers Undo",get(toastStore).some(t=>t.message===`Deleted branch "${target}"`&&t.action?.label==="Undo"));
+    failCreate=true;
+    await click("Undo");await waitFor(()=>branchCreates.length===createsBeforeUndo+1);await settle();await settle();
+    const afterFailedUndo=get(toastStore);
+    check(`a failed Undo shows no Restored success toast`,!afterFailedUndo.some(t=>t.kind==="success"&&t.message.startsWith("Restored")));
+    check("a failed Undo shows an error naming the branch and its sha",
+      afterFailedUndo.some(t=>t.kind==="error"&&t.message.includes(`${target} at abc123456789`)));
+    check("a failed Undo keeps the Undo offer and the branch listed",
+      afterFailedUndo.some(t=>t.message===`Deleted branch "${target}"`&&t.action?.label==="Undo")&&Boolean(rowFor(target)));
+    failCreate=false;repoStore.setError(null);
+    await click("Undo");await waitFor(()=>branchCreates.length===createsBeforeUndo+2);await settle();await settle();
+    check("a retried Undo that succeeds says Restored and consumes the offer",
+      get(toastStore).some(t=>t.message===`Restored branch "${target}"`)&&!get(toastStore).some(t=>t.action?.label==="Undo"));
+    toastStore.clear();repoStore.setError(null);branchCreates.length=0;
     // Tags: chip only when compared and ahead; failed and capped reads say so.
     tags=[{name:"v1.0",commit_id:"a".repeat(40),commits_ahead_of_base:3,commits_behind_base:0,compared_to:"main"},
       {name:"v0.9",commit_id:"b".repeat(40),commits_ahead_of_base:5,commits_behind_base:0,compared_to:null},
