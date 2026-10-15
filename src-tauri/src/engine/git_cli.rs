@@ -3294,6 +3294,17 @@ impl SpawnGate {
         .coalesced += 1;
     }
 
+    /// Takes back a [`Self::note_coalesced`] for a joiner whose leader timed
+    /// out and who asks again: it was not answered by another's child.
+    fn note_uncoalesced(&self, class: Admission) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counters = &mut state.counters[class.index()];
+        counters.coalesced = counters.coalesced.saturating_sub(1);
+    }
+
     #[cfg(test)]
     fn counters(&self) -> [AdmissionCounters; 3] {
         self.state
@@ -3600,6 +3611,22 @@ struct SharedReadKey {
 struct SharedRead {
     result: Mutex<Option<Result<BoundedRun, String>>>,
     done: Condvar,
+    /// Where this flight's joiners go when its leader's deadline passed
+    /// before theirs: the one flight that asks again for all of them, set by
+    /// the first to arrive. It stays reachable from here after the gate has
+    /// admitted it, because everyone who asks was waiting before its child
+    /// started, which is all the "joined while queued" rule protects.
+    retry: Mutex<Option<Arc<SharedRead>>>,
+}
+
+impl SharedRead {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            done: Condvar::new(),
+            retry: Mutex::new(None),
+        })
+    }
 }
 
 fn shared_reads() -> &'static Mutex<HashMap<SharedReadKey, Arc<SharedRead>>> {
@@ -3626,16 +3653,45 @@ fn run_read_shared(
 ) -> Result<BoundedRun, String> {
     let deadline = Instant::now() + timeout;
     let mut attempt = timeout;
+    // The flight whose leader timed out last, and the longest prefix any such
+    // leader printed: a keeping caller's rerun may reach its deadline with
+    // less than that.
+    let mut after: Option<Arc<SharedRead>> = None;
+    let mut prefix: Option<BoundedRun> = None;
     loop {
-        match run_read_shared_once(&mut cmd, label, attempt, deadline, stdout_cap, gate) {
-            SharedAttempt::Done(result) => return result,
-            SharedAttempt::LeaderTimedOut => {
+        let outcome = match run_read_shared_once(
+            &mut cmd,
+            label,
+            attempt,
+            deadline,
+            stdout_cap,
+            gate,
+            after.as_ref(),
+        ) {
+            SharedAttempt::Done(result) => result,
+            SharedAttempt::LeaderTimedOut { flight, printed } => {
+                if let Some(run) = printed {
+                    if prefix
+                        .as_ref()
+                        .is_none_or(|kept| run.stdout.len() > kept.stdout.len())
+                    {
+                        prefix = Some(run);
+                    }
+                }
+                after = Some(flight);
                 attempt = deadline.saturating_duration_since(Instant::now());
                 if attempt.is_zero() {
-                    return deadline_expired(label, timeout);
+                    deadline_expired(label, timeout)
+                } else {
+                    continue;
                 }
             }
-        }
+        };
+        return if after.is_some() {
+            as_the_callers_deadline(outcome, prefix, label, timeout)
+        } else {
+            outcome
+        };
     }
 }
 
@@ -3644,8 +3700,59 @@ enum SharedAttempt {
     Done(Result<BoundedRun, String>),
     /// The leader this caller joined ran out of its own time while this
     /// caller's deadline has not come. Its timeout is not this caller's
-    /// answer, so the caller asks again.
-    LeaderTimedOut,
+    /// answer, so the caller asks again, on `flight`'s retry. `printed` is
+    /// what the leader had read when it was stopped.
+    LeaderTimedOut {
+        flight: Arc<SharedRead>,
+        printed: Option<BoundedRun>,
+    },
+}
+
+/// A caller that asked again after a leader's timeout ends at its own
+/// deadline like a solo call: naming the budget it was given rather than the
+/// remainder a rerun was handed, and, when it keeps prefixes, with the
+/// longest prefix it saw, since a solo call over the same budget would have
+/// read at least that much.
+fn as_the_callers_deadline(
+    outcome: Result<BoundedRun, String>,
+    prefix: Option<BoundedRun>,
+    label: &str,
+    timeout: Duration,
+) -> Result<BoundedRun, String> {
+    if !is_deadline_outcome(&outcome) {
+        return outcome;
+    }
+    let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
+    let longer = |own: usize| {
+        prefix
+            .as_ref()
+            .filter(|_| keeping_deadline_prefix())
+            .is_some_and(|kept| kept.stdout.len() > own)
+    };
+    match outcome {
+        Ok(run) if !longer(run.stdout.len()) => Ok(rename_deadline(run, message)),
+        Err(error) if !longer(0) => {
+            // A refusal to wait any longer for a slot says so; only the bare
+            // timeout is rewritten.
+            Err(if error.ends_with(SLOT_WAIT_SUFFIX) {
+                error
+            } else {
+                message
+            })
+        }
+        // The leader's prefix outweighs this caller's own.
+        _ => match prefix {
+            Some(kept) => Ok(rename_deadline(kept, message)),
+            None => Err(message),
+        },
+    }
+}
+
+fn rename_deadline(mut run: BoundedRun, message: String) -> BoundedRun {
+    if let Some(Incomplete::Deadline { message: slot, .. }) = &mut run.incomplete {
+        *slot = message;
+    }
+    run
 }
 
 /// Whether a flight's outcome is its leader's deadline rather than an answer.
@@ -3686,6 +3793,7 @@ fn run_read_shared_once(
     deadline: Instant,
     stdout_cap: usize,
     gate: &'static SpawnGate,
+    after: Option<&Arc<SharedRead>>,
 ) -> SharedAttempt {
     let Some(cwd) = cmd.get_current_dir().map(Path::to_path_buf) else {
         return SharedAttempt::Done(run_with_gate(
@@ -3710,17 +3818,31 @@ fn run_read_shared_once(
         let mut reads = table
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match reads.get(&key) {
-            Some(flight) => (Arc::clone(flight), false),
+        // Callers whose leader timed out share one retry flight, however
+        // far its child has got, so a hung read meets one new child and not
+        // one per caller. The table is held, so the first to arrive decides.
+        let mut retry = after.map(|previous| {
+            previous
+                .retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let known = retry
+            .as_deref()
+            .and_then(Clone::clone)
+            .or_else(|| reads.get(&key).cloned());
+        let (flight, leader) = match known {
+            Some(flight) => (flight, false),
             None => {
-                let flight = Arc::new(SharedRead {
-                    result: Mutex::new(None),
-                    done: Condvar::new(),
-                });
+                let flight = SharedRead::new();
                 reads.insert(key.clone(), Arc::clone(&flight));
                 (flight, true)
             }
+        };
+        if let Some(slot) = retry.as_deref_mut() {
+            slot.get_or_insert_with(|| Arc::clone(&flight));
         }
+        (flight, leader)
     };
     if !leader {
         gate.note_coalesced(key.class);
@@ -3752,7 +3874,12 @@ fn run_read_shared_once(
             return SharedAttempt::Done(deadline_expired(label, timeout));
         };
         if is_deadline_outcome(&shared) && Instant::now() < deadline {
-            return SharedAttempt::LeaderTimedOut;
+            // Not answered by another's child after all.
+            gate.note_uncoalesced(key.class);
+            return SharedAttempt::LeaderTimedOut {
+                flight: Arc::clone(&flight),
+                printed: shared.ok(),
+            };
         }
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
@@ -4655,7 +4782,10 @@ fn git_run_inner(
         if remaining.is_zero() {
             return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
         }
-        let mut out = if shared && stdin_bytes.is_none() {
+        // A hook-running command is cancellable and can write, so it is
+        // never shared whatever the caller asked: the shared path has no
+        // observer to poll.
+        let mut out = if shared && stdin_bytes.is_none() && hooked.is_none() {
             run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
         } else if let Some((_, run)) = &hooked {
             let mut cmd = cmd;
@@ -9075,19 +9205,26 @@ mod tests {
         gate: &'static SpawnGate,
         _dir: tempfile::TempDir,
         cwd: PathBuf,
-        held: Option<super::SpawnPermit<'static>>,
+        held: Vec<super::SpawnPermit<'static>>,
     }
 
     #[cfg(unix)]
     impl JoinerRig {
         fn new() -> Self {
-            let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(1)));
+            Self::with_slots(1)
+        }
+
+        /// A gate of `slots` slots, every one held until [`Self::release`].
+        fn with_slots(slots: usize) -> Self {
+            let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(slots)));
             let dir = tempfile::TempDir::new().unwrap();
             let cwd = dir.path().canonicalize().unwrap();
-            let held = Some(
-                gate.acquire(Instant::now() + Duration::from_secs(5))
-                    .unwrap(),
-            );
+            let held = (0..slots)
+                .map(|_| {
+                    gate.acquire(Instant::now() + Duration::from_secs(5))
+                        .unwrap()
+                })
+                .collect();
             Self {
                 gate,
                 _dir: dir,
@@ -9102,8 +9239,28 @@ mod tests {
             script: &str,
             timeout: Duration,
         ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+            self.read_as(script, timeout, false)
+        }
+
+        /// [`Self::read`] from a caller that keeps a deadline's prefix, as
+        /// `git_run_inner` does for every production read.
+        fn read_keeping(
+            &self,
+            script: &str,
+            timeout: Duration,
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+            self.read_as(script, timeout, true)
+        }
+
+        fn read_as(
+            &self,
+            script: &str,
+            timeout: Duration,
+            keep_prefix: bool,
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
             let (gate, cwd, script) = (self.gate, self.cwd.clone(), script.to_string());
             thread::spawn(move || {
+                let _kept = keep_prefix.then(KeepDeadlinePrefix::enter);
                 let mut cmd = Command::new("/bin/sh");
                 cmd.args(["-c", script.as_str()]).current_dir(&cwd);
                 let started = Instant::now();
@@ -9137,7 +9294,7 @@ mod tests {
         }
 
         fn release(&mut self) {
-            self.held = None;
+            self.held.clear();
         }
     }
 
@@ -9333,6 +9490,200 @@ mod tests {
             assert!(waited < Duration::from_secs(3), "{waited:?}");
             assert!(leader.join().unwrap().0.expect("leader").success);
         }
+    }
+
+    /// A caller that keeps deadline prefixes, as every production read does,
+    /// gets the marked form when its joiner deadline passes. The joiner has no
+    /// bytes of its own: the child is the leader's.
+    #[cfg(unix)]
+    #[test]
+    fn a_keeping_joiner_that_runs_out_reports_a_marked_empty_run() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read_keeping("sleep 2; echo late", Duration::from_secs(10));
+        rig.wait_for_flight();
+        let joiner = rig.read_keeping("sleep 2; echo late", Duration::from_millis(200));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (joined, _) = joiner.join().unwrap();
+        let run = joined.expect("a keeping caller gets the prefix form, not an error");
+        assert!(!run.success && run.stdout.is_empty(), "{run:?}");
+        let Some(Incomplete::Deadline { message, over_cap }) = &run.incomplete else {
+            panic!("expected a deadline marker: {run:?}");
+        };
+        assert_eq!(message, &format!("joined-read{TIMEOUT_MARKER}0.2s"));
+        assert!(over_cap.is_none());
+        assert!(leader.join().unwrap().0.expect("leader").success);
+    }
+
+    /// The leader's prefix is the best answer a keeping joiner can get when
+    /// its own rerun has too little time left to print anything: a solo call
+    /// with the joiner's budget would have returned those bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerunning_joiner_keeps_the_leaders_prefix_when_its_own_run_yields_less() {
+        let mut rig = JoinerRig::new();
+        let script = "if [ -e ran ]; then sleep 5; else touch ran; echo partial; sleep 5; fi";
+        let leader = rig.read_keeping(script, Duration::from_millis(400));
+        rig.wait_for_flight();
+        let joiner = rig.read_keeping(script, Duration::from_millis(900));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (led, _) = leader.join().unwrap();
+        let led = led.expect("keeping leader");
+        assert_eq!(String::from_utf8_lossy(&led.stdout).trim(), "partial");
+        let (joined, waited) = joiner.join().unwrap();
+        let run = joined.expect("keeping joiner");
+        assert!(
+            matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+            "{run:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).trim(),
+            "partial",
+            "the leader's prefix was thrown away"
+        );
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(2500)),
+            "{waited:?}"
+        );
+    }
+
+    /// A rerun spends what is left of the caller's own budget, never a fresh
+    /// one: a leader's timeout does not give its joiner more time in all, and
+    /// the timeout it reports is still the budget it was given.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_never_outlasts_the_joiners_total_budget() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 5", Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 5", Duration::from_millis(900));
+        rig.wait_for_joins(1);
+        rig.release();
+        assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+        let (joined, waited) = joiner.join().unwrap();
+        let error = joined.expect_err("joiner deadline");
+        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(1900)),
+            "{waited:?}"
+        );
+        assert_eq!(
+            error,
+            format!("joined-read{TIMEOUT_MARKER}0.9s"),
+            "a joiner's timeout names its own budget, not the remainder"
+        );
+    }
+
+    /// Joiners of a leader that timed out all ask again. They ask once, as one
+    /// flight: a hung git must not meet a stampede of children where it used
+    /// to meet one.
+    #[cfg(unix)]
+    #[test]
+    fn a_leaders_timeout_sends_its_joiners_to_one_new_child() {
+        // Whether the unfixed code stampedes depends on how fast the first
+        // rerun reaches the gate, so ask over several rounds.
+        for round in 0..4 {
+            let mut rig = JoinerRig::with_slots(16);
+            let script = format!("echo $$ >> '{}/pids'; sleep 2", rig.cwd.display());
+            let leader = rig.read(&script, Duration::from_millis(300));
+            rig.wait_for_flight();
+            let joiners: Vec<_> = (0..12)
+                .map(|_| rig.read(&script, Duration::from_millis(1000)))
+                .collect();
+            rig.wait_for_joins(12);
+            rig.release();
+            assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+            for joiner in joiners {
+                let (joined, _) = joiner.join().unwrap();
+                assert!(is_timed_out(&joined.expect_err("every rerun hung")));
+            }
+            let started = std::fs::read_to_string(rig.cwd.join("pids")).unwrap();
+            assert_eq!(
+                started.lines().count(),
+                2,
+                "round {round}: the leader's child and one shared retry: {started}"
+            );
+        }
+    }
+
+    /// `coalesced` counts reads answered without a child of their own. A
+    /// joiner whose leader timed out and who then ran its own child was not.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_that_reruns_is_not_counted_as_coalesced() {
+        let mut rig = JoinerRig::new();
+        let script = "if [ -e ran ]; then echo second; else touch ran; sleep 5; fi";
+        let leader = rig.read(script, Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read(script, Duration::from_secs(10));
+        rig.wait_for_joins(1);
+        rig.release();
+        assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+        assert!(joiner.join().unwrap().0.expect("rerun").success);
+        let counters = rig.gate.counters()[super::Admission::Reactive.index()];
+        assert_eq!(counters.admitted, 3, "the rig's held slot and two children");
+        assert_eq!(
+            counters.coalesced, 0,
+            "no read was answered by another's child"
+        );
+    }
+
+    /// A caller that can be cancelled never takes the shared path, which has
+    /// no observer to poll: a hook-running command asked for through the
+    /// shared entry point still honours the cancel.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_running_command_is_never_shared_so_it_stays_cancellable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .status_locked()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        }
+        crate::test_support::trust_repo(&repo);
+        let hook = repo.join(".git/hooks/pre-commit");
+        let marker = repo.join(".git/hook-started");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let canceller = {
+            let (repo, marker) = (repo.clone(), marker.clone());
+            thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(20);
+                while !marker.exists() {
+                    assert!(Instant::now() < until, "hook never started");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                cancel_hooked_git(&repo)
+            })
+        };
+        let started = Instant::now();
+        let error =
+            git_text_shared(&repo, &["commit", "--allow-empty", "-m", "x"]).expect_err("cancelled");
+        assert!(marker.exists(), "the hook never ran: {error}");
+        assert_eq!(canceller.join().unwrap(), 1, "the run was registered");
+        assert!(is_hooked_git_cancelled(&error), "{error}");
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A rate-limit refusal after ~2s used to print the command's own 30s or
