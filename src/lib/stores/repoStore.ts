@@ -2908,7 +2908,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     createFile: async (filePath: string, target?: MutationTarget | null) =>
       runMutating("create", filePath, (path) =>
         invokeFn("cmd_create_file", { repoPath: path, filePath }),
-        { target, expected: (err) => readFileWriteError(err)?.code === "already_exists" },
+        {
+          target,
+          // Only the refusal for THIS path: the host echoes the path it was
+          // given, and a refusal about any other is a failure like the rest.
+          expected: (err) => {
+            const refusal = readFileWriteError(err);
+            return refusal?.code === "already_exists" && refusal.path === filePath;
+          },
+        },
       ),
     movePath: async (from: string, to: string, target?: MutationTarget | null) =>
       runMutating("move", `${from} → ${to}`, (path) =>

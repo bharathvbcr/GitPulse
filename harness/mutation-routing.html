@@ -58,7 +58,7 @@ mockIPCWithEvents(async (cmd, args) => {
       sent.push({ cmd, repoPath: args.repoPath, ...args });
       await parkIfHeld(cmd);
       if (failNext[cmd]) { delete failNext[cmd]; throw new Error(`${cmd} refused by fixture`); }
-      if (cmd === "cmd_deadbranch_clean") return guarded({ deleted: args.branches, failed: [], backup_path: null, message: "Cleaned" });
+      if (cmd === "cmd_deadbranch_clean") return guarded({ deleted: args.branches, failed: [], backup_path: args.createBackup ? `${args.repoPath}/.backup/new.json` : null, message: "Cleaned" });
       if (cmd === "cmd_deadbranch_restore") return guarded({ restored: ["stale/from-a"], failed: [], message: "Restored" });
       return guarded(null);
     }
@@ -199,6 +199,22 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   check("a restore in the repository that listed the backup runs there", () => sentTo("cmd_deadbranch_restore")[0].repoPath === A && sentTo("cmd_deadbranch_restore")[0].backupPath === `${A}/.backup/1.json`);
   check("and is journalled", () => journal().some(a => /restore/.test(a.kind) && a.ok && ownedBy(a, A)));
   check("a refused clean or restore is not journalled: nothing ran", () => journal().filter(a => /deadbranch/.test(a.kind)).length === 2);
+
+  // --- a clean that finishes after the repository changed ---------------------------------
+  [...document.querySelectorAll("button")].find(b => b.textContent.includes("Scan & Clean")).click();
+  await until(() => button("Clean Selected (1)"), "A's list back on the clean tab");
+  hold("cmd_deadbranch_clean");
+  button("Clean Selected (1)").click();
+  await until(() => sentTo("cmd_deadbranch_clean").length === 2, "second clean sent");
+  await repoStore.activateTab(tabId(B));
+  harnessStore.activateRepository(B);
+  await until(() => document.body.textContent.includes("stale/from-b"), "B's list shown");
+  releaseAll("cmd_deadbranch_clean");
+  await until(() => busy() === 0, "second clean settled");
+  await wait(200);
+  check("A's clean result is not drawn over B's list", () => !host.textContent.includes("Cleaned"));
+  check("and B's list cannot offer to restore A's backup into B", () => !button("Undo / Restore Branches") && sentTo("cmd_deadbranch_restore").length === 1);
+  check("the result still reaches the user, naming A", () => toasts().some(t => /mr-a/.test(t) && /Cleaned/.test(t)));
 
   check("No unexpected commands", () => unexpected.length === 0);
   check("No unhandled runtime errors", () => errors.length === 0);

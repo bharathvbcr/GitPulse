@@ -533,7 +533,8 @@
       const outcome = await repoStore.createFile(path, target);
       if (outcome.ok) return path;
       const typedError = readFileWriteError(outcome.cause);
-      if (typedError?.code === "already_exists") {
+      // `surfaced` false: the store judged it the expected refusal for this path.
+      if (typedError?.code === "already_exists" && !outcome.surfaced) {
         typed = name;
         refusal = typedError.message;
         continue;

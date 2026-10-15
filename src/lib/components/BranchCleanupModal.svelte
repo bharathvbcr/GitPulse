@@ -4,6 +4,7 @@
   import { toastStore } from "../stores/toastStore";
   import { reportFailure } from "../stores/mutationOutcome";
   import type { MutationTarget } from "../repos/storeTypes";
+  import { displayName } from "../repos/paths";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { fade, scale } from "svelte/transition";
@@ -82,6 +83,19 @@
     if (owner && repoStore.targetIsActive(owner)) return owner;
     toastStore.error(`${what}: the repository changed since this list was read. Rescan, then try again.`);
     return null;
+  }
+
+  /**
+   * Whether the result belongs on screen. One for a repository that is no
+   * longer in front is toasted under that repository's name instead: the
+   * banner (and its Undo, which restores into whatever the backups list is
+   * showing) is for the list on screen, and the list now is another's.
+   * Returns true when the caller should go on and draw the banner.
+   */
+  function showsHere(owner: MutationTarget, message: string, backupPath: string | null | undefined): boolean {
+    if (repoStore.targetIsActive(owner)) return true;
+    toastStore.info(`${displayName(owner.path)}: ${message}${backupPath ? ` Backup: ${backupPath}` : ""}`);
+    return false;
   }
 
   const displayedBranches = $derived.by(() => {
@@ -213,6 +227,7 @@
       const outcome = await repoStore.deadbranchClean(branchesToClean, forceDelete, createBackup, target);
       const res = outcome.output;
       if (!reportFailure(outcome, "Could not clean the branches") || !res) return;
+      if (!showsHere(target, res.message, res.backup_path)) return;
 
       actionBanner = {
         text: res.message,
@@ -245,6 +260,7 @@
       const outcome = await repoStore.deadbranchRestore(backupPath, target);
       const res = outcome.output;
       if (!reportFailure(outcome, "Could not restore the branches") || !res) return;
+      if (!showsHere(target, res.message, null)) return;
       actionBanner = {
         text: res.message,
         kind: res.failed.length === 0 ? "ok" : "err",

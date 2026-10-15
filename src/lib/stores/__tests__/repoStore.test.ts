@@ -5015,6 +5015,65 @@ describe("file, worktree and branch-cleanup mutations (ft-d61584de)", () => {
     expect(get(store).error).toBeNull();
   });
 
+  it("an already_exists for a different path than the one created is not expected: it is filed", async () => {
+    const refusal = { code: "already_exists", message: "'other.ts' already exists", path: "other.ts" };
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome.ok).toBe(false);
+    expect(get(store).error).toContain("other.ts");
+  });
+
+  it("a refused or changed_on_disk create is filed, not treated as the name prompt's retry", async () => {
+    for (const refusal of [
+      { code: "refused", message: "outside the repository" },
+      { code: "changed_on_disk", message: "changed", path: "a.ts", expected: "x", actual: "y" },
+    ]) {
+      const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+      await store.openRepo("/r/a");
+      await store.createFile("a.ts", store.captureTarget());
+      expect(get(store).error, refusal.code).toContain(refusal.message);
+    }
+  });
+
+  it("an exception thrown synchronously by the wrapped call, and a failed delete, release the quit guard", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_delete_path: () => { throw new Error("sync boom"); },
+      cmd_move_path: async () => { throw new Error("async boom"); },
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget();
+    expect(await store.deletePath("x", a)).toMatchObject({ ok: false });
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    expect(await store.movePath("x", "y", a)).toMatchObject({ ok: false });
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    // A later mutation on the same repository is not stranded behind the failed one.
+    expect(await store.deletePath("z", a)).toMatchObject({ ok: false });
+  });
+
+  it("fetch, pull and push with no target pin the repository in front when they are CALLED, not when they finish", async () => {
+    for (const run of [
+      (s: ReturnType<typeof makeStore>["store"]) => s.fetch(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.pull(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.push(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.stashSave(),
+    ]) {
+      const hold = deferred<unknown>();
+      const paths: unknown[] = [];
+      const gate = async (_c: string, args?: Record<string, unknown>) => {
+        paths.push(args?.repoPath);
+        return hold.promise as never;
+      };
+      const { store } = makeStore(makeInvoke({ cmd_fetch: gate, cmd_pull: gate, cmd_push: gate, cmd_stash_save: gate }));
+      await store.openRepo("/r/a");
+      const pending = run(store);
+      await store.openRepo("/r/b");
+      hold.resolve(guarded(null));
+      await pending;
+      expect(paths).toEqual(["/r/a"]);
+    }
+  });
+
   it("any other create failure is filed as an error", async () => {
     const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw new Error("disk full"); } }));
     await store.openRepo("/r/a");
