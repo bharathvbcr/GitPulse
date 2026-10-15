@@ -37,7 +37,7 @@
   } from "./lib/desktop/nativeShell";
   import { gitActionCount, waitForGitIdle } from "./lib/desktop/exitGuard";
   import { nativeMenuState } from "./lib/desktop/menuStateStore";
-  import { canDispatchMenuEvent } from "./lib/desktop/menuState";
+  import { blockedWhilePrompting, canDispatchMenuEvent } from "./lib/desktop/menuState";
   import { createMenuSync } from "./lib/desktop/menuSync";
   import { createMenuCommands, checkUpdatesFromMenu } from "./lib/desktop/menuCommands";
   import { repoWindowTitle, syncWindowChrome } from "./lib/desktop/windowChrome";
@@ -166,7 +166,7 @@
   import { applyTabWidth } from "./lib/ui/codeDisplay";
   import { applyReduceMotion } from "./lib/motion/motionPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
-  import { askConfirm } from "./lib/stores/modalStore";
+  import { askConfirm, isPromptOpen } from "./lib/stores/modalStore";
   import { terminalSessions } from "./lib/terminal/sessionRegistry";
   import { quitRisks } from "./lib/terminal/quitGuard";
   import {
@@ -674,7 +674,10 @@
     const shellHandlers: NativeShellHandlers = {
       ...createMenuCommands(),
       checkUpdates: () => void checkUpdatesFromMenu(),
-      canDispatch: (event) => !exitRequestPending && canDispatchMenuEvent(event, get(nativeMenuState), get(repoStore)),
+      canDispatch: (event) =>
+        !exitRequestPending &&
+        !(isPromptOpen() && blockedWhilePrompting(event.id)) &&
+        canDispatchMenuEvent(event, get(nativeMenuState), get(repoStore)),
       open: () => void repoStore.pickAndOpenRepo(),
       clone: openCloneDialog,
       settings: () => {

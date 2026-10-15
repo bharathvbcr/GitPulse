@@ -974,7 +974,8 @@
     if (!$repoStore.selectedFilePath) return;
     const patch = buildFilePatchForHunk(lines, $repoStore.selectedFilePath, hunkIndex);
     if (!patch) return;
-    await repoStore.stageSelectivePatch(patch, !isStaged);
+    const outcome = await repoStore.stageSelectivePatch(patch, !isStaged);
+    if (!outcome.ok) return;
     selectedLines = new Set();
   }
 
@@ -1006,7 +1007,8 @@
     if (!$repoStore.selectedFilePath || selectedLines.size === 0) return;
     const patch = buildFilePatchFromLines(lines, $repoStore.selectedFilePath, selectedLines);
     if (!patch) return;
-    await repoStore.stageSelectivePatch(patch, isStaging);
+    const outcome = await repoStore.stageSelectivePatch(patch, isStaging);
+    if (!outcome.ok) return;
     selectedLines = new Set();
   }
 

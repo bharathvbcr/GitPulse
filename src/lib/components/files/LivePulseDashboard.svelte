@@ -20,6 +20,7 @@
   } from "@lucide/svelte";
   import { formatAge } from "../../storage/format";
   import { askConfirm } from "../../stores/modalStore";
+  import { reportFailure } from "../../stores/mutationOutcome";
   import { promptQuickCommit } from "../../commit/quickCommit";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import {
@@ -103,29 +104,32 @@
   }
 
   async function stageAll() {
-    await repoStore.stageAll();
+    return await repoStore.stageAll();
   }
 
   async function unstageAll() {
-    await repoStore.unstageAll();
+    return await repoStore.unstageAll();
   }
 
   async function stageFile(path: string) {
-    await repoStore.stageFile(path);
+    return await repoStore.stageFile(path);
   }
 
   async function unstageFile(path: string) {
-    await repoStore.unstageFile(path);
+    return await repoStore.unstageFile(path);
   }
 
   async function discardFile(path: string) {
+    // The repository this file belongs to, held across the confirm.
+    const target = repoStore.captureTarget();
     const confirmed = await askConfirm({
       title: "Discard Changes",
       message: `Discard all uncommitted changes to ${path}? This cannot be undone.`,
       confirmLabel: "Discard Changes",
     });
     if (!confirmed) return;
-    await repoStore.discardChanges(path);
+    const outcome = await repoStore.discardChanges(path, target);
+    reportFailure(outcome, "Could not discard the changes");
   }
 
   // Load commit history & language detection when selectedFile changes

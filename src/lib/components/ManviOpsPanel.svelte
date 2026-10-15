@@ -28,6 +28,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
+  import { offerBranchUndo } from "../repos/branchUndo";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
   import { harnessPermissionMode } from "../harness/availability";
   import {
@@ -264,7 +265,9 @@
   async function cleanTags() {
     if (selectedTags.length === 0) return;
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    // The repository these tags belong to, held across the confirm and the loop.
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const names = [...selectedTags];
     const confirmed = await askConfirm({
       title: "Delete tags",
@@ -278,10 +281,11 @@
     const failures: string[] = [];
     try {
       for (const name of names) {
-        if ($repoStore.currentPath !== repo) break;
-        const outcome = await repoStore.deleteTag(name);
+        const outcome = await repoStore.deleteTag(name, target);
         if (outcome.ok) deleted += 1;
         else failures.push(`${name}: ${outcome.error ?? "failed"}`);
+        // The repository changed: every remaining tag would be refused too.
+        if (outcome.refused) break;
       }
       notice = failures.length
         ? `Deleted ${deleted} of ${names.length}. ${failures.join("; ")}`
@@ -296,7 +300,10 @@
   async function cleanBranches() {
     if (selectedBranches.length === 0) return;
     const repo = $repoStore.currentPath;
-    if (!repo || !cleanup) return;
+    // The repository these branches belong to, held across the confirm, the
+    // loop and the Undo toast.
+    const target = repoStore.captureTarget();
+    if (!repo || !target || !cleanup) return;
     const selected = cleanup.candidates.filter((c) => selectedBranches.includes(c.name));
     if (selected.length === 0) return;
     const names = selected.map((c) => c.name);
@@ -317,38 +324,33 @@
     const restoredTips: { name: string; tip: string }[] = [];
     try {
       for (const candidate of selected) {
-        if ($repoStore.currentPath !== repo) break;
         const tip = candidate.tip_commit_id;
-        const outcome = await repoStore.deleteBranch(candidate.name, false);
+        const outcome = await repoStore.deleteBranch(candidate.name, false, target);
         if (outcome.ok) {
           deleted += 1;
           if (tip) restoredTips.push({ name: candidate.name, tip });
         } else {
           failures.push(`${candidate.name}: ${outcome.error ?? "failed"}`);
         }
+        // The repository changed: every remaining branch would be refused too.
+        if (outcome.refused) break;
+      }
+      // The Undo is bound to the repository the delete ran in, so it is offered
+      // even when another tab is active now. The panel's own notice and rescan
+      // describe the active repository, and only apply while it is still this one.
+      if (restoredTips.length > 0) {
+        offerBranchUndo(
+          restoredTips.length === 1
+            ? `Deleted branch "${restoredTips[0].name}"`
+            : `Deleted ${restoredTips.length} merged branches`,
+          restoredTips,
+          target,
+        );
       }
       if ($repoStore.currentPath === repo) {
         notice = failures.length
           ? `Deleted ${deleted} of ${names.length}. ${failures.join(" ")}`
           : `Deleted ${deleted} merged branch${deleted === 1 ? "" : "es"}.`;
-        if (restoredTips.length === 1) {
-          const { name, tip } = restoredTips[0];
-          toastStore.action(`Deleted branch "${name}"`, "Undo", async () => {
-            await repoStore.createBranch(name, tip);
-            toastStore.success(`Restored branch "${name}"`);
-          });
-        } else if (restoredTips.length > 1) {
-          toastStore.action(
-            `Deleted ${restoredTips.length} merged branches`,
-            "Undo",
-            async () => {
-              for (const { name, tip } of restoredTips) {
-                await repoStore.createBranch(name, tip);
-              }
-              toastStore.success(`Restored ${restoredTips.length} branches`);
-            },
-          );
-        }
         await scanBranches();
       }
     } finally {

@@ -54,6 +54,7 @@
   import { copyText } from "../../desktop/clipboard";
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
   import { askConfirm, askText } from "../../stores/modalStore";
+  import { reportFailure } from "../../stores/mutationOutcome";
   import { harnessStore, type Guarded } from "../../stores/harnessStore";
   import type { DeleteOutcome } from "../../files/types";
   import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
@@ -665,23 +666,26 @@
 
   async function stageFile(path: string) {
     closeContextMenu();
-    await repoStore.stageFile(path);
+    return await repoStore.stageFile(path);
   }
 
   async function unstageFile(path: string) {
     closeContextMenu();
-    await repoStore.unstageFile(path);
+    return await repoStore.unstageFile(path);
   }
 
   async function discardFile(path: string) {
     closeContextMenu();
+    // The repository this file belongs to, held across the confirm.
+    const target = repoStore.captureTarget();
     const confirmed = await askConfirm({
       title: "Discard Changes",
       message: `Are you sure you want to discard all uncommitted changes to ${path}? This cannot be undone.`,
       confirmLabel: "Discard Changes",
     });
     if (!confirmed) return;
-    await repoStore.discardChanges(path);
+    const outcome = await repoStore.discardChanges(path, target);
+    reportFailure(outcome, "Could not discard the changes");
   }
 
   async function openInSystem(filePath: string) {

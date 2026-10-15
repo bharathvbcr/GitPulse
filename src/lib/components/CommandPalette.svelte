@@ -5,7 +5,7 @@
   import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle } from "@lucide/svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
-  import { promptState } from "../stores/modalStore";
+  import { isPromptOpen } from "../stores/modalStore";
   import { sameRepo, isCaseInsensitiveFs, displayName } from "../repos/paths";
   import { backdropFade, cardScale } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
@@ -162,7 +162,7 @@
   }
 
   function modalOccupied(): boolean {
-    return get(promptState) !== null || Boolean(document.querySelector('[aria-modal="true"]:not([data-command-palette])'));
+    return isPromptOpen() || Boolean(document.querySelector('[aria-modal="true"]:not([data-command-palette])'));
   }
 
   function requestOpen() {

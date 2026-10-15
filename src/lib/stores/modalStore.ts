@@ -37,6 +37,11 @@ interface PendingPrompt {
 /** The currently shown prompt, if any. Rendered once by PromptModal.svelte. */
 export const promptState = writable<PendingPrompt | null>(null);
 
+/** Whether a prompt is open right now. */
+export function isPromptOpen(): boolean {
+  return get(promptState) !== null;
+}
+
 /** The open prompt's `validate` refusal, shown under its field; null when none. */
 export const promptError = writable<string | null>(null);
 

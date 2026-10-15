@@ -28,7 +28,7 @@
     ListChecks,
     SquareTerminal,
   } from "@lucide/svelte";
-  import { askConfirm, askText } from "../stores/modalStore";
+  import { askConfirm, askText, isPromptOpen } from "../stores/modalStore";
   import {
     computeTabLayout,
     normalizeGroupName,
@@ -563,6 +563,10 @@
       return;
     }
     if (shouldSkipWebviewShortcut(e, isTauri())) return;
+    // A confirm or name prompt belongs to the tab it was raised on. Switching,
+    // closing and opening tabs wait until it is answered (the native menu
+    // accelerators are held by the same rule in App's canDispatch).
+    if (isPromptOpen()) return;
     switch (classifyShortcut(e)) {
       case "closeActiveTab":
         if (isTypingTarget(e.target)) return;

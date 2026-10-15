@@ -5,7 +5,11 @@ export type ToastKind = "success" | "info" | "warning" | "error";
 
 export interface ToastAction {
   label: string;
-  onClick: () => void | Promise<void>;
+  /**
+   * Resolving `false` says the action did not complete: the toast stays so the
+   * user can try again. Anything else dismisses it.
+   */
+  onClick: () => void | boolean | Promise<void | boolean>;
 }
 
 export interface ToastItem {
@@ -164,7 +168,7 @@ function createToastStore() {
     clear,
     pauseAll,
     resumeAll,
-    action: (message: string, actionLabel: string, onClick: () => void | Promise<void>, duration?: number) =>
+    action: (message: string, actionLabel: string, onClick: ToastAction["onClick"], duration?: number) =>
       add({ kind: "info", message, action: { label: actionLabel, onClick }, duration }),
     success: (message: string, action?: ToastAction, duration?: number) =>
       add({ kind: "success", message, action, duration }),

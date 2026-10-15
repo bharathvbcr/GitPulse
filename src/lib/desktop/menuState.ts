@@ -264,7 +264,8 @@ export function buildMenuState(
     }
   }
   const gitBusy = repoBusy(repo.currentPath);
-  const workingRepos = Object.entries(gitActivity).filter(([, actions]) => actions.length);
+  // The "" key is a bulk sweep's own token, not a repository; its repositories are counted themselves.
+  const workingRepos = Object.entries(gitActivity).filter(([path, actions]) => path !== "" && actions.length);
   const totalBusy = workingRepos.reduce((sum, [, actions]) => sum + actions.length, 0);
   const status = !hasRepo ? "No repository" : repo.isLoading ? "Loading…"
     : repo.error ? "Status unavailable" : repo.operation.probeFailed ? "Operation unavailable"
@@ -478,6 +479,21 @@ export function statusKeyAction(
   if (event.key === "3" && can("section:work:resolve") && card.conflicts) return { id: "section:work:resolve" };
   if (event.key === "4" && can("section:work:overview") && card.stashes) return { id: "section:work:overview" };
   return null;
+}
+
+/** Menu items that change which tab is open or active. */
+const TAB_CHANGING_EVENTS: ReadonlySet<string> = new Set([
+  "activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab",
+]);
+
+/**
+ * Whether a menu item must wait while a prompt is open. A confirm or name
+ * prompt belongs to the tab it was raised on; the native accelerators for
+ * switching, opening and closing tabs reach the app past the webview, so the
+ * prompt cannot swallow them and the dispatcher refuses them instead.
+ */
+export function blockedWhilePrompting(eventId: string): boolean {
+  return TAB_CHANGING_EVENTS.has(eventId);
 }
 
 /**

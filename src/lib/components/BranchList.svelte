@@ -5,6 +5,8 @@
   import { currentRepoPath, repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
+  import { reportFailure } from "../stores/mutationOutcome";
+  import { offerBranchUndo } from "../repos/branchUndo";
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
   import { formatError } from "../ui/formatError";
@@ -572,6 +574,8 @@
 
   async function runCreateTag(at?: { name: string; commitId: string }) {
     closeMenu();
+    // The repository this was asked about, held across the prompt.
+    const target = repoStore.captureTarget();
     const name = await askText({
       title: at ? `Create tag at ${at.name}` : "Create tag at HEAD",
       message: at
@@ -582,22 +586,26 @@
     });
     const trimmed = name?.trim();
     if (!trimmed) return;
-    await repoStore.createTag(trimmed, at?.commitId);
+    const outcome = await repoStore.createTag(trimmed, at?.commitId, undefined, target);
+    reportFailure(outcome, "Could not create the tag");
   }
 
   async function runDeleteTag(tag: TagInfo) {
     closeMenu();
+    const target = repoStore.captureTarget();
     const ok = await askConfirm({
       title: "Delete tag",
       message: `Delete tag ${tag.name}? The commit it points at is untouched.`,
       confirmLabel: "Delete",
     });
     if (!ok) return;
-    await repoStore.deleteTag(tag.name);
+    const outcome = await repoStore.deleteTag(tag.name, target);
+    reportFailure(outcome, "Could not delete the tag");
   }
 
   async function runRename(branch: BranchInfo) {
     closeMenu();
+    const target = repoStore.captureTarget();
     const next = await askText({
       title: "Rename branch",
       message: branch.name,
@@ -606,11 +614,14 @@
     });
     const trimmed = next?.trim();
     if (!trimmed || trimmed === branch.name) return;
-    await repoStore.renameBranch(branch.name, trimmed);
+    const outcome = await repoStore.renameBranch(branch.name, trimmed, target);
+    reportFailure(outcome, "Could not rename the branch");
   }
 
   async function runDelete(branch: BranchInfo) {
     closeMenu();
+    // Both confirms and the Undo run against the repository this was asked in.
+    const target = repoStore.captureTarget();
     // Two-step escalation (WorktreesPanel's armed remove is the house style):
     // the first confirm runs the SAFE delete. Only an explicit second confirm
     // — shown when git refused because the branch is unmerged — retries with
@@ -624,37 +635,26 @@
     if (!ok) return;
     const branchSha = branch.tip_commit_id;
     const branchName = branch.name;
-    const outcome = await repoStore.deleteBranch(branch.name, false);
+    const tips = branchSha ? [{ name: branchName, tip: branchSha }] : [];
+    const outcome = await repoStore.deleteBranch(branch.name, false, target);
     if (outcome.ok) {
-      if (branchSha) {
-        toastStore.action(`Deleted branch "${branchName}"`, "Undo", async () => {
-          await repoStore.createBranch(branchName, branchSha);
-          toastStore.success(`Restored branch "${branchName}"`);
-        });
-      } else {
-        toastStore.success(`Deleted branch "${branchName}"`);
-      }
+      offerBranchUndo(`Deleted branch "${branchName}"`, tips, target);
       return;
     }
     const decision = escalateDeleteDecision(outcome.error ?? "", branch);
-    if (!decision.canRetryForce || !decision.message) return;
+    if (!decision.canRetryForce || !decision.message) {
+      reportFailure(outcome, "Could not delete the branch");
+      return;
+    }
     const forceOk = await askConfirm({
       title: "Force-delete branch",
       message: decision.message,
       confirmLabel: "Force delete",
     });
     if (!forceOk) return;
-    const forceOutcome = await repoStore.deleteBranch(branch.name, true);
-    if (forceOutcome.ok) {
-      if (branchSha) {
-        toastStore.action(`Force deleted branch "${branchName}"`, "Undo", async () => {
-          await repoStore.createBranch(branchName, branchSha);
-          toastStore.success(`Restored branch "${branchName}"`);
-        });
-      } else {
-        toastStore.success(`Force deleted branch "${branchName}"`);
-      }
-    }
+    const forceOutcome = await repoStore.deleteBranch(branch.name, true, target);
+    if (!reportFailure(forceOutcome, "Could not force-delete the branch")) return;
+    offerBranchUndo(`Force deleted branch "${branchName}"`, tips, target);
   }
 
   async function runCompare(branch: BranchInfo) {
