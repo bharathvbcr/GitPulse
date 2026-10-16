@@ -455,14 +455,29 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
     state.set_output_stall_timeout(Duration::from_millis(20));
     let held: Unrepaid = Arc::default();
     let keep = held.clone();
+    // Every byte the view was sent, repaid or not.
+    let everything: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let log = everything.clone();
+    // Off while the view "never acknowledges"; on once it repays, after which it
+    // acknowledges as it receives, as a live view does. Without it, whatever the
+    // reader still held when the view repaid would refill the window with
+    // nobody left to repay it, and the resumed output would be shed again.
+    let acknowledging = Arc::new(AtomicBool::new(false));
+    let repay = (acknowledging.clone(), state.clone());
     app.listen("terminal-output", move |event| {
         let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
         let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
-        keep.lock().unwrap().push((
-            data["id"].as_str().unwrap().to_owned(),
-            data["bytes"].as_u64().unwrap() as usize,
-            bytes,
-        ));
+        let id = data["id"].as_str().unwrap().to_owned();
+        let reserved = data["bytes"].as_u64().unwrap() as usize;
+        // Decided under the same lock the drain below holds, so an event is
+        // either drained and repaid there or repaid here, never both or neither.
+        let mut unrepaid = keep.lock().unwrap();
+        log.lock().unwrap().extend_from_slice(&bytes);
+        if repay.0.load(Ordering::SeqCst) {
+            acknowledge_output(&repay.1, &id, reserved).unwrap();
+        } else {
+            unrepaid.push((id, reserved, bytes));
+        }
     });
     let losses = Arc::new(Mutex::new(0usize));
     let counted = losses.clone();
@@ -470,19 +485,31 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
         *counted.lock().unwrap() += 1;
     });
     let dir = repo();
-    // After the burst the shell waits for a line, then proves it is alive.
+    // After the burst the shell says so out of band (a file: the view is being
+    // shed, so it cannot be told in-band), waits for a line, then proves it is
+    // alive.
+    let burst_done = dir.path().join("burst-done");
+    let tail = format!(
+        "touch '{}'; read line; printf RESUMED-OK; sleep 30",
+        burst_done.display()
+    );
     let id = spawn(
         &app,
         &state,
         &dir,
-        burst_command_then(2 * 1024 * 1024, "read line; printf RESUMED-OK; sleep 30"),
+        burst_command_then(2 * 1024 * 1024, &tail),
     );
     // The window fills, the stall passes, and the rest is shed.
     assert!(
-        wait_for(Duration::from_secs(30), || *losses.lock().unwrap() > 0),
+        wait_for(Duration::from_secs(60), || *losses.lock().unwrap() > 0),
         "a view that never acknowledges was never told output was skipped"
     );
-    std::thread::sleep(Duration::from_millis(300));
+    // The whole burst has been written. With no acknowledgement the window
+    // stays shut, so nothing more is delivered or reported from here on.
+    assert!(
+        wait_for(Duration::from_secs(60), || burst_done.exists()),
+        "the burst never finished being written"
+    );
     let delivered: usize = held.lock().unwrap().iter().map(|(_, n, _)| n).sum();
     assert!(
         delivered <= WINDOW,
@@ -491,16 +518,21 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
     assert!(delivered > 0, "positive control: something was delivered");
     assert_eq!(*losses.lock().unwrap(), 1, "told exactly once");
     // Repay everything: the session was never stopped, and delivery resumes.
-    for (session, reserved, bytes) in held.lock().unwrap().drain(..) {
-        assert_eq!(bytes.len(), reserved);
-        acknowledge_output(&state, &session, reserved).unwrap();
+    {
+        let mut unrepaid = held.lock().unwrap();
+        for (session, reserved, bytes) in unrepaid.drain(..) {
+            assert_eq!(bytes.len(), reserved);
+            acknowledge_output(&state, &session, reserved).unwrap();
+        }
+        acknowledging.store(true, Ordering::SeqCst);
     }
     write_to_session(&state, &id, "go\n").unwrap();
-    let resumed = wait_for(Duration::from_secs(20), || {
-        held.lock()
+    let resumed = wait_for(Duration::from_secs(60), || {
+        everything
+            .lock()
             .unwrap()
-            .iter()
-            .any(|(_, _, bytes)| bytes.windows(10).any(|w| w == b"RESUMED-OK"))
+            .windows(10)
+            .any(|w| w == b"RESUMED-OK")
     });
     assert!(resumed, "delivery never resumed after the view repaid");
     gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
@@ -1085,18 +1117,21 @@ fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit()
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let (viewer, sink) = Viewer::new(&state, true);
-    let ended_before_exit = Arc::new(AtomicBool::new(false));
+    // One listener both samples the view and wakes the test, so the sample is
+    // always taken before the test proceeds. Two listeners ran in no fixed order,
+    // and the test could read the flag before the sampler had set it.
+    let (exit_sent, exited) = mpsc::channel();
     {
-        let (seen, flag) = (viewer.received.clone(), ended_before_exit.clone());
+        let seen = viewer.received.clone();
         app.listen("terminal-exit", move |_| {
-            flag.store(seen.lock().unwrap().ended_after.is_some(), Ordering::SeqCst);
+            let ended = seen.lock().unwrap().ended_after.is_some();
+            let _ = exit_sent.send(ended);
         });
     }
-    let exited = exits(&app);
     let script = burst_command_then(TOTAL, "exit 0").pop().unwrap();
     let id = spawn_for(&app, &state, &dir, script, sink);
     viewer.bind(&id);
-    exited.recv_timeout(Duration::from_secs(60)).expect("exit");
+    let ended_before_exit = exited.recv_timeout(Duration::from_secs(120)).expect("exit");
     let seen = viewer.received.lock().unwrap();
     let want = pattern(TOTAL);
     assert!(
@@ -1119,7 +1154,7 @@ fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit()
     );
     assert_eq!(seen.after_end, 0);
     assert!(
-        ended_before_exit.load(Ordering::SeqCst),
+        ended_before_exit,
         "the exit event overtook the end of the output"
     );
     println!(
@@ -1129,14 +1164,34 @@ fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit()
         seen.bytes.len() / seen.messages.len().max(1),
         seen.messages.len() as f64 / (seen.bytes.len() as f64 / (1024.0 * 1024.0))
     );
-    // One message per 64 KiB is 16 per MiB; the slack is for the gaps a loaded
-    // reader leaves, each of which flushes what has been gathered. The
-    // baseline this replaced was 1,024 per MiB (a message per 1 KiB read).
+    // One message per 64 KiB is 16 per MiB. The reader sends what it has
+    // gathered whenever the tty runs dry for a couple of milliseconds, and on a
+    // host with no core to spare the writer is descheduled for longer than that
+    // all the time (120 to 340 per MiB measured at load 150 to 300 on this
+    // machine's cores; the per-read defect makes about 1,024 and a starved
+    // writer can approach it), so how many messages a flood makes is a function
+    // of scheduling, not of the code. Where the host can keep the writer
+    // running the count is pinned tightly. Where it cannot, what still
+    // separates coalescing from a message per read is that the reader, when it
+    // is the one descheduled, finds the tty full and sends a large message: the
+    // per-read defect never makes one near the chunk size.
     let per_mib = seen.messages.len() as f64 / (seen.bytes.len() as f64 / (1024.0 * 1024.0));
-    assert!(
-        per_mib <= 24.0,
-        "{per_mib:.1} messages per MiB: a flood is sent in messages of up to 64 KiB"
-    );
+    let largest = seen.messages.iter().copied().max().unwrap_or(0);
+    let quiet_host =
+        common::env::coverage_relaxed(Duration::from_secs(1)) == Duration::from_secs(1);
+    if quiet_host {
+        assert!(
+            per_mib <= 24.0,
+            "{per_mib:.1} messages per MiB: a flood is sent in messages of up to 64 KiB"
+        );
+    } else {
+        assert!(
+            largest >= OUTPUT_CHUNK_BYTES / 2,
+            "largest message {largest} of {} ({per_mib:.1} per MiB): a flood is not being gathered into large messages",
+            seen.messages.len()
+        );
+    }
+    println!("largest message {largest}, quiet host {quiet_host}");
     drop(seen);
     // Everything sent was repaid, and the session has left nothing to repay.
     assert!(
