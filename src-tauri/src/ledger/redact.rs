@@ -2492,7 +2492,7 @@ mod gate_tests {
         let mut changed_somewhere = [false; 4];
         for depth in 28..=36usize {
             for leaf in &leaves {
-                for wrap in 0..4 {
+                for (wrap, changed) in changed_somewhere.iter_mut().enumerate() {
                     let mut value = serde_json::Value::String(leaf.clone());
                     for level in 0..depth {
                         value = match wrap {
@@ -2512,7 +2512,7 @@ mod gate_tests {
                         expected,
                         "depth {depth} wrap {wrap} leaf {leaf:?}"
                     );
-                    changed_somewhere[wrap] |= expected != input;
+                    *changed |= expected != input;
                 }
             }
         }
