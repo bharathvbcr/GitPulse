@@ -120,8 +120,17 @@ pub(super) fn docs_rename_guarded(
         // appears whether or not either note has links to rewrite.
         fold.record(guard_file(repo_path, plan.from, "delete")?);
         fold.record(guard_file(repo_path, plan.to, "modify")?);
-        for path in plan.rewrites.iter().filter(|path| path.as_str() != plan.to) {
-            fold.record(guard_file(repo_path, path, "modify")?);
+        // Every rewrite is judged on its own path, but together: one scope
+        // lookup and a bounded fan-out to the sidecar, not a round trip per
+        // note while the repository lock is held.
+        let rewrites: Vec<&str> = plan
+            .rewrites
+            .iter()
+            .map(String::as_str)
+            .filter(|path| *path != plan.to)
+            .collect();
+        for verdict in guard_files(repo_path, &rewrites, "modify")? {
+            fold.record(verdict);
         }
         Ok(())
     })?;
@@ -333,6 +342,132 @@ done
                 "{path} was not judged: {asked:?}"
             );
         }
+    }
+
+    /// `count` more notes that all link at `docs/Roadmap.md`, committed.
+    fn add_linking_notes(dir: &tempfile::TempDir, count: usize) -> Vec<String> {
+        let paths: Vec<String> = (0..count)
+            .map(|i| format!("docs/extra-{i:03}.md"))
+            .collect();
+        for path in &paths {
+            write(dir.path(), path, "[r](Roadmap.md)\n");
+        }
+        git_in(dir.path(), &["add", "docs"]);
+        git_in(dir.path(), &["commit", "-qm", "linking notes"]);
+        paths
+    }
+
+    #[test]
+    fn a_hub_rename_judges_every_rewrite_once_and_stages_in_one_batch() {
+        let (dir, repo, script) = bound_doc_repo("nothing/is/denied.md");
+        let extra = add_linking_notes(&dir, 40);
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let (guarded, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md")
+        });
+        let guarded = guarded.expect("rename");
+        assert!(guarded.output.complete, "{:?}", guarded.output);
+        assert_eq!(
+            guarded.output.rewritten_paths.len(),
+            42,
+            "{:?}",
+            guarded.output
+        );
+
+        let asked: Vec<String> = file_requests(&dir.path().join("requests.ndjson"))
+            .iter()
+            .filter_map(|request| request["params"]["path"].as_str().map(String::from))
+            .collect();
+        for path in extra
+            .iter()
+            .map(String::as_str)
+            .chain(["README.md", "docs/Guide.md"])
+        {
+            assert_eq!(
+                asked.iter().filter(|p| p.as_str() == path).count(),
+                1,
+                "{path} must be judged exactly once: {asked:?}"
+            );
+        }
+        let adds = labels.iter().filter(|l| l.as_str() == "git add").count();
+        assert_eq!(adds, 1, "{labels:?}");
+    }
+
+    #[test]
+    fn a_refusal_in_the_middle_of_a_hub_refuses_the_rename_before_the_move() {
+        let (dir, repo, script) = bound_doc_repo("docs/extra-017.md");
+        add_linking_notes(&dir, 40);
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let refused = docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md");
+        assert!(refused.is_err(), "one denied rewrite refuses the rename");
+        assert!(dir.path().join("docs/Roadmap.md").exists());
+        assert!(!dir.path().join("plans").exists());
+        let staged =
+            crate::engine::git_cli::git_text(dir.path(), &["diff", "--cached", "--name-only"])
+                .unwrap();
+        assert_eq!(staged, "");
+    }
+
+    /// A denial at file k refuses before the move, and the ledger holds a
+    /// record for the files up to k and none after it, though the workers had
+    /// already asked the sidecar about later files. Runs the production
+    /// 8-worker path against the fake sidecar.
+    #[test]
+    fn a_denial_at_file_k_records_nothing_after_k() {
+        let (dir, repo, script) = bound_doc_repo("docs/extra-017.md");
+        let extra = add_linking_notes(&dir, 120);
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+
+        let refused = docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md");
+        assert!(refused.is_err());
+        assert!(dir.path().join("docs/Roadmap.md").exists());
+
+        let recorded: Vec<String> = crate::ledger::tail(&repo, 0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.action == "file.modify")
+            .filter_map(|event| event.object)
+            .collect();
+        // Every rewrite is judged in the order the plan lists it; the denied
+        // one is the last record, so nothing that sorts after it was written.
+        let denied = recorded
+            .iter()
+            .position(|p| p == "docs/extra-017.md")
+            .unwrap_or_else(|| panic!("the denial is not recorded: {recorded:?}"));
+        assert_eq!(denied, recorded.len() - 1, "{recorded:?}");
+        for path in &extra {
+            let asked_after = recorded[denied + 1..].contains(path);
+            assert!(!asked_after, "{path} recorded after the denial");
+        }
+    }
+
+    /// A warning on one file among many still reaches the caller's verdict.
+    #[test]
+    fn a_warning_among_many_rewrites_still_surfaces() {
+        let (dir, repo, script) = bound_doc_repo("docs/extra-021.md");
+        add_linking_notes(&dir, 30);
+        // The same fake, answering "warn" where it would have said "deny".
+        let body = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(
+            &script,
+            body.replace("\"action\":\"deny\"", "\"action\":\"warn\""),
+        )
+        .unwrap();
+        let serial = test_serial();
+        let _binary = bind_test_binary(&serial, script.to_string_lossy());
+        let guarded =
+            docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md").expect("rename");
+        assert_eq!(
+            guarded.policy.status,
+            crate::harness::PolicyStatus::Warned,
+            "{:?}",
+            guarded.policy
+        );
     }
 
     // ---- adversarial gate cases ------------------------------------------

@@ -14,6 +14,9 @@ pub mod protocol;
 pub(crate) mod review;
 pub mod sidecar;
 
+#[cfg(test)]
+mod concurrent_tests;
+
 use serde::{Deserialize, Serialize};
 
 pub use policy::{
@@ -320,6 +323,156 @@ pub(crate) fn guard_file(
         &verdict,
     );
     gated(verdict)
+}
+
+/// How many file checks [`guard_files`] keeps in flight at once. The sidecar
+/// correlates replies by id, so overlapping calls proceed side by side; the cap
+/// keeps one rename from queueing thousands of requests behind each other.
+const GUARD_FILES_CONCURRENCY: usize = 8;
+
+/// Evaluates `op` on each of `files`, one verdict per file, in order — exactly
+/// what calling [`guard_file`] on each in turn answers, in less time.
+///
+/// The scope is resolved once instead of once per file, and the checks go to
+/// the sidecar [`GUARD_FILES_CONCURRENCY`] at a time. The verdicts are then
+/// recorded and gated in order: the first file whose verdict refuses (or that
+/// could not be checked) ends the walk with the same `Err` `guard_file` would
+/// have returned for it, and nothing after it is recorded. Workers stop taking
+/// new files once one refuses, so a dead or refusing sidecar costs a handful of
+/// timeouts, not one per file.
+///
+/// A scope that cannot be resolved blocks every file alike; that case hands
+/// the list to [`guard_file`] unchanged so its classification is the one used.
+pub(crate) fn guard_files(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+) -> Result<Vec<PolicyVerdict>, String> {
+    guard_files_with(repo_path, files, op, GUARD_FILES_CONCURRENCY)
+}
+
+/// [`guard_files`] with `workers` checks in flight. Production always runs
+/// [`GUARD_FILES_CONCURRENCY`]; the count is a parameter so a test drives the
+/// same concurrent path, not a one-worker stand-in.
+fn guard_files_with(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<PolicyVerdict>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = match scope_at(&address) {
+        Ok(scope) => scope,
+        Err(_) => return files.iter().map(|f| guard_file(repo_path, f, op)).collect(),
+    };
+    let action = format!("file.{}", if op.is_empty() { "write" } else { op });
+
+    // The test build's one fake sidecar is guarded by a lock that only the
+    // thread that took it may re-enter (see `sidecar::test_serial`). This
+    // thread blocks until every worker is done, so it lends what it holds to
+    // them; without a lend a worker would wait on its own spawner.
+    #[cfg(test)]
+    let lent = sidecar::test_serial_held_here();
+    let judged = judge_in_order(
+        files,
+        workers,
+        |file| {
+            #[cfg(test)]
+            let _lent = sidecar::lend_test_serial(lent);
+            check_file(repo_path, file, op, scope.as_ref())
+        },
+        |verdict| verdict.blocks() || verdict.gate_failed(),
+    );
+
+    let mut verdicts = Vec::with_capacity(files.len());
+    for (file, verdict) in files.iter().zip(judged) {
+        let verdict =
+            verdict.ok_or_else(|| format!("No policy verdict was produced for {file}"))?;
+        record_gate(
+            repo_path,
+            address.as_ref().ok(),
+            &action,
+            file,
+            None,
+            &verdict,
+        );
+        verdicts.push(gated(verdict)?);
+    }
+    Ok(verdicts)
+}
+
+/// Runs `check` on every file with up to `workers` in flight, claiming files in
+/// order, and stops claiming once a result satisfies `refuses`.
+///
+/// Slot `i` holds the result for `files[i]`, or `None` if it was never
+/// claimed. Because files are claimed in order and every worker finishes
+/// before this returns, every slot before the first refusing one is `Some`.
+fn judge_in_order<V: Send>(
+    files: &[&str],
+    workers: usize,
+    check: impl Fn(&str) -> V + Sync,
+    refuses: impl Fn(&V) -> bool + Sync,
+) -> Vec<Option<V>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<V>>> = files.iter().map(|_| Mutex::new(None)).collect();
+    let work = || loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let index = next.fetch_add(1, Ordering::AcqRel);
+        let Some(file) = files.get(index) else {
+            return;
+        };
+        let result = check(file);
+        if refuses(&result) {
+            stop.store(true, Ordering::Release);
+        }
+        *slots[index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+    };
+    let workers = workers.clamp(1, files.len().max(1));
+    if workers == 1 {
+        work();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
+    }
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect()
+}
+
+/// Test-only door to [`judge_in_order`] and [`GUARD_FILES_CONCURRENCY`], so the
+/// hub-rename benchmark drives the fan-out production uses for rewrites with
+/// its own counting check instead of a copy of it. Never refuses early.
+#[cfg(test)]
+pub(crate) fn judge_files_for_bench<V: Send>(
+    files: &[&str],
+    workers: usize,
+    check: impl Fn(&str) -> V + Sync,
+) -> Vec<Option<V>> {
+    judge_in_order(files, workers, check, |_| false)
+}
+
+/// The worker count [`guard_files`] runs in production.
+#[cfg(test)]
+pub(crate) const fn production_guard_workers() -> usize {
+    GUARD_FILES_CONCURRENCY
 }
 
 /// The task scope this checkout is working under, if it is bound to one.
@@ -1223,5 +1376,83 @@ done
             check_command_in_scope(Lane::Shared, &worktree, "ls");
         assert!(!bound, "a missing checkout declares no scope");
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
+    }
+}
+
+#[cfg(test)]
+mod judge_in_order_tests {
+    use super::judge_in_order;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn names(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("f{i}.md")).collect()
+    }
+
+    #[test]
+    fn every_file_is_checked_once_with_a_bounded_number_in_flight() {
+        let names = names(64);
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (in_flight, peak, checks) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let judged = judge_in_order(
+            &files,
+            8,
+            |file| {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                checks.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(3));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                file.to_string()
+            },
+            |_| false,
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 64);
+        assert!(peak.load(Ordering::SeqCst) <= 8, "{peak:?}");
+        assert!(peak.load(Ordering::SeqCst) >= 2, "no overlap: {peak:?}");
+        let answered: Vec<_> = judged.into_iter().collect::<Option<Vec<_>>>().unwrap();
+        assert_eq!(answered, names, "results stay in input order");
+    }
+
+    #[test]
+    fn a_refusal_stops_new_checks_and_leaves_every_earlier_file_judged() {
+        let names = names(2_000);
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let checks = AtomicUsize::new(0);
+        for workers in [1, 8] {
+            checks.store(0, Ordering::SeqCst);
+            let judged = judge_in_order(
+                &files,
+                workers,
+                |file| {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_micros(200));
+                    file == "f40.md"
+                },
+                |refused| *refused,
+            );
+            let first = judged
+                .iter()
+                .position(|r| *r == Some(true))
+                .expect("the refusal is recorded");
+            assert_eq!(first, 40);
+            assert!(judged[..first].iter().all(Option::is_some), "{workers}");
+            assert!(
+                checks.load(Ordering::SeqCst) < 40 + 1 + 2 * workers + 8,
+                "{workers} workers checked {} of 2000",
+                checks.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    #[test]
+    fn no_files_and_one_file() {
+        assert!(judge_in_order(&[], 8, |_| 0u8, |_| false).is_empty());
+        let one = judge_in_order(&["a.md"], 8, |_| 7u8, |_| false);
+        assert_eq!(one, vec![Some(7)]);
     }
 }
