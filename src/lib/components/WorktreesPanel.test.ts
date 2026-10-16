@@ -220,6 +220,10 @@ describe("WorktreesPanel removal safety", () => {
     const show = source.slice(source.indexOf("function showFailure"), source.indexOf("async function toggleLock"));
     expect(show).toMatch(/if \(tabScope\.isCurrent\(epoch\)\) error = message;\s*else toastStore\.error\(/);
     const merge = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    // A trust check that throws is said, not left as an unhandled rejection.
+    for (const [fn, trust] of [[merge, "trustRepo(wt.path)"], [source.slice(source.indexOf("async function remove"), source.indexOf("function open")), "trustRepo(targetPath)"]] as const) {
+      expect(fn).toMatch(new RegExp(`try \\{\\s*trusted = await repoStore\\.${trust.replace(/[()]/g, "\\$&").replace(".", "\\.")};?\\s*\\} catch \\(cause\\) \\{\\s*return showFailure\\(`));
+    }
     expect(merge).toMatch(/if \(!outcome\.ok\) return showFailure\(/);
     expect(merge).toMatch(/if \(!merged\) \{[\s\S]*?showFailure\([\s\S]*?return;\s*\}/);
   });

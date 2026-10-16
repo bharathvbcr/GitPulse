@@ -430,7 +430,14 @@
     // not a verified-clean one: never force-remove it. A scanned dirty
     // tree is force-removed only after the armed confirm named the cost.
     const force = typeof wt.dirty_files === "number" && wt.dirty_files > 0;
-    if (!(await repoStore.trustRepo(targetPath))) return;
+    // The trust check can itself fail (the path is no longer a repository): said, not thrown away.
+    let trusted: string | null;
+    try {
+      trusted = await repoStore.trustRepo(targetPath);
+    } catch (cause) {
+      return showFailure({ ok: false, cause, error: String(cause) }, "Could not remove the worktree", epoch);
+    }
+    if (!trusted) return;
     // The trust prompt can sit open while the reader goes elsewhere: the
     // removal runs only in the repository whose row was confirmed, and says so
     // when that is no longer in front.
@@ -492,7 +499,13 @@
     mergingPath = wt.path;
     error = null;
     try {
-      if (!(await repoStore.trustRepo(wt.path))) return;
+      let trusted: string | null;
+      try {
+        trusted = await repoStore.trustRepo(wt.path);
+      } catch (cause) {
+        return showFailure({ ok: false, cause, error: String(cause) }, "Could not merge the worktree", epoch);
+      }
+      if (!trusted) return;
       // The trust prompt can sit open while the reader goes elsewhere. The
       // merge is the destructive one: it runs only in the repository whose
       // row was confirmed, and says so when that is no longer in front.
