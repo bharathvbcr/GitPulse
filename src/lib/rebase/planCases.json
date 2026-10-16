@@ -1,0 +1,20 @@
+[
+  { "plan": ["Squash"], "accepted": false },
+  { "plan": ["Fixup"], "accepted": false },
+  { "plan": ["Reword", "Squash"], "accepted": true },
+  { "plan": ["Pick", "Drop", "Fixup", "Squash"], "accepted": true },
+  { "plan": ["Drop", "Drop", "Drop", "Squash"], "accepted": false },
+  { "plan": ["Drop", "Drop", "Fixup"], "accepted": false },
+  { "plan": ["Drop", "Fixup"], "accepted": false },
+  { "plan": ["Pick", "Drop", "Squash"], "accepted": true },
+  { "plan": ["Drop", "Pick", "Squash"], "accepted": true },
+  { "plan": ["Reword", "Fixup"], "accepted": true },
+  { "plan": ["Squash", "Pick"], "accepted": false },
+  { "plan": ["Pick", "Pick", "Drop", "Squash"], "accepted": true },
+  { "plan": ["Drop", "Reword", "Squash"], "accepted": true },
+  { "plan": ["Pick", "Fixup", "Drop", "Fixup"], "accepted": true },
+  { "plan": ["Drop", "Drop"], "accepted": true },
+  { "plan": ["Pick"], "accepted": true },
+  { "plan": ["Drop"], "accepted": true },
+  { "plan": [], "accepted": true }
+]

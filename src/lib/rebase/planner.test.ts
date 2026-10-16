@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { rebasePlanProblem, seedRebasePlan, shouldReseed, shouldSeed } from "./planner";
+import { rebasePlanProblem, seedRebasePlan, shouldReseed, shouldSeed, type PlannerAction } from "./planner";
+import planCases from "./planCases.json";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
 
 function row(id: string): VisualCommitRow {
@@ -19,6 +20,13 @@ function row(id: string): VisualCommitRow {
     is_root: false,
   };
 }
+
+describe("rebasePlanProblem against the table the backend and real git are also held to", () => {
+  it.each(planCases)("$plan", ({ plan, accepted }) => {
+    const items = plan.map((action, index) => ({ id: `c${index}00000000`, action: action as PlannerAction }));
+    expect(rebasePlanProblem(items) === null).toBe(accepted);
+  });
+});
 
 describe("rebasePlanProblem", () => {
   const plan = (...actions: Array<"Pick" | "Squash" | "Fixup" | "Drop" | "Reword">) =>

@@ -208,6 +208,96 @@ fn remote_mapping_handles_slashed_and_prefix_remotes() {
     );
 }
 
+/// One case table, shared with the dialog's own test (`planner.test.ts`).
+#[derive(serde::Deserialize)]
+struct PlanCase {
+    plan: Vec<String>,
+    accepted: bool,
+}
+
+fn plan_cases() -> Vec<PlanCase> {
+    serde_json::from_str(include_str!("../../../src/lib/rebase/planCases.json"))
+        .expect("planCases.json parses")
+}
+
+fn steps_for(plan: &[String]) -> Vec<RebaseStep> {
+    plan.iter()
+        .enumerate()
+        .map(|(index, verb)| RebaseStep {
+            commit_id: format!("c{index}"),
+            action: match verb.as_str() {
+                "Pick" => RebaseActionKind::Pick,
+                "Squash" => RebaseActionKind::Squash,
+                "Fixup" => RebaseActionKind::Fixup,
+                "Drop" => RebaseActionKind::Drop,
+                "Reword" => RebaseActionKind::Reword("new subject".into()),
+                other => panic!("unknown verb {other}"),
+            },
+        })
+        .collect()
+}
+
+#[test]
+fn the_backend_validator_matches_the_shared_plan_table() {
+    for case in plan_cases() {
+        let verdict = validate_rebase_plan(&steps_for(&case.plan));
+        assert_eq!(
+            verdict.is_ok(),
+            case.accepted,
+            "{:?}: {verdict:?}",
+            case.plan
+        );
+    }
+}
+
+/// The table is only worth sharing if it is what git itself says. Real
+/// `git rebase -i`, with a sequence editor that rewrites each todo verb in
+/// order, must accept and refuse exactly the plans the table does.
+#[cfg(unix)]
+#[test]
+fn the_shared_plan_table_matches_gits_own_rebase_verdict() {
+    use crate::procguard::LockedSpawn;
+    let scripts = tempfile::TempDir::new().unwrap();
+    let editor = scripts.path().join("seq-editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nawk -v plan=\"$PLAN\" 'BEGIN{n=split(plan,v,\" \")} /^#/||/^$/{next} {i++; if(i<=n){ $1=v[i]; print }}' \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for case in plan_cases().into_iter().filter(|c| !c.plan.is_empty()) {
+        let repo = git_repo();
+        git_in(
+            repo.path(),
+            &["commit", "--allow-empty", "-q", "-m", "base"],
+        );
+        for index in 0..case.plan.len() {
+            std::fs::write(repo.path().join(format!("f{index}")), "x").unwrap();
+            git_in(repo.path(), &["add", "."]);
+            git_in(repo.path(), &["commit", "-q", "-m", &format!("c{index}")]);
+        }
+        let verbs: Vec<String> = case.plan.iter().map(|v| v.to_lowercase()).collect();
+        let output = std::process::Command::new("git")
+            .args(["rebase", "-i", &format!("HEAD~{}", case.plan.len())])
+            .current_dir(repo.path())
+            .env("GIT_SEQUENCE_EDITOR", &editor)
+            .env("GIT_EDITOR", "true")
+            .env("PLAN", verbs.join(" "))
+            .output_locked()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(
+            output.status.success(),
+            case.accepted,
+            "git's verdict for {:?} disagrees with the table: {text}",
+            case.plan
+        );
+    }
+}
+
 /// A remote-tracking ref whose branch part starts with a dash must not become
 /// an option once the remote prefix is stripped (`origin/-x` -> `-x`).
 #[test]

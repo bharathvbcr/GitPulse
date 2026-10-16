@@ -1412,3 +1412,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "repo_op_adv_tests.rs"]
+mod adv_tests;
