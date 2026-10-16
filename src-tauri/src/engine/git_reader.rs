@@ -1430,26 +1430,58 @@ impl GitReader {
         Self::merge_render_args(git_cli::git_supports(git_cli::DIFF_MERGES_OPTION))
     }
 
-    /// The one `git show` argv for a commit's patch, whole or narrowed to one
-    /// path. The file list and the details read below take their merge
+    /// The one `git show` argv for a commit's patch, whole or narrowed to
+    /// `pathspecs`. The file list and the details read below take their merge
     /// rendering from [`Self::merge_render_args`] too, so the list, the counts
-    /// and the hunks cannot disagree about a merge.
-    fn commit_show_args<'a>(commit_id: &'a str, pathspec: Option<&'a str>) -> Vec<&'a str> {
+    /// and the hunks cannot disagree about a merge. A narrowed read must carry
+    /// every path a rename or copy pairs (see [`Self::paired_sources`]).
+    fn commit_show_args<'a>(
+        commit_id: &'a str,
+        pathspecs: &'a [String],
+        diff_filter: Option<&'static str>,
+    ) -> Vec<&'a str> {
         let mut args = vec!["-c", "core.quotepath=off", "show", "--unified=3"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.extend(diff_filter);
+        args.push("--format=");
+        args.push(commit_id);
+        if !pathspecs.is_empty() {
+            args.push("--");
+            args.extend(pathspecs.iter().map(String::as_str));
+        }
+        args
+    }
+
+    /// The source paths of the renames and copies the commit shows for `path`
+    /// (or, for a directory, for anything under it), read with the same merge
+    /// rendering and rename detection as the whole-commit view. Git pairs a
+    /// rename only when both its ends survive the pathspec, so a one-path read
+    /// that leaves the old path out shows the new file as wholly added while
+    /// the file list, which was never narrowed, counts it as the rename it is.
+    ///
+    /// The second value says why the list was cut at the byte cap, when it
+    /// was: a rename whose record fell past the cut stays unpaired and is
+    /// shown as an addition, which the caller must report rather than hide.
+    fn paired_sources(
+        repo: &Path,
+        commit_id: &str,
+        path: &str,
+    ) -> Result<(Vec<String>, Option<String>), String> {
+        let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
         args.extend_from_slice(Self::merge_render_args_here());
         args.push("--format=");
         args.push(commit_id);
-        if let Some(spec) = pathspec {
-            args.push("--");
-            args.push(spec);
-        }
-        args
+        let (stdout, cut) = git_text_capped(repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
+        Ok((
+            parse_paired_sources(&stdout, path),
+            cut.map(|reason| reason.describe()),
+        ))
     }
 
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, None))
+        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], None))
     }
 
     pub fn get_commit_file_diff(
@@ -1460,8 +1492,57 @@ impl GitReader {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         sandbox_join(&repo, file_path)?;
-        let spec = literal_pathspec(file_path);
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, Some(&spec)))
+        let mut specs = vec![literal_pathspec(file_path)];
+        let narrowed = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs, None))?;
+        // Only an added file can be the other end of a rename or copy, so a
+        // modified or deleted one costs exactly the one `git show` above, and
+        // no path costs more than three.
+        if !has_new_file_section(&narrowed.text) {
+            return Ok(narrowed);
+        }
+        let (sources, list_cut) = Self::paired_sources(&repo, commit_id, file_path)?;
+        if sources.is_empty() {
+            return Ok(Self::note_pairing_list_cut(narrowed, list_cut));
+        }
+        // A file is read as added, copied or renamed whatever happened to its
+        // source, so the source's own edit is left out of the read; a
+        // directory also holds modified and deleted files, which stay.
+        let diff_filter = has_section_at(&narrowed.text, file_path).then_some("--diff-filter=ACR");
+        // The sources go on the command line, which has a size limit (32 KiB
+        // on Windows); past a bounded few the commit is read whole and cut
+        // down to the path instead.
+        let fits = sources.len() <= MAX_PAIRED_SOURCES
+            && sources
+                .iter()
+                .map(|source| source.len() + 16)
+                .sum::<usize>()
+                <= MAX_PAIRED_SOURCE_BYTES;
+        let read = if fits {
+            specs.extend(sources.iter().map(|source| literal_pathspec(source)));
+            Self::capped_diff(
+                &repo,
+                &Self::commit_show_args(commit_id, &specs, diff_filter),
+            )?
+        } else {
+            Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], diff_filter))?
+        };
+        // The source pathspecs can pull in another file's section (an old path
+        // reused by a new file), and the whole read is every file's.
+        let paired = keep_payload_under(read, file_path).unwrap_or(narrowed);
+        Ok(Self::note_pairing_list_cut(paired, list_cut))
+    }
+
+    /// `payload` marked cut when the rename list it was paired from was: the
+    /// text is not a prefix, but it may show a rename as an addition, and a
+    /// view that may be wrong must not read as a whole one.
+    fn note_pairing_list_cut(mut payload: DiffPayload, list_cut: Option<String>) -> DiffPayload {
+        if let Some(reason) = list_cut {
+            payload.truncated = true;
+            payload.truncation_reason.get_or_insert(format!(
+                "its rename and copy list {reason}, so a rename past that point shows as an addition"
+            ));
+        }
+        payload
     }
 
     pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
@@ -5125,6 +5206,153 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
     files
 }
 
+/// Most source paths a one-path read puts on the command line, and the most
+/// bytes they may take together, so a renamed directory of thousands of files
+/// cannot overrun the argument limit (macOS 1 MiB, Windows 32 KiB).
+const MAX_PAIRED_SOURCES: usize = 256;
+const MAX_PAIRED_SOURCE_BYTES: usize = 16 * 1024;
+
+/// The old paths of the renames and copies in `git show --name-status
+/// --diff-filter=RC -z` output, whose records are all `R100\0old\0new\0` or
+/// `C75\0src\0copy\0`, for the entries whose new path is `path` or under it.
+/// A trailing record cut by the byte cap is ignored.
+fn parse_paired_sources(stdout: &str, path: &str) -> Vec<String> {
+    let under = format!("{}/", path.trim_end_matches('/'));
+    let mut sources: Vec<String> = Vec::new();
+    let mut tokens = stdout.split('\0');
+    while let (Some(_status), Some(old), Some(new)) = (tokens.next(), tokens.next(), tokens.next())
+    {
+        if (new == path || new.starts_with(&under)) && !sources.iter().any(|s| s == old) {
+            sources.push(old.to_string());
+        }
+    }
+    sources
+}
+
+/// Whether a patch has a section that adds a whole file, the only section a
+/// rename or copy can re-pair. Header lines never begin like content lines
+/// (`+`, `-`, space), so a line-start match is exact.
+fn has_new_file_section(patch: &str) -> bool {
+    patch.lines().any(|line| line.starts_with("new file mode "))
+}
+
+/// A path as a patch header prints it: raw, or C-quoted when git had to.
+fn header_path(raw: &str) -> Option<String> {
+    if raw.starts_with('"') {
+        unquote_c_style(raw)
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// The post-image path of one patch section (`diff --git` through its last
+/// line), read from the lines that name it unambiguously: `rename to` /
+/// `copy to`, then `+++ b/` (or `--- a/` for a deletion), and last a
+/// `diff --git` header whose two paths are equal, which is all a binary,
+/// empty or mode-only section has. Each of those may be C-quoted. `None` when
+/// the name is not readable, which the caller treats as "keep".
+fn section_post_path(section: &str) -> Option<String> {
+    let header: Vec<&str> = section
+        .lines()
+        .take_while(|line| !line.starts_with("@@"))
+        .collect();
+    let value = |prefix: &str| header.iter().find_map(|line| line.strip_prefix(prefix));
+    let side = |marker: &str, prefix: &str| {
+        let raw = value(marker)?.trim_end_matches('\t');
+        header_path(raw)?.strip_prefix(prefix).map(str::to_string)
+    };
+    if let Some(raw) = value("rename to ").or_else(|| value("copy to ")) {
+        return header_path(raw);
+    }
+    if value("+++ /dev/null").is_some() {
+        return side("--- ", "a/");
+    }
+    if value("+++ ").is_some() {
+        return side("+++ ", "b/");
+    }
+    let rest = header.first()?.strip_prefix("diff --git ")?;
+    if rest.ends_with('"') {
+        let at = rest.rfind(" \"b/")?;
+        return header_path(&rest[at + 1..])?
+            .strip_prefix("b/")
+            .map(str::to_string);
+    }
+    let rest = rest.strip_prefix("a/")?;
+    let each = rest.len().checked_sub(3)? / 2;
+    if rest.len() != each * 2 + 3 || !rest.is_char_boundary(each) {
+        return None;
+    }
+    let (old, new) = (&rest[..each], rest[each..].strip_prefix(" b/")?);
+    (old == new).then(|| new.to_string())
+}
+
+/// `patch` cut at each `diff --git` line: one slice per file section.
+fn patch_sections(patch: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut offset = 0;
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| &patch[start..starts.get(i + 1).copied().unwrap_or(patch.len())])
+        .collect()
+}
+
+/// Whether a section's post-image path is `path` or under the directory
+/// `dir` (`path` plus a slash). A section whose path cannot be read is kept:
+/// showing one extra file is safer than hiding the requested one.
+fn section_is_under(section: &str, path: &str, dir: &str) -> bool {
+    section_post_path(section).is_none_or(|post| post == path || post.starts_with(dir))
+}
+
+/// Whether some section of `patch` is the file `path` itself.
+fn has_section_at(patch: &str, path: &str) -> bool {
+    patch_sections(patch)
+        .into_iter()
+        .any(|section| section_post_path(section).is_some_and(|post| post == path))
+}
+
+/// A diff read wider than the request, reduced to the request. `None` when
+/// nothing of the request is in it, which for a cut read means the cut fell
+/// before the request, so the caller must not present the empty text as the
+/// answer. A cut read stays cut unless the request is a file whose own
+/// section was read: the output is path-ordered, so a file's section that
+/// precedes the cut is whole, while a directory's later files may be past it.
+fn keep_payload_under(raw: DiffPayload, path: &str) -> Option<DiffPayload> {
+    let dir = format!("{}/", path.trim_end_matches('/'));
+    let sections = patch_sections(&raw.text);
+    if sections.is_empty() {
+        return Some(raw);
+    }
+    let kept: Vec<&str> = sections
+        .iter()
+        .copied()
+        .filter(|section| section_is_under(section, path, &dir))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let tail_kept = sections
+        .last()
+        .is_some_and(|section| section_is_under(section, path, &dir));
+    let text = kept.concat();
+    let truncated = raw.truncated && (tail_kept || !has_section_at(&text, path));
+    Some(DiffPayload {
+        text,
+        truncated,
+        truncation_reason: if truncated {
+            raw.truncation_reason
+        } else {
+            None
+        },
+    })
+}
+
 /// The metadata `git show` prints before a commit's numstat, NUL-separated.
 /// The body is last and free text, but git cannot put a NUL in a message, so
 /// the Nth NUL is always the end of field N.
@@ -7404,6 +7632,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_paired_sources_matches_the_new_path_or_a_directory_and_drops_a_cut_record() {
+        let out = "R100\0Report.txt\0C.txt\0C75\0src.txt\0pkg/copy.txt\0R90\0a\0pkg/b\0R50\0cut\0";
+        assert_eq!(parse_paired_sources(out, "C.txt"), ["Report.txt"]);
+        assert_eq!(parse_paired_sources(out, "pkg"), ["src.txt", "a"]);
+        assert!(parse_paired_sources(out, "cut").is_empty());
+        assert!(parse_paired_sources("", "x").is_empty());
+    }
+
+    #[test]
+    fn keep_sections_under_reads_the_post_image_path_not_the_ambiguous_header() {
+        let patch = "diff --git a/a b/x b/y z.txt\nsimilarity index 90%\nrename from a b/x\nrename to y z.txt\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git a/other.txt b/other.txt\nnew file mode 100644\n--- /dev/null\n+++ b/other.txt\t\n@@ -0,0 +1 @@\n+x\n\
+diff --git a/pkg/in.bin b/pkg/in.bin\nnew file mode 100644\nBinary files /dev/null and b/pkg/in.bin differ\n\
+diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n\
+diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
+        let only = |path: &str| keep_sections_under(patch, path);
+        assert!(only("y z.txt").starts_with("diff --git a/a b/x b/y z.txt"));
+        assert_eq!(only("y z.txt").matches("diff --git").count(), 1);
+        assert_eq!(only("other.txt").matches("diff --git").count(), 1);
+        assert!(only("pkg").contains("pkg/in.bin"));
+        assert_eq!(only("pkg").matches("diff --git").count(), 1);
+        assert!(only("gone.txt").contains("deleted file mode"));
+        assert!(only("mode.sh").contains("new mode 100755"));
+        assert!(only("nothing.txt").is_empty());
+        assert_eq!(
+            only("pk").matches("diff --git").count(),
+            0,
+            "prefix is not a directory"
+        );
+    }
+
+    #[test]
     fn list_tags_caps_payload_at_tag_list_cap() {
         use std::io::Write;
         let dir = init_repo_with_remotes(&[], "main");
@@ -7613,6 +7873,16 @@ mod tests {
             strip_remote_tracking("refs/remotes/upstream/main", "origin"),
             None
         );
+    }
+
+    /// `patch` reduced to the sections under `path`, as one whole read.
+    fn keep_sections_under(patch: &str, path: &str) -> String {
+        let whole = DiffPayload {
+            text: patch.to_string(),
+            truncated: false,
+            truncation_reason: None,
+        };
+        keep_payload_under(whole, path).map_or_else(String::new, |kept| kept.text)
     }
 
     fn rev_parse_at(dir: &Path, rev: &str) -> String {
@@ -9275,13 +9545,351 @@ mod tests {
         let renamed = GitReader::get_commit_file_diff(path, &oid, "renamed.txt")
             .expect("renamed")
             .text;
-        // The row exists and opens a diff. (Its counts are the rename's 0/0
-        // while the one-path read shows the file as added: a narrowed pathspec
-        // cannot pair the rename, merge or not.)
+        // The row exists and opens a diff, paired as a rename (see
+        // `merge_rename_on_second_parent_pairs_in_the_one_path_view`).
         let listed = GitReader::get_commit_files(path, &oid).expect("list");
         assert!(listed.iter().any(|f| f.path == "renamed.txt"), "{listed:?}");
         assert!(renamed.contains("renamed.txt"), "{renamed}");
         assert!(!renamed.contains("@@@"), "{renamed}");
+    }
+
+    /// Builds `main` with `base` committed, a `second` branch from it that
+    /// `on_second` edits (it commits itself), then a diverging `main` commit
+    /// and a no-ff merge of `second`. Returns the merge's id.
+    fn merge_with_second_parent(
+        dir: &Path,
+        base: &[(&str, &[u8])],
+        on_second: impl FnOnce(&Path),
+        on_main: impl FnOnce(&Path),
+    ) -> String {
+        for (name, body) in base {
+            if let Some(parent) = dir.join(name).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-m", "base"]);
+        git_in(dir, &["checkout", "-q", "-b", "second"]);
+        on_second(dir);
+        git_in(dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("main-only.txt"), "m\n").unwrap();
+        on_main(dir);
+        commit_all(dir, "main");
+        git_in(dir, &["merge", "--no-ff", "-q", "second", "-m", "merge"]);
+        rev_parse_at(dir, "HEAD")
+    }
+
+    /// [`merge_with_second_parent`] for a repo that already has history.
+    fn merge_with_second_parent_on(
+        dir: &Path,
+        branch: &str,
+        on_second: impl FnOnce(&Path),
+        on_main: impl FnOnce(&Path),
+    ) -> String {
+        git_in(dir, &["checkout", "-q", "-b", branch]);
+        on_second(dir);
+        git_in(dir, &["checkout", "-q", "main"]);
+        on_main(dir);
+        commit_all(dir, "main again");
+        git_in(
+            dir,
+            &["merge", "--no-ff", "-q", branch, "-m", "merge again"],
+        );
+        rev_parse_at(dir, "HEAD")
+    }
+
+    fn commit_all(dir: &Path, msg: &str) {
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-m", msg]);
+    }
+
+    /// The row for a renamed (or copied) path, read every way, must agree and
+    /// the one-path view must pair the rename rather than show an addition.
+    fn assert_rename_pairs(path: &str, oid: &str, new: &str, old: &str, label: &str) {
+        assert_commit_view_agrees(path, oid, label);
+        let one = GitReader::get_commit_file_diff(path, oid, new)
+            .expect(label)
+            .text;
+        assert!(
+            one.contains(&format!("rename from {old}"))
+                || one.contains(&format!("copy from {old}")),
+            "{label}: {new} is not paired with {old}\n{one}"
+        );
+        assert!(!one.contains("new file mode"), "{label}: {one}");
+    }
+
+    const EIGHT: &[u8] = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+
+    /// The reported bug: a path renamed on the second parent is listed as 0/0
+    /// but its one-path diff showed every line added.
+    #[test]
+    fn merge_rename_on_second_parent_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                commit_all(d, "rename");
+            },
+            |_| {},
+        );
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        let row = listed.iter().find(|f| f.path == "new.txt").expect("row");
+        assert_eq!((row.additions, row.deletions), (0, 0), "{listed:?}");
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "rename");
+    }
+
+    #[test]
+    fn merge_rename_plus_edit_on_second_parent_counts_only_the_edit() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                std::fs::write(d.join("new.txt"), "l1\nl2\nEDIT\nl4\nl5\nl6\nl7\nl8\nl9\n")
+                    .unwrap();
+                commit_all(d, "rename and edit");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "rename+edit");
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        let row = listed.iter().find(|f| f.path == "new.txt").expect("row");
+        assert_eq!((row.additions, row.deletions), (2, 1), "{listed:?}");
+    }
+
+    /// A rename made on both parents leaves nothing to show against the first
+    /// parent; a rename made on the first parent only is the same.
+    #[test]
+    fn merge_rename_on_both_parents_and_on_the_first_only_agree() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let both = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                commit_all(d, "rename on second");
+            },
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+            },
+        );
+        assert_commit_view_agrees(path, &both, "rename on both parents");
+        let whole = GitReader::get_commit_diff(path, &both).expect("whole").text;
+        assert!(!whole.contains("new.txt"), "{whole}");
+
+        let first_only = merge_with_second_parent_on(
+            dir.path(),
+            "second2",
+            |d| {
+                std::fs::write(d.join("side.txt"), "s\n").unwrap();
+                commit_all(d, "side");
+            },
+            |d| {
+                git_in(d, &["mv", "new.txt", "newer.txt"]);
+            },
+        );
+        assert_commit_view_agrees(path, &first_only, "rename on first parent only");
+    }
+
+    #[test]
+    fn merge_copy_detection_pairs_the_copy_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("src.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("copy.txt"), EIGHT).unwrap();
+                std::fs::write(d.join("src.txt"), "l1\nCHANGED\nl3\nl4\nl5\nl6\nl7\nl8\n").unwrap();
+                commit_all(d, "copy and touch source");
+            },
+            |_| {},
+        );
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        assert!(whole.contains("copy from src.txt"), "fixture: {whole}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "copy.txt")
+            .expect("copy")
+            .text;
+        assert!(one.contains("copy from src.txt"), "{one}");
+        assert!(!one.contains("new file mode"), "{one}");
+        // The source was edited in the same commit, but it is another file.
+        assert!(whole.contains("diff --git a/src.txt b/src.txt"), "{whole}");
+        assert!(!one.contains("diff --git a/src.txt b/src.txt"), "{one}");
+        assert_eq!(
+            patch_file_counts(&one).keys().collect::<Vec<_>>(),
+            ["copy.txt"],
+            "{one}"
+        );
+    }
+
+    /// The old path holds a different file now and the new path carries the
+    /// old content as a copy: the one-path view of the copy must not drag the
+    /// reused path's own section in.
+    #[test]
+    fn merge_copy_from_a_reused_old_path_shows_only_the_requested_file() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("new.txt"), EIGHT).unwrap();
+                std::fs::write(d.join("old.txt"), "an\nentirely\ndifferent\nfile\n").unwrap();
+                commit_all(d, "old content moves on, old name is reused");
+            },
+            |_| {},
+        );
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        assert!(whole.contains("copy from old.txt"), "fixture: {whole}");
+        assert!(whole.contains("diff --git a/old.txt b/old.txt"), "{whole}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "new.txt")
+            .expect("copy")
+            .text;
+        assert!(one.contains("copy from old.txt"), "{one}");
+        assert!(!one.contains("diff --git a/old.txt b/old.txt"), "{one}");
+        assert_commit_view_agrees(path, &oid, "copy from reused path");
+    }
+
+    /// Only an added file can need its pairing read: a modified file starts
+    /// one `git show`, a renamed one the narrowed read, the pairing read and
+    /// the re-read, and an addition with no source stops after the pairing.
+    #[test]
+    fn one_file_diff_pays_for_pairing_only_when_the_file_is_added() {
+        use crate::engine::git_cli::spawn_log::spawns_in;
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("keep.txt", EIGHT), ("old.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("keep.txt"), "l1\nCHANGED\nl3\n").unwrap();
+                git_in(d, &["mv", "old.txt", "renamed.txt"]);
+                std::fs::write(d.join("fresh.txt"), "brand\nnew\n").unwrap();
+                commit_all(d, "edit, rename, add");
+            },
+            |_| {},
+        );
+        let repo = crate::engine::git_cli::canonicalize_plain(dir.path()).unwrap();
+        // (all `show` spawns, those that are the pairing read)
+        let shows = |file: &str| {
+            let before = spawns_in(&repo).len();
+            let diff = GitReader::get_commit_file_diff(path, &oid, file).expect(file);
+            assert!(!diff.text.is_empty(), "{file}");
+            let used: Vec<Vec<String>> = spawns_in(&repo)[before..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "show"))
+                .cloned()
+                .collect();
+            let pairing = used
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "--name-status"))
+                .count();
+            (used.len(), pairing)
+        };
+        assert_eq!(shows("keep.txt"), (1, 0), "modified file");
+        assert_eq!(shows("renamed.txt"), (3, 1), "renamed file");
+        assert_eq!(shows("fresh.txt"), (2, 1), "added file without a source");
+    }
+
+    #[test]
+    fn merge_binary_rename_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let blob: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 255, 254, 0, 1, 2];
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.bin", blob)],
+            |d| {
+                git_in(d, &["mv", "old.bin", "new.bin"]);
+                commit_all(d, "rename binary");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, "new.bin", "old.bin", "binary rename");
+    }
+
+    #[test]
+    fn merge_rename_with_spaces_and_unicode_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let old = "dir one/old na\u{ef}ve.txt";
+        let new = "d\u{fc}r two/new caf\u{e9}.txt";
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[(old, EIGHT)],
+            |d| {
+                std::fs::create_dir_all(d.join("d\u{fc}r two")).unwrap();
+                git_in(d, &["mv", old, new]);
+                commit_all(d, "rename with odd names");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, new, old, "odd names");
+    }
+
+    /// The old path comes back as a different file: git calls that a modified
+    /// old path and an added new one, so there is no pair to build, and the
+    /// one-path view must say what the whole commit says.
+    #[test]
+    fn merge_rename_whose_old_path_is_reused_matches_the_whole_commit() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                std::fs::write(d.join("old.txt"), "completely\ndifferent\n").unwrap();
+                commit_all(d, "move away and reuse the name");
+            },
+            |_| {},
+        );
+        assert_commit_view_agrees(path, &oid, "reused old path");
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        let one = GitReader::get_commit_file_diff(path, &oid, "new.txt")
+            .expect("new")
+            .text;
+        assert_eq!(
+            whole.contains("rename from old.txt"),
+            one.contains("rename from old.txt"),
+            "one-path view pairs differently from the whole commit\n{whole}\n---\n{one}"
+        );
+    }
+
+    /// The same narrowing hurt an ordinary (non-merge) rename commit.
+    #[test]
+    fn plain_and_first_parent_renames_pair_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("old.txt"), EIGHT).unwrap();
+        commit_all(dir.path(), "old");
+        git_in(dir.path(), &["mv", "old.txt", "new.txt"]);
+        commit_all(dir.path(), "plain rename");
+        let plain = rev_parse_at(dir.path(), "HEAD");
+        assert_rename_pairs(path, &plain, "new.txt", "old.txt", "plain rename");
+
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "s\n").unwrap();
+        commit_all(dir.path(), "side");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        git_in(dir.path(), &["mv", "new.txt", "newer.txt"]);
+        commit_all(dir.path(), "first-parent rename");
+        let renamed = rev_parse_at(dir.path(), "HEAD");
+        assert_rename_pairs(path, &renamed, "newer.txt", "new.txt", "first-parent");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "side", "-m", "merge"],
+        );
+        assert_commit_view_agrees(path, &rev_parse_at(dir.path(), "HEAD"), "merge");
     }
 
     /// A submodule added on the second parent: the list row and the per-file
@@ -11855,5 +12463,569 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             (1..=CALLS).contains(&recomputed),
             "{recomputed} computations for {CALLS} sequential asks"
         );
+    }
+
+    // ---- adversarial tests for the one-path commit diff (bl/ccf03e33-adv) ----
+
+    /// `(additions, deletions)` of every `diff --git` section of a patch, in
+    /// order, counted only below the section's first hunk header so a header
+    /// line can never be mistaken for a content line.
+    fn adv_section_counts(patch: &str) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut in_hunk = false;
+        for line in patch.split_inclusive('\n') {
+            if line.starts_with("diff --git ") {
+                out.push((0, 0));
+                in_hunk = false;
+            } else if line.starts_with("@@") {
+                in_hunk = true;
+            } else if in_hunk {
+                if let Some(last) = out.last_mut() {
+                    if line.starts_with('+') {
+                        last.0 += 1;
+                    } else if line.starts_with('-') {
+                        last.1 += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every row the file list shows, opened one path at a time, must open one
+    /// section with the list's counts, and the multiset of the whole commit's
+    /// section counts must be the list's. Returns the problems found.
+    fn adv_agreement_problems(path: &str, oid: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        let listed = GitReader::get_commit_files(path, oid).expect("list");
+        let whole = GitReader::get_commit_diff(path, oid).expect("whole");
+        let mut from_whole = adv_section_counts(&whole.text);
+        let mut from_list: Vec<(usize, usize)> =
+            listed.iter().map(|f| (f.additions, f.deletions)).collect();
+        from_whole.sort_unstable();
+        from_list.sort_unstable();
+        if from_whole != from_list {
+            problems.push(format!("whole {from_whole:?} vs list {from_list:?}"));
+        }
+        for row in &listed {
+            let one = match GitReader::get_commit_file_diff(path, oid, &row.path) {
+                Ok(one) => one,
+                Err(err) => {
+                    problems.push(format!("{:?}: error {err}", row.path));
+                    continue;
+                }
+            };
+            let sections = adv_section_counts(&one.text);
+            if sections != [(row.additions, row.deletions)] {
+                problems.push(format!(
+                    "{:?}: one-path sections {sections:?} (truncated {}) vs list ({}, {})\n{}",
+                    row.path,
+                    one.truncated,
+                    row.additions,
+                    row.deletions,
+                    one.text
+                        .lines()
+                        .filter(|l| l.starts_with("diff --git")
+                            || l.starts_with("copy ")
+                            || l.starts_with("rename "))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+        problems
+    }
+
+    fn adv_tracked(dir: &Path) -> Vec<String> {
+        let out = git_output(dir, &["ls-files", "-z"]);
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn adv_commit(dir: &Path, msg: &str) {
+        git_output(dir, &["add", "-A"]);
+        git_output(dir, &["commit", "-q", "--allow-empty", "-m", msg]);
+    }
+
+    struct AdvRng(u64);
+    impl AdvRng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn adv_body(family: usize, tweak: usize) -> String {
+        let mut text = String::new();
+        for i in 0..14 {
+            if tweak > 0 && i == tweak % 14 {
+                text.push_str(&format!("tweak {tweak}\n"));
+            } else {
+                text.push_str(&format!(
+                    "family {family} line {i} with some padding text\n"
+                ));
+            }
+        }
+        text
+    }
+
+    const ADV_NAMES: &[&str] = &[
+        "a.txt",
+        "b c.txt",
+        "d b/e.txt",
+        "rename to x.txt",
+        "t\tab.txt",
+        "q\"uote.txt",
+        "back\\slash.txt",
+        "caf\u{e9}.txt",
+        "trail .txt",
+        "\"lead.txt",
+        "new\nline.txt",
+        "copy to y.txt",
+    ];
+
+    fn adv_pick_new(rng: &mut AdvRng, taken: &[String]) -> String {
+        loop {
+            let dirs = ["", "pkg/", "pkg2/"];
+            let name = format!(
+                "{}{}",
+                dirs[rng.below(dirs.len())],
+                ADV_NAMES[rng.below(ADV_NAMES.len())]
+            );
+            if !taken.contains(&name) {
+                return name;
+            }
+            if taken.len() > ADV_NAMES.len() * 3 - 2 {
+                return format!("overflow{}.txt", taken.len());
+            }
+        }
+    }
+
+    fn adv_write(dir: &Path, name: &str, body: &str) {
+        let file = dir.join(name);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(file, body).unwrap();
+    }
+
+    /// One random change to the working tree.
+    fn adv_random_op(dir: &Path, rng: &mut AdvRng) {
+        let tracked: Vec<String> = adv_tracked(dir)
+            .into_iter()
+            .filter(|name| dir.join(name).is_file())
+            .collect();
+        let existing = |rng: &mut AdvRng| tracked[rng.below(tracked.len())].clone();
+        match if tracked.is_empty() { 0 } else { rng.below(8) } {
+            0 => {
+                let name = adv_pick_new(rng, &tracked);
+                adv_write(dir, &name, &adv_body(rng.below(3), 0));
+            }
+            1 => {
+                let name = existing(rng);
+                adv_write(dir, &name, &adv_body(rng.below(3), 1 + rng.below(20)));
+            }
+            2 => {
+                let name = existing(rng);
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+            3 | 4 => {
+                let old = existing(rng);
+                let new = adv_pick_new(rng, &tracked);
+                adv_write(dir, &new, &std::fs::read_to_string(dir.join(&old)).unwrap());
+                std::fs::remove_file(dir.join(&old)).unwrap();
+                if rng.below(3) == 0 {
+                    adv_write(dir, &new, &adv_body(rng.below(3), 1 + rng.below(20)));
+                }
+                if rng.below(4) == 0 {
+                    // the old name comes back as another file
+                    adv_write(dir, &old, &adv_body(rng.below(3), 7));
+                }
+            }
+            5 => {
+                let src = existing(rng);
+                let copy = adv_pick_new(rng, &tracked);
+                adv_write(
+                    dir,
+                    &copy,
+                    &std::fs::read_to_string(dir.join(&src)).unwrap(),
+                );
+                if rng.below(2) == 0 {
+                    adv_write(dir, &src, &adv_body(rng.below(3), 1 + rng.below(20)));
+                }
+            }
+            6 if tracked.len() >= 2 => {
+                let a = existing(rng);
+                let b = existing(rng);
+                if a != b {
+                    let ta = std::fs::read_to_string(dir.join(&a)).unwrap();
+                    let tb = std::fs::read_to_string(dir.join(&b)).unwrap();
+                    std::fs::write(dir.join(&a), tb).unwrap();
+                    std::fs::write(dir.join(&b), ta).unwrap();
+                }
+            }
+            _ => {
+                // move a whole directory
+                let from = if rng.below(2) == 0 { "pkg" } else { "pkg2" };
+                let to = if from == "pkg" { "pkg2" } else { "pkg" };
+                if dir.join(from).is_dir() && !dir.join(to).exists() {
+                    std::fs::rename(dir.join(from), dir.join(to)).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The seeded agreement oracle over renames, copies, edits, deletes, adds,
+    /// swaps, directory moves and merges, with copy detection on or off.
+    fn adv_run_oracle(seed: u64, copies: bool, steps: usize) -> Vec<String> {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        if copies {
+            git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        }
+        let mut rng = AdvRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        for i in 0..6 {
+            adv_write(
+                dir.path(),
+                &format!("{}seed{i}.txt", if i % 2 == 0 { "pkg/" } else { "" }),
+                &adv_body(i % 3, 0),
+            );
+        }
+        adv_commit(dir.path(), "seed files");
+        for step in 0..steps {
+            if rng.below(4) == 0 {
+                let side = format!("side{step}");
+                git_in(dir.path(), &["checkout", "-q", "-b", &side]);
+                for _ in 0..1 + rng.below(2) {
+                    adv_random_op(dir.path(), &mut rng);
+                    adv_commit(dir.path(), "side");
+                }
+                git_in(dir.path(), &["checkout", "-q", "main"]);
+                adv_random_op(dir.path(), &mut rng);
+                adv_commit(dir.path(), "main");
+                let merged = git_output(
+                    dir.path(),
+                    &["merge", "--no-ff", "-q", &side, "-m", "merge"],
+                );
+                if !merged.status.success() {
+                    git_output(dir.path(), &["merge", "--abort"]);
+                }
+            } else {
+                for _ in 0..1 + rng.below(2) {
+                    adv_random_op(dir.path(), &mut rng);
+                }
+                adv_commit(dir.path(), "step");
+            }
+        }
+        let revs = git_output(dir.path(), &["rev-list", "--all"]);
+        let mut problems = Vec::new();
+        for oid in String::from_utf8_lossy(&revs.stdout).lines() {
+            for problem in adv_agreement_problems(path, oid) {
+                problems.push(format!("seed {seed} copies {copies} {oid}: {problem}"));
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn adv_oracle_one_path_view_agrees_with_list_and_whole_commit() {
+        let mut problems = Vec::new();
+        for seed in 1..=14u64 {
+            problems.extend(adv_run_oracle(seed, seed % 2 == 0, 14));
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
+    /// A name git C-quotes (a tab, a newline, a backslash, a double quote, a
+    /// leading quote) must be read, not "kept": a kept unreadable section
+    /// leaks into another file's view and a quoted request must still match.
+    #[test]
+    fn adv_keep_sections_under_reads_c_quoted_names() {
+        let patch = "diff --git \"a/t\\tab.txt\" \"b/t\\tab.txt\"\nindex 1..2 100644\n--- \"a/t\\tab.txt\"\n+++ \"b/t\\tab.txt\"\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git a/other.txt b/other.txt\nnew file mode 100644\n--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1 @@\n+x\n\
+diff --git \"a/q\\\"uote.txt\" \"b/pkg/new\\nline.txt\"\nsimilarity index 90%\ncopy from \"q\\\"uote.txt\"\ncopy to \"pkg/new\\nline.txt\"\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0..1\n";
+        let sections = |path: &str| {
+            keep_sections_under(patch, path)
+                .matches("diff --git")
+                .count()
+        };
+        assert_eq!(sections("other.txt"), 1, "a quoted section leaked");
+        assert_eq!(sections("t\tab.txt"), 1);
+        assert_eq!(sections("pkg/new\nline.txt"), 1);
+        assert_eq!(
+            sections("pkg"),
+            1,
+            "a directory request leaks quoted sections"
+        );
+        assert_eq!(sections("\"lead.txt"), 1);
+        assert_eq!(sections("nothing.txt"), 0);
+    }
+
+    /// A binary notice names two paths in one line; a directory called
+    /// `z and b` must not make the file under it read as `y.bin`.
+    #[test]
+    fn adv_keep_sections_under_binary_notice_with_and_b_in_the_name() {
+        let patch = "diff --git a/z and b/y.bin b/z and b/y.bin\nnew file mode 100644\nindex 0..1\nBinary files /dev/null and b/z and b/y.bin differ\n";
+        assert_eq!(keep_sections_under(patch, "y.bin"), "", "misread as y.bin");
+        assert_eq!(keep_sections_under(patch, "z and b/y.bin"), patch);
+    }
+
+    /// Every awkward name, as a rename target and as an edited copy source on
+    /// a merge's second parent, must agree between list, whole and one path.
+    #[test]
+    fn adv_awkward_names_agree_as_rename_target_and_copy_source() {
+        let mut problems = Vec::new();
+        for name in ADV_NAMES {
+            let rename = init_repo_with_remotes(&[], "main");
+            let path = rename.path().to_str().unwrap();
+            let oid = merge_with_second_parent(
+                rename.path(),
+                &[("old.txt", EIGHT)],
+                |d| {
+                    adv_write(d, name, std::str::from_utf8(EIGHT).unwrap());
+                    std::fs::remove_file(d.join("old.txt")).unwrap();
+                    commit_all(d, "rename to the awkward name");
+                },
+                |_| {},
+            );
+            for p in adv_agreement_problems(path, &oid) {
+                problems.push(format!("rename to {name:?}: {p}"));
+            }
+
+            let copy = init_repo_with_remotes(&[], "main");
+            let path = copy.path().to_str().unwrap();
+            git_in(copy.path(), &["config", "diff.renames", "copies"]);
+            let oid = merge_with_second_parent(
+                copy.path(),
+                &[(name, EIGHT)],
+                |d| {
+                    adv_write(d, "a-copy.txt", std::str::from_utf8(EIGHT).unwrap());
+                    adv_write(d, name, "l1\nCHANGED\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                    commit_all(d, "copy from the awkward name, which is also edited");
+                },
+                |_| {},
+            );
+            for p in adv_agreement_problems(path, &oid) {
+                problems.push(format!("copy from {name:?}: {p}"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// `pkg` is not `pkg2`: each directory's request shows its own rows.
+    #[test]
+    fn adv_directory_request_does_not_take_a_prefix_sibling() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("pkg/s.txt", EIGHT), ("pkg2/t.txt", EIGHT)],
+            |d| {
+                adv_write(d, "pkg2/s.txt", std::str::from_utf8(EIGHT).unwrap());
+                adv_write(d, "pkg/s.txt", "l1\nEDIT\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                adv_write(d, "pkg/u.txt", "fresh\nfile\n");
+                commit_all(d, "copy across siblings");
+            },
+            |_| {},
+        );
+        let two = GitReader::get_commit_file_diff(path, &oid, "pkg2").expect("pkg2");
+        let sections = adv_section_counts(&two.text);
+        assert_eq!(sections.len(), 1, "pkg2 request: {}", two.text);
+        assert!(two.text.contains("copy from pkg/s.txt"), "{}", two.text);
+        let one = GitReader::get_commit_file_diff(path, &oid, "pkg").expect("pkg");
+        assert!(
+            !one.text.contains("pkg2/"),
+            "pkg request took pkg2: {}",
+            one.text
+        );
+    }
+
+    /// A directory rename of thousands of files requested as the directory:
+    /// the pairing must not put every source on one command line.
+    #[test]
+    fn adv_directory_rename_of_thousands_of_files_opens() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let long = "n".repeat(200);
+        for i in 0..6000 {
+            adv_write(
+                dir.path(),
+                &format!("pkg/{long}{i:05}.txt"),
+                &format!("file {i}\nbody\nbody\nbody\n"),
+            );
+        }
+        adv_commit(dir.path(), "many files");
+        std::fs::rename(dir.path().join("pkg"), dir.path().join("pkg2")).unwrap();
+        adv_commit(dir.path(), "move the directory");
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "pkg2");
+        let one = one.unwrap_or_else(|err| panic!("directory request failed: {err}"));
+        assert_eq!(
+            adv_section_counts(&one.text).len(),
+            6000,
+            "truncated {}",
+            one.truncated
+        );
+    }
+
+    /// A copy whose source is also rewritten by a huge edit that sorts first:
+    /// the paired read runs out of budget inside the source's section, and the
+    /// requested file must still open.
+    #[test]
+    fn adv_copy_whose_edited_source_eats_the_budget_still_opens() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        adv_write(dir.path(), "a.txt", std::str::from_utf8(EIGHT).unwrap());
+        adv_commit(dir.path(), "base");
+        let mut huge = String::from(std::str::from_utf8(EIGHT).unwrap());
+        for i in 0..400_000 {
+            huge.push_str(&format!("appended line number {i:08} padding padding\n"));
+        }
+        adv_write(dir.path(), "a.txt", &huge);
+        adv_write(dir.path(), "z.txt", std::str::from_utf8(EIGHT).unwrap());
+        adv_commit(dir.path(), "copy z from a while a grows enormous");
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "z.txt").expect("z");
+        assert_eq!(
+            adv_section_counts(&one.text).len(),
+            1,
+            "z.txt opened {} bytes, truncated {}",
+            one.text.len(),
+            one.truncated
+        );
+    }
+
+    /// A rename on the second parent with edits on both sides, and an octopus
+    /// merge with a rename on each of two side branches.
+    #[test]
+    fn adv_conflicting_edit_and_octopus_merges_agree() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT), ("c.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                adv_write(d, "new.txt", "l1\nSIDE\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                commit_all(d, "rename and edit on the side");
+            },
+            |d| {
+                adv_write(d, "old.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nMAIN\n");
+            },
+        );
+        assert_eq!(
+            adv_agreement_problems(path, &oid),
+            Vec::<String>::new(),
+            "rename + edits both sides"
+        );
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "conflicting edits");
+
+        git_in(dir.path(), &["checkout", "-q", "-b", "o1"]);
+        git_in(dir.path(), &["mv", "c.txt", "d.txt"]);
+        commit_all(dir.path(), "o1 renames c");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "o2"]);
+        adv_write(dir.path(), "e.txt", std::str::from_utf8(EIGHT).unwrap());
+        git_in(dir.path(), &["mv", "new.txt", "f.txt"]);
+        commit_all(dir.path(), "o2 renames new and adds e");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        adv_write(dir.path(), "m.txt", "m\n");
+        commit_all(dir.path(), "main moves on");
+        git_in(
+            dir.path(),
+            &["merge", "-q", "--no-ff", "o1", "o2", "-m", "octopus"],
+        );
+        let octo = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(
+            adv_agreement_problems(path, &octo),
+            Vec::<String>::new(),
+            "octopus"
+        );
+    }
+
+    /// A cut read reduced to a request: empty means "the cut hid it" (None),
+    /// a file read whole stays whole, a directory or a cut inside the
+    /// request's own section stays cut, and a cut pairing list marks the
+    /// payload.
+    #[test]
+    fn adv_keep_payload_under_keeps_the_truncated_flag_honest() {
+        let sec = |name: &str| {
+            format!("diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+x\n")
+        };
+        let cut = |text: String| DiffPayload {
+            text,
+            truncated: true,
+            truncation_reason: Some("exceeded 8 MB".into()),
+        };
+        // Cut inside another file before the request: nothing to show.
+        assert!(keep_payload_under(cut(sec("a.txt")), "z.txt").is_none());
+        // The request's own section precedes the cut inside a source: whole.
+        let whole = keep_payload_under(cut(format!("{}{}", sec("a.txt"), sec("b.txt"))), "a.txt")
+            .expect("kept");
+        assert!(
+            !whole.truncated && whole.truncation_reason.is_none(),
+            "{whole:?}"
+        );
+        // The cut is inside the request itself: still cut.
+        let inside =
+            keep_payload_under(cut(format!("{}{}", sec("b.txt"), sec("pkg/a.txt"))), "pkg")
+                .expect("kept");
+        assert!(inside.truncated, "{inside:?}");
+        // A directory's later files may be past the cut: still cut.
+        let dir = keep_payload_under(cut(format!("{}{}", sec("pkg/a.txt"), sec("zz.txt"))), "pkg")
+            .expect("kept");
+        assert!(dir.truncated, "{dir:?}");
+        let marked = GitReader::note_pairing_list_cut(
+            DiffPayload {
+                text: String::new(),
+                truncated: false,
+                truncation_reason: None,
+            },
+            Some("exceeded 4 MB".into()),
+        );
+        assert!(
+            marked.truncated && marked.truncation_reason.is_some(),
+            "{marked:?}"
+        );
+    }
+
+    /// An evil merge: a rename that exists only in the merge commit's own
+    /// content change (committed with `--amend` after a clean merge).
+    #[test]
+    fn adv_evil_merge_rename_agrees() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        merge_with_second_parent(
+            dir.path(),
+            &[("keep.txt", EIGHT), ("old.txt", EIGHT)],
+            |d| {
+                adv_write(d, "side.txt", "s\n");
+                commit_all(d, "side");
+            },
+            |_| {},
+        );
+        git_in(dir.path(), &["mv", "old.txt", "evil.txt"]);
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-q", "--amend", "--no-edit"]);
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(
+            adv_agreement_problems(path, &oid),
+            Vec::<String>::new(),
+            "evil merge"
+        );
+        assert_rename_pairs(path, &oid, "evil.txt", "old.txt", "evil merge");
     }
 }
