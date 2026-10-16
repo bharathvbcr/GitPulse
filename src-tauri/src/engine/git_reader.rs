@@ -1435,9 +1435,14 @@ impl GitReader {
     /// rendering from [`Self::merge_render_args`] too, so the list, the counts
     /// and the hunks cannot disagree about a merge. A narrowed read must carry
     /// every path a rename or copy pairs (see [`Self::paired_sources`]).
-    fn commit_show_args<'a>(commit_id: &'a str, pathspecs: &'a [String]) -> Vec<&'a str> {
+    fn commit_show_args<'a>(
+        commit_id: &'a str,
+        pathspecs: &'a [String],
+        diff_filter: Option<&'static str>,
+    ) -> Vec<&'a str> {
         let mut args = vec!["-c", "core.quotepath=off", "show", "--unified=3"];
         args.extend_from_slice(Self::merge_render_args_here());
+        args.extend(diff_filter);
         args.push("--format=");
         args.push(commit_id);
         if !pathspecs.is_empty() {
@@ -1454,22 +1459,29 @@ impl GitReader {
     /// that leaves the old path out shows the new file as wholly added while
     /// the file list, which was never narrowed, counts it as the rename it is.
     ///
-    /// Best effort past the byte cap: when the list is cut, a rename whose
-    /// record fell past the cut stays unpaired and is shown as an addition,
-    /// with no signal that the list was cut.
-    fn paired_sources(repo: &Path, commit_id: &str, path: &str) -> Result<Vec<String>, String> {
+    /// The second value says why the list was cut at the byte cap, when it
+    /// was: a rename whose record fell past the cut stays unpaired and is
+    /// shown as an addition, which the caller must report rather than hide.
+    fn paired_sources(
+        repo: &Path,
+        commit_id: &str,
+        path: &str,
+    ) -> Result<(Vec<String>, Option<String>), String> {
         let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
         args.extend_from_slice(Self::merge_render_args_here());
         args.push("--format=");
         args.push(commit_id);
-        let (stdout, _cut) = git_text_capped(repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
-        Ok(parse_paired_sources(&stdout, path))
+        let (stdout, cut) = git_text_capped(repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
+        Ok((
+            parse_paired_sources(&stdout, path),
+            cut.map(|reason| reason.describe()),
+        ))
     }
 
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[]))
+        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], None))
     }
 
     pub fn get_commit_file_diff(
@@ -1481,22 +1493,56 @@ impl GitReader {
         validate_oid(commit_id)?;
         sandbox_join(&repo, file_path)?;
         let mut specs = vec![literal_pathspec(file_path)];
-        let narrowed = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs))?;
+        let narrowed = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs, None))?;
         // Only an added file can be the other end of a rename or copy, so a
-        // modified or deleted one costs exactly the one `git show` above.
+        // modified or deleted one costs exactly the one `git show` above, and
+        // no path costs more than three.
         if !has_new_file_section(&narrowed.text) {
             return Ok(narrowed);
         }
-        let sources = Self::paired_sources(&repo, commit_id, file_path)?;
+        let (sources, list_cut) = Self::paired_sources(&repo, commit_id, file_path)?;
         if sources.is_empty() {
-            return Ok(narrowed);
+            return Ok(Self::note_pairing_list_cut(narrowed, list_cut));
         }
-        specs.extend(sources.iter().map(|source| literal_pathspec(source)));
-        let mut paired = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs))?;
-        // The source pathspecs can pull in another file's section (a copy's
-        // source that was also edited, an old path reused by a new file).
-        paired.text = keep_sections_under(&paired.text, file_path);
-        Ok(paired)
+        // A file is read as added, copied or renamed whatever happened to its
+        // source, so the source's own edit is left out of the read; a
+        // directory also holds modified and deleted files, which stay.
+        let diff_filter = has_section_at(&narrowed.text, file_path).then_some("--diff-filter=ACR");
+        // The sources go on the command line, which has a size limit (32 KiB
+        // on Windows); past a bounded few the commit is read whole and cut
+        // down to the path instead.
+        let fits = sources.len() <= MAX_PAIRED_SOURCES
+            && sources
+                .iter()
+                .map(|source| source.len() + 16)
+                .sum::<usize>()
+                <= MAX_PAIRED_SOURCE_BYTES;
+        let read = if fits {
+            specs.extend(sources.iter().map(|source| literal_pathspec(source)));
+            Self::capped_diff(
+                &repo,
+                &Self::commit_show_args(commit_id, &specs, diff_filter),
+            )?
+        } else {
+            Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], diff_filter))?
+        };
+        // The source pathspecs can pull in another file's section (an old path
+        // reused by a new file), and the whole read is every file's.
+        let paired = keep_payload_under(read, file_path).unwrap_or(narrowed);
+        Ok(Self::note_pairing_list_cut(paired, list_cut))
+    }
+
+    /// `payload` marked cut when the rename list it was paired from was: the
+    /// text is not a prefix, but it may show a rename as an addition, and a
+    /// view that may be wrong must not read as a whole one.
+    fn note_pairing_list_cut(mut payload: DiffPayload, list_cut: Option<String>) -> DiffPayload {
+        if let Some(reason) = list_cut {
+            payload.truncated = true;
+            payload.truncation_reason.get_or_insert(format!(
+                "its rename and copy list {reason}, so a rename past that point shows as an addition"
+            ));
+        }
+        payload
     }
 
     pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
@@ -5160,6 +5206,12 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
     files
 }
 
+/// Most source paths a one-path read puts on the command line, and the most
+/// bytes they may take together, so a renamed directory of thousands of files
+/// cannot overrun the argument limit (macOS 1 MiB, Windows 32 KiB).
+const MAX_PAIRED_SOURCES: usize = 256;
+const MAX_PAIRED_SOURCE_BYTES: usize = 16 * 1024;
+
 /// The old paths of the renames and copies in `git show --name-status
 /// --diff-filter=RC -z` output, whose records are all `R100\0old\0new\0` or
 /// `C75\0src\0copy\0`, for the entries whose new path is `path` or under it.
@@ -5184,75 +5236,121 @@ fn has_new_file_section(patch: &str) -> bool {
     patch.lines().any(|line| line.starts_with("new file mode "))
 }
 
+/// A path as a patch header prints it: raw, or C-quoted when git had to.
+fn header_path(raw: &str) -> Option<String> {
+    if raw.starts_with('"') {
+        unquote_c_style(raw)
+    } else {
+        Some(raw.to_string())
+    }
+}
+
 /// The post-image path of one patch section (`diff --git` through its last
 /// line), read from the lines that name it unambiguously: `rename to` /
-/// `copy to`, then `+++ b/` (or `--- a/` for a deletion), then the binary
-/// notice, and last a header whose two paths are equal. `None` when the name
-/// is quoted or otherwise not readable, which the caller treats as "keep".
+/// `copy to`, then `+++ b/` (or `--- a/` for a deletion), and last a
+/// `diff --git` header whose two paths are equal, which is all a binary,
+/// empty or mode-only section has. Each of those may be C-quoted. `None` when
+/// the name is not readable, which the caller treats as "keep".
 fn section_post_path(section: &str) -> Option<String> {
     let header: Vec<&str> = section
         .lines()
         .take_while(|line| !line.starts_with("@@"))
         .collect();
-    let named = |prefix: &str| {
-        header
-            .iter()
-            .find_map(|line| line.strip_prefix(prefix))
-            .map(|rest| rest.trim_end_matches('\t').to_string())
+    let value = |prefix: &str| header.iter().find_map(|line| line.strip_prefix(prefix));
+    let side = |marker: &str, prefix: &str| {
+        let raw = value(marker)?.trim_end_matches('\t');
+        header_path(raw)?.strip_prefix(prefix).map(str::to_string)
     };
-    let readable = |path: String| (!path.starts_with('"')).then_some(path);
-    if let Some(path) = named("rename to ").or_else(|| named("copy to ")) {
-        return readable(path);
+    if let Some(raw) = value("rename to ").or_else(|| value("copy to ")) {
+        return header_path(raw);
     }
-    if let Some(path) = named("+++ b/") {
-        return readable(path);
+    if value("+++ /dev/null").is_some() {
+        return side("--- ", "a/");
     }
-    if named("+++ /dev/null").is_some() {
-        return named("--- a/").and_then(readable);
+    if value("+++ ").is_some() {
+        return side("+++ ", "b/");
     }
-    if let Some(path) = header.iter().find_map(|line| {
-        line.strip_prefix("Binary files ")
-            .and_then(|rest| rest.strip_suffix(" differ"))
-            .and_then(|rest| rest.rsplit_once(" and b/"))
-            .map(|(_, new)| new.to_string())
-    }) {
-        return readable(path);
+    let rest = header.first()?.strip_prefix("diff --git ")?;
+    if rest.ends_with('"') {
+        let at = rest.rfind(" \"b/")?;
+        return header_path(&rest[at + 1..])?
+            .strip_prefix("b/")
+            .map(str::to_string);
     }
-    let rest = header.first()?.strip_prefix("diff --git a/")?;
-    let (old, new) = rest.split_at(rest.len().checked_sub(2)? / 2);
-    let new = new.strip_prefix(" b/")?;
-    (old == new).then(|| new.to_string()).and_then(readable)
+    let rest = rest.strip_prefix("a/")?;
+    let each = rest.len().checked_sub(3)? / 2;
+    if rest.len() != each * 2 + 3 || !rest.is_char_boundary(each) {
+        return None;
+    }
+    let (old, new) = (&rest[..each], rest[each..].strip_prefix(" b/")?);
+    (old == new).then(|| new.to_string())
 }
 
-/// `patch` reduced to the sections whose post-image path is `path` or under
-/// it. A section whose path cannot be read is kept: showing one extra file is
-/// safer than hiding the requested one.
-fn keep_sections_under(patch: &str, path: &str) -> String {
-    let dir = format!("{}/", path.trim_end_matches('/'));
-    let mut out = String::with_capacity(patch.len());
-    let mut section_start: Option<usize> = None;
-    let flush = |out: &mut String, section: &str| {
-        let keep =
-            section_post_path(section).is_none_or(|post| post == path || post.starts_with(&dir));
-        if keep {
-            out.push_str(section);
-        }
-    };
+/// `patch` cut at each `diff --git` line: one slice per file section.
+fn patch_sections(patch: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
     let mut offset = 0;
     for line in patch.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
-            if let Some(start) = section_start {
-                flush(&mut out, &patch[start..offset]);
-            }
-            section_start = Some(offset);
+            starts.push(offset);
         }
         offset += line.len();
     }
-    match section_start {
-        Some(start) => flush(&mut out, &patch[start..]),
-        None => out.push_str(patch),
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| &patch[start..starts.get(i + 1).copied().unwrap_or(patch.len())])
+        .collect()
+}
+
+/// Whether a section's post-image path is `path` or under the directory
+/// `dir` (`path` plus a slash). A section whose path cannot be read is kept:
+/// showing one extra file is safer than hiding the requested one.
+fn section_is_under(section: &str, path: &str, dir: &str) -> bool {
+    section_post_path(section).is_none_or(|post| post == path || post.starts_with(dir))
+}
+
+/// Whether some section of `patch` is the file `path` itself.
+fn has_section_at(patch: &str, path: &str) -> bool {
+    patch_sections(patch)
+        .into_iter()
+        .any(|section| section_post_path(section).is_some_and(|post| post == path))
+}
+
+/// A diff read wider than the request, reduced to the request. `None` when
+/// nothing of the request is in it, which for a cut read means the cut fell
+/// before the request, so the caller must not present the empty text as the
+/// answer. A cut read stays cut unless the request is a file whose own
+/// section was read: the output is path-ordered, so a file's section that
+/// precedes the cut is whole, while a directory's later files may be past it.
+fn keep_payload_under(raw: DiffPayload, path: &str) -> Option<DiffPayload> {
+    let dir = format!("{}/", path.trim_end_matches('/'));
+    let sections = patch_sections(&raw.text);
+    if sections.is_empty() {
+        return Some(raw);
     }
-    out
+    let kept: Vec<&str> = sections
+        .iter()
+        .copied()
+        .filter(|section| section_is_under(section, path, &dir))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let tail_kept = sections
+        .last()
+        .is_some_and(|section| section_is_under(section, path, &dir));
+    let text = kept.concat();
+    let truncated = raw.truncated && (tail_kept || !has_section_at(&text, path));
+    Some(DiffPayload {
+        text,
+        truncated,
+        truncation_reason: if truncated {
+            raw.truncation_reason
+        } else {
+            None
+        },
+    })
 }
 
 /// The metadata `git show` prints before a commit's numstat, NUL-separated.
@@ -7775,6 +7873,16 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             strip_remote_tracking("refs/remotes/upstream/main", "origin"),
             None
         );
+    }
+
+    /// `patch` reduced to the sections under `path`, as one whole read.
+    fn keep_sections_under(patch: &str, path: &str) -> String {
+        let whole = DiffPayload {
+            text: patch.to_string(),
+            truncated: false,
+            truncation_reason: None,
+        };
+        keep_payload_under(whole, path).map_or_else(String::new, |kept| kept.text)
     }
 
     fn rev_parse_at(dir: &Path, rev: &str) -> String {
@@ -12845,6 +12953,52 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             adv_agreement_problems(path, &octo),
             Vec::<String>::new(),
             "octopus"
+        );
+    }
+
+    /// A cut read reduced to a request: empty means "the cut hid it" (None),
+    /// a file read whole stays whole, a directory or a cut inside the
+    /// request's own section stays cut, and a cut pairing list marks the
+    /// payload.
+    #[test]
+    fn adv_keep_payload_under_keeps_the_truncated_flag_honest() {
+        let sec = |name: &str| {
+            format!("diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+x\n")
+        };
+        let cut = |text: String| DiffPayload {
+            text,
+            truncated: true,
+            truncation_reason: Some("exceeded 8 MB".into()),
+        };
+        // Cut inside another file before the request: nothing to show.
+        assert!(keep_payload_under(cut(sec("a.txt")), "z.txt").is_none());
+        // The request's own section precedes the cut inside a source: whole.
+        let whole = keep_payload_under(cut(format!("{}{}", sec("a.txt"), sec("b.txt"))), "a.txt")
+            .expect("kept");
+        assert!(
+            !whole.truncated && whole.truncation_reason.is_none(),
+            "{whole:?}"
+        );
+        // The cut is inside the request itself: still cut.
+        let inside =
+            keep_payload_under(cut(format!("{}{}", sec("b.txt"), sec("pkg/a.txt"))), "pkg")
+                .expect("kept");
+        assert!(inside.truncated, "{inside:?}");
+        // A directory's later files may be past the cut: still cut.
+        let dir = keep_payload_under(cut(format!("{}{}", sec("pkg/a.txt"), sec("zz.txt"))), "pkg")
+            .expect("kept");
+        assert!(dir.truncated, "{dir:?}");
+        let marked = GitReader::note_pairing_list_cut(
+            DiffPayload {
+                text: String::new(),
+                truncated: false,
+                truncation_reason: None,
+            },
+            Some("exceeded 4 MB".into()),
+        );
+        assert!(
+            marked.truncated && marked.truncation_reason.is_some(),
+            "{marked:?}"
         );
     }
 
