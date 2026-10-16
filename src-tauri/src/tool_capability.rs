@@ -49,19 +49,31 @@ impl Entry {
 /// The per-tool answers plus one gate per tool that lets a single thread
 /// re-probe an expired entry while the others wait for its answer.
 struct CapabilityCache {
-    slots: Mutex<[Option<Entry>; 2]>,
+    slots: Mutex<Slots>,
     gates: [Mutex<()>; 2],
+}
+
+/// The answers and, per tool, how many times they have been invalidated. A
+/// probe remembers the epoch it started under and stores nothing if an
+/// invalidation passed while it ran, so an answer read before an install is
+/// never written back after it.
+struct Slots {
+    entries: [Option<Entry>; 2],
+    epochs: [u64; 2],
 }
 
 impl CapabilityCache {
     const fn new() -> Self {
         Self {
-            slots: Mutex::new([None, None]),
+            slots: Mutex::new(Slots {
+                entries: [None, None],
+                epochs: [0, 0],
+            }),
             gates: [Mutex::new(()), Mutex::new(())],
         }
     }
 
-    fn slots(&self) -> std::sync::MutexGuard<'_, [Option<Entry>; 2]> {
+    fn slots(&self) -> std::sync::MutexGuard<'_, Slots> {
         self.slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -70,7 +82,7 @@ impl CapabilityCache {
     /// The live answer for `tool`: a stale one is dropped, never returned. A
     /// hit on a found tool costs one `stat`, taken outside the lock.
     fn get(&self, tool: ExternalTool, now: impl FnOnce() -> Instant) -> Option<CapabilityAnswer> {
-        let entry = self.slots()[idx(tool)].clone()?;
+        let entry = self.slots().entries[idx(tool)].clone()?;
         let live = match &entry {
             Entry::Present { path, stamp } => stamp_of(Path::new(path)).as_ref() == Some(stamp),
             Entry::Absent { at, .. } => now().saturating_duration_since(*at) < ABSENT_TTL,
@@ -81,16 +93,22 @@ impl CapabilityCache {
         // Evict only the entry that was judged stale: another thread may have
         // replaced it with a fresh answer in the meantime.
         let mut slots = self.slots();
-        if slots[idx(tool)]
+        if slots.entries[idx(tool)]
             .as_ref()
             .is_some_and(|held| held.answer() == entry.answer())
         {
-            slots[idx(tool)] = None;
+            slots.entries[idx(tool)] = None;
         }
         None
     }
 
     fn set(&self, tool: ExternalTool, answer: CapabilityAnswer, at: Instant) {
+        let epoch = self.slots().epochs[idx(tool)];
+        self.set_in_epoch(tool, answer, at, epoch);
+    }
+
+    /// Stores `answer` unless `tool` was invalidated since `epoch` was read.
+    fn set_in_epoch(&self, tool: ExternalTool, answer: CapabilityAnswer, at: Instant, epoch: u64) {
         // A found path that is not a regular file right now has no stamp to
         // validate against, so it is not kept: it is asked again every time.
         let entry = match answer {
@@ -99,15 +117,24 @@ impl CapabilityCache {
             }
             CapabilityAnswer::Absent { reason } => Some(Entry::Absent { reason, at }),
         };
-        self.slots()[idx(tool)] = entry;
+        let mut slots = self.slots();
+        if slots.epochs[idx(tool)] == epoch {
+            slots.entries[idx(tool)] = entry;
+        }
     }
 
     fn invalidate(&self, tool: ExternalTool) {
-        self.slots()[idx(tool)] = None;
+        let mut slots = self.slots();
+        slots.entries[idx(tool)] = None;
+        slots.epochs[idx(tool)] += 1;
     }
 
     fn invalidate_all(&self) {
-        *self.slots() = [None, None];
+        let mut slots = self.slots();
+        slots.entries = [None, None];
+        for epoch in &mut slots.epochs {
+            *epoch += 1;
+        }
     }
 
     /// Miss or stale: one thread probes, the rest wait on the gate and are
@@ -131,6 +158,7 @@ impl CapabilityCache {
         if let Some(answer) = self.get(tool, &now) {
             return answered(answer);
         }
+        let epoch = self.slots().epochs[idx(tool)];
         let result = probe();
         let answer = match &result {
             Ok(path) => CapabilityAnswer::Present { path: path.clone() },
@@ -138,7 +166,7 @@ impl CapabilityCache {
                 reason: reason.clone(),
             },
         };
-        self.set(tool, answer, now());
+        self.set_in_epoch(tool, answer, now(), epoch);
         result
     }
 }
@@ -680,5 +708,180 @@ mod tests {
         assert!(cache.get(ExternalTool::Manvi, Instant::now).is_some());
         cache.invalidate_all();
         assert_eq!(cache.get(ExternalTool::Manvi, Instant::now), None);
+    }
+
+    /// A probe that panics holds the gate while it unwinds. The next caller
+    /// must get a probe of its own, not a poisoned gate or a hang.
+    #[test]
+    fn a_panicking_probe_does_not_wedge_the_gate() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _ = cache.resolve(ExternalTool::Devmap, || clock.now(), || panic!("boom"));
+                })
+                .join()
+        });
+        assert!(panicked.is_err(), "the probe panic reaches its own caller");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(cache.resolve(ExternalTool::Devmap, || clock.now(), || found(&bin)))
+                    .unwrap();
+            });
+            let got = rx
+                .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                    5,
+                )))
+                .expect("a caller after a panicked probe is not left waiting");
+            assert_eq!(got.unwrap(), bin.to_str().unwrap());
+        });
+    }
+
+    /// Waiters queue behind a running probe and read its answer; they are not
+    /// answered early and not left behind once it ends.
+    #[test]
+    fn callers_wait_for_a_slow_probe_and_share_its_answer() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        let release = std::sync::Barrier::new(2);
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = cache.resolve(
+                    ExternalTool::Devmap,
+                    || clock.now(),
+                    || {
+                        probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        release.wait();
+                        found(&bin)
+                    },
+                );
+            });
+            while probes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            scope.spawn(|| {
+                tx.send(cache.resolve(
+                    ExternalTool::Devmap,
+                    || clock.now(),
+                    || {
+                        probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        found(&bin)
+                    },
+                ))
+                .unwrap();
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "the waiter was answered while the probe was still running"
+            );
+            release.wait();
+            let got = rx
+                .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                    5,
+                )))
+                .expect("the waiter is answered once the probe ends");
+            assert_eq!(got.unwrap(), bin.to_str().unwrap());
+        });
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A probe slower than the TTL stamps its Absent answer when it ends, not
+    /// when it began, so the answer is born live and 16 callers cost one probe.
+    #[test]
+    fn a_probe_slower_than_the_ttl_still_yields_a_live_absent_answer() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    start.wait();
+                    let got = cache.resolve(
+                        ExternalTool::Manvi,
+                        || clock.now(),
+                        || {
+                            probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            clock.advance(ABSENT_TTL + Duration::from_secs(10));
+                            Err("slow miss".into())
+                        },
+                    );
+                    assert_eq!(got.unwrap_err(), "slow miss");
+                });
+            }
+        });
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An invalidation that lands while a probe is running ends the answer the
+    /// probe is about to store: the install it announces may postdate what the
+    /// probe saw.
+    #[test]
+    fn an_invalidation_during_a_probe_is_not_overwritten_by_its_answer() {
+        for all in [false, true] {
+            let cache = CapabilityCache::new();
+            let clock = Clock::new();
+            let inside = std::sync::Barrier::new(2);
+            let release = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let got = cache.resolve(
+                        ExternalTool::Devmap,
+                        || clock.now(),
+                        || {
+                            inside.wait();
+                            release.wait();
+                            Err("not installed (read before the install)".into())
+                        },
+                    );
+                    assert!(
+                        got.is_err(),
+                        "the in-flight caller still gets its own answer"
+                    );
+                });
+                inside.wait();
+                if all {
+                    cache.invalidate_all();
+                } else {
+                    cache.invalidate(ExternalTool::Devmap);
+                }
+                release.wait();
+            });
+            assert_eq!(
+                cache.get(ExternalTool::Devmap, || clock.now()),
+                None,
+                "a pre-invalidation answer was stored after the invalidation (all={all})"
+            );
+        }
+    }
+
+    /// Stated limit, shared with `BinaryProbeCache`: a rewrite that keeps the
+    /// length and puts the mtime back is not a change the stamp can see.
+    #[test]
+    fn a_rewrite_that_restores_length_and_mtime_is_the_stamps_known_blind_spot() {
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        let before = std::fs::metadata(&bin).unwrap().modified().unwrap();
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        std::fs::write(&bin, "v2").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&bin)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        assert!(
+            cache.get(ExternalTool::Devmap, Instant::now).is_some(),
+            "len and mtime both match, so the entry is kept"
+        );
     }
 }
