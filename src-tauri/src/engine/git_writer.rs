@@ -2481,15 +2481,6 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
-/// Composes the user-facing error for a failed rebase step together with any
-/// recovery failures that occurred while rolling back.
-///
-/// The step error always leads verbatim. When `abort_result` is
-/// `Some(Err(..))` (a cherry-pick was mid-flight and could not be aborted) or
-/// `restore_result` is `Err(..)` (the checkout back to the original branch /
-/// HEAD failed), an explicit clause names the failure and the true end-state,
-/// so a locked index or full disk can never hide behind the primary error.
-/// Pure: no git, fully unit-testable.
 /// Refuses a plan in which a squash or fixup has no kept commit before it, as
 /// git does ("cannot 'squash' without a previous commit"). A dropped step is
 /// not a commit to fold into: with only drops ahead of it the fold would amend
@@ -2519,6 +2510,15 @@ fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
     Ok(())
 }
 
+/// Composes the user-facing error for a failed rebase step together with any
+/// recovery failures that occurred while rolling back.
+///
+/// The step error always leads verbatim. When `abort_result` is
+/// `Some(Err(..))` (a cherry-pick was mid-flight and could not be aborted) or
+/// `restore_result` is `Err(..)` (the checkout back to the original branch /
+/// HEAD failed), an explicit clause names the failure and the true end-state,
+/// so a locked index or full disk can never hide behind the primary error.
+/// Pure: no git, fully unit-testable.
 fn combine_step_failure_with_recovery(
     step_error: &str,
     abort_result: Option<&Result<(), String>>, // None when no cherry-pick was in progress

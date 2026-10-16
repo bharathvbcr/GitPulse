@@ -3732,7 +3732,6 @@ pub(crate) fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
     Some((ahead.parse().ok()?, behind.parse().ok()?))
 }
 
-/// One listed ref awaiting churn computation in [`GitReader::branch_stats`].
 /// The listing name of a `for-each-ref` branch refname and whether it is a
 /// remote-tracking one. The namespace is stripped exactly once: `git branch
 /// refs/heads/x` creates the real ref `refs/heads/refs/heads/x`, whose name is
@@ -3748,6 +3747,7 @@ fn short_branch_name(refname: &str) -> (&str, bool) {
     }
 }
 
+/// One listed ref awaiting churn computation in [`GitReader::branch_stats`].
 struct BranchStatTarget {
     name: String,
     tip_commit_id: String,
