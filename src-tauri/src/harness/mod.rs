@@ -475,6 +475,54 @@ pub(crate) const fn production_guard_workers() -> usize {
     GUARD_FILES_CONCURRENCY
 }
 
+/// Test-only door to [`guard_files_with`], so the live-sidecar benchmark runs
+/// the production walk (scope once, judge, record, gate) at a chosen worker
+/// count.
+#[cfg(test)]
+pub(crate) fn guard_files_with_workers_for_bench(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<PolicyVerdict>, String> {
+    guard_files_with(repo_path, files, op, workers)
+}
+
+/// Test-only: the sidecar round trip alone. Resolves the scope once, then
+/// times every [`check_file`] call (no ledger record, no gating) on `workers`
+/// threads, returning one duration per file in order.
+#[cfg(test)]
+pub(crate) fn time_file_checks_for_bench(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<std::time::Duration>, String> {
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = scope_at(&address).map_err(|failure| failure.reason)?;
+    let lent = sidecar::test_serial_held_here();
+    let timed = judge_in_order(
+        files,
+        workers,
+        |file| {
+            let _lent = sidecar::lend_test_serial(lent);
+            let started = std::time::Instant::now();
+            let verdict = check_file(repo_path, file, op, scope.as_ref());
+            (started.elapsed(), verdict.gate_failed())
+        },
+        |_| false,
+    );
+    timed
+        .into_iter()
+        .zip(files)
+        .map(|(slot, file)| match slot {
+            Some((_, true)) => Err(format!("the sidecar could not judge {file}")),
+            Some((elapsed, false)) => Ok(elapsed),
+            None => Err(format!("{file} was never judged")),
+        })
+        .collect()
+}
+
 /// The task scope this checkout is working under, if it is bound to one.
 ///
 /// Two lookups, both cheap and both allowed to come back empty:
