@@ -821,7 +821,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("routes.json");
             std::fs::write(&file, r#"{"a.localhost": {"port": 4001}}"#).unwrap();
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
             let _env = bind_env_owned(env_serial()).set("PORTLESS_STATE_DIR", dir.path());
             let readable = std::fs::File::open(&file).is_ok();
             assert_eq!(PortlessSnapshot::load().routes.len(), usize::from(readable));
@@ -847,7 +847,8 @@ mod tests {
     #[test]
     fn json_number_shapes_for_port_and_pid() {
         // (json for the entry body, kept as (port, pid))
-        let table: &[(&str, Option<(u16, Option<u32>)>)] = &[
+        type Kept = Option<(u16, Option<u32>)>;
+        let table: &[(&str, Kept)] = &[
             (r#""port": 65535.0"#, None),
             (r#""port": 1e3"#, None),
             (r#""port": -0"#, None),
