@@ -475,3 +475,550 @@ fn no_production_rust_builds_a_commit_graph_write_argv() {
     }
     assert!(offenders.is_empty(), "commit-graph argv in {offenders:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial coverage: hostile bytes, oracle-checked against `git commit-graph
+// verify`. Every graph git rejects must read as `unknown`, never as a verdict.
+// ---------------------------------------------------------------------------
+
+/// SHA-1, only to re-seal a mutated graph: git checks the trailing checksum
+/// first, so without re-sealing every mutation is rejected for that one reason
+/// and the structural checks behind it are never reached.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                block[4 * i],
+                block[4 * i + 1],
+                block[4 * i + 2],
+                block[4 * i + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, v) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+fn reseal(bytes: &mut [u8]) {
+    if bytes.len() > 20 {
+        let n = bytes.len() - 20;
+        let sum = sha1(&bytes[..n]);
+        bytes[n..].copy_from_slice(&sum);
+    }
+}
+
+fn git_accepts_graph(dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["commit-graph", "verify"])
+        .current_dir(dir)
+        .output_locked()
+        .expect("spawn git")
+        .status
+        .success()
+}
+
+/// The detector alone, without `scan_storage`'s git spawns, for loops.
+fn inspect_only(dir: &Path) -> CommitGraphReport {
+    let git_dir = dir.join(".git");
+    inspect(&git_dir, &git_dir)
+}
+
+fn graph_repo(commits: usize) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+    let dir = repo_with_commits(commits);
+    run_git(
+        dir.path(),
+        &["commit-graph", "write", "--reachable", "--changed-paths"],
+    );
+    let graph = dir.path().join(".git/objects/info/commit-graph");
+    let good = std::fs::read(&graph).unwrap();
+    (dir, graph, good)
+}
+
+fn put_graph(graph: &Path, bytes: &[u8]) {
+    let _ = std::fs::remove_file(graph);
+    std::fs::write(graph, bytes).unwrap();
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+#[test]
+fn a_resealed_graph_is_accepted_by_git_and_read_as_present() {
+    let _g = serial();
+    let (dir, graph, mut good) = graph_repo(6);
+    reseal(&mut good);
+    put_graph(&graph, &good);
+    assert!(
+        git_accepts_graph(dir.path()),
+        "the re-sealing helper is broken"
+    );
+    assert_state(&detect(dir.path()), CommitGraphState::Present);
+}
+
+#[test]
+fn every_truncation_of_a_graph_is_unknown() {
+    let _g = serial();
+    let (dir, graph, good) = graph_repo(6);
+    for n in 0..good.len() {
+        put_graph(&graph, &good[..n]);
+        let report = inspect_only(dir.path());
+        assert_eq!(
+            report.state,
+            CommitGraphState::Unknown,
+            "prefix {n}: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn structural_mutations_git_rejects_never_read_as_a_verdict() {
+    let _g = serial();
+    let (dir, graph, good) = graph_repo(40);
+    let table_end = 8 + (good[6] as usize + 1) * 12;
+    let structural = table_end + 1024;
+    let rows = good[6] as usize + 1;
+    let mut rng = Rng(0x9cfa_4874_dead_beef);
+    let mut offenders = Vec::new();
+    let mut rejected = 0;
+    for round in 0..250 {
+        let mut bytes = good.clone();
+        for _ in 0..=rng.below(3) {
+            match rng.below(4) {
+                0 => {
+                    let i = rng.below(structural);
+                    bytes[i] = rng.next() as u8;
+                }
+                1 => {
+                    let i = rng.below(structural);
+                    bytes[i] ^= 1 << rng.below(8);
+                }
+                2 => {
+                    // Rewrite one chunk-table offset with an edge value.
+                    let row = rng.below(rows);
+                    let v: u64 = [0, 8, 1, u64::MAX, bytes.len() as u64, 1 << 32, 12][rng.below(7)];
+                    bytes[8 + row * 12 + 4..8 + row * 12 + 12].copy_from_slice(&v.to_be_bytes());
+                }
+                _ => {
+                    // Swap two chunk ids.
+                    let a = rng.below(rows);
+                    let b = rng.below(rows);
+                    for k in 0..4 {
+                        bytes.swap(8 + a * 12 + k, 8 + b * 12 + k);
+                    }
+                }
+            }
+        }
+        reseal(&mut bytes);
+        put_graph(&graph, &bytes);
+        if git_accepts_graph(dir.path()) {
+            continue;
+        }
+        rejected += 1;
+        let report = inspect_only(dir.path());
+        if report.state != CommitGraphState::Unknown {
+            offenders.push(format!(
+                "round {round}: {:?} on {:02x?}",
+                report.state,
+                &bytes[..table_end]
+            ));
+        }
+    }
+    assert!(
+        rejected > 60,
+        "the fuzz barely produced rejected graphs ({rejected})"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} graphs git rejects read as a verdict, first: {:?}",
+        offenders.len(),
+        offenders.first()
+    );
+}
+
+fn sha256_repo_with_graph() -> Option<(tempfile::TempDir, Vec<u8>)> {
+    let dir = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main", "--object-format=sha256"])
+        .current_dir(dir.path())
+        .output_locked()
+        .expect("spawn git");
+    if !init.status.success() {
+        return None;
+    }
+    trust_repo(dir.path());
+    run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    run_git(dir.path(), &["config", "user.name", "T"]);
+    run_git(dir.path(), &["config", "user.email", "t@example.com"]);
+    add_commit(dir.path(), "a.txt");
+    run_git(
+        dir.path(),
+        &["commit-graph", "write", "--reachable", "--changed-paths"],
+    );
+    let bytes = std::fs::read(dir.path().join(".git/objects/info/commit-graph")).unwrap();
+    Some((dir, bytes))
+}
+
+#[test]
+fn a_graph_of_the_other_hash_version_is_unknown() {
+    let _g = serial();
+    let Some((_sha256_dir, sha256_graph)) = sha256_repo_with_graph() else {
+        eprintln!("git lacks sha256 support; case skipped");
+        return;
+    };
+    let (dir, graph, _good) = graph_repo(3);
+    put_graph(&graph, &sha256_graph);
+    assert!(
+        !git_accepts_graph(dir.path()),
+        "oracle: git must reject a sha256 graph in a sha1 repository"
+    );
+    let report = detect(dir.path());
+    assert_state(&report, CommitGraphState::Unknown);
+}
+
+#[test]
+fn a_sha1_graph_in_a_sha256_repository_is_unknown() {
+    let _g = serial();
+    let Some((sha256_dir, _)) = sha256_repo_with_graph() else {
+        eprintln!("git lacks sha256 support; case skipped");
+        return;
+    };
+    let (_dir, _graph, sha1_graph) = graph_repo(3);
+    put_graph(
+        &sha256_dir.path().join(".git/objects/info/commit-graph"),
+        &sha1_graph,
+    );
+    assert!(
+        !git_accepts_graph(sha256_dir.path()),
+        "oracle: git must reject a sha1 graph in a sha256 repository"
+    );
+    assert_state(&detect(sha256_dir.path()), CommitGraphState::Unknown);
+}
+
+#[test]
+fn core_commit_graph_false_means_git_ignores_the_graph() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(3);
+    assert_state(&detect(dir.path()), CommitGraphState::Present);
+    run_git(dir.path(), &["config", "core.commitGraph", "false"]);
+    let report = detect(dir.path());
+    assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
+    assert!(
+        report
+            .note
+            .as_deref()
+            .unwrap_or("")
+            .contains("core.commitGraph"),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn core_commit_graph_false_in_the_user_config_is_seen_too() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(3);
+    let config = PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config"));
+    let original = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(&config, format!("{original}\n[core]\n\tcommitGraph = no\n")).unwrap();
+    let report = detect(dir.path());
+    std::fs::write(&config, original).unwrap();
+    assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
+}
+
+#[test]
+fn fetch_write_commit_graph_does_not_change_what_a_present_graph_means() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(3);
+    run_git(dir.path(), &["config", "fetch.writeCommitGraph", "false"]);
+    assert_state(&detect(dir.path()), CommitGraphState::Present);
+}
+
+fn chain_repo() -> (tempfile::TempDir, PathBuf, Vec<String>) {
+    let dir = repo_with_commits(3);
+    run_git(
+        dir.path(),
+        &[
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+            "--split",
+        ],
+    );
+    add_commit(dir.path(), "x.txt");
+    run_git(
+        dir.path(),
+        &[
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+            "--split=no-merge",
+        ],
+    );
+    let chain = dir
+        .path()
+        .join(".git/objects/info/commit-graphs/commit-graph-chain");
+    let lines = std::fs::read_to_string(&chain)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (dir, chain, lines)
+}
+
+fn write_chain(chain: &Path, text: &str) {
+    let _ = std::fs::remove_file(chain);
+    std::fs::write(chain, text).unwrap();
+}
+
+#[test]
+fn hostile_chain_files_are_unknown_whenever_git_rejects_them() {
+    let _g = serial();
+    let (dir, chain, lines) = chain_repo();
+    assert_eq!(lines.len(), 2, "fixture: two layers");
+    assert_state(&detect(dir.path()), CommitGraphState::Present);
+    let (base, tip) = (&lines[0], &lines[1]);
+    let cases: Vec<(&str, String)> = vec![
+        ("layers swapped", format!("{tip}\n{base}\n")),
+        ("duplicate layer", format!("{base}\n{base}\n")),
+        ("tip repeated", format!("{base}\n{tip}\n{tip}\n")),
+        ("tip alone", format!("{tip}\n")),
+        ("crlf", format!("{base}\r\n{tip}\r\n")),
+        ("blank lines", format!("\n{base}\n\n{tip}\n\n")),
+        ("non hex", format!("{base}\nzzzz{}\n", &tip[4..])),
+        (
+            "uppercase",
+            format!("{}\n{}\n", base.to_uppercase(), tip.to_uppercase()),
+        ),
+        ("trailing garbage", format!("{base}\n{tip}\nnot-a-hash\n")),
+    ];
+    for (label, text) in cases {
+        write_chain(&chain, &text);
+        let accepted = git_accepts_graph(dir.path());
+        let report = detect(dir.path());
+        if !accepted {
+            assert_eq!(
+                report.state,
+                CommitGraphState::Unknown,
+                "{label}: git rejects it but the detector said {report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_chain_of_sixty_five_layers_is_unknown_and_sixty_four_is_bounded() {
+    let _g = serial();
+    let (dir, chain, lines) = chain_repo();
+    let tip = &lines[1];
+    write_chain(&chain, &format!("{tip}\n").repeat(65));
+    let report = detect(dir.path());
+    assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
+    write_chain(&chain, &format!("{tip}\n").repeat(64));
+    let report = detect(dir.path());
+    assert!(report.layers <= 64, "{report:?}");
+}
+
+#[test]
+fn layers_that_disagree_on_hash_version_are_unknown() {
+    let _g = serial();
+    let Some((_d, sha256_graph)) = sha256_repo_with_graph() else {
+        eprintln!("git lacks sha256 support; case skipped");
+        return;
+    };
+    let (dir, chain, lines) = chain_repo();
+    // Replace the tip layer with a sha256 graph under the same name.
+    let layer = dir.path().join(format!(
+        ".git/objects/info/commit-graphs/graph-{}.graph",
+        lines[1]
+    ));
+    put_graph(&layer, &sha256_graph);
+    let _ = chain;
+    assert!(!git_accepts_graph(dir.path()), "oracle");
+    assert_state(&detect(dir.path()), CommitGraphState::Unknown);
+}
+
+#[test]
+fn a_graph_missing_a_required_chunk_is_unknown() {
+    let _g = serial();
+    let (dir, graph, good) = graph_repo(6);
+    let rows = good[6] as usize;
+    for row in 0..rows {
+        let id = &good[8 + row * 12..8 + row * 12 + 4];
+        if id == b"CDAT" || id == b"OIDF" || id == b"OIDL" {
+            let mut bytes = good.clone();
+            bytes[8 + row * 12] = b'X';
+            reseal(&mut bytes);
+            put_graph(&graph, &bytes);
+            assert!(
+                !git_accepts_graph(dir.path()),
+                "oracle: renaming {:?} must make git reject",
+                std::str::from_utf8(id)
+            );
+            assert_eq!(
+                detect(dir.path()).state,
+                CommitGraphState::Unknown,
+                "chunk {:?} renamed",
+                std::str::from_utf8(id)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_loose_ref_wins_over_packed_refs_and_packed_refs_is_not_opened_for_it() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(4);
+    run_git(dir.path(), &["pack-refs", "--all"]);
+    let git_dir = dir.path().join(".git");
+    // A new commit makes a loose ref that disagrees with the packed one; the
+    // graph predates it, so a loose-wins read is stale and a packed-wins read
+    // is present.
+    add_commit(dir.path(), "newer.txt");
+    assert_state(&detect(dir.path()), CommitGraphState::Stale);
+    // With the branch loose, an unreadable packed-refs must not be touched.
+    use std::os::unix::fs::PermissionsExt;
+    let packed = git_dir.join("packed-refs");
+    std::fs::set_permissions(&packed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let report = detect(dir.path());
+    std::fs::set_permissions(&packed, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_state(&report, CommitGraphState::Stale);
+}
+
+#[test]
+fn symref_loops_and_packed_refs_oddities_do_not_hang_or_mislead() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(3);
+    let git_dir = dir.path().join(".git");
+    std::fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+    std::fs::write(git_dir.join("refs/heads/a"), "ref: refs/heads/b\n").unwrap();
+    std::fs::write(git_dir.join("refs/heads/b"), "ref: refs/heads/a\n").unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/a\n").unwrap();
+    let report = inspect(&git_dir, &git_dir);
+    assert_state(&report, CommitGraphState::Unknown);
+
+    // Header, peeled and annotated lines, an unrelated ref, then the real one.
+    let head_oid = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    std::fs::remove_file(git_dir.join("refs/heads/a")).unwrap();
+    std::fs::remove_file(git_dir.join("refs/heads/b")).unwrap();
+    std::fs::remove_file(git_dir.join("refs/heads/main")).unwrap();
+    std::fs::write(
+        git_dir.join("packed-refs"),
+        format!(
+            "# pack-refs with: peeled fully-peeled sorted \n{z} refs/heads/other\n^{z}\n{head_oid} refs/heads/main\n",
+            z = "0".repeat(40)
+        ),
+    )
+    .unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_state(&inspect(&git_dir, &git_dir), CommitGraphState::Present);
+}
+
+#[test]
+fn a_linked_worktree_with_its_own_head_reads_the_shared_objects() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(3);
+    let wt = dir.path().join("wt");
+    run_git(
+        dir.path(),
+        &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()],
+    );
+    add_commit(&wt, "side.txt");
+    // The worktree's HEAD is newer than the shared graph: stale, not present.
+    assert_state(&detect(&wt), CommitGraphState::Stale);
+    assert_state(&detect(dir.path()), CommitGraphState::Present);
+}
+
+#[test]
+fn a_fifty_thousand_commit_graph_is_read_correctly_and_cheaply() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    run_git(dir.path(), &["init", "-q", "-b", "main"]);
+    let mut stream = String::new();
+    for i in 0..50_000u32 {
+        stream.push_str(&format!(
+            "commit refs/heads/main\nmark :{}\ncommitter T <t@example.com> {} +0000\ndata 2\nc\n",
+            i + 1,
+            1_000_000_000 + i
+        ));
+        if i > 0 {
+            stream.push_str(&format!("from :{i}\n"));
+        }
+        stream.push('\n');
+    }
+    let input = dir.path().join("stream");
+    std::fs::write(&input, stream).unwrap();
+    let status = std::process::Command::new("sh")
+        .args(["-c", "git fast-import --quiet < stream"])
+        .current_dir(dir.path())
+        .output_locked()
+        .expect("spawn sh");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    run_git(
+        dir.path(),
+        &["commit-graph", "write", "--reachable", "--changed-paths"],
+    );
+    let report = detect(dir.path());
+    assert_eq!(report.state, CommitGraphState::Present, "{report:?}");
+    assert_eq!(report.commits, Some(50_000));
+}
