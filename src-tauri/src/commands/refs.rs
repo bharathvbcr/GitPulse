@@ -15,37 +15,33 @@ pub struct ReleasePublishResult {
 pub async fn cmd_checkout_branch(
     repo_path: String,
     branch_name: String,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<crate::engine::git_writer::CheckoutOutcome>, String> {
     off_thread(move || {
-        // checkout_branch tries `switch --guess`, then revision-only `checkout`,
-        // falling through on failure. Both can execute, so both are judged;
-        // a refusal of either refuses the action (a policy denying
-        // `git checkout X` must not be routed around by running
-        // `git switch X` instead).
-        let attempts: [Vec<String>; 2] = [
-            vec![
-                "git".into(),
-                "switch".into(),
-                "--guess".into(),
-                branch_name.clone(),
-            ],
-            vec![
-                "git".into(),
-                "checkout".into(),
-                branch_name.clone(),
-                "--".into(),
-            ],
-        ];
-        let fold = VerdictFold::default();
-        for argv in &attempts {
-            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            fold.record(guard(&repo_path, &refs)?);
-        }
-        GitWriter::checkout_branch(&repo_path, &branch_name)?;
-        Ok(Guarded {
-            policy: fold.finish().expect("at least one attempt is always gated"),
-            output: (),
-        })
+        // The writer resolves exactly one argv (switch to a local branch or to
+        // the local twin of a remote-tracking name, `--track` to create it, or
+        // `--guess`), and the gate judges that line, not a guess at it.
+        let argv = GitWriter::checkout_branch_argv(&repo_path, &branch_name)?;
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = GitWriter::checkout_branch(&repo_path, &branch_name)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Checks out a commit, tag or other revision with HEAD detached. Kept apart
+/// from `cmd_checkout_branch`, which never detaches.
+#[tauri::command(async)]
+pub async fn cmd_checkout_detached(
+    repo_path: String,
+    revision: String,
+) -> Result<Guarded<crate::engine::git_writer::CheckoutOutcome>, String> {
+    off_thread(move || {
+        let argv = GitWriter::checkout_detached_argv(&revision)?;
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = GitWriter::checkout_detached(&repo_path, &revision)?;
+        Ok(Guarded { policy, output })
     })
     .await
 }

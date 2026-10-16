@@ -368,6 +368,7 @@ pub fn run() {
             cmd_commit,
             cmd_quick_commit,
             cmd_checkout_branch,
+            cmd_checkout_detached,
             cmd_create_branch,
             cmd_delete_branch,
             cmd_rename_branch,
