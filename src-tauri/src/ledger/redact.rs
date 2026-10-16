@@ -1707,7 +1707,7 @@ mod equivalence_tests {
     use super::*;
     use proptest::prelude::*;
 
-    const KEY: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    pub(super) const KEY: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
     const KEY2: &str = "ghp_ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210B";
     const PAT: &str = "q7Zp4Lw9Xv2Rk8Tn5Jm3Hs6Bd1Fg0Ca";
 
@@ -2098,13 +2098,17 @@ mod equivalence_tests {
         "a",
     ];
 
+    pub(super) fn fragments() -> &'static [&'static str] {
+        FRAGMENTS
+    }
+
     fn fragment_text() -> impl Strategy<Value = String> {
         proptest::collection::vec(0..FRAGMENTS.len(), 0..14)
             .prop_map(|picks| picks.into_iter().map(|index| FRAGMENTS[index]).collect())
     }
 
     /// A fragment string, bare or wrapped in the JSON shapes the ledger stores.
-    fn candidate() -> impl Strategy<Value = String> {
+    pub(super) fn candidate() -> impl Strategy<Value = String> {
         (fragment_text(), fragment_text(), 0u8..9).prop_map(|(a, b, shape)| match shape {
             0..=3 => a,
             4 => serde_json::json!({ "m": a }).to_string(),
@@ -2120,9 +2124,24 @@ mod equivalence_tests {
         })
     }
 
+    /// Cases per generated property. Optimized builds run the full 220k
+    /// the equivalence claim is stated for; an unoptimized build (CI's
+    /// `cargo test`, coverage instrumented) runs a seeded-size sample, since
+    /// the same loop is several hundred times slower there.
+    pub(super) fn generated_cases() -> u32 {
+        if cfg!(debug_assertions) {
+            GENERATED_CASES_DEBUG
+        } else {
+            GENERATED_CASES_RELEASE
+        }
+    }
+
+    const GENERATED_CASES_RELEASE: u32 = 220_000;
+    const GENERATED_CASES_DEBUG: u32 = 10_000;
+
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 220_000,
+            cases: generated_cases(),
             failure_persistence: None,
             ..ProptestConfig::default()
         })]
@@ -2154,6 +2173,394 @@ mod equivalence_tests {
                     prop_assert!(dc_redact::find_secret(segment).is_none());
                 }
             }
+        }
+    }
+}
+
+/// Adversarial checks on the one claim the rewrite stands on: the `RegexSet`
+/// gate says "no match" only when no chain pattern matches. Plus a count of
+/// what the generator reaches, so the equivalence suite cannot pass vacuously.
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+
+    /// Pieces that stress the regex flags: case folding that is not ASCII
+    /// (Kelvin sign, long s, sharp s, dotless/dotted i), line terminators
+    /// `(?m)$` and `(?s)` care about, and the empty and very long cases.
+    const ADVERSARIAL: &[&str] = &[
+        "\u{212a}ey",
+        "api_\u{212a}ey=opaque",
+        "pa\u{17f}\u{17f}word=opaque",
+        "\u{17f}ecret: opaque",
+        "to\u{212a}en=opaque",
+        "A\u{17f}\u{17f}ociation",
+        "stra\u{df}e",
+        "\u{131}",
+        "\u{130}",
+        "authorization:\u{212a}",
+        "AUTHORIZATION: Bearer x",
+        "co\u{212a}\u{212a}ie=x",
+        "cookie: a=b\r\n",
+        "cookie: a=b\r",
+        "cookie: a=b\n",
+        "cookie: a=b\u{2028}c",
+        "authorization: Bearer x\u{85}y",
+        "authorization: Bearer x\r\nHost: h\r\n",
+        "-----BEGIN PRIVATE KEY-----\r\nbody\r\n",
+        "-----BEGIN PRIVATE KEY-----\r\nbody\r\n-----END PRIVATE KEY-----\r\n",
+        "-----BEGIN \u{212a}EY PRIVATE KEY-----",
+        "-----begin private key-----",
+        "\r\n",
+        "\r",
+        "\n",
+        "\u{0}",
+        "",
+        "password",
+        "password=",
+        "password: ",
+        "--password",
+        "--password ",
+        "-u ",
+        "://",
+        "a://:@",
+        "x://@",
+        "a:b@",
+        ":@",
+        "\\",
+        "\\\"",
+        "\"",
+        "'",
+    ];
+
+    fn any_piece() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => proptest::sample::select(ADVERSARIAL).prop_map(str::to_string),
+            3 => proptest::sample::select(super::equivalence_tests::fragments()).prop_map(str::to_string),
+            1 => any::<String>(),
+            1 => "[ -~\u{80}-\u{2fff}\r\n]{0,12}".prop_map(|s: String| s),
+        ]
+    }
+
+    fn adversarial_text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(any_piece(), 0..24).prop_map(|parts| parts.concat())
+    }
+
+    /// Every set index must agree with its individual regex, and the set's
+    /// `is_match` with "some chain regex matches".
+    fn assert_gate_agrees(input: &str) {
+        let stage = contextual();
+        let set_hit = stage.any.is_match(input);
+        let chain_hit = stage.chain.iter().any(|regex| regex.is_match(input));
+        assert_eq!(set_hit, chain_hit, "gate vs chain on {input:?}");
+        let matched: Vec<usize> = stage.any.matches(input).into_iter().collect();
+        let individually: Vec<usize> = stage
+            .chain
+            .iter()
+            .enumerate()
+            .filter(|(_, regex)| regex.is_match(input))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(matched, individually, "set indices vs regexes on {input:?}");
+        assert_eq!(set_hit, !matched.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: super::equivalence_tests::generated_cases(),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn the_gate_matches_exactly_when_some_chain_pattern_does(input in adversarial_text()) {
+            assert_gate_agrees(&input);
+            prop_assert_eq!(text(&input), super::reference::text(&input));
+        }
+    }
+
+    #[test]
+    fn the_gate_agrees_with_the_chain_on_line_endings_and_long_inputs() {
+        let mut inputs: Vec<String> = ADVERSARIAL.iter().map(|s| (*s).to_string()).collect();
+        for piece in ADVERSARIAL {
+            for suffix in ["", "\r\n", "\r", "\n", "\u{2028}", "\u{85}"] {
+                for prefix in ["", "x", "\r\n", "\n\n"] {
+                    inputs.push(format!("{prefix}{piece}{suffix}"));
+                    inputs.push(format!("{prefix}{piece}{suffix}{piece}"));
+                }
+            }
+        }
+        // Past the lazy DFA's cache budget, where the engine may fall back to
+        // another strategy: the answer must not change with the strategy.
+        let filler = "x".repeat(300_000);
+        inputs.push(format!("{filler}password=opaque"));
+        inputs.push(format!("password=opaque{filler}"));
+        inputs.push(format!("{filler}\r\n{filler}"));
+        inputs.push(format!("{filler}{}", "authorization: ".repeat(2000)));
+        inputs.push("-----BEGIN PRIVATE KEY-----".to_string() + &filler);
+        inputs.push("\u{212a}".repeat(50_000) + "ey=opaque");
+        inputs.push("api_\u{212a}ey=".to_string() + &"\u{17f}".repeat(100_000));
+        inputs.push(filler);
+        for input in &inputs {
+            assert_gate_agrees(input);
+            assert_eq!(text(input), super::reference::text(input));
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_case_fold_reaches_the_chain_and_the_set_alike() {
+        // Pins that the folds are exercised at all: if the gate said "no
+        // match" here, a Kelvin-sign key would reach the ledger in full.
+        let stage = contextual();
+        for input in [
+            "api_\u{212a}ey=opaque-value",
+            "pa\u{17f}\u{17f}word=opaque-value",
+            "\u{17f}ecret=opaque-value",
+        ] {
+            assert!(stage.any.is_match(input), "{input:?}");
+            assert!(
+                stage.chain.iter().any(|regex| regex.is_match(input)),
+                "{input:?}"
+            );
+            assert!(!text(input).contains("opaque-value"), "{input:?}");
+        }
+    }
+
+    /// What one generated case exercises.
+    #[derive(Default, Debug)]
+    struct Reach {
+        total: usize,
+        pattern: [usize; 15],
+        port_exemption: usize,
+        line_end_anchor_mid_text: usize,
+        pem_without_end: usize,
+        json_scalar_string: usize,
+        changed: usize,
+        deepest: usize,
+    }
+
+    fn json_depth(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+            serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn observe(reach: &mut Reach, input: &str) {
+        let stage = contextual();
+        reach.total += 1;
+        for (index, regex) in stage.chain.iter().enumerate() {
+            if regex.is_match(input) {
+                reach.pattern[index] += 1;
+            }
+        }
+        if stage.chain[URL_PASSWORD].captures_iter(input).any(|caps| {
+            caps[2].split_once('/').is_some_and(|(head, _)| {
+                !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())
+            })
+        }) {
+            reach.port_exemption += 1;
+        }
+        if [AUTHORIZATION, COOKIE].iter().any(|&slot| {
+            stage.chain[slot]
+                .find_iter(input)
+                .any(|found| matches!(input.as_bytes().get(found.end()), Some(b'\n' | b'\r')))
+        }) {
+            reach.line_end_anchor_mid_text += 1;
+        }
+        if stage.chain[PRIVATE_KEY]
+            .find_iter(input)
+            .any(|found| !found.as_str().contains("-----END"))
+        {
+            reach.pem_without_end += 1;
+        }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
+            reach.deepest = reach.deepest.max(json_depth(&parsed));
+            if !parsed.is_array() && !parsed.is_object() {
+                reach.json_scalar_string += 1;
+            }
+        }
+        let out = text(input);
+        if out != input {
+            reach.changed += 1;
+        }
+    }
+
+    #[test]
+    fn the_generator_reaches_every_branch_the_rewrite_touched() {
+        let mut runner = TestRunner::new_with_rng(
+            Config::default(),
+            TestRng::from_seed(RngAlgorithm::ChaCha, &[7; 32]),
+        );
+        let strategy = super::equivalence_tests::candidate();
+        let mut reach = Reach::default();
+        for _ in 0..40_000 {
+            let input = strategy.new_tree(&mut runner).expect("tree").current();
+            observe(&mut reach, &input);
+        }
+        eprintln!("generator reach: {reach:#?}");
+        for (index, hits) in reach.pattern.iter().enumerate() {
+            assert!(*hits >= 50, "pattern {index} reached by only {hits} inputs");
+        }
+        assert!(reach.port_exemption >= 20, "{reach:?}");
+        assert!(reach.line_end_anchor_mid_text >= 50, "{reach:?}");
+        assert!(reach.pem_without_end >= 50, "{reach:?}");
+        assert!(reach.json_scalar_string >= 20, "{reach:?}");
+        assert!(reach.changed >= 4_000, "{reach:?}");
+    }
+
+    /// Objects whose keys are equal-length tokens (so they redact to the same
+    /// text and take collision ordinals), literal `<redacted>` / `<redacted> #N`
+    /// keys the ordinals must step around, and fragment keys, over fragment
+    /// values. The fragment generator almost never builds two such keys.
+    fn colliding_key_document() -> impl Strategy<Value = String> {
+        let key = prop_oneof![
+            4 => "ghp_[A-Za-z0-9]{36}",
+            2 => Just("<redacted>".to_string()),
+            2 => (2usize..6).prop_map(|n| format!("<redacted> #{n}")),
+            2 => proptest::sample::select(super::equivalence_tests::fragments()).prop_map(str::to_string),
+        ];
+        let value = prop_oneof![
+            2 => proptest::sample::select(super::equivalence_tests::fragments()).prop_map(|s| serde_json::Value::String(s.to_string())),
+            1 => (0u32..100).prop_map(serde_json::Value::from),
+            1 => Just(serde_json::json!({"ghp_0123456789abcdefghijklmnopqrstuvwxyzA": "x"})),
+        ];
+        proptest::collection::vec((key, value), 1..9).prop_map(|entries| {
+            let mut map = serde_json::Map::new();
+            for (k, v) in entries {
+                map.insert(k, v);
+            }
+            serde_json::Value::Object(map).to_string()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: super::equivalence_tests::generated_cases(),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn colliding_token_keys_match_the_reference(input in colliding_key_document()) {
+            prop_assert_eq!(text(&input), super::reference::text(&input), "{:?}", input);
+            prop_assert_eq!(carries_secret(&input), super::reference::reference_carries_secret(&input));
+        }
+    }
+
+    #[test]
+    fn the_collision_generator_takes_ordinals() {
+        let mut runner = TestRunner::new_with_rng(
+            Config::default(),
+            TestRng::from_seed(RngAlgorithm::ChaCha, &[11; 32]),
+        );
+        let strategy = colliding_key_document();
+        let mut ordinals = 0usize;
+        for _ in 0..5_000 {
+            let input = strategy.new_tree(&mut runner).expect("tree").current();
+            let out = text(&input);
+            if out.contains(" #2") && !input.contains(" #2") {
+                ordinals += 1;
+            }
+        }
+        assert!(
+            ordinals >= 500,
+            "only {ordinals} documents took a #2 ordinal"
+        );
+    }
+
+    /// The generator's strings are at most a dozen fragments, so they cannot
+    /// nest to the serialized-nesting cap. These do, with the payload as an
+    /// object chain, as a serialized document one level in, and as a leaf
+    /// string, around levels 31, 32 and 33.
+    #[test]
+    fn nesting_around_the_cap_matches_the_reference() {
+        let leaves = [
+            "Authorization: Bearer opaque-boundary-auth".to_string(),
+            "api_key=opaque".to_string(),
+            r#"{"p":"api_key=opaque","password":"x"}"#.to_string(),
+            r#"["tool","--password","opaque"]"#.to_string(),
+            "123".to_string(),
+            "true".to_string(),
+            "null".to_string(),
+            r#""x""#.to_string(),
+            super::equivalence_tests::KEY.to_string(),
+        ];
+        let mut changed_somewhere = [false; 4];
+        for depth in 28..=36usize {
+            for leaf in &leaves {
+                for wrap in 0..4 {
+                    let mut value = serde_json::Value::String(leaf.clone());
+                    for level in 0..depth {
+                        value = match wrap {
+                            0 => serde_json::json!({ "message": value }),
+                            1 => serde_json::json!([value]),
+                            2 if level % 2 == 0 => serde_json::json!({ "k": value }),
+                            2 => serde_json::json!([value, "tail"]),
+                            _ => {
+                                serde_json::json!({ "a": value, "ghp_0123456789abcdefghijklmnopqrstuvwxyzA": 1 })
+                            }
+                        };
+                    }
+                    let input = value.to_string();
+                    let expected = super::reference::text(&input);
+                    assert_eq!(
+                        text(&input),
+                        expected,
+                        "depth {depth} wrap {wrap} leaf {leaf:?}"
+                    );
+                    changed_somewhere[wrap] |= expected != input;
+                }
+            }
+        }
+        assert!(
+            changed_somewhere.iter().all(|c| *c),
+            "{changed_somewhere:?}"
+        );
+    }
+
+    #[test]
+    fn twenty_thousand_equal_length_token_keys_match_the_reference() {
+        let mut hostile = serde_json::Map::new();
+        for index in 0..20_000u32 {
+            hostile.insert(format!("ghp_{index:036}"), serde_json::Value::from(index));
+        }
+        hostile.insert("<redacted> #2".to_string(), serde_json::Value::from(1));
+        let document = serde_json::Value::Object(hostile).to_string();
+        let out = text(&document);
+        assert_eq!(out, super::reference::text(&document));
+        assert!(out.contains("#2"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed.as_object().map(serde_json::Map::len), Some(20_001));
+    }
+
+    #[test]
+    fn json_scalar_strings_and_a_string_at_each_depth_match_the_reference() {
+        for scalar in [
+            "123",
+            "true",
+            "null",
+            "\"x\"",
+            "\"123\"",
+            "\"true\"",
+            "\"\\\"x\\\"\"",
+            "1e999",
+            "-0",
+            "[]",
+            "{}",
+        ] {
+            for depth in [0usize, 1, 30, 31, 32, 33] {
+                let mut value = serde_json::Value::String(scalar.to_string());
+                for _ in 0..depth {
+                    value = serde_json::json!({ "message": value });
+                }
+                let input = value.to_string();
+                assert_eq!(text(&input), super::reference::text(&input), "{input:?}");
+            }
+            assert_eq!(text(scalar), super::reference::text(scalar), "{scalar:?}");
         }
     }
 }
