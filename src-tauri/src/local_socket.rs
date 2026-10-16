@@ -455,7 +455,7 @@ mod tests {
             wake.notify();
         }
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "100k notifies took {:?}",
             started.elapsed()
         );
@@ -492,7 +492,10 @@ mod tests {
             let started = std::time::Instant::now();
             let ready = wait_readable_or_woken(listener_side.as_raw_fd(), reader.as_raw_fd());
             assert!(ready.woken, "{ready:?}");
-            assert!(started.elapsed() < Duration::from_millis(100));
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(Duration::from_millis(100))
+            );
         }
     }
 
