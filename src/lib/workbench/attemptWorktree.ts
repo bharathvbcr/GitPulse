@@ -98,12 +98,15 @@ async function listingFor(root: string, cwd: string): Promise<{ main: WorktreeIn
 }
 
 /**
- * The main checkout as a mutation target, captured before anything is asked.
- * Its tab is opened in the background when none holds it, so the work runs
- * there, counted by the quit guard and journalled, whatever is in front; and
- * is refused if that tab is gone or no longer names it by the time it runs.
+ * The main checkout as a mutation target. A tab that already holds it is
+ * looked up (`known`) before anything is asked, so closing it while the reader
+ * decides refuses the run. When none holds it, its tab is opened in the
+ * background only now, after approval and just before the work, so a declined
+ * or refused action leaves no tab behind. The work runs there, counted by the
+ * quit guard and journalled, whatever is in front.
  */
-async function mainCheckoutTarget(root: string): Promise<MutationTarget> {
+async function mainCheckoutTarget(root: string, known: MutationTarget | null): Promise<MutationTarget> {
+  if (known) return known;
   const target = await repoStore.targetForPath(root);
   if (!target) throw new Error(`${root} could not be opened, so nothing is run in it.`);
   return target;
@@ -146,7 +149,7 @@ export type WorktreeActionResult = { message: string } | null;
  */
 export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeActionResult> {
   const root = await mainCheckoutOf(run.cwd);
-  const mutationTarget = await mainCheckoutTarget(root);
+  const known = await repoStore.targetForPath(root, { open: false });
   const { main, own } = await listingFor(root, run.cwd);
   if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
   const target = main?.branch ?? null;
@@ -159,6 +162,7 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   });
   if (!approved) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
+  const mutationTarget = await mainCheckoutTarget(root, known);
   const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, own.head);
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged)];
@@ -210,7 +214,7 @@ export interface VerifiedMerge { head: string; message: string }
 export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string): Promise<VerifiedMerge> {
   if (!expectedHead) throw new Error("No verified head was named, so nothing is merged.");
   const root = await mainCheckoutOf(run.cwd);
-  const mutationTarget = await mainCheckoutTarget(root);
+  const known = await repoStore.targetForPath(root, { open: false });
   const { main, own } = await listingFor(root, run.cwd);
   if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
   if (own.head !== expectedHead) throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${expectedHead.slice(0, 8)} was verified, so it is not merged.`);
@@ -223,6 +227,7 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (liveRunIn(root, live.runs)) throw new Error(`Another attempt is working in the main checkout ${root}, so nothing is merged into it.`);
   if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
   // The head the verdict was reached for is the tip the host holds the merge to.
+  const mutationTarget = await mainCheckoutTarget(root, known);
   const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, expectedHead);
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged)];
@@ -241,7 +246,7 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
  */
 export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeActionResult> {
   const root = await mainCheckoutOf(run.cwd);
-  const mutationTarget = await mainCheckoutTarget(root);
+  const known = await repoStore.targetForPath(root, { open: false });
   const { own } = await listingFor(root, run.cwd);
   const dirty = own.dirty_files;
   const approved = await askConfirm({
@@ -253,6 +258,7 @@ export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeA
   if (!approved) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
   const force = dirty !== null && dirty > 0;
+  const mutationTarget = await mainCheckoutTarget(root, known);
   const removed = await repoStore.removeWorktree(run.cwd, force, mutationTarget, true);
   if (!removed.ok) throw failureOf(removed);
   await closeStranded(run.cwd);

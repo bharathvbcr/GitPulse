@@ -3016,20 +3016,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * A mutation target for the repository at `rawPath`, opening it in the
      * background when no tab holds it. For flows that act on a repository other
      * than the one in front (an attempt's main checkout) and must capture it
-     * before they ask. Null when it cannot be opened.
+     * before they ask. Null when it cannot be opened, or when the tab that
+     * names it is missing or untrusted (a target that could only be refused).
+     * `open: false` only looks: a caller that has not been approved yet must
+     * not leave a tab behind if the person declines.
      */
-    targetForPath: async (rawPath: string): Promise<MutationTarget | null> => {
-      const find = (): MutationTarget | null => {
+    targetForPath: async (rawPath: string, lookup: { open?: boolean } = {}): Promise<MutationTarget | null> => {
+      const find = (spelling: string): MutationTarget | null => {
         for (const tab of internal.workspace.tabs) {
           const session = internal.sessions[tab.id];
-          if (session && sameRepo(session.path, rawPath, options)) return { tabId: session.id, path: session.path };
+          if (!session || !sameRepo(session.path, spelling, options)) continue;
+          const target = { tabId: session.id, path: session.path };
+          return resolveTarget(target) ? target : null;
         }
         return null;
       };
-      const open = find();
-      if (open) return open;
+      const existing = find(rawPath);
+      if (existing || lookup.open === false) return existing;
       if (!(await store.openRepo(rawPath, { activate: false }))) return null;
-      return find();
+      // The tab sits under the canonical path, which a symlinked or aliased
+      // spelling does not equal as a string.
+      return find(rawPath) ?? find((await resolvePath(rawPath).catch(() => null))?.path ?? rawPath);
     },
     deadbranchClean: async (branches: string[], force: boolean, createBackup: boolean, target?: MutationTarget | null) =>
       runMutating<DeadbranchCleanResult>("deadbranch-clean", `${branches.length} branches`, (path) =>

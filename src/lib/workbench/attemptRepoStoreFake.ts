@@ -16,7 +16,9 @@ export interface FakeCommands { merge: string; remove: string; deleteBranch: str
 export function fakeAttemptStore(send: (command: string, args: Record<string, unknown>) => Promise<unknown>, commands: FakeCommands) {
   /** The targets each wrapper was called with, in order. */
   const seen: { command: string; target: FakeTarget | null | undefined }[] = [];
-  const state = { stillNamed: (_target: FakeTarget) => true, openFails: false };
+  const state = { stillNamed: (_target: FakeTarget) => true, openFails: false, mainOpen: true };
+  /** The paths `targetForPath` opened a tab for, in order: a lookup that only looks opens nothing. */
+  const opened: string[] = [];
   async function run(command: string, args: Record<string, unknown>, target: FakeTarget | null | undefined) {
     seen.push({ command, target });
     if (!target || !state.stillNamed(target)) return { ok: false, error: REPOSITORY_CHANGED, refused: true, surfaced: false };
@@ -28,10 +30,18 @@ export function fakeAttemptStore(send: (command: string, args: Record<string, un
     }
   }
   const members = {
-    targetForPath: async (path: string): Promise<FakeTarget | null> => (state.openFails ? null : { tabId: `tab:${path}`, path }),
+    targetForPath: async (path: string, lookup: { open?: boolean } = {}): Promise<FakeTarget | null> => {
+      const target = { tabId: `tab:${path}`, path };
+      if (state.mainOpen) return target;
+      if (lookup.open === false) return null;
+      if (state.openFails) return null;
+      opened.push(path);
+      state.mainOpen = true;
+      return target;
+    },
     worktreeMergeTeardown: (request: Record<string, unknown>, target?: FakeTarget | null) => run(commands.merge, request, target),
     removeWorktree: (targetPath: string, force: boolean, target?: FakeTarget | null) => run(commands.remove, { targetPath, force }, target),
     deleteBranch: (branchName: string, force: boolean, target?: FakeTarget | null) => run(commands.deleteBranch, { branchName, force }, target),
   };
-  return { members, seen, state };
+  return { members, seen, state, opened };
 }

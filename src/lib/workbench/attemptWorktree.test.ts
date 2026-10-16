@@ -37,7 +37,7 @@ const listing = (dirty: number | null) => [
 beforeEach(() => {
   invoke.mockReset(); askConfirm.mockReset(); trustRepo.mockClear(); closeTab.mockClear(); setGlobalSurface.mockClear(); previewUncommitted.mockClear();
   repoState.set({ openTabs: [] });
-  fake.seen.length = 0; fake.state.stillNamed = () => true; fake.state.openFails = false;
+  fake.seen.length = 0; fake.opened.length = 0; fake.state.stillNamed = () => true; fake.state.openFails = false; fake.state.mainOpen = true;
 });
 
 describe("attemptWorktreeOffer", () => {
@@ -205,11 +205,49 @@ describe("merge and discard", () => {
     expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_worktree_merge_teardown");
   });
 
-  it("does not ask or send when the main checkout cannot be opened to hold the target", async () => {
+  it("sends nothing when the main checkout cannot be opened to hold the target, once the reader has approved", async () => {
+    // The tab is opened only after approval (a declined confirm must leave none behind),
+    // so an open that fails is said after the ask, with nothing sent.
+    fake.state.mainOpen = false;
     fake.state.openFails = true;
+    askConfirm.mockResolvedValue(true);
     await expect(discardAttemptWorktree(run())).rejects.toThrow(/could not be opened/);
     await expect(mergeAttemptWorktree(run())).rejects.toThrow(/could not be opened/);
-    expect(askConfirm).not.toHaveBeenCalled();
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_remove_worktree");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_worktree_merge_teardown");
+    expect(fake.seen).toEqual([]);
+  });
+
+  it("opens no tab for the main checkout when the reader declines, or when the work is refused before it would run", async () => {
+    fake.state.mainOpen = false;
+    askConfirm.mockResolvedValue(false);
+    expect(await mergeAttemptWorktree(run())).toBeNull();
+    expect(await discardAttemptWorktree(run())).toBeNull();
+    trustRepo.mockResolvedValueOnce(null as never);
+    askConfirm.mockResolvedValue(true);
+    expect(await discardAttemptWorktree(run())).toBeNull();
+    expect(fake.opened).toEqual([]);
+    expect(fake.state.mainOpen).toBe(false);
+  });
+
+  it("opens the main checkout once, after approval and before it sends, when no tab holds it", async () => {
+    fake.state.mainOpen = false;
+    askConfirm.mockResolvedValue(true);
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+      if (cmd === "cmd_list_worktrees") return listing(0);
+      return { policy: null, output: {} };
+    });
+    await discardAttemptWorktree(run());
+    expect(fake.opened).toEqual(["/work/repo"]);
+    expect(fake.seen.map((entry) => entry.command)).toEqual(["cmd_remove_worktree", "cmd_delete_branch"]);
+  });
+
+  it("holds a tab that was already open before the ask, so closing it while the reader decides refuses the run", async () => {
+    askConfirm.mockImplementation(async () => { fake.state.stillNamed = () => false; return true; });
+    await expect(discardAttemptWorktree(run())).rejects.toThrow(/repository changed/);
+    expect(fake.opened).toEqual([]);
+    expect(fake.seen).toEqual([{ command: "cmd_remove_worktree", target: { tabId: "tab:/work/repo", path: "/work/repo" } }]);
   });
 
   it("review opens the checkout on its changes, in front", async () => {
