@@ -1,6 +1,7 @@
 //! `GitReader::get_status` on generated repositories of 1k and 10k files,
 //! clean and dirty, and the transcript pass over a 100k-line corpus and a
-//! 10k-distinct-cwd corpus.
+//! 10k-distinct-cwd corpus, and `ledger::redact::text` on representative
+//! `detail_json` rows.
 //!
 //! Run with `cargo bench --manifest-path src-tauri/Cargo.toml --bench repo_read`.
 //!
@@ -187,11 +188,63 @@ fn main() {
          departed row names a distinct removed `.claude/worktrees/<name>` in each line"
     ));
 
+    // The ledger redacts every `object` and `detail_json` before the insert, so
+    // `redact::text` is a per-row cost of everything that records. Three shapes
+    // of what the writers actually store: the 4-field transcript detail, a
+    // 7-field detail (event-time stamp and task added), and a transcript edit
+    // as the writer stores it (the object path plus the 4-field detail). Each
+    // sample redacts REDACT_ROUNDS copies, so the row is long enough to time.
+    let transcript_detail = serde_json::json!({
+        "source": "transcript",
+        "tool": "Edit",
+        "transcript_version": "2.1.241",
+        "git_branch": "pf/1de1ff48-redact",
+    })
+    .to_string();
+    let wide_detail = serde_json::json!({
+        "source": "transcript",
+        "tool": "Edit",
+        "transcript_version": "2.1.241",
+        "git_branch": "pf/1de1ff48-redact",
+        "occurred_at": "2026-09-01T12:00:00.000Z",
+        "occurred_at_basis": "transcript",
+        "task_id": "ft-1de1ff48177ae7b96c27dd1635cc8a1e",
+    })
+    .to_string();
+    let edit_object =
+        "/Users/dev/Code/devtools/GitPulse/.claude/worktrees/pf-redact/src-tauri/src/ledger/redact.rs"
+            .to_string();
+    for (name, texts) in [
+        ("redact::text 4 fields", vec![transcript_detail.clone()]),
+        ("redact::text 7 fields", vec![wide_detail]),
+        (
+            "redact::text transcript edit",
+            vec![edit_object, transcript_detail],
+        ),
+    ] {
+        cases.push(Case::new(name, move || {
+            let mut bytes = 0u64;
+            for _ in 0..REDACT_ROUNDS {
+                for text in &texts {
+                    let out = gitpulse_lib::ledger::redact::text(std::hint::black_box(text));
+                    bytes += out.len() as u64;
+                    std::hint::black_box(&out);
+                }
+            }
+            Sample::default().counter("bytes", bytes)
+        }));
+    }
+    report.note(format!(
+        "redact::text: {REDACT_ROUNDS} redactions per sample of a 4-field detail_json, a 7-field \
+         detail_json, and a transcript edit (object path plus 4-field detail_json)"
+    ));
+
     let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
     report.extend(rows);
     report.finish();
 }
 
+const REDACT_ROUNDS: usize = 2_000;
 const TRANSCRIPT_LINES: usize = 100_000;
 const TRANSCRIPT_CWDS: usize = 10_000;
 
