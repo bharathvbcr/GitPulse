@@ -696,6 +696,21 @@
                     </p>
                   </div>
 
+                  <div data-setting="terminal-gpu" hidden={!shown("terminal-gpu")}>
+                    <SettingToggle
+                      label="GPU terminal rendering"
+                      description="Draws the terminals you can see with WebGL instead of page elements, which keeps a continuously redrawing agent off the interface's main thread."
+                      ariaLabel="GPU terminal rendering"
+                      checked={$interfaceStore.terminalGpu}
+                      onchange={(next) => interfaceStore.setTerminalGpu(next)}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug">
+                      On by default. Turn it off if terminal text draws wrongly on your
+                      graphics hardware. A terminal whose GPU context is lost goes back to
+                      the ordinary renderer for the rest of its life on its own.
+                    </p>
+                  </div>
+
                   <div data-setting="terminal-option-as-meta" hidden={!shown("terminal-option-as-meta")}>
                     <SettingToggle
                       label="Option as Meta in terminals"

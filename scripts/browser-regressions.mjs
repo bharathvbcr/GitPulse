@@ -66,6 +66,12 @@ export function chromeBinary() {
 
 /** How Chrome is started. Chrome is its own process group, so its helpers can
  * be ended with it.
+ *
+ * `--enable-unsafe-swiftshader` lets a host with no GPU (the CI Linux runner)
+ * fall back to software WebGL, which Chrome otherwise refuses. Without it the
+ * terminal page's GPU checks stop at "this browser can create a WebGL2
+ * context", which was reproduced here with `--disable-gpu`. Where a GPU
+ * exists the flag changes nothing.
  * @param {string} chrome @param {string} profile @param {string} url
  */
 export function chromeLaunch(chrome, profile, url) {
@@ -74,6 +80,7 @@ export function chromeLaunch(chrome, profile, url) {
     args: [
       "--headless", `--user-data-dir=${profile}`, "--no-first-run",
       "--no-default-browser-check", "--disable-background-networking", "--window-size=1400,1000",
+      "--enable-unsafe-swiftshader",
       url,
     ],
     /** @type {import('node:child_process').StdioOptions} */

@@ -1663,3 +1663,171 @@ Reading it: a missing graph costs a roughly linear walk, so it is invisible at 5
 Not measured: a repository where auto-maintenance keeps the graph fresh (this repository, 1,398 commits, topo 5000 in 29 ms, cannot show a gap); cold page cache; split chains versus a single file; the cost of writing a graph; repositories with many merges (the fixture is linear, which is the best case for the no-graph walk).
 
 **Not in the committed baseline.** `benches/baselines/` is untouched and the bench is not wired into the scheduled `benches.yml` gate; whether to baseline it is a separate decision. The numbers above are a one-off run.
+
+## 2026-10-14: xterm WebGL renderer, built and NOT yet measured (ft-406d1f4a)
+
+**Status: merged to main on 2026-10-16 on the owner's instruction, before the
+A/B ran.** The owner approved `@xterm/addon-webgl` "if it's better", and the
+win rule below decides "better"; that run is still owed. Until it meets the
+rule, the renderer ships unmeasured, on by default, with Settings ›
+Appearance › GPU terminal rendering as the way off. If a run misses the
+rule, the renderer and the dependency are removed.
+
+### What the branch carries
+
+* `@xterm/addon-webgl` **0.19.0, pinned exact** (as `addon-search` is). It
+  declares no peer range. npm shows it was published on 2025-12-22, 13:51 UTC,
+  the same day as `@xterm/xterm` 6.0.0 (13:50 UTC), `addon-fit` 0.11.0 and
+  `addon-search` 0.16.0. The harness checks below load it against 6.0.0 in
+  Chrome and in WKWebView. `@xterm/addon-canvas` is not an option: nothing
+  exists for xterm 6.
+* `src/lib/terminal/gpuRenderer.ts` owns the lifecycle, and
+  `TerminalSession.svelte` drives it from the same `onscreen` signal it
+  reports to `terminalAttendance`:
+  * A session takes a context only while it is on screen (the selected tab,
+    or either half of a split, in an open dock on the active repository). It
+    disposes the context the moment it is hidden.
+  * Contexts come from one pool capped at `MAX_VISIBLE_SESSIONS` (8). Today
+    the panel can put at most two sessions on screen, so the cap is
+    insurance, not the bound in practice.
+  * Context loss is handled through the canvas's own `webglcontextlost`
+    event, captured on the session's host element. The addon's
+    `onContextLoss` is kept as a backstop. Reading `addon-webgl.mjs` shows the
+    addon `preventDefault`s the loss and waits **3 s** for a restore before it
+    fires `onContextLoss`, with a blank canvas on screen the whole time.
+    Disposing on the event itself is what keeps the pane from blanking.
+  * The session is then marked `lost` (`data-renderer="lost"` on its
+    container) and is never attached again. A context that cannot be created
+    (no WebGL2) is final in the same way.
+* Settings › Appearance › **GPU terminal rendering**, on by default. It is
+  the escape hatch for a driver that draws wrongly, and it is how the A/B
+  switches arms on one build.
+
+### Verified
+
+* `src/lib/terminal/gpuRenderer.test.ts`: attach, hide and show; synchronous
+  dispose on loss with no re-attach across five hide/show rounds; a failed
+  create treated as final; the cap of 8 across 11 sessions.
+* `harness/terminal.html` passes 137 of 137 checks in headless Chrome 155 and
+  137 of 137 in WKWebView (macOS 27), 2026-10-14. The GPU block checks that:
+  * the on-screen session draws through WebGL, and the hidden tab and the
+    other repository's session hold no canvas;
+  * hiding the dock releases the context, and showing it attaches a fresh one;
+  * `WEBGL_lose_context.loseContext()` leaves no canvas, the session reads
+    `lost`, and DOM rows carry text two frames after the loss event (within
+    1 s, not 3 s);
+  * a hide/show cycle does not re-attach it, while another session still gets
+    WebGL;
+  * turning the setting off returns a live WebGL session to DOM rows.
+
+  This is what proves the brief's inferred claim that xterm reverts to its
+  DOM renderer when the addon is disposed. With the capture listener removed,
+  the run fails at "a lost context is disposed at once".
+* A host with no GPU was reproduced with `--disable-gpu`. Chrome then
+  refused WebGL2 and the page stopped at its WebGL2 check. With
+  `--enable-unsafe-swiftshader`, which the runner now always passes, the page
+  passed 137 of 137 on software GL. This was not run on the CI Linux runner
+  itself.
+* The other checks on that page read xterm's DOM rows, so the page runs them
+  with the setting off and turns it on only for the GPU block. As a result,
+  hover, link and search behaviour **under WebGL** is not exercised.
+
+### The bench, and why it has not run
+
+`scripts/tui-redraw-bench.mjs` runs inside a GitPulse terminal session, so
+its bytes take the production path: PTY → reader → per-session output
+Channel → xterm → ack. The bench does not use the legacy events sink that
+`terminal_pty` measures.
+
+* `--mode redraw` repaints every cell at 60 Hz for 30 s.
+* `--mode flood` writes 100 MiB and is timed to the DSR answered after the
+  last byte.
+* `--mode idle` waits 60 s.
+
+Each run samples the test app's WebContent process with `ps -M`. `ps -M`
+reads per-thread CPU of a WebContent process from a normal user shell; this
+was checked on 2026-10-14. Each run appends one JSON line to the results
+file. `--summarize` applies the win rule and fails closed:
+
+* exit 0: ships;
+* exit 1: misses;
+* exit 2: undecided, with every missing piece named.
+
+**The frame probe.** `redraw` also records `dropped_frame_fraction` and
+`frame_p95_ms` from inside the page. The bench asks the session's terminal
+over a private OSC: `OSC 7700 ; frames-start [; period=<ms>]`, then
+`OSC 7700 ; frames-stop`. The terminal answers through the PTY as a terminal
+reply, as it does for a cursor-position report
+(`src/lib/diagnostics/frameProbe.ts`).
+
+* Before the CPU sample starts, 2 s of idle frames measure the page's own
+  rAF period. WebKit can run rAF slower than the display (60 Hz on a 120 Hz
+  panel), so the display's refresh rate would be the wrong yardstick.
+* A dropped frame is an interval longer than 1.5× that period, the
+  definition ft-cc4be67b uses. That card can drive the same probe.
+* The harness checks the probe answers exactly once, through the PTY, and
+  draws nothing on the grid (139 of 139 in Chrome and in WKWebView). With
+  the reply removed, the check fails.
+* What a program in a terminal can learn this way: the page's frame-interval
+  statistics over a window of at most 120 s. It gets no content, no other
+  session's data and no input.
+
+It has not run, for two reasons:
+
+1. **`allowTransparency` is undecided.** ft-cc4be67b is still in backlog. Both
+   arms must use the value it decides, and that card has to run first.
+2. **It needs an attended window and a quiet host.** The installed app must
+   be quit, and no other WebKit host app can be running. On 2026-10-14 the
+   load average was 32 on 18 cores, with 10 agent sessions live.
+
+Known limits of the apparatus, as built:
+
+* The "main thread" is the first thread `ps -M` lists. That is inferred from
+  creation order; `ps` prints no thread names.
+* The echo figure is the round trip of a DSR (`ESC [6n`) sent every 250 ms
+  during the redraw. It is a **proxy** for keystroke-echo p95: it covers the
+  PTY, the Channel and the parse on the main thread, but not the keydown or
+  the final paint.
+* `--arm` and `--transparency` are declared by the person running the bench.
+  The script cannot observe them.
+
+### Procedure, once ft-cc4be67b has decided
+
+1. Set `allowTransparency` in `TerminalSession.svelte` to the decided value
+   and build. Copy the bundle with `cp -c` under a different bundle id. Pass
+   `--env HOME=/private/tmp/gpe-bench` on every `open`.
+2. Quit the installed app and every other WebKit host app. Size the window to
+   1280×850, and record the display refresh rate.
+3. To find the test app's WebContent pid, run
+   `pgrep -f com.apple.WebKit.WebContent` before and after launching it. The
+   new pid is the one.
+4. Open one terminal session and keep it visible. Use Settings › GPU terminal
+   rendering to pick the arm. A session marked `lost` is a failed run: close it
+   and open a fresh one.
+5. Run seven rounds of each mode, alternating which arm goes first (A B, B A,
+   …):
+
+   ```
+   node scripts/tui-redraw-bench.mjs --mode redraw --arm <dom|webgl> --transparency <decided> \
+        --webcontent-pid <pid> --out tmp/tui-bench.jsonl
+   ```
+
+   Then `--mode flood` and `--mode idle` the same way.
+6. Run `node scripts/tui-redraw-bench.mjs --summarize tmp/tui-bench.jsonl`.
+   Add the figures and the verdict to this section. Ship the branch only on
+   exit 0.
+
+**The win rule** (owner decision, 2026-10-12, set by Fable):
+
+* WebContent main-thread CPU-seconds in `redraw` must be at least 2× lower
+  with WebGL.
+* None of these may be worse:
+  * keystroke-echo p95 (here, the DSR proxy);
+  * dropped-frame fraction;
+  * flood throughput;
+  * 60 s idle CPU, which must stay within 1 pp of a core.
+* Any miss means no dependency.
+
+| row | DOM | WebGL | verdict |
+| --- | --- | --- | --- |
+| all | not yet run | not yet run | undecided |

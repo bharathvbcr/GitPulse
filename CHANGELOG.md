@@ -13,6 +13,22 @@ before that tag is pushed.
 
 ### Added
 
+- **GPU terminal rendering**, gated on the TUI-redraw A/B in
+  `docs/PERFORMANCE.md`, which has not run yet.
+  - Terminals you can see draw through `@xterm/addon-webgl` 0.19.0 (a new
+    dependency, pinned exact), so a continuously redrawing agent CLI no longer
+    rebuilds rows of DOM elements on the interface's main thread.
+  - A session holds a WebGL context only while it is on screen, at most 8 at
+    once, and gives it back the moment it is hidden.
+  - A lost context falls back to the DOM renderer at once (within two frames
+    in the harness, not after the addon's 3 s restore wait). That session is
+    never given another context.
+  - **Settings → Appearance → GPU terminal rendering** turns it off.
+  - `scripts/tui-redraw-bench.mjs` is the bench that decides whether this
+    ships. It reads frame pacing through a new private terminal sequence,
+    OSC 7700 (`frames-start` / `frames-stop`). The terminal answers it with
+    frame-interval statistics only. See `docs/TERMINAL.md`.
+
 - Host load governor, cards 1b and 1c: one verdict (`sysload::governor`) from the host-load sensor now decides what GitPulse does under memory pressure. Agent launches are refused at severe pressure (kernel level critical, or a thrashing memory compressor) before their checkout probes, capacity check and PTY open, with a typed `host_pressure` refusal that names the resource and value; the user's own shell is never gated, and stop, kill, cancel, save, commit, release and reconcile are never gated. GitPulse's own work is shed through the spawn gate's existing classes with the existing "deferred under load" marker: background work at `warn`, background and reactive work at critical or thrash, never a user action, resuming when the pressure clears. A stale-old or dead sensor admits with a warning and a `host_load.sensor_unavailable` ledger event and sheds nothing; Health shows it as ungoverned. Overrides are human only: **Admit anyway** (Health, and beside Retry on a refused launch) asks in a native dialog, then admits for two minutes. After 30 minutes of continuous refusal a toast offers one click to stop refusing; the refusal never lifts on its own. New setting `host_load.govern_launches`, new command `cmd_host_load_admit_anyway` (granted to the main window; 279 handlers). See `docs/LOAD_GOVERNOR.md`.
 
 ### Changed
