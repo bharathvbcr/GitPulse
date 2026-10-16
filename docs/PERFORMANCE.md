@@ -1352,10 +1352,16 @@ in part), a tip the listing did not count, a git without the listing, and any
 changed input (the fingerprint is still in the key) are measured as before.
 
 **Persisted data.** The table's primary key changed, so `SCHEMA_VERSION` is 2.
-A file written by an older build is dropped and rebuilt empty by
+The file is now `churn.v2.sqlite`: named for the schema, so an older build
+keeps its own `churn.v1.sqlite` and the two never drop each other's table
+(sharing one name, every start of either build emptied the other's cache and
+the loser fell back to memory;
+`builds_of_different_schema_versions_do_not_rebuild_each_others_cache`). A
+same-named file of another version is still dropped and rebuilt empty by
 `ensure_schema` (`a_cache_from_before_the_base_left_the_key_is_rebuilt`). The
 file is derived data, so the cost is one measurement per branch on the first
-launch. No DevCouncil-owned schema is involved.
+launch; the orphaned `churn.v1.sqlite` is left for the older build. No
+DevCouncil-owned schema is involved.
 
 Bench `churn_spawns` (new): 32 branches, each one commit ahead; `main` gets an
 unrelated commit; the call after it. Process counts come from trace2 on two

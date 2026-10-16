@@ -1362,6 +1362,306 @@ mod tests {
         assert_ne!(FILE_NAME, "churn.v1.sqlite");
     }
 
+    /// A git process in `repo` for the random-history oracle; `false` when it
+    /// refused (a conflicting merge, an empty cherry-pick), which the caller
+    /// then backs out of.
+    fn try_git(repo: &Path, args: &[&str]) -> bool {
+        use crate::procguard::LockedSpawn;
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = command.spawn_locked().expect("spawn git");
+        child
+            .wait_with_output()
+            .expect("wait for git")
+            .status
+            .success()
+    }
+
+    /// What `git` says a branch's churn against `main` is, asked without the
+    /// cache: `--numstat` summed (a second route to what `--shortstat` counts)
+    /// and the left-right count.
+    fn fresh_churn(repo: &Path, name: &str) -> Churn {
+        let spec = format!("main...{name}");
+        let numstat = git_cli::git_text(repo, &["diff", "--numstat", &spec]).unwrap();
+        let (mut additions, mut deletions, mut files_changed) = (0, 0, 0);
+        for line in numstat.lines() {
+            let mut cols = line.split('\t');
+            additions += cols.next().unwrap().parse::<usize>().unwrap();
+            deletions += cols.next().unwrap().parse::<usize>().unwrap();
+            files_changed += 1;
+        }
+        let counts =
+            git_cli::git_text(repo, &["rev-list", "--left-right", "--count", &spec]).unwrap();
+        let (behind, ahead) = git_cli::parse_left_right_count(&counts);
+        Churn {
+            additions,
+            deletions,
+            files_changed,
+            commits_ahead: ahead,
+            commits_behind: behind,
+        }
+    }
+
+    /// The carried answer is what git measures. A carried answer rests on
+    /// "the ahead count is unchanged, so the commit set is" over a base that
+    /// descends from the old one; this throws seeded random histories (commits,
+    /// merges both ways, criss-cross merges, cherry-picks, rebases, rewinds,
+    /// fast-forwards, and many empty advances of `main`) at it and compares
+    /// every branch after every step with a fresh `diff` and `rev-list`.
+    #[test]
+    fn a_carried_answer_is_what_git_measures_over_random_histories() {
+        let (mut carried_answers, mut ancestry_checks) = (0, 0);
+        for seed in 1u64..=8 {
+            let (_dir, repo) = fixture();
+            let cache = tempfile::tempdir().unwrap();
+            let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move |n: usize| -> usize {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % n as u64) as usize
+            };
+            let mut branches = vec!["main".to_string(), "topic".to_string()];
+            for step in 0..22 {
+                let pick = branches[next(branches.len())].clone();
+                let other = branches[next(branches.len())].clone();
+                let what;
+                match next(12) {
+                    0..=2 => {
+                        what = "empty advance of main";
+                        try_git(&repo, &["checkout", "-q", "main"]);
+                        try_git(&repo, &["commit", "-q", "--allow-empty", "-m", "adv"]);
+                    }
+                    3..=4 => {
+                        what = "commit";
+                        try_git(&repo, &["checkout", "-q", &pick]);
+                        let file = format!("f{}.txt", next(3));
+                        let body: String = (0..6).map(|i| format!("{} {}\n", i, next(4))).collect();
+                        std::fs::write(repo.join(&file), body).unwrap();
+                        try_git(&repo, &["add", "."]);
+                        try_git(&repo, &["commit", "-q", "-m", "c"]);
+                    }
+                    5 => {
+                        what = "new branch";
+                        let name = format!("b{step}");
+                        let at = format!("{other}~{}", next(2));
+                        if try_git(&repo, &["branch", &name, &at])
+                            || try_git(&repo, &["branch", &name, &other])
+                        {
+                            branches.push(name);
+                        }
+                    }
+                    6..=7 => {
+                        what = "merge";
+                        try_git(&repo, &["checkout", "-q", &pick]);
+                        if !try_git(&repo, &["merge", "-q", "--no-ff", "-m", "m", &other]) {
+                            try_git(&repo, &["merge", "--abort"]);
+                        }
+                    }
+                    8 => {
+                        what = "cherry-pick";
+                        try_git(&repo, &["checkout", "-q", &pick]);
+                        if !try_git(&repo, &["cherry-pick", "-x", &other]) {
+                            try_git(&repo, &["cherry-pick", "--abort"]);
+                        }
+                    }
+                    9 => {
+                        what = "rebase";
+                        if pick != "main" && !try_git(&repo, &["rebase", "-q", "main", &pick]) {
+                            try_git(&repo, &["rebase", "--abort"]);
+                        }
+                    }
+                    10 => {
+                        what = "fast-forward main";
+                        try_git(&repo, &["checkout", "-q", "main"]);
+                        try_git(&repo, &["merge", "-q", "--ff-only", &other]);
+                    }
+                    _ => {
+                        what = "rewind main";
+                        try_git(&repo, &["checkout", "-q", "main"]);
+                        try_git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+                    }
+                }
+                try_git(&repo, &["checkout", "-q", "-f", "main"]);
+                let report = GitReader::branch_stats(repo.to_str().unwrap()).expect("stats");
+                carried_answers += report.cached;
+                for update in &report.updates {
+                    let reported = Churn {
+                        additions: update.additions,
+                        deletions: update.deletions,
+                        files_changed: update.files_changed,
+                        commits_ahead: update.commits_ahead_of_base,
+                        commits_behind: update.commits_behind_base,
+                    };
+                    assert_eq!(
+                        reported,
+                        fresh_churn(&repo, &update.name),
+                        "seed {seed} step {step} ({what}): {} differs from a fresh measurement",
+                        update.name
+                    );
+                }
+            }
+            ancestry_checks += spawns_named(&repo, "--is-ancestor");
+        }
+        assert!(carried_answers > 0, "the histories never reused an answer");
+        assert!(
+            ancestry_checks > 0,
+            "the histories never carried over a moved base"
+        );
+    }
+
+    /// Points every stored row of `tip` at `base`, as a row written by another
+    /// process (or kept before a failed write) would be.
+    fn restamp(store: &Arc<Mutex<Store>>, tip: &str, base: &str) {
+        store
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE churn SET base = ?1 WHERE tip = ?2",
+                params![base, tip],
+            )
+            .unwrap();
+    }
+
+    /// More distinct stored bases than the carry cap: the cap bounds the
+    /// ancestry processes, and the branches it leaves out are measured, not
+    /// carried on trust.
+    #[test]
+    fn stored_bases_past_the_carry_cap_are_measured_not_carried() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let tree = rev(&repo, "main^{tree}");
+        let mut old_bases = Vec::new();
+        for i in 0..6 {
+            advance(&repo, &format!("m{i}"));
+            let base = rev(&repo, "main");
+            let commit = git_cli::git_text(
+                &repo,
+                &["commit-tree", &tree, "-p", &base, "-m", &format!("b{i}")],
+            )
+            .unwrap();
+            git_in(&repo, &["branch", &format!("k{i}"), commit.trim()]);
+            old_bases.push((format!("k{i}"), commit.trim().to_string(), base));
+        }
+        let path = repo.to_str().unwrap();
+        GitReader::branch_stats(path).unwrap();
+        for (_, tip, base) in &old_bases {
+            restamp(&store, tip, base);
+        }
+        advance(&repo, "unrelated");
+        let (diffs_before, ancestry_before) = (diffs(&repo), spawns_named(&repo, "--is-ancestor"));
+        let report = GitReader::branch_stats(path).unwrap();
+        assert!(
+            spawns_named(&repo, "--is-ancestor") - ancestry_before <= 4,
+            "more ancestry processes than the cap"
+        );
+        assert_eq!(
+            diffs(&repo) - diffs_before,
+            2,
+            "the branches past the cap are measured, the others carried"
+        );
+        for update in &report.updates {
+            let fresh = fresh_churn(&repo, &update.name);
+            assert_eq!(
+                (update.additions, update.deletions, update.files_changed),
+                (fresh.additions, fresh.deletions, fresh.files_changed),
+                "{}",
+                update.name
+            );
+            assert_eq!(
+                update.commits_behind_base, fresh.commits_behind,
+                "{}",
+                update.name
+            );
+        }
+    }
+
+    /// A stored base git cannot place (a shallow clone without it, a pruned
+    /// commit) makes the ancestry question an error: measured, never carried.
+    #[test]
+    fn a_stored_base_git_cannot_place_is_measured_not_carried() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let (_, first) = stats(&repo);
+        restamp(&store, &rev(&repo, "topic"), &"a".repeat(40));
+        advance(&repo, "unrelated");
+        let before = diffs(&repo);
+        let (report, second) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1, "an unplaceable base was trusted");
+        assert_eq!(report.computed, 1);
+        assert_eq!(second.additions, first.additions);
+        assert_eq!(second.commits_behind, 1);
+    }
+
+    /// A carry is written once, in one transaction, and a call that finds
+    /// the carried rows current writes nothing.
+    #[test]
+    fn carried_answers_are_written_once_per_advance() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let tree = rev(&repo, "main^{tree}");
+        let main = rev(&repo, "main");
+        for i in 0..20 {
+            let commit = git_cli::git_text(
+                &repo,
+                &["commit-tree", &tree, "-p", &main, "-m", &format!("b{i}")],
+            )
+            .unwrap();
+            git_in(&repo, &["branch", &format!("many-{i:02}"), commit.trim()]);
+        }
+        let path = repo.to_str().unwrap();
+        GitReader::branch_stats(path).unwrap();
+        advance(&repo, "unrelated");
+        let changes = |store: &Arc<Mutex<Store>>| store.lock().unwrap().conn.total_changes();
+        let at_advance = changes(&store);
+        GitReader::branch_stats(path).unwrap();
+        let carried = changes(&store) - at_advance;
+        assert_eq!(carried, 21, "the carry rewrote more than its rows");
+        let settled = changes(&store);
+        GitReader::branch_stats(path).unwrap();
+        assert_eq!(changes(&store), settled, "a settled call wrote");
+    }
+
+    /// An input that moves after an answer was carried is still seen: the
+    /// carried row sits under the fingerprint it was read with.
+    #[test]
+    fn a_carried_answer_does_not_survive_a_later_input_change() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let (_, baseline) = stats(&repo);
+        advance(&repo, "unrelated");
+        let before = diffs(&repo);
+        stats(&repo);
+        assert_eq!(diffs(&repo) - before, 0, "the answer was carried");
+        git_in(&repo, &["config", "diff.renames", "false"]);
+        let before = diffs(&repo);
+        let (_, unrenamed) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        assert_ne!(unrenamed.files_changed, baseline.files_changed);
+        std::fs::write(repo.join(".git/info/attributes"), "a.txt -diff\n").unwrap();
+        let before = diffs(&repo);
+        stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1, "an attributes change was missed");
+    }
+
     #[test]
     fn a_carried_answer_keeps_the_measurement_and_takes_fresh_counts() {
         let kept = Kept {
