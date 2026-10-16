@@ -252,8 +252,11 @@ pub fn wait_readable_or_woken(fd: RawFd, wake: RawFd) -> Ready {
         return Ready::default();
     }
     // POLLHUP and POLLERR count: a listener that errored must be looked at by
-    // `accept`, and a closed wake pipe means nobody can ever wake us.
-    let any = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+    // `accept`, and a closed wake pipe means nobody can ever wake us. So does
+    // POLLNVAL, a descriptor closed under the waiter: reporting nothing would
+    // return at once, every time, and turn the caller's loop into a spin;
+    // `accept` on it fails and the loop ends.
+    let any = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     Ready {
         listener: descriptors[0].revents & any != 0,
         woken: descriptors[1].revents & any != 0,
@@ -441,6 +444,70 @@ mod tests {
                 .ok(),
             None,
             "fixture cleaned up"
+        );
+    }
+
+    #[test]
+    fn notifying_a_full_pipe_never_blocks_and_one_drain_leaves_it_quiet() {
+        let wake = Wake::new().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..100_000 {
+            wake.notify();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "100k notifies took {:?}",
+            started.elapsed()
+        );
+        let (listener_side, _peer) = UnixStream::pair().unwrap();
+        let ready = wait_readable_or_woken(listener_side.as_raw_fd(), wake.reader_fd());
+        assert!(ready.woken && !ready.listener, "{ready:?}");
+        wake.drain();
+        // Drained to empty: a second wait must block, so give it a waker.
+        let reader = wake.reader_fd();
+        let fd = listener_side.as_raw_fd();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            (wait_readable_or_woken(fd, reader), started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        wake.notify();
+        let (ready, waited) = waiter.join().unwrap();
+        assert!(ready.woken, "{ready:?}");
+        assert!(
+            waited >= Duration::from_millis(150),
+            "a drained pipe still read as readable ({waited:?})"
+        );
+    }
+
+    /// Dropping the writer makes the reader permanently POLLHUP, so a loop that
+    /// kept polling the reader would spin. This pins what the wait reports, and
+    /// why `Wake` must keep both ends alive for as long as anyone polls it.
+    #[test]
+    fn a_writer_dropped_under_a_poller_reads_as_woken_forever() {
+        let Wake { reader, writer } = Wake::new().unwrap();
+        drop(writer);
+        let (listener_side, _peer) = UnixStream::pair().unwrap();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let ready = wait_readable_or_woken(listener_side.as_raw_fd(), reader.as_raw_fd());
+            assert!(ready.woken, "{ready:?}");
+            assert!(started.elapsed() < Duration::from_millis(100));
+        }
+    }
+
+    /// POLLNVAL (a descriptor closed under the waiter) must be reported as
+    /// something to look at; an empty answer makes every caller's loop spin.
+    #[test]
+    fn a_closed_listener_descriptor_is_reported_not_swallowed() {
+        let wake = Wake::new().unwrap();
+        // A descriptor number no thread has open: a number closed a moment ago
+        // can be handed to another test's socket, and the wait would block on it.
+        let fd: RawFd = 900_000;
+        let ready = wait_readable_or_woken(fd, wake.reader_fd());
+        assert!(
+            ready.listener,
+            "POLLNVAL on the listener was swallowed: {ready:?}"
         );
     }
 }
