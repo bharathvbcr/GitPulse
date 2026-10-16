@@ -425,9 +425,462 @@ pub type QueryCancel = Cancel;
 /// this flag leaves the blocking traversal running on the pool.
 pub const QUERY_CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn cancel_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, Cancel>> {
+/// The one shared deadline timer behind every cancellable query.
+///
+/// A single long-lived thread sleeps on a condvar until the earliest
+/// registered deadline (with no timeout at all when nothing is registered, so
+/// an idle process takes no wakeups) and trips that query's cancel flag.
+/// Registering is a map insert, not a thread, so query rate cannot exhaust
+/// threads and the deadline cannot silently disappear under load.
+mod deadline_timer {
+    use super::Cancel;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    /// Most deadlines held at once. A registration past it fails closed; it is
+    /// far above any UI call rate times the 30 s deadline.
+    pub(super) const MAX_PENDING: usize = 65_536;
+
+    /// Identifies one registration so it can be withdrawn on completion.
+    pub(super) type TimerKey = (Instant, u64);
+
+    #[derive(Default)]
+    struct State {
+        next_id: u64,
+        due: BTreeMap<TimerKey, Cancel>,
+        closed: bool,
+    }
+
+    #[derive(Default)]
+    struct Shared {
+        state: Mutex<State>,
+        wake: Condvar,
+        /// Times the worker loop has come round, so a test can tell an idle
+        /// sleep from a spin.
+        #[cfg(test)]
+        passes: std::sync::atomic::AtomicU64,
+        /// Worker passes that should panic, so a test can drive the restart path.
+        #[cfg(test)]
+        panics_left: std::sync::atomic::AtomicU32,
+    }
+
+    impl Shared {
+        fn lock(&self) -> MutexGuard<'_, State> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn run(&self) {
+            // Declared before `state`, so it drops after the lock is released.
+            let _fail_closed = TripPendingOnUnwind(self);
+            let mut state = self.lock();
+            loop {
+                if state.closed {
+                    return;
+                }
+                #[cfg(test)]
+                self.passes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                if self
+                    .panics_left
+                    .try_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    panic!("injected deadline timer panic");
+                }
+                let now = Instant::now();
+                let mut fired = Vec::new();
+                while let Some(entry) = state.due.first_entry() {
+                    if entry.key().0 > now {
+                        break;
+                    }
+                    fired.push(entry.remove());
+                }
+                if !fired.is_empty() {
+                    // Trip outside the lock so registration is never held up.
+                    drop(state);
+                    for cancel in fired {
+                        cancel.cancel();
+                    }
+                    state = self.lock();
+                    continue;
+                }
+                let wait = state
+                    .due
+                    .keys()
+                    .next()
+                    .map(|(at, _)| at.saturating_duration_since(now));
+                state = match wait {
+                    None => self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                    Some(wait) => {
+                        self.wake
+                            .wait_timeout(state, wait)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                };
+            }
+        }
+    }
+
+    /// A worker that panics may be restarted, or may be given up on for good,
+    /// and either way the deadlines it held are no longer guaranteed. Tripping
+    /// them is the fail-closed answer: a cancelled query reports itself, an
+    /// untimed one runs on unseen.
+    struct TripPendingOnUnwind<'a>(&'a Shared);
+
+    impl Drop for TripPendingOnUnwind<'_> {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            let pending = std::mem::take(&mut self.0.lock().due);
+            for cancel in pending.into_values() {
+                cancel.cancel();
+            }
+        }
+    }
+
+    pub(super) struct DeadlineTimer {
+        shared: Arc<Shared>,
+        thread: JoinHandle<()>,
+    }
+
+    impl DeadlineTimer {
+        pub(super) fn start() -> std::io::Result<Self> {
+            let shared = Arc::new(Shared::default());
+            let worker = Arc::clone(&shared);
+            let thread =
+                crate::supervisor::spawn_service(super::DEADLINE_THREAD, move || worker.run())?;
+            Ok(Self { shared, thread })
+        }
+
+        /// False once the supervised thread has given up (repeated panics), at
+        /// which point nothing registered would ever fire.
+        pub(super) fn is_running(&self) -> bool {
+            !self.thread.is_finished()
+        }
+
+        /// Trip `cancel` after `after`. Errors, rather than leaving the query
+        /// untimed, when the timer cannot honour the deadline.
+        pub(super) fn register(
+            &self,
+            cancel: &Cancel,
+            after: Duration,
+        ) -> Result<TimerKey, String> {
+            if !self.is_running() {
+                return Err("the deadline timer thread has stopped".into());
+            }
+            let at = Instant::now()
+                .checked_add(after)
+                .ok_or_else(|| "the query deadline overflows the clock".to_string())?;
+            let mut state = self.shared.lock();
+            if state.closed {
+                return Err("the deadline timer is shut down".into());
+            }
+            if state.due.len() >= MAX_PENDING {
+                return Err(format!("{MAX_PENDING} query deadlines are already pending"));
+            }
+            let key = (at, state.next_id);
+            state.next_id += 1;
+            let earliest = state.due.keys().next().is_none_or(|first| key < *first);
+            state.due.insert(key, cancel.clone());
+            drop(state);
+            if earliest {
+                self.shared.wake.notify_one();
+            }
+            Ok(key)
+        }
+
+        /// Withdraw a registration. False when it already fired or was removed.
+        pub(super) fn deregister(&self, key: &TimerKey) -> bool {
+            self.shared.lock().due.remove(key).is_some()
+        }
+
+        #[cfg(test)]
+        pub(super) fn pending(&self) -> usize {
+            self.shared.lock().due.len()
+        }
+    }
+
+    impl Drop for DeadlineTimer {
+        fn drop(&mut self) {
+            self.shared.lock().closed = true;
+            self.shared.wake.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::test_support::coverage_relaxed;
+        use std::sync::atomic::Ordering;
+        use std::sync::Weak;
+
+        fn passes(timer: &DeadlineTimer) -> u64 {
+            timer.shared.passes.load(Ordering::Relaxed)
+        }
+
+        #[test]
+        fn an_idle_timer_sleeps_without_waking() {
+            let timer = DeadlineTimer::start().expect("start timer");
+            std::thread::sleep(coverage_relaxed(Duration::from_millis(300)));
+            // One pass to find nothing to do, then an untimed wait: a spin or a
+            // poll interval would count in the hundreds.
+            assert!(passes(&timer) <= 2, "idle passes: {}", passes(&timer));
+        }
+
+        #[test]
+        fn a_far_deadline_is_one_timed_wait_not_a_poll() {
+            let timer = DeadlineTimer::start().expect("start timer");
+            let cancel = Cancel::new();
+            timer
+                .register(&cancel, Duration::from_secs(3600))
+                .expect("register");
+            std::thread::sleep(coverage_relaxed(Duration::from_millis(300)));
+            assert!(passes(&timer) <= 3, "passes: {}", passes(&timer));
+            assert!(!cancel.is_cancelled());
+        }
+
+        fn timer_with_policy(
+            name: &'static str,
+            policy: crate::supervisor::Policy,
+        ) -> DeadlineTimer {
+            let shared = Arc::new(Shared::default());
+            let worker = Arc::clone(&shared);
+            let thread = crate::supervisor::spawn_service_with(name, policy, move || worker.run())
+                .expect("start timer");
+            DeadlineTimer { shared, thread }
+        }
+
+        fn fragile(max_fast_failures: u32) -> crate::supervisor::Policy {
+            crate::supervisor::Policy {
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(2),
+                healthy_after: Duration::from_secs(60),
+                max_fast_failures,
+            }
+        }
+
+        fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let limit = Instant::now() + coverage_relaxed(Duration::from_secs(5));
+            while !done() {
+                assert!(Instant::now() < limit, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn a_worker_that_gives_up_leaves_no_registered_query_untimed() {
+            const THREAD: &str = "codeintel-cancel-deadline";
+            let timer = timer_with_policy(THREAD, fragile(2));
+            let parked = Cancel::new();
+            timer
+                .register(&parked, Duration::from_secs(3600))
+                .expect("register");
+            // Every pass from here panics, until the supervisor gives up.
+            timer.shared.panics_left.store(100, Ordering::SeqCst);
+            let earlier = Cancel::new();
+            timer
+                .register(&earlier, Duration::from_secs(3599))
+                .expect("register wakes the worker into its panics");
+            wait_for("the supervisor gives up", || !timer.is_running());
+            assert!(
+                parked.is_cancelled() && earlier.is_cancelled(),
+                "queries registered with a timer that then stopped for good would never be \
+                 timed out; they must be tripped, not left running untimed"
+            );
+            timer
+                .register(&Cancel::new(), Duration::from_secs(1))
+                .expect_err("a stopped timer refuses new registrations");
+
+            // Replacing the stopped timer clears the stopped record it left.
+            let mut slot = Some(Arc::new(timer));
+            let fresh = super::super::running_timer(&mut slot, DeadlineTimer::start)
+                .expect("replacement timer");
+            assert!(fresh.is_running());
+            assert!(
+                !crate::supervisor::degraded()
+                    .iter()
+                    .any(|d| d.subsystem == THREAD),
+                "the replaced timer's stopped record must not outlive it"
+            );
+        }
+
+        #[test]
+        fn a_worker_the_supervisor_restarts_keeps_firing_into_the_same_state() {
+            let timer = timer_with_policy("codeintel-cancel-deadline-restart", fragile(8));
+            timer.shared.panics_left.store(1, Ordering::SeqCst);
+            timer
+                .register(&Cancel::new(), Duration::from_secs(3600))
+                .expect("register wakes the worker into its panic");
+            wait_for("the one panic is spent", || {
+                timer.shared.panics_left.load(Ordering::SeqCst) == 0
+            });
+            let after = Cancel::new();
+            timer
+                .register(&after, Duration::from_millis(40))
+                .expect("register after the restart");
+            wait_for("a deadline set after the restart fires", || {
+                after.is_cancelled()
+            });
+            assert!(timer.is_running());
+        }
+
+        #[test]
+        fn short_deadlines_registered_behind_a_long_one_all_fire_on_time() {
+            let timer = Arc::new(DeadlineTimer::start().expect("start timer"));
+            let parked = Cancel::new();
+            timer
+                .register(&parked, Duration::from_secs(3600))
+                .expect("register");
+            let slack = coverage_relaxed(Duration::from_millis(750));
+            let handles: Vec<_> = (0..16)
+                .map(|t| {
+                    let timer = Arc::clone(&timer);
+                    std::thread::spawn(move || {
+                        for round in 0..25u64 {
+                            std::thread::sleep(Duration::from_micros((t * 37 + round * 11) % 900));
+                            let batch: Vec<_> = [20u64, 40, 80]
+                                .into_iter()
+                                .map(|ms| {
+                                    let cancel = Cancel::new();
+                                    let after = Duration::from_millis(ms);
+                                    let at = Instant::now();
+                                    timer.register(&cancel, after).expect("register");
+                                    (cancel, after, at)
+                                })
+                                .collect();
+                            for (cancel, after, at) in batch {
+                                while !cancel.is_cancelled() {
+                                    assert!(
+                                        at.elapsed() < after + slack,
+                                        "a {after:?} deadline had not fired after {:?}",
+                                        at.elapsed()
+                                    );
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("registering thread");
+            }
+            assert!(!parked.is_cancelled());
+            assert_eq!(timer.pending(), 1, "only the parked deadline remains");
+        }
+
+        #[test]
+        fn dropping_the_timer_stops_its_thread() {
+            let timer = DeadlineTimer::start().expect("start timer");
+            let cancel = Cancel::new();
+            timer
+                .register(&cancel, Duration::from_secs(3600))
+                .expect("register");
+            let shared: Weak<Shared> = Arc::downgrade(&timer.shared);
+            drop(timer);
+            let limit = Instant::now() + coverage_relaxed(Duration::from_secs(5));
+            while shared.upgrade().is_some() && Instant::now() < limit {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                shared.upgrade().is_none(),
+                "the worker still holds the timer state after the timer dropped"
+            );
+        }
+
+        #[test]
+        fn a_full_timer_refuses_instead_of_leaving_a_query_untimed() {
+            let timer = DeadlineTimer::start().expect("start timer");
+            let cancel = Cancel::new();
+            {
+                let mut state = timer.shared.lock();
+                for id in 0..MAX_PENDING as u64 {
+                    state.due.insert(
+                        (Instant::now() + Duration::from_secs(3600), id),
+                        cancel.clone(),
+                    );
+                }
+            }
+            let err = timer
+                .register(&Cancel::new(), Duration::from_secs(1))
+                .expect_err("a full timer must refuse");
+            assert!(err.contains("pending"), "{err}");
+        }
+    }
+}
+
+use deadline_timer::{DeadlineTimer, TimerKey};
+
+/// The process-wide timer, started on first use and started again if its
+/// thread ever stopped. An error means no deadline can be honoured right now.
+fn shared_timer() -> Result<std::sync::Arc<DeadlineTimer>, String> {
+    static TIMER: std::sync::Mutex<Option<std::sync::Arc<DeadlineTimer>>> =
+        std::sync::Mutex::new(None);
+    let mut slot = TIMER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    running_timer(&mut slot, DeadlineTimer::start)
+}
+
+/// The timer in `slot` if its thread is alive, else a freshly `start`ed one
+/// placed there.
+fn running_timer(
+    slot: &mut Option<std::sync::Arc<DeadlineTimer>>,
+    start: impl FnOnce() -> std::io::Result<DeadlineTimer>,
+) -> Result<std::sync::Arc<DeadlineTimer>, String> {
+    if let Some(timer) = slot.as_ref().filter(|timer| timer.is_running()) {
+        return Ok(std::sync::Arc::clone(timer));
+    }
+    let timer = std::sync::Arc::new(
+        start().map_err(|e| format!("could not start the deadline timer: {e}"))?,
+    );
+    *slot = Some(std::sync::Arc::clone(&timer));
+    crate::supervisor::note_recovered(DEADLINE_SUBSYSTEM);
+    // The replaced thread's own "stopped" record would otherwise outlive it.
+    crate::supervisor::note_recovered(DEADLINE_THREAD);
+    Ok(timer)
+}
+
+const DEADLINE_SUBSYSTEM: &str = "codeintel deadline";
+/// The timer thread's name, which is also its supervisor record's subsystem.
+const DEADLINE_THREAD: &str = "codeintel-cancel-deadline";
+
+/// A registered query: its cancel flag and the deadline entry to withdraw
+/// when it finishes.
+struct Registered {
+    cancel: Cancel,
+    deadline: (std::sync::Arc<DeadlineTimer>, TimerKey),
+    /// Another live query held this token when this one registered, so a
+    /// `finish` by token cannot say which of them it belongs to.
+    token_reused: bool,
+}
+
+impl Registered {
+    /// Take the deadline back when the query is done. A reused token's
+    /// deadline is left to expire instead: withdrawing it on the other
+    /// query's finish would leave the one still running untimed.
+    fn withdraw(&self) {
+        if !self.token_reused {
+            self.deadline.0.deregister(&self.deadline.1);
+        }
+    }
+}
+
+fn cancel_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, Registered>> {
     static REGISTRY: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Cancel>>,
+        std::sync::Mutex<std::collections::HashMap<String, Registered>>,
     > = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -435,24 +888,50 @@ fn cancel_registry() -> &'static std::sync::Mutex<std::collections::HashMap<Stri
 /// Register a cancel flag for `token`, also tripped after [`QUERY_CANCEL_DEADLINE`].
 ///
 /// UI dismiss (file switch, unmount) calls [`cancel_query`] with the same token
-/// so the walk stops rather than only having its answer ignored.
+/// so the walk stops rather than only having its answer ignored. If the
+/// deadline cannot be registered the returned flag is already tripped and the
+/// failure is logged: a query is never handed out untimed.
 pub fn begin_cancellable_query(token: Option<&str>) -> Cancel {
+    begin_cancellable_query_with(token, QUERY_CANCEL_DEADLINE, shared_timer)
+}
+
+fn begin_cancellable_query_with(
+    token: Option<&str>,
+    deadline: std::time::Duration,
+    timer: impl FnOnce() -> Result<std::sync::Arc<DeadlineTimer>, String>,
+) -> Cancel {
     let cancel = Cancel::new();
+    let registration = timer().and_then(|timer| {
+        let key = timer.register(&cancel, deadline)?;
+        Ok((timer, key))
+    });
+    let deadline = match registration {
+        Ok(deadline) => deadline,
+        Err(reason) => {
+            log::error!(target: "codeintel", "cancellable query refused, no deadline: {reason}");
+            crate::supervisor::note_degraded(DEADLINE_SUBSYSTEM, &reason);
+            cancel.cancel();
+            return cancel;
+        }
+    };
+    // A query without a token has no handle to finish by, so its entry waits
+    // out its deadline; that is a map slot for 30 s, never a thread. Reusing a
+    // live token replaces the registry entry; both queries keep their
+    // deadlines (see `Registered::withdraw`).
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         let mut map = cancel_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(token.to_string(), cancel.clone());
+        let token_reused = map.contains_key(token);
+        map.insert(
+            token.to_string(),
+            Registered {
+                cancel: cancel.clone(),
+                deadline,
+                token_reused,
+            },
+        );
     }
-    let timed = cancel.clone();
-    let _ = crate::supervisor::spawn_once(
-        "codeintel-cancel-deadline",
-        "codeintel deadline",
-        move || {
-            std::thread::sleep(QUERY_CANCEL_DEADLINE);
-            timed.cancel();
-        },
-    );
     cancel
 }
 
@@ -461,24 +940,32 @@ pub fn cancel_query(token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let mut map = cancel_registry()
+    let removed = cancel_registry()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cancel) = map.remove(token) {
-        cancel.cancel();
-        true
-    } else {
-        false
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(token);
+    match removed {
+        Some(registered) => {
+            registered.cancel.cancel();
+            registered.withdraw();
+            true
+        }
+        None => false,
     }
 }
 
-/// Drop a finished token so the registry cannot grow with every request.
+/// Drop a finished token so the registry cannot grow with every request, and
+/// withdraw its deadline so the timer holds nothing for a completed query.
 pub fn finish_cancellable_query(token: Option<&str>) {
-    if let Some(token) = token.filter(|t| !t.is_empty()) {
-        let mut map = cancel_registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.remove(token);
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return;
+    };
+    let removed = cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(token);
+    if let Some(registered) = removed {
+        registered.withdraw();
     }
 }
 
@@ -3788,5 +4275,234 @@ pub(crate) mod tests {
             report.tests.items.is_empty(),
             "must not return test paths from a stale map"
         );
+    }
+
+    /// Threads in this process, from the kernel's own count.
+    fn process_thread_count() -> usize {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: an all-zero `proc_taskinfo` is a valid value (plain integers).
+            let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+            // SAFETY: `info` is live and `size` is its exact size; the call
+            // writes at most `size` bytes into it.
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDTASKINFO,
+                    0,
+                    (&mut info as *mut libc::proc_taskinfo).cast(),
+                    size,
+                )
+            };
+            assert_eq!(written, size, "proc_pidinfo did not fill proc_taskinfo");
+            info.pti_threadnum as usize
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .count()
+        }
+    }
+
+    #[test]
+    fn a_thousand_instantly_finished_queries_leave_no_threads_behind() {
+        // Warm the shared timer so its one long-lived thread is in the baseline.
+        drop(begin_cancellable_query(None));
+        let baseline = process_thread_count();
+        for i in 0..1000 {
+            let token = format!("thread-count-{i}");
+            let cancel = begin_cancellable_query(Some(&token));
+            assert!(!cancel.is_cancelled());
+            finish_cancellable_query(Some(&token));
+        }
+        let after = process_thread_count();
+        // Other tests start and stop threads concurrently, so allow a constant
+        // of slack; a thread per query would add ~1000.
+        assert!(
+            after <= baseline + 50,
+            "thread count grew from {baseline} to {after} after 1000 fast queries"
+        );
+    }
+
+    fn local_timer() -> std::sync::Arc<DeadlineTimer> {
+        std::sync::Arc::new(DeadlineTimer::start().expect("start timer"))
+    }
+
+    fn begin_on(
+        timer: &std::sync::Arc<DeadlineTimer>,
+        token: Option<&str>,
+        deadline: std::time::Duration,
+    ) -> Cancel {
+        begin_cancellable_query_with(token, deadline, || Ok(std::sync::Arc::clone(timer)))
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let limit = std::time::Instant::now()
+            + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5));
+        while !done() {
+            assert!(std::time::Instant::now() < limit, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(60);
+    const LONG: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    #[test]
+    fn a_query_still_running_at_the_deadline_sees_cancel_tripped() {
+        let timer = local_timer();
+        let cancel = begin_on(&timer, None, SHORT);
+        wait_until("deadline trips the flag", || cancel.is_cancelled());
+        assert_eq!(timer.pending(), 0, "a fired deadline must leave the heap");
+    }
+
+    #[test]
+    fn a_failed_registration_is_logged_and_returns_a_tripped_cancel() {
+        // Warm the shared timer so a concurrent test cannot restart it (and
+        // clear the degraded record) between the failure and the assertion.
+        shared_timer().expect("shared timer");
+        let cancel = begin_cancellable_query_with(Some("refused-token"), LONG, || {
+            Err("simulated thread exhaustion".to_string())
+        });
+        assert!(
+            cancel.is_cancelled(),
+            "a query whose deadline could not be registered must not run untimed"
+        );
+        assert!(
+            !cancel_query("refused-token"),
+            "a refused query must not be left registered"
+        );
+        assert!(
+            crate::supervisor::degraded()
+                .iter()
+                .any(|d| d.subsystem == DEADLINE_SUBSYSTEM),
+            "the refusal must be recorded as a degraded subsystem"
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_deadline_fails_closed() {
+        let timer = local_timer();
+        let cancel = begin_on(&timer, None, std::time::Duration::MAX);
+        assert!(cancel.is_cancelled());
+        assert_eq!(timer.pending(), 0);
+    }
+
+    #[test]
+    fn deadlines_fire_in_deadline_order_not_registration_order() {
+        let timer = local_timer();
+        let long_a = begin_on(&timer, None, LONG);
+        let mid = begin_on(&timer, None, std::time::Duration::from_millis(200));
+        let short = begin_on(&timer, None, SHORT);
+        let long_b = begin_on(&timer, None, LONG);
+        wait_until("short deadline", || short.is_cancelled());
+        wait_until("mid deadline", || mid.is_cancelled());
+        assert!(!long_a.is_cancelled() && !long_b.is_cancelled());
+        assert_eq!(timer.pending(), 2, "only the two long deadlines remain");
+    }
+
+    #[test]
+    fn an_earlier_registration_wakes_a_timer_waiting_on_a_later_one() {
+        let timer = local_timer();
+        let long = begin_on(&timer, None, LONG);
+        // The worker is now parked on the one-hour deadline; a short one
+        // registered afterwards must still fire on time.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let short = begin_on(&timer, None, SHORT);
+        wait_until("short deadline behind a long one", || short.is_cancelled());
+        assert!(!long.is_cancelled());
+    }
+
+    #[test]
+    fn concurrent_registrations_all_fire_and_all_withdraw_cleanly() {
+        let timer = local_timer();
+        let threads = 8;
+        let per_thread = 200;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let timer = std::sync::Arc::clone(&timer);
+                std::thread::spawn(move || {
+                    let mut kept = Vec::new();
+                    for i in 0..per_thread {
+                        if i % 2 == 0 {
+                            kept.push(begin_on(&timer, None, SHORT));
+                        } else {
+                            let token = format!("concurrent-{t}-{i}");
+                            let cancel = begin_on(&timer, Some(&token), LONG);
+                            finish_cancellable_query(Some(&token));
+                            assert!(!cancel.is_cancelled());
+                        }
+                    }
+                    kept
+                })
+            })
+            .collect();
+        let kept: Vec<Cancel> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("registering thread"))
+            .collect();
+        assert_eq!(kept.len(), threads * per_thread / 2);
+        wait_until("every short deadline fires", || {
+            kept.iter().all(Cancel::is_cancelled)
+        });
+        assert_eq!(timer.pending(), 0, "withdrawn and fired entries are gone");
+    }
+
+    #[test]
+    fn finishing_a_query_withdraws_its_deadline() {
+        let timer = local_timer();
+        let _cancel = begin_on(&timer, Some("finish-withdraws"), LONG);
+        assert_eq!(timer.pending(), 1);
+        finish_cancellable_query(Some("finish-withdraws"));
+        assert_eq!(timer.pending(), 0);
+    }
+
+    #[test]
+    fn dismissing_a_query_trips_it_and_withdraws_its_deadline() {
+        let timer = local_timer();
+        let cancel = begin_on(&timer, Some("dismiss-withdraws"), LONG);
+        assert!(cancel_query("dismiss-withdraws"));
+        assert!(cancel.is_cancelled());
+        assert_eq!(timer.pending(), 0);
+    }
+
+    #[test]
+    fn finishing_after_the_deadline_already_fired_is_harmless() {
+        let timer = local_timer();
+        let cancel = begin_on(&timer, Some("fired-then-finished"), SHORT);
+        wait_until("deadline fires", || cancel.is_cancelled());
+        finish_cancellable_query(Some("fired-then-finished"));
+        finish_cancellable_query(Some("fired-then-finished"));
+        assert!(!cancel_query("fired-then-finished"));
+        assert_eq!(timer.pending(), 0);
+    }
+
+    #[test]
+    fn a_reused_token_keeps_the_earlier_querys_deadline() {
+        let timer = local_timer();
+        let first = begin_on(&timer, Some("reused-token"), SHORT);
+        let second = begin_on(&timer, Some("reused-token"), LONG);
+        // The registry now names the second query; the first still has its
+        // deadline and must not run untimed.
+        wait_until("first query's deadline", || first.is_cancelled());
+        assert!(!second.is_cancelled());
+        finish_cancellable_query(Some("reused-token"));
+        // The second's entry is not withdrawn: the token no longer says which
+        // of the two queries finished. It expires on its own deadline.
+        assert_eq!(timer.pending(), 1, "the second's deadline stays in force");
+    }
+
+    #[test]
+    fn finishing_an_earlier_query_does_not_untime_a_later_one_on_the_same_token() {
+        let timer = local_timer();
+        let _first = begin_on(&timer, Some("shared-token"), LONG);
+        let second = begin_on(&timer, Some("shared-token"), SHORT);
+        // The first query finishes while the second is still running.
+        finish_cancellable_query(Some("shared-token"));
+        wait_until("the second query keeps its deadline", || {
+            second.is_cancelled()
+        });
     }
 }
