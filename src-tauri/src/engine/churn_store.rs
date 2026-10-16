@@ -1546,7 +1546,10 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
         let tree = rev(&repo, "main^{tree}");
-        let mut old_bases = Vec::new();
+        // The fixture's `topic` gets a base of its own (the commit it forked
+        // from), so every stored base names exactly one tip: 7 distinct bases,
+        // 4 carried, 3 measured, whichever 4 the call happens to ask about.
+        let mut old_bases = vec![("topic".to_string(), rev(&repo, "topic"), rev(&repo, "main"))];
         for i in 0..6 {
             advance(&repo, &format!("m{i}"));
             let base = rev(&repo, "main");
@@ -1572,7 +1575,7 @@ mod tests {
         );
         assert_eq!(
             diffs(&repo) - diffs_before,
-            2,
+            3,
             "the branches past the cap are measured, the others carried"
         );
         for update in &report.updates {
