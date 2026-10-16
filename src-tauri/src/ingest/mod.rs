@@ -87,6 +87,13 @@ pub struct CatchUp {
     /// a number that only grows is a family that never will.
     #[serde(default)]
     pub family_unresolved_cycles: i64,
+    /// The earlier locations of this repository, as the ledger's rows named
+    /// them, that this pass took over because the repository was moved or
+    /// renamed. Non-empty on exactly the one pass that did it (the take-over is
+    /// also a durable `ledger.reanchor` row), so a moved repository is reported
+    /// once and never silently. Not an error: the pass went on.
+    #[serde(default)]
+    pub reanchored_from: Vec<String>,
     /// Reflog entries replayed.
     pub reflog_entries: i64,
     /// True when the wall-clock deadline stopped the pass early.
@@ -1589,3 +1596,5 @@ mod watermark_tests {
 mod event_time_tests;
 #[cfg(test)]
 mod family_tests;
+#[cfg(test)]
+mod reanchor_tests;

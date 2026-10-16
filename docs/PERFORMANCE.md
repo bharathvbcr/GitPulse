@@ -819,6 +819,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
+| `graph_spawns` | `cmd_get_commit_graph` at the default 5,000-row cap on 6,000 commits; `cmd_get_stack_hierarchy` with 20 branches beyond its 2,000-commit window, cold and with refs unmoved; each with git processes | ft-9cfa4f74 (S4-03, S4-04) |
 
 `src/watcher/bench_seam.rs` is a `#[doc(hidden)]` module that builds the same
 `IgnoreRules` (through the same `parse_ignored_directories`) and calls the same
@@ -1298,3 +1299,196 @@ conflict-resolution saves rely on it.
   recorded and gated in order, so the rename refuses on the same file it did
   before. The sidecar protocol has no batch op (`policy.check.file` takes one
   path), so each rewrite is still judged on its own.
+
+## 2026-10-15: graph and stack history walks (ft-9cfa4f74, S4-03 and S4-04)
+
+Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench graph_spawns`.
+Rows and fixtures are described in the bench's header. The cold rows move a tag
+before every timed call so the ref cache cannot answer; the warm row reads a
+repository whose refs have been idle for longer than the cache's racy window.
+
+**The spawn counters are the gate.** This host runs at load 40 to 200 on 18
+cores, so the time columns are recorded with the load beside them and do not
+pass or fail anything.
+
+### Baseline (unmodified `cd52ff3c`)
+
+| row | git processes | min of 2 runs | run 1 min / p50 | run 2 min / p50 | load1 at start (run 1, run 2) |
+| --- | --- | --- | --- | --- | --- |
+| S4-04 graph default page, 5,000 rows of 6,000 commits | **12** | 61.3 ms | 70.0 / 91.1 ms | 61.3 / 73.6 ms | 49.3, 49.5 |
+| S4-03 stack refresh, 20 branches beyond the window, cold | **28** | 237.6 ms | 237.6 / 286.6 ms | 264.6 / 315.8 ms | 49.3, 49.5 |
+| S4-03 stack refresh, refs unmoved (warm) | **20** | 236.3 ms | 236.3 / 289.7 ms | 255.4 / 295.6 ms | 49.3, 49.5 |
+
+N = 9 per row after one warmup, two runs. The warm stack row still spawns 20
+processes: the first-parent repairs bypass the ref cache, so an idle repository
+pays one walk per unresolved branch on every tick, and nothing else (the branch
+listing, the history read and the default-branch probes are answered from the
+cache). The cold row's 28 are 20 walks and 8 others. A spawn log of the same
+refresh in a unit test names 7 of the 8: the default-branch probes (`config
+--list`, two `symbolic-ref`, `remote`, a `for-each-ref` over the conventional
+names), the branch listing and the history read. The eighth is not identified
+(trace2 counts every process, including ones git starts itself).
+
+**Counting the warm row.** `count_git_processes` rewrites the hermetic global
+git config, and the ref cache stamps that file, so the first call inside a
+counted block is always cold and nothing is kept until the new file is older
+than the 3 s racy window. The warm count is the difference between two counted
+blocks that wait that window out: one call, and two calls. (The first version
+of this bench counted the warm row in one block and printed the cold figure,
+28, beside a warm time; the pre-fix test
+`a_stack_refresh_with_no_ref_movement_spawns_nothing` independently saw 20
+`rev-list` walks and nothing else on a warm tick.)
+
+Baselines were built from the unmodified tree at `cd52ff3c` plus this bench file
+only (`src-tauri/src` and `src-tauri/tests` checked out from `HEAD`), and run
+interleaved with the fixed build (A B A B) so host load lands on both.
+
+### After
+
+| row | git processes, before to after | min of 2 runs, before to after | after, run 1 min / p50 | after, run 2 min / p50 | load1 at start (run 1, run 2) |
+| --- | --- | --- | --- | --- | --- |
+| S4-04 graph default page | 12 to **11** | 61.3 to 35.4 ms | 40.7 / 63.0 ms | 35.4 / 45.6 ms | 47.8, 43.6 |
+| S4-03 stack refresh, 20 branches beyond the window, cold | 28 to **9** | 237.6 to 19.4 ms | 23.4 / 27.5 ms | 19.4 / 22.3 ms | 47.8, 43.6 |
+| S4-03 stack refresh, refs unmoved (warm) | 20 to **0** | 236.3 to 2.1 ms | 2.1 / 3.5 ms | 2.2 / 3.0 ms | 47.8, 43.6 |
+
+The counters are the result; the times are recorded beside load 44 to 50 on 18
+cores and gate nothing. What changed:
+
+* **S4-04.** A kept history chunk is `chunk` rows plus the first row of the next
+  one, so a window of n rows needs ceil((n - 1) / chunk) chunks. The default
+  page is 5,000 rows plus the has_more probe: one `git log -n5001` instead of
+  `-n5000` and a second `--skip=5000 -n5000` walk for one row. Chunks stay
+  aligned and kept, so growing the window still reads only the chunks it has
+  not held (`chunk_windows_around_every_boundary_read_the_fewest_walks` pins
+  c, c+1, 2c, 2c+1 and 2c+2, and the existing grow test is unchanged). The
+  one process saved is the 5,000-row walk and parse, not the whole page; the
+  other 11 are not touched by this change (inferred: the graph's ref, HEAD and
+  default-branch reads, and one more).
+* **S4-03.** The 20 per-branch `rev-list --first-parent --max-count=100000`
+  walks are one `rev-list --first-parent --parents` over every unresolved tip,
+  read through the ref cache over `refs/heads`, with a 20 s deadline and the
+  same 100,000-commit cap shared across the tips. The cap is read newest first
+  across every tip, so a deep unrelated branch can spend it before a shallow
+  branch's fork point is reached; a chain the shared cap cut therefore gets its
+  own single-tip pass over the deadline that is left, as the per-branch walks
+  had (only after the shared cap is exhausted, so it costs nothing in the
+  common case). An idle repository's next tick
+  is answered without a process. `--not` is deliberately not used: excluding
+  the other tips also excludes whatever a tip sitting mid-chain can reach
+  (`excluding_other_tips_would_cut_a_chain_a_mid_chain_tip_shares`), and the
+  window's own commits cannot be excluded for the same reason. A branch the pass could not
+  finish (cap, deadline, a failed git) is counted in the payload as
+  `unresolved_branches`, with `walk_incomplete`, and shown in the Stack view;
+  it was previously left parentless without saying so.
+* **Not changed.** The default-branch probes (`config --list`, two
+  `symbolic-ref`, `remote`, one `for-each-ref`) run again after any ref moves,
+  5 of the 9 remaining cold spawns. They are outside this card.
+
+## 2026-10-15: branch churn survives a default-branch advance (ft-9cfa497403d3338f25e75bdb97176a44, S4-06)
+
+`churn_store` keyed a row `(repo, inputs, base, tip)`, so one commit on the
+default branch missed every branch's row and `branch_stats` ran one
+`diff --shortstat` per branch again (96 a call, serial, 5 s budget). The row is
+now keyed `(repo, inputs, tip)` and records the base it was measured against.
+
+The rule for keeping an answer over a moved base lives with the value
+(`churn_store::Kept::carried`): the new base must descend from the recorded
+one, and the tip's ahead count against the new base (from the one
+`tip_counts_against` listing, always fresh) must be the recorded count. The
+set of a branch's own commits can only shrink as the base grows, so an equal
+count is an equal set, hence the same merge base and the same diff. Behind is
+taken from the listing; the carried answer is re-kept against the new base. The
+descent costs one `merge-base --is-ancestor` per distinct stored base, at most
+`MAX_CARRY_BASES` (4) a call, and none when every row is already against the
+current base. A rewound or replaced base, a branch the base absorbed (fully or
+in part), a tip the listing did not count, a git without the listing, and any
+changed input (the fingerprint is still in the key) are measured as before.
+
+**Persisted data.** The table's primary key changed, so `SCHEMA_VERSION` is 2.
+The file is now `churn.v2.sqlite`: named for the schema, so an older build
+keeps its own `churn.v1.sqlite` and the two never drop each other's table
+(sharing one name, every start of either build emptied the other's cache and
+the loser fell back to memory;
+`builds_of_different_schema_versions_do_not_rebuild_each_others_cache`). A
+same-named file of another version is still dropped and rebuilt empty by
+`ensure_schema` (`a_cache_from_before_the_base_left_the_key_is_rebuilt`). The
+file is derived data, so the cost is one measurement per branch on the first
+launch; the orphaned `churn.v1.sqlite` is left for the older build. No
+DevCouncil-owned schema is involved.
+
+Bench `churn_spawns` (new): 32 branches, each one commit ahead; `main` gets an
+unrelated commit; the call after it. Process counts come from trace2 on two
+repository copies (advance only, advance and call), so priming and the advance
+do not count. Interleaved pre-fix / post-fix binaries, two rounds each, on a
+host at load 91-104 on 18 cores; the counters are the gate, the times are
+recorded.
+
+| | shortstat | merge-base | ahead-behind listing | all processes | min (round 1, 2) | p50 (round 1, 2) |
+|---|---|---|---|---|---|---|
+| before | 32 | 0 | 1 | 44 | 650 ms, 666 ms | 874 ms, 731 ms |
+| after | 0 | 1 | 1 | 13 | 162 ms, 181 ms | 212 ms, 253 ms |
+
+The 13 after are the call's fixed reads (config, ref listings, the base
+probes, the `for-each-ref` ahead-behind listing) and the one ancestry check.
+`merge-base` is 0 before because `diff --shortstat <base>...<tip>` finds its
+own merge base inside the shortstat process.
+
+## 2026-10-16: `local-macos-aarch64` baseline brought up to the integration head (ft-f069aa425202f3abe84fe2a573dbbf6a)
+
+The committed baseline had drifted from `bl/integrate-1013` (`c462eda6`), so the
+gate failed on counters. A fresh `command_timings` run at that head against the
+old baseline reported exactly one counter change; the two new benches had no
+rows at all. Every counter that moved, and what moved it:
+
+| bench / row | counter | before | after | cause |
+| --- | --- | --- | --- | --- |
+| `command_timings` / list_worktrees full | git_processes | 38 | **42** | CARD 20 (ft-9d044274, merge `94443dfb`): destructive callers read the default base fresh, not from the cache |
+| `command_timings` / commit details | git_processes | 1 | **1** (no baseline change) | the bench counted the one-time `git version` probe as 2; the warm-up below removes it |
+| `graph_spawns` (3 rows) | git_processes 11, 9, 0 | no row | added | CARD 17 (ft-9cfa4f74): the rows this card's own section above records as its "After" |
+| `churn_spawns` (1 row) | git_processes 13 | no row | added | CARD 19 (ft-9cfa4974): the "after" row of the churn table above |
+
+**list_worktrees full, 38 to 42.** Measured, not inferred: the same bench with
+`src-tauri/src` taken from `94443dfb^1` (the integration head without CARD 20)
+counts 38, and at `c462eda6` it counts 42. The `git` argv list at 42 is 18
+`status --porcelain -z`, 17 `diff --no-ext-diff HEAD --shortstat`, one
+`worktree list`, one `for-each-ref` over the ahead/behind listing and the
+default-branch names, and the four default-base reads: `config --list -z`,
+`symbolic-ref --quiet HEAD`, `symbolic-ref --quiet refs/remotes/origin/HEAD`
+and `remote`. The listing is intended to start those four: the default-branch
+protection (`is_default_branch`) and the default base now read config and HEAD
+straight from git (`Reads::Fresh`) so an `include.path` change or a moved HEAD is
+seen at once. The cached `default_base` path is unchanged.
+
+**commit details, and the `git version` probe.** The old baseline said 1 and the
+integration head's bench reads 2 without a warm-up (measured with the warm-up
+removed, `--smoke`: the two processes are `git version` and the `git show`). The
+second process is `git version`, the process-wide probe `git_preflight` runs once and
+caches when it passes. `GitReader::get_commit_details` reaches it through
+`git_supports(DIFF_MERGES_OPTION)`, so whichever row calls it first in a process
+pays for it; the counted commit details pass was the first. Production does not
+pay it per call: it is one process per run of the app, and a later call finds the
+cached answer. The bench now calls `git_preflight` before the first counted pass
+and asserts the status is Ok (a failed probe is never cached, so a broken git
+would put the probe back inside a counted row), and the commit details pass
+records its argvs and asserts none of them is `git version` (trace2's argv starts
+with the git binary and the app's `-c` pairs, so the subcommand is matched as a
+whole word after argv[0]). With the warm-up removed the assertion fails and
+prints both argvs; with it restored the counter is 1.
+
+**New rows.** `graph_spawns` and `churn_spawns` are seeded into the baseline
+with `scripts/bench-compare.mjs --write-baseline` run over a directory holding
+only their two reports, and those two benches spliced into the committed file
+(load 0.4 to 0.5x when they ran). The existing `command_timings` times were not
+re-seeded: that run was at load 19.5 on 18 cores (1.1x), and a baseline taken
+then would loosen the time gate for every row. Only the `list_worktrees full`
+counter was changed in that bench. Its min-of-N (349.1 ms) was left as it is;
+the fresh run measured 321.2 ms with the extra four processes, so the time gate
+is not weakened by the counter change.
+
+`.github/workflows/benches.yml` runs a fixed `BENCHES` list that does not name
+`graph_spawns` or `churn_spawns`. A class with a committed baseline that carries
+them would fail the compare with "baselined but produced no report". Only
+`local-macos-aarch64` carries a baseline today, and it is compared by hand; add
+both benches to that list in the same change that seeds `ubuntu-latest` or
+`macos-latest`.
+

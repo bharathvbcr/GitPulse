@@ -8,7 +8,7 @@ import CommandPalette from "../src/lib/components/CommandPalette.svelte";
 import { FRECENCY_KEY } from "../src/lib/palette/model";
 import { graphStore } from "../src/lib/stores/graphStore";
 import PromptModal from "../src/lib/components/PromptModal.svelte";
-import { cancelPrompt } from "../src/lib/stores/modalStore";
+import { cancelPrompt, completePrompt } from "../src/lib/stores/modalStore";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], calls = [], pending = new Map();
@@ -32,6 +32,7 @@ const fixture = {
  cmd_workspace_sync: () => ({ repos: [] }),
  cmd_workspace_list: () => ({ version: 1, registry_root: "/fixture/GitPulse", registry_path: "fixture", repos: missingRegistry ? [] : [{ name: "other", root: "/fixture/other", db: "", db_path: "" }] }),
  cmd_list_repo_files: () => files,
+ cmd_create_branch: () => "", cmd_fetch: () => "",
  cmd_codeintel_search: a => new Promise(resolve => pending.set(a.query, resolve)),
  cmd_workspace_search: () => { if (failWorkspace) throw Error("Workspace offline"); return { items: [symbol("workspaceResult", "other")], shown: 1, total: partialWorkspace ? 75 : 1, hidden: partialWorkspace ? 74 : 0, truncated: partialWorkspace, unavailable: partialWorkspace ? [{repo:"unavailable-repo",reason:"Index missing"}] : [], repos_queried: 1, semantic: false }; },
 };
@@ -118,6 +119,23 @@ if (params.has("check")) {
   await key("k", { metaKey: true }); check("the palette cannot cover an active prompt", !input());
   cancelPrompt(); await waitFor(() => !promptRoot.querySelector('[aria-modal="true"]')); await open(); await waitFor(input);
   check("cancelled prompts do not record command use", !Object.hasOwn(JSON.parse(localStorage.getItem(FRECENCY_KEY) ?? "{}"), "new_branch"));
+  // A name prompt raised in one repository is answered after another opened:
+  // the branch is created in the repository the palette was built for, or not
+  // at all, and never in the one now in front.
+  const origin = get(repoStore).currentPath;
+  await type("Create New Branch"); await key("Enter"); await waitFor(() => promptRoot.querySelector("input"));
+  const createsBefore = calls.filter(c => c.cmd === "cmd_create_branch").length;
+  await repoStore.openRepo("/fixture/branch-prompt-other"); await settle();
+  completePrompt("from-palette"); await settle(); await new Promise(resolve => setTimeout(resolve, 200)); await settle();
+  const created = calls.filter(c => c.cmd === "cmd_create_branch").slice(createsBefore);
+  check("a branch named after the repository changed is never created in the one now in front", created.every(c => c.args.repoPath === origin) && !created.some(c => c.args.repoPath === "/fixture/branch-prompt-other"));
+  check("and where it is created, it is the repository the palette was built for", created.length === 1 && created[0].args.branchName === "from-palette");
+  await repoStore.openRepo(origin); await settle();
+  await open(); await type("Fetch All Remotes");
+  const fetchesBefore = calls.filter(c => c.cmd === "cmd_fetch").length;
+  await key("Enter"); await settle(); await new Promise(resolve => setTimeout(resolve, 100));
+  check("a palette command with no prompt runs in the repository in front, through the store", (f => f.length === 1 && f[0].args.repoPath === origin)(calls.filter(c => c.cmd === "cmd_fetch").slice(fetchesBefore)));
+  if (!input()) await open();
   await type("?"); check("help is filtered by its search text", Boolean(option("Type #")));
   await type("?workspace"); check("help search narrows the mode list", Boolean(option("Type ::")) && !option("Type #"));
   await key("Escape"); localStorage.setItem(FRECENCY_KEY,"null"); await open(); check("malformed history cannot crash reopening", Boolean(input()));

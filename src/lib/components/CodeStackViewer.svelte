@@ -18,6 +18,7 @@
     rootlessBranches,
     stackBranchFacts,
     stackTreeRows,
+    unresolvedStackNotice,
     type RestackStep,
   } from "../stack/tree";
   import { untrack } from "svelte";
@@ -77,6 +78,7 @@
   const stackBreadcrumb = $derived(payload?.breadcrumb ?? null);
   const stackDefaultBranch = $derived(payload?.default_branch ?? null);
   const rows = $derived(stackTreeRows(stackNodes));
+  const unresolvedNotice = $derived(unresolvedStackNotice(payload));
   const unplaced = $derived(
     rootlessBranches(stackNodes, $repoStore.branches, stackDefaultBranch ?? ""),
   );
@@ -329,6 +331,13 @@
         <RefreshCw size={12} class={isLoading ? "animate-spin" : ""} />
         <span>Retry</span>
       </button>
+    </div>
+  {/if}
+
+  {#if unresolvedNotice}
+    <div data-testid="stack-unresolved" class="mb-3 max-w-3xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300">
+      <CircleAlert size={14} class="shrink-0 mt-px" />
+      <span>{unresolvedNotice}</span>
     </div>
   {/if}
 

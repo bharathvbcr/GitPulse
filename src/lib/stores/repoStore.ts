@@ -12,7 +12,9 @@ import { createDiffSelection } from "../repos/diffSelection";
 import { sessionsByRepo, terminalSessions } from "../terminal/sessionRegistry";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
-import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
+import { parseTagList, type BranchInfo, type DeadbranchCleanResult, type DeadbranchRestoreResult, type MergeTeardownResult, type TagInfo, type WorktreeCreated, type WorktreeRemoval } from "../branches/types";
+import type { DeleteOutcome } from "../files/types";
+import { readFileWriteError } from "../files/fileWrite";
 import { filterStore } from "./filterStore";
 import { graphStore } from "./graphStore";
 import { interfaceStore } from "./interfaceStore";
@@ -1670,6 +1672,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       return session ? { tabId: session.id, path: session.path } : null;
     },
+    /**
+     * Whether `target` still names the repository in front. For a surface that
+     * shows one repository's data (a dialog, a palette built from a snapshot)
+     * and must refuse to act once another is active, even though the tab the
+     * data came from is still open and `runMutating` would run there.
+     */
+    targetIsActive: (target: MutationTarget | null): boolean => {
+      const session = activeSession();
+      return Boolean(target && session && resolveTarget(target) === session);
+    },
     contentRevisions: { subscribe: contentRevisions.subscribe },
     setError: (error: string | null) => {
       // Every user-facing error funnels through here; mirror it into the
@@ -2767,13 +2779,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName }),
         { target },
       ),
-    deleteBranch: async (branchName: string, force: boolean = false, target?: MutationTarget | null) =>
+    /**
+     * `handled`: the caller reports a refusal itself (a row that says the
+     * branch was kept), so it is returned and journalled but not also filed on
+     * the session as an error banner.
+     */
+    deleteBranch: async (branchName: string, force: boolean = false, target?: MutationTarget | null, handled: boolean = false) =>
       runMutating(
         force ? "branch-delete-force" : "branch-delete",
         branchName,
         (path) =>
           invokeFn("cmd_delete_branch", { repoPath: path, branchName, force }),
-        { target },
+        { target, expected: handled ? () => true : undefined },
       ),
     // --- stash ----------------------------------------------------------
 
@@ -2882,6 +2899,153 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     deleteTag: async (tagName: string, target?: MutationTarget | null) =>
       runMutating("tag-delete", tagName, (path) =>
         invokeFn("cmd_delete_tag", { repoPath: path, tagName }),
+        { target },
+      ),
+
+    // --- files, worktree housekeeping and branch cleanup ----------------------
+
+    /**
+     * Creates an empty file, refusing to overwrite. A host refusal that says
+     * the file already exists is the caller's to handle (the name prompt
+     * reopens on it), so it comes back on `cause` and is not filed on the
+     * session as an error.
+     */
+    createFile: async (filePath: string, target?: MutationTarget | null) =>
+      runMutating("create", filePath, (path) =>
+        invokeFn("cmd_create_file", { repoPath: path, filePath }),
+        {
+          target,
+          // Only the refusal for THIS path: the host echoes the path it was
+          // given, and a refusal about any other is a failure like the rest.
+          expected: (err) => {
+            const refusal = readFileWriteError(err);
+            return refusal?.code === "already_exists" && refusal.path === filePath;
+          },
+        },
+      ),
+    movePath: async (from: string, to: string, target?: MutationTarget | null) =>
+      runMutating("move", `${from} → ${to}`, (path) =>
+        invokeFn("cmd_move_path", { repoPath: path, from, to }),
+        { target },
+      ),
+    deletePath: async (filePath: string, target?: MutationTarget | null) =>
+      runMutating<DeleteOutcome>("delete", filePath, (path) =>
+        invokeFn("cmd_delete_path", { repoPath: path, path: filePath }),
+        { target },
+      ),
+    pruneWorktrees: async (target?: MutationTarget | null) =>
+      runMutating("worktree-prune", "stale worktree metadata", (path) =>
+        invokeFn("cmd_prune_worktree", { repoPath: path }),
+        { target },
+      ),
+    worktreeCowSync: async (worktreePath: string, target?: MutationTarget | null) =>
+      runMutating("worktree-cow-sync", worktreePath, (path) =>
+        invokeFn("cmd_worktree_cow_sync", { repoPath: path, targetPath: worktreePath }),
+        { target },
+      ),
+    /**
+     * The worktree commands below return `Guarded<T>`, so a successful call
+     * carries its payload on `output`. `handled` is the same flag as on
+     * `deleteBranch`: the panel or row that asked reports the failure itself.
+     */
+    addWorktree: async (
+      request: { targetPath: string; newBranch: string | null; startPoint: string | null; detach: boolean; cowCaches: boolean; runHooks: boolean },
+      target?: MutationTarget | null,
+      handled: boolean = false,
+    ) =>
+      runMutating<WorktreeCreated>(
+        "worktree",
+        request.newBranch ? `${request.newBranch} → ${request.targetPath}` : request.targetPath,
+        (path) =>
+          invokeFn("cmd_add_worktree", {
+            repoPath: path,
+            targetPath: request.targetPath,
+            newBranch: request.newBranch,
+            startPoint: request.startPoint,
+            detach: request.detach,
+            cowCaches: request.cowCaches,
+            runHooks: request.runHooks,
+          }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    removeWorktree: async (targetPath: string, force: boolean, target?: MutationTarget | null, handled: boolean = false) =>
+      runMutating<WorktreeRemoval>(
+        "worktree-remove",
+        targetPath,
+        (path) => invokeFn("cmd_remove_worktree", { repoPath: path, targetPath, force }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    lockWorktree: async (targetPath: string, target?: MutationTarget | null, handled: boolean = false) =>
+      runMutating(
+        "worktree-lock",
+        targetPath,
+        (path) => invokeFn("cmd_lock_worktree", { repoPath: path, targetPath, reason: null }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    unlockWorktree: async (targetPath: string, target?: MutationTarget | null, handled: boolean = false) =>
+      runMutating(
+        "worktree-unlock",
+        targetPath,
+        (path) => invokeFn("cmd_unlock_worktree", { repoPath: path, targetPath }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    /**
+     * Merges the worktree's branch and removes it. `expectedTip` is the commit
+     * the caller showed the person: the host merges nothing when the branch is
+     * anywhere else once it holds its lock. Its typed refusal stays on `cause`.
+     */
+    worktreeMergeTeardown: async (
+      request: { worktreePath: string; targetBranch: string | null; squash: boolean; expectedTip: string },
+      target?: MutationTarget | null,
+      handled: boolean = false,
+    ) =>
+      runMutating<MergeTeardownResult>(
+        "worktree-merge",
+        `${request.worktreePath} merge-teardown`,
+        (path) =>
+          invokeFn("cmd_worktree_merge_teardown", {
+            repoPath: path,
+            worktreePath: request.worktreePath,
+            targetBranch: request.targetBranch,
+            squash: request.squash,
+            expectedTip: request.expectedTip,
+          }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    /**
+     * A mutation target for the repository at `rawPath`, opening it in the
+     * background when no tab holds it. For flows that act on a repository other
+     * than the one in front (an attempt's main checkout) and must capture it
+     * before they ask. Null when it cannot be opened, or when the tab that
+     * names it is missing or untrusted (a target that could only be refused).
+     * `open: false` only looks: a caller that has not been approved yet must
+     * not leave a tab behind if the person declines.
+     */
+    targetForPath: async (rawPath: string, lookup: { open?: boolean } = {}): Promise<MutationTarget | null> => {
+      const find = (spelling: string): MutationTarget | null => {
+        for (const tab of internal.workspace.tabs) {
+          const session = internal.sessions[tab.id];
+          if (!session || !sameRepo(session.path, spelling, options)) continue;
+          const target = { tabId: session.id, path: session.path };
+          return resolveTarget(target) ? target : null;
+        }
+        return null;
+      };
+      const existing = find(rawPath);
+      if (existing || lookup.open === false) return existing;
+      if (!(await store.openRepo(rawPath, { activate: false }))) return null;
+      // The tab sits under the canonical path, which a symlinked or aliased
+      // spelling does not equal as a string.
+      return find(rawPath) ?? find((await resolvePath(rawPath).catch(() => null))?.path ?? rawPath);
+    },
+    deadbranchClean: async (branches: string[], force: boolean, createBackup: boolean, target?: MutationTarget | null) =>
+      runMutating<DeadbranchCleanResult>("deadbranch-clean", `${branches.length} branches`, (path) =>
+        invokeFn("cmd_deadbranch_clean", { repoPath: path, branches, force, createBackup }),
+        { target },
+      ),
+    deadbranchRestore: async (backupPath: string, target?: MutationTarget | null) =>
+      runMutating<DeadbranchRestoreResult>("deadbranch-restore", backupPath, (path) =>
+        invokeFn("cmd_deadbranch_restore", { repoPath: path, backupPath, branches: null }),
         { target },
       ),
 
@@ -3022,19 +3186,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating(mode === "squash" ? "merge-squash" : "merge", branchName, (path) =>
         invokeFn("cmd_merge_branch", { repoPath: path, branchName, mode }),
       ),
-    fetch: async (remote?: string) =>
+    fetch: async (remote?: string, target?: MutationTarget | null) =>
       runMutating("fetch", remote ?? "origin", (path) =>
         invokeFn("cmd_fetch", { repoPath: path, remote }),
+        { target },
       ),
     /**
      * `rebase`: true rebases local commits onto the upstream (`--rebase`),
      * false merges (`--no-rebase`), undefined follows `pull.rebase`.
      */
-    pull: async (remote?: string, branch?: string, rebase?: boolean) =>
+    pull: async (remote?: string, branch?: string, rebase?: boolean, target?: MutationTarget | null) =>
       runMutating(
         rebase ? "pull-rebase" : "pull",
         [remote, branch].filter(Boolean).join(" ") || "upstream",
         (path) => invokeFn("cmd_pull", { repoPath: path, remote, branch, rebase }),
+        { target },
       ),
     /** `pull.rebase` for the active repository, or null when unset (git merges). */
     pullRebaseConfig: async (): Promise<string | null> => {
@@ -3105,12 +3271,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       });
       return createAdaptiveTimer(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
     },
-    push: async (remote?: string, branch?: string, force: boolean = false) =>
+    push: async (remote?: string, branch?: string, force: boolean = false, target?: MutationTarget | null) =>
       runMutating(
         force ? "push-force" : "push",
         [remote, branch].filter(Boolean).join(" ") || "upstream",
         (path) =>
           invokeFn("cmd_push", { repoPath: path, remote, branch, force }),
+        { target },
       ),
     /**
      * File a GitHub issue on a checkout's remote. Without `target` that is the
@@ -3147,18 +3314,23 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating<ReleasePublishResult>("release-publish", tag, (path) =>
         invokeFn("cmd_publish_release", { repoPath: path, tag, message }),
       ),
-    stashSave: async (message?: string, options?: StashSaveOptions) =>
+    stashSave: async (message?: string, options?: StashSaveOptions, target?: MutationTarget | null) =>
       runMutating("stash", message ?? "", (path) =>
         invokeFn("cmd_stash_save", { repoPath: path, message, options }),
+        { target },
       ),
-    stashPop: async () => {
+    stashPop: async (target?: MutationTarget | null) => {
       // The menu/palette "Pop" used to call `git stash pop` on stash@{0}
       // sight-unseen. The stash stack is shared with every worktree and
       // agent: that path is what silently applied (or dropped) someone
       // else's entry. Pop the entry this session last listed, by object
       // id; refuse if the list could not be read or is empty.
-      const session = activeSession();
-      if (!session) return { ok: false as const, error: "No repository is open." };
+      const session = target === undefined ? activeSession() : (target && resolveTarget(target)) || undefined;
+      if (!session) {
+        return target === undefined
+          ? { ok: false as const, error: "No repository is open." }
+          : { ok: false as const, error: REPOSITORY_CHANGED, refused: true, surfaced: false };
+      }
       if (session.stashFailed) {
         return {
           ok: false as const,
@@ -3175,6 +3347,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           index: top.index,
           expectedOid: top.oid,
         }),
+        { target: { tabId: session.id, path: session.path } },
       );
     },
     /**
@@ -3395,6 +3568,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
        */
       target?: MutationTarget | null;
       trackActivity?: boolean;
+      /**
+       * A failure the caller handles itself (a name that already exists, so the
+       * prompt reopens): returned on `cause`, journalled as failed, and not
+       * filed on the session as an error banner.
+       */
+      expected?: (err: unknown) => boolean;
     } = {},
   ): Promise<MutationOutcome<T>> {
     let session: RepoSession | undefined;
@@ -3464,13 +3643,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
       const error = formatError(err);
-      applyToSession(session.id, generation, { error });
       harnessStore.recordAction({ repoPath: path, kind, label, ok: false });
+      if (opts.expected?.(err)) return { ok: false, error, cause: err, surfaced: false };
+      applyToSession(session.id, generation, { error });
       // Surfaced when the banner the app toasts from is showing THIS error: a
       // concurrent failure with the same message shares one banner.
       return {
         ok: false,
         error,
+        cause: err,
         surfaced: internal.workspace.activeId === session.id && internal.sessions[session.id]?.error === error,
       };
     } finally {

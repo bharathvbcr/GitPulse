@@ -142,6 +142,79 @@ describe("parseUnifiedDiff", () => {
     expect(leading[1].noNewline).toBeUndefined();
   });
 
+  describe("noNewline flag follows whatever row the marker follows", () => {
+    const MARK = "\\ No newline at end of file";
+    const flags = (raw: string) =>
+      parseUnifiedDiff(raw)
+        .filter((l) => l.type === "add" || l.type === "del" || l.type === "ctx")
+        .map((l) => `${l.type}:${l.noNewline ? "nn" : "-"}`);
+
+    it("flags a context row the marker follows at the end of a hunk", () => {
+      expect(flags(["@@ -1,2 +1,2 @@", "-a", "+b", " tail", MARK].join("\n"))).toEqual([
+        "del:-",
+        "add:-",
+        "ctx:nn",
+      ]);
+    });
+
+    it("flags a context row mid-file and leaves the others alone", () => {
+      expect(flags(["@@ -1,3 +1,3 @@", " one", " two", MARK, " three"].join("\n"))).toEqual([
+        "ctx:-",
+        "ctx:nn",
+        "ctx:-",
+      ]);
+    });
+
+    it("still flags add and del rows, old side only and new side only", () => {
+      expect(flags(["@@ -1,2 +1,2 @@", " keep", "-old", MARK, "+new"].join("\n"))).toEqual([
+        "ctx:-",
+        "del:nn",
+        "add:-",
+      ]);
+      expect(flags(["@@ -1,2 +1,2 @@", " keep", "-old", "+new", MARK].join("\n"))).toEqual([
+        "ctx:-",
+        "del:-",
+        "add:nn",
+      ]);
+    });
+
+    it("flags nothing for a marker first in a hunk or right after a hunk header", () => {
+      expect(flags(["@@ -1 +1 @@", MARK, " a"].join("\n"))).toEqual(["ctx:-"]);
+      expect(flags(["@@ -1 +1 @@", " a", "@@ -5 +5 @@", MARK, "+b"].join("\n"))).toEqual([
+        "ctx:-",
+        "add:-",
+      ]);
+    });
+
+    it("a second marker in a row does not flag anything twice", () => {
+      const rows = parseUnifiedDiff(["@@ -1 +1 @@", " a", MARK, MARK].join("\n"));
+      expect(rows.map((r) => `${r.type}:${r.noNewline ? "nn" : "-"}`)).toEqual([
+        "hdr:-",
+        "ctx:nn",
+        "hdr:-",
+        "hdr:-",
+      ]);
+    });
+
+    it("keeps a CRLF row's carriage return as content while flagging it", () => {
+      const rows = parseUnifiedDiff(["@@ -1 +1 @@", " tail\r", MARK].join("\n"));
+      expect(rows[1]).toMatchObject({ type: "ctx", content: " tail\r", noNewline: true });
+    });
+
+    it("flags only the last hunk when the marker is in it", () => {
+      expect(
+        flags(
+          ["@@ -1,2 +1,2 @@", " a", "-b", "+c", "@@ -9,2 +9,2 @@", "-x", "+y", " z", MARK].join("\n")
+        )
+      ).toEqual(["ctx:-", "del:-", "add:-", "del:-", "add:-", "ctx:nn"]);
+    });
+
+    it("does not flag a marker outside a hunk body", () => {
+      const rows = parseUnifiedDiff(["diff --git a/f b/f", "--- a/f", "+++ b/f", MARK].join("\n"));
+      expect(rows.some((r) => r.noNewline)).toBe(false);
+    });
+  });
+
   it("parses padded hunk headers via relaxed whitespace matching", () => {
     const rows = parseUnifiedDiff("@@  -5 +5  @@ padded\n+five\n");
     expect(rows[0].type).toBe("hdr");

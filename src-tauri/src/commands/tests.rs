@@ -1168,3 +1168,710 @@ fn a_third_background_job_waits_until_one_of_the_first_two_ends() {
     }
     assert!(third_started.load(Ordering::SeqCst));
 }
+
+// ---------------------------------------------------------------------------
+// Stack refresh: the repair pass for branches beyond the history window
+// ---------------------------------------------------------------------------
+
+/// A repository whose `main` is `commits` linear empty commits, with a branch
+/// at each `(name, index)` and, when `orphan` is set, a branch `orphan` that
+/// shares no history with `main`. Written by one `git fast-import`, so a
+/// fixture of hundreds of commits costs one spawn.
+fn stack_chain(
+    commits: usize,
+    branches: &[(String, usize)],
+    orphan: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::io::Write;
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    let mut stream = String::new();
+    let commit = |stream: &mut String, refname: &str, mark: usize, from: Option<usize>| {
+        let message = format!("c{mark}\n");
+        stream.push_str(&format!("commit refs/heads/{refname}\nmark :{mark}\n"));
+        stream.push_str(&format!(
+            "committer T <t@t> {} +0000\ndata {}\n{message}",
+            1_700_000_000 + mark,
+            message.len()
+        ));
+        if let Some(from) = from {
+            stream.push_str(&format!("from :{from}\n"));
+        }
+        stream.push('\n');
+    };
+    for n in 1..=commits {
+        commit(&mut stream, "main", n, (n > 1).then(|| n - 1));
+    }
+    if orphan {
+        commit(&mut stream, "orphan", commits + 1, None);
+        commit(&mut stream, "orphan", commits + 2, Some(commits + 1));
+    }
+    for (name, index) in branches {
+        stream.push_str(&format!("reset refs/heads/{name}\nfrom :{}\n\n", index + 1));
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(&repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn fast-import");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stream.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "fast-import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    crate::test_support::trust_repo(&repo);
+    (dir, repo)
+}
+
+/// Twenty branches `b00`..`b19` at main commits 10, 13, ... 67: far below a
+/// 60-commit window over 150 commits, each sitting on the one under it.
+fn twenty_deep_branches() -> Vec<(String, usize)> {
+    (0..20).map(|i| (format!("b{i:02}"), 10 + 3 * i)).collect()
+}
+
+/// Rows of the spawn log for `repo` from `since` on.
+fn spawns_since(repo: &std::path::Path, since: usize) -> Vec<Vec<String>> {
+    crate::engine::git_cli::spawn_log::spawns_in(repo)[since..].to_vec()
+}
+
+fn first_parent_walks(spawns: &[Vec<String>]) -> usize {
+    spawns
+        .iter()
+        .filter(|argv| {
+            argv.iter().any(|a| a == "rev-list") && argv.iter().any(|a| a == "--first-parent")
+        })
+        .count()
+}
+
+fn parent_of(payload: &crate::stack::StackHierarchyPayload, branch: &str) -> Option<String> {
+    payload
+        .nodes
+        .iter()
+        .find(|n| n.branch_name == branch)
+        .unwrap_or_else(|| panic!("no node for {branch}"))
+        .parent_branch_name
+        .clone()
+}
+
+const FIXTURE_WINDOW: usize = 60;
+
+/// S4-03: every branch the window cannot place used to get its own
+/// `rev-list --first-parent` walk of up to 100,000 commits.
+#[test]
+fn a_stack_refresh_repairs_twenty_branches_beyond_the_window_in_one_walk() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+    let payload = crate::engine::ref_cache::eager(|| {
+        stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+    })
+    .expect("stack loads");
+    let spawned = spawns_since(&repo, before);
+    assert_eq!(
+        first_parent_walks(&spawned),
+        1,
+        "one shared pass, not one per branch: {spawned:#?}"
+    );
+    assert_eq!(parent_of(&payload, "b00"), None, "nothing is below b00");
+    for i in 1..20 {
+        assert_eq!(
+            parent_of(&payload, &format!("b{i:02}")),
+            Some(format!("b{:02}", i - 1)),
+            "b{i:02} sits on the previous branch"
+        );
+    }
+    assert_eq!(
+        payload.unresolved_branches, 0,
+        "b00 reached the root: settled"
+    );
+    assert!(!payload.walk_incomplete);
+}
+
+/// S4-03: with no ref movement the next tick is answered from the kept
+/// answers: no process at all.
+#[test]
+fn a_stack_refresh_with_no_ref_movement_spawns_nothing() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    crate::engine::ref_cache::eager(|| {
+        let first =
+            stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION).expect("first tick");
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+        let second = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+            .expect("second tick");
+        let spawned = spawns_since(&repo, before);
+        assert!(
+            spawned.is_empty(),
+            "an idle repository was walked again: {spawned:#?}"
+        );
+        assert_eq!(first, second);
+    });
+}
+
+/// A tick after a ref moved is answered from git again, and the new base shows.
+#[test]
+fn a_ref_that_moves_between_ticks_is_walked_again() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    crate::engine::ref_cache::eager(|| {
+        let first =
+            stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION).expect("first tick");
+        assert_eq!(parent_of(&first, "b00"), None);
+        // b05 moves below b00: b00 now sits on it.
+        let target = crate::engine::git_cli::git_text(&repo, &["rev-parse", "main~145"]).unwrap();
+        run_git(&repo, &["update-ref", "refs/heads/b05", target.trim()]);
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+        let second = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+            .expect("second tick");
+        assert_eq!(parent_of(&second, "b00"), Some("b05".to_string()));
+        let spawned = spawns_since(&repo, before);
+        assert_eq!(
+            first_parent_walks(&spawned),
+            1,
+            "a moved ref must not be answered from the old walk"
+        );
+        // The card's bound: the history walks a refresh over twenty unresolved
+        // branches starts are the window's `log` and the one pass (was
+        // 1 + 20). The branch listing and its default-branch probes are
+        // other spawns, unchanged by this card, and are not counted here.
+        let history_walks = spawned
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "log" || a == "rev-list"))
+            .count();
+        assert!(
+            history_walks <= 3,
+            "a refresh after a ref moved started {history_walks} history walks: {spawned:#?}"
+        );
+    });
+}
+
+/// A pass that hits its commit cap labels what it could not settle: the
+/// branches it did place stay placed, the rest are counted, and the payload
+/// says the walk was cut short.
+#[test]
+fn a_walk_that_exhausts_its_budget_counts_what_it_left_unresolved() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    let budget = StackWalkBudget {
+        max_commits: 5,
+        ..StackWalkBudget::PRODUCTION
+    };
+    let payload = crate::engine::ref_cache::eager(|| stack_hierarchy(path, FIXTURE_WINDOW, budget))
+        .expect("a partial walk is an answer, not a failure");
+    assert!(payload.walk_incomplete, "the cap was hit");
+    // The five newest commits are b19's tip down to b18's: b19 is placed by
+    // the shared pass. The rest used to be left unresolved because the SHARED
+    // cap ran out (19); the per-branch walks this replaced each had their own
+    // cap, and b01..b18 each sit three commits above their base, so each is
+    // placed by its own pass. Only b00 (ten commits from the root) really
+    // exceeds a 5-commit cap, and is not reported as a settled root.
+    assert_eq!(parent_of(&payload, "b19"), Some("b18".to_string()));
+    assert_eq!(parent_of(&payload, "b10"), Some("b09".to_string()));
+    assert_eq!(parent_of(&payload, "b01"), Some("b00".to_string()));
+    assert_eq!(
+        payload.unresolved_branches, 1,
+        "only b00 is beyond the cap; b00 is not reported as a settled root"
+    );
+    assert_eq!(payload.nodes.len(), 21, "every branch is still listed");
+}
+
+/// A deadline that expires before the pass finishes leaves every candidate
+/// unresolved and says so; the rest of the payload still loads.
+#[test]
+fn a_walk_whose_deadline_expires_is_labelled_not_failed() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    let budget = StackWalkBudget {
+        deadline: std::time::Duration::ZERO,
+        ..StackWalkBudget::PRODUCTION
+    };
+    let payload = stack_hierarchy(path, FIXTURE_WINDOW, budget)
+        .expect("a deadline in the repair pass must not fail the load");
+    assert!(payload.walk_incomplete);
+    assert_eq!(payload.unresolved_branches, 20);
+    assert_eq!(payload.nodes.len(), 21);
+}
+
+/// Shapes that need no pass, or whose pass has nothing to find.
+#[test]
+fn stack_shapes_that_need_no_walk_spawn_none_and_report_nothing_unresolved() {
+    let _held = crate::engine::ref_cache::retention();
+    // No branches besides main.
+    let (_a, repo_a) = stack_chain(30, &[], false);
+    // A branch on main's tip is placed from the window alone.
+    let (_b, repo_b) = stack_chain(30, &[("twin".to_string(), 29)], false);
+    for (repo, nodes) in [(&repo_a, 1), (&repo_b, 2)] {
+        let before = crate::engine::git_cli::spawn_log::spawns_in(repo).len();
+        let payload = crate::engine::ref_cache::eager(|| {
+            stack_hierarchy(
+                repo.to_str().unwrap(),
+                FIXTURE_WINDOW,
+                StackWalkBudget::PRODUCTION,
+            )
+        })
+        .expect("stack loads");
+        assert_eq!(payload.nodes.len(), nodes);
+        assert_eq!(
+            first_parent_walks(&spawns_since(repo, before)),
+            0,
+            "nothing to repair, nothing walked"
+        );
+        assert_eq!(payload.unresolved_branches, 0);
+        assert!(!payload.walk_incomplete);
+    }
+}
+
+/// A branch with no common history reaches its own root without meeting a
+/// tip: a settled, honest root, not an unresolved one.
+#[test]
+fn a_branch_with_no_common_history_is_a_settled_root() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &[("b00".to_string(), 10)], true);
+    let payload = crate::engine::ref_cache::eager(|| {
+        stack_hierarchy(
+            repo.to_str().unwrap(),
+            FIXTURE_WINDOW,
+            StackWalkBudget::PRODUCTION,
+        )
+    })
+    .expect("stack loads");
+    assert_eq!(parent_of(&payload, "orphan"), None);
+    assert_eq!(parent_of(&payload, "b00"), None);
+    assert_eq!(payload.unresolved_branches, 0);
+    assert!(!payload.walk_incomplete);
+}
+
+/// A detached HEAD has no current branch; the repair pass and the breadcrumb
+/// must not depend on one.
+#[test]
+fn a_detached_head_still_repairs_the_stack() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    run_git(&repo, &["checkout", "-q", "--detach", "main~3"]);
+    let payload = stack_hierarchy(
+        repo.to_str().unwrap(),
+        FIXTURE_WINDOW,
+        StackWalkBudget::PRODUCTION,
+    )
+    .expect("stack loads on a detached HEAD");
+    assert_eq!(payload.default_branch, "main");
+    assert_eq!(parent_of(&payload, "b07"), Some("b06".to_string()));
+    assert_eq!(payload.unresolved_branches, 0);
+}
+
+/// S4-04 at the command's own arithmetic: the page the graph asks for at a
+/// cap that equals one history chunk (the default 5,000 over a 5,000-row
+/// chunk) is one `git log`, probe row included.
+#[test]
+fn the_default_graph_page_is_one_history_walk() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(40, &[], false);
+    let path = repo.to_str().unwrap();
+    let chunk = 10;
+    let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+    let rows = crate::engine::git_reader::with_history_chunk(chunk, || {
+        crate::engine::ref_cache::eager(|| {
+            GitReader::read_commit_history_paged(
+                path,
+                0,
+                graph_fetch_limit(chunk),
+                None,
+                None,
+                RefScope::Named,
+            )
+        })
+    })
+    .expect("page loads");
+    assert_eq!(
+        rows.len(),
+        chunk + 1,
+        "the page plus the has_more probe row"
+    );
+    let logs = spawns_since(&repo, before)
+        .iter()
+        .filter(|argv| argv.iter().any(|a| a == "log"))
+        .count();
+    assert_eq!(logs, 1, "cap + 1 rows over a chunk of cap rows");
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial: the shared first-parent pass against the per-branch walks it
+// replaced (S4-03). The oracle below is the old `first_parent_chain` and its
+// caller, reconstructed from cd52ff3c.
+// ---------------------------------------------------------------------------
+
+/// A repository from an explicit DAG. Commit `i + 1` has `parents[i]` (1-based
+/// marks, first entry the first parent) and committer date `dates[i]`; every
+/// `(name, mark)` in `refs` becomes `refs/heads/name`. One `git fast-import`.
+fn dag_repo(
+    parents: &[Vec<usize>],
+    dates: &[i64],
+    refs: &[(String, usize)],
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::io::Write;
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    let mut stream = String::new();
+    for (i, ps) in parents.iter().enumerate() {
+        let mark = i + 1;
+        let message = format!("c{mark}\n");
+        if ps.is_empty() {
+            stream.push_str("reset refs/heads/tmp\n\n");
+        }
+        stream.push_str(&format!("commit refs/heads/tmp\nmark :{mark}\n"));
+        stream.push_str(&format!(
+            "committer T <t@t> {} +0000\ndata {}\n{message}",
+            dates[i],
+            message.len()
+        ));
+        if let Some(first) = ps.first() {
+            stream.push_str(&format!("from :{first}\n"));
+        }
+        for extra in ps.iter().skip(1) {
+            stream.push_str(&format!("merge :{extra}\n"));
+        }
+        stream.push('\n');
+    }
+    for (name, mark) in refs {
+        stream.push_str(&format!("reset refs/heads/{name}\nfrom :{mark}\n\n"));
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(&repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn fast-import");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stream.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "fast-import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    run_git(&repo, &["update-ref", "-d", "refs/heads/tmp"]);
+    crate::test_support::trust_repo(&repo);
+    (dir, repo)
+}
+
+/// The stack tree as the code before S4-03 built it: one bounded
+/// `rev-list --first-parent` per parentless branch, each stopping at any
+/// other branch tip.
+fn per_branch_oracle(
+    repo: &std::path::Path,
+    window: usize,
+    per_branch_cap: usize,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let path = repo.to_str().unwrap();
+    let branches = GitReader::list_branches(path).unwrap();
+    let locals: Vec<&BranchInfo> = branches.iter().filter(|b| !b.is_remote).collect();
+    let default_branch = locals
+        .iter()
+        .find(|b| b.is_default)
+        .or_else(|| locals.iter().find(|b| b.is_current))
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let mut branch_tips = HashMap::new();
+    for b in &locals {
+        branch_tips.insert(b.name.clone(), b.tip_commit_id.clone());
+    }
+    let mut commit_parents = HashMap::new();
+    for c in GitReader::read_commit_history(path, window, None).unwrap() {
+        commit_parents.insert(c.id, c.parent_ids);
+    }
+    let mut nodes =
+        StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+    let tip_oids: HashSet<String> = branch_tips.values().cloned().collect();
+    let mut enriched = false;
+    for node in &nodes {
+        if node.parent_branch_name.is_some() || node.branch_name == default_branch {
+            continue;
+        }
+        let mut stop_at = tip_oids.clone();
+        stop_at.remove(&node.tip_commit_id);
+        let chain = if stop_at.contains(&node.tip_commit_id) {
+            Some(vec![node.tip_commit_id.clone()])
+        } else {
+            let text = crate::engine::git_cli::git_text(
+                repo,
+                &[
+                    "rev-list",
+                    "--first-parent",
+                    &format!("--max-count={per_branch_cap}"),
+                    &node.tip_commit_id,
+                ],
+            )
+            .unwrap();
+            let mut walked = Vec::new();
+            let mut found = None;
+            for line in text.lines() {
+                walked.push(line.trim().to_string());
+                if stop_at.contains(line.trim()) {
+                    walked.reverse();
+                    found = Some(walked.clone());
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(chain) = chain {
+            for edge in chain.windows(2) {
+                commit_parents
+                    .entry(edge[1].clone())
+                    .or_insert_with(|| vec![edge[0].clone()]);
+            }
+            enriched = true;
+        }
+    }
+    if enriched {
+        nodes =
+            StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+    }
+    nodes
+        .into_iter()
+        .map(|n| (n.branch_name, n.parent_branch_name))
+        .collect()
+}
+
+fn tree_of(
+    payload: &crate::stack::StackHierarchyPayload,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    payload
+        .nodes
+        .iter()
+        .map(|n| (n.branch_name.clone(), n.parent_branch_name.clone()))
+        .collect()
+}
+
+/// xorshift: the generator must be reproducible from the seed alone.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Random DAGs (forks, merges, octopus merges, criss-crosses, twin branches,
+/// skewed committer dates, several roots) against window sizes from 1 to well
+/// past the history: the shared pass must give the tree the per-branch walks
+/// gave.
+#[test]
+fn the_shared_pass_builds_the_tree_the_per_branch_walks_built() {
+    let _held = crate::engine::ref_cache::retention();
+    let mut compared = 0;
+    let mut repaired = 0;
+    for seed in 1..=30u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let n = 12 + rng.below(40);
+        let mut parents: Vec<Vec<usize>> = Vec::new();
+        let mut dates = Vec::new();
+        for i in 1..=n {
+            let mut ps = Vec::new();
+            if i > 1 && rng.below(25) != 0 {
+                ps.push(if rng.below(10) < 7 {
+                    i - 1
+                } else {
+                    1 + rng.below(i - 1)
+                });
+                while rng.below(100) < 18 && ps.len() < 3 {
+                    let extra = 1 + rng.below(i - 1);
+                    if !ps.contains(&extra) {
+                        ps.push(extra);
+                    }
+                }
+            }
+            parents.push(ps);
+            let skew = if rng.below(6) == 0 {
+                rng.below(60) as i64 - 30
+            } else {
+                0
+            };
+            dates.push(1_700_000_000 + i as i64 * 10 + skew);
+        }
+        let mut refs = vec![("main".to_string(), n)];
+        for b in 0..(2 + rng.below(8)) {
+            refs.push((format!("b{b}"), 1 + rng.below(n)));
+        }
+        let (_dir, repo) = dag_repo(&parents, &dates, &refs);
+        let path = repo.to_str().unwrap();
+        for window in [1, 3, 8, 21, 1000] {
+            let want = per_branch_oracle(&repo, window, GitReader::MAX_HISTORY_COMMITS);
+            let got = stack_hierarchy(path, window, StackWalkBudget::PRODUCTION).unwrap();
+            assert_eq!(
+                tree_of(&got),
+                want,
+                "seed {seed} window {window} parents {parents:?} refs {refs:?}"
+            );
+            assert_eq!(got.unresolved_branches, 0, "seed {seed} window {window}");
+            compared += 1;
+            if want.values().any(Option::is_some) {
+                repaired += 1;
+            }
+        }
+    }
+    assert_eq!(compared, 30 * 5);
+    assert!(
+        repaired > 60,
+        "the corpus barely places any branch: {repaired}"
+    );
+}
+
+/// The old walks each had their own commit cap; the shared pass has one. A
+/// deep unrelated branch whose commits are newer than a shallow branch's fork
+/// point must not spend the budget that branch needed: `a` sits on `x` two
+/// commits above it and the old walk found that in three commits, whatever
+/// `hog` was doing.
+#[test]
+fn a_deep_branch_does_not_spend_the_commits_a_shallow_branch_needed() {
+    let _held = crate::engine::ref_cache::retention();
+    let mut parents: Vec<Vec<usize>> = Vec::new();
+    let mut dates: Vec<i64> = Vec::new();
+    for i in 1..=30usize {
+        parents.push(if i == 1 { vec![] } else { vec![i - 1] });
+        dates.push(1_700_000_000 + i as i64 * 10);
+    }
+    // a: 31, 32 on top of main's commit 5 (where x is); older than the hog.
+    parents.push(vec![5]);
+    dates.push(1_700_000_000 + 51);
+    parents.push(vec![31]);
+    dates.push(1_700_000_000 + 52);
+    // hog: 80 commits sharing no history, all newer than anything above.
+    for k in 0..80usize {
+        parents.push(if k == 0 { vec![] } else { vec![33 + k - 1] });
+        dates.push(1_700_100_000 + k as i64);
+    }
+    let refs = vec![
+        ("main".to_string(), 30),
+        ("x".to_string(), 5),
+        ("a".to_string(), 32),
+        ("hog".to_string(), 112),
+    ];
+    let (_dir, repo) = dag_repo(&parents, &dates, &refs);
+    let cap = 50;
+    let want = per_branch_oracle(&repo, 3, cap);
+    assert_eq!(want["a"], Some("x".to_string()), "the oracle places a on x");
+    let budget = StackWalkBudget {
+        max_commits: cap,
+        ..StackWalkBudget::PRODUCTION
+    };
+    let got = stack_hierarchy(repo.to_str().unwrap(), 3, budget).unwrap();
+    assert_eq!(tree_of(&got), want);
+    // The hog itself is the branch nothing could settle, and it is counted.
+    assert!(got.unresolved_branches >= 1);
+    assert!(got.walk_incomplete);
+}
+
+/// The kept answer of the pass must follow every way the branch set can
+/// change between ticks: a branch force-moved to an OLDER commit, a deleted
+/// branch, a new branch on an existing tip, and a pack-refs that rewrites the
+/// ref store without moving a ref. After each step the tree is the one the
+/// per-branch walks give on the repository as it now is.
+#[test]
+fn the_kept_pass_follows_force_moves_deletes_twins_and_packed_refs() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
+    let path = repo.to_str().unwrap();
+    crate::engine::ref_cache::eager(|| {
+        let check = |step: &str| {
+            let got = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
+                .unwrap_or_else(|e| panic!("{step}: {e}"));
+            let want = per_branch_oracle(&repo, FIXTURE_WINDOW, GitReader::MAX_HISTORY_COMMITS);
+            assert_eq!(tree_of(&got), want, "{step}");
+        };
+        check("cold");
+        check("idle tick");
+        // b10 force-moved to an older commit than b05's tip.
+        let older = crate::engine::git_cli::git_text(&repo, &["rev-parse", "main~145"]).unwrap();
+        run_git(&repo, &["update-ref", "refs/heads/b10", older.trim()]);
+        check("force-moved to an older commit");
+        // b03 deleted: b04 now sits on b02.
+        run_git(&repo, &["branch", "-D", "b03"]);
+        check("deleted branch");
+        // A new branch on b07's tip.
+        run_git(&repo, &["branch", "twin", "b07"]);
+        check("new branch on an existing tip");
+        run_git(&repo, &["pack-refs", "--all"]);
+        check("packed refs only");
+        // A ref that moves back to where it was: the answer kept for that
+        // exact argv must still be the right one.
+        let b10 = crate::engine::git_cli::git_text(&repo, &["rev-parse", "main~97"]).unwrap();
+        run_git(&repo, &["update-ref", "refs/heads/b10", b10.trim()]);
+        check("moved back");
+    });
+}
+
+/// Why the pass has no `--not` stop set. Excluding the other branch tips (the
+/// obvious set) also excludes everything a tip sitting MID-chain can reach:
+/// `y` forks off `a`'s own chain at commit 5, so `--not y` removes 5, 4 and 3
+/// from `a`'s walk and the base `x` (commit 3) is never seen, although `a`
+/// sits on it. The pass without `--not` places `a`.
+#[test]
+fn excluding_other_tips_would_cut_a_chain_a_mid_chain_tip_shares() {
+    let _held = crate::engine::ref_cache::retention();
+    // 1 - 2 - 3(x) - 4 - 5 - 6(a); y is commit 7 on top of 5.
+    let parents = vec![vec![], vec![1], vec![2], vec![3], vec![4], vec![5], vec![5]];
+    let dates: Vec<i64> = (1..=7).map(|i| 1_700_000_000 + i * 10).collect();
+    let refs = vec![
+        ("main".to_string(), 1),
+        ("x".to_string(), 3),
+        ("a".to_string(), 6),
+        ("y".to_string(), 7),
+    ];
+    let (_dir, repo) = dag_repo(&parents, &dates, &refs);
+    let oid = |name: &str| {
+        crate::engine::git_cli::git_text(&repo, &["rev-parse", name])
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let with_not = crate::engine::git_cli::git_text(
+        &repo,
+        &[
+            "rev-list",
+            "--first-parent",
+            &oid("a"),
+            "--not",
+            &oid("x"),
+            &oid("y"),
+            &oid("main"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        with_not.lines().collect::<Vec<_>>(),
+        vec![oid("a").as_str()],
+        "with the other tips excluded the walk stops at a's own tip"
+    );
+    let payload = stack_hierarchy(repo.to_str().unwrap(), 1, StackWalkBudget::PRODUCTION).unwrap();
+    assert_eq!(parent_of(&payload, "a"), Some("x".to_string()));
+    assert_eq!(payload.unresolved_branches, 0);
+}

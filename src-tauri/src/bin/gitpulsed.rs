@@ -112,6 +112,10 @@ OUTPUT:
     and returns to 0 once the family resolves: a number that only grows is a
     family that never will.
 
+    `reanchored_from` appears only on the one cycle that took over the ledger of
+    a repository that was moved or renamed: the earlier locations its rows named.
+    The takeover is also a `ledger.reanchor` row in the ledger itself.
+
     `recording` is the ledger's own status. A cycle that recorded nothing
     because the ledger could not be opened is not the same as one that
     recorded nothing because nothing happened, and both appear here.
@@ -230,6 +234,10 @@ struct CycleReport {
     departed_overflow: i64,
     family_unresolved: bool,
     family_unresolved_cycles: i64,
+    /// Earlier locations of this repository a moved or renamed checkout's ledger
+    /// named, taken over by this cycle. Present only on the one cycle that did it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reanchored_from: Vec<String>,
     reflog_entries: i64,
     /// True when the catch-up deadline stopped the pass early: the counts are
     /// a floor, and what was not reached is the next cycle's. Carried as its
@@ -276,6 +284,7 @@ fn guarded_cycle(
                 departed_overflow: 0,
                 family_unresolved: false,
                 family_unresolved_cycles: 0,
+                reanchored_from: Vec::new(),
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -314,6 +323,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 departed_overflow: 0,
                 family_unresolved: false,
                 family_unresolved_cycles: 0,
+                reanchored_from: Vec::new(),
                 reflog_entries: 0,
                 truncated: false,
                 pruned: 0,
@@ -339,6 +349,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         departed_overflow: caught.departed_overflow,
         family_unresolved: caught.family_unresolved,
         family_unresolved_cycles: caught.family_unresolved_cycles,
+        reanchored_from: caught.reanchored_from,
         reflog_entries: caught.reflog_entries,
         truncated: caught.truncated,
         pruned: caught.pruned,
@@ -494,6 +505,7 @@ mod tests {
                         departed_overflow: 0,
                         family_unresolved: false,
                         family_unresolved_cycles: 0,
+                        reanchored_from: Vec::new(),
                         reflog_entries: 0,
                         truncated: false,
                         pruned: 0,

@@ -60,6 +60,8 @@
       });
       /** The GitHub context call parks until the page releases it. */
       let releaseContext = null;
+      // The stack payload the next load answers with; null keeps the empty fixture.
+      let stackPayload = null;
       const githubContext = { available: true, cli_present: true, host: "github.com", owner: "acme", repo: "churn",
         html_url: "", pull_requests: [], prs_truncated: false, issues: [], issues_truncated: false, issues_error: null,
         workflow_runs: [], runs_error: null, runs_truncated: false, releases: [], releases_truncated: false,
@@ -110,7 +112,7 @@
         cmd_record_pulse_snapshot: () => null,
         cmd_get_file_diff: () => ({ text: "diff --git a/README.md b/README.md\n", truncated: false, truncation_reason: null }),
         cmd_get_commit_diff: () => ({ text: "", truncated: false, truncation_reason: null }),
-        cmd_get_stack_hierarchy: () => ({ stacks: [], branches: [], truncated: false }),
+        cmd_get_stack_hierarchy: () => stackPayload ?? ({ stacks: [], branches: [], truncated: false }),
         cmd_detect_language: () => "markdown",
         cmd_get_language_stats: () => ({ languages: [], total_files: 0, total_lines: 0, truncated: false }),
         cmd_scan_coverage: () => null,
@@ -291,6 +293,50 @@
         // ---- Loaders keyed on the repository alone.
         await quietUnderChurn("ReflogViewer", ReflogViewer, ["cmd_get_reflog"]);
         await quietUnderChurn("CodeStackViewer", CodeStackViewer, ["cmd_get_stack_hierarchy"]);
+
+        // ---- CodeStackViewer: the unresolved-branches banner, and loads only while mounted.
+        const stackNode = { branch_name: "main", tip_commit_id: "a".repeat(40), parent_branch_name: null, child_branch_names: [], commit_count_ahead_of_parent: 0 };
+        const stackWith = (unresolved_branches, walk_incomplete) => ({
+          nodes: [stackNode], default_branch: "main",
+          breadcrumb: { current_branch: "main", root_branch: "main", breadcrumb_chain: ["main"] },
+          unresolved_branches, walk_incomplete,
+        });
+        const banner = () => app.querySelector('[data-testid="stack-unresolved"]');
+        stackPayload = stackWith(3, true);
+        await show(CodeStackViewer);
+        await until(banner);
+        check(`CodeStackViewer: unresolved branches render a banner with the count (saw ${banner()?.textContent.trim() ?? "none"})`,
+          () => /3 branches could not be placed/.test(banner()?.textContent ?? "") && /budget/.test(banner()?.textContent ?? ""));
+        // Mounted: a refresh of the repository loads the stack again.
+        const mountedLoads = count("cmd_get_stack_hierarchy");
+        await repoStore.refresh();
+        await settle(10);
+        const afterRefresh = count("cmd_get_stack_hierarchy");
+        await repoStore.openRepo(OTHER);
+        await settle(10);
+        await repoStore.openRepo(REPO);
+        await settle(10);
+        check(`CodeStackViewer: while mounted, a refresh and a repository switch load the stack again (${mountedLoads} -> ${afterRefresh} -> ${count("cmd_get_stack_hierarchy")})`,
+          () => count("cmd_get_stack_hierarchy") > mountedLoads);
+        stackPayload = stackWith(0, true);
+        await show(CodeStackViewer);
+        await until(() => app.textContent.includes("main"));
+        check("CodeStackViewer: zero unresolved branches hide the banner, even when the walk was cut short", () => !banner());
+        // Unmounted: nothing loads the stack, whatever the repository does.
+        unmount(component);
+        component = null;
+        app.innerHTML = "";
+        await settle(5);
+        const unmountedLoads = count("cmd_get_stack_hierarchy");
+        await repoStore.openRepo(OTHER);
+        await settle(10);
+        await repoStore.openRepo(REPO);
+        await settle(10);
+        await repoStore.refresh();
+        await settle(10);
+        check(`CodeStackViewer: an unmounted viewer makes no further stack loads (saw ${count("cmd_get_stack_hierarchy") - unmountedLoads})`,
+          () => count("cmd_get_stack_hierarchy") === unmountedLoads);
+        stackPayload = null;
         await quietUnderChurn("TrustExtensionBanner", TrustExtensionBanner, ["cmd_repository_trust"]);
         await quietUnderChurn("LivePulseDashboard", LivePulseDashboard, ["cmd_detect_language", "cmd_get_commit_graph"], { selectedFile: "README.md" });
         // LanguageSegment first: it shares PulseView's line-count metric, which

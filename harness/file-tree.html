@@ -27,6 +27,12 @@ const root = "/fixture/GitPulse";
 let listing = ["README.md", "docs/guide.md", "src/app.ts", "src/lib/a.ts", "src/lib/b.ts"];
 const unexpected = [], deletes = [], indexCalls = [], discards = [], writes = [], moves = [];
 let moveFails = false;
+// A command parked here answers only when `release` is called, so a check can
+// look at the store while the host is still working.
+const parked = {};
+const park = cmd => new Promise(resolve => { (parked[cmd] ??= []).push(resolve); });
+const release = cmd => { (parked[cmd] ?? []).splice(0).forEach(resolve => resolve()); };
+let holding = new Set();
 const status = (path, code, extra = {}) => ({ path, is_staged: false, status_code: code, is_conflicted: false, additions: 1, deletions: 0, ...extra });
 // README is staged only; a.ts is changed on both sides of the index; b.ts
 // carries a churn count the backend could not verify.
@@ -44,8 +50,8 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_get_status": return statuses;
     case "cmd_stage_file": case "cmd_unstage_file": indexCalls.push({ cmd, ...args }); return guarded;
     case "cmd_discard_changes": discards.push(args); return guarded;
-    case "cmd_create_file": writes.push(args); if (args.filePath === "hidden-on-disk.ts") throw { code: "already_exists", message: "'hidden-on-disk.ts' already exists", path: args.filePath }; return guarded;
-    case "cmd_move_path": moves.push(args); if (moveFails) throw new Error("move refused by fixture"); return guarded;
+    case "cmd_create_file": writes.push(args); if (holding.has(cmd)) return park(cmd).then(() => guarded); if (args.filePath === "hidden-on-disk.ts") throw { code: "already_exists", message: "'hidden-on-disk.ts' already exists", path: args.filePath }; return guarded;
+    case "cmd_move_path": moves.push(args); if (holding.has(cmd)) return park(cmd).then(() => guarded); if (moveFails) throw new Error("move refused by fixture"); return guarded;
     case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: "a".repeat(40), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
     case "cmd_list_remotes": case "cmd_list_submodules": return [];
     case "cmd_stash_list": return { entries: [], truncated: false };
@@ -55,7 +61,7 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
     case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
     case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
-    case "cmd_delete_path": deletes.push(args); return { policy: null, output: { left_behind: false } };
+    case "cmd_delete_path": deletes.push(args); if (holding.has(cmd)) return park(cmd).then(() => ({ policy: null, output: { left_behind: false } })); return { policy: null, output: { left_behind: false } };
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
   }
 });
@@ -63,6 +69,8 @@ const { mount, tick } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
 const { promptState, promptError, completePrompt } = await import("../src/lib/stores/modalStore");
+const { harnessStore } = await import("../src/lib/stores/harnessStore");
+const { gitActionCount } = await import("../src/lib/desktop/exitGuard");
 const Panel = (await import("../src/lib/components/files/FileTreePanel.svelte")).default;
 const { results, check, stopped } = createChecks();
 const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
@@ -293,6 +301,56 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   check("a move the backend refuses says why and leaves the open file where it was", () => get(repoStore).error?.includes("refused by fixture") && get(repoStore).selectedFilePath === "src/app.ts");
   moveFails = false;
   repoStore.setError(null);
+
+  // --- every file mutation goes through the store's wrapper --------------------
+  // Counted by the quit guard while it is queued or running, one at a time per
+  // repository, and journalled; a confirm raised in one repository is not
+  // answered in another.
+  harnessStore.activateRepository(root);
+  const busy = () => gitActionCount(get(repoStore.mutationActivity));
+  const journal = () => get(harnessStore).actions;
+  const settled = async () => { await until(() => busy() === 0, "mutations settled"); await wait(80); };
+  await settled();
+  const deletesBefore = deletes.length, movesBefore = moves.length, writesBefore = writes.length;
+  holding = new Set(["cmd_delete_path", "cmd_move_path", "cmd_create_file"]);
+  await openMenuFor("README.md");
+  menuItem("Delete File…").click();
+  await until(() => get(promptState), "wrapped delete confirmation"); completePrompt(true);
+  await until(() => deletes.length === deletesBefore + 1, "wrapped delete sent");
+  check("a pending delete is counted by the quit guard", () => busy() === 1);
+  await openMenuFor("src/lib/a.ts");
+  menuItem("Rename or Move…").click();
+  await until(() => get(promptState), "wrapped move prompt"); completePrompt("src/lib/z.ts");
+  await wait(250);
+  check("a move asked for behind it is counted too, and waits its turn instead of running beside it", () => busy() === 2 && moves.length === movesBefore);
+  release("cmd_delete_path");
+  await until(() => moves.length === movesBefore + 1, "queued move runs after the delete");
+  release("cmd_move_path");
+  await settled();
+  check("both ran, in order, and the quit guard is idle again", () => busy() === 0 && deletes.length === deletesBefore + 1 && moves.length === movesBefore + 1);
+  check("the delete and the move are each journalled, once, as done", () => journal().filter(a => a.kind === "delete" && a.label === "README.md" && a.ok).length === 1 && journal().filter(a => a.kind === "move" && a.label === "src/lib/a.ts → src/lib/z.ts" && a.ok).length === 1);
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "wrapped create prompt"); completePrompt("wrapped.ts");
+  await until(() => writes.length === writesBefore + 1, "wrapped create sent");
+  check("a pending create is counted by the quit guard", () => busy() === 1);
+  release("cmd_create_file");
+  await settled();
+  check("and journalled as done", () => journal().some(a => a.kind === "create" && a.label === "wrapped.ts" && a.ok));
+  holding = new Set();
+
+  const otherRepo = "/fixture/Other";
+  const deletesAtSwitch = deletes.length;
+  await openMenuFor("docs/guide.md");
+  menuItem("Delete File…").click();
+  await until(() => get(promptState), "delete confirmation before a switch");
+  await repoStore.openRepo(otherRepo);
+  await wait(200);
+  completePrompt(true);
+  await wait(300);
+  check("a delete confirmed after the repository changed is not sent to the one now in front", () => !deletes.slice(deletesAtSwitch).some(args => args.repoPath === otherRepo));
+  await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === root).id);
+  harnessStore.activateRepository(root);
+  await wait(300);
 
   // --- churn the backend could not verify --------------------------------------
   await reveal("src/lib/a.ts");

@@ -151,44 +151,32 @@ impl PatchBuilder {
         patch_buffer.push_str(&unified_path_header("+++", "b", &file_patch.new_path));
 
         for hunk in &file_patch.hunks {
-            let mut hunk_lines_out = Vec::new();
+            let mut rows: Vec<(char, &UnifiedDiffLine)> = Vec::new();
             let mut old_count = 0;
             let mut new_count = 0;
-            // The `\ No newline at end of file` marker attaches to the line
-            // content in every direction git emits it, so a row flagged by the
-            // parser keeps its marker whichever sign this selection turns it
-            // into. Emitting it only "when staging" or only for additions
-            // would desync preimage/postimage blob endings and fail apply.
-            fn render(prefix: char, line: &UnifiedDiffLine) -> String {
-                if line.no_newline {
-                    format!("{prefix}{}\n\\ No newline at end of file", line.content)
-                } else {
-                    format!("{prefix}{}", line.content)
-                }
-            }
 
             for line in &hunk.lines {
                 match line.line_type {
                     DiffLineType::Context => {
-                        hunk_lines_out.push(render(' ', line));
+                        rows.push((' ', line));
                         old_count += 1;
                         new_count += 1;
                     }
                     DiffLineType::Addition => {
                         if line.is_selected {
                             if is_staging {
-                                hunk_lines_out.push(render('+', line));
+                                rows.push(('+', line));
                                 new_count += 1;
                             } else {
                                 // For unstaging an addition: it becomes a deletion in the reverse patch
-                                hunk_lines_out.push(render('-', line));
+                                rows.push(('-', line));
                                 old_count += 1;
                             }
                         } else if is_staging {
                             // Skipped addition: keep in original working tree, do not add to index
                         } else {
                             // Unstaging skipped addition: treat as unchanged context in the reverse index
-                            hunk_lines_out.push(render(' ', line));
+                            rows.push((' ', line));
                             old_count += 1;
                             new_count += 1;
                         }
@@ -196,16 +184,16 @@ impl PatchBuilder {
                     DiffLineType::Deletion => {
                         if line.is_selected {
                             if is_staging {
-                                hunk_lines_out.push(render('-', line));
+                                rows.push(('-', line));
                                 old_count += 1;
                             } else {
                                 // For unstaging a deletion: restore it
-                                hunk_lines_out.push(render('+', line));
+                                rows.push(('+', line));
                                 new_count += 1;
                             }
                         } else if is_staging {
                             // Skipped deletion: keep the line as context in the staged patch
-                            hunk_lines_out.push(render(' ', line));
+                            rows.push((' ', line));
                             old_count += 1;
                             new_count += 1;
                         } else {
@@ -215,21 +203,60 @@ impl PatchBuilder {
                 }
             }
 
-            if !hunk_lines_out.is_empty() {
+            if !rows.is_empty() {
                 let start_old = hunk.old_start;
                 let start_new = hunk.new_start;
                 patch_buffer.push_str(&format!(
                     "@@ -{},{} +{},{} @@\n",
                     start_old, old_count, start_new, new_count
                 ));
-                for hl in hunk_lines_out {
-                    patch_buffer.push_str(&hl);
-                    patch_buffer.push('\n');
-                }
+                render_rows(&rows, &mut patch_buffer);
             }
         }
 
         patch_buffer
+    }
+}
+
+const NO_NEWLINE_MARKER: &str = "\\ No newline at end of file";
+
+/// Writes one hunk's body rows, placing `\ No newline at end of file` only
+/// where the blob it describes actually ends.
+///
+/// A parsed row's flag records the newline-ness of the file side it came from,
+/// and only the last line of a side can lack its newline. A selection can
+/// leave that row followed by more result lines (a skipped deletion kept as
+/// context, a restored deletion before unselected additions), and a marker
+/// there makes git join the two lines. The rules, for a patch whose old side
+/// is the blob being edited and whose new side is the result:
+/// - `-` keeps its marker: the blob row really lacks the newline;
+/// - `+` keeps it only when it is the last new-side row; earlier, the newline
+///   exists in the result;
+/// - ` ` keeps it only when it is the last new-side row too; otherwise it is
+///   split into `-row` + marker and `+row`, since the old side lacks the
+///   newline and the new side has it.
+fn render_rows(rows: &[(char, &UnifiedDiffLine)], out: &mut String) {
+    let last_new = rows.iter().rposition(|(sign, _)| *sign != '-');
+    for (i, (sign, line)) in rows.iter().enumerate() {
+        let is_last_new = last_new == Some(i);
+        let flagged = line.no_newline;
+        let push = |out: &mut String, sign: char, marker: bool| {
+            out.push(sign);
+            out.push_str(&line.content);
+            out.push('\n');
+            if marker {
+                out.push_str(NO_NEWLINE_MARKER);
+                out.push('\n');
+            }
+        };
+        match sign {
+            ' ' if flagged && !is_last_new => {
+                push(out, '-', true);
+                push(out, '+', false);
+            }
+            ' ' | '+' => push(out, *sign, flagged && is_last_new),
+            _ => push(out, *sign, flagged),
+        }
     }
 }
 
@@ -665,5 +692,161 @@ mod tests {
         let patch = PatchBuilder::build_selective_patch(&deleted, true);
         assert!(patch.contains("--- a/gone.txt\n"), "got:\n{patch}");
         assert!(patch.contains("+++ /dev/null\n"), "got:\n{patch}");
+    }
+
+    fn git_in(dir: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
+        use crate::procguard::LockedSpawn;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .expect("git spawns");
+        let mut pipe = child.stdin.take().expect("stdin piped");
+        if let Some(text) = stdin {
+            pipe.write_all(text.as_bytes()).expect("patch written");
+        }
+        drop(pipe);
+        child.wait_with_output().expect("git finishes")
+    }
+
+    /// The diff of "a" -> "a\nb" (neither side ends in a newline) as parsed
+    /// rows: `-a`, marker, `+a`, `+b`, marker.
+    fn missing_newline_growth(select: [bool; 3]) -> FilePatch {
+        FilePatch {
+            old_path: "f.txt".to_string(),
+            new_path: "f.txt".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                header: String::new(),
+                lines: vec![
+                    line_no_newline(DiffLineType::Deletion, "a", select[0]),
+                    line(DiffLineType::Addition, "a", select[1]),
+                    line_no_newline(DiffLineType::Addition, "b", select[2]),
+                ],
+            }],
+        }
+    }
+
+    /// Only the last row of a side can lack its newline, so a flagged row that
+    /// the selection leaves other result lines after must not keep its marker
+    /// (git would join the lines), and a skipped flagged deletion kept as
+    /// context must split into `-row` + marker and `+row`.
+    #[test]
+    fn a_marker_is_only_written_where_its_side_ends() {
+        // Stage only `+b`: the unselected `-a` becomes context but `b` now
+        // follows it, so the old no-newline `a` is replaced by `a` + newline.
+        let staged = PatchBuilder::build_selective_patch(
+            &missing_newline_growth([false, false, true]),
+            true,
+        );
+        assert!(
+            staged.ends_with(&format!(
+                "@@ -1,1 +1,2 @@\n-a\n{MARKER}\n+a\n+b\n{MARKER}\n"
+            )),
+            "{staged}"
+        );
+
+        // Unstage only `-a`: it is restored ahead of the unselected rows
+        // that stay, so the restored line gets its newline back.
+        let unstaged = PatchBuilder::build_selective_patch(
+            &missing_newline_growth([true, false, false]),
+            false,
+        );
+        assert!(
+            unstaged.ends_with(&format!("@@ -1,2 +1,3 @@\n+a\n a\n b\n{MARKER}\n")),
+            "{unstaged}"
+        );
+    }
+
+    /// Real git: the shapes above stage and unstage to the exact bytes asked
+    /// for, which the old always-attach marker could not produce.
+    #[test]
+    fn marker_placement_stages_and_unstages_the_exact_bytes() {
+        let apply = ["apply", "--cached", "--unidiff-zero", "--recount", "-"];
+        let run = |blob: &str, select: [bool; 3], staging: bool| -> Vec<u8> {
+            let dir = tempfile::TempDir::new().unwrap();
+            let p = dir.path();
+            git_in(p, &["init", "-q", "-b", "main"], None);
+            git_in(p, &["config", "core.autocrlf", "false"], None);
+            std::fs::write(p.join("f.txt"), blob).unwrap();
+            git_in(p, &["add", "--", "f.txt"], None);
+            let patch =
+                PatchBuilder::build_selective_patch(&missing_newline_growth(select), staging);
+            let out = git_in(p, &apply, Some(&patch));
+            assert!(
+                out.status.success(),
+                "{patch}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            git_in(p, &["show", ":f.txt"], None).stdout
+        };
+        assert_eq!(run("a", [false, false, true], true), b"a\nb");
+        assert_eq!(run("a\nb", [true, false, false], false), b"a\na\nb");
+    }
+
+    /// A hunk ending in a context row plus the marker, built by the Rust
+    /// renderer, applied by real git onto a blob with no trailing newline: the
+    /// index blob must keep the missing newline.
+    #[test]
+    fn context_marker_patch_keeps_the_index_blob_without_a_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-q", "-b", "main"], None);
+        git_in(p, &["config", "core.autocrlf", "false"], None);
+        std::fs::write(p.join("ctx.txt"), "one\ntwo\nthree").unwrap();
+        git_in(p, &["add", "--", "ctx.txt"], None);
+
+        let patch_for = |flag_context: bool| {
+            let mut last = line(DiffLineType::Context, "three", false);
+            last.no_newline = flag_context;
+            let fp = FilePatch {
+                old_path: "ctx.txt".to_string(),
+                new_path: "ctx.txt".to_string(),
+                hunks: vec![UnifiedDiffHunk {
+                    old_start: 1,
+                    old_lines: 3,
+                    new_start: 1,
+                    new_lines: 3,
+                    header: String::new(),
+                    lines: vec![
+                        line(DiffLineType::Deletion, "one", true),
+                        line(DiffLineType::Addition, "ONE", true),
+                        line(DiffLineType::Context, "two", false),
+                        last,
+                    ],
+                }],
+            };
+            PatchBuilder::build_selective_patch(&fp, true)
+        };
+        let apply = ["apply", "--cached", "--unidiff-zero", "--recount", "-"];
+
+        // Control: without the flag git cannot match the no-newline preimage.
+        let unflagged = patch_for(false);
+        assert!(
+            !git_in(p, &apply, Some(&unflagged)).status.success(),
+            "a missing marker must be rejected by git:\n{unflagged}"
+        );
+
+        let flagged = patch_for(true);
+        assert!(
+            flagged.ends_with(&format!(" three\n{MARKER}\n")),
+            "{flagged}"
+        );
+        let out = git_in(p, &apply, Some(&flagged));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let blob = git_in(p, &["show", ":ctx.txt"], None).stdout;
+        assert_eq!(blob, b"ONE\ntwo\nthree");
     }
 }

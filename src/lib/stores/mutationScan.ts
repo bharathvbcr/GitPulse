@@ -26,6 +26,23 @@ export const TARGET_ARG_INDEX: Readonly<Record<string, number>> = {
   resetTo: 2,
   createTag: 3,
   deleteTag: 1,
+  createFile: 1,
+  movePath: 2,
+  deletePath: 1,
+  pruneWorktrees: 0,
+  addWorktree: 1,
+  removeWorktree: 2,
+  lockWorktree: 1,
+  unlockWorktree: 1,
+  worktreeMergeTeardown: 1,
+  worktreeCowSync: 1,
+  deadbranchClean: 3,
+  deadbranchRestore: 1,
+  fetch: 1,
+  pull: 3,
+  push: 3,
+  stashSave: 2,
+  stashPop: 0,
 };
 
 const PROMPTS = new Set(["askConfirm", "askText"]);
@@ -404,6 +421,184 @@ function untargetedIn(sf: ts.SourceFile, names: ReadonlySet<string>, aliases: Al
   };
   visit(sf);
   return lines;
+}
+
+// ---- direct invokes of a mutating command ------------------------------------
+
+/** The text of a string-literal argument, or null for anything computed. */
+function literalText(node: ts.Node | undefined): string | null {
+  if (!node) return null;
+  const inner = unwrap(node as ts.Expression);
+  return ts.isStringLiteral(inner) || ts.isNoSubstitutionTemplateLiteral(inner) ? inner.text : null;
+}
+
+/**
+ * The `cmd_*` commands the store's mutations send: every command named by a
+ * string literal inside a member that `mutationNames` derives. A component
+ * that sends one of these itself has stepped around the wrapper — the quit
+ * guard, the per-repository queue, the journal and the echo rule — so the set
+ * follows the store: a mutation added there is covered the day it is written.
+ */
+export function mutatingCommands(storeSource: string): Set<string> {
+  const names = mutationNames(storeSource);
+  const commands = new Set<string>();
+  const sf = parseSource("repoStore.ts", storeSource);
+  const literal = storeLiteral(sf);
+  if (!literal) return commands;
+  const collect = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const command = literalText(node.arguments[0]);
+      if (command !== null && command.startsWith("cmd_")) commands.add(command);
+    }
+    ts.forEachChild(node, collect);
+  };
+  for (const member of literal.properties) {
+    if (member.name && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)) && names.has(member.name.text)) collect(member);
+  }
+  return commands;
+}
+
+/** The names the IPC bridge is exported under (`ipc/invoke`, `@tauri-apps/api/core`), before any rename. */
+const BRIDGE_NAME = /^(invoke|invokeFn)$/;
+
+/**
+ * What a source file says about the IPC bridge: string constants a command
+ * name may be read from, and the identifiers that ARE the bridge.
+ */
+interface BridgeScope {
+  consts: Map<string, string>;
+  bindings: Set<string>;
+}
+
+/** Whether `expr` names the bridge: `invoke`, `x.invoke`, `x["invoke"]`, or a bound alias. */
+function isBridge(expr: ts.Expression, scope: BridgeScope): boolean {
+  const target = unwrap(expr);
+  if (ts.isIdentifier(target)) return scope.bindings.has(target.text) || BRIDGE_NAME.test(target.text);
+  if (ts.isPropertyAccessExpression(target)) return BRIDGE_NAME.test(target.name.text);
+  if (ts.isElementAccessExpression(target)) {
+    const key = literalText(target.argumentExpression);
+    return key !== null && BRIDGE_NAME.test(key);
+  }
+  return false;
+}
+
+function collectBridge(sfs: readonly ts.SourceFile[]): BridgeScope {
+  const scope: BridgeScope = { consts: new Map(), bindings: new Set() };
+  let grew = true;
+  const visit = (node: ts.Node) => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+      for (const element of node.importClause.namedBindings.elements) {
+        if (BRIDGE_NAME.test((element.propertyName ?? element.name).text) &&!scope.bindings.has(element.name.text)) {
+          scope.bindings.add(element.name.text);
+          grew = true;
+        }
+      }
+    }
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      const init = unwrap(node.initializer);
+      if (ts.isIdentifier(node.name)) {
+        const text = literalText(init);
+        if (text !== null) scope.consts.set(node.name.text, text);
+        else if (isBridge(init, scope) && !scope.bindings.has(node.name.text)) {
+          scope.bindings.add(node.name.text);
+          grew = true;
+        }
+      } else if (ts.isObjectBindingPattern(node.name)) {
+        // `const { invoke: go } = await import("@tauri-apps/api/core")` and `= window.__TAURI__.core`.
+        for (const element of node.name.elements) {
+          const source = element.propertyName ?? element.name;
+          if (ts.isIdentifier(element.name) && ts.isIdentifier(source) && BRIDGE_NAME.test(source.text) && !scope.bindings.has(element.name.text)) {
+            scope.bindings.add(element.name.text);
+            grew = true;
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  while (grew) {
+    grew = false;
+    for (const sf of sfs) visit(sf);
+  }
+  return scope;
+}
+
+/**
+ * What an argument says about the command it names: its whole text when it is
+ * readable (a literal, or a constant in this file), the static prefix of one
+ * that is built (`"cmd_" + x`, a template with substitutions), or neither.
+ */
+function commandOf(node: ts.Node | undefined, scope: BridgeScope): { text?: string; prefix?: string } {
+  if (!node) return {};
+  const inner = unwrap(node as ts.Expression);
+  const literal = literalText(inner);
+  if (literal !== null) return { text: literal };
+  if (ts.isIdentifier(inner)) {
+    const held = scope.consts.get(inner.text);
+    return held === undefined ? {} : { text: held };
+  }
+  if (ts.isTemplateExpression(inner)) return { prefix: inner.head.text };
+  if (ts.isBinaryExpression(inner) && inner.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = commandOf(inner.left, scope);
+    return left.text !== undefined ? { prefix: left.text } : left;
+  }
+  return {};
+}
+
+function directInvokesIn(sf: ts.SourceFile, commands: ReadonlySet<string>, scope: BridgeScope = collectBridge([sf])): number[] {
+  const lines: number[] = [];
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const bridge = isBridge(node.expression, scope);
+      const flagged = node.arguments.some((argument, index) => {
+        const { text, prefix } = commandOf(argument, scope);
+        if (text !== undefined) return commands.has(text);
+        if (prefix !== undefined && prefix.startsWith("cmd_")) return [...commands].some((command) => command.startsWith(prefix));
+        // The bridge called with a command that cannot be read: it may be any.
+        return bridge && index === 0 && !ts.isStringLiteralLike(unwrap(argument));
+      });
+      if (flagged) lines.push(lineOf(sf, node));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return lines;
+}
+
+/**
+ * Lines of a call that sends a mutating command: one with a command's name in
+ * any argument, or the IPC bridge called with a name that cannot be read.
+ *
+ * The callee is not what is read, so a direct, generic, aliased
+ * (`import { invoke as call }`), `window.__TAURI__.core.invoke`, dynamically
+ * imported or wrapped call are all alike. A name held in a same-file constant
+ * is resolved; one built from a `cmd_` prefix matches every command that
+ * starts with it; any other first argument to something that IS the bridge is
+ * flagged, because it may name a mutation. Calls that are not the bridge are
+ * read only for literal names, so an ordinary function is not flagged.
+ *
+ * Blind to a command the store does not send: the set comes from repoStore, so
+ * a mutating `cmd_*` that has no wrapper there (WorktreesPanel's add, remove,
+ * lock, unlock and merge-and-teardown) is invisible until the store owns it.
+ */
+export function directMutatingInvokes(code: string, commands: ReadonlySet<string>): number[] {
+  return directInvokesIn(parseSource("scan.ts", code), commands);
+}
+
+/** The same scan over a component's scripts and markup expressions. */
+export function directMutatingInvokesSvelte(source: string, commands: ReadonlySet<string>): number[] {
+  if (!/cmd_|invoke/i.test(source)) return [];
+  const { scripts, expressions } = svelteRanges(source);
+  const scriptFiles = scripts.map((range) => parseSource("component.ts", padding(source.slice(0, range.start)) + source.slice(range.start, range.end)));
+  // The markup sees what the scripts bound and held.
+  const scope = collectBridge(scriptFiles);
+  const mentions = ["cmd_", "invoke", ...scope.bindings, ...scope.consts.keys()];
+  const markupFiles = expressions
+    .map((range) => ({ range, text: source.slice(range.start, range.end) }))
+    .filter(({ text }) => mentions.some((name) => text.includes(name)))
+    .map(({ range, text }) => parseSource("component.ts", `${padding(source.slice(0, range.start - 1))}(${text});`));
+  const lines = [...scriptFiles, ...markupFiles].flatMap((sf) => directInvokesIn(sf, commands, scope));
+  return [...new Set(lines)].sort((a, b) => a - b);
 }
 
 // ---- Svelte ----------------------------------------------------------------

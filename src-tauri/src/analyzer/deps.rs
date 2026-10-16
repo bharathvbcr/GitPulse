@@ -21,14 +21,17 @@ use crate::analyzer::cargo_supply::{
     parse_cargo_crev_jsonl, parse_cargo_deny_sarif, BinAuditKind,
 };
 use crate::analyzer::language::LanguageDetector;
+use crate::deadline::{ScanDeadline, AUDIT_TIMEOUT};
 use crate::engine::git_cli::{
-    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_in,
-    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, PathSource, ToolProbe,
+    capture_command_with_env, classify_tool_probe, git_text, is_timed_out,
+    resolve_spawn_program_in, sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput,
+    PathSource, ToolProbe,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 const MAX_SOURCE_FILES: usize = 10_000;
@@ -50,7 +53,6 @@ const MAX_ECOSYSTEM_MANIFESTS: usize = 24;
 /// They are counted in their own bucket instead of masquerading as "info".
 pub(crate) const SEVERITY_UNKNOWN: &str = "unknown";
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const AUDIT_TIMEOUT: Duration = Duration::from_secs(90);
 
 const NPM_SAFE_ENV: &[(&str, &str)] = &[
     ("npm_config_ignore_scripts", "true"),
@@ -333,6 +335,161 @@ struct ScanEnv {
     /// latter is widened by the GUI-launch fallback dirs.
     path_source: PathSource,
     home: Option<std::ffi::OsString>,
+    /// The scan's one deadline and what it cut. `None` for a probe or test
+    /// that is bounded only by its own per-command timeout.
+    scan: Option<Arc<ScanClock>>,
+}
+
+/// What a refused spawn's error starts with, so a probe can tell "the deadline
+/// would not let it start" from a tool that is absent.
+const DEADLINE_REFUSED: &str = "the scan deadline passed before ";
+
+/// The one deadline of a dependency scan and the record of what it cut.
+///
+/// Every spawn goes through [`capture_scanner_command`], which asks the clock
+/// for the command's timeout: the command's own timeout, shortened to what is
+/// left of the deadline, or nothing at all once the deadline has passed. A
+/// command already running at the deadline is therefore cut at it, so the
+/// scan returns within the deadline plus the cost of killing one child.
+/// Every auditor step that did not run, or was cut, is named here, so a
+/// partial scan says which ecosystems it did not cover.
+#[derive(Debug)]
+struct ScanClock {
+    deadline: ScanDeadline,
+    state: Mutex<ClockState>,
+}
+
+#[derive(Debug, Default)]
+struct ClockState {
+    /// Steps that ran to the end without being cut.
+    completed: usize,
+    /// Steps that did not run or were cut, each named once.
+    not_run: Vec<String>,
+    /// Every time something was recorded as not run, repeats included. A step
+    /// is complete when this did not move while it ran; the length of
+    /// `not_run` cannot say so, because a repeated name does not grow it.
+    cuts: usize,
+    /// A version probe was refused or cut by the deadline, so a scanner's
+    /// presence was never established either way.
+    probes_unresolved: bool,
+}
+
+impl ScanClock {
+    fn new(deadline: ScanDeadline) -> Self {
+        Self {
+            deadline,
+            state: Mutex::new(ClockState::default()),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ClockState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn note_not_run(&self, what: &str) {
+        let mut state = self.state();
+        state.cuts += 1;
+        if !state.not_run.iter().any(|seen| seen == what) {
+            state.not_run.push(what.to_string());
+        }
+    }
+
+    /// True when a probe's timeout error happened with the deadline gone: the
+    /// deadline shortened it, or it ran out at the same moment.
+    fn deadline_cut_probe(&self, error: &str) -> bool {
+        is_timed_out(error) && self.deadline.remaining().is_zero()
+    }
+
+    /// True once a version probe was refused or cut by the deadline.
+    fn probes_unresolved(&self) -> bool {
+        self.state().probes_unresolved
+    }
+
+    /// True, and `what` recorded as not run, once the deadline has passed.
+    /// Checked before starting each auditor and each npm root.
+    fn skip(&self, what: &str) -> bool {
+        let expired = self.deadline.expired();
+        if expired {
+            self.note_not_run(what);
+        }
+        expired
+    }
+
+    /// The timeout for a command about to start: its own, shortened to what is
+    /// left of the deadline, and whether the deadline shortened it. `None`
+    /// once nothing is left.
+    fn timeout_for(&self, requested: Duration, what: &str) -> Option<(Duration, bool)> {
+        let left = self.deadline.remaining();
+        if left.is_zero() {
+            self.note_not_run(what);
+            return None;
+        }
+        Some((requested.min(left), left < requested))
+    }
+
+    /// A command is cut by the deadline only if the deadline shortened its
+    /// timeout and it then timed out. One that failed for its own reason —
+    /// however close to the deadline — is reported by its own failure.
+    fn note_finished<T>(&self, outcome: &Result<T, String>, what: &str, shortened: bool) {
+        if shortened && outcome.as_ref().is_err_and(|e| is_timed_out(e)) {
+            self.note_not_run(&format!("{what} (cut off at the deadline)"));
+        }
+    }
+
+    /// Runs one auditor step unless the deadline has passed. A step with
+    /// nothing to do is neither run nor counted.
+    fn step<T>(&self, name: &str, has_work: bool, run: impl FnOnce() -> T) -> Option<T> {
+        if !has_work || self.skip(name) {
+            return None;
+        }
+        let before = self.state().cuts;
+        let out = run();
+        let mut state = self.state();
+        if state.cuts == before {
+            state.completed += 1;
+        }
+        Some(out)
+    }
+}
+
+/// Puts what the scan deadline cut into the report: truncated, a limit
+/// notice that blocks `audit_complete`, and one issue that names the steps.
+fn record_deadline_cut(report: &mut DepsHealthReport, clock: &ScanClock) {
+    let (completed, not_run) = {
+        let state = clock.state();
+        (state.completed, state.not_run.clone())
+    };
+    if not_run.is_empty() {
+        return;
+    }
+    const NAMED: usize = 12;
+    let mut names = not_run
+        .iter()
+        .take(NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if not_run.len() > NAMED {
+        names.push_str(&format!(" and {} more", not_run.len() - NAMED));
+    }
+    report.truncated = true;
+    report.limit_notices.push(ScanLimitNotice {
+        resource: "audit steps finished before the scan deadline".into(),
+        kept: completed,
+        total: completed + not_run.len(),
+        inventory_only: false,
+    });
+    report.issues.insert(
+        0,
+        HealthIssue {
+            severity: "error".into(),
+            code: "scan_deadline".into(),
+            message: format!(
+                "The dependency scan reached its deadline. These did not run or were cut short: {names}. This is not a clean bill of health."
+            ),
+            path: None,
+        },
+    );
 }
 
 impl ScanEnv {
@@ -351,6 +508,7 @@ impl ScanEnv {
                 .clone()
                 .or_else(|| std::env::var_os("HOME"))
                 .or_else(|| std::env::var_os("USERPROFILE")),
+            scan: None,
         }
     }
 
@@ -370,45 +528,118 @@ impl DepsScanner {
         Self::scan_with(repo_path, ScanOptions::default())
     }
 
+    /// One scan under one [`AUDIT_TIMEOUT`] deadline.
     pub fn scan_with(repo_path: &str, options: ScanOptions) -> Result<DepsHealthReport, String> {
+        Self::scan_with_deadline(repo_path, options, ScanDeadline::audit())
+    }
+
+    /// One scan under a deadline of `budget` from now. See
+    /// [`DepsScanner::scan_with_deadline`].
+    pub fn scan_within(
+        repo_path: &str,
+        options: ScanOptions,
+        budget: Duration,
+    ) -> Result<DepsHealthReport, String> {
+        Self::scan_with_deadline(repo_path, options, ScanDeadline::after(budget))
+    }
+
+    /// One scan under `deadline`: no auditor, ecosystem or npm root starts
+    /// after it, and a command still running at it is cut at it. What was cut
+    /// is named in the report, which is then never `audit_complete`.
+    pub(crate) fn scan_with_deadline(
+        repo_path: &str,
+        options: ScanOptions,
+        deadline: ScanDeadline,
+    ) -> Result<DepsHealthReport, String> {
         let repo = validate_repo(repo_path)?;
-        let env = ScanEnv::from_options(&options);
+        let clock = Arc::new(ScanClock::new(deadline));
+        let mut env = ScanEnv::from_options(&options);
+        env.scan = Some(Arc::clone(&clock));
         let (mut report, targets) = local_scan(&repo, &env)?;
         if options.run_cli {
             // A scanner is recorded only once it actually dispatched a
             // command — presence flags alone never imply execution.
             let mut ran: Vec<String> = Vec::new();
-            let js = enrich_npm(&repo, &mut report, &env);
-            if js.npm {
-                ran.push("npm".into());
+            let has_manifests = !report.manifests.is_empty();
+            if let Some(js) = clock.step("npm audit", has_manifests, || {
+                enrich_npm(&repo, &mut report, &env)
+            }) {
+                if js.npm {
+                    ran.push("npm".into());
+                }
+                if js.bun {
+                    ran.push("bun".into());
+                }
             }
-            if js.bun {
-                ran.push("bun".into());
-            }
-            if enrich_cargo(&repo, &targets, &mut report, &env) {
+            // Not gated on the lock list: the auditable-binary scan inside
+            // this step looks for release builds even when none is listed.
+            let cargo_work = report.cargo_audit_present;
+            if clock
+                .step("cargo audit", cargo_work, || {
+                    enrich_cargo(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("cargo".into());
             }
-            if enrich_cargo_deny(&repo, &targets, &mut report, &env) {
+            let deny_work = report.cargo_deny_present && !targets.deny_configs.is_empty();
+            if clock
+                .step("cargo-deny", deny_work, || {
+                    enrich_cargo_deny(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("cargo-deny".into());
             }
-            if enrich_cargo_crev(&repo, &targets, &mut report, &env) {
+            let crev_work = report.cargo_crev_present && !targets.cargo_locks.is_empty();
+            if clock
+                .step("cargo-crev", crev_work, || {
+                    enrich_cargo_crev(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("cargo-crev".into());
             }
-            if enrich_python(&repo, &targets, &mut report, &env) {
+            let python_work = report.pip_audit_present && !targets.py_requirements.is_empty();
+            if clock
+                .step("pip-audit", python_work, || {
+                    enrich_python(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("pip-audit".into());
             }
-            if enrich_go(&repo, &targets, &mut report, &env) {
+            let go_work = report.govulncheck_present && !targets.go_mods.is_empty();
+            if clock
+                .step("govulncheck", go_work, || {
+                    enrich_go(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("govulncheck".into());
             }
-            if enrich_php(&repo, &targets, &mut report, &env) {
+            let php_work = report.composer_present && !targets.composer_locks.is_empty();
+            if clock
+                .step("composer audit", php_work, || {
+                    enrich_php(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("composer".into());
             }
-            if enrich_ruby(&repo, &targets, &mut report, &env) {
+            let ruby_work = report.bundler_audit_present && !targets.gemfile_locks.is_empty();
+            if clock
+                .step("bundler-audit", ruby_work, || {
+                    enrich_ruby(&repo, &targets, &mut report, &env)
+                })
+                .unwrap_or(false)
+            {
                 ran.push("bundler-audit".into());
             }
             ran.sort();
             report.scanners_ran = ran;
         }
+        record_deadline_cut(&mut report, &clock);
         report.audit = AuditSummary::from_vulns(&report.vulnerabilities);
         sort_report(&mut report);
         cap_report(&mut report);
@@ -588,7 +819,16 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             });
             files.truncate(MAX_ECOSYSTEM_MANIFESTS);
         }
+        let probes_unresolved = env
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.probes_unresolved());
         let note = match family.as_str() {
+            // A scanner the deadline never let us look for is not a missing
+            // one: no "install it" advice for what may well be installed.
+            "cargo" | "go" | "python" | "php" | "ruby" if probes_unresolved => {
+                "The scan deadline passed before the scanners for this ecosystem could be checked, so whether they are installed is unknown".into()
+            }
             "cargo" => cargo_family_note(
                 &files,
                 cargo_audit_present,
@@ -890,6 +1130,16 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCl
     let mut npm = false;
     let mut bun = false;
     for rel_dir in roots {
+        // Each root is two commands that can take AUDIT_TIMEOUT apiece; the
+        // scan deadline is checked before starting each root.
+        if env.scan.as_ref().is_some_and(|scan| {
+            scan.skip(&format!(
+                "npm audit and outdated in {}",
+                package_label(&rel_dir)
+            ))
+        }) {
+            continue;
+        }
         let cwd = match npm_cwd(repo, &rel_dir) {
             Ok(p) => p,
             Err(msg) => {
@@ -2298,10 +2548,17 @@ fn run_json_cli(cwd: &Path, program: &str, args: &[&str], env: &ScanEnv) -> Resu
 /// `/opt/homebrew/bin/npm` existed with its shebang interpreter missing, and
 /// collapsing "never started" into it blamed a busy machine on the toolchain.
 fn probe_tool_version(program: &str, args: &[&str], env: &ScanEnv, timeout: Duration) -> ToolProbe {
-    classify_tool_probe(
-        program,
-        capture_scanner_command(env, program, args, None, timeout, &[]),
-    )
+    let result = capture_scanner_command(env, program, args, None, timeout, &[]);
+    // A probe the scan deadline refused or cut never established whether the
+    // tool exists. It is `NotRun`, never "not installed" and never "found but
+    // failed": the report must not tell the reader to install what is there.
+    if let (Some(scan), Err(error)) = (env.scan.as_ref(), result.as_ref()) {
+        if error.starts_with(DEADLINE_REFUSED) || scan.deadline_cut_probe(error) {
+            scan.state().probes_unresolved = true;
+            return ToolProbe::NotRun(error.clone());
+        }
+    }
+    classify_tool_probe(program, result)
 }
 
 /// First version line a probe reported, if any. Thin wrapper kept so the
@@ -2371,7 +2628,22 @@ fn capture_scanner_command(
     timeout: Duration,
     extra_env: &[(&str, &str)],
 ) -> Result<CapturedOutput, String> {
-    capture_command_with_env(
+    // The command's own timeout, shortened to what is left of the scan
+    // deadline: a command already running at the deadline is cut at it.
+    let what = format!("{program} {}", args.first().copied().unwrap_or_default());
+    let (timeout, shortened) = match env.scan.as_ref() {
+        Some(scan) => match scan.timeout_for(timeout, what.trim_end()) {
+            Some(clamped) => clamped,
+            None => {
+                return Err(format!(
+                    "{DEADLINE_REFUSED}`{}` could start",
+                    what.trim_end()
+                ))
+            }
+        },
+        None => (timeout, false),
+    };
+    let outcome = capture_command_with_env(
         program,
         args,
         cwd,
@@ -2380,7 +2652,11 @@ fn capture_scanner_command(
         env.path(),
         env.home(),
         env.path_source,
-    )
+    );
+    if let Some(scan) = env.scan.as_ref() {
+        scan.note_finished(&outcome, what.trim_end(), shortened);
+    }
+    outcome
 }
 
 /// The spelling that reaches cargo-audit, preferring the one a repository
@@ -6684,6 +6960,7 @@ mod tests {
             path_var: None,
             path_source: PathSource::Inherited,
             home: None,
+            scan: None,
         };
         let broken = ToolProbe::FoundButFailed("env: node: No such file or directory".to_string());
         let node_gone = ToolProbe::NotFound(
@@ -6723,6 +7000,7 @@ mod tests {
             path_var: Some(dir.path().as_os_str().to_os_string()),
             path_source: PathSource::Explicit,
             home: None,
+            scan: None,
         };
         match probe_tool_version(
             "gitpulse-silent-probe",
@@ -6747,6 +7025,7 @@ mod tests {
             path_var: Some(dir.path().as_os_str().to_os_string()),
             path_source: PathSource::Explicit,
             home: None,
+            scan: None,
         };
         match probe_tool_version(
             "gitpulse-slow-probe",
@@ -6770,6 +7049,7 @@ mod tests {
             path_var: Some(std::ffi::OsString::new()),
             path_source: PathSource::Explicit,
             home: None,
+            scan: None,
         };
         match probe_tool_version(
             "gitpulse-nowhere-probe-xyz",
@@ -7230,6 +7510,322 @@ mod fail_closed_tests {
             );
             assert!(report.audit_coverage.found > report.audit_coverage.audited);
         }
+    }
+
+    // -- one scan deadline ------------------------------------------------------
+
+    /// Stubs for `scan_with_stubs` that also append their name to `log`, so a
+    /// test can say exactly which auditors a scan started.
+    #[cfg(unix)]
+    fn logging_stubs(log: &Path, hang: &[&str]) -> Vec<(String, String)> {
+        let log = log.display();
+        vec![
+            (
+                "node".to_string(),
+                "#!/bin/sh\nif [ \"$1\" = -v ]; then echo v20.0.0; fi\n".to_string(),
+            ),
+            (
+                "npm".to_string(),
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) echo 10.9.0 ;;\n  audit) echo npm-audit >> '{log}'\n{hang_npm}\n    echo '{{\"auditReportVersion\":2,\"vulnerabilities\":{{}},\"metadata\":{{\"vulnerabilities\":{{\"total\":0}}}}}}' ;;\n  outdated) echo npm-outdated >> '{log}'; echo '{{}}' ;;\nesac\n",
+                    hang_npm = if hang.contains(&"npm") { "    /bin/sleep 30" } else { "" }
+                ),
+            ),
+            (
+                "cargo-audit".to_string(),
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  audit)\n    if [ \"$2\" = --version ]; then echo 0.21.0; exit 0; fi\n    echo cargo-audit >> '{log}'\n    echo '{{\"vulnerabilities\":{{\"found\":false,\"count\":0,\"list\":[]}}}}' ;;\n  *) echo 0.21.0 ;;\nesac\n"
+                ),
+            ),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn scan_with_deadline(
+        repo: &Path,
+        stubs: &[(String, String)],
+        deadline: crate::deadline::ScanDeadline,
+    ) -> DepsHealthReport {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, body) in stubs {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var =
+            std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        DepsScanner::scan_with_deadline(
+            repo.to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+            deadline,
+        )
+        .expect("scan")
+    }
+
+    #[cfg(unix)]
+    fn npm_and_cargo_repo() -> tempfile::TempDir {
+        npm_repo(&[
+            ("package.json", PKG),
+            ("package-lock.json", LOCK),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+            ),
+            ("Cargo.lock", "version = 3\n"),
+        ])
+    }
+
+    #[cfg(unix)]
+    fn logged(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// R3-03: a scan whose deadline has passed starts no auditor, and says so
+    /// instead of reading as a scan that found nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_past_its_deadline_starts_no_auditor_and_is_not_complete() {
+        let repo = npm_and_cargo_repo();
+        let logs = tempfile::TempDir::new().unwrap();
+        let log = logs.path().join("ran");
+        let report = scan_with_deadline(
+            repo.path(),
+            &logging_stubs(&log, &[]),
+            crate::deadline::ScanDeadline::after(Duration::ZERO),
+        );
+        assert!(logged(&log).is_empty(), "started: {:?}", logged(&log));
+        assert!(!report.audit_complete);
+        assert!(report.truncated);
+        assert!(report.scanners_ran.is_empty(), "{:?}", report.scanners_ran);
+        assert!(
+            report
+                .limit_notices
+                .iter()
+                .any(|n| n.resource.contains("scan deadline")
+                    && n.total > n.kept
+                    && !n.inventory_only),
+            "{:?}",
+            report.limit_notices
+        );
+        assert!(
+            report.issues.iter().any(|i| i.code == "scan_deadline"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// R3-03: cut the scan after each possible number of stage checks. Every
+    /// result is either the complete scan or one that says what it skipped, and
+    /// the auditors that did start are always a prefix of the full run.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_between_any_two_stages_leaves_an_honest_report() {
+        let repo = npm_and_cargo_repo();
+        let logs = tempfile::TempDir::new().unwrap();
+        let full_log = logs.path().join("full");
+        let full = scan_with_deadline(
+            repo.path(),
+            &logging_stubs(&full_log, &[]),
+            crate::deadline::ScanDeadline::audit(),
+        );
+        assert!(
+            full.audit_complete,
+            "a fast repo is complete: {:?}",
+            full.issues
+        );
+        assert!(full.limit_notices.is_empty(), "{:?}", full.limit_notices);
+        let full_order = logged(&full_log);
+        assert!(full_order.len() >= 3, "{full_order:?}");
+
+        let (mut saw_cut, mut saw_complete) = (false, false);
+        for after in 0..8 {
+            let log = logs.path().join(format!("cut{after}"));
+            let _forced = crate::deadline::tests::ExpireAfterChecks::new(after);
+            let report = scan_with_deadline(
+                repo.path(),
+                &logging_stubs(&log, &[]),
+                crate::deadline::ScanDeadline::audit(),
+            );
+            drop(_forced);
+            let started = logged(&log);
+            assert!(
+                full_order.starts_with(&started),
+                "after {after}: {started:?} is not a prefix of {full_order:?}"
+            );
+            if report.audit_complete {
+                saw_complete = true;
+                assert_eq!(started, full_order, "after {after}");
+            } else {
+                saw_cut = true;
+                assert!(report.truncated, "after {after}");
+                assert!(
+                    report.limit_notices.iter().any(|n| n.total > n.kept),
+                    "after {after}: {:?}",
+                    report.limit_notices
+                );
+            }
+        }
+        assert!(saw_cut && saw_complete, "the sweep must cross the boundary");
+    }
+
+    /// R3-03: an auditor still running at the deadline is cut at it — the
+    /// command gets what is left of the deadline as its timeout — and nothing
+    /// after it starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_auditor_is_cut_at_the_deadline_and_the_next_one_never_starts() {
+        let repo = npm_and_cargo_repo();
+        let logs = tempfile::TempDir::new().unwrap();
+        let log = logs.path().join("ran");
+        let started = std::time::Instant::now();
+        let report = scan_with_deadline(
+            repo.path(),
+            &logging_stubs(&log, &["npm"]),
+            crate::deadline::ScanDeadline::after(Duration::from_secs(2)),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "a 30 s auditor under a 2 s deadline took {elapsed:?}"
+        );
+        let ran = logged(&log);
+        assert!(ran.contains(&"npm-audit".to_string()), "{ran:?}");
+        assert!(!ran.contains(&"cargo-audit".to_string()), "{ran:?}");
+        assert!(!report.audit_complete);
+        assert!(report.truncated);
+        assert!(
+            report.issues.iter().any(|i| i.code == "scan_deadline"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// Zero artifacts: a repository with nothing to audit returns under an
+    /// expired deadline without starting anything, and is not complete.
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_deadline_on_a_repo_with_nothing_to_audit_starts_nothing() {
+        let repo = npm_repo(&[("README.md", "hello\n")]);
+        let logs = tempfile::TempDir::new().unwrap();
+        let log = logs.path().join("ran");
+        let report = scan_with_deadline(
+            repo.path(),
+            &logging_stubs(&log, &[]),
+            crate::deadline::ScanDeadline::after(Duration::ZERO),
+        );
+        assert!(logged(&log).is_empty());
+        assert!(!report.audit_complete);
+        assert!(report.manifests.is_empty() && report.vulnerabilities.is_empty());
+    }
+
+    /// A probe the deadline refused never ran, so it says nothing about
+    /// whether the tool exists. The report must not tell the reader to install
+    /// a tool that is installed, nor claim npm "was found but failed".
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_refused_at_the_deadline_is_not_run_rather_than_not_installed() {
+        let repo = npm_and_cargo_repo();
+        let logs = tempfile::TempDir::new().unwrap();
+        let log = logs.path().join("ran");
+        let report = scan_with_deadline(
+            repo.path(),
+            &logging_stubs(&log, &[]),
+            crate::deadline::ScanDeadline::after(Duration::ZERO),
+        );
+        assert!(report.truncated);
+        assert!(!report.ecosystems.is_empty());
+        for hint in &report.ecosystems {
+            assert!(
+                !hint.note.contains("Install "),
+                "{}: a scanner that was never probed is reported as missing: {}",
+                hint.family,
+                hint.note
+            );
+        }
+        for issue in report.issues.iter().filter(|i| i.code == "npm_missing") {
+            assert!(
+                !issue.message.contains("not installed") && !issue.message.contains("was found"),
+                "npm was never probed: {}",
+                issue.message
+            );
+        }
+        let env = ScanEnv {
+            scan: Some(Arc::new(ScanClock::new(
+                crate::deadline::ScanDeadline::after(Duration::ZERO),
+            ))),
+            ..ScanEnv::from_options(&ScanOptions::default())
+        };
+        assert!(matches!(
+            probe_tool_version("npm", &["--version"], &env, VERSION_TIMEOUT),
+            ToolProbe::NotRun(_)
+        ));
+    }
+
+    /// A command that failed for its own reason is not "cut off at the
+    /// deadline" just because the clock has passed by the time we look.
+    #[test]
+    fn a_command_failing_for_its_own_reason_is_not_labelled_a_deadline_cut() {
+        let clock = ScanClock::new(crate::deadline::ScanDeadline::after(Duration::ZERO));
+        clock.note_finished::<()>(
+            &Err("npm audit produced no output".into()),
+            "npm audit",
+            false,
+        );
+        assert!(
+            clock.state().not_run.is_empty(),
+            "{:?}",
+            clock.state().not_run
+        );
+        clock.note_finished::<()>(
+            &Err("npm audit timed out after 1s".into()),
+            "npm audit",
+            true,
+        );
+        assert_eq!(clock.state().not_run.len(), 1);
+    }
+
+    /// A load deferral did not run and is not a timeout, so it is never a
+    /// deadline cut; a slot-wait timeout under a clamped deadline is one.
+    #[test]
+    fn a_load_deferral_is_not_a_deadline_cut_but_a_slot_wait_timeout_is() {
+        let deferred = "npm deferred under load after 0.000s: background work is shed";
+        assert!(crate::engine::git_cli::is_deferred_under_load(deferred));
+        let clock = ScanClock::new(crate::deadline::ScanDeadline::after(Duration::from_secs(
+            60,
+        )));
+        clock.note_finished::<()>(&Err(deferred.into()), "npm audit", true);
+        assert!(
+            clock.state().not_run.is_empty(),
+            "{:?}",
+            clock.state().not_run
+        );
+        let slot = "npm timed out after 1.000s waiting for a process slot";
+        assert!(crate::engine::git_cli::is_slot_wait_timeout(slot));
+        clock.note_finished::<()>(&Err(slot.into()), "npm audit", true);
+        assert_eq!(clock.state().not_run.len(), 1);
+    }
+
+    /// A step is complete only if nothing it ran was cut, even when the cut
+    /// command carries a name an earlier step already recorded.
+    #[test]
+    fn a_step_that_was_cut_is_not_counted_complete_when_its_name_repeats() {
+        let clock = ScanClock::new(crate::deadline::ScanDeadline::after(Duration::from_secs(
+            60,
+        )));
+        clock.note_not_run("npm audit");
+        clock.step("cargo audit", true, || clock.note_not_run("npm audit"));
+        assert_eq!(clock.state().completed, 0);
+        clock.step("pip-audit", true, || ());
+        assert_eq!(clock.state().completed, 1);
     }
 
     #[test]

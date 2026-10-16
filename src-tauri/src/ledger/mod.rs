@@ -28,12 +28,16 @@
 //! screen is still on disk, in a file that gets backed up and synced and read
 //! by every later consumer.
 
+mod anchor;
 pub mod bindings;
 mod cap;
 mod consolidated;
 pub mod ids;
 pub mod redact;
 
+#[cfg(test)]
+pub(crate) use anchor::forget as forget_identity_state;
+pub(crate) use anchor::settle as settle_identity;
 pub(crate) use cap::{bound_json_text, ROW_FIELD_CAP_BYTES};
 use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
 use std::collections::HashMap;
@@ -1858,11 +1862,42 @@ pub(crate) struct BindingRow {
     pub task_id: Option<String>,
 }
 
-/// Any row attributed to a repository other than the two spellings `?1 <= ?2`.
-/// See [`latest_binding`] for why this is range probes rather than `NOT IN`.
-const FOREIGN_ROW_SQL: &str = "SELECT 1 FROM events
-     WHERE repo_path < ?1 OR (repo_path > ?1 AND repo_path < ?2) OR repo_path > ?2
-     LIMIT 1";
+/// The `WHERE` of any row attributed to a repository other than the `n`
+/// spellings `?1 < ?2 < … < ?n` (bound sorted and distinct): the gaps between
+/// them and the two ends. See [`latest_binding`] for why this is range probes
+/// rather than `NOT IN`.
+fn foreign_row_sql(n: usize) -> String {
+    let mut clauses = vec!["repo_path < ?1".to_string()];
+    clauses.extend((1..n).map(|i| format!("(repo_path > ?{i} AND repo_path < ?{})", i + 1)));
+    clauses.push(format!("repo_path > ?{n}"));
+    clauses.join(" OR ")
+}
+
+/// Any row attributed to a repository other than the spellings in `allowed`
+/// (sorted, distinct), one indexed probe.
+fn has_foreign_row(conn: &Connection, allowed: &[String]) -> Result<bool, LedgerError> {
+    conn.query_row(
+        &format!(
+            "SELECT 1 FROM events WHERE {} LIMIT 1",
+            foreign_row_sql(allowed.len())
+        ),
+        rusqlite::params_from_iter(allowed),
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+}
+
+/// The two spellings a repository's rows are stored under (its canonical path,
+/// and that path as redacted), sorted and distinct.
+fn home_spellings(repo_path: &str) -> Vec<String> {
+    let canonical = canonical_repo(repo_path);
+    let mut spellings = vec![redact::text(&canonical), canonical];
+    spellings.sort();
+    spellings.dedup();
+    spellings
+}
 
 /// The newest bind or unbind recorded for a worktree under either spelling of
 /// its path: `Some(Some(task))` for a binding, `Some(None)` for an unbind (or
@@ -1915,23 +1950,21 @@ pub(crate) fn latest_binding_readonly(
 /// Refuses a ledger holding a row attributed to a repository other than
 /// `repo_path`: no binding read may be answered from it.
 fn refuse_foreign_rows(conn: &Connection, repo_path: &str) -> Result<(), LedgerError> {
-    let canonical_repo_path = canonical_repo(repo_path);
-    let stored_repo_path = redact::text(&canonical_repo_path);
     // `NOT IN` cannot seek, and in the normal case — no foreign row — `LIMIT 1`
     // never stops it early, so it scanned all of `idx_events_repo_ts` on every
-    // gated mutation and every hook process. Three range probes around the two
+    // gated mutation and every hook process. Range probes around the
     // spellings ask the same question with index seeks. `repo_path` is
     // `TEXT NOT NULL` under BINARY collation, so `<`/`>` partition it exactly.
-    let (lo, hi) = if canonical_repo_path <= stored_repo_path {
-        (&canonical_repo_path, &stored_repo_path)
-    } else {
-        (&stored_repo_path, &canonical_repo_path)
-    };
-    let foreign = conn
-        .query_row(FOREIGN_ROW_SQL, params![lo, hi], |row| row.get::<_, i64>(0))
-        .optional()
-        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
-    if foreign.is_some() {
+    let mut allowed = home_spellings(repo_path);
+    if !has_foreign_row(conn, &allowed)? {
+        return Ok(());
+    }
+    // Only a ledger whose repository moved reaches here: a row names a path
+    // that a re-anchor row recorded as an earlier location of this one.
+    allowed.extend(anchor::aliases(conn, &allowed)?);
+    allowed.sort();
+    allowed.dedup();
+    if has_foreign_row(conn, &allowed)? {
         return Err(LedgerError::new(
             "repository_mismatch",
             "the ledger contains an event attributed to a different repository",
@@ -2099,12 +2132,20 @@ fn read_after(
         if newest {
             events.reverse();
         }
+        // The earlier locations of a repository that moved, read only when a
+        // row names a path that is not the repository's own.
+        let mut prior: Option<Vec<String>> = None;
         for event in &mut events {
             if event.repo_path != canonical_repo_path && event.repo_path != stored_repo_path {
-                return Err(LedgerError::new(
-                    "repository_mismatch",
-                    "the ledger contains an event attributed to a different repository",
-                ));
+                if prior.is_none() {
+                    prior = Some(anchor::aliases(conn, &home_spellings(repo_path))?);
+                }
+                if !prior.iter().flatten().any(|path| *path == event.repo_path) {
+                    return Err(LedgerError::new(
+                        "repository_mismatch",
+                        "the ledger contains an event attributed to a different repository",
+                    ));
+                }
             }
             // The caller already supplied this repository identity. Returning
             // that identity keeps a redacted on-disk spelling from becoming a
