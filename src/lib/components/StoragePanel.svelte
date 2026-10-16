@@ -1,5 +1,6 @@
 <script lang="ts">
   import { keyedList } from "../ui/eachKeys";
+  import { commitGraphHint } from "../health/commitGraph";
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { requestManviFocus } from "../ui/manviFocus";
@@ -178,6 +179,7 @@
     ].filter((s) => s.bytes > 0) as Segment[];
   });
 
+  let commitGraph = $derived(commitGraphHint(report?.commit_graph));
   let hygieneGaps = $derived.by(() => {
     const current = report;
     if (!current) return [] as ArtifactDir[];
@@ -541,6 +543,23 @@
             </tbody>
           </table>
         </div>
+        {#if commitGraph}
+          <!-- Display only: GitPulse never runs this command. -->
+          <div
+            class="rounded-2xl border border-border/70 bg-surface p-3 space-y-1"
+            data-testid="commit-graph-hint"
+            data-tone={commitGraph.tone}
+          >
+            <div class="text-[11px] font-semibold {commitGraph.tone === 'advice' ? 'text-amber-300' : 'text-textSecondary'}">
+              {commitGraph.title}
+            </div>
+            <p class="text-[11px] text-textMuted">{commitGraph.detail}</p>
+            {#if commitGraph.command}
+              <p class="text-[11px] text-textMuted">Run this in the repository to build one:</p>
+              <code class="block select-all font-mono text-[11px] text-textPrimary" data-testid="commit-graph-command">{commitGraph.command}</code>
+            {/if}
+          </div>
+        {/if}
       </section>
 
       <!--
