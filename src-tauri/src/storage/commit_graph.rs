@@ -41,6 +41,8 @@ const MAX_SMALL_FILE_BYTES: u64 = 64 * 1024;
 
 const CHUNK_OID_FANOUT: [u8; 4] = *b"OIDF";
 const CHUNK_OID_LOOKUP: [u8; 4] = *b"OIDL";
+const CHUNK_COMMIT_DATA: [u8; 4] = *b"CDAT";
+const CHUNK_BASE: [u8; 4] = *b"BASE";
 const CHUNK_BLOOM_INDEXES: [u8; 4] = *b"BIDX";
 const CHUNK_BLOOM_DATA: [u8; 4] = *b"BDAT";
 
@@ -93,12 +95,23 @@ pub struct CommitGraphReport {
     pub note: Option<String>,
 }
 
+/// Longest note shown. Notes quote ref names and paths, which a repository
+/// controls, so they are bounded and stripped of control characters here, once.
+const MAX_NOTE_CHARS: usize = 240;
+
+fn tidy_note(note: &str) -> String {
+    note.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_NOTE_CHARS)
+        .collect()
+}
+
 impl CommitGraphReport {
     fn unknown(layout: CommitGraphLayout, note: impl Into<String>) -> Self {
         Self {
             state: CommitGraphState::Unknown,
             layout,
-            note: Some(note.into()),
+            note: Some(tidy_note(&note.into())),
             ..Self::default()
         }
     }
@@ -109,6 +122,10 @@ struct GraphFile {
     commits: u64,
     bloom: bool,
     hash_len: usize,
+    /// Header byte 7: how many graphs this layer sits on (0 for a base).
+    base_count: u8,
+    /// The BASE chunk: those graphs' checksums, base first.
+    bases: Vec<u8>,
     file: File,
     oid_lookup_offset: u64,
     fanout: [u32; 256],
@@ -135,6 +152,12 @@ impl GraphFile {
                 ))
                 .map_err(|e| e.to_string())?;
             self.file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            // The fanout promises every entry in this range starts with the
+            // probed byte; one that does not means the table is not sorted, and
+            // a search over it proves nothing.
+            if buf[0] as usize != first {
+                return Err("the OID table is not sorted under its fanout".to_string());
+            }
             match buf.as_slice().cmp(oid) {
                 std::cmp::Ordering::Equal => return Ok(true),
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -197,6 +220,24 @@ fn open_graph(path: &Path) -> Result<GraphFile, String> {
     if chunks.last().map(|c| c.1).unwrap_or(0) > len.saturating_sub(trailer) {
         return Err("chunk table points past the end of the file".to_string());
     }
+    // The table is `chunk_count` real rows closed by a row whose id is zero;
+    // git rejects a zero id anywhere else, a repeated id, and a first chunk
+    // that starts inside the header or the table itself.
+    let (terminator, real) = chunks.split_last().expect("chunk_count + 1 rows");
+    if terminator.0 != [0; 4] {
+        return Err("chunk table has no terminating row".to_string());
+    }
+    for (i, (id, _)) in real.iter().enumerate() {
+        if *id == [0; 4] {
+            return Err("chunk table has a zero chunk id".to_string());
+        }
+        if real[..i].iter().any(|(other, _)| other == id) {
+            return Err("chunk table repeats a chunk id".to_string());
+        }
+    }
+    if real[0].1 < 8 + (chunk_count as u64 + 1) * 12 {
+        return Err("first chunk starts inside the chunk table".to_string());
+    }
     let span = |id: [u8; 4]| -> Option<(u64, u64)> {
         chunks
             .windows(2)
@@ -222,11 +263,45 @@ fn open_graph(path: &Path) -> Result<GraphFile, String> {
     if commits.saturating_mul(hash_len as u64) != lookup_len {
         return Err("OID lookup size disagrees with the fanout".to_string());
     }
-    let bloom = span(CHUNK_BLOOM_INDEXES).is_some() && span(CHUNK_BLOOM_DATA).is_some();
+    let (_, cdat_len) =
+        span(CHUNK_COMMIT_DATA).ok_or_else(|| "missing commit data chunk".to_string())?;
+    if commits.saturating_mul(hash_len as u64 + 16) != cdat_len {
+        return Err("commit data size disagrees with the fanout".to_string());
+    }
+    let (bidx, bdat) = (span(CHUNK_BLOOM_INDEXES), span(CHUNK_BLOOM_DATA));
+    if bidx.is_some() != bdat.is_some() {
+        return Err("only one of the two Bloom filter chunks is present".to_string());
+    }
+    if let (Some((idx_off, idx_len)), Some((_, data_len))) = (bidx, bdat) {
+        // BIDX is a cumulative end offset per commit and BDAT is a 12 byte
+        // header plus exactly that many bytes, so the last entry pins both
+        // sizes and shows the two chunks really are what their ids claim.
+        if idx_len != commits * 4 || data_len < 12 {
+            return Err("Bloom filter chunks have the wrong size".to_string());
+        }
+        if commits > 0 {
+            let last = read_exact_at(&mut file, idx_off + idx_len - 4, 4)?;
+            let end = u64::from(u32::from_be_bytes([last[0], last[1], last[2], last[3]]));
+            if end + 12 != data_len {
+                return Err("Bloom filter index disagrees with the filter data".to_string());
+            }
+        }
+    }
+    let base_count = header[7];
+    let bases = match span(CHUNK_BASE) {
+        Some((off, len)) if len == u64::from(base_count) * hash_len as u64 => {
+            read_exact_at(&mut file, off, len as usize)?
+        }
+        Some(_) => return Err("base graph list has the wrong size".to_string()),
+        None if base_count == 0 => Vec::new(),
+        None => return Err("a layered graph has no base graph list".to_string()),
+    };
     Ok(GraphFile {
         commits,
-        bloom,
+        bloom: bidx.is_some(),
         hash_len,
+        base_count,
+        bases,
         file,
         oid_lookup_offset: lookup_off,
         fanout,
@@ -351,7 +426,9 @@ fn packed_ref(common_dir: &Path, name: &str) -> Result<Option<Vec<u8>>, String> 
     Ok(None)
 }
 
-type GraphPaths = (CommitGraphLayout, Vec<PathBuf>);
+/// Layout, the files to read in chain order, and the chain's own checksums
+/// (empty for a single graph).
+type GraphPaths = (CommitGraphLayout, Vec<PathBuf>, Vec<Vec<u8>>);
 
 /// Graph files to read, in chain order, or `None` when no graph exists.
 fn graph_paths(info: &Path) -> Result<Option<GraphPaths>, (CommitGraphLayout, String)> {
@@ -359,8 +436,14 @@ fn graph_paths(info: &Path) -> Result<Option<GraphPaths>, (CommitGraphLayout, St
     let chain_file = chain_dir.join("commit-graph-chain");
     match read_small(&chain_file) {
         Ok(Some(text)) => {
-            let hashes: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            if hashes.is_empty() {
+            // Git reads one hash and one newline per layer: a carriage return,
+            // a blank line or padding is a chain it rejects.
+            let hashes: Vec<&str> = text
+                .strip_suffix('\n')
+                .unwrap_or(&text)
+                .split('\n')
+                .collect();
+            if text.is_empty() {
                 return Err((
                     CommitGraphLayout::Split,
                     "the commit-graph chain file is empty".to_string(),
@@ -373,27 +456,197 @@ fn graph_paths(info: &Path) -> Result<Option<GraphPaths>, (CommitGraphLayout, St
                 ));
             }
             let mut paths = Vec::with_capacity(hashes.len());
+            let mut raw = Vec::with_capacity(hashes.len());
             for hash in hashes {
-                let hash = hash.trim();
-                if !is_hex_hash(hash) {
+                let decoded = match decode_hex(hash) {
+                    Some(bytes) if is_hex_hash(hash) => bytes,
+                    _ => {
+                        return Err((
+                            CommitGraphLayout::Split,
+                            "the commit-graph chain file lists a malformed hash".to_string(),
+                        ))
+                    }
+                };
+                if raw.contains(&decoded) {
                     return Err((
                         CommitGraphLayout::Split,
-                        "the commit-graph chain file lists a malformed hash".to_string(),
+                        "the commit-graph chain file lists a layer twice".to_string(),
                     ));
                 }
+                raw.push(decoded);
                 paths.push(chain_dir.join(format!("graph-{hash}.graph")));
             }
-            return Ok(Some((CommitGraphLayout::Split, paths)));
+            return Ok(Some((CommitGraphLayout::Split, paths, raw)));
         }
         Ok(None) => {}
         Err(e) => return Err((CommitGraphLayout::Split, e)),
     }
     let single = info.join("commit-graph");
     match fs::symlink_metadata(&single) {
-        Ok(_) => Ok(Some((CommitGraphLayout::Single, vec![single]))),
+        Ok(_) => Ok(Some((CommitGraphLayout::Single, vec![single], Vec::new()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err((CommitGraphLayout::Single, format!("commit-graph: {e}"))),
     }
+}
+
+/// The layers must be one hash version matching the repository's object
+/// format, and a chain must stack in the order its file lists: layer `i` sits
+/// on exactly the `i` layers before it. Anything else is a graph git rejects.
+fn check_layers(graphs: &[GraphFile], chain: &[Vec<u8>], sha256: bool) -> Result<(), String> {
+    let want = if sha256 { 32 } else { 20 };
+    for (i, g) in graphs.iter().enumerate() {
+        if g.hash_len != want {
+            return Err("the graph's hash version differs from the repository's".to_string());
+        }
+        if usize::from(g.base_count) != i {
+            return Err("a layer does not sit on the layers before it".to_string());
+        }
+        if chain.is_empty() {
+            continue;
+        }
+        if chain[i].len() != g.hash_len {
+            return Err("a chain hash is the wrong width for its layer".to_string());
+        }
+        if g.bases != chain[..i].concat() {
+            return Err("a layer's base list disagrees with the chain order".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Config files read, counting includes: past this the scan stops reading.
+const MAX_CONFIG_FILES: usize = 16;
+/// Include nesting followed; git itself stops at ten.
+const MAX_CONFIG_DEPTH: usize = 4;
+
+/// What the detector needs from git config, read without spawning git.
+#[derive(Default)]
+struct ConfigFacts {
+    /// `core.commitGraph` resolved to false: git ignores every graph file.
+    commit_graph_off: bool,
+    /// `extensions.objectFormat = sha256`.
+    sha256: bool,
+    /// A config file that exists but could not be read; the facts are partial.
+    unreadable: Option<String>,
+}
+
+fn config_value_is_false(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "false" | "no" | "off" | "0" | ""
+    )
+}
+
+/// Drops a trailing comment and the quotes around a config value.
+fn config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut chars = raw.trim().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => quoted = !quoted,
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '#' | ';' if !quoted => break,
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+fn scan_config(path: &Path, depth: usize, files_left: &mut usize, facts: &mut ConfigFacts) {
+    if *files_left == 0 {
+        facts.unreadable = Some("too many included config files".to_string());
+        return;
+    }
+    *files_left -= 1;
+    // Dotfile managers symlink config files, and `/dev/null` is how a caller
+    // says "no config", so follow links and skip anything that is not a file.
+    let text = match fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_SMALL_FILE_BYTES => match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                facts.unreadable = Some(format!("{}: {e}", path.display()));
+                return;
+            }
+        },
+        Ok(m) if m.is_file() => {
+            facts.unreadable = Some(format!("{} is implausibly large", path.display()));
+            return;
+        }
+        Ok(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            facts.unreadable = Some(format!("{}: {e}", path.display()));
+            return;
+        }
+    };
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest.split(']').next().unwrap_or("");
+            section = name
+                .split(|c: char| c.is_whitespace() || c == '"' || c == '.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), config_value(v)),
+            None => (line.to_ascii_lowercase(), "true".to_string()),
+        };
+        match (section.as_str(), key.as_str()) {
+            ("core", "commitgraph") => facts.commit_graph_off = config_value_is_false(&value),
+            ("extensions", "objectformat") => {
+                facts.sha256 = value.eq_ignore_ascii_case("sha256");
+            }
+            ("include" | "includeif", "path") if depth < MAX_CONFIG_DEPTH => {
+                // Conditions are not evaluated: an include that might apply is
+                // read, so a graph it switches off is never reported as present.
+                let target = match value.strip_prefix("~/") {
+                    Some(rest) => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest)),
+                    None => Some(path.parent().unwrap_or(Path::new("")).join(&value)),
+                };
+                if let Some(target) = target {
+                    scan_config(&target, depth + 1, files_left, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// System config is not read; user, repository and worktree config are, in
+/// git's precedence order (later wins).
+fn read_config_facts(git_dir: &Path, common_dir: &Path) -> ConfigFacts {
+    let mut facts = ConfigFacts::default();
+    let mut files_left = MAX_CONFIG_FILES;
+    let mut files: Vec<PathBuf> = Vec::new();
+    match std::env::var_os("GIT_CONFIG_GLOBAL") {
+        Some(global) => files.push(PathBuf::from(global)),
+        None => {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| home.as_ref().map(|h| h.join(".config")));
+            files.extend(xdg.map(|x| x.join("git").join("config")));
+            files.extend(home.map(|h| h.join(".gitconfig")));
+        }
+    }
+    files.push(common_dir.join("config"));
+    files.push(git_dir.join("config.worktree"));
+    for file in files {
+        scan_config(&file, 0, &mut files_left, &mut facts);
+    }
+    facts
 }
 
 /// Inspect the commit-graph of the repository whose private git dir is
@@ -423,7 +676,17 @@ pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
         );
     }
 
-    let (layout, paths) = match graph_paths(&info) {
+    // `core.commitGraph=false` makes git ignore the files below, so neither a
+    // verdict on them nor a "write one" hint is true.
+    let config = read_config_facts(git_dir, common_dir);
+    if config.commit_graph_off {
+        return CommitGraphReport::unknown(
+            CommitGraphLayout::None,
+            "core.commitGraph is false, so git ignores the commit-graph",
+        );
+    }
+
+    let (layout, paths, chain_hashes) = match graph_paths(&info) {
         Ok(Some(found)) => found,
         Ok(None) => {
             if has_alternates {
@@ -462,6 +725,15 @@ pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
             }
         }
     }
+    if let Some(why) = &config.unreadable {
+        return CommitGraphReport::unknown(
+            layout,
+            format!("could not read git config, which may switch the graph off: {why}"),
+        );
+    }
+    if let Err(why) = check_layers(&graphs, &chain_hashes, config.sha256) {
+        return CommitGraphReport::unknown(layout, format!("could not read it: {why}"));
+    }
     let commits: u64 = graphs.iter().map(|g| g.commits).sum();
     let bloom = graphs.iter().all(|g| g.bloom);
     let mut report = CommitGraphReport {
@@ -475,6 +747,12 @@ pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
     let head = resolve_head(git_dir, common_dir);
     let head_covered = match &head {
         Head::Commit(oid) => {
+            if graphs.iter().any(|g| g.hash_len != oid.len()) {
+                return CommitGraphReport::unknown(
+                    layout,
+                    "HEAD's object id is a different hash version than the graph's",
+                );
+            }
             let mut covered = false;
             for g in &mut graphs {
                 match g.contains(oid) {
@@ -531,7 +809,9 @@ pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
                 _ => String::new(),
             };
             return CommitGraphReport {
-                note: Some(format!("HEAD could not be resolved without git: {why}")),
+                note: Some(tidy_note(&format!(
+                    "HEAD could not be resolved without git: {why}"
+                ))),
                 state: CommitGraphState::Unknown,
                 ..report
             };
