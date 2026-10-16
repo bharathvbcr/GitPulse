@@ -395,7 +395,7 @@ const MAX_DIRTY_SCANS: usize = 32;
 const DIRTY_SCAN_FAN_OUT: usize = 4;
 
 use crate::engine::cow_clone::reflink_ignored_caches;
-use crate::engine::portless::{detect_worktree_routes, WorktreeRouteInfo};
+use crate::engine::portless::{detect_worktree_routes, PortlessSnapshot, WorktreeRouteInfo};
 use crate::engine::worktree_hooks::run_repo_hooks;
 
 /// Diff stats for uncommitted changes in a worktree (`HEAD±`).
@@ -1043,6 +1043,9 @@ struct Base {
     /// `None` when the batch was not asked or did not answer; each worktree
     /// then measures itself, as it always did.
     batch: Option<HashMap<String, WorktreeDivergence>>,
+    /// The machine's portless routes, read and probed once for the listing.
+    /// `None` outside a full listing, where a worktree's scan reads its own.
+    routes: Option<PortlessSnapshot>,
 }
 
 impl Base {
@@ -1050,6 +1053,7 @@ impl Base {
         Self {
             default: Ok(None),
             batch: None,
+            routes: None,
         }
     }
 }
@@ -1329,7 +1333,7 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
     // checkout of the default needs the answer to be called "no divergence".
     let needs_base =
         depth == ScanDepth::Full && scan_targets.iter().any(|&idx| parsed[idx].branch.is_some());
-    let base = if needs_base {
+    let mut base = if needs_base {
         let default = read_base(&repo);
         let batch = match &default {
             Ok(Some((name, oid))) => {
@@ -1342,10 +1346,19 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
             }
             _ => None,
         };
-        Base { default, batch }
+        Base {
+            default,
+            batch,
+            routes: None,
+        }
     } else {
         Base::none()
     };
+    // Routes belong to the machine, not to a worktree: one read and one probe
+    // per port for the whole listing.
+    if depth == ScanDepth::Full {
+        base.routes = Some(PortlessSnapshot::load());
+    }
     let mut metrics = scan_in_waves(&scan_targets, class, None, |idx| {
         scan_worktree(&repo, &parsed[idx], depth, &base, None)
     });
@@ -1625,7 +1638,10 @@ fn scan_worktree(
             measure_diff_stat(dir)
         },
         divergence,
-        routes: detect_worktree_routes(&entry.path, branch),
+        routes: match &base.routes {
+            Some(snapshot) => snapshot.detect(&entry.path, branch),
+            None => detect_worktree_routes(&entry.path, branch),
+        },
         note: None,
         status_read,
         cut: false,
@@ -5960,6 +5976,59 @@ some-future-field whatever
         assert_eq!(spawned_with(&cwds, "--shortstat"), 0);
         assert_eq!(spawned_with(&cwds, "rev-list"), 0);
         assert_eq!(spawned_with(&cwds, "for-each-ref"), 0);
+    }
+
+    /// Portless's `routes.json` is the machine's, not a worktree's: a full
+    /// listing reads it once however many worktrees it scans, a lighter one
+    /// not at all, and each route still lands on the worktree it names.
+    #[test]
+    fn a_listing_reads_the_portless_routes_once_whatever_the_worktree_count() {
+        let (main, _parent, _linked) = repo_with_worktrees(3);
+        let root = plain(main.path());
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state.path().join("routes.json"),
+            r#"[{"hostname": "agent-01.app.localhost", "port": 4301},
+                {"hostname": "agent-0.app.localhost", "port": 4302}]"#,
+        )
+        .unwrap();
+        let serial = crate::test_support::env::env_serial();
+        let _env =
+            crate::test_support::env::bind_env(&serial).set("PORTLESS_STATE_DIR", state.path());
+
+        let lighter = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Dirty).unwrap();
+        assert!(lighter.iter().all(|w| w.active_routes.is_empty()));
+        assert_eq!(
+            crate::engine::portless::read_log::routes_reads(state.path()),
+            0
+        );
+
+        let full = list_worktrees(root.to_str().unwrap()).expect("list");
+        assert_eq!(full.len(), 4);
+        assert_eq!(
+            crate::engine::portless::read_log::routes_reads(state.path()),
+            1,
+            "one read for {} worktrees",
+            full.len()
+        );
+        let claimed: Vec<(Option<&str>, Vec<&str>)> = full
+            .iter()
+            .map(|w| {
+                (
+                    w.branch.as_deref(),
+                    w.active_routes
+                        .iter()
+                        .filter(|r| r.is_portless)
+                        .map(|r| r.hostname.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(_, routes)| !routes.is_empty())
+            .collect();
+        assert_eq!(
+            claimed,
+            vec![(Some("agent/01"), vec!["agent-01.app.localhost"])]
+        );
     }
 
     /// Filling in one worktree scans that worktree only.
