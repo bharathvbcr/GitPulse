@@ -1270,6 +1270,48 @@ body for both rows (only the hub run count and a `runs=` column were added).
 The leaf row (1 rewrite, min of 7) is unchanged within noise: 131.5 ms before,
 152.1 ms after.
 
+### What the policy calls cost (counting gate)
+
+The rows above ran with a gate of `|_| Ok(())`, which says nothing about the
+per-file policy cost. `docs_rename_benchmark` now runs the rename through a
+counting gate (`counting_gate_rename`, `docs/rename_tests.rs`) that makes the
+calls `commands::knowledge::docs_rename_guarded` makes (the move, the source
+delete, the destination write, then every other rewritten note through the
+fan-out `harness::guard_files` uses, `judge_in_order`) and counts and times
+each one. A simulated per-call latency is slept inside every call to stand in
+for the sidecar round trip. **The latency is a stand-in, not a measurement of
+the sidecar**, and the gate does not do the real scope lookup or IPC; it
+measures the call count, the fan-out and what that fan-out buys.
+
+Release build, 5,000-note corpus, hub target, **min of 5**, the four arms run
+interleaved in each round, on a host with other agents building at load (the
+hub rename takes 84 to 101 s here against 44.6 s above, so read the shares, not
+the absolute rename times):
+
+| latency per call | workers | policy calls | files judged | gate wall (ms) | sum of call times (ms) | rename (ms) | gate share |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 ms | 1 | 5,002 | 5,001 | 0.56 | 0.19 | 97,315 | 0.0% |
+| 0 ms | 8 | 5,002 | 5,001 | 2.00 | 6.62 | 92,792 | 0.0% |
+| 2 ms | 1 | 5,002 | 5,001 | 18,635 | 18,622 | 101,509 | 18.4% |
+| 2 ms | 8 | 5,002 | 5,001 | 2,401 | 19,109 | 83,781 | 2.9% |
+
+- One rename is 5,002 policy calls: the `git mv` line, the source delete, the
+  destination write, and 4,999 rewritten notes (the moved note's own rewrite is
+  judged as the destination). 5,001 distinct files, each once; the bench
+  asserts no file is judged twice.
+- With a free gate the policy is nothing (0.0% of the rename). With 2 ms a call
+  one worker costs 18.6 s (18.4% of the rename); the production 8 workers cost
+  2.4 s (2.9%), a **7.76x** shorter gate (the bench asserts it beats one worker
+  within `coverage_relaxed`). What `GUARD_FILES_CONCURRENCY` buys is therefore
+  about 16 s per hub rename at 2 ms a call, and it scales with the sidecar's
+  real latency, which this bench does not know.
+- Leaf target (no linking notes): 3 calls, 2 files; at 2 ms the gate is 7.6 ms
+  with 1 worker and 24 ms with 8 (the workers do not overlap anything there and
+  the spawn plus scheduling noise dominates). No speed claim is made for it and
+  the bench asserts none.
+- Not measured: the real sidecar's round-trip latency, the scope lookup, and
+  the ledger recording `guard_files` does per verdict.
+
 ### What is left in the 44.6 s
 
 It is not git and not policy. It is the durable write of each rewritten note:

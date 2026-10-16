@@ -457,6 +457,24 @@ fn judge_in_order<V: Send>(
         .collect()
 }
 
+/// Test-only door to [`judge_in_order`] and [`GUARD_FILES_CONCURRENCY`], so the
+/// hub-rename benchmark drives the fan-out production uses for rewrites with
+/// its own counting check instead of a copy of it. Never refuses early.
+#[cfg(test)]
+pub(crate) fn judge_files_for_bench<V: Send>(
+    files: &[&str],
+    workers: usize,
+    check: impl Fn(&str) -> V + Sync,
+) -> Vec<Option<V>> {
+    judge_in_order(files, workers, check, |_| false)
+}
+
+/// The worker count [`guard_files`] runs in production.
+#[cfg(test)]
+pub(crate) const fn production_guard_workers() -> usize {
+    GUARD_FILES_CONCURRENCY
+}
+
 /// The task scope this checkout is working under, if it is bound to one.
 ///
 /// Two lookups, both cheap and both allowed to come back empty:
