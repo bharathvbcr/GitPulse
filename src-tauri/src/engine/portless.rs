@@ -448,16 +448,19 @@ pub(crate) mod read_log {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::thread::ThreadId;
 
-    static READS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+    static READS: Mutex<Option<HashMap<(ThreadId, PathBuf), usize>>> = Mutex::new(None);
 
-    /// Counts an attempt to read `routes_file`, keyed by file so a test reads
-    /// back only its own state directory's count.
+    /// Counts an attempt to read `routes_file`, keyed by calling thread and
+    /// file. The environment is process-wide, so another test listing
+    /// worktrees on its own thread while this one holds `PORTLESS_STATE_DIR`
+    /// reads the same file; its read is not this test's.
     pub(super) fn record(routes_file: &Path) {
         let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
         *reads
             .get_or_insert_with(HashMap::new)
-            .entry(routes_file.to_path_buf())
+            .entry((std::thread::current().id(), routes_file.to_path_buf()))
             .or_insert(0) += 1;
     }
 
@@ -466,7 +469,7 @@ pub(crate) mod read_log {
         let reads = READS.lock().unwrap_or_else(|e| e.into_inner());
         reads
             .as_ref()
-            .and_then(|map| map.get(&state_dir.join("routes.json")))
+            .and_then(|map| map.get(&(std::thread::current().id(), state_dir.join("routes.json"))))
             .copied()
             .unwrap_or(0)
     }
