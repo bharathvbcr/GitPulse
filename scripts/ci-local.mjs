@@ -183,6 +183,15 @@ export const GATES = [
     ],
   },
   {
+    // The terminal suites again, every registry backed by a real
+    // gitpulse-ptyd (docs/TERMINAL_HOST.md, migration step 2).
+    id: "terminal-host-suites",
+    name: "Terminal suites against the terminal host",
+    program: "bun",
+    args: ["run", "test:terminal-host"],
+    covers: ["bun run test:terminal-host"],
+  },
+  {
     // ci.yml's Gusset engine job. It needs DevCouncil and gusset checked out
     // beside this repository, as go/go.mod's replaces do; without them the
     // script exits 2, "could not run", which fails here rather than passing.

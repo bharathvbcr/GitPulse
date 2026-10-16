@@ -713,10 +713,21 @@ pub fn cmd_set_exit_guard_ready(state: State<DesktopState>) {
     state.exit.arm();
 }
 
-/// Completes a frontend-approved exit (see `exit::approve`).
+/// Completes a frontend-approved exit (see `exit::approve`). `terminals`
+/// is the quit's choice for sessions a terminal host holds: `"leave"` keeps
+/// them running for the next launch, `"stop"` ends them. Absent leaves the
+/// backend's default: in-process sessions always stop, a host's are left.
 #[tauri::command(async)]
-pub fn cmd_exit_app(app: AppHandle) {
+pub fn cmd_exit_app(app: AppHandle, terminals: Option<String>) -> Result<(), String> {
+    let sessions = app.state::<crate::terminal::TerminalSessions>();
+    match terminals.as_deref() {
+        None => {}
+        Some("leave") => sessions.set_leave_running(true),
+        Some("stop") => sessions.set_leave_running(false),
+        Some(other) => return Err(format!("Unknown choice for terminals on quit: {other:?}")),
+    }
     exit::approve(&app);
+    Ok(())
 }
 
 /// The frontend acknowledges a quit request, or cancels it.

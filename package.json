@@ -55,6 +55,7 @@
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "tauri": "node scripts/tauri.mjs",
+    "test:terminal-host": "node scripts/terminal-host-suites.mjs",
     "test:browser": "node scripts/browser-regressions.mjs",
     "test:browser:all": "node scripts/browser-regressions.mjs --all",
     "test:coverage-ui": "node scripts/browser-regressions.mjs --harness coverage",

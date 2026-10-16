@@ -2007,6 +2007,18 @@ fn resolve_bundled_binary(env_var: &str, stem: &str) -> BinaryStatus {
     ))
 }
 
+/// The path of a helper executable that ships beside the app (the bundle's
+/// `Contents/MacOS`), or why it could not be found. `env_var` overrides, as it
+/// does for the copy-paste setup above.
+pub(crate) fn bundled_binary(env_var: &str, stem: &str) -> Result<std::path::PathBuf, String> {
+    let status = resolve_bundled_binary(env_var, stem);
+    if status.found {
+        Ok(status.path.into())
+    } else {
+        Err(status.error)
+    }
+}
+
 /// Single-quotes `text` for a POSIX shell.
 fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))

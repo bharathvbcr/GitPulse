@@ -125,7 +125,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_session_limit(100);
     let dir = repo();
@@ -152,6 +152,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )
+    .unwrap()
     .is_empty()));
     std::thread::sleep(Duration::from_millis(500));
     let (fds_before, threads_before) = (open_descriptors(), threads());
@@ -163,7 +164,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
                 .collect();
             launches.into_iter().map(|l| l.join().unwrap()).collect()
         });
-        assert_eq!(list_sessions(&state).len(), 100, "round {round}");
+        assert_eq!(list_sessions(&state).unwrap().len(), 100, "round {round}");
         std::thread::scope(|scope| {
             for id in &ids {
                 let state = &state;
@@ -171,7 +172,9 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
             }
         });
         assert!(
-            wait_until(Duration::from_secs(20), || list_sessions(&state).is_empty()),
+            wait_until(Duration::from_secs(20), || list_sessions(&state)
+                .unwrap()
+                .is_empty()),
             "round {round}: sessions left after every close returned"
         );
     }
@@ -210,7 +213,7 @@ fn unread_flood(total: usize, budget: Duration) {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_output_stall_timeout(Duration::from_millis(10));
     let delivered = Arc::new(AtomicUsize::new(0));
@@ -266,7 +269,10 @@ fn unread_flood(total: usize, budget: Duration) {
         "an unacknowledged view was sent {} bytes; the window is 512 KiB",
         delivered.load(Ordering::SeqCst)
     );
-    assert!(list_sessions(&state).iter().all(|s| s.id != spawned.id));
+    assert!(list_sessions(&state)
+        .unwrap()
+        .iter()
+        .all(|s| s.id != spawned.id));
 }
 
 /// Output is bytes, not text. Invalid UTF-8, and multi-byte sequences cut at
@@ -278,7 +284,7 @@ fn invalid_utf8_and_split_multibyte_sequences_arrive_byte_exact_at_every_alignme
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (output, exits) = collecting(&app, &state);
     let dir = repo();
@@ -335,7 +341,7 @@ fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (output, exits) = collecting(&app, &state);
     let dir = repo();
@@ -387,7 +393,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (_output, exits) = collecting(&app, &state);
     let dir = repo();

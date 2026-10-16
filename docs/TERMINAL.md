@@ -212,6 +212,14 @@ message. Invalid Unicode is also refused before any portion is sent. Failed or
 timed-out writes are not retried, since part of a command may already have arrived;
 restart the session before entering more input.
 
+Sessions live in the app unless Settings → Agents → "Keep terminals running when
+GitPulse quits" is on; then they live in `gitpulse-ptyd`, survive a quit or a crash,
+and a quit with sessions running asks whether to leave them or stop them. A session
+taken over by a new view — after a reload, a crash, or from Sessions — is first shown
+its newest 512 KiB of output, kept whether or not anything was showing it, and is told
+when output printed while it was detached is no longer kept. See
+[Terminal host](TERMINAL_HOST.md).
+
 The native PTY pauses after 512 KiB of output awaiting renderer acknowledgements.
 If the renderer stops acknowledging for 30 seconds, the session closes with a
 delivery error. This bounds output in transit; retained history is limited

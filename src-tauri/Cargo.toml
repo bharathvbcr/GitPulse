@@ -45,6 +45,10 @@ path = "src/bin/gitpulse-mcp.rs"
 name = "gitpulse-hook"
 path = "src/bin/gitpulse-hook.rs"
 
+[[bin]]
+name = "gitpulse-ptyd"
+path = "src/bin/gitpulse-ptyd.rs"
+
 [dependencies]
 # `macos-private-api` is what makes the macOS glass appearance possible at all,
 # and the gate is deeper than the name suggests: it forwards `wry/transparent`,

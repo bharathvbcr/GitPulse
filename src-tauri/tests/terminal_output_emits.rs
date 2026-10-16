@@ -157,7 +157,7 @@ fn run_tui(sessions: usize, frames: usize, writes: usize) -> (Vec<Tally>, Durati
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let tallies = counting(&app, &state);
     let exited = exits(&app);
@@ -278,7 +278,7 @@ fn a_one_megabyte_burst_is_byte_exact_in_few_events_with_exact_credit() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let tallies = counting(&app, &state);
     let dir = repo();
@@ -353,7 +353,7 @@ fn output_that_stops_after_looking_like_a_stream_is_still_delivered() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let tallies = counting(&app, &state);
     let dir = repo();
@@ -399,7 +399,7 @@ fn output_gathered_when_the_process_exits_is_delivered_before_the_exit() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let tallies = counting(&app, &state);
     let exited = exits(&app);
@@ -450,7 +450,7 @@ fn a_view_that_never_acknowledges_gets_one_window_then_one_notice_then_resumes()
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_output_stall_timeout(Duration::from_millis(20));
     let held: Unrepaid = Arc::default();
@@ -547,7 +547,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let tallies = counting_with(&app, &state, false);
     let dir = repo();
@@ -574,6 +574,7 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     );
     assert!(
         gitpulse_lib::terminal::list_sessions(&state)
+            .unwrap()
             .iter()
             .any(|s| s.id == id && s.detached),
         "the process must still be running, detached"
@@ -667,7 +668,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let arrivals = hearing_marks(&app, &state);
     let dir = repo();
@@ -761,7 +762,7 @@ fn characters_and_escape_sequences_split_across_events_arrive_byte_exact() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let boundaries: Arc<Mutex<Vec<usize>>> = Arc::default();
     let tallies = counting(&app, &state);
@@ -865,7 +866,7 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     state.set_output_stall_timeout(Duration::from_millis(50));
     let owed: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
@@ -1113,7 +1114,7 @@ fn a_views_channel_gets_raw_bytes_in_order_then_one_end_marker_before_the_exit()
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let (viewer, sink) = Viewer::new(&state, true);
@@ -1212,7 +1213,7 @@ fn attaching_a_view_moves_the_output_to_its_channel() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let (first, first_sink) = Viewer::new(&state, true);
@@ -1257,7 +1258,7 @@ fn a_hidden_sessions_output_is_batched_at_least_ten_times_harder_and_still_whole
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let losses = Arc::new(AtomicUsize::new(0));
     {

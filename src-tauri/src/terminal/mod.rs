@@ -11,9 +11,12 @@ use crate::engine::git_cli::{
 };
 use crate::harness::{guard_command, PolicyVerdict};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+pub mod events;
 mod executor;
 mod flow;
 pub(crate) mod foreground;
+#[cfg(unix)]
+pub mod host;
 pub mod incident;
 #[cfg(unix)]
 mod input;
@@ -22,10 +25,13 @@ mod ipc;
 mod jobs;
 #[cfg(unix)]
 mod readiness;
+mod ring;
 mod sink;
+pub use events::{AppEvents, SessionEnded, SessionEvents};
 use executor::Executor;
 use flow::{OutputFlow, Route};
 pub use ipc::{control_async, resize_async, write_async};
+pub use ring::RING_BYTES;
 use serde::{Deserialize, Serialize};
 use sink::OutputSlot;
 pub use sink::{OutputChannel, OutputSink, END_OF_OUTPUT};
@@ -36,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Bounds for one-shot command execution timeout.
 const MIN_RUN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -175,7 +181,7 @@ pub struct TerminalRunResult {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSpawned {
     pub id: String,
     pub shell: String,
@@ -220,7 +226,7 @@ fn output_payload_names_the_reserved_length() {
 
 /// Output a live session's view will never see. The process keeps running;
 /// the view says what was lost. Emitted as `terminal-loss`.
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalLossPayload {
     pub id: String,
     pub message: String,
@@ -264,7 +270,7 @@ const HIDDEN_MAX_HOLD: Duration = Duration::from_millis(250);
 /// not be one.
 const CLOSING_LAP: Duration = Duration::from_millis(50);
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalExitPayload {
     pub id: String,
     pub exit_code: Option<i32>,
@@ -285,7 +291,13 @@ pub struct TerminalExitPayload {
 pub(crate) trait SessionObserver: Send + Sync {
     fn run_id(&self) -> &str;
     fn before_spawn(&self, session_id: &str) -> Result<(), String>;
-    fn started(&self, session_id: &str, process_id: Option<u32>) -> Result<(), String>;
+    /// The process started: its id and creation identity, read right after
+    /// the fork, or why they could not be read.
+    fn started(
+        &self,
+        session_id: &str,
+        process: Result<(u32, String), String>,
+    ) -> Result<(), String>;
     fn spawn_failed(&self, session_id: &str, reason: &str);
     fn finished(&self, payload: &TerminalExitPayload);
 }
@@ -318,6 +330,23 @@ struct SessionEntry {
     /// Where this session's resizes are applied, apart from `input` so a
     /// write spinning on a full tty never holds a resize behind it.
     geometry: Executor,
+    /// Where this session's losses and its end are reported.
+    events: Arc<dyn SessionEvents>,
+    /// Its newest output, whatever its view did with it. Also the order of
+    /// delivery: the reader holds it from keeping a chunk to sending it, and
+    /// a view taking the session over holds it across its replay, so the two
+    /// never interleave.
+    ring: Arc<Mutex<ring::Ring>>,
+}
+
+/// Which backend holds the terminals, as Settings and the quit dialog read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalBackendStatus {
+    /// `host` (`gitpulse-ptyd`; sessions outlive the app) or `in-process`.
+    pub backend: String,
+    /// What is wrong with the host, plainly: version skew, a host that would
+    /// not start. Empty when nothing is known to be wrong.
+    pub trouble: Vec<String>,
 }
 
 /// Thread-safe registry of live PTY sessions.
@@ -338,9 +367,19 @@ pub struct TerminalSessions {
     /// command shares (see `executor`). As wide as the session cap, so closing
     /// every tab at once still closes them side by side, as it did.
     control: Executor,
+    /// The terminal host that holds the PTYs, when this registry is the app's
+    /// side of one (`docs/TERMINAL_HOST.md`). `None` is the engine in this
+    /// process. Every `terminal::` function routes on this and nothing else.
+    #[cfg(unix)]
+    host: Option<host::client::HostClient>,
+    /// What an exit of this app does to the sessions a host holds: leave
+    /// them running (a crash, a signal, or a quit that chose to), or stop them.
+    /// Meaningless in-process, where a session cannot outlive the app.
+    leave_running: Arc<AtomicBool>,
 }
 
 impl Default for TerminalSessions {
+    /// The engine in this process.
     fn default() -> Self {
         Self {
             sessions: Arc::default(),
@@ -354,11 +393,125 @@ impl Default for TerminalSessions {
                 CONTROL_QUEUE_CAPACITY,
                 CONTROL_IDLE,
             ),
+            #[cfg(unix)]
+            host: None,
+            leave_running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl TerminalSessions {
+    /// A registry whose sessions live in the terminal host described by
+    /// `config`. Nothing connects until the first call (or [`Self::connect_host`]).
+    #[cfg(unix)]
+    pub fn with_host(config: host::client::HostConfig) -> Self {
+        Self {
+            host: Some(host::client::HostClient::new(config)),
+            leave_running: Arc::new(AtomicBool::new(true)),
+            ..Self::default()
+        }
+    }
+
+    /// The app's registry: the host when the user has chosen to keep
+    /// terminals running across quits (Settings → Agents), else in-process.
+    pub fn from_settings() -> Self {
+        #[cfg(unix)]
+        if crate::tool_config::agent_defaults().keeps_terminals_running() {
+            match host::client::HostConfig::for_app() {
+                Ok(config) => return Self::with_host(config),
+                Err(error) => {
+                    log::error!(target: "terminal", "terminals stay in the app: the terminal host has no directory: {error}")
+                }
+            }
+        }
+        Self::default()
+    }
+
+    /// The terminal host's pid while connected; `None` in-process. For tests
+    /// that measure what the process holding the PTYs gives back.
+    #[doc(hidden)]
+    pub fn host_pid(&self) -> Option<u32> {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            return host.host_pid();
+        }
+        None
+    }
+
+    /// Which backend holds the PTYs: `"host"` or `"in-process"`.
+    pub fn backend(&self) -> &'static str {
+        #[cfg(unix)]
+        if self.host.is_some() {
+            return "host";
+        }
+        "in-process"
+    }
+
+    /// Where session events go in the app (Tauri events, incidents), for the
+    /// sessions it did not start itself: those a host kept from an earlier
+    /// app. Called once at startup.
+    pub fn bind_app<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            host.set_events(Arc::new(AppEvents::new(app, self.incidents.clone())));
+        }
+        #[cfg(not(unix))]
+        let _ = app;
+    }
+
+    /// How a task run whose terminal outlived the app that launched it is
+    /// observed when it ends. Only a host has such runs.
+    #[cfg(unix)]
+    pub(crate) fn set_adopter(&self, adopter: host::client::Adopter) {
+        if let Some(host) = &self.host {
+            host.set_adopter(adopter);
+        }
+    }
+
+    /// Connects to the host, adopting what it holds and recording what ended
+    /// while no app was there. Nothing to do in-process.
+    pub fn connect_host(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            host.connect()?;
+            host.set_limit(self.session_limit());
+        }
+        Ok(())
+    }
+
+    /// What is wrong with the terminal host, if anything (version skew, a host
+    /// that would not start). Always empty in-process.
+    pub fn host_trouble(&self) -> Vec<String> {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            return host.trouble();
+        }
+        Vec::new()
+    }
+
+    /// Whether this app's exit leaves the host's sessions running.
+    pub fn leaves_sessions_running(&self) -> bool {
+        #[cfg(unix)]
+        if self.host.is_some() {
+            return self.leave_running.load(Ordering::Acquire);
+        }
+        false
+    }
+
+    /// The quit's choice: leave the host's sessions running, or stop them.
+    pub fn set_leave_running(&self, leave: bool) {
+        self.leave_running.store(leave, Ordering::Release);
+    }
+
+    /// Lets the host go without stopping anything: every view detaches and
+    /// every session keeps running for the next app. Nothing in-process.
+    pub fn disconnect_host(&self) {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            host.disconnect();
+        }
+    }
+
     /// The lane that delivers `session_id`'s keystrokes.
     fn input_lane(&self, session_id: &str) -> Result<Executor, String> {
         self.lock_sessions()
@@ -373,6 +526,10 @@ impl TerminalSessions {
     /// retire ask this.
     #[doc(hidden)]
     pub fn lane_threads(&self) -> usize {
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            return host.lane_threads();
+        }
         self.lock_sessions()
             .values()
             .map(|session| session.input.workers() + session.geometry.workers())
@@ -422,6 +579,10 @@ impl TerminalSessions {
     pub fn set_session_limit(&self, limit: usize) {
         self.limit
             .store(limit.clamp(1, MAX_PTY_SESSIONS), Ordering::Release);
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            host.set_limit(self.session_limit());
+        }
     }
 
     /// Sets how long a reader waits for a view before shedding, clamped to
@@ -430,6 +591,15 @@ impl TerminalSessions {
     pub fn set_output_stall_timeout(&self, timeout: Duration) {
         let ms = timeout.as_millis().clamp(10, 300_000) as u64;
         self.output_stall_ms.store(ms, Ordering::Release);
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            host.set_stall(Duration::from_millis(ms));
+        }
+    }
+
+    /// How long a reader waits on an unacknowledged window before it sheds.
+    fn output_stall(&self) -> Duration {
+        Duration::from_millis(self.output_stall_ms.load(Ordering::Acquire))
     }
 }
 
@@ -772,10 +942,17 @@ struct SessionWatcher {
     /// The scanner's own overflow count, mirrored so only the delta is
     /// reported and the total cannot be double-counted.
     reported_drops: u64,
+    /// Where a notice goes: a banner in the app, a frame from the host.
+    events: Arc<dyn SessionEvents>,
 }
 
 impl SessionWatcher {
-    fn new(session_id: &str, program: &str, cwd: &std::path::Path) -> Self {
+    fn new(
+        session_id: &str,
+        program: &str,
+        cwd: &std::path::Path,
+        events: Arc<dyn SessionEvents>,
+    ) -> Self {
         let agent = agent_launcher(program);
         Self {
             key: session_id.to_owned(),
@@ -786,12 +963,13 @@ impl SessionWatcher {
             is_agent: agent.is_some(),
             scanner: crate::alerts::scan::Scanner::new(),
             reported_drops: 0,
+            events,
         }
     }
 
     fn observe(&mut self, bytes: &[u8]) {
         for signal in self.scanner.feed(bytes) {
-            crate::alerts::offer(crate::alerts::Notice {
+            self.events.notice(crate::alerts::Notice {
                 key: self.key.clone(),
                 origin: crate::alerts::Origin::Terminal,
                 label: self.label.clone(),
@@ -808,7 +986,10 @@ impl SessionWatcher {
             });
         }
         let dropped = self.scanner.dropped();
-        crate::alerts::record_scan_drops(dropped.saturating_sub(self.reported_drops));
+        let new_drops = dropped.saturating_sub(self.reported_drops);
+        if new_drops > 0 {
+            self.events.scan_drops(new_drops);
+        }
         self.reported_drops = dropped;
     }
 
@@ -816,7 +997,7 @@ impl SessionWatcher {
     /// be answered, whether or not its agent's own `SessionEnd` hook ran — a
     /// killed process runs no hooks.
     fn ended(&self) {
-        crate::alerts::offer(crate::alerts::Notice {
+        self.events.notice(crate::alerts::Notice {
             key: self.key.clone(),
             origin: crate::alerts::Origin::Terminal,
             label: self.label.clone(),
@@ -1218,7 +1399,7 @@ fn task_start(cwd: &str) -> Result<(String, Option<String>), String> {
 /// Every field is optional because the OS can decline to describe a process
 /// (a setuid program, a process that exited between two calls). An unknown
 /// is reported as unknown — never as idle, and never as the repository root.
-#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalContext {
     /// Name of the program in the terminal's foreground.
     pub process: Option<String>,
@@ -1251,6 +1432,10 @@ pub fn session_context(
     state: &TerminalSessions,
     session_id: &str,
 ) -> Result<TerminalContext, String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.context(session_id);
+    }
     let (child, master, repo, closing) = state
         .lock_sessions()
         .get(session_id)
@@ -1327,6 +1512,10 @@ pub fn session_context(
 /// the exit receipt, so while it is here the real outcome may still arrive,
 /// and nothing else may record one in its place.
 pub(crate) fn tracks_run(state: &TerminalSessions, run_id: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.tracks_run(run_id);
+    }
     state
         .lock_sessions()
         .values()
@@ -1357,9 +1546,14 @@ pub struct TerminalListing {
     pub ending: bool,
 }
 
-/// Every session this process still owns, live or ending. Bounded by
-/// `MAX_PTY_SESSIONS`.
-pub fn list_sessions(state: &TerminalSessions) -> Vec<TerminalListing> {
+/// Every session this process (or its terminal host) still owns, live or
+/// ending. Bounded by `MAX_PTY_SESSIONS`. `Err` when the host could not be
+/// asked, which is not the same as holding nothing.
+pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.list();
+    }
     let guard = state.lock_sessions();
     let mut listed: Vec<TerminalListing> = guard
         .values()
@@ -1377,22 +1571,128 @@ pub fn list_sessions(state: &TerminalSessions) -> Vec<TerminalListing> {
         })
         .collect();
     listed.sort_by(|a, b| a.id.cmp(&b.id));
-    listed
+    Ok(listed)
 }
 
 /// The page holding every session is being replaced (a webview reload).
 /// Each live session stops waiting on that page's acknowledgements; none is
 /// stopped. Returns how many were detached.
 pub fn detach_all(state: &TerminalSessions) -> usize {
-    let guard = state.lock_sessions();
-    let mut detached = 0;
-    for session in guard.values() {
-        if !session.dead.load(Ordering::Acquire) {
-            session.flow.detach();
-            detached += 1;
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        // A count is all the caller logs; a host that could not be told has
+        // already detached every view of an app whose page it cannot reach.
+        return host.detach_all().unwrap_or_else(|error| {
+            log::warn!(target: "terminal", "the terminal host could not be told the page reloaded: {error}");
+            0
+        });
+    }
+    let live: Vec<(Arc<OutputFlow>, Arc<Mutex<ring::Ring>>)> = state
+        .lock_sessions()
+        .values()
+        .filter(|session| !session.dead.load(Ordering::Acquire))
+        .map(|session| (session.flow.clone(), session.ring.clone()))
+        .collect();
+    for (flow, ring) in &live {
+        let_go(flow, ring);
+    }
+    live.len()
+}
+
+/// The view holding a session is gone: its reader stops waiting on that view's
+/// credit, and the ring marks where unseen output begins.
+///
+/// The flow first, outside the ring's lock: a reader waiting for credit holds
+/// that lock, and only the detach wakes it. The mark is set only if the
+/// session is still detached once the lock is had, because a view may have
+/// taken it over in between.
+fn let_go(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
+    flow.detach();
+    let mut ring = ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if flow.is_detached() {
+        ring.detached();
+    }
+}
+
+/// What a view taking a session over needs of it.
+struct Takeover {
+    flow: Arc<OutputFlow>,
+    output: Arc<OutputSlot>,
+    ring: Arc<Mutex<ring::Ring>>,
+    events: Arc<dyn SessionEvents>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    spawned: TerminalSpawned,
+}
+
+impl Takeover {
+    fn of(session: &SessionEntry) -> Self {
+        Self {
+            flow: session.flow.clone(),
+            output: session.output.clone(),
+            ring: session.ring.clone(),
+            events: session.events.clone(),
+            master: session.master.clone(),
+            spawned: session.spawned.clone(),
         }
     }
-    detached
+
+    /// Hands the session to `output` at `rows`×`cols`: the ring's newest bytes
+    /// first, on the new view's fresh window, then everything the program
+    /// prints from here on, then a resize nudge so a full-screen program also
+    /// redraws itself. `forced` takes it from a view that still holds it.
+    fn hand_to(
+        self,
+        output: OutputSink,
+        rows: u16,
+        cols: u16,
+        forced: bool,
+        stall: Duration,
+    ) -> Result<TerminalSpawned, String> {
+        if forced {
+            let_go(&self.flow, &self.ring);
+        } else if !self.flow.is_detached() {
+            // Refused before the ring's lock, which a reader waiting on the
+            // holding view's credit keeps for as long as it waits.
+            return Err("This terminal is already shown in a tab.".into());
+        }
+        {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self.flow.attach() {
+                return Err("This terminal is already shown in a tab.".into());
+            }
+            // The new view's channel, before anything is sent to it: the
+            // replay and the repaint are what it is shown first.
+            self.output.replace(output);
+            let replay = ring.attached();
+            if replay.lost_while_detached > 0 {
+                self.events.loss(TerminalLossPayload {
+                    id: self.spawned.id.clone(),
+                    message: ring::lost_notice(replay.lost_while_detached),
+                });
+            }
+            let sink = self.output.current();
+            for chunk in replay.bytes.chunks(OUTPUT_CHUNK_BYTES) {
+                // The ring is one window, and the window is fresh, so this
+                // never waits; anything but Deliver means the view went away.
+                match self.flow.reserve(chunk.len(), stall) {
+                    Ok(Route::Deliver | Route::Resume) => {
+                        if sink.bytes(&self.spawned.id, chunk).is_err() {
+                            self.flow.shed(chunk.len());
+                            break;
+                        }
+                    }
+                    Ok(Route::Hold | Route::Shed { .. }) | Err(_) => break,
+                }
+            }
+        }
+        repaint(&self.master, rows, cols);
+        Ok(self.spawned)
+    }
 }
 
 /// The one view holding this session has gone without closing it — a tab
@@ -1401,14 +1701,19 @@ pub fn detach_all(state: &TerminalSessions) -> usize {
 /// stops it. Returns whether it was live and is now detached; an id that has
 /// already ended is not an error, there is simply nothing left to keep.
 pub fn detach_session(state: &TerminalSessions, session_id: &str) -> Result<bool, String> {
-    let guard = state.lock_sessions();
-    let Some(session) = guard
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.detach(session_id);
+    }
+    let Some((flow, ring)) = state
+        .lock_sessions()
         .get(session_id)
         .filter(|s| !s.dead.load(Ordering::Acquire))
+        .map(|s| (s.flow.clone(), s.ring.clone()))
     else {
         return Ok(false);
     };
-    session.flow.detach();
+    let_go(&flow, &ring);
     log::info!(target: "terminal", "terminal view went away; session detached and left running");
     Ok(true)
 }
@@ -1416,11 +1721,13 @@ pub fn detach_session(state: &TerminalSessions, session_id: &str) -> Result<bool
 /// Hands a detached session to a new view at that view's size.
 ///
 /// Refused for a session a view still holds: two views of one PTY would both
-/// paint and both acknowledge. The size is set twice, the first time one
-/// column off, because a resize to the size a process already has sends no
-/// `SIGWINCH`: without the change a full-screen program (Claude Code, an
-/// editor) would not repaint, and the new view — which has none of the
-/// output from before the reload — would stay blank until the next keypress.
+/// paint and both acknowledge. The new view is sent the session's newest
+/// output (its ring) first, so a shell prompt, a test run or `tail -f` comes
+/// back as it was, and is told when output printed while it was away is no
+/// longer kept. The size is then set twice, the first time one column off,
+/// because a resize to the size a process already has sends no `SIGWINCH`:
+/// without the change a full-screen program (Claude Code, an editor) would not
+/// redraw over the replay until the next keypress.
 pub fn attach_session(
     state: &TerminalSessions,
     session_id: &str,
@@ -1428,22 +1735,17 @@ pub fn attach_session(
     cols: u16,
     output: OutputSink,
 ) -> Result<TerminalSpawned, String> {
-    let (spawned, master) = {
-        let guard = state.lock_sessions();
-        let session = guard
-            .get(session_id)
-            .filter(|s| !s.dead.load(Ordering::Acquire))
-            .ok_or_else(|| format!("Terminal session '{session_id}' has ended"))?;
-        if !session.flow.attach() {
-            return Err("This terminal is already shown in a tab.".into());
-        }
-        // The new view's channel, before anything is sent to it: the repaint
-        // below is what it will be shown first.
-        session.output.replace(output);
-        (session.spawned.clone(), session.master.clone())
-    };
-    repaint(&master, rows, cols);
-    Ok(spawned)
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.attach(session_id, rows, cols, output);
+    }
+    let takeover = state
+        .lock_sessions()
+        .get(session_id)
+        .filter(|s| !s.dead.load(Ordering::Acquire))
+        .map(Takeover::of)
+        .ok_or_else(|| format!("Terminal session '{session_id}' has ended"))?;
+    takeover.hand_to(output, rows, cols, false, state.output_stall())
 }
 
 /// The live tracked task session of `run_id`, which repairs a lost launch
@@ -1459,23 +1761,24 @@ pub(crate) fn attach_tracked_session(
     cols: u16,
     output: OutputSink,
 ) -> Option<TerminalSpawned> {
-    let (spawned, master) = {
-        let guard = state.lock_sessions();
-        let session = guard.values().find(|s| {
-            s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire)
-        })?;
-        // The caller brings its own channel, so even a session a view still
-        // holds is taken over: the channel the lost launch response went with
-        // belongs to a call that never learned this session's id, and what it
-        // was sent will never be shown or repaid. A fresh window and a repaint
-        // are what a view that starts here needs.
-        session.flow.detach();
-        session.flow.attach();
-        session.output.replace(output);
-        (session.spawned.clone(), session.master.clone())
-    };
-    repaint(&master, rows, cols);
-    Some(spawned)
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.attach_tracked(run_id, rows, cols, output);
+    }
+    let takeover = state
+        .lock_sessions()
+        .values()
+        .find(|s| s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire))
+        .map(Takeover::of)?;
+    // The caller brings its own channel, so even a session a view still holds
+    // is taken over: the channel the lost launch response went with belongs to
+    // a call that never learned this session's id, and what it was sent will
+    // never be shown or repaid. A fresh window, the ring and a repaint are what
+    // a view that starts here needs.
+    takeover
+        .hand_to(output, rows, cols, true, state.output_stall())
+        .inspect_err(|error| log::warn!(target: "terminal", "a task terminal could not be taken over: {error}"))
+        .ok()
 }
 
 /// Has the program redraw at the size it already has: what a view that
@@ -1522,12 +1825,12 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     output: OutputSink,
     observer: Arc<dyn SessionObserver>,
 ) -> Result<TerminalSpawned, String> {
-    let (root, start) = task_start(cwd)?;
-    spawn_session_inner(
+    spawn_at(
         app,
         state,
-        &root,
-        start.as_deref(),
+        Place::Task {
+            cwd: cwd.to_owned(),
+        },
         rows,
         cols,
         Some(program),
@@ -1536,6 +1839,93 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
         output,
         Some(observer),
     )
+}
+
+/// Where a session starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Place {
+    /// `start_dir` (relative, `None` for the root) inside the repository
+    /// `repo_path`.
+    Repo {
+        repo_path: String,
+        start_dir: Option<String>,
+    },
+    /// A task attempt's recorded working directory: its checkout's root is
+    /// what is validated and trusted.
+    Task { cwd: String },
+}
+
+impl Place {
+    /// The canonical repository and the directory inside it to start in,
+    /// checked the way every spawn is: a git work tree, and a start directory
+    /// that resolves inside it.
+    fn resolve(&self) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+        let (root, start_dir) = match self {
+            Place::Repo {
+                repo_path,
+                start_dir,
+            } => (repo_path.clone(), start_dir.clone()),
+            Place::Task { cwd } => task_start(cwd)?,
+        };
+        let repo = validate_repo(&root)?;
+        let start = resolve_start_dir(&repo, start_dir.as_deref())?;
+        Ok((repo, start))
+    }
+}
+
+/// One request to start a session: everything the engine needs, and nothing
+/// it could only find in the app. Crosses the host socket as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnRequest {
+    /// Minted by the app (`next_session_id`), so a run's claim can name the
+    /// session before the process exists.
+    pub session_id: String,
+    pub place: Place,
+    pub rows: u16,
+    pub cols: u16,
+    pub program: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    /// The task run this session belongs to.
+    pub run_id: Option<String>,
+}
+
+/// One session's lanes: its keystrokes and its resizes, each one thread in
+/// order. The engine's, and the app's in front of a terminal host, so a full
+/// queue and a dropped call behave the same on both backends.
+pub(crate) fn session_lanes() -> (Executor, Executor) {
+    (
+        Executor::new("input", 1, INPUT_QUEUE_CAPACITY, LANE_IDLE),
+        Executor::new("geometry", 1, GEOMETRY_QUEUE_CAPACITY, LANE_IDLE),
+    )
+}
+
+/// A new session id: `term-<this process's pid>-<counter>`. Unique for the
+/// life of this process, and across its restarts because the pid changes.
+pub(crate) fn next_session_id() -> String {
+    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("term-{}-{:x}", std::process::id(), count)
+}
+
+/// Whether `id` is one [`next_session_id`] could have minted. The host takes
+/// ids from the app; one it could not have made is refused, not stored.
+fn is_session_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("term-") else {
+        return false;
+    };
+    let Some((pid, count)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.len() <= 10
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && !count.is_empty()
+        && count.len() <= 16
+        && count
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1552,14 +1942,121 @@ fn spawn_session_inner<R: tauri::Runtime>(
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<TerminalSpawned, String> {
+    spawn_at(
+        app,
+        state,
+        Place::Repo {
+            repo_path: repo_path.to_owned(),
+            start_dir: start_dir.map(str::to_owned),
+        },
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        output,
+        observer,
+    )
+}
+
+/// The app's side of every spawn, whichever backend holds the PTY: the checks
+/// that need this process (the load governor's override is held here), the
+/// session id, and the ledger record once the session exists.
+#[allow(clippy::too_many_arguments)]
+fn spawn_at<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    place: Place,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    observer: Option<Arc<dyn SessionObserver>>,
+) -> Result<TerminalSpawned, String> {
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
-    let repo = validate_repo(repo_path)?;
-    let start = resolve_start_dir(&repo, start_dir)?;
+    let (repo, _) = place.resolve()?;
     // An agent CLI is a launch the load governor may refuse under severe
     // memory pressure; the user's own shell (no program) never is.
     if program.as_deref().is_some_and(|p| !p.trim().is_empty()) {
         crate::sysload::admit(crate::sysload::Site::PtySpawn, &repo.to_string_lossy())
             .map_err(|refused| refused.message())?;
+    }
+    let request = SpawnRequest {
+        session_id: next_session_id(),
+        place,
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        run_id: observer.as_ref().map(|o| o.run_id().to_owned()),
+    };
+    let ledger = (
+        request
+            .program
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(default_shell),
+        request.args.clone(),
+    );
+    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app, state.incidents.clone()));
+    #[cfg(unix)]
+    let started = match &state.host {
+        Some(host) => host.spawn(events, request, output, observer)?,
+        None => start_session(state, request, output, events, observer)?,
+    };
+    #[cfg(not(unix))]
+    let started = start_session(state, request, output, events, observer)?;
+    let spawned = started.spawned;
+    // The ledger entry resolves the repository's address and task binding
+    // (git) and appends (a lock another writer may hold), and none of it can
+    // change what the caller is told: spawn used to wait on all of it, and a
+    // renderer watchdog then killed the new session for being slow to start.
+    // Done beside the session, never in front of it.
+    record_session_spawn(
+        repo.to_string_lossy().into_owned(),
+        ledger.0,
+        spawned.id.clone(),
+        ledger.1,
+        agent_launcher(&spawned.shell).is_some(),
+    );
+    Ok(spawned)
+}
+
+/// Starts one session in this process: the engine. Everything here runs where
+/// the PTY will live — the repository and trust checks, the fork, the reader —
+/// so the checks hold for the process that forks.
+pub(crate) fn start_session(
+    state: &TerminalSessions,
+    request: SpawnRequest,
+    output: OutputSink,
+    events: Arc<dyn SessionEvents>,
+    observer: Option<Arc<dyn SessionObserver>>,
+) -> Result<Started, String> {
+    let SpawnRequest {
+        session_id,
+        place,
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        run_id,
+    } = request;
+    if !is_session_id(&session_id) {
+        return Err("Invalid terminal session id".into());
+    }
+    if run_id.as_deref().is_some_and(|id| {
+        id.is_empty() || id.len() > 128 || !id.chars().all(|c| c.is_ascii_graphic())
+    }) {
+        return Err("Invalid task run id".into());
+    }
+    validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
+    let (repo, start) = place.resolve()?;
+    if state.lock_sessions().contains_key(&session_id) {
+        return Err(format!("Terminal session '{session_id}' already exists"));
     }
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
@@ -1592,7 +2089,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
             return Err(refusal);
         }
     }
-    if observer.is_some() {
+    if run_id.is_some() {
         normalize_task_environment(&mut cmd, &repo);
     }
 
@@ -1615,8 +2112,6 @@ fn spawn_session_inner<R: tauri::Runtime>(
         .master
         .take_writer()
         .map_err(|e| format!("Failed to take PTY writer: {e}"))?;
-    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let session_id = format!("term-{}-{:x}", std::process::id(), count);
     // What an agent's own hook needs in order to report back precisely: which
     // GitPulse session it is running under, and where to say so. Both are set
     // after the caller's `env` map has been applied, and deliberately so —
@@ -1639,9 +2134,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     // The launch table's environment (the task run id), after the caller's
     // map for the same reason as the two above: it names this launch, and an
     // IPC caller must not be able to file a session under another run.
-    for (name, value) in
-        crate::workbench::terminal_command::launch_env(observer.as_ref().map(|o| o.run_id()))
-    {
+    for (name, value) in crate::workbench::terminal_command::launch_env(run_id.as_deref()) {
         match value {
             Some(value) => cmd.env(name, value),
             None => cmd.env_remove(name),
@@ -1678,9 +2171,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
             return Err(reason);
         }
     };
+    // Read now, while the child cannot have been reaped: what a task run
+    // records its start with, here or, through the host's reply, in the app.
+    let identity = process_identity(child.process_id());
     let start_error = observer
         .as_ref()
-        .and_then(|observer| observer.started(&session_id, child.process_id()).err());
+        .and_then(|observer| observer.started(&session_id, identity.clone()).err());
     // Registered before the reader exists and before anything can have asked
     // the child whether it ran: a child that exits from here on is reported to
     // the watch, and one that already has is found by the reader's first ask.
@@ -1698,6 +2194,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let hidden = Arc::new(AtomicBool::new(false));
     let master = Arc::new(Mutex::new(pair.master));
     let closing = Arc::new(AtomicUsize::new(0));
+    let ring = Arc::new(Mutex::new(ring::Ring::default()));
+    let (input, geometry) = session_lanes();
     let entry = SessionEntry {
         master: master.clone(),
         writer: Arc::new(Mutex::new(writer)),
@@ -1708,24 +2206,37 @@ fn spawn_session_inner<R: tauri::Runtime>(
         output: output_slot.clone(),
         hidden: hidden.clone(),
         closing: closing.clone(),
-        tracked_run: observer.as_ref().map(|o| o.run_id().to_owned()),
+        tracked_run: run_id.clone(),
         spawned: TerminalSpawned {
             id: session_id.clone(),
             shell: resolved.clone(),
             cwd: start.to_string_lossy().into_owned(),
         },
         repo: repo.clone(),
-        input: Executor::new("input", 1, INPUT_QUEUE_CAPACITY, LANE_IDLE),
-        geometry: Executor::new("geometry", 1, GEOMETRY_QUEUE_CAPACITY, LANE_IDLE),
+        input,
+        geometry,
+        events: events.clone(),
+        ring: ring.clone(),
     };
 
     {
         let mut guard = state.lock_sessions();
+        // Checked again where it counts: two requests naming one id raced past
+        // the check above, and the second child is stopped, not filed.
+        if guard.contains_key(&session_id) {
+            drop(guard);
+            dead.store(true, Ordering::SeqCst);
+            if let Err(error) = terminate_pty_child(&child, &master, &closing) {
+                log::error!(target: "terminal", "could not stop a duplicate session: {error}");
+            }
+            return Err(format!("Terminal session '{session_id}' already exists"));
+        }
         guard.insert(session_id.clone(), entry);
     }
 
     // Reader thread: streams output to the session's view through its output sink.
-    let app_handle = app.clone();
+    let thread_events = events.clone();
+    let thread_ring = ring.clone();
     let sid_for_thread = session_id.clone();
     let sid_for_exit = session_id.clone();
     let dead_flag = dead.clone();
@@ -1741,9 +2252,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let thread_master = master.clone();
     let thread_closing = closing.clone();
     let thread_observer = observer.clone();
-    let incident_log = state.incidents.clone();
-    let incident_program = shell.clone();
-    let incident_cwd = start.to_string_lossy().into_owned();
+    let exit_program = shell.clone();
+    let exit_cwd = start.to_string_lossy().into_owned();
     if start_error.is_some() {
         dead.store(true, Ordering::SeqCst);
         output_flow.stop();
@@ -1754,7 +2264,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
 
     // What a banner from this session will say. Resolved once, here, because
     // the reader thread outlives every borrow it could otherwise take.
-    let watcher = SessionWatcher::new(&session_id, &resolved, &repo);
+    let watcher = SessionWatcher::new(&session_id, &resolved, &repo, events);
 
     let slot = SessionSlot {
         sessions: state.sessions.clone(),
@@ -1790,10 +2300,19 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut deliver = |data: &[u8], failure: &mut Option<String>| {
                 let n = data.len();
                 let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
+                // Kept before it is routed, whatever the route: a view that
+                // takes this session over later is shown it. Held until the
+                // chunk is sent, so a takeover's replay cannot land between
+                // keeping it and sending it.
+                let mut kept = thread_ring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                kept.push(data);
                 let delivery = output_flow.reserve(n, stall).map(|route| {
                     let resumed = match route {
                         // Detached: the page that would paint this is gone.
-                        // The process keeps running; the bytes are not sent.
+                        // The process keeps running; the bytes are kept in
+                        // the ring and not sent.
                         Route::Hold => return,
                         // The view is alive but behind. Never a reason to
                         // end the process: drop, keep draining, say so once.
@@ -1804,12 +2323,10 @@ fn spawn_session_inner<R: tauri::Runtime>(
                                     "{program_for_log} terminal: view did not acknowledge output for {}ms; skipping output until it catches up (process left running)",
                                     stall.as_millis()
                                 );
-                                if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                thread_events.loss(TerminalLossPayload {
                                     id: sid_for_thread.clone(),
                                     message: SHED_NOTICE.into(),
-                                }) {
-                                    log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
-                                }
+                                });
                             }
                             return;
                         }
@@ -1836,16 +2353,15 @@ fn spawn_session_inner<R: tauri::Runtime>(
                                 log::warn!(target: "terminal", "{program_for_log} terminal: failed to send output to its view, skipping output: {error}");
                             }
                             if output_flow.shed(n) {
-                                if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                thread_events.loss(TerminalLossPayload {
                                     id: sid_for_thread.clone(),
                                     message: SHED_NOTICE.into(),
-                                }) {
-                                    log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
-                                }
+                                });
                             }
                         }
                     }
                 });
+                drop(kept);
                 if let Err(error) = delivery {
                     if !dead_flag.swap(true, Ordering::SeqCst) {
                         *failure = Some(error);
@@ -2091,14 +2607,6 @@ fn spawn_session_inner<R: tauri::Runtime>(
                             );
                         }
                     }
-                    incident::report_exit(
-                        &incident_log,
-                        &app_handle,
-                        ended_by_gitpulse,
-                        &payload,
-                        &incident_program,
-                        &incident_cwd,
-                    );
                     drop(reservation.take());
                     sessions_map
                         .lock()
@@ -2111,9 +2619,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     if let Err(error) = output_slot.current().end(&sid_for_exit) {
                         log::warn!(target: "terminal", "{program_for_log} terminal: could not mark the end of its output: {error}");
                     }
-                    if let Err(e) = app_handle.emit("terminal-exit", payload) {
-                        log::warn!(target: "terminal", "failed to emit terminal-exit event: {e}");
-                    }
+                    thread_events.exit(SessionEnded {
+                        payload,
+                        ended_by_gitpulse,
+                        program: exit_program.clone(),
+                        cwd: exit_cwd.clone(),
+                    });
                 },
             );
         },
@@ -2138,28 +2649,36 @@ fn spawn_session_inner<R: tauri::Runtime>(
         return Err(format!("Task process bookkeeping failed; the child was asked to stop. Inspect the run before another attempt: {error}"));
     }
 
-    // The ledger entry resolves the repository's address and task binding
-    // (git) and appends (a lock another writer may hold), and none of it can
-    // change what the caller is told: spawn used to wait on all of it, and a
-    // renderer watchdog then killed the new session for being slow to start.
-    // Done beside the session, never in front of it.
-    record_session_spawn(
-        repo.to_string_lossy().into_owned(),
-        shell.clone(),
-        session_id.clone(),
-        args.clone(),
-        agent_launcher(&resolved).is_some(),
-    );
-
-    Ok(TerminalSpawned {
-        // The resolved path, not the requested name: on a GUI launch these
-        // differ, and "which binary is this session running" is the question
-        // the status row and the harness journal are actually asking.
-        shell: resolved,
-        id: session_id,
-        // Where the process started, the same value the session entry holds.
-        cwd: start.to_string_lossy().into_owned(),
+    Ok(Started {
+        spawned: TerminalSpawned {
+            // The resolved path, not the requested name: on a GUI launch these
+            // differ, and "which binary is this session running" is the
+            // question the status row and the harness journal are actually
+            // asking.
+            shell: resolved,
+            id: session_id,
+            // Where the process started, the same value the session entry
+            // holds.
+            cwd: start.to_string_lossy().into_owned(),
+        },
+        process: identity,
     })
+}
+
+/// A session the engine has started.
+pub(crate) struct Started {
+    pub spawned: TerminalSpawned,
+    /// The process's id and creation identity (`process_birth`), or why they
+    /// could not be read.
+    pub process: Result<(u32, String), String>,
+}
+
+/// The id and creation identity of a process just forked.
+fn process_identity(pid: Option<u32>) -> Result<(u32, String), String> {
+    let pid = pid
+        .filter(|pid| *pid > 0)
+        .ok_or("PTY did not report a process ID")?;
+    Ok((pid, crate::workbench::process_birth::read(pid)?))
 }
 
 /// Records `session.spawn` on a thread of its own. `record` rather than
@@ -2224,7 +2743,7 @@ pub fn write_to_session(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
-    write_pty_bytes(state, session_id, data.as_bytes())
+    write_input(state, session_id, data.as_bytes())
 }
 
 /// xterm's onBinary stream encodes one byte per Latin-1 character.
@@ -2233,15 +2752,34 @@ pub fn write_binary_to_session(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
+    write_input(state, session_id, &binary_input(data)?)
+}
+
+/// xterm's onBinary characters as the bytes they stand for, one per
+/// Latin-1 character.
+fn binary_input(data: &str) -> Result<Vec<u8>, String> {
     if data.len() > 2 * MAX_PTY_INPUT_BYTES {
         return Err("Binary terminal input exceeds its limit".into());
     }
-    let bytes: Result<Vec<u8>, _> = data.chars().map(|c| u8::try_from(u32::from(c))).collect();
-    write_pty_bytes(
-        state,
-        session_id,
-        &bytes.map_err(|_| "Invalid binary terminal input")?,
-    )
+    data.chars()
+        .map(|c| u8::try_from(u32::from(c)))
+        .collect::<Result<_, _>>()
+        .map_err(|_| "Invalid binary terminal input".into())
+}
+
+/// Input for a session, wherever it lives.
+fn write_input(state: &TerminalSessions, session_id: &str, data: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        if data.len() > MAX_PTY_INPUT_BYTES {
+            return Err(format!(
+                "Terminal input is {} bytes; the per-write limit is {MAX_PTY_INPUT_BYTES}",
+                data.len()
+            ));
+        }
+        return host.write_blocking(session_id, data);
+    }
+    write_pty_bytes(state, session_id, data)
 }
 
 struct EraseInputCounts {
@@ -2348,6 +2886,10 @@ pub fn resize_session(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.resize_blocking(session_id, rows, cols);
+    }
     // The map is let go before the master is waited for: one session's busy
     // master must not stall list, write, kill and attach for all the others.
     let master = state
@@ -2393,6 +2935,9 @@ fn lock_within<T: ?Sized>(
 pub struct MasterHold {
     release: Option<std::sync::mpsc::Sender<()>>,
     holder: Option<thread::JoinHandle<()>>,
+    /// Held in the terminal host instead: released by asking it.
+    #[cfg(unix)]
+    remote: Option<(host::client::HostClient, String)>,
 }
 
 impl MasterHold {
@@ -2401,7 +2946,20 @@ impl MasterHold {
         self.finish();
     }
 
+    #[cfg(unix)]
+    pub(crate) fn remote(host: host::client::HostClient, session_id: String) -> Self {
+        Self {
+            release: None,
+            holder: None,
+            remote: Some((host, session_id)),
+        }
+    }
+
     fn finish(&mut self) {
+        #[cfg(unix)]
+        if let Some((host, session_id)) = self.remote.take() {
+            host.release(&session_id);
+        }
         drop(self.release.take());
         if let Some(holder) = self.holder.take() {
             let _ = holder.join();
@@ -2419,6 +2977,10 @@ impl Drop for MasterHold {
 /// tests that need to know which of many resizes was applied last.
 #[doc(hidden)]
 pub fn pty_size(state: &TerminalSessions, session_id: &str) -> Result<(u16, u16), String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.size(session_id);
+    }
     let master = state
         .lock_sessions()
         .get(session_id)
@@ -2434,6 +2996,10 @@ pub fn pty_size(state: &TerminalSessions, session_id: &str) -> Result<(u16, u16)
 /// is held.
 #[doc(hidden)]
 pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterHold, String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.hold(session_id);
+    }
     let master = state
         .lock_sessions()
         .get(session_id)
@@ -2458,6 +3024,8 @@ pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterH
     Ok(MasterHold {
         release: Some(release),
         holder: Some(holder),
+        #[cfg(unix)]
+        remote: None,
     })
 }
 
@@ -2467,6 +3035,11 @@ pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterH
 /// Waits for the reader to reap the child and release capacity before success;
 /// a timeout retains ownership so a retry cannot signal an unrelated process.
 pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        log::info!(target: "terminal", "terminal close requested");
+        return host.kill(session_id);
+    }
     let handles = {
         let guard = state.lock_sessions();
         guard.get(session_id).map(|s| {
@@ -2505,6 +3078,10 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
 
 /// Application exit closes every owned PTY before the runtime disappears.
 pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.stop_all();
+    }
     let ids: Vec<String> = state.lock_sessions().keys().cloned().collect();
     // Every session at once: each close waits for its own reader (a hangup
     // grace plus a reap), and quitting with a full dock one session after
@@ -2540,6 +3117,12 @@ pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
 /// for a session that is not (or no longer) open. An idle session's reader
 /// sleeps until output, an exit or its safety net, so this does not move.
 pub fn reader_wakeups(state: &TerminalSessions, session_id: &str) -> Option<u64> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.wakeups(session_id).unwrap_or_else(|error| {
+            panic!("the terminal host's reader could not be asked: {error}")
+        });
+    }
     state
         .lock_sessions()
         .get(session_id)
@@ -2555,6 +3138,11 @@ const MAX_BACKGROUND_REPORT: usize = 256;
 /// including one the view has never mentioned, is treated as seen. The list
 /// is the whole truth each time, so a session that left it is visible again.
 pub fn set_background_sessions(state: &TerminalSessions, session_ids: &[String]) {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        let bounded = &session_ids[..session_ids.len().min(MAX_BACKGROUND_REPORT)];
+        return host.set_background(bounded);
+    }
     let hidden: std::collections::HashSet<&str> = session_ids
         .iter()
         .take(MAX_BACKGROUND_REPORT)
@@ -2573,6 +3161,10 @@ pub fn acknowledge_output(
     session_id: &str,
     bytes: usize,
 ) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.ack(session_id, bytes);
+    }
     let flow = state
         .lock_sessions()
         .get(session_id)
@@ -2687,11 +3279,108 @@ fn terminate_pty_child_within(
     if shell.try_wait().map_err(|e| e.to_string())?.is_some() {
         return Ok(());
     }
+    #[cfg(unix)]
+    {
+        stop_leader(&mut shell)
+    }
     // The shell itself: `kill` hangs it up before it kills it.
-    shell.kill().map_err(|e| {
-        log::warn!(target: "terminal", "could not signal terminal child: {e}");
-        format!("Could not stop terminal process: {e}")
-    })
+    #[cfg(not(unix))]
+    {
+        shell.kill().map_err(|e| {
+            log::warn!(target: "terminal", "could not signal terminal child: {e}");
+            format!("Could not stop terminal process: {e}")
+        })
+    }
+}
+
+/// How long the session leader has after its hangup before it is killed: what
+/// `portable_pty`'s own `kill` allowed, which this replaces.
+#[cfg(unix)]
+const LEADER_HANGUP_WAIT: Duration = Duration::from_millis(200);
+
+/// Hangs up the session's own process, then kills it if the hangup did not end
+/// it — through `procguard::signal`, the one primitive every signal the app
+/// (and the terminal host) sends goes through, never `portable_pty`'s raw
+/// `kill(2)`. The caller holds the child's lock and has seen it unreaped, so
+/// the pid is still this child's; the start time read here is what
+/// `signal_process` re-checks at each signal.
+///
+/// The shell is often already on its way out: the hangup of its session's
+/// jobs reaches it too, and on macOS a killed process blocked on a full tty
+/// cannot finish exiting until the reader drains it, which starts only once
+/// this close returns. An exiting process, and a zombie, cannot be described by
+/// the process table, so the guarded primitive refuses to signal it — where a
+/// raw `kill(2)` would have "succeeded" at nothing. This child is unreaped and
+/// its lock is held, so its pid cannot belong to anyone else: one the table
+/// cannot describe is exiting, needs no signal, and is left to the reaper. One
+/// that never finishes is reported by the close's own cleanup deadline.
+#[cfg(unix)]
+fn stop_leader(shell: &mut Box<dyn Child + Send + Sync>) -> Result<(), String> {
+    let pid = shell
+        .process_id()
+        .and_then(|p| i32::try_from(p).ok())
+        .ok_or("The terminal process reports no id; it was not signalled")?;
+    let Some(started) = start_of(pid) else {
+        log::debug!(target: "terminal", "the terminal process is already exiting; nothing to signal");
+        return Ok(());
+    };
+    if signal_leader(shell, pid, started, libc::SIGHUP)? {
+        return Ok(());
+    }
+    if reaped_within(shell, LEADER_HANGUP_WAIT)? {
+        return Ok(());
+    }
+    signal_leader(shell, pid, started, libc::SIGKILL).map(|_| ())
+}
+
+/// The start time the process table reports for `pid`, which
+/// `signal_process` compares against the one recorded.
+#[cfg(unix)]
+fn start_of(pid: i32) -> Option<u64> {
+    crate::sysload::procscan::probe_one(pid).map(|facts| facts.start_us)
+}
+
+/// Sends `signo` to the session leader through the guarded primitive.
+/// `Ok(true)` when the child turned out to be gone already.
+#[cfg(unix)]
+fn signal_leader(
+    shell: &mut Box<dyn Child + Send + Sync>,
+    pid: i32,
+    started: u64,
+    signo: libc::c_int,
+) -> Result<bool, String> {
+    match crate::procguard::signal::signal_process(pid, started, &start_of, signo, "terminal close")
+    {
+        Ok(()) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+        // Refused because the table no longer describes it: exiting.
+        Err(_) if start_of(pid).is_none() => Ok(true),
+        Err(error) => {
+            if reaped_within(shell, LEADER_HANGUP_WAIT)? {
+                return Ok(true);
+            }
+            log::warn!(target: "terminal", "could not signal terminal child: {error}");
+            Err(format!("Could not stop terminal process: {error}"))
+        }
+    }
+}
+
+/// Whether the child exits (and is reaped here) within `within`.
+#[cfg(unix)]
+fn reaped_within(
+    shell: &mut Box<dyn Child + Send + Sync>,
+    within: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + within;
+    loop {
+        if shell.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// One-shot bounded command execution in `repo_path`.
@@ -3902,7 +4591,7 @@ mod tests {
             fn before_spawn(&self, _: &str) -> Result<(), String> {
                 crate::repository_trust::revoke(self.repo.to_str().unwrap())
             }
-            fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+            fn started(&self, _: &str, _: Result<(u32, String), String>) -> Result<(), String> {
                 panic!("revoked launch started")
             }
             fn spawn_failed(&self, _: &str, reason: &str) {
@@ -4034,7 +4723,7 @@ mod tests {
             fn before_spawn(&self, _: &str) -> Result<(), String> {
                 Ok(())
             }
-            fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+            fn started(&self, _: &str, _: Result<(u32, String), String>) -> Result<(), String> {
                 Ok(())
             }
             fn spawn_failed(&self, _: &str, reason: &str) {
@@ -4124,7 +4813,7 @@ mod tests {
         };
         // Attached and unacknowledged, the program is held back by the window.
         assert!(!wait_for(&|| marker.exists(), Duration::from_millis(1500)));
-        assert!(!list_sessions(&state)[0].detached);
+        assert!(!list_sessions(&state).unwrap()[0].detached);
         assert_eq!(
             attach_session(&state, &spawned.id, 24, 80, discard()).unwrap_err(),
             "This terminal is already shown in a tab."
@@ -4135,22 +4824,130 @@ mod tests {
             wait_for(&|| marker.exists(), Duration::from_secs(10)),
             "a detached session must keep running past its output window"
         );
-        let listed = list_sessions(&state);
+        let listed = list_sessions(&state).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, spawned.id);
         assert!(listed[0].detached);
         assert_eq!(listed[0].launcher, None);
         assert_eq!(listed[0].run_id, None);
 
-        let shown = attach_session(&state, &spawned.id, 30, 100, discard()).unwrap();
+        // S2-11: what was printed while nobody held the session is not lost
+        // to the next view. It is shown the ring's tail first — here all
+        // `a`s, the newest window of the 1.5 MiB the program printed — and,
+        // because more was printed while detached than the ring keeps, told
+        // that the rest was not kept.
+        let losses: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        {
+            use tauri::Listener;
+            let losses = losses.clone();
+            app.listen_any("terminal-loss", move |event| {
+                losses
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(event.payload()).unwrap());
+            });
+        }
+        let (view, shown_bytes) = recording();
+        let shown = attach_session(&state, &spawned.id, 30, 100, view).unwrap();
         assert_eq!(shown.id, spawned.id);
-        assert!(!list_sessions(&state)[0].detached);
+        let replayed = shown_bytes.lock().unwrap().concat();
+        assert_eq!(replayed.len(), RING_BYTES, "the whole ring is replayed");
+        assert!(replayed.iter().all(|b| *b == b'a'));
+        let losses = losses.lock().unwrap();
+        assert_eq!(losses.len(), 1, "{losses:?}");
+        assert_eq!(losses[0]["id"], spawned.id.as_str());
+        assert!(losses[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Output while detached was not kept"));
+        drop(losses);
+        assert!(!list_sessions(&state).unwrap()[0].detached);
         assert!(attach_session(&state, &spawned.id, 30, 100, discard()).is_err());
         assert!(attach_session(&state, "term-missing", 30, 100, discard()).is_err());
 
         kill_session(&state, &spawned.id).unwrap();
-        assert!(list_sessions(&state).is_empty());
+        assert!(list_sessions(&state).unwrap().is_empty());
         assert_eq!(detach_all(&state), 0);
+    }
+
+    /// S2-11's other half: a program that never repaints (a shell prompt, a
+    /// test run) printing a little while detached comes back with exactly
+    /// that, in order, and with no "not kept" notice, because nothing was lost.
+    #[cfg(unix)]
+    #[test]
+    fn output_printed_while_detached_is_replayed_to_the_next_view() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let go = dir.path().join("go");
+        let printed = dir.path().join("printed");
+        let script = format!(
+            "printf 'before\\n'; while [ ! -e '{go}' ]; do sleep 0.02; done; \
+             printf 'while-away-1\\nwhile-away-2\\n'; : > '{printed}'; read finish",
+            go = go.display(),
+            printed = printed.display(),
+        );
+        let (first, first_bytes) = recording();
+        let spawned = spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), script]),
+            None,
+            first,
+            None,
+        )
+        .unwrap();
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            done()
+        };
+        let seen = |log: &Arc<Mutex<Vec<Vec<u8>>>>| {
+            String::from_utf8_lossy(&log.lock().unwrap().concat()).into_owned()
+        };
+        assert!(wait_for(&|| seen(&first_bytes).contains("before")));
+        assert!(detach_session(&state, &spawned.id).unwrap());
+        std::fs::write(&go, b"").unwrap();
+        assert!(wait_for(&|| printed.exists()));
+        // Read past the marker's creation: the reader may not have kept the
+        // last line yet when the file appears.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !seen(&first_bytes).contains("while-away"),
+            "the view that went away was sent nothing more"
+        );
+
+        let (second, second_bytes) = recording();
+        attach_session(&state, &spawned.id, 24, 80, second).unwrap();
+        let replay = seen(&second_bytes);
+        let at = |needle: &str| {
+            replay
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {replay:?}"))
+        };
+        assert!(at("before") < at("while-away-1") && at("while-away-1") < at("while-away-2"));
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// A sink whose messages are kept, raw, in order.
+    fn recording() -> (OutputSink, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let log: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let into = log.clone();
+        let sink = OutputSink::channel(tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Raw(bytes) = body {
+                into.lock().unwrap().push(bytes);
+            }
+            Ok(())
+        }));
+        (sink, log)
     }
 
     /// An observer that panics when told the process ended, standing for any
@@ -4165,7 +4962,7 @@ mod tests {
         fn before_spawn(&self, _: &str) -> Result<(), String> {
             Ok(())
         }
-        fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+        fn started(&self, _: &str, _: Result<(u32, String), String>) -> Result<(), String> {
             Ok(())
         }
         fn spawn_failed(&self, _: &str, reason: &str) {
@@ -4206,7 +5003,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            wait_until(Duration::from_secs(10), || list_sessions(&state).is_empty()),
+            wait_until(Duration::from_secs(10), || list_sessions(&state)
+                .unwrap()
+                .is_empty()),
             "a session whose end-of-session bookkeeping panicked stayed in the map"
         );
         assert!(
@@ -4255,7 +5054,9 @@ mod tests {
         // itself cannot be announced here; what must hold is that the process
         // does not outlive its reader.
         assert!(
-            wait_until(Duration::from_secs(15), || list_sessions(&state).is_empty()),
+            wait_until(Duration::from_secs(15), || list_sessions(&state)
+                .unwrap()
+                .is_empty()),
             "the reader panicked and the session was left running"
         );
         assert!(
@@ -4289,7 +5090,7 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         let (send, receive) = std::sync::mpsc::channel();
         let lister = state.clone();
-        thread::spawn(move || send.send(list_sessions(&lister).len()));
+        thread::spawn(move || send.send(list_sessions(&lister).unwrap().len()));
         let listed = receive.recv_timeout(Duration::from_secs(2));
         drop(held);
         resizer.join().unwrap().unwrap();
@@ -4547,8 +5348,12 @@ mod tests {
             .load(Ordering::SeqCst)
             >= 1));
         thread::sleep(Duration::from_millis(800));
-        assert_eq!(list_sessions(&state).len(), 1, "the session kept running");
-        assert!(!list_sessions(&state)[0].ending);
+        assert_eq!(
+            list_sessions(&state).unwrap().len(),
+            1,
+            "the session kept running"
+        );
+        assert!(!list_sessions(&state).unwrap()[0].ending);
         kill_session(&state, &spawned.id).unwrap();
     }
 
@@ -4923,7 +5728,9 @@ mod tests {
         );
         // Once the close is over the reader reaps it and the session ends.
         assert!(
-            wait_until(Duration::from_secs(5), || list_sessions(&state).is_empty()),
+            wait_until(Duration::from_secs(5), || list_sessions(&state)
+                .unwrap()
+                .is_empty()),
             "the session never ended after its close"
         );
         assert!(wait_until(Duration::from_secs(1), || !alive(stubborn)));
@@ -4958,7 +5765,7 @@ mod tests {
             close.join().unwrap().unwrap();
         }
         assert!(wait_until(Duration::from_secs(1), || !alive(pid)));
-        assert!(list_sessions(&state).is_empty());
+        assert!(list_sessions(&state).unwrap().is_empty());
     }
 
     /// The jobs a close would kill are visible to the unmount check: a prompt
@@ -5012,7 +5819,7 @@ mod tests {
             !acknowledge_output(&state, &spawned.id, 0).is_err_and(|e| e.contains("Lock error"))
         );
         kill_session(&state, &spawned.id).unwrap();
-        assert!(list_sessions(&state).is_empty());
+        assert!(list_sessions(&state).unwrap().is_empty());
     }
 
     /// The defect: shutdown returned on a poisoned map before killing any PTY.
@@ -5068,7 +5875,7 @@ mod tests {
             Some(false),
             "the sweep ran before the terminals stopped"
         );
-        assert!(list_sessions(&state).is_empty());
+        assert!(list_sessions(&state).unwrap().is_empty());
     }
 
     /// The defect: spawn waited on the repository address (git), the task
@@ -5112,19 +5919,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = TerminalSessions::default();
         let spawned = spawn_script(&state, dir.path(), "read finish".into());
-        assert!(!list_sessions(&state)[0].ending);
+        assert!(!list_sessions(&state).unwrap()[0].ending);
         state
             .lock_sessions()
             .get(&spawned.id)
             .unwrap()
             .dead
             .store(true, Ordering::SeqCst);
-        let listed = list_sessions(&state);
+        let listed = list_sessions(&state).unwrap();
         assert_eq!(listed.len(), 1, "an ending session was hidden");
         assert!(listed[0].ending && listed[0].detached);
         // Stop still works on it.
         kill_session(&state, &spawned.id).unwrap();
-        assert!(list_sessions(&state).is_empty());
+        assert!(list_sessions(&state).unwrap().is_empty());
     }
 
     fn init_test_repo(dir: &std::path::Path) {
@@ -7129,27 +7936,68 @@ mod tests {
 
     #[test]
     fn a_watcher_turns_an_agent_bell_into_a_notice_and_a_shell_bell_into_a_flagged_one() {
+        let agent_events = Arc::new(RecordedEvents::default());
         let mut agent = SessionWatcher::new(
             "term-1",
             "/opt/homebrew/bin/claude",
             std::path::Path::new("/w/x"),
+            agent_events.clone(),
         );
         assert!(agent.is_agent);
         assert_eq!(agent.label, "Claude Code");
         assert_eq!(agent.place.as_deref(), Some("x"));
 
-        let mut shell = SessionWatcher::new("term-2", "/bin/zsh", std::path::Path::new("/w/x"));
+        let shell_events = Arc::new(RecordedEvents::default());
+        let mut shell = SessionWatcher::new(
+            "term-2",
+            "/bin/zsh",
+            std::path::Path::new("/w/x"),
+            shell_events.clone(),
+        );
         assert!(!shell.is_agent);
         assert_eq!(shell.label, "Terminal");
 
-        // `observe` offers into a hub that is not running in unit tests, which
-        // is a no-op; what is asserted here is that it neither panics nor
-        // retains anything across a stream of hostile bytes.
+        // What is asserted is that a stream of hostile bytes neither panics
+        // nor is retained, and that every notice goes to the session's own
+        // events, named for it.
         for _ in 0..64 {
             agent.observe(b"\x1b]9;4;1;40\x07\x07\x1b]0;title\x07");
             shell.observe(&[0x1b, b']', b'9', b';']);
         }
         assert_eq!(agent.reported_drops, agent.scanner.dropped());
+        let notices = agent_events.notices.lock().unwrap();
+        assert!(!notices.is_empty(), "an agent's bell is a notice");
+        assert!(notices
+            .iter()
+            .all(|n| n.key == "term-1" && n.is_agent && n.label == "Claude Code"));
+        drop(notices);
+        assert!(shell_events.notices.lock().unwrap().is_empty());
+        agent.ended();
+        assert_eq!(
+            agent_events.notices.lock().unwrap().last().map(|n| n.event),
+            Some(Some("session_ended"))
+        );
+    }
+
+    /// Every event an engine session reports, kept for a test to read.
+    #[derive(Default)]
+    struct RecordedEvents {
+        notices: Mutex<Vec<crate::alerts::Notice>>,
+        losses: Mutex<Vec<TerminalLossPayload>>,
+        exits: Mutex<Vec<SessionEnded>>,
+    }
+
+    impl SessionEvents for RecordedEvents {
+        fn loss(&self, payload: TerminalLossPayload) {
+            self.losses.lock().unwrap().push(payload);
+        }
+        fn notice(&self, notice: crate::alerts::Notice) {
+            self.notices.lock().unwrap().push(notice);
+        }
+        fn scan_drops(&self, _: u64) {}
+        fn exit(&self, ended: SessionEnded) {
+            self.exits.lock().unwrap().push(ended);
+        }
     }
 
     #[test]

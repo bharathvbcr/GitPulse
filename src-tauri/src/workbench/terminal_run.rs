@@ -1,6 +1,6 @@
 use super::{
-    announce, claude_hook, process_birth, query, receipts, terminal_command, terminal_launch,
-    WorkbenchError, WorkbenchState,
+    announce, claude_hook, query, receipts, terminal_command, terminal_launch, WorkbenchError,
+    WorkbenchState,
 };
 use crate::terminal::{
     self, SessionObserver, TerminalExitPayload, TerminalSessions, TerminalSpawned,
@@ -199,7 +199,7 @@ fn start<R: tauri::Runtime>(
         }),
         run_id: source.id,
         owner,
-        _brief: brief,
+        _brief: Some(brief),
     });
     terminal::spawn_tracked_session(
         app,
@@ -224,7 +224,54 @@ struct RunObserver<R: tauri::Runtime> {
     /// `receipts::apply`, shared with the replay of a receipt that storage
     /// refused.
     observed: Mutex<receipts::Observed>,
-    _brief: terminal_command::BriefFile,
+    /// The launch's brief, removed when the observer is. `None` for a run
+    /// adopted from an earlier app, whose brief went with that app.
+    _brief: Option<terminal_command::BriefFile>,
+}
+
+/// The observer for a task run whose terminal outlived the app that launched
+/// it: a terminal host kept it running, or recorded its exit while no app was
+/// there. What that app's observer had seen is read back from the run itself
+/// — its owner, its session and its process identity — so the exit goes
+/// through the same `receipts::apply` decision, under the same owner and
+/// the same request ids, as it would have.
+///
+/// `None` for a run the store cannot read or that has no owner: nothing can
+/// be recorded for it, and reconciliation decides it instead.
+pub(crate) fn adopted_observer<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    host: &WorkbenchState,
+    run_id: &str,
+) -> Option<Arc<dyn SessionObserver>> {
+    let response = host
+        .with_store(|store| query(store, "runs.get", &json!({"id": run_id}).to_string()))
+        .inspect_err(|e| log::warn!(target: "workbench", "run {run_id}: its terminal outlived its app, but the run could not be read: {}: {}", e.code, e.message))
+        .ok()?;
+    let item = &response["item"];
+    let owner = item["owner_id"]
+        .as_str()
+        .filter(|o| !o.is_empty())?
+        .to_owned();
+    let session = item["session_id"].as_str().unwrap_or_default().to_owned();
+    let start = match (item["process_id"].as_u64(), item["process_start"].as_str()) {
+        (Some(pid), Some(birth)) => u32::try_from(pid).ok().map(|pid| (pid, birth.to_owned())),
+        _ => None,
+    };
+    Some(Arc::new(RunObserver {
+        app: app.clone(),
+        host: host.clone(),
+        observed: Mutex::new(receipts::Observed {
+            run_id: run_id.to_owned(),
+            owner: owner.clone(),
+            session,
+            start,
+            exit: None,
+            spawn_failure: None,
+        }),
+        run_id: run_id.to_owned(),
+        owner,
+        _brief: None,
+    }))
 }
 
 impl<R: tauri::Runtime> RunObserver<R> {
@@ -276,11 +323,8 @@ impl<R: tauri::Runtime> SessionObserver for RunObserver<R> {
         announce(&self.app, &result);
         Ok(())
     }
-    fn started(&self, session: &str, pid: Option<u32>) -> Result<(), String> {
-        let pid = pid
-            .filter(|pid| *pid > 0)
-            .ok_or("PTY did not report a process ID")?;
-        let birth = process_birth::read(pid)?;
+    fn started(&self, session: &str, process: Result<(u32, String), String>) -> Result<(), String> {
+        let (pid, birth) = process?;
         self.observe(|observed| {
             observed.session = session.to_owned();
             observed.start = Some((pid, birth));
@@ -887,5 +931,130 @@ mod tests {
         assert_eq!(after["item"]["exit_code"], 7);
         assert_eq!(after["item"]["revision"], revision);
         assert!(!journal.exists());
+    }
+
+    /// AC: an agent that exits while no app is connected to its terminal host
+    /// gets its real exit status recorded in its run when the next app
+    /// connects. The first app goes away with the agent running; the agent
+    /// exits with 7 while nothing is connected; the host keeps the receipt;
+    /// the next app adopts the run and records the 7.
+    ///
+    /// The host is the real server (`host::server::serve`), on a thread of this
+    /// process rather than as `gitpulse-ptyd`: a unit test has no path to the
+    /// binary. `tests/terminal_host.rs` runs the binary itself.
+    #[test]
+    fn a_task_agent_that_exits_while_no_app_is_connected_gets_its_real_exit_recorded() {
+        use crate::terminal::host::{client::HostConfig, server};
+        let root = tempfile::tempdir().unwrap();
+        let state = fixture(root.path());
+        let dir = tempfile::Builder::new()
+            .prefix("ph")
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
+        let serving = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                server::serve(server::ServeConfig {
+                    dir,
+                    idle_exit: Duration::from_secs(2),
+                })
+            })
+        };
+        let socket = dir.path().join(crate::terminal::host::socket_name(
+            crate::terminal::host::PROTOCOL,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "the host never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Never started by these apps: the host above is already listening.
+        let config = HostConfig {
+            dir: dir.path().to_path_buf(),
+            binary: Some("/nonexistent/gitpulse-ptyd".into()),
+            idle_exit: None,
+            log_dir: None,
+        };
+        let release = root.path().join("release");
+        let program = script(
+            root.path(),
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done\nexit 7",
+                release.display()
+            ),
+        );
+        let run = |state: &WorkbenchState| state.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        {
+            let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+            let terminals = TerminalSessions::with_host(config.clone());
+            terminals.bind_app(app.handle());
+            start(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                source(&state),
+                program,
+                super::terminal_command::LaunchOptions::default(),
+                crate::terminal::OutputSink::events(app.handle()),
+            )
+            .unwrap();
+            assert_eq!(run(&state)["item"]["state"], "running");
+        } // This app is gone: its connection closes, its observer with it.
+        std::fs::write(&release, b"").unwrap();
+        let receipts = dir.path().join("receipts");
+        let exited = || {
+            std::fs::read_dir(&receipts)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    std::fs::read_to_string(e.path())
+                        .unwrap_or_default()
+                        .contains("{\"exit\"")
+                })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !exited() {
+            assert!(
+                Instant::now() < deadline,
+                "the host never recorded the exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            run(&state)["item"]["state"],
+            "running",
+            "nobody has recorded it yet"
+        );
+
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let terminals = TerminalSessions::with_host(config);
+        terminals.bind_app(app.handle());
+        {
+            let (handle, runs) = (app.handle().clone(), state.clone());
+            terminals.set_adopter(Arc::new(move |run_id: &str| {
+                super::adopted_observer(&handle, &runs, run_id)
+            }));
+        }
+        terminals.connect_host().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while run(&state)["item"]["state"] != "exited" {
+            assert!(
+                Instant::now() < deadline,
+                "the exit was never recorded: {}",
+                run(&state)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(run(&state)["item"]["exit_code"], 7);
+        // Recorded, so the host forgets it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while exited() {
+            assert!(Instant::now() < deadline, "the receipt was never forgotten");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(terminals);
+        assert_eq!(serving.join().unwrap(), server::exit_code::IDLE);
     }
 }

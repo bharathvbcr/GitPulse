@@ -32,7 +32,7 @@ pub(crate) enum Liveness {
 }
 
 /// The creation identity of `pid`, for recording at launch.
-pub(super) fn read(pid: u32) -> Result<String, String> {
+pub(crate) fn read(pid: u32) -> Result<String, String> {
     match observe(pid)? {
         Some(birth) => Ok(birth.identity),
         None => Err(format!(

@@ -78,6 +78,7 @@
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
+  import KeepTerminalsSetting from "./KeepTerminalsSetting.svelte";
   import AgentSettingSourcesSetting from "./AgentSettingSourcesSetting.svelte";
   import AgentModelSettings from "./AgentModelSettings.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
@@ -1350,6 +1351,9 @@
                     Shells, agent tabs and task terminals that may be open together, across every repository — up to {MAX_TERMINAL_SESSIONS}, {DEFAULT_TERMINAL_SESSIONS} unless you change it.
                     Applies to the next session. Lowering it closes nothing; new sessions wait until enough close.
                   </AgentLimitSetting>
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
+                  <KeepTerminalsSetting active={isOpen && activeSection === "agents"} />
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
                   <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />

@@ -177,6 +177,19 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
 
+      - name: Terminal Suites Against the Terminal Host
+        # The same terminal suites, every session registry backed by a real
+        # gitpulse-ptyd rather than the engine in the test process
+        # (docs/TERMINAL_HOST.md, migration step 2). The host is Unix-only.
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a dbus-run-session -- bun run test:terminal-host
+          else
+            bun run test:terminal-host
+          fi
+
   # release.yml builds Linux aarch64 and Windows arm64 only on a tag, so a
   # broken ARM leg would first fail with every other platform already on the
   # draft. This bundles both on their real runners, through the same

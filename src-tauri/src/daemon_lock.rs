@@ -157,10 +157,16 @@ fn read_owner(path: &Path) -> Owner {
 
 /// Takes the daemon lock in `dir` for a process running `version`.
 pub fn acquire(dir: &Path, version: &str) -> Acquire {
+    acquire_named(dir, LOCK_FILE, version)
+}
+
+/// [`acquire`] for another one-owner process, under its own file name in
+/// `dir`: the terminal host takes one per protocol version.
+pub fn acquire_named(dir: &Path, file: &str, version: &str) -> Acquire {
     if let Err(error) = std::fs::create_dir_all(dir) {
         return Acquire::Unavailable(format!("cannot create {}: {error}", dir.display()));
     }
-    let path = dir.join(LOCK_FILE);
+    let path = dir.join(file);
     for attempt in 0..RETRIES {
         let file = match open(&path) {
             Ok(file) => file,
@@ -206,7 +212,12 @@ pub fn acquire(dir: &Path, version: &str) -> Acquire {
 /// The daemon running against `dir` right now, or `None` when nobody holds
 /// the lock. `Err` when the lock could not be examined.
 pub fn running(dir: &Path) -> Result<Option<Owner>, String> {
-    let path = dir.join(LOCK_FILE);
+    running_named(dir, LOCK_FILE)
+}
+
+/// [`running`] for the owner of the lock `file` in `dir`.
+pub fn running_named(dir: &Path, file: &str) -> Result<Option<Owner>, String> {
+    let path = dir.join(file);
     if !path.exists() {
         return Ok(None);
     }

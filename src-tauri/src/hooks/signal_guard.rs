@@ -2005,6 +2005,12 @@ struct Tally {
     hosted_agents: usize,
     gitpulse: usize,
     hosted: usize,
+    /// Terminal sessions GitPulse hosts: a process GitPulse launched whose
+    /// parent is GitPulse itself (the app, or the terminal host
+    /// `gitpulse-ptyd`). A shell is one; a job running under that shell is
+    /// not, so killing a dev server you started in a GitPulse terminal is not
+    /// this guard's business.
+    sessions: usize,
     examples: Vec<String>,
 }
 
@@ -2027,7 +2033,17 @@ fn is_gitpulse(row: &TableRow) -> bool {
     (name.starts_with("gitpulse") && name != "gitpulse-hook") || in_app
 }
 
-fn tally(hits: &[&TableRow]) -> Tally {
+/// Whether `row` is a terminal session GitPulse hosts: launched by GitPulse
+/// (it carries a GitPulse launch id) and a child of a GitPulse process.
+fn is_hosted_session(row: &TableRow, rows: &[TableRow]) -> bool {
+    row.hosted
+        && rows
+            .iter()
+            .find(|parent| parent.pid == row.ppid)
+            .is_some_and(is_gitpulse)
+}
+
+fn tally(hits: &[&TableRow], rows: &[TableRow]) -> Tally {
     let mut t = Tally {
         total: hits.len(),
         ..Tally::default()
@@ -2036,11 +2052,13 @@ fn tally(hits: &[&TableRow]) -> Tally {
     for row in hits {
         let agent = row.agent.is_some();
         let gitpulse = is_gitpulse(row);
+        let session = is_hosted_session(row, rows);
         t.agents += usize::from(agent);
         t.hosted_agents += usize::from(agent && row.hosted);
         t.gitpulse += usize::from(gitpulse);
         t.hosted += usize::from(row.hosted);
-        let rank = match (agent && row.hosted, agent, gitpulse) {
+        t.sessions += usize::from(session);
+        let rank = match (agent && row.hosted, agent, gitpulse || session) {
             (true, _, _) => 0,
             (_, true, _) => 1,
             (_, _, true) => 2,
@@ -2157,7 +2175,8 @@ fn deny_reason(finding: &Finding, why: &str, tally: Option<&Tally>, advice: &str
     if let Some(t) = tally {
         reason.push_str(&format!(
             "\nIt would signal {} of your processes: {} agent session{} ({} hosted by GitPulse), \
-             {} GitPulse process{} (the app, gitpulsed, gitpulse-mcp), and {} in a GitPulse \
+             {} GitPulse process{} (the app, its terminal host gitpulse-ptyd, gitpulsed, \
+             gitpulse-mcp), {} terminal session{} GitPulse hosts, and {} in a GitPulse \
              terminal tree. The bound for a pattern kill is {MAX_MATCHES}.",
             t.total,
             t.agents,
@@ -2165,6 +2184,8 @@ fn deny_reason(finding: &Finding, why: &str, tally: Option<&Tally>, advice: &str
             t.hosted_agents,
             t.gitpulse,
             if t.gitpulse == 1 { "" } else { "es" },
+            t.sessions,
+            if t.sessions == 1 { "" } else { "s" },
             t.hosted,
         ));
         if !t.examples.is_empty() {
@@ -2224,9 +2245,9 @@ fn judge(finding: &Finding, facts: &Facts) -> Verdict {
             ))
         }
     };
-    let t = tally(&reach.hits);
+    let t = tally(&reach.hits, &facts.rows);
     let over = finding.bounded && t.total > MAX_MATCHES;
-    if t.agents > 0 || t.gitpulse > 0 || over {
+    if t.agents > 0 || t.gitpulse > 0 || t.sessions > 0 || over {
         let cause = match &finding.sel {
             Sel::Pgrep(spec) => describe_pgrep(spec),
             Sel::Killall(spec) => describe_killall(spec),
@@ -2655,6 +2676,51 @@ mod tests {
             classify_output(&run_in("pkill -a -f claude", &alone)),
             Out::Deny,
             "-a includes ancestors"
+        );
+    }
+
+    /// The terminal host and every session it (or the app) hosts are in the
+    /// protected set: a pattern kill that reaches a hosted shell is refused,
+    /// as one that reaches a hosted agent always was. A job under that shell
+    /// is not a session, and stays the user's to kill.
+    #[test]
+    fn a_terminal_session_gitpulse_hosts_is_protected_but_the_jobs_under_it_are_not() {
+        let mut facts = world();
+        facts.rows.push(row(
+            4100,
+            1,
+            &[
+                "/Applications/GitPulse.app/Contents/MacOS/gitpulse-ptyd",
+                "--dir",
+                "/x",
+            ],
+        ));
+        let mut hosted_shell = row(4101, 4100, &["/bin/zsh", "-l"]);
+        hosted_shell.hosted = true;
+        facts.rows.push(hosted_shell);
+        let mut job = row(
+            4102,
+            4101,
+            &["node", "/Users/bharath/Code/web/dev-server.js"],
+        );
+        job.hosted = true;
+        facts.rows.push(job);
+        // A session the app holds itself, with no terminal host.
+        let mut in_app = row(4103, 4001, &["/opt/homebrew/bin/fish"]);
+        in_app.hosted = true;
+        facts.rows.push(in_app);
+        for (command, want) in [
+            ("pkill -f gitpulse-ptyd", Out::Deny),
+            ("pkill -x zsh", Out::Deny),
+            ("pkill fish", Out::Deny),
+            ("pkill -f dev-server", Out::Silent),
+        ] {
+            assert_eq!(classify_output(&run_in(command, &facts)), want, "{command}");
+        }
+        let reason = reason_of(&run_in("pkill -x zsh", &facts));
+        assert!(
+            reason.contains("1 terminal session GitPulse hosts"),
+            "{reason}"
         );
     }
 

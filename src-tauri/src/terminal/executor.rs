@@ -162,6 +162,30 @@ impl Executor {
             .unwrap_or_else(|| Err(dropped_unrun(operation)))
     }
 
+    /// Queues `body` with nobody awaiting it: it reports its own result. For
+    /// the terminal host, whose replies go back over a socket rather than to a
+    /// future. Queued in call order, refused at once when the queue is full,
+    /// and a panic in `body` is contained like one in [`Executor::run`]'s.
+    pub(crate) fn spawn<F>(&self, operation: &'static str, body: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String> + Send + 'static,
+    {
+        let mut timing = CommandTiming::queue(operation);
+        self.submit(Box::new(move || {
+            timing.start();
+            let result = catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|payload| {
+                Err(format!(
+                    "{operation} panicked: {}",
+                    crate::supervisor::payload_text(payload.as_ref())
+                ))
+            });
+            if let Err(error) = &result {
+                log::warn!(target: "terminal", "{operation} failed: {error}");
+            }
+            timing.finish(&result);
+        }))
+    }
+
     fn submit(&self, job: Job) -> Result<(), String> {
         let shared = &self.handle.shared;
         let mut state = shared.lock();

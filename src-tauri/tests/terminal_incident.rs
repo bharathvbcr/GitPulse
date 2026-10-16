@@ -6,7 +6,7 @@
 //! signalled.
 #![cfg(unix)]
 use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{kill_session, spawn_session, TerminalSessions};
+use gitpulse_lib::terminal::{kill_session, spawn_session};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
@@ -57,7 +57,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let incidents = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let seen = incidents.clone();
     app.listen("terminal-incident", move |event| {
@@ -185,7 +185,7 @@ fn sessions_closed_through_gitpulse_are_never_an_incident() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let dir = repo();
     let mut ids = Vec::new();
     for _ in 0..4 {

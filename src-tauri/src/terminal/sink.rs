@@ -82,6 +82,20 @@ impl OutputSink {
         }
     }
 
+    /// A sink over any transport: `send(session, Some(bytes))` for output and
+    /// `send(session, None)` for the end marker. The terminal host's sink,
+    /// which frames output to whichever app is connected.
+    pub(crate) fn from_fn(
+        send: impl Fn(&str, Option<&[u8]>) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            send: Arc::new(move |id, frame| match frame {
+                Frame::Bytes(data) => send(id, Some(data)),
+                Frame::End => send(id, None),
+            }),
+        }
+    }
+
     /// Delivers `data`, one message. `Err` is the transport's: the page is gone
     /// or its event loop refused, which the reader answers by shedding.
     pub(super) fn bytes(&self, session_id: &str, data: &[u8]) -> Result<(), String> {

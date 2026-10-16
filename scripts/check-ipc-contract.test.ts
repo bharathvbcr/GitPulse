@@ -307,13 +307,15 @@ describe("annotated but unregistered commands", () => {
     // cmd_host_load_settings, cmd_host_load_settings_save), and 279 with
     // cmd_host_load_admit_anyway, 280 with cmd_terminal_incidents, 281
     // with cmd_verify_commit_signature, 282 with cmd_create_file, 283
-    // with cmd_terminal_conversations, and 284 with cmd_checkout_detached;
+    // with cmd_terminal_conversations, 284 with cmd_checkout_detached, and
+    // 285 with cmd_terminal_backend;
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(284);
+    expect(found.size).toBe(285);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
+    expect(found.has("cmd_terminal_backend")).toBe(true);
     expect(found.has("cmd_host_load_admit_anyway")).toBe(true);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);

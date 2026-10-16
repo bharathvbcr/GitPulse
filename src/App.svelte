@@ -166,9 +166,10 @@
   import { applyTabWidth } from "./lib/ui/codeDisplay";
   import { applyReduceMotion } from "./lib/motion/motionPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
-  import { askConfirm, isPromptOpen } from "./lib/stores/modalStore";
+  import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
   import { terminalSessions } from "./lib/terminal/sessionRegistry";
   import { quitRisks } from "./lib/terminal/quitGuard";
+  import { decideQuitTerminals, type QuitTerminals } from "./lib/terminal/quitChoice";
   import {
     hasUnsavedEditorDrafts,
     unsavedEditorDrafts,
@@ -364,10 +365,18 @@
     // request, so this answers nothing and must not cancel the first.
     if (exitRequestPending) return;
     exitRequestPending = true;
-    // Quitting ends every PTY, and an agent's work in progress with it. Every
-    // other way an agent's tab goes away now leaves it running; this one
-    // cannot, so it asks.
-    const agents = await quitRisks(get(terminalSessions), {
+    // With the terminal host, sessions can outlive this app: a quit with any
+    // running asks whether to leave them or stop them. In-process, quitting
+    // ends every PTY, and an agent's work in progress with it; every other way
+    // an agent's tab goes away leaves it running, so that quit asks too.
+    const decision = await decideQuitTerminals({
+      ask: askChoice,
+      displayName,
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+    });
+    if ("cancelled" in decision) { cancelNativeExitRequest(); return; }
+    const terminals: QuitTerminals | undefined = decision.backend === "host" ? decision.terminals : undefined;
+    const agents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
       onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
     });
     if (agents.length > 0) {
@@ -437,7 +446,7 @@
     flushBeforeExit();
     exitApproved = true;
     try {
-      await invoke("cmd_exit_app");
+      await invoke("cmd_exit_app", terminals ? { terminals } : {});
     } catch (error) {
       exitApproved = false;
       cancelNativeExitRequest();

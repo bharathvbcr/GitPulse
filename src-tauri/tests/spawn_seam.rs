@@ -35,6 +35,14 @@ const ALLOWED: &[(&str, &str)] = &[
          whole life would starve every git call behind it",
     ),
     (
+        "src/terminal/host/client.rs",
+        "the terminal host, gitpulse-ptyd: started once, detached in a session \
+         of its own, and meant to outlive this process. A gate permit, a \
+         timeout or an output cap would end the very terminals it exists to \
+         keep; it is spawned under the inheritance lock (`spawn_locked`) and \
+         deliberately not registered with procguard's quit sweep",
+    ),
+    (
         "src/procguard/mod.rs",
         "the Windows arm of the tree kill (`taskkill /T /F`), which moved here \
          from `git_cli::kill_process_tree` when process-group teardown became \
