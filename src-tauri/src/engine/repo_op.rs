@@ -327,8 +327,8 @@ fn classify<'a>(
 /// cherry-pick with a warning: a probe that could not tell must not look idle.
 fn sequencer_kind(sequencer: &Path, warnings: &mut Vec<String>) -> Option<OperationKind> {
     let before = warnings.len();
-    let todo = read_control(&sequencer.join("todo"), warnings);
-    let Some(todo) = todo else {
+    let todo = read_control_head(&sequencer.join("todo"), SEQUENCER_HEAD_BYTES, warnings);
+    let Some((todo, truncated)) = todo else {
         if warnings.len() > before {
             warnings.push("sequencer/todo is unreadable; assuming a cherry-pick".into());
             return Some(OperationKind::CherryPick);
@@ -338,7 +338,18 @@ fn sequencer_kind(sequencer: &Path, warnings: &mut Vec<String>) -> Option<Operat
     let first = todo
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+        .find(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(first) = first else {
+        // Nothing but comments in the part that was read: only a todo that was
+        // read whole can be called finished.
+        if truncated {
+            warnings.push(
+                "sequencer/todo has no step in its first 64 KiB; assuming a cherry-pick".into(),
+            );
+            return Some(OperationKind::CherryPick);
+        }
+        return None;
+    };
     match first.split_whitespace().next() {
         Some("pick" | "p") => Some(OperationKind::CherryPick),
         Some("revert") => Some(OperationKind::Revert),
@@ -404,6 +415,42 @@ fn read_control(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             warnings.push(format!("cannot stat {}: {err}", path.display()));
+            None
+        }
+    }
+}
+
+/// How much of a sequencer `todo` is read to name the operation. The first
+/// step is at the head of the file, so a todo past
+/// [`MAX_CONTROL_FILE_BYTES`] still says what it is without being read whole.
+const SEQUENCER_HEAD_BYTES: u64 = 64 * 1024;
+
+/// Reads at most the first `limit` bytes of a control file. Absent is `None`
+/// without a warning; any other failure is `None` with one. A file longer than
+/// `limit` is truncated, which is the point: the caller wants its head.
+fn read_control_head(
+    path: &Path,
+    limit: u64,
+    warnings: &mut Vec<String>,
+) -> Option<(String, bool)> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warnings.push(format!("cannot read {}: {err}", path.display()));
+            return None;
+        }
+    };
+    let mut bytes = Vec::new();
+    match file.take(limit + 1).read_to_end(&mut bytes) {
+        Ok(_) => {
+            let truncated = bytes.len() as u64 > limit;
+            bytes.truncate(limit as usize);
+            Some((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+        }
+        Err(err) => {
+            warnings.push(format!("cannot read {}: {err}", path.display()));
             None
         }
     }
