@@ -3244,6 +3244,28 @@ mod tests {
         assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
     }
 
+    /// Between the steps of a multi-commit cherry-pick or revert the
+    /// `*_HEAD` file is gone but the sequencer is not; reset and stash must
+    /// still refuse rather than walk away from it.
+    #[test]
+    fn refuse_if_parked_refuses_between_the_steps_of_a_sequence() {
+        for revert in [false, true] {
+            let dir = crate::test_support::repo_parked_in_a_sequence(revert);
+            let canon = dir.path().canonicalize().unwrap();
+            let refused = GitWriter::refuse_if_parked(&canon, "reset")
+                .expect_err("a parked sequence must refuse a reset");
+            assert!(
+                refused.contains(if revert { "revert" } else { "cherry-pick" }),
+                "{refused}"
+            );
+            assert!(GitWriter::refuse_if_parked(&canon, "stash").is_err());
+        }
+        let idle = crate::test_support::git_repo();
+        crate::test_support::git_in(idle.path(), &["commit", "--allow-empty", "-q", "-m", "x"]);
+        let canon = idle.path().canonicalize().unwrap();
+        GitWriter::refuse_if_parked(&canon, "reset").expect("an idle repository is not parked");
+    }
+
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
