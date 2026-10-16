@@ -19,6 +19,16 @@ describe("CommandPalette", () => {
     expect(source).toContain("recordFrecency");
   });
 
+  // Behaviour is driven in harness/paletteChecks.js ("a remote branch row
+  // keeps its remote"): a remote row carries `origin/x`, and the palette
+  // sends `origin/x` as BranchList does; the backend maps it to the local
+  // tracking branch. Sending `x` would answer with any local `x`, even one
+  // tracking a different remote.
+  it("checks out a remote branch row by its remote-qualified name", () => {
+    expect(source).toContain("repoStore.checkoutBranch(checkoutNameFor(branch))");
+    expect(source).not.toContain("repoStore.checkoutBranch(branch.name)");
+  });
+
   it("exposes Settings and MCP setup as commands", () => {
     expect(source).toContain('id: "settings"');
     expect(source).toContain('id: "mcp_setup"');

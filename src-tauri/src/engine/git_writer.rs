@@ -38,6 +38,13 @@ const MAX_INDEX_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INDEX_ARGV_BYTES: usize = 12 * 1024;
 const MAX_INDEX_CHUNK_PATHS: usize = 128;
 
+/// What a checkout left behind. `detached` is read from HEAD after the switch,
+/// not assumed from which entry point ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutOutcome {
+    pub detached: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexAction {
@@ -1205,33 +1212,159 @@ Unset the local override with `git config --local --unset-all user.name` and \
         .map(|output| String::from_utf8_lossy(&output).into_owned())
     }
 
-    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
+    /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the
+    /// program name first, so the write gate judges exactly the line that runs.
+    ///
+    /// `switch` only ever lands on a branch, so no spelling here can detach
+    /// HEAD. A local branch is switched to by name. A remote-tracking name such
+    /// as `origin/feature` (what a remote row in the UI carries) is mapped to
+    /// its local tracking branch: switched to when it exists, created with
+    /// `--track` when it does not. Anything else goes through `--guess`, which
+    /// creates a local branch from a single remote twin. A tag or an object id
+    /// is not a branch and is refused; [`Self::checkout_detached`] is the
+    /// explicit way to land on one.
+    ///
+    /// The answer is a snapshot of the refs and config. A caller that gets it
+    /// approved must run it through [`Self::checkout_branch_judged`], which
+    /// re-derives it under the repository lock and refuses if it changed.
+    pub fn checkout_branch_argv(repo_path: &str, branch_name: &str) -> Result<Vec<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::checkout_branch_argv_in(&repo, branch_name)
+    }
+
+    fn checkout_branch_argv_in(repo: &Path, branch_name: &str) -> Result<Vec<String>, String> {
+        validate_ref_name(branch_name)?;
+        let ref_exists = |full: &str| -> Result<bool, String> {
+            Ok(git_captured(repo, &["show-ref", "--verify", "--quiet", full])?.success)
+        };
+        let argv = |rest: &[&str]| -> Vec<String> {
+            std::iter::once("git")
+                .chain(rest.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        if ref_exists(&format!("refs/heads/{branch_name}"))? {
+            return Ok(argv(&["switch", branch_name]));
+        }
+        if ref_exists(&format!("refs/remotes/{branch_name}"))? {
+            // Read fresh: a branch is created or chosen on this answer.
+            let remotes = crate::engine::git_reader::configured_remote_names_fresh(repo)?;
+            let mut owners = remotes.iter().filter(|remote| {
+                branch_name.len() > remote.len()
+                    && branch_name.starts_with(remote.as_str())
+                    && branch_name.as_bytes()[remote.len()] == b'/'
+            });
+            let (Some(remote), None) = (owners.next(), owners.next()) else {
+                return Err(format!(
+                    "'{branch_name}' does not name exactly one configured remote's branch; \
+                     check it out by its local name"
+                ));
+            };
+            let local = &branch_name[remote.len() + 1..];
+            validate_ref_name(local)?;
+            if local == "HEAD" {
+                return Err(format!(
+                    "'{branch_name}' is the remote's HEAD pointer, not a branch"
+                ));
+            }
+            if ref_exists(&format!("refs/heads/{local}"))? {
+                let upstream = git_text(
+                    repo,
+                    &[
+                        "for-each-ref",
+                        "--format=%(upstream)",
+                        &format!("refs/heads/{local}"),
+                    ],
+                )?;
+                let upstream = upstream.trim();
+                if !upstream.is_empty() && upstream != format!("refs/remotes/{branch_name}") {
+                    return Err(format!(
+                        "local branch '{local}' tracks {upstream}, not '{branch_name}'; \
+                         switch to '{local}' by name, or rename it first"
+                    ));
+                }
+                return Ok(argv(&["switch", local]));
+            }
+            // `--track` alone names the new branch by dropping everything up to
+            // the first slash, which is wrong for a remote called `a/b`; name it.
+            return Ok(argv(&["switch", "--track", "-c", local, branch_name]));
+        }
+        Ok(argv(&["switch", "--guess", branch_name]))
+    }
+
+    /// Switches to a branch, creating the local tracking branch for a remote
+    /// one, and reports whether HEAD ended up detached. There is no fallback
+    /// to `checkout <name>`: it detaches HEAD for a remote-tracking ref, a tag
+    /// or an object id and reported that as a branch checkout. A refused
+    /// `switch` (dirty tree, ambiguous or missing name) is the error.
+    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<CheckoutOutcome, String> {
+        Self::checkout_branch_locked(repo_path, branch_name, None)
+    }
+
+    /// [`Self::checkout_branch`] for a caller whose policy gate approved
+    /// `judged` (from [`Self::checkout_branch_argv`]). The argv is derived again
+    /// under the repository lock; if refs or config moved in between and it is
+    /// no longer the approved line, nothing runs.
+    pub fn checkout_branch_judged(
+        repo_path: &str,
+        branch_name: &str,
+        judged: &[String],
+    ) -> Result<CheckoutOutcome, String> {
+        Self::checkout_branch_locked(repo_path, branch_name, Some(judged))
+    }
+
+    fn checkout_branch_locked(
+        repo_path: &str,
+        branch_name: &str,
+        judged: Option<&[String]>,
+    ) -> Result<CheckoutOutcome, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_ref_name(branch_name)?;
-        // Two strategies: `switch --guess` covers creating a local
-        // branch from a remote twin (git >= 2.23), revision-only `checkout` covers
-        // everything older. The former middle attempt (`checkout --guess`)
-        // added a third executable spelling without covering any state the
-        // other two miss — and every extra strategy is another argv the
-        // policy gate must judge identically.
-        let attempts: [&[&str]; 2] = [
-            &["switch", "--guess", branch_name],
-            &["checkout", branch_name, "--"],
-        ];
-        let mut first_err = None;
-        for attempt in attempts {
-            match git_text(&repo, attempt) {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                }
+        let argv = Self::checkout_branch_argv_in(&repo, branch_name)?;
+        if let Some(judged) = judged {
+            if judged != argv.as_slice() {
+                return Err(format!(
+                    "'{branch_name}' now resolves to `{}`, not the approved `{}`; \
+                     the repository changed, try again",
+                    argv.join(" "),
+                    judged.join(" ")
+                ));
             }
         }
-        Err(first_err.expect("at least one attempt recorded"))
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
+    }
+
+    /// Checks out a commit, tag or other revision with HEAD detached. This is
+    /// the named way to detach: [`Self::checkout_branch`] never does.
+    pub fn checkout_detached_argv(revision: &str) -> Result<Vec<String>, String> {
+        validate_oid_or_revision(revision)?;
+        Ok(["git", "switch", "--detach", revision]
+            .into_iter()
+            .map(String::from)
+            .collect())
+    }
+
+    pub fn checkout_detached(repo_path: &str, revision: &str) -> Result<CheckoutOutcome, String> {
+        let argv = Self::checkout_detached_argv(revision)?;
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
+    }
+
+    fn checkout_outcome(repo: &Path) -> Result<CheckoutOutcome, String> {
+        Ok(CheckoutOutcome {
+            detached: crate::engine::git_reader::head_branch(repo)?.is_none(),
+        })
     }
 
     pub fn create_branch(
@@ -1347,22 +1480,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err("Rebase sequence is empty".into());
         }
         Self::refuse_fixture_identity(&repo, false)?;
-        if let Some(first) = steps.first() {
-            if matches!(
-                first.action,
-                RebaseActionKind::Squash | RebaseActionKind::Fixup
-            ) {
-                return Err(format!(
-                    "Cannot '{}' commit {} without a previous commit to combine into",
-                    match first.action {
-                        RebaseActionKind::Squash => "squash",
-                        RebaseActionKind::Fixup => "fixup",
-                        _ => unreachable!(),
-                    },
-                    first.commit_id
-                ));
-            }
-        }
+        validate_rebase_plan(steps)?;
         for step in steps {
             validate_oid_or_revision(&step.commit_id)?;
         }
@@ -2363,6 +2481,35 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
+/// Refuses a plan in which a squash or fixup has no kept commit before it, as
+/// git does ("cannot 'squash' without a previous commit"). A dropped step is
+/// not a commit to fold into: with only drops ahead of it the fold would amend
+/// the onto commit itself and `branch -f` would then move the branch onto that
+/// rewritten copy of the base. Pick and reword keep a commit; drop does not.
+fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
+    let mut has_kept_commit = false;
+    for step in steps {
+        let folds_into_previous = match step.action {
+            RebaseActionKind::Squash => Some("squash"),
+            RebaseActionKind::Fixup => Some("fixup"),
+            RebaseActionKind::Pick | RebaseActionKind::Reword(_) => {
+                has_kept_commit = true;
+                None
+            }
+            RebaseActionKind::Drop => None,
+        };
+        if let Some(verb) = folds_into_previous {
+            if !has_kept_commit {
+                return Err(format!(
+                    "Cannot '{verb}' commit {} without a previous commit to combine into",
+                    step.commit_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Composes the user-facing error for a failed rebase step together with any
 /// recovery failures that occurred while rolling back.
 ///
@@ -3230,6 +3377,28 @@ mod tests {
         assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
     }
 
+    /// Between the steps of a multi-commit cherry-pick or revert the
+    /// `*_HEAD` file is gone but the sequencer is not; reset and stash must
+    /// still refuse rather than walk away from it.
+    #[test]
+    fn refuse_if_parked_refuses_between_the_steps_of_a_sequence() {
+        for revert in [false, true] {
+            let dir = crate::test_support::repo_parked_in_a_sequence(revert);
+            let canon = dir.path().canonicalize().unwrap();
+            let refused = GitWriter::refuse_if_parked(&canon, "reset")
+                .expect_err("a parked sequence must refuse a reset");
+            assert!(
+                refused.contains(if revert { "revert" } else { "cherry-pick" }),
+                "{refused}"
+            );
+            assert!(GitWriter::refuse_if_parked(&canon, "stash").is_err());
+        }
+        let idle = crate::test_support::git_repo();
+        crate::test_support::git_in(idle.path(), &["commit", "--allow-empty", "-q", "-m", "x"]);
+        let canon = idle.path().canonicalize().unwrap();
+        GitWriter::refuse_if_parked(&canon, "reset").expect("an idle repository is not parked");
+    }
+
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
@@ -3669,7 +3838,12 @@ mod tests {
                     "{what}({name:?}) was refused for the wrong reason: {err}"
                 );
             };
-            refused("checkout_branch", GitWriter::checkout_branch(&path, name));
+            refused(
+                "checkout_branch",
+                GitWriter::checkout_branch(&path, name).map(|_| ()),
+            );
+            GitWriter::checkout_detached(&path, name)
+                .expect_err("checkout_detached must refuse a leading dash");
             refused("create_branch", GitWriter::create_branch(&path, name, None));
             refused(
                 "delete_branch",
@@ -4144,6 +4318,181 @@ mod tests {
         );
     }
 
+    /// A clone of a repository that has `main` and `feature`, left on `main`.
+    /// Its remote-tracking branches are `origin/main` and `origin/feature`.
+    fn clone_with_remote_feature() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let origin = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            origin.path(),
+            &["commit", "--allow-empty", "-q", "-m", "base"],
+        );
+        crate::test_support::git_in(origin.path(), &["switch", "-q", "-c", "feature"]);
+        crate::test_support::git_in(
+            origin.path(),
+            &["commit", "--allow-empty", "-q", "-m", "on feature"],
+        );
+        crate::test_support::git_in(origin.path(), &["switch", "-q", "main"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(
+            parent.path(),
+            &["clone", "-q", origin.path().to_str().unwrap(), "work"],
+        );
+        let work = parent.path().join("work").canonicalize().unwrap();
+        crate::test_support::trust_repo(&work);
+        (origin, parent, work)
+    }
+
+    /// The branch HEAD is on, or `None` when it is detached.
+    fn attached_branch(repo: &std::path::Path) -> Option<String> {
+        git_text(repo, &["symbolic-ref", "-q", "HEAD"])
+            .ok()
+            .and_then(|name| name.trim().strip_prefix("refs/heads/").map(String::from))
+    }
+
+    /// The command palette hands the remote row's name, `origin/feature`. It
+    /// is a remote-tracking ref, so the old `checkout origin/feature --`
+    /// fallback detached HEAD at it and reported success.
+    #[test]
+    fn checkout_of_a_remote_tracking_name_lands_on_a_local_tracking_branch() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        let _ = GitWriter::checkout_branch(path, "origin/feature");
+        assert_eq!(
+            attached_branch(&work).as_deref(),
+            Some("feature"),
+            "HEAD must be on the local tracking branch, not detached"
+        );
+        assert_eq!(
+            git_text(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .unwrap()
+                .trim(),
+            "origin/feature"
+        );
+    }
+
+    #[test]
+    fn checkout_of_a_remote_tracking_name_reuses_an_existing_local_branch() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["branch", "feature", "origin/feature"]);
+        GitWriter::checkout_branch(path, "origin/feature").expect("switch to the local twin");
+        assert_eq!(attached_branch(&work).as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn checkout_of_a_tag_or_an_oid_never_detaches_head() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "v-only"]);
+        let oid = git_text(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        for name in ["v-only", oid.as_str()] {
+            let _ = GitWriter::checkout_branch(path, name);
+            assert_eq!(
+                attached_branch(&work).as_deref(),
+                Some("main"),
+                "checkout_branch({name}) must not leave HEAD detached"
+            );
+            assert!(GitWriter::checkout_branch(path, name).is_err(), "{name}");
+        }
+    }
+
+    /// A tag sharing its name with a branch: a local branch wins, because it is
+    /// what a branch checkout means; with only a remote twin the name is
+    /// ambiguous and is refused rather than resolved onto the tag.
+    #[test]
+    fn checkout_never_resolves_a_branch_name_onto_a_tag() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "feature"]);
+        let ambiguous = GitWriter::checkout_branch(path, "feature");
+        assert_eq!(
+            attached_branch(&work).as_deref(),
+            ambiguous.is_ok().then_some("feature").or(Some("main")),
+            "HEAD is on the new branch or untouched, never detached on the tag"
+        );
+        crate::test_support::git_in(&work, &["switch", "-q", "-c", "local-and-tag"]);
+        crate::test_support::git_in(&work, &["tag", "local-and-tag"]);
+        crate::test_support::git_in(&work, &["switch", "-q", "main"]);
+        let outcome = GitWriter::checkout_branch(path, "local-and-tag").expect("the branch");
+        assert!(!outcome.detached);
+        assert_eq!(attached_branch(&work).as_deref(), Some("local-and-tag"));
+    }
+
+    #[test]
+    fn checkout_detached_is_the_named_way_to_detach_and_says_so() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "v-only"]);
+        let attached = GitWriter::checkout_branch(path, "origin/feature").unwrap();
+        assert!(!attached.detached);
+        let detached = GitWriter::checkout_detached(path, "v-only").unwrap();
+        assert!(detached.detached);
+        assert_eq!(attached_branch(&work), None);
+        let back = GitWriter::checkout_branch(path, "main").unwrap();
+        assert!(!back.detached);
+    }
+
+    /// Two remotes carrying the same branch: a bare `feature` is ambiguous and
+    /// must not be guessed into a detached checkout, while the qualified name
+    /// is exact.
+    #[test]
+    fn checkout_with_two_remotes_never_detaches() {
+        let (origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(
+            &work,
+            &["remote", "add", "upstream", origin.path().to_str().unwrap()],
+        );
+        crate::test_support::git_in(&work, &["fetch", "-q", "upstream"]);
+        let _ = GitWriter::checkout_branch(path, "feature");
+        assert_eq!(attached_branch(&work).as_deref(), Some("main"));
+        let _ = GitWriter::checkout_branch(path, "upstream/feature");
+        assert_eq!(attached_branch(&work).as_deref(), Some("feature"));
+        assert_eq!(
+            git_text(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .unwrap()
+                .trim(),
+            "upstream/feature"
+        );
+    }
+
+    /// An unborn HEAD (no commit yet) with a fetched remote branch.
+    #[test]
+    fn checkout_of_a_remote_branch_works_from_an_unborn_head() {
+        let (origin, _parent, _work) = clone_with_remote_feature();
+        let fresh = crate::test_support::git_repo();
+        let canon = fresh.path().canonicalize().unwrap();
+        crate::test_support::git_in(
+            &canon,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        crate::test_support::git_in(&canon, &["fetch", "-q", "origin"]);
+        let _ = GitWriter::checkout_branch(canon.to_str().unwrap(), "origin/feature");
+        assert_eq!(attached_branch(&canon).as_deref(), Some("feature"));
+        assert!(GitWriter::checkout_branch(canon.to_str().unwrap(), "origin/missing").is_err());
+    }
+
+    #[test]
+    fn a_refused_checkout_on_a_dirty_tree_changes_nothing() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["switch", "-q", "feature"]);
+        std::fs::write(work.join("clash.txt"), "feature\n").unwrap();
+        crate::test_support::git_in(&work, &["add", "clash.txt"]);
+        crate::test_support::git_in(&work, &["commit", "-q", "-m", "clash on feature"]);
+        crate::test_support::git_in(&work, &["switch", "-q", "main"]);
+        std::fs::write(work.join("clash.txt"), "uncommitted\n").unwrap();
+        GitWriter::checkout_branch(path, "feature").expect_err("the dirty file would be lost");
+        assert_eq!(attached_branch(&work).as_deref(), Some("main"));
+        assert_eq!(
+            std::fs::read_to_string(work.join("clash.txt")).unwrap(),
+            "uncommitted\n"
+        );
+    }
+
     /// Regression (audit A7): when every checkout strategy fails, the first
     /// (most meaningful) error must surface, not the last retry's.
     #[test]
@@ -4480,6 +4829,90 @@ mod tests {
             "error must name fixup, got: {fixup_err}"
         );
         assert_eq!(head_message(&dir), "commit A", "HEAD must be untouched");
+    }
+
+    /// A squash/fixup folds into the nearest kept commit before it. Dropping
+    /// every commit ahead of it leaves only the onto commit, which git refuses
+    /// to squash into ("cannot 'squash' without a previous commit") and which
+    /// this engine would otherwise amend, rewriting the base's tip.
+    #[test]
+    fn rebase_refuses_squash_or_fixup_with_no_kept_commit_before_it() {
+        for (leading, action_name) in [
+            (vec![RebaseActionKind::Drop], "squash"),
+            (vec![RebaseActionKind::Drop], "fixup"),
+            (
+                vec![RebaseActionKind::Drop, RebaseActionKind::Drop],
+                "squash",
+            ),
+        ] {
+            let dir = init_repo_with_commit();
+            let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+            let mut steps = Vec::new();
+            for (i, action) in leading.iter().enumerate() {
+                let id = write_commit(&dir, &format!("d{i}.txt"), "d\n", &format!("dropped {i}"));
+                steps.push(RebaseStep {
+                    commit_id: id,
+                    action: match action {
+                        RebaseActionKind::Drop => RebaseActionKind::Drop,
+                        _ => unreachable!("only Drop leads these plans"),
+                    },
+                });
+            }
+            let last = write_commit(&dir, "z.txt", "z\n", "folded");
+            steps.push(RebaseStep {
+                commit_id: last,
+                action: if action_name == "squash" {
+                    RebaseActionKind::Squash
+                } else {
+                    RebaseActionKind::Fixup
+                },
+            });
+            let head_before = head_oid(&dir);
+            let err =
+                GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+                    .expect_err("a squash with every earlier step dropped must be refused");
+            assert!(
+                err.to_lowercase().contains(action_name),
+                "error must name {action_name}, got: {err}"
+            );
+            assert_eq!(head_oid(&dir), head_before, "HEAD must not move");
+            let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+            assert_eq!(branch.trim(), "main", "HEAD must stay on its branch");
+        }
+    }
+
+    #[test]
+    fn rebase_still_squashes_into_a_pick_across_a_drop() {
+        let dir = init_repo_with_commit();
+        let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+        let c_a = write_commit(&dir, "b.txt", "b\n", "kept A");
+        let c_b = write_commit(&dir, "d.txt", "d\n", "dropped B");
+        let c_c = write_commit(&dir, "c.txt", "c\n", "folded C");
+        let steps = vec![
+            RebaseStep {
+                commit_id: c_a,
+                action: RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: c_b,
+                action: RebaseActionKind::Drop,
+            },
+            RebaseStep {
+                commit_id: c_c,
+                action: RebaseActionKind::Squash,
+            },
+        ];
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect("pick, drop, squash folds into the pick");
+        assert_eq!(head_message(&dir), "kept A");
+        let count = git_text(
+            dir.path(),
+            &["rev-list", "--count", &format!("{base}..HEAD")],
+        )
+        .unwrap();
+        assert_eq!(count.trim(), "1", "one commit above the base");
+        assert!(dir.path().join("c.txt").exists());
+        assert!(!dir.path().join("d.txt").exists());
     }
 
     /// Pure-message tests for rebase recovery reporting: the step error always
@@ -5745,3 +6178,7 @@ mod bound_to_checked_state {
         assert_eq!(ours.email.as_deref(), Some("env@example.test"));
     }
 }
+
+#[cfg(test)]
+#[path = "git_writer_adv_tests.rs"]
+mod adv_tests;

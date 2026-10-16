@@ -47,6 +47,7 @@
     "allow-cmd-change-index",
     "allow-cmd-check-app-update",
     "allow-cmd-checkout-branch",
+    "allow-cmd-checkout-detached",
     "allow-cmd-cherry-pick",
     "allow-cmd-ci-local",
     "allow-cmd-cleaner-cancel",

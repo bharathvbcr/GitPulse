@@ -22,6 +22,7 @@
     highlightMatches,
     isStaleBranch,
     localNameFor,
+    checkoutNameFor,
   } from "../branches/groupBranches";
   import {
     flattenRows,
@@ -399,7 +400,7 @@
           toggle(row.folderId, "local");
         } else if (row.kind === "branch") {
           if (e.metaKey || e.ctrlKey) {
-            checkoutName(localNameFor(row.branch));
+            checkoutName(checkoutNameFor(row.branch));
           } else {
             selectRef(row.branch.name);
           }
@@ -949,12 +950,12 @@
     <button
       type="button"
       onclick={() => selectRef(branch.name)}
-      ondblclick={() => checkoutName(localNameFor(branch))}
+      ondblclick={() => checkoutName(checkoutNameFor(branch))}
       onkeydown={(event) => {
         if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
           event.preventDefault();
           event.stopPropagation();
-          checkoutName(localNameFor(branch));
+          checkoutName(checkoutNameFor(branch));
         }
       }}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
@@ -1366,7 +1367,7 @@
         {pinnedNames.has(b.name) ? "Unpin branch" : "Pin branch"}
       </button>
       {#if !b.is_current}
-        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = localNameFor(b); closeMenu(); checkoutName(name); }}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = checkoutNameFor(b); closeMenu(); checkoutName(name); }}>
           <GitBranch size={12} /> Checkout
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, "default")}>
@@ -1412,8 +1413,8 @@
       {/if}
     {:else if menu.tag}
       {@const t = menu.tag}
-      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); checkoutName(name); }}>
-        <GitBranch size={12} /> Checkout
+      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); void repoStore.checkoutDetached(name); }}>
+        <GitBranch size={12} /> Checkout (detached)
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); selectRef(name); }}>
         <Tag size={12} /> Filter history

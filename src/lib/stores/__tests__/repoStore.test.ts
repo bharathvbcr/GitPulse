@@ -3039,6 +3039,29 @@ describe("repoStore post-mutation selection refetch", () => {
     await flushMicro();
     expect(diffPaths).toEqual(["a.ts"]);
   });
+
+  it("detaching goes through its own command, never cmd_checkout_branch", async () => {
+    const seen: Array<[string, unknown]> = [];
+    const invoke = makeInvoke({
+      cmd_checkout_branch: async (cmd, args) => {
+        seen.push([cmd, args?.branchName]);
+        return undefined as never;
+      },
+      cmd_checkout_detached: async (cmd, args) => {
+        seen.push([cmd, args?.revision]);
+        return undefined as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/detach");
+    const outcome = await store.checkoutDetached("v1.0");
+    expect(outcome.ok).toBe(true);
+    await store.checkoutBranch("feature");
+    expect(seen).toEqual([
+      ["cmd_checkout_detached", "v1.0"],
+      ["cmd_checkout_branch", "feature"],
+    ]);
+  });
 });
 
 describe("repoStore watcher echo suppression", () => {

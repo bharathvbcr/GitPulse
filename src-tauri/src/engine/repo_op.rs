@@ -171,6 +171,11 @@ const PROBE_ORDER: &[&str] = &[
     "SQUASH_MSG",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
+    // A multi-commit cherry-pick/revert keeps its remaining steps here after a
+    // step is committed, when `CHERRY_PICK_HEAD`/`REVERT_HEAD` are already
+    // gone. It follows them, as in git's own status, and it follows the rebase
+    // and merge probes, so a rebase never reads as a cherry-pick.
+    "sequencer",
     "BISECT_LOG",
 ];
 
@@ -184,6 +189,7 @@ const IDX_MERGE_HEAD: usize = 2;
 const IDX_SQUASH_MSG: usize = 3;
 const IDX_CHERRY_PICK_HEAD: usize = 4;
 const IDX_REVERT_HEAD: usize = 5;
+const IDX_SEQUENCER: usize = 6;
 
 /// Reports the operation `repo`'s worktree is parked in, or `None` when it is
 /// idle.
@@ -299,6 +305,10 @@ fn classify<'a>(
             }
             "CHERRY_PICK_HEAD" => OperationKind::CherryPick,
             "REVERT_HEAD" => OperationKind::Revert,
+            "sequencer" => match sequencer_kind(path, warnings) {
+                Some(kind) => kind,
+                None => continue,
+            },
             "BISECT_LOG" => OperationKind::Bisect,
             other => {
                 return Err(format!("unhandled operation probe '{other}'"));
@@ -307,6 +317,50 @@ fn classify<'a>(
         return Ok(Some((kind, path)));
     }
     Ok(None)
+}
+
+/// What a `sequencer/` directory is running, from the first step of its
+/// `todo`, as git's own status reads it. `None` when no step is left (no
+/// `todo`, or only comments): git reports nothing in progress then either. A
+/// `todo` that cannot be read, or whose first verb is not one this reader
+/// knows, is still a sequencer git will resume, so it is reported as a
+/// cherry-pick with a warning: a probe that could not tell must not look idle.
+fn sequencer_kind(sequencer: &Path, warnings: &mut Vec<String>) -> Option<OperationKind> {
+    let before = warnings.len();
+    let todo = read_control_head(&sequencer.join("todo"), SEQUENCER_HEAD_BYTES, warnings);
+    let Some((todo, truncated)) = todo else {
+        if warnings.len() > before {
+            warnings.push("sequencer/todo is unreadable; assuming a cherry-pick".into());
+            return Some(OperationKind::CherryPick);
+        }
+        return None;
+    };
+    let first = todo
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(first) = first else {
+        // Nothing but comments in the part that was read: only a todo that was
+        // read whole can be called finished.
+        if truncated {
+            warnings.push(
+                "sequencer/todo has no step in its first 64 KiB; assuming a cherry-pick".into(),
+            );
+            return Some(OperationKind::CherryPick);
+        }
+        return None;
+    };
+    match first.split_whitespace().next() {
+        Some("pick" | "p") => Some(OperationKind::CherryPick),
+        Some("revert") => Some(OperationKind::Revert),
+        other => {
+            warnings.push(format!(
+                "sequencer/todo starts with an unrecognised step ({}); assuming a cherry-pick",
+                other.unwrap_or("")
+            ));
+            Some(OperationKind::CherryPick)
+        }
+    }
 }
 
 /// The warning a squash probe leaves when it could not read the index, so a
@@ -361,6 +415,42 @@ fn read_control(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             warnings.push(format!("cannot stat {}: {err}", path.display()));
+            None
+        }
+    }
+}
+
+/// How much of a sequencer `todo` is read to name the operation. The first
+/// step is at the head of the file, so a todo past
+/// [`MAX_CONTROL_FILE_BYTES`] still says what it is without being read whole.
+const SEQUENCER_HEAD_BYTES: u64 = 64 * 1024;
+
+/// Reads at most the first `limit` bytes of a control file. Absent is `None`
+/// without a warning; any other failure is `None` with one. A file longer than
+/// `limit` is truncated, which is the point: the caller wants its head.
+fn read_control_head(
+    path: &Path,
+    limit: u64,
+    warnings: &mut Vec<String>,
+) -> Option<(String, bool)> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warnings.push(format!("cannot read {}: {err}", path.display()));
+            return None;
+        }
+    };
+    let mut bytes = Vec::new();
+    match file.take(limit + 1).read_to_end(&mut bytes) {
+        Ok(_) => {
+            let truncated = bytes.len() as u64 > limit;
+            bytes.truncate(limit as usize);
+            Some((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+        }
+        Err(err) => {
+            warnings.push(format!("cannot read {}: {err}", path.display()));
             None
         }
     }
@@ -434,14 +524,10 @@ fn progress(
     }
 }
 
-/// The sequencer lives beside the other control files in the same git dir.
-/// Derived from a probe path rather than re-invoking `rev-parse`.
+/// The sequencer lives beside the other control files in the same git dir; its
+/// path is one of the probe paths, so nothing re-invokes `rev-parse`.
 fn sequencer_dir(paths: &[PathBuf]) -> PathBuf {
-    let cherry_pick_head = &paths[IDX_CHERRY_PICK_HEAD];
-    cherry_pick_head
-        .parent()
-        .map(|dir| dir.join("sequencer"))
-        .unwrap_or_else(|| PathBuf::from("sequencer"))
+    paths[IDX_SEQUENCER].clone()
 }
 
 /// Strips a full ref name down to what a person would call it.
@@ -766,6 +852,7 @@ mod tests {
         assert_eq!(PROBE_ORDER[IDX_SQUASH_MSG], "SQUASH_MSG");
         assert_eq!(PROBE_ORDER[IDX_CHERRY_PICK_HEAD], "CHERRY_PICK_HEAD");
         assert_eq!(PROBE_ORDER[IDX_REVERT_HEAD], "REVERT_HEAD");
+        assert_eq!(PROBE_ORDER[IDX_SEQUENCER], "sequencer");
     }
 
     #[test]
@@ -853,6 +940,112 @@ mod tests {
         assert!(git_text(repo, &["status", "--porcelain"])
             .unwrap()
             .is_empty());
+    }
+
+    /// `git cherry-pick A B` that conflicted on A and was resolved with
+    /// `git commit` has no `CHERRY_PICK_HEAD`, but `.git/sequencer` still holds
+    /// B and git still reports the operation as in progress.
+    #[test]
+    fn a_multi_commit_cherry_pick_between_steps_is_still_parked() {
+        let dir = crate::test_support::repo_parked_in_a_sequence(false);
+        let repo = dir.path();
+        assert!(!repo.join(".git/CHERRY_PICK_HEAD").exists());
+        assert_eq!(detect_kind(repo).unwrap(), Some(OperationKind::CherryPick));
+        let parked = detect(repo)
+            .unwrap()
+            .expect("a parked sequence read as idle");
+        assert_eq!(parked.kind, OperationKind::CherryPick);
+        assert!(parked.allows(OperationAction::Continue));
+        assert!(parked.allows(OperationAction::Abort));
+        assert_eq!(parked.total_steps, Some(2));
+
+        let abort = action_argv(OperationKind::CherryPick, OperationAction::Abort);
+        crate::test_support::git_in(repo, &abort[1..]);
+        assert_eq!(detect(repo).unwrap(), None);
+    }
+
+    #[test]
+    fn a_multi_commit_revert_between_steps_is_still_parked() {
+        let dir = crate::test_support::repo_parked_in_a_sequence(true);
+        let repo = dir.path();
+        assert!(!repo.join(".git/REVERT_HEAD").exists());
+        assert_eq!(detect_kind(repo).unwrap(), Some(OperationKind::Revert));
+        let parked = detect(repo)
+            .unwrap()
+            .expect("a parked sequence read as idle");
+        assert_eq!(parked.kind, OperationKind::Revert);
+        assert!(parked.allows(OperationAction::Continue));
+        assert!(parked.allows(OperationAction::Abort));
+
+        let r#continue = action_argv(OperationKind::Revert, OperationAction::Continue);
+        crate::test_support::git_in(repo, &r#continue[1..]);
+        assert_eq!(detect(repo).unwrap(), None, "the sequence finished");
+    }
+
+    #[test]
+    fn an_idle_repository_with_no_sequencer_is_idle() {
+        let dir = crate::test_support::git_repo();
+        crate::test_support::git_in(dir.path(), &["commit", "--allow-empty", "-q", "-m", "base"]);
+        assert_eq!(detect(dir.path()).unwrap(), None);
+        // An empty sequencer directory (no todo) is not an operation: git
+        // itself reports nothing in progress.
+        std::fs::create_dir(dir.path().join(".git/sequencer")).unwrap();
+        assert_eq!(detect(dir.path()).unwrap(), None);
+    }
+
+    /// A rebase keeps the lead even when a sequencer directory sits beside it.
+    #[test]
+    fn a_rebase_outranks_a_sequencer_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = PROBE_ORDER
+            .iter()
+            .map(|probe| dir.path().join(probe))
+            .collect();
+        std::fs::create_dir_all(&paths[IDX_REBASE_MERGE]).unwrap();
+        std::fs::create_dir_all(&paths[IDX_SEQUENCER]).unwrap();
+        std::fs::write(paths[IDX_SEQUENCER].join("todo"), "pick abc one\n").unwrap();
+        let mut warnings = Vec::new();
+        let (kind, _) = classify(dir.path(), &paths, &mut warnings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, OperationKind::Rebase);
+    }
+
+    #[test]
+    fn the_sequencer_todo_names_the_operation_and_an_unreadable_one_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = PROBE_ORDER
+            .iter()
+            .map(|probe| dir.path().join(probe))
+            .collect();
+        let sequencer = &paths[IDX_SEQUENCER];
+        std::fs::create_dir_all(sequencer).unwrap();
+        let todo = sequencer.join("todo");
+        let kind_for = |paths: &[PathBuf]| {
+            let mut warnings = Vec::new();
+            let found = classify(dir.path(), paths, &mut warnings)
+                .unwrap()
+                .map(|(kind, _)| kind);
+            (found, warnings)
+        };
+
+        std::fs::write(&todo, "# comment\n\nrevert abc one\npick def two\n").unwrap();
+        assert_eq!(kind_for(&paths).0, Some(OperationKind::Revert));
+        std::fs::write(&todo, "pick abc one\n").unwrap();
+        assert_eq!(kind_for(&paths).0, Some(OperationKind::CherryPick));
+
+        // Nothing left to run: not an operation.
+        std::fs::write(&todo, "# only comments\n").unwrap();
+        assert_eq!(kind_for(&paths).0, None);
+        std::fs::remove_file(&todo).unwrap();
+        assert_eq!(kind_for(&paths).0, None);
+
+        // A verb this reader does not know is still a sequencer git will
+        // resume: reported, with a warning, never as idle.
+        std::fs::write(&todo, "frobnicate abc one\n").unwrap();
+        let (found, warnings) = kind_for(&paths);
+        assert_eq!(found, Some(OperationKind::CherryPick));
+        assert!(!warnings.is_empty());
     }
 
     #[test]
@@ -1266,3 +1459,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "repo_op_adv_tests.rs"]
+mod adv_tests;

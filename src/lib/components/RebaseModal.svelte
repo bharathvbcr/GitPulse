@@ -10,7 +10,7 @@
     cardScale,
     cardScaleOut,
   } from "../ui/transitions";
-  import { seedRebasePlan, shouldReseed, type RebaseStep } from "../rebase/planner";
+  import { rebasePlanProblem, seedRebasePlan, shouldReseed, type RebaseStep } from "../rebase/planner";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { reportPanelError } from "../diagnostics/report";
@@ -38,6 +38,8 @@
   let planRepoPath = $state<string | null>(null);
   let planGeneration = $state(0);
   const planCurrent = $derived(planRepoPath === $repoStore.currentPath && planGeneration === $repoStore.generation);
+
+  const planProblem = $derived(rebasePlanProblem(items));
 
   let wasOpen = false;
   let planDirty = $state(false);
@@ -73,7 +75,7 @@
     // redirect the completion effects ($repoStore.currentPath re-read after
     // the awaits would target whatever tab is now active).
     const repoPath = $repoStore.currentPath;
-    if (!repoPath || items.length === 0 || isExecuting || !planCurrent) return;
+    if (!repoPath || items.length === 0 || isExecuting || !planCurrent || planProblem !== null) return;
     isExecuting = true;
     errorMsg = null;
 
@@ -144,6 +146,9 @@
       {#if !planCurrent}
         <p role="alert" class="text-xs text-amber-500">Repository changed. Close and reopen this plan before rebasing.</p>
       {/if}
+      {#if planProblem}
+        <p role="alert" class="mx-4 mt-3 text-xs text-amber-500">{planProblem}</p>
+      {/if}
       {#if errorMsg}
         <div class="mx-4 mt-3 p-2 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-400 text-xs flex items-center gap-2">
           <AlertCircle size={14} class="shrink-0" />
@@ -180,7 +185,7 @@
         <button onclick={requestClose} disabled={isExecuting} class="gp-btn">Cancel</button>
         <button
           onclick={executeRebase}
-          disabled={isExecuting || items.length === 0 || !planCurrent}
+          disabled={isExecuting || items.length === 0 || !planCurrent || planProblem !== null}
           class="gp-btn-primary"
         >
           <Check size={14} />

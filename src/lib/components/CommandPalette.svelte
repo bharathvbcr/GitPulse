@@ -14,7 +14,7 @@
   import { shellOwnsKey } from "../keyboard/terminalFocus";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
-  import { highlightMatches } from "../branches/groupBranches";
+  import { checkoutNameFor, highlightMatches } from "../branches/groupBranches";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
   import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
@@ -97,7 +97,7 @@
       const root = workspaceRoot(hit.repo, searchResult.repos);
       return { id: `ws:${hit.repo}:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`, label: hit.symbol_name, description: `${hit.repo} · ${hit.kind} · ${hit.file_path}:${hit.span_start_line}`, filePath: hit.file_path, category: "Cross-repo symbols", icon: FileCode, disabledReason: root ? undefined : `The workspace registry cannot uniquely resolve ${hit.repo}. Open Map to repair its registration.`, action: () => { if (root) return openWorkspaceHit(root, hit.file_path); } };
     });
-    if (mode === "branches") return $repoStore.branches.map(branch => ({ id: `branch:${repoPath}:${branch.name}`, label: branch.name, description: branch.is_current ? "Current branch" : `${branch.last_author} · ${branch.last_summary}`, category: branch.is_remote ? "Remote branches" : "Local branches", icon: GitBranch, disabledReason: branch.is_current ? "This branch is already checked out." : worktreeUnavailable($repoStore), action: () => repoStore.checkoutBranch(branch.name) }));
+    if (mode === "branches") return $repoStore.branches.map(branch => ({ id: `branch:${repoPath}:${branch.name}`, label: branch.name, description: branch.is_current ? "Current branch" : `${branch.last_author} · ${branch.last_summary}`, category: branch.is_remote ? "Remote branches" : "Local branches", icon: GitBranch, disabledReason: branch.is_current ? "This branch is already checked out." : worktreeUnavailable($repoStore), action: () => repoStore.checkoutBranch(checkoutNameFor(branch)) }));
     if (mode === "commits") {
       if ($graphStore.visiblePath !== repoPath) return [];
       return $graphStore.commits.map(commit => ({ id: `commit:${repoPath}:${commit.id}`, label: commit.summary, description: `${commit.id.slice(0, 8)} · ${commit.author_name}`, keywords: `${commit.id} ${commit.author_email}`, category: "Loaded commits", icon: GitCommit, action: async () => { await repoStore.selectCommitDiff(commit.id); repoStore.setActiveTab("history", "diff"); } }));

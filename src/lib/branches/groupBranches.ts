@@ -70,6 +70,17 @@ export function localNameFor(branch: BranchInfo): string {
   return branch.name;
 }
 
+/**
+ * The name a checkout of this row sends. A remote row keeps its remote
+ * (`upstream/feat`): collapsing it to the local name would answer with any
+ * local branch of that name, including one tracking a different remote. The
+ * backend maps the qualified name to its local tracking branch and refuses a
+ * local branch that tracks another upstream.
+ */
+export function checkoutNameFor(branch: BranchInfo): string {
+  return branch.name;
+}
+
 export function branchLeafName(branch: BranchInfo): string {
   const name = localNameFor(branch);
   const parts = name.split("/").filter(Boolean);

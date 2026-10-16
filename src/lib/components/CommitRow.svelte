@@ -181,7 +181,7 @@
 
   async function checkoutHere() {
     closeMenu();
-    const outcome = await repoStore.checkoutBranch(row.id);
+    const outcome = await repoStore.checkoutDetached(row.id);
     reportFailure(outcome, "Could not check out the commit");
   }
 
