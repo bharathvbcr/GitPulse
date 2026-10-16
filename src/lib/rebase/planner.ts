@@ -24,6 +24,26 @@ export function seedRebasePlan(commits: VisualCommitRow[], window = 12): Planner
 }
 
 /**
+ * Why a plan cannot run, or null when it can. A squash or fixup folds into the
+ * nearest kept commit before it; a dropped commit is not one. With only drops
+ * ahead of it there is nothing to fold into but the onto commit itself, which
+ * git refuses ("cannot 'squash' without a previous commit") and which the
+ * backend rejects with the same rule, so the dialog stops it first. Pick and
+ * reword keep a commit.
+ */
+export function rebasePlanProblem(items: ReadonlyArray<Pick<PlannerItem, "id" | "action">>): string | null {
+  let hasKeptCommit = false;
+  for (const item of items) {
+    if (item.action === "Pick" || item.action === "Reword") {
+      hasKeptCommit = true;
+    } else if ((item.action === "Squash" || item.action === "Fixup") && !hasKeptCommit) {
+      return `Cannot ${item.action.toLowerCase()} ${item.id.slice(0, 8)}: no kept commit before it to combine into.`;
+    }
+  }
+  return null;
+}
+
+/**
  * True only on the closed→open transition. The dialog must seed its plan
  * once per opening; a background refresh (watcher event, filter keystroke)
  * while the dialog is open updates the commit list but must NOT rebuild the
