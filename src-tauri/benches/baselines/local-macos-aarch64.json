@@ -4,6 +4,26 @@
   "os": "macos",
   "arch": "aarch64",
   "benches": {
+    "churn_spawns": {
+      "commit": "c462eda6e7f673322565ee67019688e4778ec507",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 8.81787109375,
+      "rows": {
+        "branch_stats after a default-branch advance unrelated to 32 branches": {
+          "n": 9,
+          "time_gated": true,
+          "min_ns": 115009084,
+          "counters": {
+            "ahead_behind": 1,
+            "branches": 32,
+            "git_processes": 13,
+            "merge_base": 1,
+            "shortstat": 0
+          }
+        }
+      }
+    },
     "command_timings": {
       "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
@@ -75,7 +95,7 @@
           "time_gated": true,
           "min_ns": 349134500,
           "counters": {
-            "git_processes": 38,
+            "git_processes": 42,
             "worktrees": 18
           }
         },
@@ -228,6 +248,43 @@
             "input_bytes": 122619,
             "modified_segments": 1,
             "original_segments": 1
+          }
+        }
+      }
+    },
+    "graph_spawns": {
+      "commit": "c462eda6e7f673322565ee67019688e4778ec507",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 7.85546875,
+      "rows": {
+        "graph default page 5k (S4-04)": {
+          "n": 9,
+          "time_gated": true,
+          "min_ns": 25806292,
+          "counters": {
+            "git_processes": 11,
+            "rows": 5000
+          }
+        },
+        "stack refresh 20 branches beyond the window (S4-03)": {
+          "n": 9,
+          "time_gated": true,
+          "min_ns": 13819791,
+          "counters": {
+            "git_processes": 9,
+            "nodes": 21,
+            "parented": 19
+          }
+        },
+        "stack refresh, refs unmoved (warm)": {
+          "n": 9,
+          "time_gated": true,
+          "min_ns": 1267042,
+          "counters": {
+            "git_processes": 0,
+            "nodes": 21,
+            "parented": 19
           }
         }
       }

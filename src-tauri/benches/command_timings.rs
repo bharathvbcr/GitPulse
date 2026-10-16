@@ -28,7 +28,7 @@
 
 mod common;
 
-use common::fixture::{build_repo, count_git_processes, Repo, Spec};
+use common::fixture::{build_repo, count_git_processes, git_process_argvs, Repo, Spec};
 use common::{interleave, require_no_failed_facets, Case, Report, Sample};
 use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::engine::worktree::ScanDepth;
@@ -450,6 +450,19 @@ fn main() {
         worktrees
     };
 
+    // `git_preflight` runs `git version` once per process and remembers a
+    // passing answer; `git_supports` (commit details' merge rendering) is the
+    // first caller to trigger it. Production pays that once, off the per-call
+    // path, so warm it here: each row's counter is then its own work, and a
+    // row that happens to run first is not charged for the probe.
+    let preflight = gitpulse_lib::engine::git_cli::git_preflight();
+    assert_eq!(
+        preflight.status,
+        gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
+        "git did not pass its preflight ({:?}), so the warm-up did not cache and a counted row would pay the probe",
+        preflight.message
+    );
+
     // Work counters (git processes) in their own untimed pass.
     let (_, snapshot_procs) = count_git_processes(|| snapshot(&path));
     let (_, list_full_procs) = count_git_processes(|| list_full(&path));
@@ -458,7 +471,17 @@ fn main() {
     // and a scan it cut short would be timed as if it were the whole work.
     let (_, lang_procs) =
         count_git_processes(|| GitReader::get_repo_language_stats_bounded(&path, None));
-    let (_, details_procs) = count_git_processes(|| GitReader::get_commit_details(&path, &commit));
+    let (_, details_argvs) = git_process_argvs(|| GitReader::get_commit_details(&path, &commit));
+    // Pins the warm-up: the probe is `git version`, and none may land in the
+    // counted pass, or the row would charge commit details a one-time cost.
+    assert!(
+        !details_argvs
+            .iter()
+            .any(|argv| argv.first().map(String::as_str) == Some("version")),
+        "commit details started `git version` inside the counted pass; the git_preflight \
+         warm-up must run before it: {details_argvs:?}"
+    );
+    let details_procs = details_argvs.len() as u64;
 
     // Settle catch_up's watermark (first pass over the transcripts).
     let (first, _) = catch_up_sample(&steady_root, &path);
