@@ -334,7 +334,12 @@ export function replacementBlock(
   const line = lines[index];
   if (!line || (line.type !== "del" && line.type !== "add")) return null;
   let start = index;
-  while (start > 0 && lines[start - 1].type === "add") start -= 1;
+  // Only an add row can sit inside the add run of its own block. A del row
+  // starts (or continues) a del run, so an add run before it ends the previous
+  // block rather than belonging to this one.
+  if (line.type === "add") {
+    while (start > 0 && lines[start - 1].type === "add") start -= 1;
+  }
   while (start > 0 && lines[start - 1].type === "del") start -= 1;
   let addStart = start;
   while (addStart < lines.length && lines[addStart].type === "del") addStart += 1;

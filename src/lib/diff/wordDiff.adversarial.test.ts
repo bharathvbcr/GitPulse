@@ -114,6 +114,31 @@ describe("a del row that directly follows an add row", () => {
   });
 });
 
+describe("pairs that bail out of computeWordDiff", () => {
+  it("still get segments, so a re-render never recomputes them", () => {
+    const huge = (c: string) => c.repeat(60_000);
+    const lines = parseUnifiedDiff(`@@ -1 +1 @@\n-${huge("a")}\n+${huge("b")}\n`);
+    annotateAround(lines, 1);
+    const first = lines[1].segments;
+    expect(first).toBeDefined();
+    for (let i = 0; i < 50; i += 1) annotateAround(lines, 1);
+    expect(lines[1].segments).toBe(first);
+  });
+
+  it("an all-bail block costs only its forced pair plus cheap neighbours", () => {
+    const row = (c: string, i: number) => `${c}${i} ${"q".repeat(60_000)}`;
+    const raw = ["@@ -1,60 +1,60 @@"];
+    for (let i = 0; i < 60; i += 1) raw.push("-" + row("a", i));
+    for (let i = 0; i < 60; i += 1) raw.push("+" + row("b", i));
+    const lines = parseUnifiedDiff(raw.join("\n") + "\n");
+    annotateAround(lines, 30);
+    expect(lines[30].segments).toBeDefined();
+    // The budget charges a bail-out the full table (it is a size upper bound),
+    // so the halo stops early; the row's own pair is the guarantee.
+    expect(lines.filter((l) => l.segments).length).toBeLessThanOrEqual(2 * 49);
+  });
+});
+
 describe("annotateAround budget edges", () => {
   it("halo 0 annotates only the requested pair", () => {
     const lines = parseUnifiedDiff("@@ -1,3 +1,3 @@\n-a\n-b\n-c\n+d\n+e\n+f\n");
