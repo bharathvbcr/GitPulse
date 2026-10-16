@@ -665,10 +665,13 @@ fn structural_mutations_git_rejects_never_read_as_a_verdict() {
         rejected += 1;
         let report = inspect_only(dir.path());
         if report.state != CommitGraphState::Unknown {
+            let changed: Vec<String> = (0..structural)
+                .filter(|&i| bytes[i] != good[i])
+                .map(|i| format!("{i}:{:02x}->{:02x}", good[i], bytes[i]))
+                .collect();
             offenders.push(format!(
-                "round {round}: {:?} on {:02x?}",
-                report.state,
-                &bytes[..table_end]
+                "round {round}: {:?} with bytes changed {changed:?}",
+                report.state
             ));
         }
     }
@@ -1021,4 +1024,105 @@ fn a_fifty_thousand_commit_graph_is_read_correctly_and_cheaply() {
     let report = detect(dir.path());
     assert_eq!(report.state, CommitGraphState::Present, "{report:?}");
     assert_eq!(report.commits, Some(50_000));
+}
+
+#[test]
+fn an_oid_table_out_of_order_under_its_fanout_is_unknown() {
+    let _g = serial();
+    let (dir, graph, good) = graph_repo(40);
+    let rows = good[6] as usize;
+    let lookup = (0..rows)
+        .find(|&r| &good[8 + r * 12..8 + r * 12 + 4] == b"OIDL")
+        .map(|r| u64::from_be_bytes(good[8 + r * 12 + 4..8 + r * 12 + 12].try_into().unwrap()))
+        .expect("OIDL row") as usize;
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output_locked()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    let head: Vec<u8> = (0..20)
+        .map(|i| u8::from_str_radix(&head[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    let at = |i: usize| lookup + i * 20..lookup + (i + 1) * 20;
+    let pos = (0..40)
+        .find(|&i| good[at(i)] == head[..])
+        .expect("HEAD is in the graph");
+    // Swap HEAD's entry with one that starts with a different byte.
+    let other = [0usize, 39, 20]
+        .into_iter()
+        .find(|&i| i != pos && good[lookup + i * 20] != head[0])
+        .expect("an entry with another first byte");
+    let mut bytes = good.clone();
+    let (a, b) = (good[at(pos)].to_vec(), good[at(other)].to_vec());
+    bytes[at(pos)].copy_from_slice(&b);
+    bytes[at(other)].copy_from_slice(&a);
+    reseal(&mut bytes);
+    put_graph(&graph, &bytes);
+    assert!(
+        !git_accepts_graph(dir.path()),
+        "oracle: git must reject an unsorted OID table"
+    );
+    assert_state(&inspect_only(dir.path()), CommitGraphState::Unknown);
+}
+
+#[test]
+fn a_hostile_ref_name_cannot_flood_or_dress_up_the_note() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(2);
+    let git_dir = dir.path().join(".git");
+    // `..` makes the name unusable, which is the path that quotes it.
+    let name = format!("refs/heads/../{}\u{1b}[31m\tX", "a".repeat(60_000));
+    std::fs::write(git_dir.join("HEAD"), format!("ref: {name}\n")).unwrap();
+    std::fs::write(
+        git_dir.join("refs").join("heads").join("x"),
+        "ref: refs/heads/\u{1b}\n",
+    )
+    .unwrap();
+    let report = inspect(&git_dir, &git_dir);
+    let note = report.note.expect("a note");
+    assert!(note.chars().count() <= 240, "note is {} chars", note.len());
+    assert!(!note.chars().any(char::is_control), "{note:?}");
+}
+
+#[test]
+fn structural_mutations_of_a_chain_layer_git_rejects_never_read_as_a_verdict() {
+    let _g = serial();
+    let (dir, _chain, lines) = chain_repo();
+    let layer = dir.path().join(format!(
+        ".git/objects/info/commit-graphs/graph-{}.graph",
+        lines[1]
+    ));
+    let good = std::fs::read(&layer).unwrap();
+    let table_end = 8 + (good[6] as usize + 1) * 12;
+    let structural = table_end + 1024;
+    let mut rng = Rng(0x0ddc_0ffe_e15_600d);
+    let mut offenders = Vec::new();
+    let mut rejected = 0;
+    for round in 0..80 {
+        let mut bytes = good.clone();
+        for _ in 0..=rng.below(3) {
+            let i = rng.below(structural.min(bytes.len()));
+            bytes[i] = if rng.below(2) == 0 {
+                rng.next() as u8
+            } else {
+                bytes[i] ^ (1 << rng.below(8))
+            };
+        }
+        reseal(&mut bytes);
+        put_graph(&layer, &bytes);
+        if git_accepts_graph(dir.path()) {
+            continue;
+        }
+        rejected += 1;
+        let report = inspect_only(dir.path());
+        if report.state != CommitGraphState::Unknown {
+            offenders.push(format!("round {round}: {:?}", report.state));
+        }
+    }
+    assert!(
+        rejected > 20,
+        "the fuzz barely produced rejected graphs ({rejected})"
+    );
+    assert!(offenders.is_empty(), "{offenders:?}");
 }
