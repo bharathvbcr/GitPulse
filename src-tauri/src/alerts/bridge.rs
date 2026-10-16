@@ -1208,6 +1208,7 @@ mod tests {
     /// peer that keeps a byte in flight inside every read timeout never trips
     /// a per-read timeout, so it held the loop — and every other agent's
     /// notification behind it — for up to `MAX_REPORT_BYTES` timeouts.
+    #[cfg(unix)]
     #[test]
     fn a_peer_dripping_bytes_cannot_hold_the_connection_past_its_ceiling() {
         use std::io::Write;
