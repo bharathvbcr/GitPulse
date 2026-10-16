@@ -93,10 +93,11 @@
   import LanguageLogo from "./LanguageLogo.svelte";
   import VirtualList from "./VirtualList.svelte";
   import {
-    annotateRange,
+    annotateAround as annotateWordDiffAround,
     emptyDiffCopy,
     isImagePath,
-    replacementBlockBounds,
+    replacementBlock,
+    type ReplacementBlock,
   } from "../diff/wordDiff";
   import {
     buildFilePatchForHunk,
@@ -1043,10 +1044,10 @@
     emptyDiffCopy($repoStore.selectedCommitId !== null && selectedGraphRow?.is_merge === true)
   );
 
-  let lastBoundsBlock: { source: AnnotatedDiffLine[]; start: number; end: number } | null = null;
+  let lastBoundsBlock: (ReplacementBlock & { source: AnnotatedDiffLine[] }) | null = null;
 
   /**
-   * Annotates the replacement block around one line, once.
+   * Annotates the replacement pairs around one line, once each.
    *
    * Both views call this, so the intra-line pairing they show comes from one
    * pass over one block. Split view used to run its own pairing (last
@@ -1063,10 +1064,12 @@
       index < lastBoundsBlock.end
         ? lastBoundsBlock
         : null;
-    const bounds = cached ? [cached.start, cached.end] : replacementBlockBounds(lines, index);
-    if (!bounds) return;
-    if (!cached) lastBoundsBlock = { source: lines, start: bounds[0], end: bounds[1] };
-    annotateRange(lines, bounds[0], bounds[1]);
+    const block = cached ?? replacementBlock(lines, index);
+    if (!block) return;
+    if (!cached) lastBoundsBlock = { source: lines, ...block };
+    // Only this row's pair and a bounded halo: a block of thousands of long
+    // lines must not run one LCS per pair before its first row paints.
+    annotateWordDiffAround(lines, index, block);
   }
 
   function unifiedRow(index: number): AnnotatedDiffLine | undefined {

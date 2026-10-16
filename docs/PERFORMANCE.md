@@ -1439,3 +1439,23 @@ them would fail the compare with "baselined but produced no report". Only
 both benches to that list in the same change that seeds `ubuntu-latest` or
 `macos-latest`.
 
+
+## 2026-10-16: word diff annotates a bounded window (ft-02b836b8)
+
+`DiffViewer` used to word-diff the whole del-run plus add-run of a replacement block
+when its first row rendered (`annotateRange` over `replacementBlockBounds`), one LCS
+per pair on the UI thread. `annotateAround` (`src/lib/diff/wordDiff.ts`) now annotates
+the row's own pair plus up to `WORD_DIFF_PAIR_HALO` (24) pairs each side, nearest
+first, within `WORD_DIFF_CELL_BUDGET` (1,000,000) LCS cells per call. Other pairs
+stay plain until their own row renders.
+
+`bun scripts/bench-word-diff.ts --whole` (2000 pairs, 3,895 chars per line, load 58
+on 18 cores, min-of-N, first visible row):
+
+| path | runs | min ms | pairs annotated |
+| --- | --- | --- | --- |
+| `annotateRange` whole block (before) | 2 | 2728.92 | 2000 |
+| `annotateAround` (after) | 5 | 3.28 | 3 |
+
+Not yet a row in the Rust bench harness above: this is a TypeScript bench with its
+own JSON line, kept beside the harness until that harness can ingest it.
