@@ -15,7 +15,17 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Probes run on this many threads at most. 256 ports at two 50 ms connects is
+/// 8 rounds of 100 ms, under [`PROBE_BUDGET`].
+const PROBE_FAN_OUT: usize = 32;
+
+/// The longest a snapshot starts new probes for. A probe already running
+/// finishes, so a snapshot takes at most this plus one probe's two connects.
+const PROBE_BUDGET: Duration = Duration::from_secs(1);
 
 /// How long one connect to one loopback address may take. Loopback answers or
 /// refuses at once; the bound is for a filtered port.
@@ -73,14 +83,85 @@ fn read_routes_text() -> Option<String> {
     let routes_file = portless_state_dir()?.join("routes.json");
     #[cfg(test)]
     read_log::record(&routes_file);
-    let file = std::fs::File::open(&routes_file).ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A FIFO at this path would park a blocking open until something wrote to
+    // it. A symlink is followed on purpose: a user may keep the file elsewhere.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(&routes_file) {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "portless routes unreadable at {}: {e}",
+                    routes_file.display()
+                );
+            }
+            return None;
+        }
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        log::warn!(
+            "portless routes path is not a regular file: {}",
+            routes_file.display()
+        );
+        return None;
+    }
     let mut raw = String::new();
     file.take(MAX_ROUTES_FILE_BYTES + 1)
         .read_to_string(&mut raw)
         .ok()?;
-    u64::try_from(raw.len())
-        .is_ok_and(|len| len <= MAX_ROUTES_FILE_BYTES)
-        .then_some(raw)
+    if u64::try_from(raw.len()).is_ok_and(|len| len <= MAX_ROUTES_FILE_BYTES) {
+        Some(raw)
+    } else {
+        log::warn!(
+            "portless routes larger than {MAX_ROUTES_FILE_BYTES} bytes ignored: {}",
+            routes_file.display()
+        );
+        None
+    }
+}
+
+/// Whether `part` is one DNS label: 1..=63 ASCII letters, digits or hyphens,
+/// not starting or ending with a hyphen. Nothing that is URL syntax (`/`, `@`,
+/// `#`, `?`, space, `\`) is one.
+fn is_dns_label(part: &str) -> bool {
+    (1..=63).contains(&part.len())
+        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !part.starts_with('-')
+        && !part.ends_with('-')
+}
+
+/// The labels of a portless hostname, lowercased as ASCII only (a Kelvin sign
+/// is not a `k`): every label a DNS label, at most 253 bytes, the last one
+/// `localhost` or `test`, and at least one label before it. One trailing dot is
+/// allowed. This is the only test of what a portless hostname is.
+fn portless_labels(hostname: &str) -> Option<Vec<String>> {
+    let lowered = hostname.to_ascii_lowercase();
+    let host = lowered.strip_suffix('.').unwrap_or(&lowered);
+    if host.len() > 253 {
+        return None;
+    }
+    let mut parts: Vec<String> = host.split('.').map(str::to_string).collect();
+    let tld = parts.pop()?;
+    (PORTLESS_TLDS.contains(&tld.as_str())
+        && !parts.is_empty()
+        && parts.iter().chain([&tld]).all(|p| is_dns_label(p)))
+    .then_some(parts)
+}
+
+/// The link for a route: `https://<hostname>` for a portless hostname, else the
+/// plain loopback port.
+fn route_url(hostname: &str, port: u16) -> String {
+    if portless_labels(hostname).is_some() {
+        format!("https://{hostname}")
+    } else {
+        format!("http://localhost:{port}")
+    }
 }
 
 /// A port from a `routes.json` number: 1..=65535, never wrapped into range.
@@ -108,13 +189,6 @@ fn entry_ports(entry: &Value) -> Option<(u16, Option<u32>)> {
     ))
 }
 
-/// Whether `hostname` ends in a portless suffix (`.localhost` or `.test`).
-fn has_portless_tld(hostname: &str) -> bool {
-    hostname
-        .rsplit_once('.')
-        .is_some_and(|(_, tld)| PORTLESS_TLDS.iter().any(|t| tld.eq_ignore_ascii_case(t)))
-}
-
 /// Parses `routes.json` content, supporting both list format and key-value
 /// dictionary. An entry whose port or pid does not fit its type is dropped on
 /// its own; the entries around it are kept. `is_listening` is `false`: probing
@@ -138,14 +212,9 @@ fn parse_portless_routes_json(raw: &str) -> Vec<WorktreeRouteInfo> {
             .filter_map(|entry| {
                 let hostname = entry.get("hostname")?.as_str()?.to_string();
                 let (port, pid) = entry_ports(entry)?;
-                let url = if has_portless_tld(&hostname) {
-                    format!("https://{hostname}")
-                } else {
-                    format!("http://localhost:{port}")
-                };
+                let url = route_url(&hostname, port);
                 (!hostname.is_empty()).then(|| route(hostname, port, pid, url))
             })
-            .take(MAX_ROUTES)
             .collect(),
         // {"hostname.localhost": {"port": 4123, "pid": 123}}
         Value::Object(map) => map
@@ -157,10 +226,9 @@ fn parse_portless_routes_json(raw: &str) -> Vec<WorktreeRouteInfo> {
                     .unwrap_or(key)
                     .to_string();
                 let (port, pid) = entry_ports(entry)?;
-                let url = format!("https://{hostname}");
+                let url = route_url(&hostname, port);
                 (!hostname.is_empty()).then(|| route(hostname, port, pid, url))
             })
-            .take(MAX_ROUTES)
             .collect(),
         _ => Vec::new(),
     }
@@ -211,20 +279,12 @@ fn dns_label(name: &str) -> Option<String> {
     (!label.is_empty() && label.len() <= 63).then(|| label.to_string())
 }
 
-/// Whether a route's hostname names one of the worktree's `labels`: the
-/// hostname is a portless one (ends in `.localhost` or `.test`), has no empty
-/// label, and one of the labels before the suffix equals a worktree label
-/// exactly. A substring, a prefix or the suffix itself never matches.
+/// Whether a route's hostname names one of the worktree's `labels`: it is a
+/// portless hostname ([`portless_labels`]) and one of the labels before the
+/// suffix equals a worktree label exactly. A substring, a prefix or the suffix
+/// itself never matches.
 fn hostname_belongs_to(hostname: &str, labels: &[String]) -> bool {
-    let lowered = hostname.to_lowercase();
-    let host = lowered.strip_suffix('.').unwrap_or(&lowered);
-    let parts: Vec<&str> = host.split('.').collect();
-    let Some((tld, names)) = parts.split_last() else {
-        return false;
-    };
-    parts.iter().all(|part| !part.is_empty())
-        && PORTLESS_TLDS.contains(tld)
-        && names.iter().any(|part| labels.iter().any(|l| l == part))
+    portless_labels(hostname).is_some_and(|names| names.iter().any(|part| labels.contains(part)))
 }
 
 /// The portless routes of this machine, read, parsed and probed once.
@@ -236,6 +296,41 @@ fn hostname_belongs_to(hostname: &str, labels: &[String]) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct PortlessSnapshot {
     routes: Vec<WorktreeRouteInfo>,
+    omitted_routes: usize,
+    unprobed_ports: usize,
+}
+
+/// Probes `ports` on at most [`PROBE_FAN_OUT`] threads and stops starting new
+/// probes once `budget` has passed, so a listing waits at most the budget plus
+/// one probe however many ports there are. Returns each probed port's answer
+/// and how many ports were never probed.
+fn probe_ports(
+    ports: &[u16],
+    budget: Duration,
+    probe: impl Fn(u16) -> bool + Sync,
+) -> (HashMap<u16, bool>, usize) {
+    let deadline = Instant::now() + budget;
+    let next = AtomicUsize::new(0);
+    let answers = Mutex::new(HashMap::new());
+    std::thread::scope(|scope| {
+        for _ in 0..PROBE_FAN_OUT.min(ports.len()) {
+            scope.spawn(|| {
+                while Instant::now() < deadline {
+                    let Some(&port) = ports.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    let listening = probe(port);
+                    answers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(port, listening);
+                }
+            });
+        }
+    });
+    let answers = answers.into_inner().unwrap_or_else(|e| e.into_inner());
+    let unprobed = ports.len() - answers.len();
+    (answers, unprobed)
 }
 
 impl PortlessSnapshot {
@@ -245,16 +340,48 @@ impl PortlessSnapshot {
         Self::from_text(read_routes_text().as_deref())
     }
 
+    /// Valid routes past [`MAX_ROUTES`] that the snapshot does not hold. Zero
+    /// means the file's routes are all here.
+    pub fn omitted_routes(&self) -> usize {
+        self.omitted_routes
+    }
+
+    /// Distinct route ports the probe budget ran out before reaching; their
+    /// routes read `is_listening: false` without having been asked.
+    pub fn unprobed_ports(&self) -> usize {
+        self.unprobed_ports
+    }
+
     fn from_text(raw: Option<&str>) -> Self {
+        Self::from_text_probed(raw, PROBE_BUDGET, is_port_listening)
+    }
+
+    fn from_text_probed(
+        raw: Option<&str>,
+        budget: Duration,
+        probe: impl Fn(u16) -> bool + Sync,
+    ) -> Self {
         let mut routes = raw.map(parse_portless_routes_json).unwrap_or_default();
-        let mut probed: HashMap<u16, bool> = HashMap::new();
+        let omitted_routes = routes.len().saturating_sub(MAX_ROUTES);
+        routes.truncate(MAX_ROUTES);
+        let mut ports: Vec<u16> = routes.iter().map(|r| r.port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        let (answers, unprobed_ports) = probe_ports(&ports, budget, probe);
         for route in &mut routes {
-            let port = route.port;
-            route.is_listening = *probed
-                .entry(port)
-                .or_insert_with(|| is_port_listening(port));
+            route.is_listening = answers.get(&route.port).copied().unwrap_or(false);
         }
-        Self { routes }
+        if omitted_routes > 0 || unprobed_ports > 0 {
+            log::warn!(
+                "portless snapshot is partial: {omitted_routes} routes past the {MAX_ROUTES} \
+                 limit left out, {unprobed_ports} ports not probed within {budget:?}"
+            );
+        }
+        Self {
+            routes,
+            omitted_routes,
+            unprobed_ports,
+        }
     }
 
     /// Detects all server routes matching a worktree, prioritizing portless subdomains
@@ -655,8 +782,15 @@ mod tests {
         let got = rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
             2,
         )));
-        // Release a blocked opener so the test thread can end either way.
-        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        // Release a blocked opener so the test thread can end. Non-blocking, so
+        // with no reader parked it fails at once instead of parking us.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
         assert_eq!(got, Ok(0), "a FIFO parked the snapshot");
     }
 
@@ -772,6 +906,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn routes_json(count: usize) -> String {
+        let entries: Vec<String> = (0..count)
+            .map(|i| format!(r#""r{i}.localhost": {{"port": {}}}"#, 10_000 + i))
+            .collect();
+        format!("{{{}}}", entries.join(","))
+    }
+
+    #[test]
+    fn routes_past_the_cap_are_counted_not_silently_dropped() {
+        for (count, omitted) in [(255, 0), (256, 0), (257, 1), (300, 44)] {
+            let snapshot = PortlessSnapshot::from_text_probed(
+                Some(&routes_json(count)),
+                Duration::from_secs(5),
+                |_| false,
+            );
+            assert_eq!(snapshot.routes.len(), count.min(256), "{count} routes");
+            assert_eq!(snapshot.omitted_routes(), omitted, "{count} routes");
+            assert_eq!(snapshot.unprobed_ports(), 0);
+        }
+    }
+
+    #[test]
+    fn many_slow_probes_run_in_parallel_not_in_series() {
+        let slow = |_port: u16| {
+            std::thread::sleep(Duration::from_millis(100));
+            true
+        };
+        let started = Instant::now();
+        let snapshot = PortlessSnapshot::from_text_probed(
+            Some(&routes_json(64)),
+            Duration::from_secs(5),
+            slow,
+        );
+        let took = started.elapsed();
+        assert!(snapshot.routes.iter().all(|r| r.is_listening));
+        // Serial is 64 x 100 ms = 6.4 s; 32 at a time is two rounds.
+        let limit = crate::test_support::coverage_relaxed(Duration::from_millis(2500));
+        assert!(took < limit, "64 probes took {took:?} (limit {limit:?})");
+    }
+
+    #[test]
+    fn a_probe_budget_that_runs_out_is_reported_and_bounds_the_wait() {
+        let slow = |_port: u16| {
+            std::thread::sleep(Duration::from_millis(100));
+            true
+        };
+        let started = Instant::now();
+        let snapshot = PortlessSnapshot::from_text_probed(
+            Some(&routes_json(256)),
+            Duration::from_millis(150),
+            slow,
+        );
+        let took = started.elapsed();
+        let probed = snapshot.routes.iter().filter(|r| r.is_listening).count();
+        assert!(snapshot.unprobed_ports() > 0, "nothing was cut off");
+        assert!(probed > 0);
+        assert_eq!(probed + snapshot.unprobed_ports(), 256);
+        let limit = crate::test_support::coverage_relaxed(Duration::from_millis(3000));
+        assert!(took < limit, "256 probes took {took:?} (limit {limit:?})");
     }
 
     #[test]
