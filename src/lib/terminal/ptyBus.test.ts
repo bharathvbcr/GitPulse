@@ -104,7 +104,7 @@ function fakeTransport() {
 /** Drains the microtask queue so pending `listen()` promises settle. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-const exit = (id: string): TerminalExitEvent => ({ id, exit_code: 0, signal: "", error: null, reaped: true });
+const exit = (id: string): TerminalExitEvent => ({ id, exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
 
 describe("ptyBus routing", () => {
   it("delivers each session only its own output", () => {
@@ -664,8 +664,10 @@ it("refuses unknown reaping evidence and preserves a reported wait failure", () 
   bus.subscribe("a", { onOutput: vi.fn(), onExit, onError });
   transport.emit("terminal-exit", { ...exit("a"), reaped: undefined });
   transport.emit("terminal-exit", { ...exit("a"), reaped: false });
+  // Who ended it decides whether Resume is offered; an exit that does not say is not trusted.
+  transport.emit("terminal-exit", { ...exit("a"), ended_by_gitpulse: undefined });
   expect(onExit).not.toHaveBeenCalled();
-  expect(onError).toHaveBeenCalledTimes(2);
+  expect(onError).toHaveBeenCalledTimes(3);
   const failed = { ...exit("a"), reaped: false, exit_code: null, error: "Could not confirm process exit: wait failed" };
   transport.emit("terminal-exit", failed);
   expect(onExit).toHaveBeenCalledTimes(1);

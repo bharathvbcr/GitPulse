@@ -247,7 +247,7 @@
           button("View agent session").click(); await tick();
           check("view agent reopens existing tab without spawning", spawned.length === 2 && visible('[role="tab"][aria-selected="true"]').some(node => node.textContent.includes("Claude")));
           const claude = spawned.find(row => row.program === "claude");
-          await emitExit(claude.id, { exit_code: 0, signal: "", error: null, reaped: true }); await wait();
+          await emitExit(claude.id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false }); await wait();
           check("completed agent transcript remains reachable", !!button("View agent session") && document.body.textContent.includes("session: exited"));
           button("Repository Other").click(); await until(() => prompt().includes("Repository: /fixture/Other"));
           check("repo switch clears old prompt and feedback", !prompt().includes("/fixture/GitPulse") && !document.body.textContent.includes("Agent session opened"));

@@ -1,4 +1,5 @@
 import type { createHostedClaudeStore, createResumers } from "./hostedClaude";
+import type { TranscriptAnswer } from "./transcripts";
 
 /**
  * A process the unified log names as a signal's sender
@@ -73,23 +74,37 @@ export function parseIncident(payload: unknown): TerminalIncident | null {
 }
 
 export interface IncidentPlan {
-  /** Sessions with a recorded conversation: the backend id of the dead PTY and Claude's session id. */
+  /**
+   * Sessions whose conversation Claude Code saved: the backend id of the dead
+   * PTY and Claude's session id. The only ones Resume is offered for.
+   */
   resumable: { terminalId: string; sessionId: string }[];
-  /** Listed sessions with no recorded conversation: shells, `--continue` launches, sessions this page never hosted. */
+  /** Conversations on record whose transcript could not be checked: not offered, and said apart. */
+  unknown: number;
+  /**
+   * Listed sessions with nothing to resume: shells, `--continue` launches,
+   * sessions this page never hosted, and conversations Claude Code never saved.
+   */
   skipped: number;
 }
 
+/** Asks whether Claude Code saved each conversation (`transcripts.checkTranscripts`). */
+export type TranscriptCheck = (sessionIds: string[]) => Promise<Map<string, TranscriptAnswer>>;
+
 /**
- * Which of an incident's sessions have a Claude conversation on record.
- * Whether a tab is still there to relaunch it is asked when the offer is
- * taken, not here: the incident can arrive a moment before a tab has seen its
- * own exit. A session without a record is counted, not guessed at.
+ * Which of an incident's sessions have a conversation to resume: one on
+ * record whose transcript was found. Whether a tab is still there to relaunch
+ * it is asked when the offer is taken, not here: the incident can arrive a
+ * moment before a tab has seen its own exit. A session without a record is
+ * counted, not guessed at, and one whose transcript could not be checked is
+ * counted apart from one that has none.
  */
-export function planIncident(
+export async function planIncident(
   incident: TerminalIncident,
   store: Pick<ReturnType<typeof createHostedClaudeStore>, "byTerminal">,
-): IncidentPlan {
-  const resumable: IncidentPlan["resumable"] = [];
+  check: TranscriptCheck,
+): Promise<IncidentPlan> {
+  const recorded: IncidentPlan["resumable"] = [];
   const claimed = new Set<string>();
   let skipped = 0;
   for (const terminalId of incident.session_ids) {
@@ -99,9 +114,17 @@ export function planIncident(
       continue;
     }
     claimed.add(record.sessionId);
-    resumable.push({ terminalId, sessionId: record.sessionId });
+    recorded.push({ terminalId, sessionId: record.sessionId });
   }
-  return { resumable, skipped };
+  const answers = recorded.length === 0 ? new Map<string, TranscriptAnswer>() : await check(recorded.map((r) => r.sessionId));
+  const plan: IncidentPlan = { resumable: [], unknown: 0, skipped };
+  for (const entry of recorded) {
+    const state = answers.get(entry.sessionId)?.state ?? "unknown";
+    if (state === "found") plan.resumable.push(entry);
+    else if (state === "unknown") plan.unknown += 1;
+    else plan.skipped += 1;
+  }
+  return plan;
 }
 
 /** How an incident reaches the person. */
@@ -117,59 +140,85 @@ export function describeIncident(incident: TerminalIncident, plan: IncidentPlan)
     : incident.sender_note || "sender unknown";
   const hosted = incident.session_ids.length;
   const resumable = plan.resumable.length;
+  const unknown =
+    plan.unknown === 0
+      ? ""
+      : ` ${plan.unknown} more could not be checked for a saved conversation, so ${plan.unknown === 1 ? "it is" : "they are"} not offered.`;
   return `${hosted} terminal session${hosted === 1 ? "" : "s"} ended by ${incident.signal || "a signal"} — ${sender}. ${
     resumable === 0
-      ? "None has a Claude conversation to resume."
+      ? "None has a saved Claude conversation to resume."
       : `${resumable} Claude conversation${resumable === 1 ? "" : "s"} can be resumed.`
-  }`;
+  }${unknown}`;
+}
+
+/** What taking an incident's offer did, tab by tab. */
+export interface ResumeReport {
+  offered: number;
+  /** Relaunched: a process started. */
+  started: number;
+  /** Waiting for a free terminal slot; each starts when one frees. Not started yet. */
+  deferred: number;
+  /** Tried and failed; each tab says why. */
+  failed: number;
+  /** No tab left to relaunch in: the user closed it, or another press took it. */
+  missing: number;
 }
 
 /**
  * Turns `terminal-incident` events into one offer each.
  *
  * An event is handled once per incident id however often it arrives. The offer
- * is "Resume N" for the N listed tabs that have a recorded conversation and a
- * tab to relaunch it; taking it relaunches them one at a time, because each
- * one claims a session slot and a refused slot must not stop the others.
+ * is "Resume N" for the N listed tabs whose conversation Claude Code saved;
+ * taking it relaunches them one at a time, because each one claims a session
+ * slot and a refused slot must not stop the others. Each relaunch says what it
+ * did, and only a process that started is counted as resumed.
  */
 export function createIncidentController(options: {
   store: Pick<ReturnType<typeof createHostedClaudeStore>, "byTerminal">;
   resumers: Pick<ReturnType<typeof createResumers>, "get" | "unregister">;
+  check: TranscriptCheck;
   notify: (notice: IncidentNotice) => void;
-  /** Reports a relaunch that failed, once per tab. */
+  /** Reports a relaunch that threw, once per tab. A resumer reports its own failures; this is for one that broke. */
   fail?: (terminalId: string, cause: unknown) => void;
-  /** Reports what taking the offer did: tabs relaunched out of tabs offered. */
-  done?: (started: number, offered: number) => void;
+  /** Reports what taking the offer did. */
+  done?: (report: ResumeReport) => void;
 }) {
   const seen: string[] = [];
   const { store, resumers, notify } = options;
 
-  async function resumeAll(plan: IncidentPlan) {
-    let started = 0;
+  async function resumeAll(plan: IncidentPlan): Promise<ResumeReport> {
+    const report: ResumeReport = { offered: plan.resumable.length, started: 0, deferred: 0, failed: 0, missing: 0 };
     for (const { terminalId } of plan.resumable) {
       // Taken first: a second press, or the tab's own button, must not relaunch it twice.
       const resume = resumers.get(terminalId);
       resumers.unregister(terminalId);
-      // A tab the user closed is gone with its resumer; nothing to relaunch.
-      if (!resume) continue;
+      if (!resume) {
+        report.missing += 1;
+        continue;
+      }
       try {
-        await resume();
-        started += 1;
+        report[await resume()] += 1;
       } catch (cause) {
+        report.failed += 1;
         options.fail?.(terminalId, cause);
       }
     }
-    options.done?.(started, plan.resumable.length);
-    return started;
+    options.done?.(report);
+    return report;
   }
 
   return {
-    handle(payload: unknown): IncidentPlan | null {
+    /**
+     * Offers the incident once. Resolves with its plan, or null for a payload
+     * that is not an incident or one already offered.
+     */
+    async handle(payload: unknown): Promise<IncidentPlan | null> {
       const incident = parseIncident(payload);
       if (!incident || seen.includes(incident.id)) return null;
+      // Marked before the transcript check, so a repeat arriving meanwhile is not offered twice.
       seen.push(incident.id);
       if (seen.length > MAX_SEEN_INCIDENTS) seen.shift();
-      const plan = planIncident(incident, store);
+      const plan = await planIncident(incident, store, options.check);
       const resumable = plan.resumable.length;
       notify({
         message: describeIncident(incident, plan),
