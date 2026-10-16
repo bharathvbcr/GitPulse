@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import {
   branchLeafName,
+  checkoutNameFor,
   filterBranchSections,
   fuzzyMatch,
   groupBranches,
@@ -117,6 +118,17 @@ describe("groupBranches", () => {
     expect(filtered[0].branches).toHaveLength(0);
     expect(filtered[0].folders[0].label).toBe("feat");
     expect(filtered[0].folders[0].branches.map((b) => b.name)).toEqual(["feat/auth"]);
+  });
+});
+
+describe("checkoutNameFor", () => {
+  it("keeps a remote row's remote, so a same-named local branch of another remote is never taken for it", () => {
+    const remote = branch({ name: "upstream/feat/auth", is_remote: true, remote_name: "upstream" });
+    // localNameFor collapses upstream/feat/auth onto feat/auth, which may be a
+    // local branch tracking origin: the wrong branch, silently.
+    expect(localNameFor(remote)).toBe("feat/auth");
+    expect(checkoutNameFor(remote)).toBe("upstream/feat/auth");
+    expect(checkoutNameFor(branch({ name: "main" }))).toBe("main");
   });
 });
 
