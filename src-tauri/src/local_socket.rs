@@ -18,6 +18,7 @@
 //!   report it is not bound at all — a check that cannot run must not be
 //!   reported as a check that passed.
 
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -251,11 +252,66 @@ pub fn wait_readable_or_woken(fd: RawFd, wake: RawFd) -> Ready {
         return Ready::default();
     }
     // POLLHUP and POLLERR count: a listener that errored must be looked at by
-    // `accept`, and a closed wake pipe means nobody can ever wake us.
-    let any = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+    // `accept`, and a closed wake pipe means nobody can ever wake us. So does
+    // POLLNVAL, a descriptor closed under the waiter: reporting nothing would
+    // return at once, every time, and turn the caller's loop into a spin;
+    // `accept` on it fails and the loop ends.
+    let any = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     Ready {
         listener: descriptors[0].revents & any != 0,
         woken: descriptors[1].revents & any != 0,
+    }
+}
+
+/// The two ends of a wake pipe: how a thread blocked in
+/// [`wait_readable_or_woken`] is told to look again.
+///
+/// One owner for every accept loop that waits with no timeout. The waiter polls
+/// [`Self::reader_fd`]; whoever retires it calls [`Self::notify`].
+pub(crate) struct Wake {
+    reader: OwnedFd,
+    writer: OwnedFd,
+}
+
+impl Wake {
+    /// Fails if the pipe cannot be made. Callers must not fall back to polling
+    /// on a timeout, which is the cost this type exists to remove.
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let (reader, writer) = crate::procguard::wake_pipe()?;
+        Ok(Self { reader, writer })
+    }
+
+    /// The descriptor to hand to [`wait_readable_or_woken`].
+    pub(crate) fn reader_fd(&self) -> RawFd {
+        self.reader.as_raw_fd()
+    }
+
+    /// Makes the reader readable. Never blocks: the pipe is non-blocking, and a
+    /// full pipe already is readable.
+    pub(crate) fn notify(&self) {
+        let byte = 1u8;
+        // SAFETY: one byte from a live local to a descriptor `self` keeps
+        // open; the result is deliberately ignored (see above).
+        unsafe { libc::write(self.writer.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1) };
+    }
+
+    /// Empties the pipe so the next wait blocks again.
+    pub(crate) fn drain(&self) {
+        let mut buffer = [0u8; 64];
+        loop {
+            // SAFETY: reads into a live local buffer of the length given, from
+            // a non-blocking descriptor `self` keeps open.
+            let read = unsafe {
+                libc::read(
+                    self.reader.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if read < buffer.len() as isize {
+                return;
+            }
+        }
     }
 }
 
@@ -388,6 +444,73 @@ mod tests {
                 .ok(),
             None,
             "fixture cleaned up"
+        );
+    }
+
+    #[test]
+    fn notifying_a_full_pipe_never_blocks_and_one_drain_leaves_it_quiet() {
+        let wake = Wake::new().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..100_000 {
+            wake.notify();
+        }
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
+            "100k notifies took {:?}",
+            started.elapsed()
+        );
+        let (listener_side, _peer) = UnixStream::pair().unwrap();
+        let ready = wait_readable_or_woken(listener_side.as_raw_fd(), wake.reader_fd());
+        assert!(ready.woken && !ready.listener, "{ready:?}");
+        wake.drain();
+        // Drained to empty: a second wait must block, so give it a waker.
+        let reader = wake.reader_fd();
+        let fd = listener_side.as_raw_fd();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            (wait_readable_or_woken(fd, reader), started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        wake.notify();
+        let (ready, waited) = waiter.join().unwrap();
+        assert!(ready.woken, "{ready:?}");
+        assert!(
+            waited >= Duration::from_millis(150),
+            "a drained pipe still read as readable ({waited:?})"
+        );
+    }
+
+    /// Dropping the writer makes the reader permanently POLLHUP, so a loop that
+    /// kept polling the reader would spin. This pins what the wait reports, and
+    /// why `Wake` must keep both ends alive for as long as anyone polls it.
+    #[test]
+    fn a_writer_dropped_under_a_poller_reads_as_woken_forever() {
+        let Wake { reader, writer } = Wake::new().unwrap();
+        drop(writer);
+        let (listener_side, _peer) = UnixStream::pair().unwrap();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let ready = wait_readable_or_woken(listener_side.as_raw_fd(), reader.as_raw_fd());
+            assert!(ready.woken, "{ready:?}");
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(Duration::from_millis(100))
+            );
+        }
+    }
+
+    /// POLLNVAL (a descriptor closed under the waiter) must be reported as
+    /// something to look at; an empty answer makes every caller's loop spin.
+    #[test]
+    fn a_closed_listener_descriptor_is_reported_not_swallowed() {
+        let wake = Wake::new().unwrap();
+        // A descriptor number no thread has open: a number closed a moment ago
+        // can be handed to another test's socket, and the wait would block on it.
+        let fd: RawFd = 900_000;
+        let ready = wait_readable_or_woken(fd, wake.reader_fd());
+        assert!(
+            ready.listener,
+            "POLLNVAL on the listener was swallowed: {ready:?}"
         );
     }
 }

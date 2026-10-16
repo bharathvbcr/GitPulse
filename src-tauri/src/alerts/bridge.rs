@@ -34,7 +34,11 @@
 //! gap rather than a silently missing feature.
 
 use super::{Notice, Origin};
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 /// The file name inside GitPulse's config directory.
@@ -56,16 +60,6 @@ pub const MAX_REPORT_BYTES: usize = 8 * 1024;
 #[cfg(unix)]
 const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long the accept loop waits for a connection before re-checking whether
-/// it has been retired.
-///
-/// This is a *ceiling on shutdown*, not a polling interval: the loop waits in
-/// `poll`, so a connection is accepted the moment it arrives. An earlier
-/// version slept for this long between `accept` attempts, which cost every
-/// single hook report up to 200 ms and made a burst of them take minutes.
-#[cfg(unix)]
-const ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
-
 #[derive(Debug, Clone, Default)]
 pub struct BridgeStatus {
     pub listening: bool,
@@ -80,6 +74,23 @@ struct State {
     generation: AtomicU64,
     path: Mutex<Option<String>>,
     error: Mutex<Option<String>>,
+    /// Held for the whole of `start` and of `stop`. Without it a `stop` that
+    /// lands between `start`'s generation bump and its `listening` store leaves
+    /// the flag set and a socket file behind with no loop to serve it, and a
+    /// retired loop no longer repairs that (it clears `listening` only while
+    /// current).
+    control: Mutex<()>,
+    /// The current accept loop's wake pipe. Written by whoever retires the
+    /// loop, so a loop that waits with no timeout still looks at `generation`.
+    #[cfg(unix)]
+    wake: Mutex<Option<Arc<crate::local_socket::Wake>>>,
+    /// Times an accept loop has come out of its wait, for whatever reason. An
+    /// idle bridge should not move this.
+    #[cfg(unix)]
+    accept_wakes: AtomicU64,
+    /// Accept loops that have started and not yet finished their exit work.
+    #[cfg(unix)]
+    live_loops: AtomicUsize,
 }
 
 fn state() -> &'static State {
@@ -89,6 +100,13 @@ fn state() -> &'static State {
         generation: AtomicU64::new(0),
         path: Mutex::new(None),
         error: Mutex::new(None),
+        control: Mutex::new(()),
+        #[cfg(unix)]
+        wake: Mutex::new(None),
+        #[cfg(unix)]
+        accept_wakes: AtomicU64::new(0),
+        #[cfg(unix)]
+        live_loops: AtomicUsize::new(0),
     })
 }
 
@@ -133,7 +151,18 @@ pub(crate) fn apply_at(enabled: bool, path: Option<std::path::PathBuf>) {
 
 fn stop() {
     let state = state();
+    let _control = state
+        .control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stop_locked(state);
+}
+
+/// `stop` for a caller already holding `State::control`.
+fn stop_locked(state: &State) {
     state.generation.fetch_add(1, Ordering::SeqCst);
+    #[cfg(unix)]
+    wake_retired_loop(state);
     state.listening.store(false, Ordering::SeqCst);
     // Remove the path we actually bound, which is not always the one
     // `socket_path` names today: a test binds elsewhere, and a configuration
@@ -148,6 +177,17 @@ fn stop() {
     let _ = bound;
 }
 
+/// Tells the loop a generation bump just retired to look at it. Called after
+/// the bump, so the loop that wakes sees a generation that is no longer its
+/// own; a byte written before it starts waiting is still there when it does.
+#[cfg(unix)]
+fn wake_retired_loop(state: &State) {
+    let wake = state.wake.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(wake) = wake {
+        wake.notify();
+    }
+}
+
 #[cfg(not(unix))]
 fn start(_path: Option<std::path::PathBuf>) {
     state().listening.store(false, Ordering::SeqCst);
@@ -159,10 +199,28 @@ fn start(_path: Option<std::path::PathBuf>) {
 #[cfg(unix)]
 fn start(path: Option<std::path::PathBuf>) {
     let state = state();
+    let _control = state
+        .control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if state.listening.load(Ordering::SeqCst) {
         return;
     }
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    wake_retired_loop(state);
+    // Before the socket, so a listener is never bound that cannot be told to
+    // stop. There is no polling fallback: the cost of one would be paid by
+    // every idle second of the app, so a failure is shown instead.
+    let wake = match crate::local_socket::Wake::new() {
+        Ok(wake) => Arc::new(wake),
+        Err(error) => {
+            state.listening.store(false, Ordering::SeqCst);
+            set_error(Some(format!(
+                "Hook bridge could not create its wake pipe: {error}"
+            )));
+            return;
+        }
+    };
     let listener = match bind(path) {
         Ok((listener, path)) => {
             if let Ok(mut slot) = state.path.lock() {
@@ -178,14 +236,17 @@ fn start(path: Option<std::path::PathBuf>) {
         }
     };
     state.listening.store(true, Ordering::SeqCst);
+    if let Ok(mut slot) = state.wake.lock() {
+        *slot = Some(wake.clone());
+    }
     let spawned =
         crate::supervisor::spawn_once("gitpulse-alert-bridge", "alert bridge", move || {
-            accept_loop(listener, generation)
+            accept_loop(listener, generation, &wake)
         });
     if let Err(error) = spawned {
         state.listening.store(false, Ordering::SeqCst);
+        stop_locked(state);
         set_error(Some(format!("Hook bridge could not start: {error}")));
-        stop();
     }
 }
 
@@ -200,16 +261,37 @@ fn bind(
 }
 
 #[cfg(unix)]
-fn accept_loop(listener: std::os::unix::net::UnixListener, generation: u64) {
+fn accept_loop(
+    listener: std::os::unix::net::UnixListener,
+    generation: u64,
+    wake: &crate::local_socket::Wake,
+) {
     use std::os::unix::io::AsRawFd;
+    /// Counts the loop out only after its exit work, the unlink included.
+    struct Running(&'static State);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0.live_loops.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     let state = state();
+    state.live_loops.fetch_add(1, Ordering::SeqCst);
+    let _running = Running(state);
     // SAFETY: `getuid` reads this process's real user id and cannot fail.
     let own = unsafe { libc::getuid() };
     loop {
         if state.generation.load(Ordering::SeqCst) != generation {
             break;
         }
-        if !crate::local_socket::wait_readable(listener.as_raw_fd(), ACCEPT_WAIT) {
+        // No timeout: nothing here needs to run unless a connection arrives or
+        // `stop`/`start` retires this generation and writes to the wake pipe.
+        let ready =
+            crate::local_socket::wait_readable_or_woken(listener.as_raw_fd(), wake.reader_fd());
+        state.accept_wakes.fetch_add(1, Ordering::Relaxed);
+        if ready.woken {
+            wake.drain();
+        }
+        if !ready.listener {
             continue;
         }
         // The accepted descriptor is made close-on-exec only after `accept`
@@ -229,22 +311,30 @@ fn accept_loop(listener: std::os::unix::net::UnixListener, generation: u64) {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => {
-                set_error(Some(format!("Hook bridge stopped accepting: {error}")));
+                if state.generation.load(Ordering::SeqCst) == generation {
+                    set_error(Some(format!("Hook bridge stopped accepting: {error}")));
+                }
                 break;
             }
         }
     }
-    state
-        .listening
-        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-        .ok();
+    // Only if this loop is still the current one. `listening` and the error
+    // now belong to the successor of a loop a restart retired, and a loop that
+    // exits promptly would otherwise switch the new listener off.
+    let current = state.generation.load(Ordering::SeqCst) == generation;
+    if current {
+        state
+            .listening
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .ok();
+    }
     let bound = listener
         .local_addr()
         .ok()
         .and_then(|addr| addr.as_pathname().map(std::path::Path::to_path_buf));
     drop(listener);
-    // Only if this loop is still the current one: a loop retired by a restart
-    // must not delete the socket its successor has already bound.
+    // A loop retired by a restart must not delete the socket its successor has
+    // already bound.
     if state.generation.load(Ordering::SeqCst) == generation {
         if let Some(path) = bound {
             let _ = std::fs::remove_file(path);
@@ -872,11 +962,253 @@ mod tests {
         apply_at(false, None);
     }
 
+    /// Polls `ready` every few milliseconds until it holds or `within` passes.
+    #[cfg(unix)]
+    fn within(within: std::time::Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        ready()
+    }
+
+    #[cfg(unix)]
+    fn live_loops() -> usize {
+        state().live_loops.load(Ordering::SeqCst)
+    }
+
+    /// The accept loop used to wake five times a second for as long as the
+    /// bridge was on, only to find out whether it had been retired.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_accept_loop_does_not_wake() {
+        let _own = own_listener();
+        let dir = ShortDir::new("idle");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
+        // One for an interrupted wait is tolerated; the old loop took ten.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let before = state().accept_wakes.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let woke = state().accept_wakes.load(Ordering::Relaxed) - before;
+        assert!(woke <= 1, "the idle accept loop woke {woke} times in 2 s");
+        // And it is still listening: not waking is not the same as not working.
+        assert_eq!(
+            send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim(),
+            r#"{"ok":true}"#
+        );
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
+    /// The wait has no timeout, so retiring the loop has to wake it.
+    #[cfg(unix)]
+    #[test]
+    fn stop_ends_a_blocked_accept_loop_promptly() {
+        let _own = own_listener();
+        let dir = ShortDir::new("stop");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
+        // Let it reach its wait.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let stopped = std::time::Instant::now();
+        apply_at(false, None);
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_millis(100)),
+                || live_loops() == 0
+            ),
+            "the accept loop was still running {:?} after stop",
+            stopped.elapsed()
+        );
+        assert!(!dir.socket().exists());
+    }
+
+    /// A loop retired by a restart finishes after its successor has bound the
+    /// same path. It must exit, and must not unlink what is no longer its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_retires_the_old_loop_without_unlinking_the_new_socket() {
+        let _own = own_listener();
+        let dir = ShortDir::new("race");
+        for _ in 0..20 {
+            apply_at(true, Some(dir.socket()));
+            apply_at(false, None);
+            apply_at(true, Some(dir.socket()));
+            assert!(status().listening, "{:?}", status().error);
+            // The old loop is gone and only the successor remains.
+            assert!(
+                within(std::time::Duration::from_secs(5), || live_loops() == 1),
+                "{} accept loops running",
+                live_loops()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(dir.socket().exists(), "the successor's socket was unlinked");
+            assert_eq!(
+                send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim(),
+                r#"{"ok":true}"#
+            );
+            apply_at(false, None);
+            assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+        }
+    }
+
+    /// Open descriptors of this process, by listing the kernel's table.
+    #[cfg(unix)]
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// Two threads flip the bridge at once. Whatever order they land in, once
+    /// both are done the published state must describe one real thing: either
+    /// not listening with no socket file and no loop, or listening with exactly
+    /// one loop that answers on the socket.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_apply_leaves_listening_and_the_socket_in_agreement() {
+        let _own = own_listener();
+        let dir = ShortDir::new("conc");
+        let mut disagreements = Vec::new();
+        for round in 0..300 {
+            let path = dir.socket();
+            let a = {
+                let path = path.clone();
+                std::thread::spawn(move || apply_at(true, Some(path)))
+            };
+            let b = std::thread::spawn(|| apply_at(false, None));
+            a.join().unwrap();
+            b.join().unwrap();
+            // Let any retired loop finish its exit work.
+            let listening = status().listening;
+            // A loop counts itself in only once its thread is running.
+            let settled = within(std::time::Duration::from_secs(5), || {
+                if listening {
+                    live_loops() == 1
+                } else {
+                    live_loops() == 0
+                }
+            });
+            let exists = path.exists();
+            let loops = live_loops();
+            let answers = listening
+                && exists
+                && std::os::unix::net::UnixStream::connect(&path).is_ok_and(|mut stream| {
+                    use std::io::{Read, Write};
+                    let _ = stream.write_all(br#"{"v":1,"event":"error","agent":"codex"}"#);
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let mut reply = String::new();
+                    let _ = stream.read_to_string(&mut reply);
+                    reply.trim() == r#"{"ok":true}"#
+                });
+            let consistent = settled
+                && if listening {
+                    answers
+                } else {
+                    // A retired loop's thread may count itself in after the
+                    // check above, so only the file is judged here; the end of
+                    // the round waits for the count to reach zero.
+                    !exists
+                };
+            if !consistent {
+                disagreements.push(format!(
+                    "round {round}: listening={listening} socket_exists={exists} loops={loops} answers={answers}"
+                ));
+            }
+            apply_at(false, None);
+            assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+            let _ = std::fs::remove_file(&path);
+        }
+        assert!(
+            disagreements.is_empty(),
+            "{} of 300 rounds disagreed, first: {:?}",
+            disagreements.len(),
+            disagreements.first()
+        );
+    }
+
+    /// 1000 start/stop cycles must not leak descriptors (the wake pipe, the
+    /// listener) and must leave no loop behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_thousand_start_stop_cycles_leak_no_descriptors_and_no_loops() {
+        let _own = own_listener();
+        let dir = ShortDir::new("leak");
+        apply_at(true, Some(dir.socket()));
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+        let before = open_fds();
+        for _ in 0..1000 {
+            apply_at(true, Some(dir.socket()));
+            apply_at(false, None);
+        }
+        assert!(within(std::time::Duration::from_secs(10), || live_loops() == 0));
+        let after = open_fds();
+        assert!(
+            // A leak would be three descriptors per cycle, 3000 in all; slack
+            // covers descriptors parallel tests open and close meanwhile.
+            after <= before + 200,
+            "descriptors grew from {before} to {after} over 1000 cycles"
+        );
+    }
+
+    /// A loop retired while it is inside `handle` (a slow client) must still
+    /// exit once the connection is done, even though the wake byte was written
+    /// while it was not waiting.
+    #[cfg(unix)]
+    #[test]
+    fn a_loop_retired_inside_a_slow_connection_exits_when_it_returns() {
+        use std::io::Write;
+        let _own = own_listener();
+        let dir = ShortDir::new("slow");
+        apply_at(true, Some(dir.socket()));
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
+        let mut client = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
+        client.write_all(b"{").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        apply_at(false, None);
+        // The loop is stuck in `handle` until the ceiling; it must then leave.
+        assert!(
+            within(
+                CONNECTION_TIMEOUT + std::time::Duration::from_secs(5),
+                || { live_loops() == 0 }
+            ),
+            "the retired loop never exited after its connection ended"
+        );
+        drop(client);
+    }
+
+    /// Unlinking the socket file behind a running loop must not make it spin.
+    #[cfg(unix)]
+    #[test]
+    fn an_externally_unlinked_socket_does_not_make_the_loop_spin() {
+        let _own = own_listener();
+        let dir = ShortDir::new("unlink");
+        apply_at(true, Some(dir.socket()));
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::remove_file(dir.socket()).unwrap();
+        let before = state().accept_wakes.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let woke = state().accept_wakes.load(Ordering::Relaxed) - before;
+        assert!(
+            woke <= 1,
+            "the loop woke {woke} times in 1 s after an unlink"
+        );
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
     /// `CONNECTION_TIMEOUT` is documented as a wall-clock ceiling on one
     /// connection, and the accept loop serves connections one at a time. A
     /// peer that keeps a byte in flight inside every read timeout never trips
     /// a per-read timeout, so it held the loop — and every other agent's
     /// notification behind it — for up to `MAX_REPORT_BYTES` timeouts.
+    #[cfg(unix)]
     #[test]
     fn a_peer_dripping_bytes_cannot_hold_the_connection_past_its_ceiling() {
         use std::io::Write;

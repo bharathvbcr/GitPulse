@@ -816,7 +816,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
-| `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
+| `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
 | `graph_spawns` | `cmd_get_commit_graph` at the default 5,000-row cap on 6,000 commits; `cmd_get_stack_hierarchy` with 20 branches beyond its 2,000-commit window, cold and with refs unmoved; each with git processes | ft-9cfa4f74 (S4-03, S4-04) |
@@ -910,6 +910,34 @@ Other benches:
   315.4/s with 32. That is still about 9.8 wake-ups per second for each idle
   session, the reader's poll. Card 12, the kqueue reader, is what brings it
   down; it landed after this baseline, which has not been re-measured.
+  - **2026-10-15 re-measure with the pollers (`0f0e0b4b`, bench rows added on
+    unmodified production code; ft-79394019, Wave 0).** Three runs of N = 3
+    windows of 5 s, `ri_interrupt_wkups`, `ri_pkg_idle_wkups` 0 throughout. The
+    figure is each run's median of its 3 windows; the harness does not keep
+    per-window values, so "min" below is the min of the three runs' medians.
+    The host was loaded throughout (load average 38.3 / 21-86 / 67-86 on 18
+    cpus, thermal `fair`, pressure `normal`), so absolute wakeups are an upper
+    bound on a quiet machine; the floor and the rows moved together.
+
+    | row | run 1 | run 2 | run 3 | min | over the floor |
+    | --- | --- | --- | --- | --- | --- |
+    | idle 0 sessions (process floor) | 2.40 | 2.40 | 2.40 | 2.40/s | n/a |
+    | idle 1 / 8 / 32 sessions | 2.20 | 2.20 | 2.20 | 2.20/s | none (kqueue reader) |
+    | idle mailbox | 2.20 | 2.00 | 2.20 | 2.00/s | none |
+    | idle 8 / 24 watches | 2.20 / 2.40 | 2.20 / 2.20 | 2.20 / 2.40 | 2.20/s | none |
+    | **idle alerts bridge** | 6.99 | 7.00 | 7.19 | **6.99/s** | about +4.6/s, the 200 ms `wait_readable` accept loop (5/s) |
+    | idle alerts bridge, after the self-pipe accept loop (`pf/79394019-bridge`) | 2.20 | 2.20 | 2.20 | **2.20/s** | none: the accept loop blocks in `wait_readable_or_woken` and is woken only by a connection or by `stop`/`start`; 6.99/s before. Measured at load average 56.8 / 78.1 / 23.7 on 18 cpus, with the floor at 2.40 and the idle mailbox at 2.20/2.20/2.20 in the same runs |
+    | **idle host-load sampler** | 2.80 | 2.80 | 2.80 | **2.80/s** | about +0.4/s, the 2 s tick |
+    | workbench `external_changes` | not measured | | | | no entry point from a bench (see below) |
+
+    The bridge row binds the listener under a throwaway `HOME` with no
+    clients; the sampler row is `sysload::start` with `SamplerOptions::new`
+    (`host_load` enabled, 2 s cadence, a full process scan per tick) after
+    its first tick has settled. The sampler's 2 s scan adds only about one
+    wakeup per tick; the CPU it costs is not what this bench counts. The
+    external_changes watcher (1 s visible, 2 s hidden) has no row: the module
+    is `pub(crate)` and `run` needs a Tauri `AppHandle` with a real `main`
+    window, so a bench cannot start it, and a seam would be production code.
 
 ### Pre-fix baseline (`a92e40fb`, loaded host), superseded
 

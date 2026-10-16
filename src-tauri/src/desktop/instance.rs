@@ -31,7 +31,6 @@
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -41,6 +40,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::local_socket::Wake;
 
 pub const LOCK_FILE: &str = "instance.lock";
 pub const SOCKET_FILE: &str = "instance.sock";
@@ -611,46 +612,6 @@ pub struct Primary {
     wake: Option<Arc<Wake>>,
 }
 
-/// The two ends of the accept thread's wake pipe.
-struct Wake {
-    reader: OwnedFd,
-    writer: OwnedFd,
-}
-
-impl Wake {
-    fn new() -> std::io::Result<Self> {
-        let (reader, writer) = crate::procguard::wake_pipe()?;
-        Ok(Self { reader, writer })
-    }
-
-    /// Makes the reader readable. A full pipe already is.
-    fn notify(&self) {
-        let byte = 1u8;
-        // SAFETY: one byte from a live local to a descriptor `self` keeps
-        // open; the result is deliberately ignored (see above).
-        unsafe { libc::write(self.writer.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1) };
-    }
-
-    /// Empties the pipe so the next wait blocks again.
-    fn drain(&self) {
-        let mut buffer = [0u8; 64];
-        loop {
-            // SAFETY: reads into a live local buffer of the length given, from
-            // a non-blocking descriptor `self` keeps open.
-            let read = unsafe {
-                libc::read(
-                    self.reader.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if read < buffer.len() as isize {
-                return;
-            }
-        }
-    }
-}
-
 impl Primary {
     fn start(mut lock: File, paths: Paths) -> Self {
         // For the log of a launch that could not reach us, and nothing else.
@@ -890,10 +851,8 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, wake: &Wake) {
     while !shared.closing.load(Ordering::Acquire) {
         // No timeout: nothing here needs to run unless a connection arrives or
         // `Primary::shutdown` writes to the wake pipe.
-        let ready = crate::local_socket::wait_readable_or_woken(
-            listener.as_raw_fd(),
-            wake.reader.as_raw_fd(),
-        );
+        let ready =
+            crate::local_socket::wait_readable_or_woken(listener.as_raw_fd(), wake.reader_fd());
         shared.accept_wakes.fetch_add(1, Ordering::Relaxed);
         if ready.woken {
             wake.drain();
