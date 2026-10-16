@@ -217,7 +217,9 @@ pub struct BlameLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffPayload {
     pub text: String,
-    /// True when the text is a prefix of the real diff, for any reason.
+    /// True when the text is a prefix of the real diff, for any reason, or when
+    /// a one-file commit diff could not pair every rename because the rename
+    /// list it read was cut (`truncation_reason` says which).
     pub truncated: bool,
     /// Which reason, as a clause the viewer can render after naming its
     /// subject; `None` when the diff is whole. Carried rather than assumed:
@@ -1532,14 +1534,15 @@ impl GitReader {
         Ok(Self::note_pairing_list_cut(paired, list_cut))
     }
 
-    /// `payload` marked cut when the rename list it was paired from was: the
-    /// text is not a prefix, but it may show a rename as an addition, and a
-    /// view that may be wrong must not read as a whole one.
+    /// `payload` marked incomplete when the rename list it was paired from was
+    /// cut: the text is not a prefix, but it may show a rename as an addition,
+    /// and a view that may be wrong must not read as a whole one. The reason is
+    /// a clause the viewer renders after "This diff".
     fn note_pairing_list_cut(mut payload: DiffPayload, list_cut: Option<String>) -> DiffPayload {
         if let Some(reason) = list_cut {
             payload.truncated = true;
             payload.truncation_reason.get_or_insert(format!(
-                "its rename and copy list {reason}, so a rename past that point shows as an addition"
+                "may show a renamed file as added: the commit's list of renames and copies {reason}"
             ));
         }
         payload
@@ -12953,6 +12956,48 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             adv_agreement_problems(path, &octo),
             Vec::<String>::new(),
             "octopus"
+        );
+    }
+
+    /// The viewer prints "This diff " before the reason, so a cut rename list
+    /// must read as a sentence there, and must not replace a reason the read
+    /// itself already gave.
+    #[test]
+    fn a_cut_rename_list_reason_reads_after_this_diff() {
+        let whole = DiffPayload {
+            text: "diff --git a/x b/x\n".to_string(),
+            truncated: false,
+            truncation_reason: None,
+        };
+        let marked = GitReader::note_pairing_list_cut(
+            whole.clone(),
+            Some(git_cli::Incomplete::OverCap(4 * 1024 * 1024).describe()),
+        );
+        assert!(marked.truncated);
+        let reason = marked.truncation_reason.unwrap();
+        assert!(
+            reason.starts_with("may show a renamed file as added: "),
+            "This diff {reason}"
+        );
+        assert_eq!(marked.text, whole.text, "the text is untouched");
+        let already = DiffPayload {
+            truncated: true,
+            truncation_reason: Some("could not be read to the end (eof)".to_string()),
+            ..whole.clone()
+        };
+        let kept = GitReader::note_pairing_list_cut(already, Some("x".to_string()));
+        assert_eq!(
+            kept.truncation_reason.as_deref(),
+            Some("could not be read to the end (eof)")
+        );
+        let untouched = GitReader::note_pairing_list_cut(whole.clone(), None);
+        assert_eq!(
+            (
+                untouched.text,
+                untouched.truncated,
+                untouched.truncation_reason
+            ),
+            (whole.text, false, None)
         );
     }
 
