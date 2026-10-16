@@ -944,6 +944,40 @@ pub(crate) fn test_serial() -> SidecarTestGuard {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Set on a worker thread whose spawner holds [`test_serial`] and is
+    /// blocked until the worker finishes.
+    static SERIAL_LENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread currently holds [`test_serial`].
+#[cfg(test)]
+pub(crate) fn test_serial_held_here() -> bool {
+    matches!(*slot_test_owner(), Some((thread, _)) if thread == std::thread::current().id())
+}
+
+/// Marks the calling (worker) thread as acting for a spawner that holds
+/// [`test_serial`] and waits for it: [`call_policy`] then does not take the
+/// serial again, which on another thread would block on the spawner forever.
+/// `held` is the spawner's [`test_serial_held_here`]; a spawner that holds
+/// nothing lends nothing, and its workers serialize at the lock as any test
+/// thread does.
+#[cfg(test)]
+pub(crate) fn lend_test_serial(held: bool) -> LentSerial {
+    LentSerial(SERIAL_LENT.with(|lent| lent.replace(held)))
+}
+
+#[cfg(test)]
+pub(crate) struct LentSerial(bool);
+
+#[cfg(test)]
+impl Drop for LentSerial {
+    fn drop(&mut self) {
+        SERIAL_LENT.with(|lent| lent.set(self.0));
+    }
+}
+
+#[cfg(test)]
 impl Drop for SidecarTestGuard {
     fn drop(&mut self) {
         let mut owner = slot_test_owner();
@@ -1801,7 +1835,7 @@ pub fn call_policy<T: serde::de::DeserializeOwned>(
     // Reentrant, so a test holding the guard across install-then-request does
     // not block against itself.
     #[cfg(test)]
-    let _serial = test_serial();
+    let _serial = (!SERIAL_LENT.with(std::cell::Cell::get)).then(test_serial);
     let params = serde_json::to_value(params)
         .map_err(|e| HarnessError::Protocol(format!("could not encode {} params: {}", op, e)))?;
     // A sidecar already inside its respawn backoff did not fault on this call:
@@ -1815,7 +1849,12 @@ pub fn call_policy<T: serde::de::DeserializeOwned>(
             // The first fault already dropped the child and armed the respawn
             // backoff inside [`call`]; clear it so the retry is allowed to
             // spawn at all, then let the second attempt decide the outcome.
-            reset();
+            // Only the backoff is cleared: `reset` also kills whichever child
+            // is live, and with several verdicts in flight that child is one
+            // the other callers are still waiting on (or one a peer has just
+            // respawned). A fault that warranted dropping the child already
+            // dropped it, in `record_fault`.
+            clear_respawn_backoff();
             call_typed::<T>(op, Some(params), timeout)
         }
         Err(e) => Err(e),
@@ -1879,6 +1918,13 @@ fn in_respawn_backoff() -> bool {
                 .backoff_until
                 .is_some_and(|until| Instant::now() < until)
     })
+}
+
+/// Forgets the shared slot's respawn backoff without touching its child.
+fn clear_respawn_backoff() {
+    let mut guard = slot().lock().unwrap_or_else(recover_slot);
+    guard.last_error = None;
+    guard.backoff_until = None;
 }
 
 /// Forgets the backoff so the next call retries immediately. The UI's

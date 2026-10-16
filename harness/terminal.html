@@ -66,7 +66,7 @@
               // the id returns, which is the only moment the bus can lose them.
               return (async () => {
                 for (let i = 0; i < 129; i++) pushOutput(id, "A");
-                await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true });
+                await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
                 showReport();
                 return { id, cwd: args.repoPath, shell: "/bin/zsh" };
               })();

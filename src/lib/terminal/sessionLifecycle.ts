@@ -9,6 +9,13 @@ import type { LauncherKind } from "./tabs";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
+/**
+ * What the latest start did: a process is `started`; `deferred` when every
+ * slot was taken and the tab took the refusal back to retry later; `failed`
+ * otherwise, with the reason shown in the tab.
+ */
+export type LaunchOutcome = "started" | "deferred" | "failed";
+
 export interface SessionTransport {
   spawn(): Promise<TerminalSpawned>;
   write(id: string, data: string, binary: boolean): Promise<void>;
@@ -43,6 +50,13 @@ export interface SessionHooks {
   skipped?(): void;
   /** This tab now holds a session slot; called once per slot taken. */
   admitted?(): void;
+  /**
+   * A close GitPulse made (the user's Close, a restart, an idle shell's view
+   * going away) was acknowledged: the process is gone. Called even when the
+   * view is already gone, because what the process left behind is not the
+   * view's. The exit event of the same close may arrive first, or never.
+   */
+  closed?(): void;
   /**
    * Every session slot was taken when this tab asked for one. Return true to
    * take the refusal back — the tab will be retried later, so nothing is
@@ -95,7 +109,7 @@ export function createSessionLifecycle(options: {
   let id: string | null = null;
   let disposed = false;
   let starting: Promise<void> | null = null;
-  let restarting: Promise<void> | null = null;
+  let restarting: Promise<LaunchOutcome> | null = null;
   let closing: Promise<void> | null = null;
   let subscription: (() => void) | null = null;
   let slot: ReturnType<typeof registry.reserve> | null = null;
@@ -105,6 +119,8 @@ export function createSessionLifecycle(options: {
   /** A resize failure was already reported and none has succeeded since. */
   let resizeWarned = false;
   let attemptEnded = false;
+  /** What the latest launch did; what `restart` resolves with. */
+  let lastLaunch: LaunchOutcome = "failed";
   /** Banner text already shown. A later clean exit must not drop it. */
   let shownError: string | null = null;
   /**
@@ -160,6 +176,7 @@ export function createSessionLifecycle(options: {
       if (id === target) {
         attemptEnded = true;
         release();
+        hooks.closed?.();
         // Kill can finish without a terminal-exit event. A bare "exited"
         // would replace the loss the reader already saw.
         if (!disposed) {
@@ -224,6 +241,7 @@ export function createSessionLifecycle(options: {
     slot?.update("Still running — its tab was closed");
   }
   async function launch(reconnect: boolean) {
+    lastLaunch = "failed";
     if (disposed || (id && !reconnect)) return;
     let ready: (() => void) | null = null;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
@@ -244,7 +262,10 @@ export function createSessionLifecycle(options: {
           // Every slot is taken. A caller that can wait for one takes the
           // refusal back (nothing started, nothing to report); anyone else
           // sees it as this tab's error, as before.
-          if (error instanceof SessionCapacityError && hooks.refused?.(error.message)) return;
+          if (error instanceof SessionCapacityError && hooks.refused?.(error.message)) {
+            lastLaunch = "deferred";
+            return;
+          }
           throw error;
         }
         hooks.admitted?.();
@@ -291,6 +312,7 @@ export function createSessionLifecycle(options: {
           hooks.started(spawned);
         } else if (lossNotice) state("error", lossNotice);
       }
+      lastLaunch = "started";
       subscription = bus.subscribe(spawned.id, {
         // Dispose must not swallow output. Rust already reserved these bytes,
         // and kill has not stopped the reader yet — dropping the chunk here
@@ -379,16 +401,26 @@ export function createSessionLifecycle(options: {
   }
   return {
     start,
-    restart(): Promise<void> {
+    /**
+     * Ends the current process (if any) and starts a new one. Never rejects:
+     * resolves with what the start did, so a caller counting relaunches counts
+     * only real ones.
+     */
+    restart(): Promise<LaunchOutcome> {
       if (restarting) return restarting;
-      restarting = (async () => {
+      restarting = (async (): Promise<LaunchOutcome> => {
         if (starting) await starting;
-        if (disposed) return;
-        if (options.singleAttempt) { await start(true); return; }
+        if (disposed) return "failed";
+        lastLaunch = "failed";
+        if (options.singleAttempt) { await start(true); return lastLaunch; }
         await closeCurrent();
         await terminalDeadline(Promise.resolve(hooks.reset()), RENDERER_DRAIN_MS, "Draining terminal renderer", { clock: options.clock, pauseWhileHidden: true });
         await start();
-      })().catch((error: unknown) => state("error", String(error))).finally(() => { restarting = null; });
+        return lastLaunch;
+      })().catch((error: unknown): LaunchOutcome => {
+        state("error", String(error));
+        return "failed";
+      }).finally(() => { restarting = null; });
       return restarting;
     },
     write: (data: string, binary = false) => input?.write(data, binary) ?? false,

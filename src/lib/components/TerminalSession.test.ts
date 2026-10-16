@@ -55,6 +55,31 @@ describe("TerminalSession refit guard", () => {
   });
 });
 
+describe("TerminalSession hosted conversation records", () => {
+  // S2-02: a view going away while its agent runs is not an end; the record
+  // goes only once the process has ended.
+  it("keeps a running agent's record when the view unmounts", () => {
+    expect(source).toContain("if (hostedId && !hostedLive) hostedClaude.forget(hostedId);");
+    expect(source).not.toMatch(/\n\s*if \(hostedId\) hostedClaude\.forget\(hostedId\);/);
+  });
+
+  // S2-02/S2-08: every end goes through the one decision, the exit and the
+  // acknowledged Close alike.
+  it("settles every end through settleConversation", () => {
+    const exit = source.slice(source.indexOf("exit(event) {"), source.indexOf("reset() {"));
+    expect(exit).toContain("settleHosted(event, event.id);");
+    expect(exit).toContain('closed() { settleHosted("closed", null); }');
+    expect(source).toContain("settleConversation(hostedClaude, conversation, end)");
+  });
+
+  // S2-01: the conversation is decided after the attach branch is known.
+  it("decides a start's conversation in conversationForStart, never minting one for an attach", () => {
+    expect(source).toContain("conversationForStart(hostedClaude, {");
+    expect(source).toContain("attach: attachTo, resumeId, args: cfg.args,");
+    expect(source).not.toContain("withSessionId(");
+  });
+});
+
 describe("TerminalSession PTY contracts", () => {
   it("invokes every PTY session endpoint", () => {
     expect(source).toContain('"cmd_terminal_spawn"');

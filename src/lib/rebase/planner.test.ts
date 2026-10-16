@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { seedRebasePlan, shouldReseed, shouldSeed } from "./planner";
+import { rebasePlanProblem, seedRebasePlan, shouldReseed, shouldSeed, type PlannerAction } from "./planner";
+import planCases from "./planCases.json";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
 
 function row(id: string): VisualCommitRow {
@@ -19,6 +20,34 @@ function row(id: string): VisualCommitRow {
     is_root: false,
   };
 }
+
+describe("rebasePlanProblem against the table the backend and real git are also held to", () => {
+  it.each(planCases)("$plan", ({ plan, accepted }) => {
+    const items = plan.map((action, index) => ({ id: `c${index}00000000`, action: action as PlannerAction }));
+    expect(rebasePlanProblem(items) === null).toBe(accepted);
+  });
+});
+
+describe("rebasePlanProblem", () => {
+  const plan = (...actions: Array<"Pick" | "Squash" | "Fixup" | "Drop" | "Reword">) =>
+    actions.map((action, index) => ({ id: `c${index}00000000`, action }));
+
+  it("refuses a squash or fixup with only drops (or nothing) before it", () => {
+    expect(rebasePlanProblem(plan("Squash"))).toMatch(/squash/);
+    expect(rebasePlanProblem(plan("Drop", "Squash"))).toMatch(/squash/);
+    expect(rebasePlanProblem(plan("Drop", "Fixup"))).toMatch(/fixup/);
+    expect(rebasePlanProblem(plan("Drop", "Drop", "Squash"))).toMatch(/squash/);
+  });
+
+  it("allows a fold into a kept commit, even across a drop", () => {
+    expect(rebasePlanProblem(plan("Pick", "Squash"))).toBeNull();
+    expect(rebasePlanProblem(plan("Pick", "Drop", "Squash"))).toBeNull();
+    expect(rebasePlanProblem(plan("Reword", "Fixup"))).toBeNull();
+    expect(rebasePlanProblem(plan("Drop", "Pick", "Fixup"))).toBeNull();
+    expect(rebasePlanProblem(plan("Pick", "Drop", "Drop"))).toBeNull();
+    expect(rebasePlanProblem([])).toBeNull();
+  });
+});
 
 describe("seedRebasePlan", () => {
   it("orders oldest-first and caps the window", () => {

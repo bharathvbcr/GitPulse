@@ -162,6 +162,24 @@ questions and approvals use the separate Manvi protocol. See
 [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for copying, permissions and
 verification limits.
 
+A plain Claude Code tab gets the same treatment. A fresh launch is given a
+session id GitPulse records; a tab that takes over a running session (after a
+reload, or from Sessions) keeps the record already made for it and never makes
+a new one. When a signal from outside ends the session, the tab — and, for a
+burst of them, the incident's **Resume N** — offers **Resume** only if Claude
+Code saved a transcript for it. If it saved none, nothing is offered; if the
+transcript could not be checked, the tab says so instead of guessing. A Close
+from GitPulse, from the tab or from Sessions, never offers Resume, and neither
+does the program ending on its own; a tab's view closing while the agent keeps
+running does not end its record. "Resume N" reports what each relaunch did:
+started, waiting for a free terminal slot, or failed.
+
+Not verified against the Claude Code CLI, and relied on only as stated: whether
+`/clear` or `/resume` inside a session moves it to another session id (the
+transcript GitPulse looks for would then be the old one), and whether a session
+killed before its first message ever has a transcript (if not, it is correctly
+not offered).
+
 If the window reloads, the terminal processes it started keep running: they are
 detached rather than stopped, so one that prints a lot is no longer killed for
 lack of a page to show it. The reloaded window lists them under **Sessions** as

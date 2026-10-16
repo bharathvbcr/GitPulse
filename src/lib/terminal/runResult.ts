@@ -242,4 +242,11 @@ export interface TerminalExitPayload {
   error: string | null;
   /** False when the native host could not confirm process termination. */
   reaped: boolean;
+  /**
+   * GitPulse ended it: a Close (from the tab or from Sessions), the app's
+   * shutdown, or the reader stopping a session it could not serve (then
+   * `error` says why). False for the program's own end or a signal from
+   * outside. Mirrors `terminal::TerminalExitPayload::ended_by_gitpulse`.
+   */
+  ended_by_gitpulse: boolean;
 }

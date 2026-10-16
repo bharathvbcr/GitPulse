@@ -254,6 +254,75 @@ pub(crate) fn repo_with_worktrees(linked: usize) -> (TempDir, TempDir, Vec<PathB
     (main, parent, paths)
 }
 
+/// A repository parked between the two commits of a multi-commit
+/// `cherry-pick` (or `revert`, when `revert`): the first commit conflicted and
+/// was resolved with a plain `git commit`, so `CHERRY_PICK_HEAD` /
+/// `REVERT_HEAD` is gone while `.git/sequencer/` still holds the second step
+/// and `git status` still says the operation is in progress.
+#[cfg(test)]
+pub(crate) fn repo_parked_in_a_sequence(revert: bool) -> TempDir {
+    let dir = git_repo();
+    let repo = dir.path();
+    let write = |name: &str, body: &str| fs::write(repo.join(name), body).expect("write fixture");
+    let commit = |message: &str| {
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-q", "-m", message]);
+    };
+    write("f.txt", "base\n");
+    commit("base");
+    let ids = if revert {
+        write("f.txt", "one\n");
+        commit("one");
+        write("f.txt", "two\n");
+        commit("two");
+        write("g.txt", "three\n");
+        commit("three");
+        ["HEAD~2", "HEAD"]
+    } else {
+        git_in(repo, &["switch", "-q", "-c", "side"]);
+        write("f.txt", "side\n");
+        commit("side one");
+        write("g.txt", "side two\n");
+        commit("side two");
+        git_in(repo, &["switch", "-q", "main"]);
+        write("f.txt", "main\n");
+        commit("main moves f");
+        ["side~1", "side"]
+    };
+    let mut command = Command::new("git");
+    command
+        .args([
+            "-c",
+            "user.name=GitPulse",
+            "-c",
+            "user.email=gitpulse@test.local",
+            "-c",
+            "commit.gpgsign=false",
+            if revert { "revert" } else { "cherry-pick" },
+            "--no-edit",
+        ])
+        .args(ids)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let first = command.spawn_locked().expect("spawn git");
+    let first = first.wait_with_output().expect("wait for git");
+    assert!(
+        !first.status.success(),
+        "the first step was meant to conflict: {}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    write("f.txt", "resolved\n");
+    git_in(repo, &["add", "f.txt"]);
+    git_in(repo, &["commit", "-q", "--no-edit"]);
+    assert!(
+        repo.join(".git/sequencer/todo").is_file(),
+        "the fixture must leave a sequencer behind"
+    );
+    dir
+}
+
 /// A fresh repository on `main`, for suites that only need somewhere to scan.
 ///
 /// Identical bodies stood in `analyzer::coverage` and `analyzer::deps`; the

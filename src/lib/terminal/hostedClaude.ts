@@ -1,4 +1,5 @@
 import { isPermissionMode, type PermissionMode } from "./agentDefaults";
+import type { TerminalExitPayload } from "./runResult";
 import { isSessionId } from "./tabs";
 
 /**
@@ -60,6 +61,33 @@ export function withSessionId(
   }
   const sessionId = newId().toLowerCase();
   return { args: ["--session-id", sessionId, ...given], sessionId };
+}
+
+/**
+ * The conversation a Claude tab's next process runs, decided where the
+ * process starts and recorded only when the start makes one.
+ *
+ * Taking over a running PTY (`attach`) makes nothing: the conversation is
+ * whichever is already on record for that PTY, or none — a fresh id there
+ * would name a conversation that does not exist, and a later signal would
+ * offer to resume it. A fresh launch, or a `--resume <id>`, records exactly
+ * one. Returns the arguments to launch with (unchanged for an attach) and the
+ * conversation's id, or null when it cannot be named.
+ */
+export function conversationForStart(
+  store: Pick<ReturnType<typeof createHostedClaudeStore>, "begin" | "byTerminal">,
+  start: {
+    attach: string | null;
+    resumeId: string | null;
+    args: string[] | undefined;
+    record: Omit<HostedClaude, "sessionId" | "terminalId" | "endedSignal">;
+    newId?: () => string;
+  },
+): { args: string[] | undefined; sessionId: string | null } {
+  if (start.attach) return { args: start.args, sessionId: store.byTerminal(start.attach)?.sessionId ?? null };
+  const hosted = withSessionId(start.resumeId ? ["--resume", start.resumeId] : start.args, start.newId);
+  if (hosted.sessionId) store.begin({ ...start.record, sessionId: hosted.sessionId });
+  return hosted;
 }
 
 /** One hosted Claude conversation, as it is kept between app runs. */
@@ -193,8 +221,50 @@ function browserStorage(): HostedStorage | null {
 /** The app-wide store, kept in the webview's local storage. */
 export const hostedClaude = createHostedClaudeStore(browserStorage());
 
+/**
+ * What a relaunch did: `started` a process; `deferred` — every terminal slot
+ * was taken, and the tab starts it when one frees (never counted as started);
+ * or `failed`, which the tab itself shows.
+ */
+export type ResumeOutcome = "started" | "deferred" | "failed";
+
 /** What a tab offers when its process was ended by a signal: relaunch its conversation. */
-export type Resumer = () => Promise<void> | void;
+export type Resumer = () => Promise<ResumeOutcome>;
+
+/** The parts of a PTY's exit that decide what becomes of its conversation. */
+export type ExitFacts = Pick<TerminalExitPayload, "signal" | "ended_by_gitpulse" | "error">;
+
+/**
+ * Whether an exit left a conversation someone may want back: ended by a
+ * signal, and not by GitPulse's own Close. A session GitPulse stopped because
+ * it could no longer serve it (`error` says why) still counts — the person did
+ * not ask for that end.
+ */
+export function endedFromOutside(exit: ExitFacts): boolean {
+  return exit.signal !== "" && (!exit.ended_by_gitpulse || exit.error !== null);
+}
+
+/**
+ * The one decision on what a PTY's end does to the conversation recorded for
+ * it, for every place that sees the end: the tab running it, and the Sessions
+ * record of a process whose tab went away. An end someone asked for — a
+ * Close, acknowledged or seen as an exit GitPulse caused, or the program's own
+ * end — forgets it. An end from outside keeps it, marked with the signal, and
+ * returns true: it may be offered for resumption, once its transcript is
+ * found. A view going away is not an end, and never comes here.
+ */
+export function settleConversation(
+  store: Pick<ReturnType<typeof createHostedClaudeStore>, "ended" | "forget">,
+  sessionId: string,
+  end: ExitFacts | "closed",
+): boolean {
+  if (end === "closed" || !endedFromOutside(end)) {
+    store.forget(sessionId);
+    return false;
+  }
+  store.ended(sessionId, end.signal);
+  return true;
+}
 
 /**
  * The relaunch each signal-ended tab has on offer, by the backend's PTY id.

@@ -1,8 +1,8 @@
 use crate::engine::git_cli::{
     git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
-    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, resolve_git_common_dir,
-    sandbox_join, validate_repo, with_background_processes, BoundedRun, OutputStream,
-    ProcessObserver, NETWORK_TIMEOUT,
+    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, is_transient_git_lock_error,
+    resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
+    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +37,21 @@ const MAX_INDEX_PATH_BYTES: usize = 4 * 1024 * 1024;
 /// Leave room for Git's executable and quoting within Windows' command limit.
 const MAX_INDEX_ARGV_BYTES: usize = 12 * 1024;
 const MAX_INDEX_CHUNK_PATHS: usize = 128;
+/// ASCII files staged by one `git add` in [`GitWriter::stage_files_attributed`];
+/// the bound on its stdin (about 150 KiB at typical note paths). Non-ASCII
+/// names in a batch cost further processes, in chunks of
+/// [`MAX_INDEX_CHUNK_PATHS`].
+const STAGE_BATCH_PATHS: usize = 2_500;
+/// Extra `git add` runs one call may spend halving failed batches to find the
+/// file at fault. Bounds the cost of many bad files to a constant.
+const STAGE_SPLIT_BUDGET: usize = 64;
+
+/// What a checkout left behind. `detached` is read from HEAD after the switch,
+/// not assumed from which entry point ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutOutcome {
+    pub detached: bool,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -337,6 +352,31 @@ impl IndexAction {
     }
 }
 
+/// `paths` split into argv lines that each begin with `prefix` and stay inside
+/// the command-length and path-count bounds. Always at least one line, so an
+/// empty `paths` yields the bare `prefix`.
+fn index_chunks(prefix: &[String], paths: &[String]) -> Vec<Vec<String>> {
+    let mut chunks = Vec::new();
+    let mut argv = prefix.to_vec();
+    let mut bytes = 128usize;
+    for path in paths {
+        // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
+        let cost = path.len() * 2 + 4;
+        if argv.len() > prefix.len()
+            && (bytes + cost > MAX_INDEX_ARGV_BYTES
+                || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
+        {
+            chunks.push(argv);
+            argv = prefix.to_vec();
+            bytes = 128;
+        }
+        bytes += cost;
+        argv.push(path.clone());
+    }
+    chunks.push(argv);
+    chunks
+}
+
 fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, String> {
     if files.is_empty() || files.len() > MAX_INDEX_PATHS {
         return Err(format!("Select between 1 and {MAX_INDEX_PATHS} paths"));
@@ -483,6 +523,127 @@ impl GitWriter {
         .map(|_| ())
     }
 
+    /// Stages many files in a bounded number of git processes and reports each
+    /// file's own outcome, in the order given.
+    ///
+    /// One `git add` (paths on stdin, literal pathspecs) per
+    /// [`STAGE_BATCH_PATHS`] files (plus one per 128 files whose names are not
+    /// ASCII, see [`Self::change_index_with`]), so a 5,000-file rewrite costs two
+    /// processes where [`Self::stage_file`] in a loop cost 5,000.
+    ///
+    /// Contract of one ASCII stdin batch: `git add` is all-or-nothing over its
+    /// pathspec set (a vanished path is fatal before anything is staged), with
+    /// one exception: an ignored path makes it exit 1 *after* staging every
+    /// other path. A failed group is therefore attributed in two steps. Ignored
+    /// paths are named exactly (`git check-ignore`) and the rest re-staged,
+    /// outside any budget. What remains is halved: a vanished file is isolated
+    /// in about `log2(batch)` extra processes and every other file in the batch
+    /// is still staged. The halving is bounded by [`STAGE_SPLIT_BUDGET`]; past
+    /// it, the files still ungrouped each carry the batch's error, which is true
+    /// of them (a vanished path staged none of the group) but does not say which
+    /// file caused it.
+    ///
+    /// A selection that mixes ASCII and non-ASCII names runs more than one git
+    /// process (stdin first, then argument chunks), so it can be partly
+    /// applied when a later one fails; the error says so. A lock held by
+    /// someone else is not a per-file fault, so it is never halved: the whole
+    /// group reports it after one bounded retry.
+    pub fn stage_files_attributed(repo_path: &str, files: &[String]) -> Vec<Result<(), String>> {
+        let mut outcomes: Vec<Result<(), String>> = vec![Ok(()); files.len()];
+        let mut split_budget = STAGE_SPLIT_BUDGET;
+        for (batch, slots) in files
+            .chunks(STAGE_BATCH_PATHS)
+            .zip(outcomes.chunks_mut(STAGE_BATCH_PATHS))
+        {
+            Self::stage_group(repo_path, batch, slots, &mut split_budget);
+        }
+        outcomes
+    }
+
+    /// Which of `files` git would refuse to add because a `.gitignore` rule
+    /// ignores them (tracked paths never are). Empty when none is, or when
+    /// git could not answer: the caller then falls back to halving.
+    fn ignored_among(repo_path: &str, files: &[String]) -> HashSet<String> {
+        let Ok(repo) = validate_repo(repo_path) else {
+            return HashSet::new();
+        };
+        let mut input = Vec::new();
+        for file in files {
+            input.extend_from_slice(file.as_bytes());
+            input.push(0);
+        }
+        match git_with_stdin(&repo, &["check-ignore", "-z", "--stdin"], &input) {
+            Ok(out) => String::from_utf8_lossy(&out)
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(String::from)
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    fn stage_group(
+        repo_path: &str,
+        files: &[String],
+        outcomes: &mut [Result<(), String>],
+        split_budget: &mut usize,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let error = match Self::change_index_with(repo_path, files, IndexAction::Stage, |_| Ok(()))
+        {
+            Ok(_) => return,
+            Err(error) => error,
+        };
+        // `git add` exits 1 for an ignored path yet stages every other path in
+        // the set, so a batch that failed is not always untouched. Ignored
+        // paths are named exactly, outside the halving budget, and the rest are
+        // staged again (a no-op for what git already took).
+        if files.len() > 1 && !is_transient_git_lock_error(&error) {
+            let ignored = Self::ignored_among(repo_path, files);
+            if !ignored.is_empty() && ignored.len() < files.len() {
+                let mut rest = Vec::new();
+                let mut rest_slots = Vec::new();
+                for (index, file) in files.iter().enumerate() {
+                    if ignored.contains(file) {
+                        outcomes[index] = Err(format!(
+                            "Index update failed for the 1 selected paths: {file} is ignored by a .gitignore file; stage it with force to track it."
+                        ));
+                    } else {
+                        rest.push(file.clone());
+                        rest_slots.push(index);
+                    }
+                }
+                let mut rest_outcomes = vec![Ok(()); rest.len()];
+                Self::stage_group(repo_path, &rest, &mut rest_outcomes, split_budget);
+                for (slot, outcome) in rest_slots.into_iter().zip(rest_outcomes) {
+                    outcomes[slot] = outcome;
+                }
+                return;
+            }
+        }
+        if files.len() > 1 && !is_transient_git_lock_error(&error) && *split_budget > 0 {
+            *split_budget -= 1;
+            let (left_files, right_files) = files.split_at(files.len() / 2);
+            let (left, right) = outcomes.split_at_mut(left_files.len());
+            Self::stage_group(repo_path, left_files, left, split_budget);
+            Self::stage_group(repo_path, right_files, right, split_budget);
+            return;
+        }
+        let error = if files.len() > 1 {
+            format!(
+                "{error} (one batch of {} paths; not attributed to a single path)",
+                files.len()
+            )
+        } else {
+            error
+        };
+        for outcome in outcomes {
+            *outcome = Err(error.clone());
+        }
+    }
+
     pub fn unstage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
         Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Unstage, |_| {
             Ok(())
@@ -493,7 +654,10 @@ impl GitWriter {
     /// One native request and lock for a selection. All paths and all policy
     /// verdicts are checked before the write, then one git process applies the
     /// whole selection (paths on stdin, so no command-length limit applies).
-    /// A Git failure is reported, never presented as success.
+    /// Paths with a non-ASCII character are the exception: they go as
+    /// arguments, in chunks, because git does not precompose a pathspec it
+    /// reads from stdin (see the comment at the write). A Git failure is
+    /// reported, never presented as success.
     pub fn change_index_with<J, V>(
         repo_path: &str,
         files: &[String],
@@ -510,47 +674,64 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefix = action.argv();
-        let mut plans = Vec::new();
-        let mut argv = prefix.clone();
-        let mut bytes = 128usize;
-        for path in &paths {
-            // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
-            let cost = path.len() * 2 + 4;
-            if argv.len() > prefix.len()
-                && (bytes + cost > MAX_INDEX_ARGV_BYTES
-                    || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
-            {
-                plans.push(argv);
-                argv = prefix.clone();
-                bytes = 128;
-            }
-            bytes += cost;
-            argv.push(path.clone());
-        }
-        plans.push(argv);
+        let plans = index_chunks(&prefix, &paths);
         let mut verdicts = Vec::with_capacity(plans.len());
         for plan in &plans {
             let args: Vec<&str> = plan.iter().map(String::as_str).collect();
             verdicts.push(judge(&args)?);
         }
-        // One process for the whole selection, paths on stdin NUL-separated:
-        // git applies the pathspec set to the index under one lock, so a
-        // failure leaves nothing half-applied (the chunked form ran a process
-        // per 128 paths and could stop partway). The judged lines above name
-        // the same pathspecs; only the transport differs.
-        let mut input = Vec::new();
-        for path in &paths {
-            input.extend_from_slice(path.as_bytes());
-            input.push(0);
+        // One process for every ASCII path, paths on stdin NUL-separated: git
+        // applies the pathspec set to the index under one lock, so a failure
+        // leaves nothing half-applied, except that an ignored path exits 1
+        // after the other paths were staged (the chunked form ran a process per
+        // 128 paths and could stop partway). The non-ASCII paths below run
+        // after it in further processes, so a selection mixing both can be
+        // partly applied. The judged lines above name the same pathspecs; only
+        // the transport differs.
+        //
+        // A path with a non-ASCII character does not go this way. On macOS git
+        // precomposes a pathspec it is handed as an argument but not one it
+        // reads from a file, so a decomposed (NFD) spelling given on stdin
+        // matches nothing and `git add` still exits 0: a silent no-op that
+        // would read as staged. Those paths take the argument form, in the
+        // bounded chunks the judge was shown.
+        let (plain, accented): (Vec<&String>, Vec<&String>) =
+            paths.iter().partition(|path| path.is_ascii());
+        // The ASCII paths are applied before the others, and each argument
+        // chunk before the next, so a failure after a first process succeeded
+        // leaves that part applied; the message says so rather than reading
+        // as all-or-nothing.
+        let applied = std::cell::Cell::new(false);
+        let failed = |error: String| {
+            let partly = if applied.get() {
+                " The selection was partly applied before this failure."
+            } else {
+                ""
+            };
+            format!("Index update failed for the {} selected paths: {error}.{partly} Refresh to review the current index.", paths.len())
+        };
+        if !plain.is_empty() {
+            let mut input = Vec::new();
+            for path in &plain {
+                input.extend_from_slice(path.as_bytes());
+                input.push(0);
+            }
+            let mut args: Vec<&str> = prefix[1..prefix.len() - 1]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+            git_with_stdin(&repo, &args, &input).map_err(failed)?;
+            applied.set(true);
         }
-        let mut args: Vec<&str> = prefix[1..prefix.len() - 1]
-            .iter()
-            .map(String::as_str)
-            .collect();
-        args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
-        git_with_stdin(&repo, &args, &input).map_err(|error| {
-            format!("Index update failed for the {} selected paths: {error}. Refresh to review the current index.", paths.len())
-        })?;
+        let accented: Vec<String> = accented.into_iter().cloned().collect();
+        for chunk in index_chunks(&prefix, &accented) {
+            if chunk.len() > prefix.len() {
+                let args: Vec<&str> = chunk.iter().skip(1).map(String::as_str).collect();
+                git_text(&repo, &args).map_err(failed)?;
+                applied.set(true);
+            }
+        }
         let completed = paths.len();
         Ok((verdicts, completed))
     }
@@ -1205,33 +1386,159 @@ Unset the local override with `git config --local --unset-all user.name` and \
         .map(|output| String::from_utf8_lossy(&output).into_owned())
     }
 
-    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
+    /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the
+    /// program name first, so the write gate judges exactly the line that runs.
+    ///
+    /// `switch` only ever lands on a branch, so no spelling here can detach
+    /// HEAD. A local branch is switched to by name. A remote-tracking name such
+    /// as `origin/feature` (what a remote row in the UI carries) is mapped to
+    /// its local tracking branch: switched to when it exists, created with
+    /// `--track` when it does not. Anything else goes through `--guess`, which
+    /// creates a local branch from a single remote twin. A tag or an object id
+    /// is not a branch and is refused; [`Self::checkout_detached`] is the
+    /// explicit way to land on one.
+    ///
+    /// The answer is a snapshot of the refs and config. A caller that gets it
+    /// approved must run it through [`Self::checkout_branch_judged`], which
+    /// re-derives it under the repository lock and refuses if it changed.
+    pub fn checkout_branch_argv(repo_path: &str, branch_name: &str) -> Result<Vec<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::checkout_branch_argv_in(&repo, branch_name)
+    }
+
+    fn checkout_branch_argv_in(repo: &Path, branch_name: &str) -> Result<Vec<String>, String> {
+        validate_ref_name(branch_name)?;
+        let ref_exists = |full: &str| -> Result<bool, String> {
+            Ok(git_captured(repo, &["show-ref", "--verify", "--quiet", full])?.success)
+        };
+        let argv = |rest: &[&str]| -> Vec<String> {
+            std::iter::once("git")
+                .chain(rest.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        if ref_exists(&format!("refs/heads/{branch_name}"))? {
+            return Ok(argv(&["switch", branch_name]));
+        }
+        if ref_exists(&format!("refs/remotes/{branch_name}"))? {
+            // Read fresh: a branch is created or chosen on this answer.
+            let remotes = crate::engine::git_reader::configured_remote_names_fresh(repo)?;
+            let mut owners = remotes.iter().filter(|remote| {
+                branch_name.len() > remote.len()
+                    && branch_name.starts_with(remote.as_str())
+                    && branch_name.as_bytes()[remote.len()] == b'/'
+            });
+            let (Some(remote), None) = (owners.next(), owners.next()) else {
+                return Err(format!(
+                    "'{branch_name}' does not name exactly one configured remote's branch; \
+                     check it out by its local name"
+                ));
+            };
+            let local = &branch_name[remote.len() + 1..];
+            validate_ref_name(local)?;
+            if local == "HEAD" {
+                return Err(format!(
+                    "'{branch_name}' is the remote's HEAD pointer, not a branch"
+                ));
+            }
+            if ref_exists(&format!("refs/heads/{local}"))? {
+                let upstream = git_text(
+                    repo,
+                    &[
+                        "for-each-ref",
+                        "--format=%(upstream)",
+                        &format!("refs/heads/{local}"),
+                    ],
+                )?;
+                let upstream = upstream.trim();
+                if !upstream.is_empty() && upstream != format!("refs/remotes/{branch_name}") {
+                    return Err(format!(
+                        "local branch '{local}' tracks {upstream}, not '{branch_name}'; \
+                         switch to '{local}' by name, or rename it first"
+                    ));
+                }
+                return Ok(argv(&["switch", local]));
+            }
+            // `--track` alone names the new branch by dropping everything up to
+            // the first slash, which is wrong for a remote called `a/b`; name it.
+            return Ok(argv(&["switch", "--track", "-c", local, branch_name]));
+        }
+        Ok(argv(&["switch", "--guess", branch_name]))
+    }
+
+    /// Switches to a branch, creating the local tracking branch for a remote
+    /// one, and reports whether HEAD ended up detached. There is no fallback
+    /// to `checkout <name>`: it detaches HEAD for a remote-tracking ref, a tag
+    /// or an object id and reported that as a branch checkout. A refused
+    /// `switch` (dirty tree, ambiguous or missing name) is the error.
+    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<CheckoutOutcome, String> {
+        Self::checkout_branch_locked(repo_path, branch_name, None)
+    }
+
+    /// [`Self::checkout_branch`] for a caller whose policy gate approved
+    /// `judged` (from [`Self::checkout_branch_argv`]). The argv is derived again
+    /// under the repository lock; if refs or config moved in between and it is
+    /// no longer the approved line, nothing runs.
+    pub fn checkout_branch_judged(
+        repo_path: &str,
+        branch_name: &str,
+        judged: &[String],
+    ) -> Result<CheckoutOutcome, String> {
+        Self::checkout_branch_locked(repo_path, branch_name, Some(judged))
+    }
+
+    fn checkout_branch_locked(
+        repo_path: &str,
+        branch_name: &str,
+        judged: Option<&[String]>,
+    ) -> Result<CheckoutOutcome, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_ref_name(branch_name)?;
-        // Two strategies: `switch --guess` covers creating a local
-        // branch from a remote twin (git >= 2.23), revision-only `checkout` covers
-        // everything older. The former middle attempt (`checkout --guess`)
-        // added a third executable spelling without covering any state the
-        // other two miss — and every extra strategy is another argv the
-        // policy gate must judge identically.
-        let attempts: [&[&str]; 2] = [
-            &["switch", "--guess", branch_name],
-            &["checkout", branch_name, "--"],
-        ];
-        let mut first_err = None;
-        for attempt in attempts {
-            match git_text(&repo, attempt) {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                }
+        let argv = Self::checkout_branch_argv_in(&repo, branch_name)?;
+        if let Some(judged) = judged {
+            if judged != argv.as_slice() {
+                return Err(format!(
+                    "'{branch_name}' now resolves to `{}`, not the approved `{}`; \
+                     the repository changed, try again",
+                    argv.join(" "),
+                    judged.join(" ")
+                ));
             }
         }
-        Err(first_err.expect("at least one attempt recorded"))
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
+    }
+
+    /// Checks out a commit, tag or other revision with HEAD detached. This is
+    /// the named way to detach: [`Self::checkout_branch`] never does.
+    pub fn checkout_detached_argv(revision: &str) -> Result<Vec<String>, String> {
+        validate_oid_or_revision(revision)?;
+        Ok(["git", "switch", "--detach", revision]
+            .into_iter()
+            .map(String::from)
+            .collect())
+    }
+
+    pub fn checkout_detached(repo_path: &str, revision: &str) -> Result<CheckoutOutcome, String> {
+        let argv = Self::checkout_detached_argv(revision)?;
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
+    }
+
+    fn checkout_outcome(repo: &Path) -> Result<CheckoutOutcome, String> {
+        Ok(CheckoutOutcome {
+            detached: crate::engine::git_reader::head_branch(repo)?.is_none(),
+        })
     }
 
     pub fn create_branch(
@@ -1347,22 +1654,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err("Rebase sequence is empty".into());
         }
         Self::refuse_fixture_identity(&repo, false)?;
-        if let Some(first) = steps.first() {
-            if matches!(
-                first.action,
-                RebaseActionKind::Squash | RebaseActionKind::Fixup
-            ) {
-                return Err(format!(
-                    "Cannot '{}' commit {} without a previous commit to combine into",
-                    match first.action {
-                        RebaseActionKind::Squash => "squash",
-                        RebaseActionKind::Fixup => "fixup",
-                        _ => unreachable!(),
-                    },
-                    first.commit_id
-                ));
-            }
-        }
+        validate_rebase_plan(steps)?;
         for step in steps {
             validate_oid_or_revision(&step.commit_id)?;
         }
@@ -2363,6 +2655,35 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
+/// Refuses a plan in which a squash or fixup has no kept commit before it, as
+/// git does ("cannot 'squash' without a previous commit"). A dropped step is
+/// not a commit to fold into: with only drops ahead of it the fold would amend
+/// the onto commit itself and `branch -f` would then move the branch onto that
+/// rewritten copy of the base. Pick and reword keep a commit; drop does not.
+fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
+    let mut has_kept_commit = false;
+    for step in steps {
+        let folds_into_previous = match step.action {
+            RebaseActionKind::Squash => Some("squash"),
+            RebaseActionKind::Fixup => Some("fixup"),
+            RebaseActionKind::Pick | RebaseActionKind::Reword(_) => {
+                has_kept_commit = true;
+                None
+            }
+            RebaseActionKind::Drop => None,
+        };
+        if let Some(verb) = folds_into_previous {
+            if !has_kept_commit {
+                return Err(format!(
+                    "Cannot '{verb}' commit {} without a previous commit to combine into",
+                    step.commit_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Composes the user-facing error for a failed rebase step together with any
 /// recovery failures that occurred while rolling back.
 ///
@@ -3230,6 +3551,28 @@ mod tests {
         assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
     }
 
+    /// Between the steps of a multi-commit cherry-pick or revert the
+    /// `*_HEAD` file is gone but the sequencer is not; reset and stash must
+    /// still refuse rather than walk away from it.
+    #[test]
+    fn refuse_if_parked_refuses_between_the_steps_of_a_sequence() {
+        for revert in [false, true] {
+            let dir = crate::test_support::repo_parked_in_a_sequence(revert);
+            let canon = dir.path().canonicalize().unwrap();
+            let refused = GitWriter::refuse_if_parked(&canon, "reset")
+                .expect_err("a parked sequence must refuse a reset");
+            assert!(
+                refused.contains(if revert { "revert" } else { "cherry-pick" }),
+                "{refused}"
+            );
+            assert!(GitWriter::refuse_if_parked(&canon, "stash").is_err());
+        }
+        let idle = crate::test_support::git_repo();
+        crate::test_support::git_in(idle.path(), &["commit", "--allow-empty", "-q", "-m", "x"]);
+        let canon = idle.path().canonicalize().unwrap();
+        GitWriter::refuse_if_parked(&canon, "reset").expect("an idle repository is not parked");
+    }
+
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
@@ -3669,7 +4012,12 @@ mod tests {
                     "{what}({name:?}) was refused for the wrong reason: {err}"
                 );
             };
-            refused("checkout_branch", GitWriter::checkout_branch(&path, name));
+            refused(
+                "checkout_branch",
+                GitWriter::checkout_branch(&path, name).map(|_| ()),
+            );
+            GitWriter::checkout_detached(&path, name)
+                .expect_err("checkout_detached must refuse a leading dash");
             refused("create_branch", GitWriter::create_branch(&path, name, None));
             refused(
                 "delete_branch",
@@ -4144,6 +4492,181 @@ mod tests {
         );
     }
 
+    /// A clone of a repository that has `main` and `feature`, left on `main`.
+    /// Its remote-tracking branches are `origin/main` and `origin/feature`.
+    fn clone_with_remote_feature() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let origin = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            origin.path(),
+            &["commit", "--allow-empty", "-q", "-m", "base"],
+        );
+        crate::test_support::git_in(origin.path(), &["switch", "-q", "-c", "feature"]);
+        crate::test_support::git_in(
+            origin.path(),
+            &["commit", "--allow-empty", "-q", "-m", "on feature"],
+        );
+        crate::test_support::git_in(origin.path(), &["switch", "-q", "main"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(
+            parent.path(),
+            &["clone", "-q", origin.path().to_str().unwrap(), "work"],
+        );
+        let work = parent.path().join("work").canonicalize().unwrap();
+        crate::test_support::trust_repo(&work);
+        (origin, parent, work)
+    }
+
+    /// The branch HEAD is on, or `None` when it is detached.
+    fn attached_branch(repo: &std::path::Path) -> Option<String> {
+        git_text(repo, &["symbolic-ref", "-q", "HEAD"])
+            .ok()
+            .and_then(|name| name.trim().strip_prefix("refs/heads/").map(String::from))
+    }
+
+    /// The command palette hands the remote row's name, `origin/feature`. It
+    /// is a remote-tracking ref, so the old `checkout origin/feature --`
+    /// fallback detached HEAD at it and reported success.
+    #[test]
+    fn checkout_of_a_remote_tracking_name_lands_on_a_local_tracking_branch() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        let _ = GitWriter::checkout_branch(path, "origin/feature");
+        assert_eq!(
+            attached_branch(&work).as_deref(),
+            Some("feature"),
+            "HEAD must be on the local tracking branch, not detached"
+        );
+        assert_eq!(
+            git_text(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .unwrap()
+                .trim(),
+            "origin/feature"
+        );
+    }
+
+    #[test]
+    fn checkout_of_a_remote_tracking_name_reuses_an_existing_local_branch() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["branch", "feature", "origin/feature"]);
+        GitWriter::checkout_branch(path, "origin/feature").expect("switch to the local twin");
+        assert_eq!(attached_branch(&work).as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn checkout_of_a_tag_or_an_oid_never_detaches_head() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "v-only"]);
+        let oid = git_text(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        for name in ["v-only", oid.as_str()] {
+            let _ = GitWriter::checkout_branch(path, name);
+            assert_eq!(
+                attached_branch(&work).as_deref(),
+                Some("main"),
+                "checkout_branch({name}) must not leave HEAD detached"
+            );
+            assert!(GitWriter::checkout_branch(path, name).is_err(), "{name}");
+        }
+    }
+
+    /// A tag sharing its name with a branch: a local branch wins, because it is
+    /// what a branch checkout means; with only a remote twin the name is
+    /// ambiguous and is refused rather than resolved onto the tag.
+    #[test]
+    fn checkout_never_resolves_a_branch_name_onto_a_tag() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "feature"]);
+        let ambiguous = GitWriter::checkout_branch(path, "feature");
+        assert_eq!(
+            attached_branch(&work).as_deref(),
+            ambiguous.is_ok().then_some("feature").or(Some("main")),
+            "HEAD is on the new branch or untouched, never detached on the tag"
+        );
+        crate::test_support::git_in(&work, &["switch", "-q", "-c", "local-and-tag"]);
+        crate::test_support::git_in(&work, &["tag", "local-and-tag"]);
+        crate::test_support::git_in(&work, &["switch", "-q", "main"]);
+        let outcome = GitWriter::checkout_branch(path, "local-and-tag").expect("the branch");
+        assert!(!outcome.detached);
+        assert_eq!(attached_branch(&work).as_deref(), Some("local-and-tag"));
+    }
+
+    #[test]
+    fn checkout_detached_is_the_named_way_to_detach_and_says_so() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "v-only"]);
+        let attached = GitWriter::checkout_branch(path, "origin/feature").unwrap();
+        assert!(!attached.detached);
+        let detached = GitWriter::checkout_detached(path, "v-only").unwrap();
+        assert!(detached.detached);
+        assert_eq!(attached_branch(&work), None);
+        let back = GitWriter::checkout_branch(path, "main").unwrap();
+        assert!(!back.detached);
+    }
+
+    /// Two remotes carrying the same branch: a bare `feature` is ambiguous and
+    /// must not be guessed into a detached checkout, while the qualified name
+    /// is exact.
+    #[test]
+    fn checkout_with_two_remotes_never_detaches() {
+        let (origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(
+            &work,
+            &["remote", "add", "upstream", origin.path().to_str().unwrap()],
+        );
+        crate::test_support::git_in(&work, &["fetch", "-q", "upstream"]);
+        let _ = GitWriter::checkout_branch(path, "feature");
+        assert_eq!(attached_branch(&work).as_deref(), Some("main"));
+        let _ = GitWriter::checkout_branch(path, "upstream/feature");
+        assert_eq!(attached_branch(&work).as_deref(), Some("feature"));
+        assert_eq!(
+            git_text(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .unwrap()
+                .trim(),
+            "upstream/feature"
+        );
+    }
+
+    /// An unborn HEAD (no commit yet) with a fetched remote branch.
+    #[test]
+    fn checkout_of_a_remote_branch_works_from_an_unborn_head() {
+        let (origin, _parent, _work) = clone_with_remote_feature();
+        let fresh = crate::test_support::git_repo();
+        let canon = fresh.path().canonicalize().unwrap();
+        crate::test_support::git_in(
+            &canon,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        crate::test_support::git_in(&canon, &["fetch", "-q", "origin"]);
+        let _ = GitWriter::checkout_branch(canon.to_str().unwrap(), "origin/feature");
+        assert_eq!(attached_branch(&canon).as_deref(), Some("feature"));
+        assert!(GitWriter::checkout_branch(canon.to_str().unwrap(), "origin/missing").is_err());
+    }
+
+    #[test]
+    fn a_refused_checkout_on_a_dirty_tree_changes_nothing() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["switch", "-q", "feature"]);
+        std::fs::write(work.join("clash.txt"), "feature\n").unwrap();
+        crate::test_support::git_in(&work, &["add", "clash.txt"]);
+        crate::test_support::git_in(&work, &["commit", "-q", "-m", "clash on feature"]);
+        crate::test_support::git_in(&work, &["switch", "-q", "main"]);
+        std::fs::write(work.join("clash.txt"), "uncommitted\n").unwrap();
+        GitWriter::checkout_branch(path, "feature").expect_err("the dirty file would be lost");
+        assert_eq!(attached_branch(&work).as_deref(), Some("main"));
+        assert_eq!(
+            std::fs::read_to_string(work.join("clash.txt")).unwrap(),
+            "uncommitted\n"
+        );
+    }
+
     /// Regression (audit A7): when every checkout strategy fails, the first
     /// (most meaningful) error must surface, not the last retry's.
     #[test]
@@ -4480,6 +5003,90 @@ mod tests {
             "error must name fixup, got: {fixup_err}"
         );
         assert_eq!(head_message(&dir), "commit A", "HEAD must be untouched");
+    }
+
+    /// A squash/fixup folds into the nearest kept commit before it. Dropping
+    /// every commit ahead of it leaves only the onto commit, which git refuses
+    /// to squash into ("cannot 'squash' without a previous commit") and which
+    /// this engine would otherwise amend, rewriting the base's tip.
+    #[test]
+    fn rebase_refuses_squash_or_fixup_with_no_kept_commit_before_it() {
+        for (leading, action_name) in [
+            (vec![RebaseActionKind::Drop], "squash"),
+            (vec![RebaseActionKind::Drop], "fixup"),
+            (
+                vec![RebaseActionKind::Drop, RebaseActionKind::Drop],
+                "squash",
+            ),
+        ] {
+            let dir = init_repo_with_commit();
+            let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+            let mut steps = Vec::new();
+            for (i, action) in leading.iter().enumerate() {
+                let id = write_commit(&dir, &format!("d{i}.txt"), "d\n", &format!("dropped {i}"));
+                steps.push(RebaseStep {
+                    commit_id: id,
+                    action: match action {
+                        RebaseActionKind::Drop => RebaseActionKind::Drop,
+                        _ => unreachable!("only Drop leads these plans"),
+                    },
+                });
+            }
+            let last = write_commit(&dir, "z.txt", "z\n", "folded");
+            steps.push(RebaseStep {
+                commit_id: last,
+                action: if action_name == "squash" {
+                    RebaseActionKind::Squash
+                } else {
+                    RebaseActionKind::Fixup
+                },
+            });
+            let head_before = head_oid(&dir);
+            let err =
+                GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+                    .expect_err("a squash with every earlier step dropped must be refused");
+            assert!(
+                err.to_lowercase().contains(action_name),
+                "error must name {action_name}, got: {err}"
+            );
+            assert_eq!(head_oid(&dir), head_before, "HEAD must not move");
+            let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+            assert_eq!(branch.trim(), "main", "HEAD must stay on its branch");
+        }
+    }
+
+    #[test]
+    fn rebase_still_squashes_into_a_pick_across_a_drop() {
+        let dir = init_repo_with_commit();
+        let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+        let c_a = write_commit(&dir, "b.txt", "b\n", "kept A");
+        let c_b = write_commit(&dir, "d.txt", "d\n", "dropped B");
+        let c_c = write_commit(&dir, "c.txt", "c\n", "folded C");
+        let steps = vec![
+            RebaseStep {
+                commit_id: c_a,
+                action: RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: c_b,
+                action: RebaseActionKind::Drop,
+            },
+            RebaseStep {
+                commit_id: c_c,
+                action: RebaseActionKind::Squash,
+            },
+        ];
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect("pick, drop, squash folds into the pick");
+        assert_eq!(head_message(&dir), "kept A");
+        let count = git_text(
+            dir.path(),
+            &["rev-list", "--count", &format!("{base}..HEAD")],
+        )
+        .unwrap();
+        assert_eq!(count.trim(), "1", "one commit above the base");
+        assert!(dir.path().join("c.txt").exists());
+        assert!(!dir.path().join("d.txt").exists());
     }
 
     /// Pure-message tests for rebase recovery reporting: the step error always
@@ -5568,6 +6175,360 @@ mod tests {
         );
         assert_eq!(staged(&dir), 0);
     }
+
+    fn staged_names(dir: &tempfile::TempDir) -> std::collections::BTreeSet<String> {
+        let out = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only", "-z"])
+            .current_dir(dir.path())
+            .output_locked()
+            .expect("git diff --cached");
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    fn adds(labels: &[String]) -> usize {
+        labels.iter().filter(|l| l.as_str() == "git add").count()
+    }
+
+    /// The hub-rename cost: the number of `git add` processes depends on the
+    /// batch size, never on how many files there are beyond it.
+    #[test]
+    fn staging_many_files_attributed_costs_one_process_per_batch() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::create_dir_all(dir.path().join("n")).unwrap();
+        for (count, expected) in [(0, 0), (1, 1), (10, 1), (2 * STAGE_BATCH_PATHS + 1, 3)] {
+            let files: Vec<String> = (0..count).map(|i| format!("n/{count}-{i}.md")).collect();
+            for file in &files {
+                std::fs::write(dir.path().join(file), "x\n").unwrap();
+            }
+            let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                GitWriter::stage_files_attributed(&path, &files)
+            });
+            assert_eq!(outcomes.len(), count);
+            assert!(outcomes.iter().all(Result::is_ok), "{count}: {outcomes:?}");
+            assert_eq!(adds(&labels), expected, "{count} files: {labels:?}");
+        }
+        assert_eq!(staged_names(&dir).len(), 1 + 10 + 2 * STAGE_BATCH_PATHS + 1);
+    }
+
+    /// One vanished file fails the whole `git add`; it must be named, and the
+    /// files beside it must still be staged.
+    #[test]
+    fn a_failed_batch_reports_each_files_own_outcome() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..40).map(|i| format!("f{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        for gone in [3usize, 17, 39] {
+            std::fs::remove_file(dir.path().join(&files[gone])).unwrap();
+        }
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(
+                outcome.is_err(),
+                [3, 17, 39].contains(&index),
+                "{index}: {outcome:?}"
+            );
+        }
+        let expected: std::collections::BTreeSet<String> = files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| ![3, 17, 39].contains(i))
+            .map(|(_, f)| f.clone())
+            .collect();
+        assert_eq!(staged_names(&dir), expected);
+        assert!(
+            adds(&labels) < files.len(),
+            "attribution is not per-file spawns: {labels:?}"
+        );
+    }
+
+    /// Many bad files cost a constant number of processes, and the files the
+    /// halving never reached say so rather than being reported staged.
+    #[test]
+    fn halving_a_failed_batch_is_bounded() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..400).map(|i| format!("never-written-{i}.md")).collect();
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        assert!(outcomes.iter().all(Result::is_err));
+        assert!(
+            adds(&labels) <= 1 + 2 * STAGE_SPLIT_BUDGET,
+            "{}",
+            adds(&labels)
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.as_ref().unwrap_err().contains("not attributed")),
+            "an unattributed batch is labelled as one"
+        );
+        assert!(staged_names(&dir).is_empty());
+    }
+
+    /// Names git or the shell would read as something else stage as themselves.
+    #[test]
+    fn staging_attributed_treats_exotic_names_literally() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let names = [
+            "-leading-dash.md",
+            ":(top)magic.md",
+            ":(glob)**.md",
+            "star*.md",
+            "two  spaces and 'quote'.md",
+            "line\nbreak.md",
+            "tab\there.md",
+            "caf\u{e9}-nfc.md",
+            "cafe\u{301}-decomposed.md",
+            "#hash?query%41.md",
+        ];
+        let files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        for name in &names {
+            std::fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        // A file that exists but must not be swept in by `*` or `**`.
+        std::fs::write(dir.path().join("bystander.md"), "x\n").unwrap();
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let staged = staged_names(&dir);
+        assert!(!staged.contains("bystander.md"), "{staged:?}");
+        for name in &names {
+            // git on macOS may record a decomposed name precomposed.
+            let precomposed = name.replace("e\u{301}", "\u{e9}");
+            assert!(
+                staged.iter().any(|s| s == name || *s == precomposed),
+                "{name:?} not in {staged:?}"
+            );
+        }
+    }
+
+    /// `git add --pathspec-from-file` exits 0 and stages nothing for a
+    /// decomposed spelling on macOS. Such names must still be staged, in a
+    /// bounded number of processes, never reported staged while absent.
+    #[test]
+    fn decomposed_names_are_staged_not_silently_skipped() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..300).map(|i| format!("cafe\u{301}-{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        assert_eq!(staged_names(&dir).len(), files.len());
+        assert!(
+            adds(&labels) <= 300usize.div_ceil(MAX_INDEX_CHUNK_PATHS),
+            "{labels:?}"
+        );
+    }
+
+    /// A lock someone else holds is not one file's fault: it is reported for
+    /// the group after the bounded retry, not halved into more waiting.
+    #[test]
+    fn a_held_index_lock_is_reported_for_the_group_without_halving() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..8).map(|i| format!("l{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let lock = dir.path().join(".git/index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        std::fs::remove_file(&lock).unwrap();
+        assert!(outcomes.iter().all(Result::is_err), "{outcomes:?}");
+        assert!(staged_names(&dir).is_empty());
+        // The retry loop re-spawns the same one batch; halving would show as
+        // a second, smaller group's worth of spawns.
+        assert!(adds(&labels) <= 4, "{labels:?}");
+    }
+
+    /// The invariant under every attribution: a file reported staged is in the
+    /// index, and a file reported failed is not (git's own list is the judge).
+    fn assert_outcomes_match_index(
+        dir: &tempfile::TempDir,
+        files: &[String],
+        outcomes: &[Result<(), String>],
+    ) {
+        let staged = staged_names(dir);
+        for (file, outcome) in files.iter().zip(outcomes) {
+            let precomposed = file.replace("e\u{301}", "\u{e9}");
+            let in_index = staged.contains(file) || staged.contains(&precomposed);
+            assert_eq!(
+                outcome.is_ok(),
+                in_index,
+                "{file:?}: reported {outcome:?}, index has it: {in_index}"
+            );
+        }
+    }
+
+    /// `git add` exits 1 for an ignored path yet stages the rest of its
+    /// pathspec set, so a failed batch is not always an untouched index.
+    #[test]
+    fn an_ignored_file_in_a_batch_is_named_and_the_rest_staged() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join(".gitignore"), "skip-*\n").unwrap();
+        let files: Vec<String> = ["a.md", "skip-me.md", "b.md", "skip-too.md", "c.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes[1].is_err() && outcomes[3].is_err());
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok() && outcomes[4].is_ok());
+    }
+
+    /// Past the halving budget no file may read as failed while git staged it,
+    /// nor staged while it is absent from the index.
+    #[test]
+    fn an_exhausted_halving_budget_never_misreports_a_staged_file() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join(".gitignore"), "skip-*\n").unwrap();
+        let files: Vec<String> = (0..600)
+            .map(|i| {
+                if i % 7 == 3 {
+                    format!("skip-{i}.md")
+                } else {
+                    format!("ok-{i}.md")
+                }
+            })
+            .collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+    }
+
+    /// A directory, a symlink and a dangling symlink are paths git can stage;
+    /// each is reported as the index shows it.
+    #[test]
+    fn directories_and_symlinks_are_reported_as_the_index_shows_them() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::create_dir_all(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d/in.md"), "x\n").unwrap();
+        std::fs::write(dir.path().join("t.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink("t.md", dir.path().join("link.md")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.path().join("dangling.md")).unwrap();
+        let files: Vec<String> = ["t.md", "link.md", "dangling.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let dirs = vec!["d".to_string()];
+        let outcomes = GitWriter::stage_files_attributed(&path, &dirs);
+        assert!(outcomes[0].is_ok());
+        assert!(staged_names(&dir).contains("d/in.md"));
+    }
+
+    /// A set mixing ASCII and non-ASCII names with vanished files of each kind:
+    /// the two transports run in sequence, so a failure in the second leaves
+    /// the first applied, and the per-file outcomes must still be exact.
+    #[test]
+    fn a_mixed_batch_with_vanished_files_of_both_kinds_is_attributed_exactly() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = [
+            "a1.md",
+            "cafe\u{301}-1.md",
+            "gone-ascii.md",
+            "a2.md",
+            "cafe\u{301}-gone.md",
+            "cafe\u{301}-2.md",
+            "a3.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for file in &files {
+            if !file.contains("gone") {
+                std::fs::write(dir.path().join(file), "x\n").unwrap();
+            }
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes[2].is_err() && outcomes[4].is_err(), "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 5);
+    }
+
+    /// An error from a mixed selection says what was applied: the plain paths
+    /// went in before the accented ones failed.
+    #[test]
+    fn a_failed_mixed_selection_does_not_claim_nothing_was_applied() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join("plain.md"), "x\n").unwrap();
+        let files = vec!["plain.md".to_string(), "cafe\u{301}-gone.md".to_string()];
+        let result = GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()));
+        let error = result.expect_err("one path is missing");
+        let staged = staged_names(&dir);
+        assert!(
+            !staged.contains("plain.md") || error.contains("partly"),
+            "plain.md is staged but the error reads as all-or-nothing: {error}"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_decomposed_name_unstages_it() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let name = "cafe\u{301}-unstage.md".to_string();
+        std::fs::write(dir.path().join(&name), "x\n").unwrap();
+        GitWriter::stage_file(&path, &name).unwrap();
+        assert_eq!(staged_names(&dir).len(), 1);
+        GitWriter::unstage_file(&path, &name).unwrap();
+        assert!(staged_names(&dir).is_empty(), "{:?}", staged_names(&dir));
+    }
+
+    /// Every argv a chunk becomes stays far from the OS command-length limit,
+    /// whatever the path lengths, and keeps to the path-count bound.
+    #[test]
+    fn index_chunks_bound_both_the_argv_bytes_and_the_path_count() {
+        let prefix: Vec<String> = ["git", "add", "--"].iter().map(|s| s.to_string()).collect();
+        for len in [1usize, 40, 1000, 4000] {
+            let paths: Vec<String> = (0..500)
+                .map(|i| format!(":(literal){}{i}", "\u{e9}".repeat(len / 2)))
+                .collect();
+            let chunks = index_chunks(&prefix, &paths);
+            assert_eq!(
+                chunks.iter().map(|c| c.len() - prefix.len()).sum::<usize>(),
+                paths.len()
+            );
+            for chunk in &chunks {
+                let bytes: usize = chunk.iter().map(|a| a.len() + 1).sum();
+                assert!(chunk.len() - prefix.len() <= MAX_INDEX_CHUNK_PATHS);
+                // One path can exceed the byte budget alone (it is at most
+                // 4096 bytes); several never do.
+                assert!(
+                    bytes <= MAX_INDEX_ARGV_BYTES || chunk.len() - prefix.len() == 1,
+                    "{len}: {bytes}"
+                );
+            }
+        }
+    }
 }
 
 /// Destructive actions are bound to a read that happened: a git read that
@@ -5745,3 +6706,7 @@ mod bound_to_checked_state {
         assert_eq!(ours.email.as_deref(), Some("env@example.test"));
     }
 }
+
+#[cfg(test)]
+#[path = "git_writer_adv_tests.rs"]
+mod adv_tests;

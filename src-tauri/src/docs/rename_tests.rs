@@ -300,9 +300,151 @@ fn a_case_only_rename_on_a_case_insensitive_volume_is_refused() {
     assert!(dir.path().join("docs/Roadmap.md").exists());
 }
 
-/// Min-of-N timing of the rename path on the synthetic 5,000-note corpus the
-/// refresh benchmark uses, with the in-memory pre-check timed on its own so
-/// "rename without it" is the difference.
+/// What a counting policy gate saw during one rename.
+#[derive(Debug, Clone, Default)]
+struct GateTally {
+    /// Every policy call: the `git mv` line, the source delete, the destination
+    /// write and one per rewritten note.
+    calls: usize,
+    /// Distinct file paths those calls judged (the `git mv` line is a command,
+    /// not a file).
+    files_judged: usize,
+    /// How many of those files were rewritten notes.
+    rewrites_judged: usize,
+    /// Wall time spent inside the gate, start to finish.
+    gate_wall: Duration,
+    /// The sum of each call's own time. Above `gate_wall` when calls overlap.
+    call_sum: Duration,
+    slowest_call: Duration,
+}
+
+/// One rename of `from` to `to` through a gate that counts and times what it is
+/// asked, with `latency` slept inside every call to stand in for the sidecar
+/// round trip. The gate makes the same calls, in the same shape, as
+/// `commands::knowledge::docs_rename_guarded`: the move, the source delete, the
+/// destination write, then every other rewritten note through the fan-out
+/// `harness::guard_files` uses (`judge_in_order`), `workers` at a time. Returns
+/// the outcome, what the gate saw, and the whole rename's wall time.
+fn counting_gate_rename(
+    path: &str,
+    from: &str,
+    to: &str,
+    latency: Duration,
+    workers: usize,
+) -> (DocRenameOutcome, GateTally, Duration) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    let calls = AtomicUsize::new(0);
+    let call_nanos = AtomicU64::new(0);
+    let slowest_nanos = AtomicU64::new(0);
+    let files = Mutex::new(Vec::<String>::new());
+    let judge = |file: Option<&str>| {
+        let started = Instant::now();
+        if !latency.is_zero() {
+            std::thread::sleep(latency);
+        }
+        calls.fetch_add(1, Ordering::AcqRel);
+        if let Some(file) = file {
+            files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(file.to_string());
+        }
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        call_nanos.fetch_add(nanos, Ordering::AcqRel);
+        slowest_nanos.fetch_max(nanos, Ordering::AcqRel);
+    };
+
+    let mut gate_wall = Duration::ZERO;
+    let mut rewrites_judged = 0;
+    let started = Instant::now();
+    let outcome = rename_doc(path, from, to, |plan| {
+        let gate_started = Instant::now();
+        judge(None);
+        judge(Some(plan.from));
+        judge(Some(plan.to));
+        let rewrites: Vec<&str> = plan
+            .rewrites
+            .iter()
+            .map(String::as_str)
+            .filter(|rewrite| *rewrite != plan.to)
+            .collect();
+        let verdicts =
+            crate::harness::judge_files_for_bench(&rewrites, workers, |file| judge(Some(file)));
+        assert!(
+            verdicts.iter().all(Option::is_some),
+            "a rewrite was never judged"
+        );
+        rewrites_judged = rewrites.len();
+        gate_wall = gate_started.elapsed();
+        Ok(())
+    })
+    .expect("rename");
+    let wall = started.elapsed();
+
+    let mut judged = files
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let files_judged = judged.len();
+    judged.sort();
+    judged.dedup();
+    assert_eq!(judged.len(), files_judged, "a file was judged twice");
+    let tally = GateTally {
+        calls: calls.load(Ordering::Acquire),
+        files_judged,
+        rewrites_judged,
+        gate_wall,
+        call_sum: Duration::from_nanos(call_nanos.load(Ordering::Acquire)),
+        slowest_call: Duration::from_nanos(slowest_nanos.load(Ordering::Acquire)),
+    };
+    // The move is one call and is not a file; every other call judged one file.
+    assert_eq!(tally.calls, tally.files_judged + 1, "{tally:?}");
+    assert_eq!(tally.files_judged, tally.rewrites_judged + 2, "{tally:?}");
+    (outcome, tally, wall)
+}
+
+#[test]
+fn the_counting_gate_sees_one_call_per_path_a_hub_rename_writes() {
+    let dir = hub_repo(40);
+    let path = dir.path().to_str().unwrap();
+    let (outcome, one, _) = counting_gate_rename(
+        path,
+        "docs/Roadmap.md",
+        "plans/Roadmap.md",
+        Duration::ZERO,
+        1,
+    );
+    assert_eq!(outcome.rewritten_paths.len(), 40, "{outcome:?}");
+    // The move, the source, the destination, and each of the 40 linking notes.
+    assert_eq!(one.calls, 43, "{one:?}");
+    assert_eq!(one.files_judged, 42, "{one:?}");
+    assert_eq!(one.rewrites_judged, 40, "{one:?}");
+
+    let workers = crate::harness::production_guard_workers();
+    let (_, many, _) = counting_gate_rename(
+        path,
+        "plans/Roadmap.md",
+        "docs/Roadmap.md",
+        Duration::ZERO,
+        workers,
+    );
+    assert_eq!(
+        (many.calls, many.files_judged),
+        (one.calls, one.files_judged),
+        "the worker count changes how long judging takes, not what is judged"
+    );
+}
+
+/// What the per-file policy cost of a hub rename is, with the gate counting and
+/// timing instead of waving every path through, on the synthetic 5,000-note
+/// corpus the refresh benchmark uses. Four arms, run interleaved and reported as
+/// the min of `RUNS`: a simulated per-call latency of 0 ms and 2 ms, each with 1
+/// worker and with the production worker count (`GUARD_FILES_CONCURRENCY`).
+/// The latency is slept inside each call; it stands in for the sidecar round
+/// trip and is not a measurement of it. The in-memory pre-check is timed on its
+/// own as before.
 ///
 /// `cargo test --release --manifest-path src-tauri/Cargo.toml --lib
 /// docs::rename_tests::docs_rename_benchmark -- --ignored --nocapture`
@@ -310,7 +452,7 @@ fn a_case_only_rename_on_a_case_insensitive_volume_is_refused() {
 #[ignore = "manual timing workload"]
 fn docs_rename_benchmark() {
     use std::time::Instant;
-    const RUNS: usize = 7;
+    const RUNS: usize = 5;
     fn min_ms(runs: usize, mut run: impl FnMut()) -> f64 {
         (0..runs)
             .map(|_| {
@@ -320,6 +462,7 @@ fn docs_rename_benchmark() {
             })
             .fold(f64::INFINITY, f64::min)
     }
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     let dir = git_repo();
     for n in 0..MAX_DOC_FILES {
         write(
@@ -336,6 +479,15 @@ fn docs_rename_benchmark() {
     let built = load_vault(path, true).unwrap();
     load_vault(path, true).unwrap();
 
+    let production = crate::harness::production_guard_workers();
+    // (simulated latency per call, workers)
+    let arms = [
+        (Duration::ZERO, 1),
+        (Duration::ZERO, production),
+        (Duration::from_millis(2), 1),
+        (Duration::from_millis(2), production),
+    ];
+
     // A note nothing links at, and the one every note links at.
     for (label, from, to) in [
         ("leaf", "notes/07/note-00007.md", "moved/note-00007.md"),
@@ -348,20 +500,109 @@ fn docs_rename_benchmark() {
         let precheck_ms = min_ms(RUNS, || {
             super::rename::links_the_rename_breaks(&repo, &built.vault, from, to, &edits);
         });
-        let (mut a, mut b) = (from.to_string(), to.to_string());
-        let end_to_end_ms = min_ms(if label == "hub" { 1 } else { RUNS }, || {
-            rename_doc(path, &a, &b, |_| Ok(())).unwrap();
-            std::mem::swap(&mut a, &mut b);
-        });
         println!(
             "docs_rename_bench target={label} notes={} rewrites={} plan_ms={plan_ms:.2} \
-             precheck_ms={precheck_ms:.2} rename_end_to_end_ms={end_to_end_ms:.2} \
-             precheck_share={:.1}%",
+             precheck_ms={precheck_ms:.2}",
             built.status.note_count,
             edits.len(),
-            100.0 * precheck_ms / end_to_end_ms
+        );
+
+        // Interleaved: each round runs every arm once, so a quiet or busy
+        // stretch of the host lands on all of them.
+        let (mut a, mut b) = (from.to_string(), to.to_string());
+        let mut best: Vec<Option<(Duration, GateTally)>> = vec![None; arms.len()];
+        for _ in 0..RUNS {
+            for (slot, (latency, workers)) in best.iter_mut().zip(arms) {
+                let (_, tally, wall) = counting_gate_rename(path, &a, &b, latency, workers);
+                std::mem::swap(&mut a, &mut b);
+                assert!(
+                    wall < crate::test_support::coverage_relaxed(Duration::from_secs(900)),
+                    "{label} rename took {wall:?}"
+                );
+                if slot.as_ref().is_none_or(|(best_wall, _)| wall < *best_wall) {
+                    *slot = Some((wall, tally));
+                }
+            }
+        }
+        let best: Vec<(Duration, GateTally)> = best.into_iter().map(Option::unwrap).collect();
+        for ((latency, workers), (wall, tally)) in arms.iter().zip(&best) {
+            println!(
+                "docs_rename_policy_bench target={label} latency_ms={} workers={workers} \
+                 policy_calls={} files_judged={} rewrites_judged={} gate_wall_ms={:.2} \
+                 gate_call_sum_ms={:.2} slowest_call_ms={:.3} rename_ms={:.2} \
+                 gate_share={:.1}% runs={RUNS}",
+                latency.as_millis(),
+                tally.calls,
+                tally.files_judged,
+                tally.rewrites_judged,
+                ms(tally.gate_wall),
+                ms(tally.call_sum),
+                ms(tally.slowest_call),
+                ms(*wall),
+                100.0 * ms(tally.gate_wall) / ms(*wall),
+            );
+        }
+        // Every arm makes the same calls; only how long they take differs.
+        for (_, tally) in &best {
+            assert_eq!(
+                (tally.calls, tally.files_judged),
+                (best[0].1.calls, best[0].1.files_judged)
+            );
+        }
+        // With a real per-call cost, the production fan-out must beat one
+        // worker; without one there is nothing to overlap and no claim is made.
+        let (serial, parallel) = (&best[2].1, &best[3].1);
+        if parallel.rewrites_judged > production {
+            assert!(
+                parallel.gate_wall < crate::test_support::coverage_relaxed(serial.gate_wall),
+                "{production} workers took {:?} against {:?} for one",
+                parallel.gate_wall,
+                serial.gate_wall
+            );
+        }
+        println!(
+            "docs_rename_policy_bench target={label} workers_speedup_at_2ms={:.2}x",
+            ms(serial.gate_wall) / ms(parallel.gate_wall).max(f64::MIN_POSITIVE)
         );
     }
+}
+
+/// A repository where `count` notes link at `docs/Roadmap.md`.
+fn hub_repo(count: usize) -> tempfile::TempDir {
+    let dir = git_repo();
+    write(dir.path(), "docs/Roadmap.md", "# Roadmap\n");
+    for i in 0..count {
+        write(dir.path(), &format!("docs/n{i:04}.md"), "[r](Roadmap.md)\n");
+    }
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "-qm", "hub"]);
+    dir
+}
+
+/// The git processes a rename starts do not grow with the notes it rewrites.
+#[test]
+fn a_hub_rename_stages_in_a_bounded_number_of_git_processes() {
+    let mut counts = Vec::new();
+    for notes in [3, 60, 300] {
+        let dir = hub_repo(notes);
+        let path = dir.path().to_str().unwrap();
+        let (outcome, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(()))
+        });
+        let outcome = outcome.expect("rename");
+        assert!(outcome.complete, "{outcome:?}");
+        assert_eq!(outcome.rewritten_paths.len(), notes);
+        let adds = labels.iter().filter(|l| l.as_str() == "git add").count();
+        assert_eq!(adds, 1, "{notes} notes: {labels:?}");
+        // Every rewritten note is in the index with its new content.
+        let index = staged(&dir);
+        assert_eq!(index.lines().count(), notes + 1, "{notes}: {index}");
+        counts.push(labels.len());
+    }
+    assert!(
+        counts.windows(2).all(|pair| pair[0] == pair[1]),
+        "{counts:?}"
+    );
 }
 
 /// Four notes that all link at `Roadmap.md`, so a rename rewrites four files.

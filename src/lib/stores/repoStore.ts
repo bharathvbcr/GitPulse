@@ -2765,6 +2765,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating("checkout", branchName, (path) =>
         invokeFn("cmd_checkout_branch", { repoPath: path, branchName }),
       ),
+    /**
+     * Checks out a commit or tag with HEAD detached. `checkoutBranch` never
+     * detaches; this is the named way to land on something that is not a
+     * branch ("Checkout Commit", a tag's Checkout).
+     */
+    checkoutDetached: async (revision: string) =>
+      runMutating("checkout", revision, (path) =>
+        invokeFn("cmd_checkout_detached", { repoPath: path, revision }),
+      ),
     createBranch: async (branchName: string, startPoint?: string, target?: MutationTarget | null) =>
       runMutating("branch", branchName, (path) =>
         invokeFn("cmd_create_branch", {

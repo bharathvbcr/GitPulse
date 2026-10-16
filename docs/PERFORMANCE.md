@@ -816,7 +816,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
-| `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
+| `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
 | `graph_spawns` | `cmd_get_commit_graph` at the default 5,000-row cap on 6,000 commits; `cmd_get_stack_hierarchy` with 20 branches beyond its 2,000-commit window, cold and with refs unmoved; each with git processes | ft-9cfa4f74 (S4-03, S4-04) |
@@ -910,6 +910,62 @@ Other benches:
   315.4/s with 32. That is still about 9.8 wake-ups per second for each idle
   session, the reader's poll. Card 12, the kqueue reader, is what brings it
   down; it landed after this baseline, which has not been re-measured.
+  - **2026-10-15 re-measure with the pollers (`0f0e0b4b`, bench rows added on
+    unmodified production code; ft-79394019, Wave 0).** Three runs of N = 3
+    windows of 5 s, `ri_interrupt_wkups`, `ri_pkg_idle_wkups` 0 throughout. The
+    figure is each run's median of its 3 windows; the harness does not keep
+    per-window values, so "min" below is the min of the three runs' medians.
+    The host was loaded throughout (load average 38.3 / 21-86 / 67-86 on 18
+    cpus, thermal `fair`, pressure `normal`), so absolute wakeups are an upper
+    bound on a quiet machine; the floor and the rows moved together.
+
+    | row | run 1 | run 2 | run 3 | min | over the floor |
+    | --- | --- | --- | --- | --- | --- |
+    | idle 0 sessions (process floor) | 2.40 | 2.40 | 2.40 | 2.40/s | n/a |
+    | idle 1 / 8 / 32 sessions | 2.20 | 2.20 | 2.20 | 2.20/s | none (kqueue reader) |
+    | idle mailbox | 2.20 | 2.00 | 2.20 | 2.00/s | none |
+    | idle 8 / 24 watches | 2.20 / 2.40 | 2.20 / 2.20 | 2.20 / 2.40 | 2.20/s | none |
+    | **idle alerts bridge** | 6.99 | 7.00 | 7.19 | **6.99/s** | about +4.6/s, the 200 ms `wait_readable` accept loop (5/s) |
+    | idle alerts bridge, after the self-pipe accept loop (`pf/79394019-bridge`) | 2.20 | 2.20 | 2.20 | **2.20/s** | none: the accept loop blocks in `wait_readable_or_woken` and is woken only by a connection or by `stop`/`start`; 6.99/s before. Measured at load average 56.8 / 78.1 / 23.7 on 18 cpus, with the floor at 2.40 and the idle mailbox at 2.20/2.20/2.20 in the same runs |
+    | **idle host-load sampler** | 2.80 | 2.80 | 2.80 | **2.80/s** | about +0.4/s, the 2 s tick |
+    | workbench `external_changes`, window hidden | see the table below | | | | |
+    | workbench `external_changes`, window visible | see the table below | | | | |
+
+    The bridge row binds the listener under a throwaway `HOME` with no
+    clients; the sampler row is `sysload::start` with `SamplerOptions::new`
+    (`host_load` enabled, 2 s cadence, a full process scan per tick) after
+    its first tick has settled. The sampler's 2 s scan adds only about one
+    wakeup per tick; the CPU it costs is not what this bench counts. The
+    external_changes watcher (1 s visible, 2 s hidden) had no row in wave 0:
+    `run` needed a Tauri `AppHandle` with a real `main` window. Its schedule is
+    now `external_changes::drive` over an `Env` trait, and
+    `external_changes::bench_seam::IdleLoop` runs it on a real clock and a
+    private profile with the window as a flag; that is what the rows below
+    measure.
+
+    **external_changes cadence, before and after (ft-79394019, wave 1, lane
+    B2).** Before is `503761fd` (the seam as a pure refactor: 2 s hidden sleep,
+    1 s visible sleep); after is `c0c037eb` (hidden loop blocks on a beacon,
+    bounded by the 30 s window check and retention's 10 min clock). Three full
+    runs each, N = 3 windows of 5 s, `ri_interrupt_wkups`, `ri_pkg_idle_wkups` 0
+    throughout; each cell is that run's median of its 3 windows. Host load
+    average (1 min) when each run started: before 142 (taken before its build;
+    the bench itself reported 26.7 once running) / 52 / 51, after 81 / 45 / 75
+    on 18 cpus (the runs were not alternated one-for-one: before first, after second,
+    because each needs its own release build).
+
+    | row | before runs 1 / 2 / 3 | after runs 1 / 2 / 3 | floor in the same runs (0 sessions) |
+    | --- | --- | --- | --- |
+    | idle external_changes (hidden) | 2.80 / 2.80 / 2.80 | 2.20 / 2.20 / 2.20 | 2.40 / 2.40 / 2.40 before; 2.40 / 2.40 / 2.20 after |
+    | idle external_changes (visible) | 3.20 / 3.20 / 3.20 | 3.20 / 3.20 / 3.20 | same |
+
+    Hidden: min 2.80/s down to 2.20/s, from +0.4/s over the floor (the 2 s
+    sleep, 0.5/s computed) to none; the row's own round counter (last window of
+    each run) went from 3 to 0 per 5 s, as the loop now wakes about twice a
+    minute. Visible: unchanged at +0.8/s, the
+    1 Hz pass the UX latency contract needs (an external task appears within
+    about a second); it is deliberately not slower. One wakeup is 0.2/s at
+    this window length, so differences below 0.4/s are one event.
 
 ### Pre-fix baseline (`a92e40fb`, loaded host), superseded
 
@@ -1246,6 +1302,101 @@ On git older than 2.37 the scan is count-bounded (`-n cap+1`, window applied
 here); a row past the cap is reported as a possibly cut window, because without
 a date bound nothing says the window does not continue behind it, and the
 window's true size is not claimed.
+
+## 2026-10-15: hub rename stages in one batch (ft-434d7befe170abdb85cb4e91264d9e6e)
+
+Renaming a note that 5,000 notes link to ran one `git add` per rewritten file
+(`GitWriter::stage_file`, about 16 ms each) and one `guard_file` policy call per
+file. Staging is now one `git add --pathspec-from-file=-` per 2,500 files
+(`GitWriter::stage_files_attributed`, which reuses `change_index_with`), and the
+rewrites are judged together (`harness::guard_files`).
+
+### Measured
+
+`docs_rename_benchmark` row `target=hub`, 5,000-note corpus, 5,000 rewrites,
+release build, **min of 3** end to end (`rename_doc`, gate `|_| Ok(())`), on a
+host with other agents building and testing at the same time. Same benchmark
+body for both rows (only the hub run count and a `runs=` column were added).
+
+| build | `rename_end_to_end_ms` (hub) | `git add` processes |
+| --- | --- | --- |
+| before (`0f0e0b4b`) | 150,106 | 5,000 |
+| after | 44,642 | 2 |
+
+The leaf row (1 rewrite, min of 7) is unchanged within noise: 131.5 ms before,
+152.1 ms after.
+
+### What the policy calls cost (counting gate)
+
+The rows above ran with a gate of `|_| Ok(())`, which says nothing about the
+per-file policy cost. `docs_rename_benchmark` now runs the rename through a
+counting gate (`counting_gate_rename`, `docs/rename_tests.rs`) that makes the
+calls `commands::knowledge::docs_rename_guarded` makes (the move, the source
+delete, the destination write, then every other rewritten note through the
+fan-out `harness::guard_files` uses, `judge_in_order`) and counts and times
+each one. A simulated per-call latency is slept inside every call to stand in
+for the sidecar round trip. **The latency is a stand-in, not a measurement of
+the sidecar**, and the gate does not do the real scope lookup or IPC; it
+measures the call count, the fan-out and what that fan-out buys.
+
+Release build, 5,000-note corpus, hub target, **min of 5**, the four arms run
+interleaved in each round, on a host with other agents building at load (the
+hub rename takes 84 to 101 s here against 44.6 s above, so read the shares, not
+the absolute rename times):
+
+| latency per call | workers | policy calls | files judged | gate wall (ms) | sum of call times (ms) | rename (ms) | gate share |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 ms | 1 | 5,002 | 5,001 | 0.56 | 0.19 | 97,315 | 0.0% |
+| 0 ms | 8 | 5,002 | 5,001 | 2.00 | 6.62 | 92,792 | 0.0% |
+| 2 ms | 1 | 5,002 | 5,001 | 18,635 | 18,622 | 101,509 | 18.4% |
+| 2 ms | 8 | 5,002 | 5,001 | 2,401 | 19,109 | 83,781 | 2.9% |
+
+- One rename is 5,002 policy calls: the `git mv` line, the source delete, the
+  destination write, and 4,999 rewritten notes (the moved note's own rewrite is
+  judged as the destination). 5,001 distinct files, each once; the bench
+  asserts no file is judged twice.
+- With a free gate the policy is nothing (0.0% of the rename). With 2 ms a call
+  one worker costs 18.6 s (18.4% of the rename); the production 8 workers cost
+  2.4 s (2.9%), a **7.76x** shorter gate (the bench asserts it beats one worker
+  within `coverage_relaxed`). What `GUARD_FILES_CONCURRENCY` buys is therefore
+  about 16 s per hub rename at 2 ms a call, and it scales with the sidecar's
+  real latency, which this bench does not know.
+- Leaf target (no linking notes): 3 calls, 2 files; at 2 ms the gate is 7.6 ms
+  with 1 worker and 24 ms with 8 (the workers do not overlap anything there and
+  the spawn plus scheduling noise dominates). No speed claim is made for it and
+  the bench asserts none.
+- Not measured: the real sidecar's round-trip latency, the scope lookup, and
+  the ledger recording `guard_files` does per verdict.
+
+### What is left in the 44.6 s
+
+It is not git and not policy. It is the durable write of each rewritten note:
+`write_regular_expecting` calls `sync_all` on the temporary file and on the
+directory, which on macOS is `F_FULLFSYNC`. A throwaway measurement of that
+shape alone (file full-fsync, rename, directory full-fsync) costs 7.95 ms per
+file against 0.27 ms for plain `fsync`, which matches 44.6 s / 5,000 = 8.9 ms.
+Amortizing the directory syncs across files in one folder would need a batched
+variant of that shared write transaction; it was not changed here because the
+conflict-resolution saves rely on it.
+
+### Bounds
+
+- Git processes: `ceil(rewrites / 2,500)` for a clean batch, plus one per 128
+  notes whose path is not ASCII. Those go as arguments, not on stdin: on macOS
+  `git add --pathspec-from-file` exits 0 and stages nothing for a decomposed
+  (NFD) spelling, which would have reported such a note staged while it was not
+  (the old per-file `git add` was unaffected). The same fix covers the
+  file-tree selection that shares `change_index_with`. A batch that fails
+  is first cleared of ignored paths (`git add` exits 1 on one but still stages
+  the rest, so those are named by `git check-ignore`, outside the budget), then
+  halved to find the file at fault, at most 64 extra runs per rename; past
+  that the files still ungrouped each carry the batch's error and say it was
+  not attributed to one path. A held `index.lock` is never halved.
+- Policy: one scope lookup, then at most 8 file checks in flight; the first
+  refusal, or a check that could not run, stops new checks. Verdicts are
+  recorded and gated in order, so the rename refuses on the same file it did
+  before. The sidecar protocol has no batch op (`policy.check.file` takes one
+  path), so each rewrite is still judged on its own.
 
 ## 2026-10-15: graph and stack history walks (ft-9cfa4f74, S4-03 and S4-04)
 

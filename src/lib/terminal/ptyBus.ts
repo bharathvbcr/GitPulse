@@ -276,6 +276,7 @@ export function createPtyBus(listen: EventListen, makeChannel: ChannelFactory): 
   function handleExit(payload: TerminalExitEvent) {
     if (!payload || typeof payload.id !== "string" || typeof payload.signal !== "string" ||
         typeof payload.reaped !== "boolean" || (!payload.reaped && (typeof payload.error !== "string" || !payload.error.trim())) ||
+        typeof payload.ended_by_gitpulse !== "boolean" ||
         !(payload.exit_code === null || (Number.isInteger(payload.exit_code) && Number.isFinite(payload.exit_code))) ||
         (payload.error != null && typeof payload.error !== "string")) {
       report("Invalid terminal exit event");
@@ -456,6 +457,8 @@ export function createPtyBus(listen: EventListen, makeChannel: ChannelFactory): 
           signal: "",
           error: notice || FORGOTTEN_EXIT,
           reaped: false,
+          // Who ended it was in the event that was discarded.
+          ended_by_gitpulse: false,
         });
       }
       let released = false;

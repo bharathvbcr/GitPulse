@@ -126,7 +126,7 @@
 
         // ---- slots free: the waiting starts follow, each once -------------
         const ended = get(terminalSessions).slice(0, 10).map((r) => r.sessionId);
-        for (const id of ended) await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true });
+        for (const id of ended) await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
         await until(() => launches.size === 36 && waiting() === 0);
         check("freeing ten slots starts every waiting agent", () => launches.size === 36);
         check("…with nothing left waiting", () => waiting() === 0);
@@ -145,7 +145,7 @@
         // ---- a resumed conversation runs in its own worktree --------------
         const before = plainSpawns.length;
         const ended2 = get(terminalSessions).slice(0, 1).map((r) => r.sessionId);
-        for (const id of ended2) await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true });
+        for (const id of ended2) await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
         prepare("old", wt("r1", "old"));
         const resumed = await resumeTaskConversation({ id: "old", task_title: "Old attempt" });
         await until(() => plainSpawns.length > before);

@@ -201,6 +201,19 @@ pub async fn cmd_terminal_incidents(
     Ok(state.incidents())
 }
 
+/// Whether Claude Code saved each of these hosted conversations: what decides
+/// whether a tab, or an incident's "Resume N", offers to resume one. Found is
+/// the only answer that offers it; Unknown is said as such and never read as
+/// Absent. At most `MAX_TRANSCRIPT_QUERIES` ids, each a canonical session id.
+///
+/// On the blocking pool: it reads Claude Code's project directories.
+#[tauri::command(async)]
+pub async fn cmd_terminal_conversations(
+    session_ids: Vec<String>,
+) -> Result<Vec<crate::workbench::conversation::ConversationTranscript>, String> {
+    off_thread(move || crate::workbench::conversation::transcripts(&session_ids)).await
+}
+
 /// Exports user-selected terminal output through the native save dialog.
 #[tauri::command(async)]
 pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {

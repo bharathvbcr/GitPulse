@@ -157,11 +157,30 @@ impl Retention {
         }
     }
 
+    /// Whether the stamp is due a look at `now`; when it is, records the look.
+    pub(crate) fn due_to_check(&mut self, now: Instant) -> bool {
+        if self
+            .checked
+            .is_some_and(|at| now.saturating_duration_since(at) < CHECK_EVERY)
+        {
+            return false;
+        }
+        self.checked = Some(now);
+        true
+    }
+
+    /// How long until [`Retention::due_to_check`] next says yes: nothing for a
+    /// loop that has not looked yet, then what is left of [`CHECK_EVERY`].
+    pub(crate) fn next_check_in(&self, now: Instant) -> Duration {
+        self.checked.map_or(Duration::ZERO, |at| {
+            CHECK_EVERY.saturating_sub(now.saturating_duration_since(at))
+        })
+    }
+
     pub(crate) fn tick(&mut self, host: &WorkbenchState) {
-        if self.checked.is_some_and(|at| at.elapsed() < CHECK_EVERY) {
+        if !self.due_to_check(Instant::now()) {
             return;
         }
-        self.checked = Some(Instant::now());
         let Ok(profile) = host.profile_path() else {
             return;
         };
