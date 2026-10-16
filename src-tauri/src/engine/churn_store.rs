@@ -81,9 +81,12 @@ pub(crate) const ZERO_CHURN: Churn = Churn {
     commits_behind: 0,
 };
 
-const FILE_NAME: &str = "churn.v1.sqlite";
-/// Bumped whenever a row's meaning changes; any other version is discarded and
-/// rebuilt empty (this is a cache of derived data, so losing it costs one
+/// The file is named for the schema, so two GitPulse builds of different
+/// schema versions sharing one cache directory each keep their own file; with
+/// one shared name, each start would drop and rebuild the other's table.
+const FILE_NAME: &str = "churn.v2.sqlite";
+/// Bumped whenever a row's meaning changes (and `FILE_NAME` with it); a file of
+/// any other version is discarded and rebuilt empty (this is a cache of derived data, so losing it costs one
 /// measurement per branch). Version 2 moved the base out of the key.
 const SCHEMA_VERSION: i64 = 2;
 /// Rows kept on disk: one per branch tip per repository and input state.
@@ -1313,6 +1316,50 @@ mod tests {
         store.insert(1, 2, "new-base", &one("a", 7)).unwrap();
         let found = store.lookup(1, 2, &["a".to_string()]).unwrap();
         assert_eq!(found["a"].base, "new-base");
+    }
+
+    /// What the build before the base left the key does on open: the oracle for
+    /// a v1 binary sharing the cache directory.
+    fn v1_binary_opens(dir: &Path) {
+        let conn = Connection::open(dir.join("churn.v1.sqlite")).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        if version != 1 {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS churn;
+                 CREATE TABLE churn (
+                     repo INTEGER NOT NULL, inputs INTEGER NOT NULL,
+                     base TEXT NOT NULL, tip TEXT NOT NULL,
+                     additions INTEGER NOT NULL, deletions INTEGER NOT NULL,
+                     files INTEGER NOT NULL, ahead INTEGER NOT NULL,
+                     behind INTEGER NOT NULL, stored INTEGER NOT NULL,
+                     PRIMARY KEY (repo, inputs, base, tip)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+    }
+
+    /// An older and a newer build sharing one cache directory must not drop
+    /// each other's table on every start.
+    #[test]
+    fn builds_of_different_schema_versions_do_not_rebuild_each_others_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        for round in 0..3 {
+            v1_binary_opens(cache.path());
+            let mut store = Store::open(&cache.path().join(FILE_NAME), 10).unwrap();
+            if round > 0 {
+                let found = store.lookup(1, 2, &["a".to_string()]).unwrap();
+                assert_eq!(
+                    found["a"].base, "base",
+                    "round {round}: the older build's start emptied the newer cache"
+                );
+            }
+            store.insert(1, 2, "base", &one("a", 7)).unwrap();
+        }
+        assert_ne!(FILE_NAME, "churn.v1.sqlite");
     }
 
     #[test]
