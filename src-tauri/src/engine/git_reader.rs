@@ -639,14 +639,13 @@ impl GitReader {
             let track = parts.get(3).copied().unwrap_or("");
             let (ahead_count, behind_count) = git_cli::parse_ahead_behind(track);
 
-            let is_remote = refname.starts_with("refs/remotes/");
+            let (short, is_remote) = short_branch_name(refname);
             let (name, remote_name) = if is_remote {
-                let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                let remote = remotes::split_tracking_ref(&remote_names, short)
                     .map(|(owner, _)| owner.to_string());
-                (rest.to_string(), remote)
+                (short.to_string(), remote)
             } else {
-                (refname.trim_start_matches("refs/heads/").to_string(), None)
+                (short.to_string(), None)
             };
 
             let upstream = parts
@@ -756,14 +755,13 @@ impl GitReader {
             if is_remote_head(&remote_names, refname) {
                 continue;
             }
-            let is_remote = refname.starts_with("refs/remotes/");
+            let (short, is_remote) = short_branch_name(refname);
             let (name, remote_name) = if is_remote {
-                let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                let remote = remotes::split_tracking_ref(&remote_names, short)
                     .map(|(owner, _)| owner.to_string());
-                (rest.to_string(), remote)
+                (short.to_string(), remote)
             } else {
-                (refname.trim_start_matches("refs/heads/").to_string(), None)
+                (short.to_string(), None)
             };
             if !is_remote {
                 local_names.push(name.clone());
@@ -3728,6 +3726,21 @@ pub(crate) fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
 }
 
 /// One listed ref awaiting churn computation in [`GitReader::branch_stats`].
+/// The listing name of a `for-each-ref` branch refname and whether it is a
+/// remote-tracking one. The namespace is stripped exactly once: `git branch
+/// refs/heads/x` creates the real ref `refs/heads/refs/heads/x`, whose name is
+/// `refs/heads/x`, and a repeated strip would collapse it onto branch `x`. The
+/// one owner both branch listings go through.
+fn short_branch_name(refname: &str) -> (&str, bool) {
+    match refname.strip_prefix("refs/remotes/") {
+        Some(rest) => (rest, true),
+        None => (
+            refname.strip_prefix("refs/heads/").unwrap_or(refname),
+            false,
+        ),
+    }
+}
+
 struct BranchStatTarget {
     name: String,
     tip_commit_id: String,
@@ -7240,6 +7253,70 @@ mod tests {
             );
         }
         dir
+    }
+
+    /// `git branch refs/heads/x` succeeds and creates the ref
+    /// `refs/heads/refs/heads/x`. The listings strip the namespace once, so it
+    /// is shown as `refs/heads/x` rather than collapsing onto the real `x`.
+    fn repo_with_doubled_prefix_branch() -> tempfile::TempDir {
+        let dir = init_repo_with_remotes(&[], "main");
+        git_in(dir.path(), &["switch", "-c", "x"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "on x"]);
+        git_in(dir.path(), &["switch", "main"]);
+        git_in(dir.path(), &["switch", "-c", "other"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "on odd"]);
+        git_in(dir.path(), &["branch", "refs/heads/x"]);
+        git_in(dir.path(), &["switch", "main"]);
+        dir
+    }
+
+    #[test]
+    fn list_branches_keeps_a_doubled_refs_heads_name_distinct() {
+        let dir = repo_with_doubled_prefix_branch();
+        let listed = GitReader::list_branches(dir.path().to_str().unwrap()).unwrap();
+        let names: Vec<&str> = listed.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "x").count(),
+            1,
+            "the real branch x is listed once: {names:?}"
+        );
+        assert!(
+            names.contains(&"refs/heads/x"),
+            "refs/heads/refs/heads/x is stripped once: {names:?}"
+        );
+    }
+
+    #[test]
+    fn branch_stats_keeps_a_doubled_refs_heads_name_distinct() {
+        let dir = repo_with_doubled_prefix_branch();
+        let report = GitReader::branch_stats(dir.path().to_str().unwrap()).unwrap();
+        let names: Vec<&str> = report.updates.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "x").count(),
+            1,
+            "the real branch x is reported once: {names:?}"
+        );
+        assert!(
+            names.contains(&"refs/heads/x"),
+            "refs/heads/refs/heads/x is stripped once: {names:?}"
+        );
+    }
+
+    #[test]
+    fn short_branch_name_strips_each_namespace_exactly_once() {
+        assert_eq!(short_branch_name("refs/heads/x"), ("x", false));
+        assert_eq!(
+            short_branch_name("refs/heads/refs/heads/x"),
+            ("refs/heads/x", false)
+        );
+        assert_eq!(
+            short_branch_name("refs/remotes/origin/x"),
+            ("origin/x", true)
+        );
+        assert_eq!(
+            short_branch_name("refs/remotes/refs/remotes/o/x"),
+            ("refs/remotes/o/x", true)
+        );
     }
 
     #[test]
