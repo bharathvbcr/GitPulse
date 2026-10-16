@@ -8666,6 +8666,11 @@ some-future-field whatever
         assert!(teardown_entries(dir.path()).is_empty());
     }
 
+    /// One `hdiutil` call. A healthy one takes seconds; one that wedges (the
+    /// image helper, a busy volume on detach) would otherwise park the suite.
+    #[cfg(target_os = "macos")]
+    const HDIUTIL_BUDGET: Duration = Duration::from_secs(60);
+
     /// A small APFS volume mounted under a temp directory, so a worktree can
     /// sit on another device than the repository's git directory.
     #[cfg(target_os = "macos")]
@@ -8681,13 +8686,19 @@ some-future-field whatever
             let image = dir.path().join("volume.dmg");
             let mount = dir.path().join("mnt");
             std::fs::create_dir(&mount).unwrap();
+            // Built before the first hdiutil call so a call that wedges or
+            // dies after mounting still reaches `Drop` and its detach.
+            let mut volume = Self { mount, _dir: dir };
             let run = |args: &[&std::ffi::OsStr]| {
-                let out = std::process::Command::new("hdiutil")
-                    .args(args)
-                    .output_locked()
-                    .expect("hdiutil");
+                let mut cmd = std::process::Command::new("hdiutil");
+                cmd.args(args);
+                let out = crate::test_support::run_within(
+                    cmd,
+                    "hdiutil",
+                    crate::test_support::coverage_relaxed(HDIUTIL_BUDGET),
+                );
                 assert!(
-                    out.status.success(),
+                    out.success,
                     "hdiutil {args:?}: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
@@ -8706,21 +8717,26 @@ some-future-field whatever
                 "attach".as_ref(),
                 "-nobrowse".as_ref(),
                 "-mountpoint".as_ref(),
-                mount.as_os_str(),
+                volume.mount.as_os_str(),
                 image.as_os_str(),
             ]);
-            let mount = mount.canonicalize().unwrap();
-            Self { mount, _dir: dir }
+            volume.mount = volume.mount.canonicalize().unwrap();
+            volume
         }
     }
 
     #[cfg(target_os = "macos")]
     impl Drop for DiskImage {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("hdiutil")
-                .args(["detach", "-force"])
-                .arg(&self.mount)
-                .output_locked();
+            // Never panics: this also runs while another failure unwinds.
+            let mut cmd = std::process::Command::new("hdiutil");
+            cmd.args(["detach", "-force"]).arg(&self.mount);
+            let _ = crate::engine::git_cli::run_bounded(
+                cmd,
+                "hdiutil detach",
+                crate::test_support::coverage_relaxed(HDIUTIL_BUDGET),
+                None,
+            );
         }
     }
 
