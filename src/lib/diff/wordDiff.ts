@@ -315,15 +315,91 @@ export function replacementBlockBounds(
   lines: AnnotatedDiffLine[],
   index: number
 ): [number, number] | null {
+  const block = replacementBlock(lines, index);
+  return block ? [block.start, block.end] : null;
+}
+
+/** A replacement block: dels in `[start, addStart)`, adds in `[addStart, end)`. */
+export interface ReplacementBlock {
+  start: number;
+  addStart: number;
+  end: number;
+}
+
+/** [`replacementBlockBounds`] plus where the del run ends and the add run begins. */
+export function replacementBlock(
+  lines: AnnotatedDiffLine[],
+  index: number
+): ReplacementBlock | null {
   const line = lines[index];
   if (!line || (line.type !== "del" && line.type !== "add")) return null;
   let start = index;
   while (start > 0 && lines[start - 1].type === "add") start -= 1;
   while (start > 0 && lines[start - 1].type === "del") start -= 1;
-  let end = index + 1;
-  while (end < lines.length && lines[end].type === "del") end += 1;
+  let addStart = start;
+  while (addStart < lines.length && lines[addStart].type === "del") addStart += 1;
+  let end = addStart;
   while (end < lines.length && lines[end].type === "add") end += 1;
-  return [start, end];
+  return { start, addStart, end };
+}
+
+/** Pairs annotated on each side of the requested row by [`annotateAround`]. */
+export const WORD_DIFF_PAIR_HALO = 24;
+
+/**
+ * LCS table cells one [`annotateAround`] call may spend on neighbours once the
+ * requested row's own pair (always done) is counted. Per-line caps bound one pair at ~252k cells (500 tokens a
+ * side); this bounds a call to a handful of those, however many pairs the
+ * halo names.
+ */
+export const WORD_DIFF_CELL_BUDGET = 1_000_000;
+
+/** Upper bound on the LCS table `computeWordDiff` builds for two lines. */
+function pairCellCost(oldLen: number, newLen: number): number {
+  return (Math.min(oldLen, MAX_TOKENS + 1) + 1) * (Math.min(newLen, MAX_TOKENS + 1) + 1);
+}
+
+/**
+ * Word-diffs the pair holding row `index` and its neighbours, not the whole
+ * replacement block.
+ *
+ * `annotateRange` over a block costs one LCS per pair, so a block of
+ * thousands of long lines stalled the first row paint. Here the row's own
+ * pair is always annotated; then up to [`WORD_DIFF_PAIR_HALO`] pairs on each
+ * side, nearest first, while the call stays within [`WORD_DIFF_CELL_BUDGET`].
+ * Pairs left over simply stay plain until their own row is rendered (each
+ * rendered row calls this for itself), and the pairing is the same
+ * `del[k]`/`add[k]` one `annotateRange` makes. Pass the block back in to skip
+ * the scan for rows of the same block.
+ */
+export function annotateAround(
+  lines: AnnotatedDiffLine[],
+  index: number,
+  block: ReplacementBlock | null = replacementBlock(lines, index),
+  halo: number = WORD_DIFF_PAIR_HALO
+): void {
+  if (!block) return;
+  const pairCount = Math.min(block.addStart - block.start, block.end - block.addStart);
+  const k = index < block.addStart ? index - block.start : index - block.addStart;
+  if (k < 0 || k >= pairCount) return;
+  let spent = 0;
+  const annotatePair = (offset: number, force: boolean): void => {
+    if (offset < 0 || offset >= pairCount) return;
+    const delLine = lines[block.start + offset];
+    const addLine = lines[block.addStart + offset];
+    if (delLine.segments || addLine.segments) return;
+    const cost = pairCellCost(delLine.content.length - 1, addLine.content.length - 1);
+    if (!force && spent + cost > WORD_DIFF_CELL_BUDGET) return;
+    spent += cost;
+    const diff = computeWordDiff(delLine.content.slice(1), addLine.content.slice(1));
+    delLine.segments = diff.original_segments;
+    addLine.segments = diff.modified_segments;
+  };
+  annotatePair(k, true);
+  for (let d = 1; d <= halo; d += 1) {
+    annotatePair(k - d, false);
+    annotatePair(k + d, false);
+  }
 }
 
 /**
