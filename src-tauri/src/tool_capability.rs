@@ -680,6 +680,9 @@ mod tests {
                         || clock.now(),
                         || {
                             probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // Long enough that every other thread is at the
+                            // gate, so a missing gate cannot pass by luck.
+                            std::thread::sleep(Duration::from_millis(50));
                             found(&bin)
                         },
                     );
@@ -749,7 +752,8 @@ mod tests {
         let clock = Clock::new();
         let dir = tempfile::tempdir().unwrap();
         let bin = stub(dir.path(), "devmap", "v1");
-        let release = std::sync::Barrier::new(2);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
         let probes = std::sync::atomic::AtomicUsize::new(0);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
@@ -759,7 +763,11 @@ mod tests {
                     || clock.now(),
                     || {
                         probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        release.wait();
+                        // Bounded, so a failing assertion below cannot leave
+                        // this thread waiting for a release that never comes.
+                        let _ = release_rx.lock().unwrap().recv_timeout(
+                            crate::test_support::coverage_relaxed(Duration::from_secs(5)),
+                        );
                         found(&bin)
                     },
                 );
@@ -778,11 +786,16 @@ mod tests {
                 ))
                 .unwrap();
             });
+            let early = rx
+                .recv_timeout(crate::test_support::coverage_relaxed(
+                    Duration::from_millis(100),
+                ))
+                .is_ok();
+            release_tx.send(()).unwrap();
             assert!(
-                rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                !early,
                 "the waiter was answered while the probe was still running"
             );
-            release.wait();
             let got = rx
                 .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
                     5,
