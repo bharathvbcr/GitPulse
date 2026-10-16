@@ -36,10 +36,12 @@ describe("WorktreesPanel", () => {
 
 describe("WorktreesPanel agent worktree affordances", () => {
   it("exposes lock, unlock, and prune commands", () => {
-    expect(source).toContain("cmd_lock_worktree");
-    expect(source).toContain("cmd_unlock_worktree");
-    // Prune and cache sync are repoStore mutations: the store owns the command
-    // (repoStore.test.ts) and the contract test keeps the panel from sending it.
+    expect(source).toContain("repoStore.lockWorktree(wt.path, target, true)");
+    expect(source).toContain("repoStore.unlockWorktree(wt.path, target, true)");
+    // Prune, cache sync, lock and unlock are repoStore mutations: the store owns
+    // the command (repoStore.test.ts) and the contract test keeps the panel from sending it.
+    expect(source).not.toContain("cmd_lock_worktree");
+    expect(source).not.toContain("cmd_unlock_worktree");
     expect(source).toContain("repoStore.pruneWorktrees(target)");
     expect(source).toContain("repoStore.worktreeCowSync(wt.path, target)");
     expect(source).not.toContain("cmd_prune_worktree");
@@ -134,9 +136,10 @@ describe("WorktreesPanel removal safety", () => {
     // tab used to stay open on a deleted path, holding a tab slot.
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
     expect(fn).not.toContain("$repoStore.currentPath === targetPath");
-    const removed = fn.indexOf("removeCompleted = true");
+    const removed = fn.indexOf("repoStore.removeWorktree(");
     const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
-    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", removed);
+    const staleReturn = fn.indexOf("repoStore.targetIsActive(target)", removed);
+    expect(removed).toBeGreaterThan(-1);
     expect(closeIdx).toBeGreaterThan(removed);
     expect(closeIdx).toBeLessThan(staleReturn);
   });
@@ -146,65 +149,81 @@ describe("WorktreesPanel removal safety", () => {
     // the same active-only check.
     const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
     expect(fn).not.toContain("$repoStore.currentPath === wt.path");
-    const merged = fn.indexOf("mergeCompleted = true");
+    const merged = fn.indexOf("repoStore.worktreeMergeTeardown(");
     const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
-    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", merged);
+    const staleReturn = fn.indexOf("repoStore.targetIsActive(target)", closeIdx);
+    expect(merged).toBeGreaterThan(-1);
     expect(closeIdx).toBeGreaterThan(merged);
     expect(closeIdx).toBeLessThan(staleReturn);
   });
 
   it("holds the merge to the commit the row showed, and keeps the tab of a worktree that is still there", () => {
     const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
-    expect(fn).toMatch(/cmd_worktree_merge_teardown[\s\S]*?expectedTip: wt\.head/);
-    // A merge that landed is recorded as one, whatever became of the cleanup.
-    expect(fn.indexOf("mergeCompleted = true")).toBeLessThan(fn.indexOf("ok: true"));
+    expect(fn).toMatch(/repoStore\.worktreeMergeTeardown\([\s\S]*?expectedTip: wt\.head/);
     // The tab goes only with a worktree the teardown removed.
-    expect(fn).toMatch(/res\.output\.worktree_removed \? \$repoStore\.openTabs\.find/);
-    expect(fn).toContain('worktreeSetupNotices(res.output, "merge")');
+    expect(fn).toMatch(/merged\.worktree_removed \? \$repoStore\.openTabs\.find/);
+    expect(fn).toContain('worktreeSetupNotices(merged, "merge")');
   });
 
-  it("preserves the concurrent-session currentPath guards after the await", () => {
+  it("keeps the concurrent-session guards across the awaits", () => {
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
-    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(3);
-    expect(fn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?currentPath !== repo[\s\S]*?cmd_remove_worktree/);
-    expect(fn).toContain("await load()");
+    // A fresh read of "the repository in front" after the await is what the old
+    // currentPath comparison was; the target the confirm captured replaces it.
+    expect(fn).not.toContain("$repoStore.currentPath !== repo");
+    expect(fn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?repoStore\.removeWorktree\(targetPath, force, target/);
+    expect(fn).toMatch(/repoStore\.targetIsActive\(target\)\) return;\s*await load\(\)/);
   });
 
-  it("journals settled create/remove calls before stale UI returns", () => {
-    for (const [start, end, command] of [
-      ["async function create", "function removeArmTitle", "cmd_add_worktree"],
-      ["async function remove", "function open", "cmd_remove_worktree"],
+  it("routes every worktree mutation through repoStore with the target captured before the first await", () => {
+    // The store journals (kind, label, ok), counts the call for the quit guard
+    // and queues it per repository, so the panel keeps none of that itself.
+    expect(source).not.toContain("harnessStore");
+    expect(source).not.toMatch(/invoke(<[^>]*>)?\("cmd_(add|remove|lock|unlock)_worktree"/);
+    expect(source).not.toContain('"cmd_worktree_merge_teardown"');
+    for (const [start, end, wrapper] of [
+      ["async function toggleLock", "async function prune", "repoStore.lockWorktree("],
+      ["async function create", "function removeArmTitle", "repoStore.addWorktree("],
+      ["async function remove", "function open", "repoStore.removeWorktree("],
+      ["async function mergeTeardown", "async function fetchAiSummary", "repoStore.worktreeMergeTeardown("],
     ] as const) {
       const body = source.slice(source.indexOf(start), source.indexOf(end));
-      const settled = body.indexOf(command);
-      const successJournal = body.indexOf("harnessStore.recordAction", settled);
-      const successGuard = body.indexOf("$repoStore.currentPath !== repo", settled);
-      expect(successJournal, `${start} success journal`).toBeGreaterThan(settled);
-      expect(successJournal, `${start} success before stale return`).toBeLessThan(successGuard);
-
-      const caught = body.indexOf("} catch", successGuard);
-      const failureJournal = body.indexOf("harnessStore.recordAction", caught);
-      const failureGuard = body.indexOf("$repoStore.currentPath !== repo", caught);
-      expect(failureJournal, `${start} failure journal`).toBeGreaterThan(caught);
-      expect(failureJournal, `${start} failure before stale return`).toBeLessThan(failureGuard);
+      const captured = body.indexOf("repoStore.captureTarget()");
+      const firstAwait = body.indexOf("await ");
+      expect(captured, `${start} captures a target`).toBeGreaterThan(-1);
+      expect(captured, `${start} captures before it awaits`).toBeLessThan(firstAwait);
+      expect(body, `${start} calls ${wrapper}`).toContain(wrapper);
     }
   });
 
-  it("freezes worktree creation inputs before invoking the backend", () => {
+  it("captures the armed confirm's target on the first click, and refuses to run when it is no longer in front", () => {
+    for (const [start, end, armed] of [
+      ["async function remove", "function open", "removeTarget = armed;"],
+      ["async function mergeTeardown", "async function fetchAiSummary", "mergeTarget = armed;"],
+    ] as const) {
+      const body = source.slice(source.indexOf(start), source.indexOf(end));
+      const arming = body.indexOf(armed);
+      const second = body.indexOf("const target = ", arming);
+      expect(arming, `${start} arms with a target`).toBeGreaterThan(-1);
+      expect(second, `${start} runs on the armed target`).toBeGreaterThan(arming);
+    }
+    const merge = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    expect(merge).toMatch(/if \(!repoStore\.targetIsActive\(target\)\) \{\s*toastStore\.error\([^)]*repository changed[^)]*\);\s*return;/);
+    expect(merge.indexOf("repoStore.targetIsActive(target)")).toBeLessThan(merge.indexOf("repoStore.worktreeMergeTeardown("));
+  });
+
+  it("freezes worktree creation inputs before calling the store", () => {
     const body = source.slice(source.indexOf("async function create"), source.indexOf("function removeArmTitle"));
-    const invoke = body.indexOf('("cmd_add_worktree"');
-    expect(invoke, "the create call").toBeGreaterThan(-1);
+    const call = body.indexOf("repoStore.addWorktree(");
+    expect(call, "the create call").toBeGreaterThan(-1);
     for (const declaration of [
       "const targetPath = newPath.trim();",
       "const branch = newBranch.trim();",
       "const base = startPoint.trim();",
-      "const actionLabel = branch ? `${branch} → ${targetPath}` : targetPath;",
     ]) {
       const index = body.indexOf(declaration);
       expect(index, declaration).toBeGreaterThan(-1);
-      expect(index, `${declaration} before invoke`).toBeLessThan(invoke);
+      expect(index, `${declaration} before the call`).toBeLessThan(call);
     }
-    expect(body).toContain("label: actionLabel");
   });
 });
 

@@ -12,7 +12,7 @@ import { createDiffSelection } from "../repos/diffSelection";
 import { sessionsByRepo, terminalSessions } from "../terminal/sessionRegistry";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
-import { parseTagList, type BranchInfo, type DeadbranchCleanResult, type DeadbranchRestoreResult, type TagInfo } from "../branches/types";
+import { parseTagList, type BranchInfo, type DeadbranchCleanResult, type DeadbranchRestoreResult, type MergeTeardownResult, type TagInfo, type WorktreeCreated, type WorktreeRemoval } from "../branches/types";
 import type { DeleteOutcome } from "../files/types";
 import { readFileWriteError } from "../files/fileWrite";
 import { filterStore } from "./filterStore";
@@ -2779,13 +2779,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName }),
         { target },
       ),
-    deleteBranch: async (branchName: string, force: boolean = false, target?: MutationTarget | null) =>
+    /**
+     * `handled`: the caller reports a refusal itself (a row that says the
+     * branch was kept), so it is returned and journalled but not also filed on
+     * the session as an error banner.
+     */
+    deleteBranch: async (branchName: string, force: boolean = false, target?: MutationTarget | null, handled: boolean = false) =>
       runMutating(
         force ? "branch-delete-force" : "branch-delete",
         branchName,
         (path) =>
           invokeFn("cmd_delete_branch", { repoPath: path, branchName, force }),
-        { target },
+        { target, expected: handled ? () => true : undefined },
       ),
     // --- stash ----------------------------------------------------------
 
@@ -2938,6 +2943,94 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_worktree_cow_sync", { repoPath: path, targetPath: worktreePath }),
         { target },
       ),
+    /**
+     * The worktree commands below return `Guarded<T>`, so a successful call
+     * carries its payload on `output`. `handled` is the same flag as on
+     * `deleteBranch`: the panel or row that asked reports the failure itself.
+     */
+    addWorktree: async (
+      request: { targetPath: string; newBranch: string | null; startPoint: string | null; detach: boolean; cowCaches: boolean; runHooks: boolean },
+      target?: MutationTarget | null,
+      handled: boolean = false,
+    ) =>
+      runMutating<WorktreeCreated>(
+        "worktree",
+        request.newBranch ? `${request.newBranch} → ${request.targetPath}` : request.targetPath,
+        (path) =>
+          invokeFn("cmd_add_worktree", {
+            repoPath: path,
+            targetPath: request.targetPath,
+            newBranch: request.newBranch,
+            startPoint: request.startPoint,
+            detach: request.detach,
+            cowCaches: request.cowCaches,
+            runHooks: request.runHooks,
+          }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    removeWorktree: async (targetPath: string, force: boolean, target?: MutationTarget | null, handled: boolean = false) =>
+      runMutating<WorktreeRemoval>(
+        "worktree-remove",
+        targetPath,
+        (path) => invokeFn("cmd_remove_worktree", { repoPath: path, targetPath, force }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    lockWorktree: async (targetPath: string, target?: MutationTarget | null, handled: boolean = false) =>
+      runMutating(
+        "worktree-lock",
+        targetPath,
+        (path) => invokeFn("cmd_lock_worktree", { repoPath: path, targetPath, reason: null }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    unlockWorktree: async (targetPath: string, target?: MutationTarget | null, handled: boolean = false) =>
+      runMutating(
+        "worktree-unlock",
+        targetPath,
+        (path) => invokeFn("cmd_unlock_worktree", { repoPath: path, targetPath }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    /**
+     * Merges the worktree's branch and removes it. `expectedTip` is the commit
+     * the caller showed the person: the host merges nothing when the branch is
+     * anywhere else once it holds its lock. Its typed refusal stays on `cause`.
+     */
+    worktreeMergeTeardown: async (
+      request: { worktreePath: string; targetBranch: string | null; squash: boolean; expectedTip: string },
+      target?: MutationTarget | null,
+      handled: boolean = false,
+    ) =>
+      runMutating<MergeTeardownResult>(
+        "worktree-merge",
+        `${request.worktreePath} merge-teardown`,
+        (path) =>
+          invokeFn("cmd_worktree_merge_teardown", {
+            repoPath: path,
+            worktreePath: request.worktreePath,
+            targetBranch: request.targetBranch,
+            squash: request.squash,
+            expectedTip: request.expectedTip,
+          }),
+        { target, expected: handled ? () => true : undefined },
+      ),
+    /**
+     * A mutation target for the repository at `rawPath`, opening it in the
+     * background when no tab holds it. For flows that act on a repository other
+     * than the one in front (an attempt's main checkout) and must capture it
+     * before they ask. Null when it cannot be opened.
+     */
+    targetForPath: async (rawPath: string): Promise<MutationTarget | null> => {
+      const find = (): MutationTarget | null => {
+        for (const tab of internal.workspace.tabs) {
+          const session = internal.sessions[tab.id];
+          if (session && sameRepo(session.path, rawPath, options)) return { tabId: session.id, path: session.path };
+        }
+        return null;
+      };
+      const open = find();
+      if (open) return open;
+      if (!(await store.openRepo(rawPath, { activate: false }))) return null;
+      return find();
+    },
     deadbranchClean: async (branches: string[], force: boolean, createBackup: boolean, target?: MutationTarget | null) =>
       runMutating<DeadbranchCleanResult>("deadbranch-clean", `${branches.length} branches`, (path) =>
         invokeFn("cmd_deadbranch_clean", { repoPath: path, branches, force, createBackup }),

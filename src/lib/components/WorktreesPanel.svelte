@@ -1,16 +1,15 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRemoval, type WorktreeRouteInfo } from "../branches/types";
+  import { worktreeSetupNotices, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
   import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
   import { loadWorktreeTasks } from "../tasks/bindings";
   import { loadTaskScopes } from "../tasks/scopes";
   import { invoke } from "../ipc/invoke";
   import { reportPanelError } from "../diagnostics/report";
-  import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore, type MutationOutcome, type MutationTarget } from "../stores/repoStore";
   import { repoScope } from "../repos/repoScope.svelte";
-  import { harnessStore, type Guarded } from "../stores/harnessStore";
-  import { reportFailure } from "../stores/mutationOutcome";
+    import { reportFailure } from "../stores/mutationOutcome";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     FolderGit2,
@@ -98,6 +97,15 @@
   }
   let mergeConfirmPath = $state<string | null>(null);
   let mergingPath = $state<string | null>(null);
+  /**
+   * The repository each armed confirm was raised in, captured on the first
+   * click. The second click runs there or is refused: it never lands on
+   * whichever repository is in front by then.
+   */
+  let removeTarget: MutationTarget | null = null;
+  let mergeTarget: MutationTarget | null = null;
+  /** Rows with a lock or unlock in flight: a second click waits for the first, whose answer decides which one it is. */
+  const locking = new Set<string>();
   let mergeTimer: ReturnType<typeof setTimeout> | null = null;
   let aiSummaries = $state<Record<string, string>>({});
   let loadingSummaries = $state<Record<string, boolean>>({});
@@ -132,6 +140,8 @@
       if (confirmTimer !== null) clearTimeout(confirmTimer);
       confirmTimer = null;
       removingPath = null;
+      removeTarget = null;
+      mergeTarget = null;
       if (mergeTimer !== null) clearTimeout(mergeTimer);
       mergeTimer = null;
       mergeConfirmPath = null;
@@ -299,23 +309,38 @@
     }
   }
 
+  /**
+   * Says why a mutation did not run or did not finish. A refusal (the
+   * repository changed) is a toast; any other failure is the panel's inline
+   * error, once: the store was told the panel reports it (`handled`), so it is
+   * not also an error banner.
+   */
+  function showFailure(outcome: MutationOutcome, what: string, epoch: number) {
+    if (outcome.ok) return;
+    if (outcome.refused) {
+      reportFailure(outcome, what);
+      return;
+    }
+    const message = reportPanelError("worktrees", outcome.cause ?? outcome.error);
+    if (tabScope.isCurrent(epoch)) error = message;
+  }
+
   async function toggleLock(wt: WorktreeInfo) {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
+    const target = repoStore.captureTarget();
+    if (!target || locking.has(wt.path)) return;
     const epoch = tabScope.epoch;
+    locking.add(wt.path);
     try {
-      if (wt.is_locked) {
-        await invoke("cmd_unlock_worktree", { repoPath: repo, targetPath: wt.path });
-      } else {
-        await invoke("cmd_lock_worktree", { repoPath: repo, targetPath: wt.path, reason: null });
-      }
+      const outcome = wt.is_locked
+        ? await repoStore.unlockWorktree(wt.path, target, true)
+        : await repoStore.lockWorktree(wt.path, target, true);
+      if (!outcome.ok) return showFailure(outcome, wt.is_locked ? "Could not unlock the worktree" : "Could not lock the worktree", epoch);
       // `load()` reads the ACTIVE repository; after a switch that is not the
       // one this lock was for, and the new one has just loaded itself.
       if (!tabScope.isCurrent(epoch)) return;
       await load();
-    } catch (err: unknown) {
-      const message = reportPanelError("worktrees", err);
-      if (tabScope.isCurrent(epoch)) error = message;
+    } finally {
+      locking.delete(wt.path);
     }
   }
 
@@ -333,48 +358,30 @@
   }
 
   async function create() {
-    const repo = $repoStore.currentPath;
+    const target = repoStore.captureTarget();
     const targetPath = newPath.trim();
     const branch = newBranch.trim();
     const base = startPoint.trim();
-    if (!repo || !targetPath) return;
-    const actionLabel = branch ? `${branch} → ${targetPath}` : targetPath;
-    let createCompleted = false;
+    if (!target || !targetPath) return;
     const epoch = tabScope.epoch;
     isCreating = true;
     error = null;
     try {
-      const created = await invoke<Guarded<WorktreeCreated>>("cmd_add_worktree", {
-        repoPath: repo,
-        targetPath,
-        newBranch: branch || null,
-        startPoint: base || null,
-        detach: !branch,
-        cowCaches,
-        runHooks,
-      });
-      createCompleted = true;
+      const outcome = await repoStore.addWorktree(
+        { targetPath, newBranch: branch || null, startPoint: base || null, detach: !branch, cowCaches, runHooks },
+        target,
+        true,
+      );
+      if (!outcome.ok) return showFailure(outcome, "Could not create the worktree", epoch);
       // Created, but not everything it was asked to do happened. Said now,
       // while the reader still knows which worktree they just made.
-      for (const notice of worktreeSetupNotices(created.output, "create")) toastStore.warning(notice);
-      harnessStore.recordAction({
-        repoPath: repo,
-        kind: "worktree",
-        label: actionLabel,
-        ok: true,
-      });
-      if ($repoStore.currentPath !== repo) return;
+      for (const notice of worktreeSetupNotices(outcome.output ?? {}, "create")) toastStore.warning(notice);
+      if (!repoStore.targetIsActive(target)) return;
       newPath = "";
       newBranch = "";
       startPoint = "";
       showAddForm = false;
       await load();
-    } catch (err: unknown) {
-      if (!createCompleted) {
-        harnessStore.recordAction({ repoPath: repo, kind: "worktree", label: actionLabel, ok: false });
-      }
-      if ($repoStore.currentPath !== repo) return;
-      error = reportPanelError("worktrees", err);
     } finally {
       // A create started in the repository left behind has no say over the
       // new one's button; the switch already cleared the flag.
@@ -394,13 +401,14 @@
   }
 
   async function remove(wt: WorktreeInfo) {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
     const targetPath = wt.path;
     // Two-step confirm: the first click arms, the second removes. No native
     // dialog, so the flow stays keyboard-reachable and testable. The arming
     // timer is tracked so destroy (effect cleanup above) can clear it.
     if (removingPath !== wt.path) {
+      const armed = repoStore.captureTarget();
+      if (!armed) return;
+      removeTarget = armed;
       removingPath = wt.path;
       if (confirmTimer !== null) clearTimeout(confirmTimer);
       confirmTimer = setTimeout(() => {
@@ -410,34 +418,27 @@
       return;
     }
     removingPath = null;
+    const target = removeTarget;
+    removeTarget = null;
+    if (!target) return;
+    const epoch = tabScope.epoch;
     // --force destroys uncommitted work. An unscanned worktree (null) is
     // not a verified-clean one: never force-remove it. A scanned dirty
     // tree is force-removed only after the armed confirm named the cost.
     const force = typeof wt.dirty_files === "number" && wt.dirty_files > 0;
-    let removeCompleted = false;
-    try {
-      if (!(await repoStore.trustRepo(targetPath))) return;
-      if ($repoStore.currentPath !== repo) return;
-      const removed = await invoke<Guarded<WorktreeRemoval>>("cmd_remove_worktree", { repoPath: repo, targetPath, force });
-      removeCompleted = true;
-      // The worktree is gone; files that could not be deleted after it are a notice, not a failure.
-      for (const notice of worktreeSetupNotices(removed?.output ?? {}, "remove")) toastStore.warning(notice);
-      harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: true });
-      // T-F09: a tab on the removed directory is stranded on a deleted path,
-      // active or not. Only the active one used to close; a background tab
-      // stayed open, held a tab slot, and was re-reported by every workspace
-      // sync. Closing the active one activates a surviving neighbor.
-      const stranded = $repoStore.openTabs.find((tab) => tab.path === targetPath);
-      if (stranded) await repoStore.closeTab(stranded.id);
-      if ($repoStore.currentPath !== repo) return;
-      await load();
-    } catch (err: unknown) {
-      if (!removeCompleted) {
-        harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: false });
-      }
-      if ($repoStore.currentPath !== repo) return;
-      error = reportPanelError("worktrees", err);
-    }
+    if (!(await repoStore.trustRepo(targetPath))) return;
+    const outcome = await repoStore.removeWorktree(targetPath, force, target, true);
+    if (!outcome.ok) return showFailure(outcome, "Could not remove the worktree", epoch);
+    // The worktree is gone; files that could not be deleted after it are a notice, not a failure.
+    for (const notice of worktreeSetupNotices(outcome.output ?? {}, "remove")) toastStore.warning(notice);
+    // T-F09: a tab on the removed directory is stranded on a deleted path,
+    // active or not. Only the active one used to close; a background tab
+    // stayed open, held a tab slot, and was re-reported by every workspace
+    // sync. Closing the active one activates a surviving neighbor.
+    const stranded = $repoStore.openTabs.find((tab) => tab.path === targetPath);
+    if (stranded) await repoStore.closeTab(stranded.id);
+    if (!repoStore.targetIsActive(target)) return;
+    await load();
   }
 
   function open(wt: WorktreeInfo) {
@@ -459,9 +460,11 @@
   );
 
   async function mergeTeardown(wt: WorktreeInfo) {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
+    if (mergingPath === wt.path) return;
     if (mergeConfirmPath !== wt.path) {
+      const armed = repoStore.captureTarget();
+      if (!armed) return;
+      mergeTarget = armed;
       mergeConfirmPath = wt.path;
       if (mergeTimer !== null) clearTimeout(mergeTimer);
       mergeTimer = setTimeout(() => {
@@ -471,47 +474,43 @@
       return;
     }
     mergeConfirmPath = null;
+    const target = mergeTarget;
+    mergeTarget = null;
+    if (!target) return;
+    const epoch = tabScope.epoch;
     mergingPath = wt.path;
     error = null;
-    let mergeCompleted = false;
     try {
       if (!(await repoStore.trustRepo(wt.path))) return;
-      if ($repoStore.currentPath !== repo) return;
-      const res = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", {
-        repoPath: repo,
-        worktreePath: wt.path,
-        targetBranch: null,
-        squash: false,
-        // The commit this row showed: the host merges nothing if the branch moved since.
-        expectedTip: wt.head,
-      });
+      // The trust prompt can sit open while the reader goes elsewhere. The
+      // merge is the destructive one: it runs only in the repository whose
+      // row was confirmed, and says so when that is no longer in front.
+      if (!repoStore.targetIsActive(target)) {
+        toastStore.error("Could not merge the worktree: the repository changed while it was waiting; nothing was run.");
+        return;
+      }
+      const outcome = await repoStore.worktreeMergeTeardown(
+        {
+          worktreePath: wt.path,
+          targetBranch: null,
+          squash: false,
+          // The commit this row showed: the host merges nothing if the branch moved since.
+          expectedTip: wt.head,
+        },
+        target,
+        true,
+      );
+      if (!outcome.ok || !outcome.output) return showFailure(outcome, "Could not merge the worktree", epoch);
+      const merged = outcome.output;
       // The merge landed: a cleanup that did not finish is a notice below, not a failure.
-      mergeCompleted = true;
-      harnessStore.recordAction({
-        repoPath: repo,
-        kind: "worktree-remove",
-        label: `Merged ${wt.branch ?? wt.name} into ${res.output.target_branch} (${res.output.commits_merged} commits) & teardown`,
-        ok: true,
-      });
-      for (const notice of worktreeSetupNotices(res.output, "merge")) toastStore.warning(notice);
+      for (const notice of worktreeSetupNotices(merged, "merge")) toastStore.warning(notice);
       // The teardown removed the directory: a tab on it is stranded whether
       // or not it is the active one (T-F09, same as remove()). A worktree
       // that is still there keeps its tab.
-      const stranded = res.output.worktree_removed ? $repoStore.openTabs.find((tab) => tab.path === wt.path) : undefined;
+      const stranded = merged.worktree_removed ? $repoStore.openTabs.find((tab) => tab.path === wt.path) : undefined;
       if (stranded) await repoStore.closeTab(stranded.id);
-      if ($repoStore.currentPath !== repo) return;
+      if (!repoStore.targetIsActive(target)) return;
       await load();
-    } catch (err: unknown) {
-      if (!mergeCompleted) {
-        harnessStore.recordAction({
-          repoPath: repo,
-          kind: "worktree-remove",
-          label: `${wt.branch ?? wt.name} merge-teardown`,
-          ok: false,
-        });
-      }
-      if ($repoStore.currentPath !== repo) return;
-      error = reportPanelError("worktrees", err);
     } finally {
       mergingPath = null;
     }

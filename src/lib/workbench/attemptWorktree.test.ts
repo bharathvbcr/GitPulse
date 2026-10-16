@@ -10,7 +10,12 @@ const repoState = writable<{ openTabs: Tab[] }>({ openTabs: [] });
 const trustRepo = vi.fn(async (path: string) => path);
 const closeTab = vi.fn(async (_id: string) => {});
 const previewUncommitted = vi.fn(async (_path: string) => {});
-vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: (p: string) => previewUncommitted(p) } }));
+let fake: ReturnType<typeof import("./attemptRepoStoreFake").fakeAttemptStore>;
+vi.mock("../stores/repoStore", async () => {
+  const { fakeAttemptStore } = await import("./attemptRepoStoreFake");
+  fake = fakeAttemptStore((command, args) => invoke(command, args), { merge: "cmd_worktree_merge_teardown", remove: "cmd_remove_worktree", deleteBranch: "cmd_delete_branch" });
+  return { repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: (p: string) => previewUncommitted(p), ...fake.members } };
+});
 const setGlobalSurface = vi.fn();
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (s: string) => setGlobalSurface(s) } }));
 
@@ -32,6 +37,7 @@ const listing = (dirty: number | null) => [
 beforeEach(() => {
   invoke.mockReset(); askConfirm.mockReset(); trustRepo.mockClear(); closeTab.mockClear(); setGlobalSurface.mockClear(); previewUncommitted.mockClear();
   repoState.set({ openTabs: [] });
+  fake.seen.length = 0; fake.state.stillNamed = () => true; fake.state.openFails = false;
 });
 
 describe("attemptWorktreeOffer", () => {
@@ -150,6 +156,60 @@ describe("merge and discard", () => {
     await discardAttemptWorktree(run());
     expect(askConfirm.mock.calls.at(-1)?.[0].message).toContain("could not be counted, so only a clean removal is tried");
     expect(calls.filter(([c]) => c === "cmd_remove_worktree").at(-1)?.[1]).toMatchObject({ force: false });
+  });
+
+  it("captures the main checkout as the target before it asks, and sends every mutation to it", async () => {
+    const order: string[] = [];
+    const target = { tabId: "tab:/work/repo", path: "/work/repo" };
+    const seenAtAsk = () => fake.seen.length;
+    askConfirm.mockImplementation(async () => { order.push(`ask:${seenAtAsk()}`); return true; });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+      if (cmd === "cmd_list_worktrees") return listing(0);
+      return null;
+    });
+    await discardAttemptWorktree(run());
+    // Nothing had been sent when the reader was asked; the target was already held.
+    expect(order).toEqual(["ask:0"]);
+    expect(fake.seen).toEqual([{ command: "cmd_remove_worktree", target }, { command: "cmd_delete_branch", target }]);
+  });
+
+  it("refuses a discard whose repository changed while the reader decided, and sends nothing", async () => {
+    askConfirm.mockImplementation(async () => { fake.state.stillNamed = () => false; return true; });
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+      if (cmd === "cmd_list_worktrees") return listing(0);
+      throw new Error(`unexpected ${cmd}`);
+    });
+    await expect(discardAttemptWorktree(run())).rejects.toThrow(/repository changed/);
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_remove_worktree");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_delete_branch");
+  });
+
+  it("says the branch was kept when the repository changed after the removal, and does not delete it", async () => {
+    askConfirm.mockResolvedValue(true);
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+      if (cmd === "cmd_list_worktrees") return listing(0);
+      if (cmd === "cmd_remove_worktree") { fake.state.stillNamed = () => false; return { policy: null, output: {} }; }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const result = await discardAttemptWorktree(run());
+    expect(result?.message).toMatch(/The worktree was removed\..*was kept: The repository changed/);
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_delete_branch");
+  });
+
+  it("refuses a merge whose repository changed while the reader decided, and sends nothing", async () => {
+    askConfirm.mockImplementation(async () => { fake.state.stillNamed = () => false; return true; });
+    await expect(mergeAttemptWorktree(run())).rejects.toThrow(/repository changed/);
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_worktree_merge_teardown");
+  });
+
+  it("does not ask or send when the main checkout cannot be opened to hold the target", async () => {
+    fake.state.openFails = true;
+    await expect(discardAttemptWorktree(run())).rejects.toThrow(/could not be opened/);
+    await expect(mergeAttemptWorktree(run())).rejects.toThrow(/could not be opened/);
+    expect(askConfirm).not.toHaveBeenCalled();
   });
 
   it("review opens the checkout on its changes, in front", async () => {
