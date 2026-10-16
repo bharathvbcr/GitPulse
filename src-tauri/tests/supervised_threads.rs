@@ -71,11 +71,40 @@ const NEEDLES: &[&str] = &[
     "spawn_scoped",
 ];
 
-/// Raw starts in the production part of a file: up to its top-level
-/// `mod tests {`. A nested, indented test module (one inside a `cfg` module of
-/// platform code) is skipped to its closing brace, which rustfmt puts at the
-/// module's own indent, and the scan goes on: production code after it is
-/// still production code.
+/// Strips an optional visibility prefix (`pub`, `pub(crate)`, `pub(super)`,
+/// `pub(self)`, `pub(in path)`) from a trimmed line.
+fn strip_visibility(trimmed: &str) -> &str {
+    let Some(rest) = trimmed.strip_prefix("pub") else {
+        return trimmed;
+    };
+    if let Some(inner) = rest.strip_prefix('(') {
+        return inner
+            .split_once(')')
+            .map_or(trimmed, |(_, after)| after.trim_start());
+    }
+    match rest.strip_prefix(char::is_whitespace) {
+        Some(after) => after.trim_start(),
+        None => trimmed,
+    }
+}
+
+/// Whether a trimmed line opens an inline test module, with any visibility.
+fn opens_test_module(trimmed: &str) -> bool {
+    let rest = strip_visibility(trimmed);
+    ["mod tests", "mod verification_note_tests"]
+        .iter()
+        .any(|name| {
+            rest.strip_prefix(name)
+                .is_some_and(|after| after.trim_start().starts_with('{'))
+        })
+}
+
+/// Raw starts in the production part of a file: up to its top-level test
+/// module, of any visibility (`mod tests`, `pub(crate) mod tests`, ...). Files
+/// keep further test-only modules after it, so a top-level one ends the scan. A
+/// nested, indented test module (one inside a `cfg` module of platform code) is
+/// skipped to its closing brace, which rustfmt puts at the module's own indent,
+/// and the scan goes on: production code after it is still production code.
 fn raw_starts(text: &str) -> usize {
     let mut count = 0;
     let mut skip_to: Option<String> = None;
@@ -87,12 +116,14 @@ fn raw_starts(text: &str) -> usize {
             continue;
         }
         let trimmed = line.trim_start();
-        if trimmed.starts_with("mod tests") || trimmed.starts_with("mod verification_note_tests") {
+        if opens_test_module(trimmed) {
             let indent = &line[..line.len() - trimmed.len()];
             if indent.is_empty() {
                 break;
             }
-            skip_to = Some(format!("{indent}}}"));
+            if !trimmed.trim_end().ends_with('}') {
+                skip_to = Some(format!("{indent}}}"));
+            }
             continue;
         }
         if trimmed.starts_with("//") {
@@ -177,4 +208,35 @@ fn test_only_modules_are_declared_under_cfg_test() {
 fn the_scan_skips_a_nested_test_module_and_counts_what_follows() {
     let text = "mod sys {\n    fn a() { std::thread::spawn(|| {}); }\n    #[cfg(test)]\n    mod tests {\n        fn t() { std::thread::spawn(|| {}); }\n    }\n}\nfn b() { std::thread::Builder::new(); }\nmod tests {\n    fn t() { std::thread::spawn(|| {}); }\n}\n";
     assert_eq!(raw_starts(text), 2);
+}
+
+/// A top-level `#[cfg(test)] pub(crate) mod tests {` is test code whatever its
+/// visibility: its raw spawns are not counted, a production spawn before it is,
+/// and the other visibility forms behave the same. The same holds for a nested
+/// test module of any visibility, after which production code still counts.
+#[test]
+fn a_test_module_of_any_visibility_is_skipped_and_production_around_it_counts() {
+    let spawn = "    fn t() { std::thread::spawn(|| {}); }\n";
+    for head in [
+        "mod tests {",
+        "pub mod tests {",
+        "pub(crate) mod tests {",
+        "pub(super) mod tests {",
+        "pub(in crate::a) mod tests {",
+        "mod verification_note_tests {",
+        "pub(crate) mod verification_note_tests {",
+    ] {
+        let test_mod = format!("#[cfg(test)]\n{head}\n{spawn}}}\n");
+        let top = format!("fn before() {{ std::thread::spawn(|| {{}}); }}\n{test_mod}");
+        assert_eq!(raw_starts(&top), 1, "{head}");
+        assert_eq!(raw_starts(&test_mod), 0, "{head}");
+        let nested = format!(
+            "mod sys {{\n    fn a() {{ std::thread::spawn(|| {{}}); }}\n    #[cfg(test)]\n    {head}\n{spawn}    }}\n    fn b() {{ std::thread::Builder::new(); }}\n}}\n"
+        );
+        assert_eq!(raw_starts(&nested), 2, "{head}");
+    }
+    assert_eq!(
+        raw_starts("mod tests_helper {\n    fn t() { std::thread::spawn(|| {}); }\n}\n"),
+        1
+    );
 }
