@@ -1330,3 +1330,46 @@ cores and gate nothing. What changed:
 * **Not changed.** The default-branch probes (`config --list`, two
   `symbolic-ref`, `remote`, one `for-each-ref`) run again after any ref moves,
   5 of the 9 remaining cold spawns. They are outside this card.
+
+## 2026-10-15: branch churn survives a default-branch advance (ft-9cfa497403d3338f25e75bdb97176a44, S4-06)
+
+`churn_store` keyed a row `(repo, inputs, base, tip)`, so one commit on the
+default branch missed every branch's row and `branch_stats` ran one
+`diff --shortstat` per branch again (96 a call, serial, 5 s budget). The row is
+now keyed `(repo, inputs, tip)` and records the base it was measured against.
+
+The rule for keeping an answer over a moved base lives with the value
+(`churn_store::Kept::carried`): the new base must descend from the recorded
+one, and the tip's ahead count against the new base (from the one
+`tip_counts_against` listing, always fresh) must be the recorded count. The
+set of a branch's own commits can only shrink as the base grows, so an equal
+count is an equal set, hence the same merge base and the same diff. Behind is
+taken from the listing; the carried answer is re-kept against the new base. The
+descent costs one `merge-base --is-ancestor` per distinct stored base, at most
+`MAX_CARRY_BASES` (4) a call, and none when every row is already against the
+current base. A rewound or replaced base, a branch the base absorbed (fully or
+in part), a tip the listing did not count, a git without the listing, and any
+changed input (the fingerprint is still in the key) are measured as before.
+
+**Persisted data.** The table's primary key changed, so `SCHEMA_VERSION` is 2.
+A file written by an older build is dropped and rebuilt empty by
+`ensure_schema` (`a_cache_from_before_the_base_left_the_key_is_rebuilt`). The
+file is derived data, so the cost is one measurement per branch on the first
+launch. No DevCouncil-owned schema is involved.
+
+Bench `churn_spawns` (new): 32 branches, each one commit ahead; `main` gets an
+unrelated commit; the call after it. Process counts come from trace2 on two
+repository copies (advance only, advance and call), so priming and the advance
+do not count. Interleaved pre-fix / post-fix binaries, two rounds each, on a
+host at load 91-104 on 18 cores; the counters are the gate, the times are
+recorded.
+
+| | shortstat | merge-base | ahead-behind listing | all processes | min (round 1, 2) | p50 (round 1, 2) |
+|---|---|---|---|---|---|---|
+| before | 32 | 0 | 1 | 44 | 650 ms, 666 ms | 874 ms, 731 ms |
+| after | 0 | 1 | 1 | 13 | 162 ms, 181 ms | 212 ms, 253 ms |
+
+The 13 after are the call's fixed reads (config, ref listings, the base
+probes, the `for-each-ref` ahead-behind listing) and the one ancestry check.
+`merge-base` is 0 before because `diff --shortstat <base>...<tip>` finds its
+own merge base inside the shortstat process.
