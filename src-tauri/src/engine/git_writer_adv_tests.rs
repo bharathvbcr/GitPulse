@@ -56,7 +56,10 @@ fn a_ref_created_after_judging_cannot_change_the_argv_that_runs() {
     let (_origin, _parent, work) = clone_with_remote_feature();
     let path = work.to_str().unwrap();
     let judged = GitWriter::checkout_branch_argv(path, "origin/feature").unwrap();
-    assert_eq!(judged[1..], ["switch", "--track", "origin/feature"]);
+    assert_eq!(
+        judged[1..],
+        ["switch", "--track", "-c", "feature", "origin/feature"]
+    );
     // Between the gate and the run, an unrelated local `feature` appears.
     git_in(&work, &["branch", "feature", "main"]);
     let result = GitWriter::checkout_branch_judged(path, "origin/feature", &judged);
@@ -77,7 +80,9 @@ fn a_ref_deleted_after_judging_cannot_change_the_argv_that_runs() {
     git_in(&work, &["branch", "-D", "feature"]);
     let result = GitWriter::checkout_branch_judged(path, "origin/feature", &judged);
     assert!(result.is_err());
-    assert!(!local_branches(&work).iter().any(|b| b == "refs/heads/feature"));
+    assert!(!local_branches(&work)
+        .iter()
+        .any(|b| b == "refs/heads/feature"));
 }
 
 #[test]
@@ -157,7 +162,14 @@ fn a_revision_starting_with_a_dash_never_reaches_argv() {
 fn checkout_detached_refuses_ranges_and_reflog_grammar() {
     let (_origin, _parent, work) = clone_with_remote_feature();
     let path = work.to_str().unwrap();
-    for rev in ["a..b", "..", "HEAD@{1}", "main:path", "@{-1}", "main^{tree}"] {
+    for rev in [
+        "a..b",
+        "..",
+        "HEAD@{1}",
+        "main:path",
+        "@{-1}",
+        "main^{tree}",
+    ] {
         assert!(GitWriter::checkout_detached(path, rev).is_err(), "{rev}");
         assert_eq!(attached(&work).as_deref(), Some("main"));
     }
@@ -196,6 +208,83 @@ fn remote_mapping_handles_slashed_and_prefix_remotes() {
     );
 }
 
+/// A remote-tracking ref whose branch part starts with a dash must not become
+/// an option once the remote prefix is stripped (`origin/-x` -> `-x`).
+#[test]
+fn a_dashed_branch_part_of_a_tracking_name_never_becomes_an_option() {
+    let (_origin, _parent, work) = clone_with_remote_feature();
+    let path = work.to_str().unwrap();
+    git_in(
+        &work,
+        &["update-ref", "refs/remotes/origin/-x", "origin/feature"],
+    );
+    for name in ["origin/-x", "origin/--orphan=x", "origin/HEAD"] {
+        if name != "origin/-x" {
+            git_in(
+                &work,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/{name}"),
+                    "origin/feature",
+                ],
+            );
+        }
+        let argv = GitWriter::checkout_branch_argv(path, name);
+        if let Ok(argv) = argv {
+            assert!(
+                argv[1..]
+                    .iter()
+                    .skip(1)
+                    .all(|a| !a.starts_with('-')
+                        || ["--track", "-c", "--guess"].contains(&a.as_str())),
+                "{name}: option-shaped argument in {argv:?}"
+            );
+        }
+        let _ = GitWriter::checkout_branch(path, name);
+        assert_eq!(attached(&work).as_deref(), Some("main"), "{name}");
+        assert_eq!(local_branches(&work), ["refs/heads/main"], "{name}");
+    }
+}
+
+/// Remotes `a` and `a/b` both own `refs/remotes/a/b/x` by name; the writer
+/// cannot tell which branch that is, so it refuses rather than guess.
+#[test]
+fn a_tracking_name_two_configured_remotes_could_own_is_refused() {
+    let (origin, _parent, work) = clone_with_remote_feature();
+    let path = work.to_str().unwrap();
+    let url = origin.path().to_str().unwrap();
+    // `git remote add` refuses overlapping names; hand-edited config does not.
+    git_in(&work, &["config", "remote.a.url", url]);
+    git_in(&work, &["config", "remote.a/b.url", url]);
+    git_in(
+        &work,
+        &["update-ref", "refs/remotes/a/b/x", "origin/feature"],
+    );
+    let result = GitWriter::checkout_branch(path, "a/b/x");
+    assert!(
+        result.is_err(),
+        "ambiguous owner must be refused: {result:?}"
+    );
+    assert_eq!(attached(&work).as_deref(), Some("main"));
+    assert!(!local_branches(&work).iter().any(|b| b.ends_with("/x")));
+}
+
+/// The remote list must be read fresh for a decision that creates a branch:
+/// a remote added after a cached read is still a remote.
+#[test]
+fn a_remote_added_after_a_cached_config_read_is_still_a_remote() {
+    let (origin, _parent, work) = clone_with_remote_feature();
+    let path = work.to_str().unwrap();
+    let _warm = crate::engine::git_reader::configured_remote_names(&work);
+    git_in(
+        &work,
+        &["remote", "add", "a/b", origin.path().to_str().unwrap()],
+    );
+    git_in(&work, &["fetch", "-q", "a/b"]);
+    GitWriter::checkout_branch(path, "a/b/feature").unwrap();
+    assert_eq!(attached(&work).as_deref(), Some("feature"));
+}
+
 /// A remote that is not configured but still has refs under `refs/remotes/`
 /// (a deleted remote, a hand-made ref). The first-slash fallback must not
 /// switch to an unrelated local branch that happens to carry the tail's name.
@@ -204,7 +293,10 @@ fn an_unconfigured_remote_namespace_never_switches_to_a_lookalike_local_branch()
     let (_origin, _parent, work) = clone_with_remote_feature();
     let path = work.to_str().unwrap();
     // refs/remotes/gone/team/x -- no remote "gone" is configured.
-    git_in(&work, &["update-ref", "refs/remotes/gone/team/x", "origin/feature"]);
+    git_in(
+        &work,
+        &["update-ref", "refs/remotes/gone/team/x", "origin/feature"],
+    );
     // A local branch whose name equals the tail after the first slash.
     git_in(&work, &["branch", "team/x", "main"]);
     let result = GitWriter::checkout_branch(path, "gone/team/x");

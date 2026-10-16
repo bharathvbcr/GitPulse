@@ -3227,6 +3227,13 @@ pub(crate) fn configured_remote_names(repo: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The configured remote names read straight from git, never from the cache,
+/// and an unreadable config is an error rather than "no remotes". For a caller
+/// that creates or moves a branch on the answer.
+pub(crate) fn configured_remote_names_fresh(repo: &Path) -> Result<Vec<String>, String> {
+    config_snapshot_with(repo, Reads::Fresh).map(|config| configured_remotes(&config))
+}
+
 /// Whether the repository still has pre-config remote definitions, which
 /// `git remote` lists and no config key shows.
 fn has_legacy_remotes(repo: &Path) -> bool {

@@ -23,7 +23,7 @@ pub async fn cmd_checkout_branch(
         let argv = GitWriter::checkout_branch_argv(&repo_path, &branch_name)?;
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
-        let output = GitWriter::checkout_branch(&repo_path, &branch_name)?;
+        let output = GitWriter::checkout_branch_judged(&repo_path, &branch_name, &argv)?;
         Ok(Guarded { policy, output })
     })
     .await

@@ -1223,11 +1223,19 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// creates a local branch from a single remote twin. A tag or an object id
     /// is not a branch and is refused; [`Self::checkout_detached`] is the
     /// explicit way to land on one.
+    ///
+    /// The answer is a snapshot of the refs and config. A caller that gets it
+    /// approved must run it through [`Self::checkout_branch_judged`], which
+    /// re-derives it under the repository lock and refuses if it changed.
     pub fn checkout_branch_argv(repo_path: &str, branch_name: &str) -> Result<Vec<String>, String> {
         let repo = validate_repo(repo_path)?;
+        Self::checkout_branch_argv_in(&repo, branch_name)
+    }
+
+    fn checkout_branch_argv_in(repo: &Path, branch_name: &str) -> Result<Vec<String>, String> {
         validate_ref_name(branch_name)?;
         let ref_exists = |full: &str| -> Result<bool, String> {
-            Ok(git_captured(&repo, &["show-ref", "--verify", "--quiet", full])?.success)
+            Ok(git_captured(repo, &["show-ref", "--verify", "--quiet", full])?.success)
         };
         let argv = |rest: &[&str]| -> Vec<String> {
             std::iter::once("git")
@@ -1239,15 +1247,47 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Ok(argv(&["switch", branch_name]));
         }
         if ref_exists(&format!("refs/remotes/{branch_name}"))? {
-            let remotes = crate::engine::git_reader::configured_remote_names(&repo);
-            if let Some((_, local)) =
-                crate::engine::remotes::split_tracking_ref(&remotes, branch_name)
-            {
-                if ref_exists(&format!("refs/heads/{local}"))? {
-                    return Ok(argv(&["switch", local]));
-                }
-                return Ok(argv(&["switch", "--track", branch_name]));
+            // Read fresh: a branch is created or chosen on this answer.
+            let remotes = crate::engine::git_reader::configured_remote_names_fresh(repo)?;
+            let mut owners = remotes.iter().filter(|remote| {
+                branch_name.len() > remote.len()
+                    && branch_name.starts_with(remote.as_str())
+                    && branch_name.as_bytes()[remote.len()] == b'/'
+            });
+            let (Some(remote), None) = (owners.next(), owners.next()) else {
+                return Err(format!(
+                    "'{branch_name}' does not name exactly one configured remote's branch; \
+                     check it out by its local name"
+                ));
+            };
+            let local = &branch_name[remote.len() + 1..];
+            validate_ref_name(local)?;
+            if local == "HEAD" {
+                return Err(format!(
+                    "'{branch_name}' is the remote's HEAD pointer, not a branch"
+                ));
             }
+            if ref_exists(&format!("refs/heads/{local}"))? {
+                let upstream = git_text(
+                    repo,
+                    &[
+                        "for-each-ref",
+                        "--format=%(upstream)",
+                        &format!("refs/heads/{local}"),
+                    ],
+                )?;
+                let upstream = upstream.trim();
+                if !upstream.is_empty() && upstream != format!("refs/remotes/{branch_name}") {
+                    return Err(format!(
+                        "local branch '{local}' tracks {upstream}, not '{branch_name}'; \
+                         switch to '{local}' by name, or rename it first"
+                    ));
+                }
+                return Ok(argv(&["switch", local]));
+            }
+            // `--track` alone names the new branch by dropping everything up to
+            // the first slash, which is wrong for a remote called `a/b`; name it.
+            return Ok(argv(&["switch", "--track", "-c", local, branch_name]));
         }
         Ok(argv(&["switch", "--guess", branch_name]))
     }
@@ -1258,25 +1298,45 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// or an object id and reported that as a branch checkout. A refused
     /// `switch` (dirty tree, ambiguous or missing name) is the error.
     pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<CheckoutOutcome, String> {
-        let argv = Self::checkout_branch_argv(repo_path, branch_name)?;
-        let repo = validate_repo(repo_path)?;
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-        git_text(&repo, &args)?;
-        Self::checkout_outcome(&repo)
+        Self::checkout_branch_locked(repo_path, branch_name, None)
     }
 
-    /// Runs `checkout_branch` for a caller that already had `judged` approved.
+    /// [`Self::checkout_branch`] for a caller whose policy gate approved
+    /// `judged` (from [`Self::checkout_branch_argv`]). The argv is derived again
+    /// under the repository lock; if refs or config moved in between and it is
+    /// no longer the approved line, nothing runs.
     pub fn checkout_branch_judged(
         repo_path: &str,
         branch_name: &str,
         judged: &[String],
     ) -> Result<CheckoutOutcome, String> {
-        let _ = judged;
-        Self::checkout_branch(repo_path, branch_name)
+        Self::checkout_branch_locked(repo_path, branch_name, Some(judged))
+    }
+
+    fn checkout_branch_locked(
+        repo_path: &str,
+        branch_name: &str,
+        judged: Option<&[String]>,
+    ) -> Result<CheckoutOutcome, String> {
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let argv = Self::checkout_branch_argv_in(&repo, branch_name)?;
+        if let Some(judged) = judged {
+            if judged != argv.as_slice() {
+                return Err(format!(
+                    "'{branch_name}' now resolves to `{}`, not the approved `{}`; \
+                     the repository changed, try again",
+                    argv.join(" "),
+                    judged.join(" ")
+                ));
+            }
+        }
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
     }
 
     /// Checks out a commit, tag or other revision with HEAD detached. This is
