@@ -7694,7 +7694,8 @@ mod fail_closed_tests {
         );
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(15),
+            // Relaxed at most 4x (28 s), still short of the 30 s auditor.
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(7)),
             "a 30 s auditor under a 2 s deadline took {elapsed:?}"
         );
         let ran = logged(&log);

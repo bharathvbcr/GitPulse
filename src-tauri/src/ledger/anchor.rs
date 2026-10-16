@@ -771,7 +771,8 @@ mod tests {
             },
         );
         assert!(out.is_err(), "{out:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Relaxed at most 4x (20 s), still short of the 30 s probe.
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
         let out = first_occupied(
             vec!["/a".to_string(), "/b".to_string()],
             Duration::from_secs(5),
@@ -938,12 +939,16 @@ mod tests {
         let (_db, b) = git_repo();
         settle(&a).unwrap();
         settle(&b).unwrap();
+        // b is held for twice the (load-relaxed) limit plus the 300 ms head
+        // start, so a settle of a that waited behind b always exceeds it.
+        let limit = crate::test_support::coverage_relaxed(Duration::from_millis(1_000));
+        let hold = limit * 2 + Duration::from_millis(300);
         let (locked_send, locked) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 super::super::with_conn(&b, |_| {
                     locked_send.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(2_000));
+                    std::thread::sleep(hold);
                     Ok(())
                 })
                 .unwrap();
@@ -955,7 +960,7 @@ mod tests {
             let started = Instant::now();
             settle(&a).unwrap();
             assert!(
-                started.elapsed() < Duration::from_millis(1_000),
+                started.elapsed() < limit,
                 "a's settle waited {:?} behind b",
                 started.elapsed()
             );
