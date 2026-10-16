@@ -23,7 +23,8 @@ let failWorkspace = false, missingRegistry = false, partialWorkspace = false, fa
 let files = ["src/App.svelte", "src/lib/components/CommandPalette.svelte", "README.md"];
 const fixture = {
  cmd_resolve_repo: a => { if(failedRepo) throw Error("Repository missing"); return { path: a.path, name: "GitPulse", is_bare: false }; },
- cmd_list_branches: () => [branch("main", true), branch("feature/palette")],
+ cmd_list_branches: () => [branch("main", true), branch("feature/palette"), { ...branch("origin/remote-only"), is_remote: true, remote_name: "origin" }],
+ cmd_checkout_branch: () => ({ detached: false }),
  cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }), cmd_stash_list: () => ({ entries: [], truncated: false }),
  cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
  cmd_repo_operation: () => null,
@@ -79,7 +80,9 @@ if (params.has("check")) {
   check("IME Enter cannot execute a command", Boolean(input()));
   await type("@"); check("current branch is visibly unavailable", option("main")?.getAttribute("aria-disabled") === "true");
   option("main").click(); await settle(); check("disabled rows keep the palette open", Boolean(input()) && !calls.some(c => c.cmd === "cmd_checkout_branch"));
-  await type("qckcmt"); check("fuzzy aliases find Quick Commit", Boolean(option("Quick Commit")));
+  option("origin/remote-only").click(); await settle();
+  check("a remote branch row checks out its local tracking name, never origin/<name>", calls.filter(c => c.cmd === "cmd_checkout_branch").map(c => c.args.branchName).join() === "remote-only");
+  await open(); await type("qckcmt"); check("fuzzy aliases find Quick Commit", Boolean(option("Quick Commit")));
   check("clean-tree Quick Commit explains why it cannot run", option("Quick Commit")?.textContent.includes("Nothing to commit"));
   files = Array.from({ length: 125 }, (_, i) => `src/file-${String(i).padStart(3,"0")}.ts`);
   await type("/"); await waitFor(() => option("file-000.ts"));

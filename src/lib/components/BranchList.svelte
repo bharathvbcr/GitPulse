@@ -1412,8 +1412,8 @@
       {/if}
     {:else if menu.tag}
       {@const t = menu.tag}
-      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); checkoutName(name); }}>
-        <GitBranch size={12} /> Checkout
+      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); void repoStore.checkoutDetached(name); }}>
+        <GitBranch size={12} /> Checkout (detached)
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); selectRef(name); }}>
         <Tag size={12} /> Filter history
