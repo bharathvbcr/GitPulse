@@ -461,6 +461,9 @@ mod deadline_timer {
         /// sleep from a spin.
         #[cfg(test)]
         passes: std::sync::atomic::AtomicU64,
+        /// Worker passes that should panic, so a test can drive the restart path.
+        #[cfg(test)]
+        panics_left: std::sync::atomic::AtomicU32,
     }
 
     impl Shared {
@@ -469,6 +472,8 @@ mod deadline_timer {
         }
 
         fn run(&self) {
+            // Declared before `state`, so it drops after the lock is released.
+            let _fail_closed = TripPendingOnUnwind(self);
             let mut state = self.lock();
             loop {
                 if state.closed {
@@ -477,6 +482,18 @@ mod deadline_timer {
                 #[cfg(test)]
                 self.passes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                if self
+                    .panics_left
+                    .try_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    panic!("injected deadline timer panic");
+                }
                 let now = Instant::now();
                 let mut fired = Vec::new();
                 while let Some(entry) = state.due.first_entry() {
@@ -515,6 +532,24 @@ mod deadline_timer {
         }
     }
 
+    /// A worker that panics may be restarted, or may be given up on for good,
+    /// and either way the deadlines it held are no longer guaranteed. Tripping
+    /// them is the fail-closed answer: a cancelled query reports itself, an
+    /// untimed one runs on unseen.
+    struct TripPendingOnUnwind<'a>(&'a Shared);
+
+    impl Drop for TripPendingOnUnwind<'_> {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            let pending = std::mem::take(&mut self.0.lock().due);
+            for cancel in pending.into_values() {
+                cancel.cancel();
+            }
+        }
+    }
+
     pub(super) struct DeadlineTimer {
         shared: Arc<Shared>,
         thread: JoinHandle<()>,
@@ -525,9 +560,7 @@ mod deadline_timer {
             let shared = Arc::new(Shared::default());
             let worker = Arc::clone(&shared);
             let thread =
-                crate::supervisor::spawn_service("codeintel-cancel-deadline", move || {
-                    worker.run()
-                })?;
+                crate::supervisor::spawn_service(super::DEADLINE_THREAD, move || worker.run())?;
             Ok(Self { shared, thread })
         }
 
@@ -618,6 +651,136 @@ mod deadline_timer {
             assert!(!cancel.is_cancelled());
         }
 
+        fn timer_with_policy(
+            name: &'static str,
+            policy: crate::supervisor::Policy,
+        ) -> DeadlineTimer {
+            let shared = Arc::new(Shared::default());
+            let worker = Arc::clone(&shared);
+            let thread = crate::supervisor::spawn_service_with(name, policy, move || worker.run())
+                .expect("start timer");
+            DeadlineTimer { shared, thread }
+        }
+
+        fn fragile(max_fast_failures: u32) -> crate::supervisor::Policy {
+            crate::supervisor::Policy {
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(2),
+                healthy_after: Duration::from_secs(60),
+                max_fast_failures,
+            }
+        }
+
+        fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let limit = Instant::now() + coverage_relaxed(Duration::from_secs(5));
+            while !done() {
+                assert!(Instant::now() < limit, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn a_worker_that_gives_up_leaves_no_registered_query_untimed() {
+            const THREAD: &str = "codeintel-cancel-deadline";
+            let timer = timer_with_policy(THREAD, fragile(2));
+            let parked = Cancel::new();
+            timer
+                .register(&parked, Duration::from_secs(3600))
+                .expect("register");
+            // Every pass from here panics, until the supervisor gives up.
+            timer.shared.panics_left.store(100, Ordering::SeqCst);
+            let earlier = Cancel::new();
+            timer
+                .register(&earlier, Duration::from_secs(3599))
+                .expect("register wakes the worker into its panics");
+            wait_for("the supervisor gives up", || !timer.is_running());
+            assert!(
+                parked.is_cancelled() && earlier.is_cancelled(),
+                "queries registered with a timer that then stopped for good would never be \
+                 timed out; they must be tripped, not left running untimed"
+            );
+            timer
+                .register(&Cancel::new(), Duration::from_secs(1))
+                .expect_err("a stopped timer refuses new registrations");
+
+            // Replacing the stopped timer clears the stopped record it left.
+            let mut slot = Some(Arc::new(timer));
+            let fresh = super::super::running_timer(&mut slot, DeadlineTimer::start)
+                .expect("replacement timer");
+            assert!(fresh.is_running());
+            assert!(
+                !crate::supervisor::degraded()
+                    .iter()
+                    .any(|d| d.subsystem == THREAD),
+                "the replaced timer's stopped record must not outlive it"
+            );
+        }
+
+        #[test]
+        fn a_worker_the_supervisor_restarts_keeps_firing_into_the_same_state() {
+            let timer = timer_with_policy("codeintel-cancel-deadline-restart", fragile(8));
+            timer.shared.panics_left.store(1, Ordering::SeqCst);
+            timer
+                .register(&Cancel::new(), Duration::from_secs(3600))
+                .expect("register wakes the worker into its panic");
+            wait_for("the one panic is spent", || {
+                timer.shared.panics_left.load(Ordering::SeqCst) == 0
+            });
+            let after = Cancel::new();
+            timer
+                .register(&after, Duration::from_millis(40))
+                .expect("register after the restart");
+            wait_for("a deadline set after the restart fires", || {
+                after.is_cancelled()
+            });
+            assert!(timer.is_running());
+        }
+
+        #[test]
+        fn short_deadlines_registered_behind_a_long_one_all_fire_on_time() {
+            let timer = Arc::new(DeadlineTimer::start().expect("start timer"));
+            let parked = Cancel::new();
+            timer
+                .register(&parked, Duration::from_secs(3600))
+                .expect("register");
+            let slack = coverage_relaxed(Duration::from_millis(750));
+            let handles: Vec<_> = (0..16)
+                .map(|t| {
+                    let timer = Arc::clone(&timer);
+                    std::thread::spawn(move || {
+                        for round in 0..25u64 {
+                            std::thread::sleep(Duration::from_micros((t * 37 + round * 11) % 900));
+                            let batch: Vec<_> = [20u64, 40, 80]
+                                .into_iter()
+                                .map(|ms| {
+                                    let cancel = Cancel::new();
+                                    let after = Duration::from_millis(ms);
+                                    let at = Instant::now();
+                                    timer.register(&cancel, after).expect("register");
+                                    (cancel, after, at)
+                                })
+                                .collect();
+                            for (cancel, after, at) in batch {
+                                while !cancel.is_cancelled() {
+                                    assert!(
+                                        at.elapsed() < after + slack,
+                                        "a {after:?} deadline had not fired after {:?}",
+                                        at.elapsed()
+                                    );
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("registering thread");
+            }
+            assert!(!parked.is_cancelled());
+            assert_eq!(timer.pending(), 1, "only the parked deadline remains");
+        }
+
         #[test]
         fn dropping_the_timer_stops_its_thread() {
             let timer = DeadlineTimer::start().expect("start timer");
@@ -668,29 +831,50 @@ fn shared_timer() -> Result<std::sync::Arc<DeadlineTimer>, String> {
     let mut slot = TIMER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    running_timer(&mut slot, DeadlineTimer::start)
+}
+
+/// The timer in `slot` if its thread is alive, else a freshly `start`ed one
+/// placed there.
+fn running_timer(
+    slot: &mut Option<std::sync::Arc<DeadlineTimer>>,
+    start: impl FnOnce() -> std::io::Result<DeadlineTimer>,
+) -> Result<std::sync::Arc<DeadlineTimer>, String> {
     if let Some(timer) = slot.as_ref().filter(|timer| timer.is_running()) {
         return Ok(std::sync::Arc::clone(timer));
     }
     let timer = std::sync::Arc::new(
-        DeadlineTimer::start().map_err(|e| format!("could not start the deadline timer: {e}"))?,
+        start().map_err(|e| format!("could not start the deadline timer: {e}"))?,
     );
     *slot = Some(std::sync::Arc::clone(&timer));
     crate::supervisor::note_recovered(DEADLINE_SUBSYSTEM);
+    // The replaced thread's own "stopped" record would otherwise outlive it.
+    crate::supervisor::note_recovered(DEADLINE_THREAD);
     Ok(timer)
 }
 
 const DEADLINE_SUBSYSTEM: &str = "codeintel deadline";
+/// The timer thread's name, which is also its supervisor record's subsystem.
+const DEADLINE_THREAD: &str = "codeintel-cancel-deadline";
 
 /// A registered query: its cancel flag and the deadline entry to withdraw
 /// when it finishes.
 struct Registered {
     cancel: Cancel,
     deadline: (std::sync::Arc<DeadlineTimer>, TimerKey),
+    /// Another live query held this token when this one registered, so a
+    /// `finish` by token cannot say which of them it belongs to.
+    token_reused: bool,
 }
 
 impl Registered {
+    /// Take the deadline back when the query is done. A reused token's
+    /// deadline is left to expire instead: withdrawing it on the other
+    /// query's finish would leave the one still running untimed.
     fn withdraw(&self) {
-        self.deadline.0.deregister(&self.deadline.1);
+        if !self.token_reused {
+            self.deadline.0.deregister(&self.deadline.1);
+        }
     }
 }
 
@@ -732,19 +916,21 @@ fn begin_cancellable_query_with(
     };
     // A query without a token has no handle to finish by, so its entry waits
     // out its deadline; that is a map slot for 30 s, never a thread. Reusing a
-    // live token replaces the registry entry but leaves the earlier query's
-    // deadline in force.
+    // live token replaces the registry entry; both queries keep their
+    // deadlines (see `Registered::withdraw`).
     if let Some(token) = token.filter(|t| !t.is_empty()) {
-        cancel_registry()
+        let mut map = cancel_registry()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                token.to_string(),
-                Registered {
-                    cancel: cancel.clone(),
-                    deadline,
-                },
-            );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let token_reused = map.contains_key(token);
+        map.insert(
+            token.to_string(),
+            Registered {
+                cancel: cancel.clone(),
+                deadline,
+                token_reused,
+            },
+        );
     }
     cancel
 }
@@ -4303,6 +4489,20 @@ pub(crate) mod tests {
         wait_until("first query's deadline", || first.is_cancelled());
         assert!(!second.is_cancelled());
         finish_cancellable_query(Some("reused-token"));
-        assert_eq!(timer.pending(), 0, "finishing withdraws the second's entry");
+        // The second's entry is not withdrawn: the token no longer says which
+        // of the two queries finished. It expires on its own deadline.
+        assert_eq!(timer.pending(), 1, "the second's deadline stays in force");
+    }
+
+    #[test]
+    fn finishing_an_earlier_query_does_not_untime_a_later_one_on_the_same_token() {
+        let timer = local_timer();
+        let _first = begin_on(&timer, Some("shared-token"), LONG);
+        let second = begin_on(&timer, Some("shared-token"), SHORT);
+        // The first query finishes while the second is still running.
+        finish_cancellable_query(Some("shared-token"));
+        wait_until("the second query keeps its deadline", || {
+            second.is_cancelled()
+        });
     }
 }
