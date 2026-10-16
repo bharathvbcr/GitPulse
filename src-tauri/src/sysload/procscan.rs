@@ -16,6 +16,19 @@
 //! kind is that parent's wrapper target, not a second session; one started in
 //! a shell under another session is a session of its own.
 //!
+//! # What `observe_sessions` reads
+//!
+//! `gitpulse-hook` is a new process per call, so it cannot amortise a full
+//! table read. `observe_sessions` lists pids and reads each process's short
+//! name, parent and start time. It reads the argument block (`KERN_PROCARGS2`,
+//! or `/proc/<pid>/cmdline` and `environ`) only when that name could be an
+//! agent, or when the name is empty or a version string and the resolved
+//! executable could. Footprints and disk writes stay unread: a session from
+//! this path reports its footprint as unavailable, which is not zero. A table
+//! that could not be listed is an error, never an empty session list. The
+//! sampler's [`Scanner::scan`] still reads every identity, footprint and
+//! write.
+//!
 //! # Launched trees
 //!
 //! A process GitPulse started in a terminal carries `GITPULSE_SESSION_ID`,
@@ -109,6 +122,111 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
         }
     }
     None
+}
+
+/// Whether the short process name is one whose arguments can name an agent.
+///
+/// Exact for `claude` and `codex`, so `Claude` and `codex-code-mode-host` are
+/// not candidates. A prefix for `node`, whose versioned binaries are `node`,
+/// `node2` and `nodejs`.
+pub(crate) fn name_selects_procargs(name: &str) -> bool {
+    name == "claude" || name == "codex" || name == "bun" || name.starts_with("node")
+}
+
+/// A name the kernel reports for a versioned installer binary: empty, or a
+/// short string of digits, dots, dashes and underscores that starts with a
+/// digit. `1Password` is a product name, not a version.
+pub(crate) fn name_wants_resolved_path(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return true;
+    }
+    if bytes.len() > 32 || !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_digit() || matches!(*b, b'.' | b'-' | b'_'))
+}
+
+/// Whether a resolved executable is worth an argument read: it is an agent on
+/// its own, or a JavaScript runtime whose script might be one.
+pub(crate) fn path_selects_procargs(path: &str) -> bool {
+    if classify(path, None).is_some() {
+        return true;
+    }
+    let base = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    base == "bun" || base.starts_with("node")
+}
+
+/// What the sessions scan still has to read for one process.
+pub(crate) enum SessionProbe {
+    /// The short name is a candidate. Arguments decide, and the resolved path
+    /// is the fallback when they cannot be read.
+    Args,
+    /// The resolved path is a candidate. The string is that path.
+    ArgsOf(String),
+}
+
+/// `None` when this process cannot be an agent, so its arguments stay unread.
+pub(crate) fn session_probe(
+    name: &str,
+    resolve: impl FnOnce() -> Option<String>,
+) -> Option<SessionProbe> {
+    if name_selects_procargs(name) {
+        return Some(SessionProbe::Args);
+    }
+    if !name_wants_resolved_path(name) {
+        return None;
+    }
+    let path = resolve()?;
+    path_selects_procargs(&path).then_some(SessionProbe::ArgsOf(path))
+}
+
+/// One process the sessions-only scan has already classified.
+pub(crate) struct SessionRow {
+    pub pid: i32,
+    pub ppid: i32,
+    pub start_us: u64,
+    pub kind: AgentKind,
+    pub launch: Option<LaunchKey>,
+}
+
+/// Arguments that were read, or `None` when the read failed. A readable
+/// argument list that is not an agent is not rescued by the resolved path.
+pub(crate) fn session_row(
+    pid: i32,
+    ppid: i32,
+    start_us: u64,
+    probe: SessionProbe,
+    args: Option<(String, Vec<String>, Option<LaunchKey>)>,
+    resolve: impl FnOnce() -> Option<String>,
+) -> Option<SessionRow> {
+    if let Some((exec, argv, launch)) = args {
+        let kind = classify(&exec, argv.get(1).map(String::as_str))?;
+        return Some(SessionRow {
+            pid,
+            ppid,
+            start_us,
+            kind,
+            launch,
+        });
+    }
+    let path = match probe {
+        SessionProbe::ArgsOf(path) => path,
+        SessionProbe::Args => resolve()?,
+    };
+    let kind = classify(&path, None)?;
+    Some(SessionRow {
+        pid,
+        ppid,
+        start_us,
+        kind,
+        launch: None,
+    })
 }
 
 /// Which GitPulse launch a process belongs to, from its own environment.
@@ -1092,30 +1210,64 @@ fn signal_term(_pid: i32, _start_us: u64) -> Result<(), String> {
 /// Whether this platform has a process scan at all.
 pub(crate) const SCAN_SUPPORTED: bool = os::SUPPORTED;
 
-/// Every agent session running now, for callers outside the sampler (the
-/// insights facet). Keeps its own identity cache across calls, so a
-/// repeated call reads only processes it has not seen.
-pub(crate) fn observe_sessions() -> Result<Vec<AgentSession>, String> {
-    static SCANNER: std::sync::OnceLock<std::sync::Mutex<Scanner>> = std::sync::OnceLock::new();
-    if !os::SUPPORTED {
-        return Err("this platform has no process scan".into());
-    }
-    let scanner = SCANNER.get_or_init(|| std::sync::Mutex::new(Scanner::os()));
-    let mut scanner = scanner
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let view = scanner.scan(&ScanContext::here());
-    if !view.ok {
-        return Err(view
-            .error
-            .unwrap_or_else(|| "the process table could not be read".into()));
-    }
-    if view.sessions_truncated {
+/// Turns classified rows into sessions. A row whose parent row is the same
+/// kind is that parent's wrapper target, not a second session. A parent that
+/// is not itself a candidate is not a wrapper. More than [`MAX_SESSIONS`] is
+/// a scan that could not finish. Working directories are read only for the
+/// sessions that remain.
+fn assemble_sessions(
+    rows: Vec<SessionRow>,
+    mut cwd_of: impl FnMut(i32) -> Option<PathBuf>,
+) -> Result<Vec<AgentSession>, String> {
+    let by_pid: HashMap<i32, AgentKind> = rows.iter().map(|row| (row.pid, row.kind)).collect();
+    let kept: Vec<&SessionRow> = rows
+        .iter()
+        .filter(|row| by_pid.get(&row.ppid).copied() != Some(row.kind))
+        .collect();
+    if kept.len() > MAX_SESSIONS {
         return Err(format!(
             "more than {MAX_SESSIONS} agent sessions are running; the scan does not describe them all"
         ));
     }
-    Ok(view.sessions)
+    Ok(kept
+        .into_iter()
+        .map(|row| AgentSession {
+            kind: row.kind,
+            pid: row.pid,
+            start_us: row.start_us,
+            cwd: cwd_of(row.pid).map(|path| path.to_string_lossy().into_owned()),
+            tree: row.launch.as_ref().and_then(LaunchKey::tree),
+            run_id: row.launch.as_ref().and_then(|key| key.run_id.clone()),
+            // This path does not read footprints. Unavailable is the
+            // not-measured signal; zero would say the session uses no memory.
+            footprint: Reading::Unavailable(Why::Unsupported),
+            members: 1,
+            unreadable_members: 0,
+        })
+        .collect())
+}
+
+/// A failed table read stays an error. An empty `Ok` would mean no sessions.
+pub(crate) fn sessions_from_read(
+    read: Result<Vec<SessionRow>, String>,
+    cwd_of: impl FnMut(i32) -> Option<PathBuf>,
+) -> Result<Vec<AgentSession>, String> {
+    assemble_sessions(read?, cwd_of)
+}
+
+/// Every agent session running now, for callers outside the sampler (the
+/// insights facet and `gitpulse-hook`).
+///
+/// A fresh process pays this once. It lists the table and reads arguments
+/// only for processes that could be agents, and it does not read footprints
+/// or disk writes. `Err` when the table could not be read or the session
+/// list is longer than [`MAX_SESSIONS`] — never an empty `Ok` for a scan
+/// that did not run.
+pub fn observe_sessions() -> Result<Vec<AgentSession>, String> {
+    if !os::SUPPORTED {
+        return Err("this platform has no process scan".into());
+    }
+    sessions_from_read(os::read_session_rows(), os::cwd)
 }
 
 /// The processes whose working directory is `dir` or inside it, other than
@@ -1691,6 +1843,54 @@ mod os {
             self.me
         }
     }
+
+    fn pidpath(pid: i32) -> Option<String> {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: `buf` is PROC_PIDPATHINFO_MAXSIZE bytes, which is what the
+        // call writes into.
+        let written = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if written <= 0 {
+            return None;
+        }
+        let written = usize::try_from(written).ok()?.min(buf.len());
+        let end = buf[..written]
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(written);
+        let path = String::from_utf8_lossy(&buf[..end]);
+        path.starts_with('/').then(|| path.into_owned())
+    }
+
+    /// Classified agent processes only. `Err` when the pid list itself could
+    /// not be read — never an empty list standing in for that failure.
+    pub(super) fn read_session_rows() -> Result<Vec<super::SessionRow>, String> {
+        let mut pids = Vec::new();
+        list_pids(&mut pids)?;
+        let me = uid();
+        let mut args_buf = vec![0u8; argmax()];
+        let mut rows = Vec::new();
+        for pid in pids {
+            if pid <= 0 {
+                continue;
+            }
+            let Some(info) = basic(pid) else {
+                continue;
+            };
+            if info.zombie || info.uid != me {
+                continue;
+            }
+            let Some(probe) = super::session_probe(&info.name, || pidpath(pid)) else {
+                continue;
+            };
+            let args = procargs(pid, &mut args_buf);
+            if let Some(row) =
+                super::session_row(pid, info.ppid, info.start_us, probe, args, || pidpath(pid))
+            {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1974,6 +2174,77 @@ mod os {
             self.me
         }
     }
+
+    fn exe_path(pid: i32) -> Option<String> {
+        let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let text = path.to_string_lossy();
+        text.starts_with('/').then(|| text.into_owned())
+    }
+
+    /// The exec spelling, arguments and launch environment. `argv[0]` wins
+    /// when it is a path, because `/proc/<pid>/exe` has already resolved a
+    /// symlink. `None` when the argument list itself could not be read.
+    fn procargs(pid: i32) -> Option<(String, Vec<String>, Option<LaunchKey>)> {
+        let raw = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20).ok()?;
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|item| !item.is_empty())
+            .map(|item| String::from_utf8_lossy(item).into_owned())
+            .collect();
+        let resolved = exe_path(pid);
+        let exec = match argv.first() {
+            Some(first) if first.starts_with('/') => first.clone(),
+            _ => resolved?,
+        };
+        let launch = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20)
+            .ok()
+            .and_then(|raw| {
+                LaunchKey::from_env(
+                    raw.split(|byte| *byte == 0)
+                        .filter_map(|item| std::str::from_utf8(item).ok()),
+                )
+            });
+        Some((exec, argv, launch))
+    }
+
+    /// Classified agent processes only. `Err` when the pid list itself could
+    /// not be read — never an empty list standing in for that failure.
+    pub(super) fn read_session_rows() -> Result<Vec<super::SessionRow>, String> {
+        let mut pids = Vec::new();
+        list_pids(&mut pids)?;
+        let me = uid();
+        let ticks = clock_ticks();
+        let boot = boot_us();
+        let mut rows = Vec::new();
+        for pid in pids {
+            if pid <= 0 {
+                continue;
+            }
+            let Some(info) = stat(pid) else {
+                continue;
+            };
+            if info.zombie {
+                continue;
+            }
+            let Some(owner_uid) = owner(pid) else {
+                continue;
+            };
+            if owner_uid != me {
+                continue;
+            }
+            let start_us = boot.saturating_add(info.start_ticks.saturating_mul(1_000_000) / ticks);
+            let Some(probe) = super::session_probe(&info.name, || exe_path(pid)) else {
+                continue;
+            };
+            let args = procargs(pid);
+            if let Some(row) =
+                super::session_row(pid, info.ppid, start_us, probe, args, || exe_path(pid))
+            {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -2024,6 +2295,10 @@ mod os {
         fn me_uid(&self) -> u32 {
             0
         }
+    }
+
+    pub(super) fn read_session_rows() -> Result<Vec<super::SessionRow>, String> {
+        Err("this platform has no process scan".into())
     }
 }
 
@@ -2394,6 +2669,167 @@ pub(crate) mod tests {
         ] {
             assert_eq!(classify(exec, arg1), want, "{exec} {arg1:?}");
         }
+    }
+
+    #[test]
+    fn argument_reads_are_limited_to_names_and_paths_that_could_be_agents() {
+        assert!(name_selects_procargs("claude"));
+        assert!(name_selects_procargs("codex"));
+        assert!(name_selects_procargs("node"));
+        assert!(name_selects_procargs("node20"));
+        assert!(name_selects_procargs("bun"));
+        assert!(!name_selects_procargs("Claude"));
+        assert!(!name_selects_procargs("codex-code-mode-host"));
+        assert!(!name_selects_procargs("git"));
+        assert!(name_wants_resolved_path(""));
+        assert!(name_wants_resolved_path("2.1.296"));
+        assert!(name_wants_resolved_path("2.1.296-1"));
+        assert!(!name_wants_resolved_path("1Password"));
+        assert!(!name_wants_resolved_path("claude"));
+        assert!(!name_wants_resolved_path(&"1".repeat(33)));
+        assert!(path_selects_procargs(CLAUDE));
+        assert!(path_selects_procargs("/opt/homebrew/bin/node"));
+        assert!(path_selects_procargs("/usr/local/bin/bun"));
+        assert!(!path_selects_procargs("/usr/bin/git"));
+        assert!(!path_selects_procargs(
+            "/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        assert!(!path_selects_procargs(
+            "/Users/me/.codex/packages/standalone/current/bin/codex-code-mode-host"
+        ));
+        assert!(matches!(
+            session_probe("node", || None),
+            Some(SessionProbe::Args)
+        ));
+        assert!(matches!(
+            session_probe("2.1.296", || Some(CLAUDE.into())),
+            Some(SessionProbe::ArgsOf(_))
+        ));
+        assert!(session_probe("git", || Some("/usr/bin/git".into())).is_none());
+        assert!(session_probe("Claude", || {
+            Some("/Applications/Claude.app/Contents/MacOS/Claude".into())
+        })
+        .is_none());
+        assert!(session_probe("2.1.0", || Some("/opt/tool/versions/2.1.0".into())).is_none());
+    }
+
+    /// A scan that could not read the table is an error, never "no sessions".
+    #[test]
+    fn a_session_scan_that_could_not_read_the_table_is_an_error() {
+        let err = sessions_from_read(Err("denied".into()), |_| None).unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+    }
+
+    #[test]
+    fn a_wrapper_target_is_not_a_second_session_and_the_launch_id_names_the_tree() {
+        let rows = vec![
+            SessionRow {
+                pid: 10,
+                ppid: 1,
+                start_us: 5,
+                kind: AgentKind::Claude,
+                launch: LaunchKey::from_env(["GITPULSE_SESSION_ID=term-9"]),
+            },
+            // The native binary a shim exec'd: same kind, direct child.
+            SessionRow {
+                pid: 11,
+                ppid: 10,
+                start_us: 6,
+                kind: AgentKind::Claude,
+                launch: None,
+            },
+            // A shell is not a candidate, so this Claude is its own session.
+            SessionRow {
+                pid: 21,
+                ppid: 20,
+                start_us: 8,
+                kind: AgentKind::Claude,
+                launch: None,
+            },
+            SessionRow {
+                pid: 30,
+                ppid: 1,
+                start_us: 9,
+                kind: AgentKind::Codex,
+                launch: LaunchKey::from_env(["GITPULSE_RUN_ID=run-3"]),
+            },
+        ];
+        let sessions = sessions_from_read(Ok(rows), |pid| {
+            (pid == 10).then(|| std::path::PathBuf::from("/repo"))
+        })
+        .unwrap();
+        let pids: Vec<i32> = sessions.iter().map(|session| session.pid).collect();
+        assert_eq!(pids, [10, 21, 30]);
+        let launched = sessions.iter().find(|session| session.pid == 10).unwrap();
+        assert_eq!(launched.tree.as_deref(), Some("session:term-9"));
+        assert_eq!(launched.cwd.as_deref(), Some("/repo"));
+        assert_eq!(launched.members, 1);
+        assert!(matches!(
+            launched.footprint,
+            Reading::Unavailable(Why::Unsupported)
+        ));
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.pid == 30)
+                .unwrap()
+                .tree
+                .as_deref(),
+            Some("run:run-3")
+        );
+        assert!(sessions
+            .iter()
+            .find(|session| session.pid == 21)
+            .unwrap()
+            .cwd
+            .is_none());
+    }
+
+    #[test]
+    fn more_sessions_than_the_scan_will_describe_is_an_error() {
+        // Parents are not candidates, so none of these is a wrapper target.
+        let rows = (1..=i32::try_from(MAX_SESSIONS).unwrap() + 1)
+            .map(|pid| SessionRow {
+                pid,
+                ppid: 0,
+                start_us: 1,
+                kind: AgentKind::Claude,
+                launch: None,
+            })
+            .collect();
+        let err = sessions_from_read(Ok(rows), |_| None).unwrap_err();
+        assert!(err.contains("more than"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_arguments_still_count_a_resolved_agent_without_a_tree() {
+        let row = session_row(7, 1, 4, SessionProbe::ArgsOf(CLAUDE.into()), None, || None).unwrap();
+        let sessions =
+            sessions_from_read(Ok(vec![row]), |_| Some(std::path::PathBuf::from("/r"))).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].tree.is_none());
+        assert_eq!(sessions[0].kind, AgentKind::Claude);
+        assert!(matches!(
+            sessions[0].footprint,
+            Reading::Unavailable(Why::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn readable_arguments_that_are_not_an_agent_are_not_rescued_by_the_path() {
+        let row = session_row(
+            7,
+            1,
+            4,
+            SessionProbe::ArgsOf("/opt/homebrew/bin/node".into()),
+            Some((
+                "/opt/homebrew/bin/node".into(),
+                vec!["/opt/homebrew/bin/node".into(), "/srv/app/server.js".into()],
+                None,
+            )),
+            || Some(CLAUDE.into()),
+        );
+        assert!(row.is_none());
     }
 
     #[test]

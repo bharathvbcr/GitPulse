@@ -7532,20 +7532,33 @@ mod tests {
     /// The fix for the characterization above. A `claude` started in a
     /// GitPulse terminal, with no registry entry anywhere, is counted — by its
     /// executable — and counted as launched, through the session id the PTY
-    /// seam gave it. The fixture is this test binary behind a symlink named
-    /// `claude`, because macOS hides the environment of Apple platform
-    /// binaries such as `/bin/sleep`.
+    /// seam gave it.
+    ///
+    /// The binary sits at `claude/versions/2.1.0` and is started through a
+    /// symlink named `claude`. The sessions scan resolves a version-named
+    /// executable and only then reads its arguments, so the resolved path is
+    /// what classifies it. A symlink whose target is not itself an agent is
+    /// invisible to that scan, and macOS hides the environment of an Apple
+    /// platform binary such as `/bin/sleep`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_terminal_claude_with_no_registry_entry_is_counted_as_launched() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().canonicalize().unwrap();
         init_test_repo(&repo);
-        let bin = tempfile::tempdir().unwrap();
-        let claude = bin.path().join("claude");
+        let root = tempfile::tempdir().unwrap();
+        let versions = root.path().join("claude").join("versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        let binary = versions.join("2.1.0");
         let (exe, args) = crate::sysload::procscan::tests::fixture_command();
-        std::os::unix::fs::symlink(&exe, &claude).unwrap();
-        let pidfile = bin.path().join("claude.pid");
+        if std::fs::hard_link(&exe, &binary).is_err() {
+            std::fs::copy(&exe, &binary).unwrap();
+        }
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::os::unix::fs::symlink(&binary, &claude).unwrap();
+        let pidfile = bin.join("claude.pid");
         let app = tauri::test::mock_builder().build(crate::context()).unwrap();
         let state = TerminalSessions::default();
         let spawned = spawn_session_inner(
