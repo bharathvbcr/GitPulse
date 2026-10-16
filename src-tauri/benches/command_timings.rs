@@ -474,10 +474,13 @@ fn main() {
     let (_, details_argvs) = git_process_argvs(|| GitReader::get_commit_details(&path, &commit));
     // Pins the warm-up: the probe is `git version`, and none may land in the
     // counted pass, or the row would charge commit details a one-time cost.
+    // trace2's argv is the git binary, then the `-c key=value` pairs the app
+    // puts first, then the subcommand, so `version` is matched as a whole word
+    // anywhere after argv[0].
     assert!(
         !details_argvs
             .iter()
-            .any(|argv| argv.first().map(String::as_str) == Some("version")),
+            .any(|argv| argv.iter().skip(1).any(|word| word == "version")),
         "commit details started `git version` inside the counted pass; the git_preflight \
          warm-up must run before it: {details_argvs:?}"
     );

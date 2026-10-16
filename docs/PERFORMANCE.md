@@ -1407,9 +1407,9 @@ straight from git (`Reads::Fresh`) so an `include.path` change or a moved HEAD i
 seen at once. The cached `default_base` path is unchanged.
 
 **commit details, and the `git version` probe.** The old baseline said 1 and the
-integration head's bench was reported to read 2 without a warm-up (this change
-did not re-run the un-warmed bench; the source shows why). The second process is
-`git version`, the process-wide probe `git_preflight` runs once and
+integration head's bench reads 2 without a warm-up (measured with the warm-up
+removed, `--smoke`: the two processes are `git version` and the `git show`). The
+second process is `git version`, the process-wide probe `git_preflight` runs once and
 caches when it passes. `GitReader::get_commit_details` reaches it through
 `git_supports(DIFF_MERGES_OPTION)`, so whichever row calls it first in a process
 pays for it; the counted commit details pass was the first. Production does not
@@ -1417,7 +1417,10 @@ pay it per call: it is one process per run of the app, and a later call finds th
 cached answer. The bench now calls `git_preflight` before the first counted pass
 and asserts the status is Ok (a failed probe is never cached, so a broken git
 would put the probe back inside a counted row), and the commit details pass
-records its argvs and asserts none of them is `git version`. The counter stays 1.
+records its argvs and asserts none of them is `git version` (trace2's argv starts
+with the git binary and the app's `-c` pairs, so the subcommand is matched as a
+whole word after argv[0]). With the warm-up removed the assertion fails and
+prints both argvs; with it restored the counter is 1.
 
 **New rows.** `graph_spawns` and `churn_spawns` are seeded into the baseline
 with `scripts/bench-compare.mjs --write-baseline` run over a directory holding
