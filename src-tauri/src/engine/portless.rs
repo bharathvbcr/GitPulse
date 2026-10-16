@@ -635,4 +635,155 @@ mod tests {
         assert_eq!(routes[0].port, 4200);
         assert_eq!(routes[0].url, "https://docs.myapp.localhost");
     }
+
+    // ---- adversarial ----
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_routes_path_does_not_block_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("routes.json");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a plain mode.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _env = bind_env_owned(env_serial()).set("PORTLESS_STATE_DIR", &path);
+            let _ = tx.send(PortlessSnapshot::load().routes.len());
+        });
+        let got = rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+            2,
+        )));
+        // Release a blocked opener so the test thread can end either way.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        assert_eq!(got, Ok(0), "a FIFO parked the snapshot");
+    }
+
+    #[test]
+    fn the_routes_path_being_a_directory_a_symlink_or_unreadable_is_handled() {
+        // A directory is no routes.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("routes.json")).unwrap();
+        let _env = bind_env_owned(env_serial()).set("PORTLESS_STATE_DIR", dir.path());
+        assert!(PortlessSnapshot::load().routes.is_empty());
+        drop(_env);
+
+        // A symlink to a real file is followed: a user may keep it elsewhere.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, r#"{"a.localhost": {"port": 4001}}"#).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, dir.path().join("routes.json")).unwrap();
+            let _env = bind_env_owned(env_serial()).set("PORTLESS_STATE_DIR", dir.path());
+            assert_eq!(PortlessSnapshot::load().routes.len(), 1);
+        }
+
+        // Mode 000 is no routes, unless the tests run as root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("routes.json");
+            std::fs::write(&file, r#"{"a.localhost": {"port": 4001}}"#).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).unwrap();
+            let _env = bind_env_owned(env_serial()).set("PORTLESS_STATE_DIR", dir.path());
+            let readable = std::fs::File::open(&file).is_ok();
+            assert_eq!(PortlessSnapshot::load().routes.len(), usize::from(readable));
+        }
+    }
+
+    #[test]
+    fn the_routes_file_cap_is_exact() {
+        let pad = |n: usize| {
+            let head = r#"[{"hostname": "a.localhost", "port": 4001}"#;
+            format!("{head}{}]", " ".repeat(n - head.len() - 1))
+        };
+        let at = pad(1 << 20);
+        let over = pad((1 << 20) + 1);
+        assert_eq!(at.len(), 1 << 20);
+        let (_env, _s) = state_with(Some(&at));
+        assert_eq!(PortlessSnapshot::load().routes.len(), 1, "exactly 1 MiB");
+        drop(_env);
+        let (_env, _s) = state_with(Some(&over));
+        assert!(PortlessSnapshot::load().routes.is_empty(), "1 MiB + 1");
+    }
+
+    #[test]
+    fn json_number_shapes_for_port_and_pid() {
+        // (json for the entry body, kept as (port, pid))
+        let table: &[(&str, Option<(u16, Option<u32>)>)] = &[
+            (r#""port": 65535.0"#, None),
+            (r#""port": 1e3"#, None),
+            (r#""port": -0"#, None),
+            (r#""port": 4123"#, Some((4123, None))),
+            (r#""port": "4123""#, None),
+            (r#""port": true"#, None),
+            (r#""port": null"#, None),
+            (r#""port": 1e400"#, None),
+            (r#""port": 99999999999999999999999"#, None),
+            (r#""port": 4123, "pid": "7""#, None),
+            (r#""port": 4123, "pid": true"#, None),
+            (r#""port": 4123, "pid": 7.0"#, None),
+            (r#""port": 4123, "pid": -0"#, None),
+            (r#""port": 4123, "pid": null"#, Some((4123, None))),
+            (r#""port": 4123, "pid": 0"#, Some((4123, Some(0)))),
+        ];
+        for (body, expected) in table {
+            let json = format!(r#"{{"a.localhost": {{{body}}}}}"#);
+            let got = parse_portless_routes_json(&json)
+                .first()
+                .map(|r| (r.port, r.pid));
+            assert_eq!(got, *expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_hostname_with_url_syntax_in_a_label_is_never_attributed_or_linked() {
+        for host in [
+            "foo.evil.com/x.localhost",
+            "foo.a@b.localhost",
+            "foo.x#y.localhost",
+            "foo.x?y.localhost",
+            "foo.x y.localhost",
+            "foo.x\\y.localhost",
+            "foo.x_y.localhost",
+            "foo.-x.localhost",
+            "foo.x-.localhost",
+            "foo.\u{212a}.localhost",
+        ] {
+            assert!(
+                !attributed(Some("foo"), "zz", host),
+                "{host:?} was attributed"
+            );
+        }
+        // A Kelvin sign lowercases to an ASCII k; a hostname is not folded that way.
+        assert!(!attributed(Some("k"), "zz", "\u{212a}.localhost"));
+        // And none of them becomes a link, whoever lists them.
+        let json = r#"[{"hostname": "foo.evil.com/x.localhost", "port": 4001}]"#;
+        let object = r#"{"foo.evil.com/x.localhost": {"port": 4001}}"#;
+        for text in [json, object] {
+            for route in parse_portless_routes_json(text) {
+                assert!(
+                    !route.url.contains("evil.com"),
+                    "a link to another host: {}",
+                    route.url
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn labels_over_63_bytes_and_slug_collisions_are_deterministic() {
+        let long = "a".repeat(64);
+        assert!(!attributed(Some(&long), "zz", &format!("{long}.localhost")));
+        let ok = "a".repeat(63);
+        assert!(attributed(Some(&ok), "zz", &format!("{ok}.localhost")));
+        // Two branches that slug alike both claim the route, every time.
+        for _ in 0..3 {
+            assert!(attributed(Some("feat/x"), "zz", "feat-x.localhost"));
+            assert!(attributed(Some("feat-x"), "zz", "feat-x.localhost"));
+        }
+    }
 }
