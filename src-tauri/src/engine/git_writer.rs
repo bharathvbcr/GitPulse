@@ -1347,22 +1347,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err("Rebase sequence is empty".into());
         }
         Self::refuse_fixture_identity(&repo, false)?;
-        if let Some(first) = steps.first() {
-            if matches!(
-                first.action,
-                RebaseActionKind::Squash | RebaseActionKind::Fixup
-            ) {
-                return Err(format!(
-                    "Cannot '{}' commit {} without a previous commit to combine into",
-                    match first.action {
-                        RebaseActionKind::Squash => "squash",
-                        RebaseActionKind::Fixup => "fixup",
-                        _ => unreachable!(),
-                    },
-                    first.commit_id
-                ));
-            }
-        }
+        validate_rebase_plan(steps)?;
         for step in steps {
             validate_oid_or_revision(&step.commit_id)?;
         }
@@ -2372,6 +2357,35 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
 /// HEAD failed), an explicit clause names the failure and the true end-state,
 /// so a locked index or full disk can never hide behind the primary error.
 /// Pure: no git, fully unit-testable.
+/// Refuses a plan in which a squash or fixup has no kept commit before it, as
+/// git does ("cannot 'squash' without a previous commit"). A dropped step is
+/// not a commit to fold into: with only drops ahead of it the fold would amend
+/// the onto commit itself and `branch -f` would then move the branch onto that
+/// rewritten copy of the base. Pick and reword keep a commit; drop does not.
+fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
+    let mut has_kept_commit = false;
+    for step in steps {
+        let folds_into_previous = match step.action {
+            RebaseActionKind::Squash => Some("squash"),
+            RebaseActionKind::Fixup => Some("fixup"),
+            RebaseActionKind::Pick | RebaseActionKind::Reword(_) => {
+                has_kept_commit = true;
+                None
+            }
+            RebaseActionKind::Drop => None,
+        };
+        if let Some(verb) = folds_into_previous {
+            if !has_kept_commit {
+                return Err(format!(
+                    "Cannot '{verb}' commit {} without a previous commit to combine into",
+                    step.commit_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn combine_step_failure_with_recovery(
     step_error: &str,
     abort_result: Option<&Result<(), String>>, // None when no cherry-pick was in progress
@@ -4480,6 +4494,90 @@ mod tests {
             "error must name fixup, got: {fixup_err}"
         );
         assert_eq!(head_message(&dir), "commit A", "HEAD must be untouched");
+    }
+
+    /// A squash/fixup folds into the nearest kept commit before it. Dropping
+    /// every commit ahead of it leaves only the onto commit, which git refuses
+    /// to squash into ("cannot 'squash' without a previous commit") and which
+    /// this engine would otherwise amend, rewriting the base's tip.
+    #[test]
+    fn rebase_refuses_squash_or_fixup_with_no_kept_commit_before_it() {
+        for (leading, action_name) in [
+            (vec![RebaseActionKind::Drop], "squash"),
+            (vec![RebaseActionKind::Drop], "fixup"),
+            (
+                vec![RebaseActionKind::Drop, RebaseActionKind::Drop],
+                "squash",
+            ),
+        ] {
+            let dir = init_repo_with_commit();
+            let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+            let mut steps = Vec::new();
+            for (i, action) in leading.iter().enumerate() {
+                let id = write_commit(&dir, &format!("d{i}.txt"), "d\n", &format!("dropped {i}"));
+                steps.push(RebaseStep {
+                    commit_id: id,
+                    action: match action {
+                        RebaseActionKind::Drop => RebaseActionKind::Drop,
+                        _ => unreachable!("only Drop leads these plans"),
+                    },
+                });
+            }
+            let last = write_commit(&dir, "z.txt", "z\n", "folded");
+            steps.push(RebaseStep {
+                commit_id: last,
+                action: if action_name == "squash" {
+                    RebaseActionKind::Squash
+                } else {
+                    RebaseActionKind::Fixup
+                },
+            });
+            let head_before = head_oid(&dir);
+            let err =
+                GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+                    .expect_err("a squash with every earlier step dropped must be refused");
+            assert!(
+                err.to_lowercase().contains(action_name),
+                "error must name {action_name}, got: {err}"
+            );
+            assert_eq!(head_oid(&dir), head_before, "HEAD must not move");
+            let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+            assert_eq!(branch.trim(), "main", "HEAD must stay on its branch");
+        }
+    }
+
+    #[test]
+    fn rebase_still_squashes_into_a_pick_across_a_drop() {
+        let dir = init_repo_with_commit();
+        let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+        let c_a = write_commit(&dir, "b.txt", "b\n", "kept A");
+        let c_b = write_commit(&dir, "d.txt", "d\n", "dropped B");
+        let c_c = write_commit(&dir, "c.txt", "c\n", "folded C");
+        let steps = vec![
+            RebaseStep {
+                commit_id: c_a,
+                action: RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: c_b,
+                action: RebaseActionKind::Drop,
+            },
+            RebaseStep {
+                commit_id: c_c,
+                action: RebaseActionKind::Squash,
+            },
+        ];
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect("pick, drop, squash folds into the pick");
+        assert_eq!(head_message(&dir), "kept A");
+        let count = git_text(
+            dir.path(),
+            &["rev-list", "--count", &format!("{base}..HEAD")],
+        )
+        .unwrap();
+        assert_eq!(count.trim(), "1", "one commit above the base");
+        assert!(dir.path().join("c.txt").exists());
+        assert!(!dir.path().join("d.txt").exists());
     }
 
     /// Pure-message tests for rebase recovery reporting: the step error always
