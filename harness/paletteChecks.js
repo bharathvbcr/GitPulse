@@ -81,7 +81,7 @@ if (params.has("check")) {
   await type("@"); check("current branch is visibly unavailable", option("main")?.getAttribute("aria-disabled") === "true");
   option("main").click(); await settle(); check("disabled rows keep the palette open", Boolean(input()) && !calls.some(c => c.cmd === "cmd_checkout_branch"));
   option("origin/remote-only").click(); await settle();
-  check("a remote branch row checks out its local tracking name, never origin/<name>", calls.filter(c => c.cmd === "cmd_checkout_branch").map(c => c.args.branchName).join() === "remote-only");
+  check("a remote branch row keeps its remote when checked out, so a same-named local branch of another remote is never taken for it", calls.filter(c => c.cmd === "cmd_checkout_branch").map(c => c.args.branchName).join() === "origin/remote-only");
   await open(); await type("qckcmt"); check("fuzzy aliases find Quick Commit", Boolean(option("Quick Commit")));
   check("clean-tree Quick Commit explains why it cannot run", option("Quick Commit")?.textContent.includes("Nothing to commit"));
   files = Array.from({ length: 125 }, (_, i) => `src/file-${String(i).padStart(3,"0")}.ts`);
