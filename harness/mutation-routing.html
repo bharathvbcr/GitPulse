@@ -328,6 +328,39 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   harnessStore.activateRepository(A);
   await until(() => button("Lock lane"), "A's rows back after the refused merge");
 
+  // remove refuses, like merge, when the repository changed between the confirm and the run
+  button("Remove this worktree").click();
+  await until(() => button("Click again to remove"), "remove armed before the trust wait");
+  hold("trust");
+  button("Click again to remove").click();
+  await wait(100);
+  await repoStore.activateTab(tabId(B));
+  harnessStore.activateRepository(B);
+  releaseAll("trust");
+  await wait(300);
+  check("a remove confirmed in A and answered after B came to the front sends nothing", () => sentTo("cmd_remove_worktree").length === 2 && sent.filter(s => s.repoPath === B).length === 0);
+  check("and says the repository changed, naming the removal", () => toasts().some(t => t.startsWith("error") && /repository changed/.test(t) && /remove/i.test(t)));
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  await until(() => button("Lock lane"), "A's rows back after the refused remove");
+
+  // a failure for a repository left behind is still said (the store was told the panel reports it)
+  button("Remove this worktree").click();
+  await until(() => button("Click again to remove"), "remove armed before the switch");
+  hold("cmd_remove_worktree");
+  button("Click again to remove").click();
+  await until(() => sentTo("cmd_remove_worktree").length === 3, "remove sent before the switch");
+  await repoStore.activateTab(tabId(B));
+  harnessStore.activateRepository(B);
+  failNext.cmd_remove_worktree = true;
+  releaseAll("cmd_remove_worktree");
+  await until(() => busy() === 0, "failing remove settled after the switch");
+  await wait(150);
+  check("a remove that fails after another repository came to the front is still said, once", () => toasts().filter(t => t.startsWith("error") && t.includes("cmd_remove_worktree refused by fixture")).length === 1 && (get(repoStore).error ?? "") === "");
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  await until(() => button("Lock lane"), "A's rows back after the failed remove");
+
   // attemptWorktree: the main checkout's tab is captured before the confirm
   const ATT = `${A}/.claude/worktrees/att`;
   const attempt = { id: "att", cwd: ATT, state: "exited", expires_at: 0 };
@@ -337,9 +370,9 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   const discarding = discardAttemptWorktree(attempt).catch(error => ({ failed: String(error) }));
   await until(() => get(promptState), "discard confirm");
   completePrompt(true);
-  await until(() => sentTo("cmd_remove_worktree").length === 3, "attempt remove sent");
+  await until(() => sentTo("cmd_remove_worktree").length === 4, "attempt remove sent");
   check("an attempt's discard is counted by the quit guard while its remove is out", () => busy() === 1);
-  check("and runs in the attempt's main checkout A though B is in front", () => sentTo("cmd_remove_worktree")[2].repoPath === A && sentTo("cmd_remove_worktree")[2].targetPath === ATT);
+  check("and runs in the attempt's main checkout A though B is in front", () => sentTo("cmd_remove_worktree")[3].repoPath === A && sentTo("cmd_remove_worktree")[3].targetPath === ATT);
   releaseAll("cmd_remove_worktree");
   const discarded = await discarding;
   await until(() => busy() === 0, "discard settled");
@@ -356,7 +389,7 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   await repoStore.closeTab(tabId(A));
   completePrompt(true);
   const result = await abandoned;
-  check("a discard confirmed after its repository's tab was closed sends no remove and no delete", () => sentTo("cmd_remove_worktree").length === 3 && sentTo("cmd_delete_branch").length === 1 && busy() === 0);
+  check("a discard confirmed after its repository's tab was closed sends no remove and no delete", () => sentTo("cmd_remove_worktree").length === 4 && sentTo("cmd_delete_branch").length === 1 && busy() === 0);
   check("and says the repository changed instead of reporting a removal", () => /repository changed/.test(result?.failed ?? "") && !/was removed/.test(result?.message ?? ""));
 
   check("No unexpected commands", () => unexpected.length === 0);

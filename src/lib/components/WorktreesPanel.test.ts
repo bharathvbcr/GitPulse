@@ -206,9 +206,22 @@ describe("WorktreesPanel removal safety", () => {
       expect(arming, `${start} arms with a target`).toBeGreaterThan(-1);
       expect(second, `${start} runs on the armed target`).toBeGreaterThan(arming);
     }
+    // The remove refuses as the merge does: after the trust prompt, before the destructive call.
+    const removeFn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
+    expect(removeFn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?if \(!repoStore\.targetIsActive\(target\)\) \{\s*toastStore\.error\([^)]*repository changed[^)]*\);\s*return;\s*\}\s*const outcome = await repoStore\.removeWorktree\(/);
     const merge = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
     expect(merge).toMatch(/if \(!repoStore\.targetIsActive\(target\)\) \{\s*toastStore\.error\([^)]*repository changed[^)]*\);\s*return;/);
     expect(merge.indexOf("repoStore.targetIsActive(target)")).toBeLessThan(merge.indexOf("repoStore.worktreeMergeTeardown("));
+  });
+
+  it("says every handled failure: inline for the repository on screen, a toast once it is not, and never a silent merge without a result", () => {
+    // The store is told the panel reports the failure (handled), so a failure
+    // that reaches neither the inline error nor a toast is lost.
+    const show = source.slice(source.indexOf("function showFailure"), source.indexOf("async function toggleLock"));
+    expect(show).toMatch(/if \(tabScope\.isCurrent\(epoch\)\) error = message;\s*else toastStore\.error\(/);
+    const merge = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    expect(merge).toMatch(/if \(!outcome\.ok\) return showFailure\(/);
+    expect(merge).toMatch(/if \(!merged\) \{[\s\S]*?showFailure\([\s\S]*?return;\s*\}/);
   });
 
   it("freezes worktree creation inputs before calling the store", () => {

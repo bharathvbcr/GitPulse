@@ -9,7 +9,7 @@
   import { reportPanelError } from "../diagnostics/report";
   import { currentRepoPath, repoStore, type MutationOutcome, type MutationTarget } from "../stores/repoStore";
   import { repoScope } from "../repos/repoScope.svelte";
-    import { reportFailure } from "../stores/mutationOutcome";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     FolderGit2,
@@ -322,7 +322,11 @@
       return;
     }
     const message = reportPanelError("worktrees", outcome.cause ?? outcome.error);
+    // The inline error belongs to the repository on screen. After a switch it
+    // would be dropped with the old rows, and the store was told not to file a
+    // banner, so a toast is the only place the failure can still be said.
     if (tabScope.isCurrent(epoch)) error = message;
+    else toastStore.error(`${what}: ${message}`);
   }
 
   async function toggleLock(wt: WorktreeInfo) {
@@ -427,6 +431,13 @@
     // tree is force-removed only after the armed confirm named the cost.
     const force = typeof wt.dirty_files === "number" && wt.dirty_files > 0;
     if (!(await repoStore.trustRepo(targetPath))) return;
+    // The trust prompt can sit open while the reader goes elsewhere: the
+    // removal runs only in the repository whose row was confirmed, and says so
+    // when that is no longer in front.
+    if (!repoStore.targetIsActive(target)) {
+      toastStore.error("Could not remove the worktree: the repository changed while it was waiting; nothing was run.");
+      return;
+    }
     const outcome = await repoStore.removeWorktree(targetPath, force, target, true);
     if (!outcome.ok) return showFailure(outcome, "Could not remove the worktree", epoch);
     // The worktree is gone; files that could not be deleted after it are a notice, not a failure.
@@ -500,8 +511,15 @@
         target,
         true,
       );
-      if (!outcome.ok || !outcome.output) return showFailure(outcome, "Could not merge the worktree", epoch);
+      if (!outcome.ok) return showFailure(outcome, "Could not merge the worktree", epoch);
       const merged = outcome.output;
+      if (!merged) {
+        // The host answered without saying what it did: never read as a clean
+        // merge, never silent, and the rows are reloaded to show what is there.
+        showFailure({ ok: false, error: "The host did not report what the merge did; check the worktree list." }, "Could not confirm the merge", epoch);
+        if (tabScope.isCurrent(epoch)) await load();
+        return;
+      }
       // The merge landed: a cleanup that did not finish is a notice below, not a failure.
       for (const notice of worktreeSetupNotices(merged, "merge")) toastStore.warning(notice);
       // The teardown removed the directory: a tab on it is stranded whether
