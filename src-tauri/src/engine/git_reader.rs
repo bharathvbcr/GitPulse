@@ -26,6 +26,11 @@ const MAX_BRANCH_STAT_TARGETS: usize = 96;
 /// the next call resumes (the oid-keyed churn cache is the cursor). The tip in
 /// progress finishes, so a call can overrun by one walk, never by a pass.
 const BRANCH_STATS_CALL_BUDGET: Duration = Duration::from_secs(5);
+/// Most distinct bases a call asks `merge-base --is-ancestor` about when it
+/// carries stored answers over a default-branch advance: one process each. The
+/// bases rows were kept against are normally one (the default branch's previous
+/// tip); rows left against more than this are measured instead.
+const MAX_CARRY_BASES: usize = 4;
 
 /// Sidebar tag ceiling: newest-first via `--sort=-creatordate`, then cut here
 /// so a 10k-tag monorepo cannot ship megabytes over IPC. The payload says
@@ -3646,11 +3651,12 @@ struct BranchStatTarget {
     remote_name: Option<String>,
 }
 
-/// Looks up the churn store in bulk, computes unique uncached tips (capped),
-/// keeps the results, and returns an update per eligible branch we have a
-/// value for. The fifth tuple element counts attempted walks that FAILED —
-/// branches which will be missing from `updates` through error, not through
-/// capping.
+/// Looks up the churn store in bulk, carries stored answers over a base that
+/// moved when that is provable (see [`churn_store::Kept::carried`]), computes
+/// the unique tips still unanswered (capped), keeps the results, and returns an
+/// update per eligible branch we have a value for. The fifth tuple element
+/// counts attempted walks that FAILED — branches which will be missing from
+/// `updates` through error, not through capping.
 #[allow(clippy::type_complexity)]
 fn compute_eligible_churn(
     repo: &Path,
@@ -3666,7 +3672,24 @@ fn compute_eligible_churn(
             unique_tips.push(target.tip_commit_id.clone());
         }
     }
-    let cached_hits = churn_store::lookup(&inputs, base_oid, &unique_tips);
+    let kept = churn_store::lookup(&inputs, &unique_tips);
+    let mut cached_hits: HashMap<String, Churn> = kept
+        .iter()
+        .filter(|(_, answer)| answer.base == base_oid)
+        .map(|(tip, answer)| (tip.clone(), answer.churn))
+        .collect();
+
+    // Every unanswered tip's ahead/behind in one listing, where each tip used
+    // to cost its own `rev-list`; a tip the listing does not answer walks. The
+    // same listing is what lets a stored answer survive a base that moved.
+    let counts = if unique_tips.iter().all(|tip| cached_hits.contains_key(tip)) {
+        HashMap::new()
+    } else {
+        tip_counts_against(repo, base_oid).unwrap_or_default()
+    };
+    let carried = carry_over_moved_base(repo, base_oid, &kept, &counts);
+    cached_hits.extend(carried.iter().map(|(tip, churn)| (tip.clone(), *churn)));
+
     let mut unique_uncached: Vec<String> = unique_tips
         .into_iter()
         .filter(|tip| !cached_hits.contains_key(tip))
@@ -3683,13 +3706,6 @@ fn compute_eligible_churn(
     // in ~200 ms is still ~80 starts a second. It also ran them on rayon
     // workers, which do not inherit the caller's admission class. The gate's
     // rate cap is the backstop; this walk must not spend the burst in one tick.
-    // Every uncached tip's ahead/behind in one listing, where each tip used to
-    // cost its own `rev-list`; a tip the listing does not answer walks.
-    let counts = if unique_uncached.is_empty() {
-        HashMap::new()
-    } else {
-        tip_counts_against(repo, base_oid).unwrap_or_default()
-    };
     // A time budget on top of the target cap: the cap bounds how many tips a
     // call may start, not how long they take. The first tip always runs so a
     // call makes progress however small the budget; tips left unstarted are
@@ -3716,7 +3732,15 @@ fn compute_eligible_churn(
     }
     let compute_failures = attempted.saturating_sub(computed_map.len());
 
-    churn_store::keep(repo, &inputs, base_oid, &computed_map);
+    // Carried answers are kept against the new base, so the next call finds
+    // them without asking again.
+    let mut to_keep = carried;
+    to_keep.extend(
+        computed_map
+            .iter()
+            .map(|(tip, churn)| (tip.clone(), *churn)),
+    );
+    churn_store::keep(repo, &inputs, base_oid, &to_keep);
 
     let mut updates = Vec::with_capacity(eligible.len());
     let mut computed = 0;
@@ -3745,6 +3769,44 @@ fn compute_eligible_churn(
     }
 
     (updates, computed, cached, capped, compute_failures)
+}
+
+/// The stored answers that still hold after the default branch moved from the
+/// base they were measured against to `base_oid`, with their counts read fresh
+/// from `counts`. An answer holds when its ahead count is unchanged (checked
+/// first, as it costs nothing) and `base_oid` descends from the base it was
+/// measured against: one `merge-base --is-ancestor` per distinct stored base,
+/// at most [`MAX_CARRY_BASES`] of them. Whatever cannot be proved — a base
+/// rewound, replaced or gone, a tip the listing did not count, a git that gave
+/// no listing — is left out and is measured.
+fn carry_over_moved_base(
+    repo: &Path,
+    base_oid: &str,
+    kept: &HashMap<String, churn_store::Kept>,
+    counts: &HashMap<String, (usize, usize)>,
+) -> HashMap<String, Churn> {
+    let mut descends: HashMap<&str, bool> = HashMap::new();
+    let mut carried = HashMap::new();
+    for (tip, answer) in kept.iter().filter(|(_, answer)| answer.base != base_oid) {
+        let Some(churn) = counts.get(tip).and_then(|now| answer.carried(*now)) else {
+            continue;
+        };
+        let old_base = answer.base.as_str();
+        let holds = match descends.get(old_base) {
+            Some(known) => *known,
+            None if descends.len() >= MAX_CARRY_BASES => false,
+            None => {
+                let held = validate_oid(old_base).is_ok()
+                    && crate::harness::review::contains(repo, base_oid, old_base).unwrap_or(false);
+                descends.insert(old_base, held);
+                held
+            }
+        };
+        if holds {
+            carried.insert(tip.clone(), churn);
+        }
+    }
+    carried
 }
 
 /// Ahead/behind of every branch and remote-tracking tip against `base_oid`,
@@ -10590,6 +10652,49 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
         let warm = GitReader::branch_stats(path).unwrap();
         assert_eq!((warm.computed, warm.cached, warm.capped), (0, 6, false));
+    }
+
+    /// A base that moved leaves every answer standing with a spent budget:
+    /// carrying them costs no walk, so a call with no time left still reports
+    /// every stored branch, measures one new one (the progress guarantee) and
+    /// says `capped` for the rest.
+    #[test]
+    fn a_carried_answer_is_not_spent_against_the_time_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        crate::test_support::git_in(&root, &["config", "user.email", "t@example.invalid"]);
+        crate::test_support::git_in(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("base.txt"), "0\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        let topic = |n: usize| {
+            let branch = format!("topic-{n}");
+            crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+            std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+            crate::test_support::git_in(&root, &["add", "."]);
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
+        };
+        topic(0);
+        topic(1);
+        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+        let path = root.to_str().unwrap();
+        let warm = GitReader::branch_stats(path).unwrap();
+        assert_eq!((warm.computed, warm.capped), (2, false));
+
+        crate::test_support::git_in(&root, &["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+        topic(2);
+        topic(3);
+        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+        let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
+        assert_eq!(report.cached, 2, "the stored answers were carried");
+        assert_eq!(report.computed, 1, "one new tip, for progress");
+        assert!(
+            report.capped,
+            "the second new tip is left for the next call"
+        );
+        assert_eq!(report.updates.len(), 3);
+        assert_eq!(report.compute_failures, 0);
     }
 
     /// What `git remote` would say, read from one config listing: a legacy

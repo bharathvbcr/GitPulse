@@ -177,6 +177,13 @@ pub fn clean(repo: &Repo) {
 /// its own pass: the log append adds a little to every process, so a timed
 /// sample never runs with it on.
 pub fn count_git_processes<T>(body: impl FnOnce() -> T) -> (T, u64) {
+    let (result, argvs) = git_process_argvs(body);
+    (result, argvs.len() as u64)
+}
+
+/// [`count_git_processes`] with each process's argv, for a bench that counts
+/// one kind of process (`diff --shortstat`, `merge-base`) apart from the rest.
+pub fn git_process_argvs<T>(body: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
     let home = PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME"));
     let config = home.join(".gitconfig");
     let log = home.join("trace2-events.json");
@@ -190,9 +197,21 @@ pub fn count_git_processes<T>(body: impl FnOnce() -> T) -> (T, u64) {
     let _ = std::fs::remove_file(&config);
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_file(&log);
-    let processes = text
+    let argvs = text
         .lines()
         .filter(|l| l.contains("\"event\":\"start\""))
-        .count() as u64;
-    (result, processes)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|event| {
+                    event["argv"].as_array().map(|argv| {
+                        argv.iter()
+                            .filter_map(|arg| arg.as_str().map(str::to_string))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    (result, argvs)
 }
