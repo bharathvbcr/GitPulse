@@ -5006,6 +5006,181 @@ describe("file, worktree and branch-cleanup mutations (ft-d61584de)", () => {
     ]);
   });
 
+  it("add, remove, lock, unlock, merge-teardown and branch delete send to the target's repository, journalled by kind", async () => {
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({
+      cmd_add_worktree: record("cmd_add_worktree", { path: "/w" }),
+      cmd_remove_worktree: record("cmd_remove_worktree", {}),
+      cmd_lock_worktree: record("cmd_lock_worktree"),
+      cmd_unlock_worktree: record("cmd_unlock_worktree"),
+      cmd_worktree_merge_teardown: record("cmd_worktree_merge_teardown", { merged: true }),
+      cmd_delete_branch: record("cmd_delete_branch"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    const request = { targetPath: "/w", newBranch: "feat", startPoint: null, detach: false, cowCaches: true, runHooks: false };
+    expect(await store.addWorktree(request, a)).toMatchObject({ ok: true, output: { path: "/w" } });
+    expect((await store.removeWorktree("/w", true, a)).ok).toBe(true);
+    expect((await store.lockWorktree("/w", a)).ok).toBe(true);
+    expect((await store.unlockWorktree("/w", a)).ok).toBe(true);
+    const merge = { worktreePath: "/w", targetBranch: null, squash: false, expectedTip: "abc" };
+    expect(await store.worktreeMergeTeardown(merge, a)).toMatchObject({ ok: true, output: { merged: true } });
+    expect((await store.deleteBranch("feat", false, a, true)).ok).toBe(true);
+    expect(sent).toEqual([
+      { cmd: "cmd_add_worktree", args: { repoPath: "/r/a", ...request } },
+      { cmd: "cmd_remove_worktree", args: { repoPath: "/r/a", targetPath: "/w", force: true } },
+      { cmd: "cmd_lock_worktree", args: { repoPath: "/r/a", targetPath: "/w", reason: null } },
+      { cmd: "cmd_unlock_worktree", args: { repoPath: "/r/a", targetPath: "/w" } },
+      { cmd: "cmd_worktree_merge_teardown", args: { repoPath: "/r/a", ...merge } },
+      { cmd: "cmd_delete_branch", args: { repoPath: "/r/a", branchName: "feat", force: false } },
+    ]);
+    const kinds = action.mock.calls.map(([entry]) => entry.kind);
+    expect(kinds).toEqual(expect.arrayContaining(["worktree", "worktree-remove", "worktree-lock", "worktree-unlock", "worktree-merge", "branch-delete"]));
+    expect(action.mock.calls.every(([entry]) => entry.repoPath === "/r/a" && entry.ok === true)).toBe(true);
+  });
+
+  it("a worktree command for a repository whose tab is gone is refused and nothing is sent", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_remove_worktree: record("cmd_remove_worktree"),
+      cmd_worktree_merge_teardown: record("cmd_worktree_merge_teardown"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    await store.closeTab(a.tabId);
+    expect(await store.removeWorktree("/w", false, a)).toMatchObject({ ok: false, refused: true });
+    expect(await store.worktreeMergeTeardown({ worktreePath: "/w", targetBranch: null, squash: false, expectedTip: "x" }, a)).toMatchObject({ ok: false, refused: true });
+    expect(await store.removeWorktree("/w", false, null)).toMatchObject({ ok: false, refused: true });
+    expect(sent).toEqual([]);
+  });
+
+  it("handled keeps a failure off the session's error banner, while it is still returned and journalled as failed", async () => {
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({ cmd_add_worktree: async () => { throw new Error("add refused"); } }));
+    await store.openRepo("/r/a");
+    const request = { targetPath: "/w", newBranch: null, startPoint: null, detach: true, cowCaches: true, runHooks: false };
+    const handled = await store.addWorktree(request, store.captureTarget(), true);
+    expect(handled).toMatchObject({ ok: false, error: expect.stringContaining("add refused"), surfaced: false });
+    expect(get(store).error).toBeNull();
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ kind: "worktree", ok: false }));
+    const unhandled = await store.addWorktree(request, store.captureTarget());
+    expect(unhandled.ok).toBe(false);
+    expect(get(store).error).toContain("add refused");
+  });
+
+  it("targetForPath names an open tab, opens a missing one without taking the screen, and is null when it cannot open", async () => {
+    const { store } = makeStore(makeInvoke({}));
+    await store.openRepo("/r/a");
+    await store.openRepo("/r/b");
+    const front = store.captureTarget()!;
+    expect(await store.targetForPath("/r/b")).toEqual(front);
+    const opened = await store.targetForPath("/r/c");
+    expect(opened).toMatchObject({ path: "/r/c" });
+    expect(store.captureTarget()).toEqual(front);
+    expect(store.targetIsActive(opened)).toBe(false);
+    expect(await store.targetForPath("")).toBeNull();
+  });
+
+  describe("targetForPath adversarial", () => {
+    const resolving = (aliases: Record<string, string>) => makeInvoke({
+      cmd_resolve_repo: async (_cmd, args) => {
+        const raw = String(args?.repoPath ?? "");
+        const path = aliases[raw] ?? raw;
+        return { path, name: path.split("/").pop(), is_bare: false } as never;
+      },
+    });
+
+    it("names the tab a symlinked or aliased spelling resolves to, opening it once and keeping the screen", async () => {
+      const { store } = makeStore(resolving({ "/link/main": "/real/main" }));
+      await store.openRepo("/r/front");
+      const front = store.captureTarget()!;
+      const target = await store.targetForPath("/link/main");
+      expect(target).toMatchObject({ path: "/real/main" });
+      expect(store.captureTarget()).toEqual(front);
+      expect(get(store).openTabs.filter((tab) => tab.path === "/real/main")).toHaveLength(1);
+      // Asked again, by either spelling, it names the same tab and opens no second one.
+      expect(await store.targetForPath("/link/main")).toEqual(target);
+      expect(await store.targetForPath("/real/main")).toEqual(target);
+      expect(get(store).openTabs).toHaveLength(2);
+    });
+
+    it("a trailing slash names the open tab and opens nothing new", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/a");
+      const a = store.captureTarget()!;
+      await store.openRepo("/r/b");
+      expect(await store.targetForPath("/r/a/")).toEqual(a);
+      expect(get(store).openTabs).toHaveLength(2);
+    });
+
+    it("a linked worktree and its main checkout are two repositories: each path names its own tab", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/main");
+      const main = store.captureTarget()!;
+      await store.openRepo("/r/main/.claude/worktrees/lane");
+      const lane = store.captureTarget()!;
+      expect(await store.targetForPath("/r/main")).toEqual(main);
+      expect(await store.targetForPath("/r/main/.claude/worktrees/lane")).toEqual(lane);
+      expect(main.tabId).not.toBe(lane.tabId);
+    });
+
+    it("two asks for the same unopened checkout at once share one tab", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/front");
+      const [one, two] = await Promise.all([store.targetForPath("/r/new"), store.targetForPath("/r/new")]);
+      expect(one).not.toBeNull();
+      expect(two).toEqual(one);
+      expect(get(store).openTabs.filter((tab) => tab.path === "/r/new")).toHaveLength(1);
+    });
+
+    it("is null, not a target that will only be refused later, for a checkout that is gone", async () => {
+      let gone = false;
+      const { store } = makeStore(makeInvoke({ cmd_resolve_repo: async (_cmd, args) => {
+        if (gone) throw new Error("not a git repository");
+        return { path: String(args?.repoPath ?? ""), name: "r", is_bare: false } as never;
+      } }));
+      await store.openRepo("/r/a");
+      await store.openRepo("/r/b");
+      gone = true;
+      store.markRepoGone("/r/a");
+      expect(await store.targetForPath("/r/a")).toBeNull();
+    });
+
+    it("a path that cannot be opened is null and leaves no tab behind", async () => {
+      const { store } = makeStore(makeInvoke({ cmd_resolve_repo: async () => { throw new Error("not a git repository"); } }));
+      expect(await store.targetForPath("/nowhere")).toBeNull();
+      expect(get(store).openTabs).toEqual([]);
+    });
+
+    it("looks an open tab up without opening one when asked not to", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/a");
+      const a = store.captureTarget()!;
+      await store.openRepo("/r/b");
+      expect(await store.targetForPath("/r/a", { open: false })).toEqual(a);
+      expect(await store.targetForPath("/r/never-opened", { open: false })).toBeNull();
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/a", "/r/b"]);
+    });
+
+    it("a merge-teardown armed on a tab that was closed and reopened at the same path runs there; one whose tab stayed closed is refused", async () => {
+      // The rule: a target names a repository by its path (the tab id is the path's identity),
+      // not a session instance. A same-path reopen is the same repository, so the run is not refused;
+      // a repository whose tab is closed is, and nothing is sent.
+      const sent: string[] = [];
+      const { store } = makeStore(makeInvoke({ cmd_worktree_merge_teardown: async (cmd) => { sent.push(cmd); return { policy: null, output: { merged: true } } as never; } }));
+      await store.openRepo("/r/a");
+      const a = store.captureTarget()!;
+      await store.openRepo("/r/b");
+      await store.closeTab(a.tabId);
+      const merge = { worktreePath: "/w", targetBranch: null, squash: false, expectedTip: "abc" };
+      expect(await store.worktreeMergeTeardown(merge, a, true)).toMatchObject({ ok: false, refused: true });
+      await store.openRepo("/r/a", { activate: false });
+      expect(await store.worktreeMergeTeardown(merge, a, true)).toMatchObject({ ok: true });
+      expect(sent).toEqual(["cmd_worktree_merge_teardown"]);
+    });
+  });
+
   it("an already-existing file comes back on cause and is not filed as the session's error", async () => {
     const refusal = { code: "already_exists", message: "'a.ts' already exists", path: "a.ts" };
     const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));

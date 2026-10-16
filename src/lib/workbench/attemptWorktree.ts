@@ -22,9 +22,8 @@ import { get } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { interfaceStore } from "../stores/interfaceStore";
 import { askConfirm } from "../stores/modalStore";
-import { repoStore, type ResolvedRepo } from "../stores/repoStore";
-import type { Guarded } from "../stores/harnessStore";
-import type { MergeTeardownResult, WorktreeInfo, WorktreeRemoval } from "../branches/types";
+import { repoStore, type MutationOutcome, type MutationTarget, type ResolvedRepo } from "../stores/repoStore";
+import type { MergeTeardownResult, WorktreeInfo } from "../branches/types";
 import { MergeTeardownFailure, readMergeTeardownError } from "../branches/mergeTeardown";
 import { familyFromCommonDir } from "../repos/repoFamily";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
@@ -98,6 +97,26 @@ async function listingFor(root: string, cwd: string): Promise<{ main: WorktreeIn
   return { main: list.find((entry) => entry.is_main) ?? null, own };
 }
 
+/**
+ * The main checkout as a mutation target. A tab that already holds it is
+ * looked up (`known`) before anything is asked, so closing it while the reader
+ * decides refuses the run. When none holds it, its tab is opened in the
+ * background only now, after approval and just before the work, so a declined
+ * or refused action leaves no tab behind. The work runs there, counted by the
+ * quit guard and journalled, whatever is in front.
+ */
+async function mainCheckoutTarget(root: string, known: MutationTarget | null): Promise<MutationTarget> {
+  if (known) return known;
+  const target = await repoStore.targetForPath(root);
+  if (!target) throw new Error(`${root} could not be opened, so nothing is run in it.`);
+  return target;
+}
+
+/** What a failed or refused mutation threw, or says, for a caller that reports it as an error. */
+function failureOf(outcome: MutationOutcome): unknown {
+  return outcome.cause ?? new Error(outcome.error ?? "It did not complete.");
+}
+
 /** What a removal would cost, said before it happens. */
 function changesClause(dirty: number | null): string {
   if (dirty === null) return "Its uncommitted changes could not be counted, so only a clean removal is tried.";
@@ -130,6 +149,7 @@ export type WorktreeActionResult = { message: string } | null;
  */
 export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeActionResult> {
   const root = await mainCheckoutOf(run.cwd);
+  const known = await repoStore.targetForPath(root, { open: false });
   const { main, own } = await listingFor(root, run.cwd);
   if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
   const target = main?.branch ?? null;
@@ -142,7 +162,8 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   });
   if (!approved) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
-  const merged = await mergeAndTeardown(root, run.cwd, target, own.head);
+  const mutationTarget = await mainCheckoutTarget(root, known);
+  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, own.head);
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
@@ -153,20 +174,20 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
 }
 
 /**
- * The one call to `cmd_worktree_merge_teardown`. `expectedTip` is the commit
- * the caller verified the branch at, and the host merges nothing when the
- * branch is anywhere else once it holds its lock. The host's typed rejection
+ * The one call to the host's merge-teardown, through the store so it is
+ * counted, queued and journalled. `expectedTip` is the commit the caller
+ * verified the branch at, and the host merges nothing when the branch is
+ * anywhere else once it holds its lock. The host's typed rejection
  * (`{code, message, ...}`) is kept as a `MergeTeardownFailure`, so a caller
- * can tell a conflict from a refusal; any other rejection passes through.
+ * can tell a conflict from a refusal; any other rejection passes through, and
+ * so does the store's refusal when the repository changed while it waited.
  */
-async function mergeAndTeardown(root: string, cwd: string, target: string, expectedTip: string): Promise<MergeTeardownResult> {
-  try {
-    const result = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", { repoPath: root, worktreePath: cwd, targetBranch: target, squash: false, expectedTip });
-    return result.output;
-  } catch (cause) {
-    const failure = readMergeTeardownError(cause);
-    throw failure ? new MergeTeardownFailure(failure) : cause;
-  }
+async function mergeAndTeardown(mutationTarget: MutationTarget, cwd: string, target: string, expectedTip: string): Promise<MergeTeardownResult> {
+  const outcome = await repoStore.worktreeMergeTeardown({ worktreePath: cwd, targetBranch: target, squash: false, expectedTip }, mutationTarget, true);
+  if (outcome.ok && outcome.output) return outcome.output;
+  const cause = failureOf(outcome);
+  const failure = readMergeTeardownError(cause);
+  throw failure ? new MergeTeardownFailure(failure) : cause;
 }
 
 /** What landed, and, when the cleanup after it did not finish, that it is pending and why. */
@@ -193,6 +214,7 @@ export interface VerifiedMerge { head: string; message: string }
 export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string): Promise<VerifiedMerge> {
   if (!expectedHead) throw new Error("No verified head was named, so nothing is merged.");
   const root = await mainCheckoutOf(run.cwd);
+  const known = await repoStore.targetForPath(root, { open: false });
   const { main, own } = await listingFor(root, run.cwd);
   if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
   if (own.head !== expectedHead) throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${expectedHead.slice(0, 8)} was verified, so it is not merged.`);
@@ -205,7 +227,8 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (liveRunIn(root, live.runs)) throw new Error(`Another attempt is working in the main checkout ${root}, so nothing is merged into it.`);
   if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
   // The head the verdict was reached for is the tip the host holds the merge to.
-  const merged = await mergeAndTeardown(root, run.cwd, target, expectedHead);
+  const mutationTarget = await mainCheckoutTarget(root, known);
+  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, expectedHead);
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
@@ -223,6 +246,7 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
  */
 export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeActionResult> {
   const root = await mainCheckoutOf(run.cwd);
+  const known = await repoStore.targetForPath(root, { open: false });
   const { own } = await listingFor(root, run.cwd);
   const dirty = own.dirty_files;
   const approved = await askConfirm({
@@ -234,18 +258,16 @@ export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeA
   if (!approved) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
   const force = dirty !== null && dirty > 0;
-  const removed = await invoke<Guarded<WorktreeRemoval>>("cmd_remove_worktree", { repoPath: root, targetPath: run.cwd, force });
+  const mutationTarget = await mainCheckoutTarget(root, known);
+  const removed = await repoStore.removeWorktree(run.cwd, force, mutationTarget, true);
+  if (!removed.ok) throw failureOf(removed);
   await closeStranded(run.cwd);
   const parts = ["The worktree was removed."];
-  if (removed?.output?.cleanup_error) parts.push(removed.output.cleanup_error);
-  if (removed?.output?.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${removed.output.sweep_problems.join("; ")}`);
+  if (removed.output?.cleanup_error) parts.push(removed.output.cleanup_error);
+  if (removed.output?.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${removed.output.sweep_problems.join("; ")}`);
   if (own.branch?.startsWith("gitpulse/")) {
-    try {
-      await invoke("cmd_delete_branch", { repoPath: root, branchName: own.branch, force: false });
-      parts.push(`Its branch ${own.branch} was deleted.`);
-    } catch (cause) {
-      parts.push(`Its branch ${own.branch} was kept: ${formatError(cause)}`);
-    }
+    const deleted = await repoStore.deleteBranch(own.branch, false, mutationTarget, true);
+    parts.push(deleted.ok ? `Its branch ${own.branch} was deleted.` : `Its branch ${own.branch} was kept: ${deleted.error ?? "it did not complete."}`);
   } else if (own.branch) {
     parts.push(`Its branch ${own.branch} was kept.`);
   }

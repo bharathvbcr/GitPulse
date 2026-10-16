@@ -238,22 +238,31 @@ describe("components never send a mutating command themselves", () => {
     expect(directMutatingInvokes('await sendWithRetry(3, "cmd_push", { repoPath });', commands)).toEqual([1]);
   });
 
-  it("cannot see a mutating command the store does not send, and says so", () => {
-    // The scanner's set is the store's. These are sent from WorktreesPanel
-    // itself; until the store owns them they are invisible here by design.
-    for (const outside of ["cmd_add_worktree", "cmd_remove_worktree", "cmd_lock_worktree", "cmd_unlock_worktree", "cmd_merge_and_teardown"]) {
-      expect(commands.has(outside), outside).toBe(false);
+  it("covers the six worktree and branch commands the store now owns, planted in a component or a module", () => {
+    const six = ["cmd_add_worktree", "cmd_remove_worktree", "cmd_lock_worktree", "cmd_unlock_worktree", "cmd_worktree_merge_teardown", "cmd_delete_branch"];
+    for (const command of six) {
+      expect(commands.has(command), command).toBe(true);
+      expect(directMutatingInvokes(`import { invoke } from "../ipc/invoke";\nawait invoke("${command}", { repoPath });`, commands), command).toEqual([2]);
+      expect(directMutatingInvokesSvelte(`<script lang="ts">\n  import { invoke } from "../ipc/invoke";\n  const go = () => invoke("${command}", {});\n</script>\n<button onclick={go}>x</button>`, commands), command).toEqual([3]);
     }
   });
 
-  it("holds for every production module under src/lib, except the known unrouted ones", () => {
+  it("flags a worktree wrapper called after a prompt without a target", () => {
+    const code = (call: string) => `async function f() {\n  if (!(await askConfirm({}))) return;\n  await ${call};\n}`;
+    expect(untargetedAfterPrompt(code("repoStore.addWorktree(req)"))).toEqual([3]);
+    expect(untargetedAfterPrompt(code("repoStore.removeWorktree(p, false)"))).toEqual([3]);
+    expect(untargetedAfterPrompt(code("repoStore.lockWorktree(p)"))).toEqual([3]);
+    expect(untargetedAfterPrompt(code("repoStore.unlockWorktree(p)"))).toEqual([3]);
+    expect(untargetedAfterPrompt(code("repoStore.worktreeMergeTeardown(req)"))).toEqual([3]);
+    expect(untargetedAfterPrompt(code("repoStore.worktreeMergeTeardown(req, target)"))).toEqual([]);
+  });
+
+  it("holds for every production module under src/lib", () => {
     const owners = new Set([join(SRC, "lib", "stores", "repoStore.ts")]);
     const hits = tsSourceFiles(join(SRC, "lib"))
       .filter((file) => !owners.has(file))
       .flatMap((file) => directMutatingInvokes(readFileSync(file, "utf8"), commands).map((line) => `${relative(SRC, file)}:${line}`));
-    // attemptWorktree deletes the agent branch with a direct cmd_delete_branch:
-    // a known bypass outside the scanned component dirs, left for its own task.
-    expect(hits.map((hit) => hit.replace(/:\d+$/, ""))).toEqual(["lib/workbench/attemptWorktree.ts"]);
+    expect(hits).toEqual([]);
   }, 60_000);
 
   it("holds for every component and palette module", () => {

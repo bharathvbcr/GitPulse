@@ -7,7 +7,12 @@ vi.mock("../stores/modalStore", () => ({ askConfirm: () => { throw new Error("an
 const repoState = writable<{ openTabs: unknown[] }>({ openTabs: [] });
 const trustRepo = vi.fn(async (path: string): Promise<string | null> => path);
 const closeTab = vi.fn(async (_id: string) => {});
-vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: async () => {} } }));
+let fake: ReturnType<typeof import("./attemptRepoStoreFake").fakeAttemptStore>;
+vi.mock("../stores/repoStore", async () => {
+  const { fakeAttemptStore } = await import("./attemptRepoStoreFake");
+  fake = fakeAttemptStore((command, args) => invoke(command, args), { merge: "cmd_worktree_merge_teardown", remove: "cmd_remove_worktree", deleteBranch: "cmd_delete_branch" });
+  return { repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: async () => {}, ...fake.members } };
+});
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: () => {} } }));
 const live = vi.fn(async (): Promise<{ runs: { cwd: string }[]; complete: boolean }> => ({ runs: [], complete: true }));
 vi.mock("./client", async (original) => ({ ...(await original<typeof import("./client")>()), listAllLiveRuns: () => live() }));
@@ -33,7 +38,7 @@ function setup(own: Record<string, unknown> = {}, main: Record<string, unknown> 
 }
 const merged = () => invoke.mock.calls.some((c) => c[0] === "cmd_worktree_merge_teardown");
 
-beforeEach(() => { invoke.mockReset(); closeTab.mockClear(); trustRepo.mockClear(); trustRepo.mockImplementation(async (p) => p); live.mockReset(); live.mockResolvedValue({ runs: [], complete: true }); repoState.set({ openTabs: [] }); });
+beforeEach(() => { invoke.mockReset(); closeTab.mockClear(); trustRepo.mockClear(); trustRepo.mockImplementation(async (p) => p); fake.seen.length = 0; fake.opened.length = 0; fake.state.mainOpen = true; fake.state.stillNamed = () => true; live.mockReset(); live.mockResolvedValue({ runs: [], complete: true }); repoState.set({ openTabs: [] }); });
 
 describe("mergeVerifiedAttempt", () => {
   it("merges the verified head without asking, into the main checkout's branch, and never pushes", async () => {
@@ -78,6 +83,19 @@ describe("mergeVerifiedAttempt", () => {
     invoke.mockImplementation(async () => ({ path: "/work/repo", name: "repo", is_bare: false, common_dir: "/work/repo/.git" }));
     await expect(mergeVerifiedAttempt({ ...run, cwd: "/work/repo" }, "1234567890abcdef")).rejects.toThrow(/main checkout itself|no worktree to merge/);
     expect(merged()).toBe(false);
+  });
+
+  it("opens no tab for the main checkout for a merge it refuses, and opens it once for one that runs", async () => {
+    fake.state.mainOpen = false;
+    setup({ dirty_files: 2 });
+    await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/uncommitted file/);
+    trustRepo.mockResolvedValueOnce(null);
+    setup();
+    await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/not trusted/);
+    expect(fake.opened).toEqual([]);
+    setup();
+    await mergeVerifiedAttempt(run, "1234567890abcdef");
+    expect(fake.opened).toEqual(["/work/repo"]);
   });
 
   it("surfaces a failing merge (a conflict) as an error, leaving the resolution to the person", async () => {
