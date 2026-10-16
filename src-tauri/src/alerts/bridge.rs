@@ -84,10 +84,13 @@ struct State {
     /// loop, so a loop that waits with no timeout still looks at `generation`.
     #[cfg(unix)]
     wake: Mutex<Option<Arc<crate::local_socket::Wake>>>,
-    /// Times an accept loop has come out of its wait, for whatever reason. An
-    /// idle bridge should not move this.
-    #[cfg(unix)]
-    accept_wakes: AtomicU64,
+    /// `(generation, times that generation's accept loop came out of its
+    /// wait)`, for whatever reason. A loop adds to it only while its own
+    /// generation is the one recorded, so a retired predecessor still draining
+    /// its exit wake cannot count against its successor. An idle bridge should
+    /// not move this. Test-only: the loop pays nothing for it in production.
+    #[cfg(all(unix, test))]
+    accept_wakes: Mutex<(u64, u64)>,
     /// Accept loops that have started and not yet finished their exit work.
     #[cfg(unix)]
     live_loops: AtomicUsize,
@@ -103,8 +106,8 @@ fn state() -> &'static State {
         control: Mutex::new(()),
         #[cfg(unix)]
         wake: Mutex::new(None),
-        #[cfg(unix)]
-        accept_wakes: AtomicU64::new(0),
+        #[cfg(all(unix, test))]
+        accept_wakes: Mutex::new((0, 0)),
         #[cfg(unix)]
         live_loops: AtomicUsize::new(0),
     })
@@ -207,6 +210,13 @@ fn start(path: Option<std::path::PathBuf>) {
         return;
     }
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    #[cfg(test)]
+    {
+        *state
+            .accept_wakes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (generation, 0);
+    }
     wake_retired_loop(state);
     // Before the socket, so a listener is never bound that cannot be told to
     // stop. There is no polling fallback: the cost of one would be paid by
@@ -260,6 +270,20 @@ fn bind(
     Ok((listener, path))
 }
 
+/// Counts one return from the wait against `generation`, if it is still the
+/// generation being counted.
+#[cfg(all(unix, test))]
+fn count_wake(state: &State, generation: u64) {
+    tests::hold_after_wait();
+    let mut counted = state
+        .accept_wakes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if counted.0 == generation {
+        counted.1 += 1;
+    }
+}
+
 #[cfg(unix)]
 fn accept_loop(
     listener: std::os::unix::net::UnixListener,
@@ -287,7 +311,8 @@ fn accept_loop(
         // `stop`/`start` retires this generation and writes to the wake pipe.
         let ready =
             crate::local_socket::wait_readable_or_woken(listener.as_raw_fd(), wake.reader_fd());
-        state.accept_wakes.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        count_wake(state, generation);
         if ready.woken {
             wake.drain();
         }
@@ -976,8 +1001,61 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn loop_wakes() -> u64 {
+        state()
+            .accept_wakes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+    }
+
+    #[cfg(unix)]
     fn live_loops() -> usize {
         state().live_loops.load(Ordering::SeqCst)
+    }
+
+    /// How long a loop that has come out of its wait stalls before counting
+    /// it: a stand-in for a thread the scheduler has not run yet.
+    #[cfg(unix)]
+    static HOLD_AFTER_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    pub(super) fn hold_after_wait() {
+        let held = HOLD_AFTER_WAIT_MS.load(Ordering::SeqCst);
+        if held > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(held));
+        }
+    }
+
+    /// Two loops a test retired without waiting for them are still on their way
+    /// out when the next test starts its own. Their exit wakes are not the new
+    /// loop's, and an idle loop must not be charged for them.
+    #[cfg(unix)]
+    #[test]
+    fn a_retiring_predecessor_does_not_count_against_an_idle_loop() {
+        let _own = own_listener();
+        let dir = ShortDir::new("pred");
+        for _ in 0..2 {
+            apply_at(true, Some(dir.socket()));
+            assert!(within(std::time::Duration::from_secs(5), || live_loops() >= 1));
+            // Let it reach its wait, so retiring it is a wake rather than a
+            // generation check.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            HOLD_AFTER_WAIT_MS.store(600, Ordering::SeqCst);
+            apply_at(false, None);
+        }
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        let before = loop_wakes();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let woke = loop_wakes() - before;
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(10), || live_loops() == 0));
+        HOLD_AFTER_WAIT_MS.store(0, Ordering::SeqCst);
+        assert_eq!(
+            woke, 0,
+            "retiring predecessors woke the idle loop {woke} times"
+        );
     }
 
     /// The accept loop used to wake five times a second for as long as the
@@ -992,9 +1070,9 @@ mod tests {
         assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
         // One for an interrupted wait is tolerated; the old loop took ten.
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let before = state().accept_wakes.load(Ordering::Relaxed);
+        let before = loop_wakes();
         std::thread::sleep(std::time::Duration::from_secs(2));
-        let woke = state().accept_wakes.load(Ordering::Relaxed) - before;
+        let woke = loop_wakes() - before;
         assert!(woke <= 1, "the idle accept loop woke {woke} times in 2 s");
         // And it is still listening: not waking is not the same as not working.
         assert_eq!(
@@ -1192,9 +1270,9 @@ mod tests {
         assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
         std::thread::sleep(std::time::Duration::from_millis(100));
         std::fs::remove_file(dir.socket()).unwrap();
-        let before = state().accept_wakes.load(Ordering::Relaxed);
+        let before = loop_wakes();
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let woke = state().accept_wakes.load(Ordering::Relaxed) - before;
+        let woke = loop_wakes() - before;
         assert!(
             woke <= 1,
             "the loop woke {woke} times in 1 s after an unlink"
