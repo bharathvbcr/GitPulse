@@ -14,6 +14,7 @@
 use regex::{Captures, Regex, RegexSet, RegexSetBuilder, Replacer};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// The contextual stage's patterns, in the order the chain applies them.
@@ -66,15 +67,90 @@ const SHELL_USERINFO_FLAG: usize = 14;
 
 const URL_TOKEN_USERINFO_PATTERN: &str = r"(?i)([a-z][a-z0-9+.-]*://)([a-z0-9_.~%-]{20,})@";
 
-/// The compiled contextual stage: every pattern of the chain, and one set over
-/// all of them. A text that matches no pattern of the set is unchanged by the
-/// whole chain, because a replacement needs a match.
-struct Contextual {
-    chain: Vec<Regex>,
-    any: RegexSet,
+/// How many `redact_contextual` calls a process runs the full chain without
+/// the gate before it builds and uses the `RegexSet`.
+///
+/// Derivation (release build, Apple silicon, min of 25 fresh processes):
+/// - Building the set costs about 1.45 ms: the first `text` call is 4.16 ms
+///   with the set built eagerly against 2.72 ms with only the chain.
+/// - Consulting it saves a few microseconds per call on a leaf no pattern
+///   matches: 9.3 us on a 4-field JSON detail, 1.7 us on a path, 6.2 us on a
+///   hook session marker (steady-state `text`, set gated vs chain only), about
+///   5.6 us on average.
+/// - Break-even is therefore about 1450 / 5.6 = 260 calls (160 to 850 across
+///   those leaves). Switching at the break-even bounds the regret of either
+///   choice to 2x the better one (ski rental), so N is the nearest power of
+///   two, 256.
+/// - A `gitpulse-hook` invocation makes 0 to 2 contextual calls on its normal
+///   paths (counted per subcommand), 100x below N, so it never builds the
+///   set. A long-lived writer (the ledger, the daemon) passes N within its
+///   first rows and then keeps the gate for the rest of its life.
+const UNGATED_CALLS: usize = 256;
+
+/// The contextual stage. The chain and the gate are built from the same
+/// `CONTEXTUAL_PATTERNS` table but in separate slots, so a process that only
+/// ever runs the chain never pays for the set.
+///
+/// A text that matches no pattern of the set is unchanged by the whole chain,
+/// because a replacement needs a match; running the chain without consulting
+/// the set therefore yields the same output, only slower on a clean leaf.
+struct ContextualStage {
+    chain: OnceLock<Vec<Regex>>,
+    gate: OnceLock<RegexSet>,
+    calls: AtomicUsize,
 }
 
-static CONTEXTUAL: OnceLock<Contextual> = OnceLock::new();
+impl ContextualStage {
+    const fn new() -> Self {
+        Self {
+            chain: OnceLock::new(),
+            gate: OnceLock::new(),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn patterns() -> Vec<String> {
+        let names = credential_name_alternation();
+        CONTEXTUAL_PATTERNS
+            .iter()
+            .map(|pattern| resolved_pattern(pattern, &names))
+            .collect()
+    }
+
+    fn chain(&self) -> &[Regex] {
+        self.chain.get_or_init(|| {
+            Self::patterns()
+                .iter()
+                .map(|pattern| Regex::new(pattern).expect("static credential regex must compile"))
+                .collect()
+        })
+    }
+
+    fn gate(&self) -> &RegexSet {
+        self.gate.get_or_init(|| {
+            // The set is the union of the chain, so it may need more than the
+            // default 10 MiB that one pattern gets.
+            RegexSetBuilder::new(Self::patterns())
+                .size_limit(64 << 20)
+                .build()
+                .expect("credential regex set must compile")
+        })
+    }
+
+    /// True when this call should consult the gate. The first `UNGATED_CALLS`
+    /// calls do not. Relaxed is enough: a race only shifts which call builds
+    /// the set, never the output.
+    fn use_gate(&self) -> bool {
+        if self.calls.load(Ordering::Relaxed) < UNGATED_CALLS {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+static CONTEXTUAL: ContextualStage = ContextualStage::new();
 static URL_TOKEN_USERINFO: OnceLock<Regex> = OnceLock::new();
 
 /// The credential names `{names}` stands for.
@@ -96,27 +172,6 @@ fn credential_name_alternation() -> String {
 
 fn resolved_pattern(pattern: &str, names: &str) -> String {
     pattern.replace("{names}", names)
-}
-
-fn contextual() -> &'static Contextual {
-    CONTEXTUAL.get_or_init(|| {
-        let names = credential_name_alternation();
-        let patterns: Vec<String> = CONTEXTUAL_PATTERNS
-            .iter()
-            .map(|pattern| resolved_pattern(pattern, &names))
-            .collect();
-        let chain = patterns
-            .iter()
-            .map(|pattern| Regex::new(pattern).expect("static credential regex must compile"))
-            .collect();
-        // The set is the union of the chain, so it may need more than the
-        // default 10 MiB that one pattern gets.
-        let any = RegexSetBuilder::new(&patterns)
-            .size_limit(64 << 20)
-            .build()
-            .expect("credential regex set must compile");
-        Contextual { chain, any }
-    })
 }
 
 fn url_token_userinfo() -> &'static Regex {
@@ -200,16 +255,19 @@ fn redacted_embedded_assignment(captures: &Captures<'_>) -> String {
 }
 
 fn redact_contextual(value: Cow<'_, str>) -> Cow<'_, str> {
-    let stage = contextual();
+    redact_contextual_with(&CONTEXTUAL, value)
+}
+
+fn redact_contextual_with<'a>(stage: &ContextualStage, value: Cow<'a, str>) -> Cow<'a, str> {
     // Every replacement needs a match, and the set matches the input when any
     // chain pattern does, so no match here means the chain is the identity.
     // When one does match, the full chain runs in order: an earlier
     // replacement can create or destroy a later match, so only running the
     // matching patterns would not be the same function.
-    if !stage.any.is_match(&value) {
+    if stage.use_gate() && !stage.gate().is_match(&value) {
         return value;
     }
-    let chain = &stage.chain;
+    let chain = stage.chain();
     let out = value;
     let out = replaced(&chain[PRIVATE_KEY], out, "<private key redacted>");
     let out = replaced(&chain[QUOTED_AUTHORIZATION], out, redacted_authorization);
@@ -785,7 +843,7 @@ mod reference {
                 .expect("canonical credential-name regex must compile")
         })
     }
-    fn redact_contextual(value: &str) -> String {
+    pub(super) fn redact_contextual(value: &str) -> String {
         // Private-key blocks go first. dc-redact deliberately recognizes the PEM
         // prefix as a secret token, but token-oriented matching stops at the first
         // space and cannot remove the body after it has rewritten that prefix.
@@ -1792,7 +1850,7 @@ mod equivalence_tests {
         "Authorization: Basic <redacted>\\nCookie: <redacted>\\nhttps://example.test/repo",
     ];
 
-    fn corpus() -> Vec<String> {
+    pub(super) fn corpus() -> Vec<String> {
         let mut inputs: Vec<String> = vec![
             // Valid JSON scalars and near-scalars.
             "123".into(),
@@ -1994,11 +2052,11 @@ mod equivalence_tests {
 
     #[test]
     fn the_gate_table_and_the_chain_are_the_same_patterns() {
-        let stage = contextual();
-        assert_eq!(stage.chain.len(), CONTEXTUAL_PATTERNS.len());
-        assert_eq!(stage.any.len(), CONTEXTUAL_PATTERNS.len());
-        for (position, pattern) in stage.any.patterns().iter().enumerate() {
-            assert_eq!(pattern, stage.chain[position].as_str(), "slot {position}");
+        let stage = &CONTEXTUAL;
+        assert_eq!(stage.chain().len(), CONTEXTUAL_PATTERNS.len());
+        assert_eq!(stage.gate().len(), CONTEXTUAL_PATTERNS.len());
+        for (position, pattern) in stage.gate().patterns().iter().enumerate() {
+            assert_eq!(pattern, stage.chain()[position].as_str(), "slot {position}");
         }
     }
 
@@ -2010,7 +2068,7 @@ mod equivalence_tests {
             "2026-09-01T12:00:00.000Z",
             "Edit",
         ] {
-            assert!(!contextual().any.is_match(input), "{input}");
+            assert!(!CONTEXTUAL.gate().is_match(input), "{input}");
             assert!(
                 matches!(redact_contextual(Cow::Borrowed(input)), Cow::Borrowed(_)),
                 "{input}"
@@ -2251,13 +2309,13 @@ mod gate_tests {
     /// Every set index must agree with its individual regex, and the set's
     /// `is_match` with "some chain regex matches".
     fn assert_gate_agrees(input: &str) {
-        let stage = contextual();
-        let set_hit = stage.any.is_match(input);
-        let chain_hit = stage.chain.iter().any(|regex| regex.is_match(input));
+        let stage = &CONTEXTUAL;
+        let set_hit = stage.gate().is_match(input);
+        let chain_hit = stage.chain().iter().any(|regex| regex.is_match(input));
         assert_eq!(set_hit, chain_hit, "gate vs chain on {input:?}");
-        let matched: Vec<usize> = stage.any.matches(input).into_iter().collect();
+        let matched: Vec<usize> = stage.gate().matches(input).into_iter().collect();
         let individually: Vec<usize> = stage
-            .chain
+            .chain()
             .iter()
             .enumerate()
             .filter(|(_, regex)| regex.is_match(input))
@@ -2313,15 +2371,15 @@ mod gate_tests {
     fn a_non_ascii_case_fold_reaches_the_chain_and_the_set_alike() {
         // Pins that the folds are exercised at all: if the gate said "no
         // match" here, a Kelvin-sign key would reach the ledger in full.
-        let stage = contextual();
+        let stage = &CONTEXTUAL;
         for input in [
             "api_\u{212a}ey=opaque-value",
             "pa\u{17f}\u{17f}word=opaque-value",
             "\u{17f}ecret=opaque-value",
         ] {
-            assert!(stage.any.is_match(input), "{input:?}");
+            assert!(stage.gate().is_match(input), "{input:?}");
             assert!(
-                stage.chain.iter().any(|regex| regex.is_match(input)),
+                stage.chain().iter().any(|regex| regex.is_match(input)),
                 "{input:?}"
             );
             assert!(!text(input).contains("opaque-value"), "{input:?}");
@@ -2350,28 +2408,31 @@ mod gate_tests {
     }
 
     fn observe(reach: &mut Reach, input: &str) {
-        let stage = contextual();
+        let stage = &CONTEXTUAL;
         reach.total += 1;
-        for (index, regex) in stage.chain.iter().enumerate() {
+        for (index, regex) in stage.chain().iter().enumerate() {
             if regex.is_match(input) {
                 reach.pattern[index] += 1;
             }
         }
-        if stage.chain[URL_PASSWORD].captures_iter(input).any(|caps| {
-            caps[2].split_once('/').is_some_and(|(head, _)| {
-                !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())
+        if stage.chain()[URL_PASSWORD]
+            .captures_iter(input)
+            .any(|caps| {
+                caps[2].split_once('/').is_some_and(|(head, _)| {
+                    !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())
+                })
             })
-        }) {
+        {
             reach.port_exemption += 1;
         }
         if [AUTHORIZATION, COOKIE].iter().any(|&slot| {
-            stage.chain[slot]
+            stage.chain()[slot]
                 .find_iter(input)
                 .any(|found| matches!(input.as_bytes().get(found.end()), Some(b'\n' | b'\r')))
         }) {
             reach.line_end_anchor_mid_text += 1;
         }
-        if stage.chain[PRIVATE_KEY]
+        if stage.chain()[PRIVATE_KEY]
             .find_iter(input)
             .any(|found| !found.as_str().contains("-----END"))
         {
@@ -2562,5 +2623,78 @@ mod gate_tests {
             }
             assert_eq!(text(scalar), super::reference::text(scalar), "{scalar:?}");
         }
+    }
+}
+
+/// The deferred gate: the first `UNGATED_CALLS` calls of a process run the
+/// bare chain, later calls consult the set. Each test owns a fresh
+/// `ContextualStage`, so none of them depends on how many calls other tests
+/// in this binary already made through the shared static.
+#[cfg(test)]
+mod deferred_gate_tests {
+    use super::equivalence_tests::{corpus, KEY};
+    use super::reference::redact_contextual as reference_contextual;
+    use super::*;
+
+    fn inputs() -> Vec<String> {
+        let mut inputs = corpus();
+        inputs.push(String::new());
+        inputs.push("src-tauri/src/ledger/redact.rs".to_string());
+        inputs.push(format!("Authorization: Bearer {KEY}"));
+        inputs
+    }
+
+    fn run(stage: &ContextualStage, input: &str) -> String {
+        redact_contextual_with(stage, Cow::Borrowed(input)).into_owned()
+    }
+
+    #[test]
+    fn both_regimes_in_one_process_match_the_reference() {
+        let stage = ContextualStage::new();
+        let inputs = inputs();
+        let mut ungated = 0;
+        let mut gated = 0;
+        for round in 0..UNGATED_CALLS / inputs.len() + 3 {
+            for input in &inputs {
+                let regime_gated = stage.calls.load(Ordering::Relaxed) >= UNGATED_CALLS;
+                assert_eq!(
+                    run(&stage, input),
+                    reference_contextual(input),
+                    "round {round} (gated: {regime_gated}) diverged on {input:?}"
+                );
+                if regime_gated {
+                    gated += 1;
+                } else {
+                    ungated += 1;
+                }
+            }
+        }
+        assert_eq!(ungated, UNGATED_CALLS, "the ungated regime ran N calls");
+        assert!(
+            gated >= 2 * inputs.len(),
+            "the gated regime ran too: {gated}"
+        );
+    }
+
+    #[test]
+    fn the_gate_is_not_built_before_the_threshold_call() {
+        let stage = ContextualStage::new();
+        assert!(stage.gate.get().is_none());
+        for call in 0..UNGATED_CALLS {
+            assert!(stage.gate.get().is_none(), "built before call {call}");
+            run(&stage, "plain text with no credential");
+        }
+        assert!(stage.chain.get().is_some(), "the chain is built by call 1");
+        assert!(
+            stage.gate.get().is_none(),
+            "{UNGATED_CALLS} calls must not build the set"
+        );
+        run(&stage, "plain text with no credential");
+        assert!(stage.gate.get().is_some(), "call N+1 builds the set");
+    }
+
+    #[test]
+    fn the_threshold_is_a_small_bounded_count() {
+        assert!((1..=1024).contains(&UNGATED_CALLS));
     }
 }
