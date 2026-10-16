@@ -44,6 +44,13 @@ fn cases(marker: &str) -> Vec<Vec<String>> {
         case(&["-n", marker]),
         case(&["-o", marker]),
         case(&["-u", &uid, marker]),
+        // Another user's processes are not this user's to signal, so these
+        // select nothing the guard counts; a guard that ignored the user
+        // filter would select the marked children (and, without a marker,
+        // every process of this user).
+        case(&["-u", "0", marker]),
+        case(&["-U", "0", "-f", marker]),
+        case(&["-u", "0"]),
         case(&["-U", &uid, "-f", marker]),
         case(&["-u", &uid, "-fx", &format!("{marker} 600")]),
         case(&[&format!("{marker}|nomatchzzq")]),
@@ -144,6 +151,15 @@ fn the_guard_picks_exactly_the_processes_pgrep_picks() {
         // The marked children live throughout, so they are in or out of both
         // answers together, whatever else is running.
         let marked_agree = wanted.intersection(&ours).eq(gotten.intersection(&ours));
+        // `unexplained` excuses the running process either way, so a guard that
+        // stopped leaving itself out of `-v`/`-a` would agree with `pgrep` and
+        // go unseen; the modelled behaviour is that it is never in the answer.
+        let leaks_self = models_self && gotten.contains(&own);
+        if leaks_self {
+            failures.push(format!(
+                "pgrep {argv:?}: the guard returned its own pid {own}"
+            ));
+        }
         if !marked_agree || !differ.is_empty() {
             let only: Vec<String> = differ
                 .iter()
