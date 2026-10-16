@@ -3671,38 +3671,56 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_status_read_under_fsmonitor_does_not_announce_itself() {
+        /// One git call under fsmonitor. A healthy call takes seconds; under
+        /// a loaded host (load average in the dozens) tens of seconds. A hung
+        /// one never returns: sampled live, the client sat in `read()` inside
+        /// `fsmonitor_ipc__send_query` while the daemon's `handle_client`
+        /// waited on a condition variable no event ever signalled, with
+        /// nothing on the client side to time it out.
+        const FSMONITOR_GIT_BUDGET: Duration = Duration::from_secs(60);
         use std::process::Command;
+        // Every git below can wait on the fsmonitor daemon, a separate
+        // process whose lifetime the test does not own: each call has a
+        // deadline, and a call that misses it fails the test with its name.
+        let git = |root: &Path, args: &[&str], no_optional_locks: bool| {
+            let mut cmd = Command::new("git");
+            cmd.args(args).current_dir(root);
+            if no_optional_locks {
+                cmd.env("GIT_OPTIONAL_LOCKS", "0");
+            }
+            crate::test_support::run_within(
+                cmd,
+                &format!("git {}", args.join(" ")),
+                crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET),
+            )
+        };
         struct StopDaemon(PathBuf);
         impl Drop for StopDaemon {
             fn drop(&mut self) {
-                let _ = Command::new("git")
-                    .args(["fsmonitor--daemon", "stop"])
-                    .current_dir(&self.0)
-                    .output_locked();
+                // Never panics: this also runs while the test's own failure
+                // unwinds, and a stop that hangs must not outlive its bound.
+                let mut cmd = Command::new("git");
+                cmd.args(["fsmonitor--daemon", "stop"]).current_dir(&self.0);
+                let _ = crate::engine::git_cli::run_bounded(
+                    cmd,
+                    "git fsmonitor--daemon stop",
+                    crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET),
+                    None,
+                );
             }
         }
         let status = |root: &Path| {
-            let out = Command::new("git")
-                .args(["status", "--porcelain=v2"])
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .current_dir(root)
-                .output_locked()
-                .expect("git status");
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let out = git(root, &["status", "--porcelain=v2"], true);
+            assert!(out.success, "{}", String::from_utf8_lossy(&out.stderr));
         };
         let temp = TempDir::new().unwrap();
         let (rx, stop, root) = spawn_loop(temp.path());
+        // The bounded runner holds git to the same repository-trust gate the
+        // product's own reads pass.
+        crate::test_support::trust_repo(&root);
         let _daemon = StopDaemon(root.clone());
-        let enabled = Command::new("git")
-            .args(["config", "core.fsmonitor", "true"])
-            .current_dir(&root)
-            .output_locked()
-            .expect("git config");
-        assert!(enabled.status.success());
+        let enabled = git(&root, &["config", "core.fsmonitor", "true"], false);
+        assert!(enabled.success);
         // Start the daemon outside the measured window; its first run creates
         // the socket and state directory.
         status(&root);

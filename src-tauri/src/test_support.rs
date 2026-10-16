@@ -137,6 +137,25 @@ fn process_is_alive(_pid: u32) -> bool {
 #[cfg(test)]
 pub(crate) use env::coverage_relaxed;
 
+/// Runs `cmd` to completion inside `budget` through the engine's bounded
+/// runner (process group killed at the deadline, output capped) and panics
+/// naming `label` when it does not finish: a fixture's helper process that
+/// wedges fails the test with a message instead of parking the whole suite.
+///
+/// The command is run exactly as built: binary, environment and working
+/// directory are the caller's. Only stdin is closed. The exit status is left
+/// to the caller.
+#[cfg(test)]
+pub(crate) fn run_within(
+    cmd: Command,
+    label: &str,
+    budget: std::time::Duration,
+) -> crate::engine::git_cli::BoundedRun {
+    crate::engine::git_cli::run_bounded(cmd, label, budget, None)
+        .and_then(|run| run.require_complete(label))
+        .unwrap_or_else(|why| panic!("{label} did not finish within {budget:?}: {why}"))
+}
+
 /// Runs `git` in `dir` with the test identity pinned, and asserts it succeeded.
 ///
 /// The `-c` flags are what make the fixture hermetic: a developer's global
@@ -449,8 +468,36 @@ pub(crate) fn verifier_spawns(dir: &TempDir) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{coverage_relaxed, isolated_libtest_command};
+    use super::{coverage_relaxed, isolated_libtest_command, run_within};
     use std::time::Duration;
+
+    /// A helper process that never exits fails the test with its label and the
+    /// budget, and the runner kills it instead of waiting for it.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "wedged-helper did not finish within 1s")]
+    fn run_within_fails_a_helper_that_outlives_its_budget() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("600");
+        run_within(cmd, "wedged-helper", Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_within_returns_the_output_of_a_helper_that_finishes() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let run = run_within(
+            cmd,
+            "quick-helper",
+            coverage_relaxed(Duration::from_secs(30)),
+        );
+        assert_eq!(
+            (run.stdout.as_slice(), run.stderr.as_slice()),
+            (&b"out"[..], &b"err"[..])
+        );
+        assert_eq!((run.success, run.status_code), (false, 3));
+    }
 
     #[test]
     fn isolated_harness_copy_is_a_file_beside_the_running_image() {
