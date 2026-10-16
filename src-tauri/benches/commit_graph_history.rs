@@ -202,7 +202,7 @@ fn clone_in_mode(root: &Path, source: &Path, size: &str, mode: Mode) -> PathBuf 
         git(&dest, &["commit-graph", "write", "--reachable", flag]);
     }
     trust_repo(&dest);
-    let report = inspect(&dest, &dest);
+    let report = inspect(&dest, &dest, &dest);
     assert_eq!(
         report.state,
         mode.expect(),

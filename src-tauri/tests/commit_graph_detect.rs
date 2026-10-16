@@ -385,48 +385,82 @@ fn a_hostile_head_is_unresolved_not_followed() {
     );
     let git_dir = dir.path().join(".git");
     std::fs::write(git_dir.join("HEAD"), "ref: ../../../../etc/hosts\n").unwrap();
-    let report = inspect(&git_dir, &git_dir);
+    let report = inspect(dir.path(), &git_dir, &git_dir);
     assert_state(&report, CommitGraphState::Unknown);
     assert_eq!(report.head_covered, None);
 }
 
-/// The detector is files only. Git's own trace2 log is the witness: a positive
-/// control proves the log would have recorded a spawn, then the detector runs
-/// with the log armed and must add none.
+/// The detector reads files, plus the shared config snapshot. Git's own trace2
+/// log is the witness: a positive control proves the log would have recorded a
+/// spawn, then the detector runs with the log armed. Its only spawn may be the
+/// snapshot's `config --list` on a cold cache, and a warm call adds none.
 #[test]
 fn detection_spawns_no_git_process() {
     let _g = serial();
     let dir = repo_with_commits(3);
     let git_dir = dir.path().join(".git");
-    let config = PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config"));
-    let original = std::fs::read_to_string(&config).unwrap_or_default();
     let log = dir.path().join("trace2.jsonl");
-    std::fs::write(
-        &config,
-        format!("{original}\n[trace2]\n\teventTarget = {}\n", log.display()),
-    )
-    .unwrap();
+    // trace2 is only honoured from user-level config. The test's git reads
+    // GIT_CONFIG_GLOBAL and the app's (which strips it) reads `$HOME/.gitconfig`,
+    // so both files arm the log.
+    let arm = format!("\n[trace2]\n\teventTarget = {}\n", log.display());
+    let files = [
+        PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config")),
+        PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME")).join(".gitconfig"),
+    ];
+    let originals: Vec<Option<String>> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(f).ok())
+        .collect();
+    for (file, original) in files.iter().zip(&originals) {
+        std::fs::write(
+            file,
+            format!("{}{arm}", original.clone().unwrap_or_default()),
+        )
+        .unwrap();
+    }
 
-    let starts = |log: &Path| {
+    let starts = |log: &Path| -> Vec<String> {
         std::fs::read_to_string(log)
             .unwrap_or_default()
             .lines()
             .filter(|l| l.contains("\"event\":\"start\""))
-            .count()
+            .map(str::to_string)
+            .collect()
     };
     run_git(dir.path(), &["rev-parse", "HEAD"]);
-    let control = starts(&log);
-    let missing = inspect(&git_dir, &git_dir);
-    let after_inspect = starts(&log);
+    let control = starts(&log).len();
+    // ref_cache keeps nothing stamped within its 3 s racy window, so a repository
+    // written a moment ago would re-run `config --list` on every call.
+    std::thread::sleep(std::time::Duration::from_millis(3300));
+    let missing = inspect(dir.path(), &git_dir, &git_dir);
+    let cold = starts(&log);
+    let missing_again = inspect(dir.path(), &git_dir, &git_dir);
+    let warm = starts(&log);
     let scanned = scan_storage(dir.path().to_str().unwrap());
-    std::fs::write(&config, original).unwrap();
+    for (file, original) in files.iter().zip(originals) {
+        match original {
+            Some(text) => std::fs::write(file, text).unwrap(),
+            None => std::fs::remove_file(file).unwrap(),
+        }
+    }
 
     assert!(
         control >= 1,
         "the trace2 log recorded no spawn: control broken"
     );
     assert_eq!(missing.state, CommitGraphState::Missing);
-    assert_eq!(after_inspect, control, "inspect spawned a git process");
+    assert_eq!(missing_again.state, CommitGraphState::Missing);
+    // The one process the detector may start is the shared `config --list`
+    // behind `config_snapshot`, on a cold cache. Nothing that reads the graph
+    // or HEAD (`commit-graph`, `rev-parse`, ...) may run.
+    for event in &cold[control..] {
+        assert!(
+            event.contains("\"config\"") && event.contains("\"--list\""),
+            "inspect spawned something other than `config --list`: {event}"
+        );
+    }
+    assert_eq!(warm.len(), cold.len(), "a warm inspect spawned a process");
     assert!(scanned.is_ok());
 }
 
@@ -559,7 +593,7 @@ fn git_accepts_graph(dir: &Path) -> bool {
 /// The detector alone, without `scan_storage`'s git spawns, for loops.
 fn inspect_only(dir: &Path) -> CommitGraphReport {
     let git_dir = dir.join(".git");
-    inspect(&git_dir, &git_dir)
+    inspect(dir, &git_dir, &git_dir)
 }
 
 fn graph_repo(commits: usize) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
@@ -749,8 +783,12 @@ fn a_sha1_graph_in_a_sha256_repository_is_unknown() {
 #[test]
 fn core_commit_graph_false_means_git_ignores_the_graph() {
     let _g = serial();
+    // Control: the same fixture without the setting is a plain "present". The
+    // config snapshot is cached per repository, so the setting goes in before
+    // the repository under test is first scanned.
+    let (control, _graph, _good) = graph_repo(3);
+    assert_state(&detect(control.path()), CommitGraphState::Present);
     let (dir, _graph, _good) = graph_repo(3);
-    assert_state(&detect(dir.path()), CommitGraphState::Present);
     run_git(dir.path(), &["config", "core.commitGraph", "false"]);
     let report = detect(dir.path());
     assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
@@ -768,12 +806,38 @@ fn core_commit_graph_false_means_git_ignores_the_graph() {
 fn core_commit_graph_false_in_the_user_config_is_seen_too() {
     let _g = serial();
     let (dir, _graph, _good) = graph_repo(3);
-    let config = PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config"));
-    let original = std::fs::read_to_string(&config).unwrap_or_default();
-    std::fs::write(&config, format!("{original}\n[core]\n\tcommitGraph = no\n")).unwrap();
+    // The app's git runs with GIT_CONFIG_GLOBAL stripped, so the user's config
+    // is `$HOME/.gitconfig` (the hermetic HOME here).
+    let config = PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME")).join(".gitconfig");
+    let original = std::fs::read_to_string(&config).ok();
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[core]\n\tcommitGraph = no\n",
+            original.clone().unwrap_or_default()
+        ),
+    )
+    .unwrap();
     let report = detect(dir.path());
-    std::fs::write(&config, original).unwrap();
+    match original {
+        Some(text) => std::fs::write(&config, text).unwrap(),
+        None => std::fs::remove_file(&config).unwrap(),
+    }
     assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
+}
+
+#[test]
+fn an_unreadable_config_is_unknown_never_a_verdict() {
+    let _g = serial();
+    let (dir, _graph, _good) = graph_repo(3);
+    let git_dir = dir.path().join(".git");
+    // A repository path git cannot run in makes `config_snapshot` fail.
+    let report = inspect(&dir.path().join("gone"), &git_dir, &git_dir);
+    assert_state(&report, CommitGraphState::Unknown);
+    assert!(
+        report.note.as_deref().unwrap_or("").contains("config"),
+        "{report:?}"
+    );
 }
 
 #[test]
@@ -946,7 +1010,7 @@ fn symref_loops_and_packed_refs_oddities_do_not_hang_or_mislead() {
     std::fs::write(git_dir.join("refs/heads/a"), "ref: refs/heads/b\n").unwrap();
     std::fs::write(git_dir.join("refs/heads/b"), "ref: refs/heads/a\n").unwrap();
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/a\n").unwrap();
-    let report = inspect(&git_dir, &git_dir);
+    let report = inspect(dir.path(), &git_dir, &git_dir);
     assert_state(&report, CommitGraphState::Unknown);
 
     // Header, peeled and annotated lines, an unrelated ref, then the real one.
@@ -970,7 +1034,10 @@ fn symref_loops_and_packed_refs_oddities_do_not_hang_or_mislead() {
     )
     .unwrap();
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    assert_state(&inspect(&git_dir, &git_dir), CommitGraphState::Present);
+    assert_state(
+        &inspect(dir.path(), &git_dir, &git_dir),
+        CommitGraphState::Present,
+    );
 }
 
 #[test]
@@ -1079,7 +1146,7 @@ fn a_hostile_ref_name_cannot_flood_or_dress_up_the_note() {
         "ref: refs/heads/\u{1b}\n",
     )
     .unwrap();
-    let report = inspect(&git_dir, &git_dir);
+    let report = inspect(dir.path(), &git_dir, &git_dir);
     let note = report.note.expect("a note");
     assert!(note.chars().count() <= 240, "note is {} chars", note.len());
     assert!(!note.chars().any(char::is_control), "{note:?}");

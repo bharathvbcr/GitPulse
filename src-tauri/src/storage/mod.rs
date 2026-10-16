@@ -1626,7 +1626,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         reclaim,
         reclaim_summary,
         commit_graph: match crate::engine::git_cli::resolve_git_dir(&repo) {
-            Ok(private_dir) => commit_graph::inspect(&private_dir, &git_dir),
+            Ok(private_dir) => commit_graph::inspect(&repo, &private_dir, &git_dir),
             Err(reason) => commit_graph::CommitGraphReport {
                 note: Some(format!("the git directory could not be resolved: {reason}")),
                 ..commit_graph::CommitGraphReport::default()

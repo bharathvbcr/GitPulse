@@ -27,10 +27,11 @@
 //! structurally sound but bit-rotted in the commit data reads as present;
 //! `git commit-graph verify` is the only full check.
 //!
-//! It also reads git config (user, repository, worktree; includes followed,
-//! bounded) for `core.commitGraph` and `extensions.objectFormat`. System config
-//! and `-c` overrides are not seen. `fetch.writeCommitGraph` only governs
-//! whether fetches refresh a graph, so it does not change what a graph means.
+//! It asks the shared config snapshot (`git_reader::config_snapshot`, git's own
+//! effective config, cached) for `core.commitGraph` and
+//! `extensions.objectFormat`; when that cannot be read the answer is unknown.
+//! `fetch.writeCommitGraph` only governs whether fetches refresh a graph, so it
+//! does not change what a graph means.
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -521,145 +522,21 @@ fn check_layers(graphs: &[GraphFile], chain: &[Vec<u8>], sha256: bool) -> Result
     Ok(())
 }
 
-/// Config files read, counting includes: past this the scan stops reading.
-const MAX_CONFIG_FILES: usize = 16;
-/// Include nesting followed; git itself stops at ten.
-const MAX_CONFIG_DEPTH: usize = 4;
-
-/// What the detector needs from git config, read without spawning git.
-#[derive(Default)]
-struct ConfigFacts {
-    /// `core.commitGraph` resolved to false: git ignores every graph file.
-    commit_graph_off: bool,
-    /// `extensions.objectFormat = sha256`.
-    sha256: bool,
-    /// A config file that exists but could not be read; the facts are partial.
-    unreadable: Option<String>,
-}
-
+/// Git's boolean false spellings. An empty value is read as false too: the
+/// snapshot prints a key with no `=` as empty, so the two cannot be told apart,
+/// and "could not tell" must land on unknown, not on a verdict.
 fn config_value_is_false(value: &str) -> bool {
     matches!(
-        value.to_ascii_lowercase().as_str(),
+        value.trim().to_ascii_lowercase().as_str(),
         "false" | "no" | "off" | "0" | ""
     )
 }
 
-/// Drops a trailing comment and the quotes around a config value.
-fn config_value(raw: &str) -> String {
-    let mut out = String::new();
-    let mut quoted = false;
-    let mut chars = raw.trim().chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => quoted = !quoted,
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    out.push(next);
-                }
-            }
-            '#' | ';' if !quoted => break,
-            _ => out.push(c),
-        }
-    }
-    out.trim().to_string()
-}
-
-fn scan_config(path: &Path, depth: usize, files_left: &mut usize, facts: &mut ConfigFacts) {
-    if *files_left == 0 {
-        facts.unreadable = Some("too many included config files".to_string());
-        return;
-    }
-    *files_left -= 1;
-    // Dotfile managers symlink config files, and `/dev/null` is how a caller
-    // says "no config", so follow links and skip anything that is not a file.
-    let text = match fs::metadata(path) {
-        Ok(m) if m.is_file() && m.len() <= MAX_SMALL_FILE_BYTES => match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) => {
-                facts.unreadable = Some(format!("{}: {e}", path.display()));
-                return;
-            }
-        },
-        Ok(m) if m.is_file() => {
-            facts.unreadable = Some(format!("{} is implausibly large", path.display()));
-            return;
-        }
-        Ok(_) => return,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            facts.unreadable = Some(format!("{}: {e}", path.display()));
-            return;
-        }
-    };
-    let mut section = String::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('[') {
-            let name = rest.split(']').next().unwrap_or("");
-            section = name
-                .split(|c: char| c.is_whitespace() || c == '"' || c == '.')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            continue;
-        }
-        let (key, value) = match line.split_once('=') {
-            Some((k, v)) => (k.trim().to_ascii_lowercase(), config_value(v)),
-            None => (line.to_ascii_lowercase(), "true".to_string()),
-        };
-        match (section.as_str(), key.as_str()) {
-            ("core", "commitgraph") => facts.commit_graph_off = config_value_is_false(&value),
-            ("extensions", "objectformat") => {
-                facts.sha256 = value.eq_ignore_ascii_case("sha256");
-            }
-            ("include" | "includeif", "path") if depth < MAX_CONFIG_DEPTH => {
-                // Conditions are not evaluated: an include that might apply is
-                // read, so a graph it switches off is never reported as present.
-                let target = match value.strip_prefix("~/") {
-                    Some(rest) => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest)),
-                    None => Some(path.parent().unwrap_or(Path::new("")).join(&value)),
-                };
-                if let Some(target) = target {
-                    scan_config(&target, depth + 1, files_left, facts);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// System config is not read; user, repository and worktree config are, in
-/// git's precedence order (later wins).
-fn read_config_facts(git_dir: &Path, common_dir: &Path) -> ConfigFacts {
-    let mut facts = ConfigFacts::default();
-    let mut files_left = MAX_CONFIG_FILES;
-    let mut files: Vec<PathBuf> = Vec::new();
-    match std::env::var_os("GIT_CONFIG_GLOBAL") {
-        Some(global) => files.push(PathBuf::from(global)),
-        None => {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            let xdg = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| home.as_ref().map(|h| h.join(".config")));
-            files.extend(xdg.map(|x| x.join("git").join("config")));
-            files.extend(home.map(|h| h.join(".gitconfig")));
-        }
-    }
-    files.push(common_dir.join("config"));
-    files.push(git_dir.join("config.worktree"));
-    for file in files {
-        scan_config(&file, 0, &mut files_left, &mut facts);
-    }
-    facts
-}
-
-/// Inspect the commit-graph of the repository whose private git dir is
-/// `git_dir` and whose common dir (objects, packed-refs) is `common_dir`. For a
-/// linked worktree the two differ and the graph lives in the common dir.
-pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
+/// Inspect the commit-graph of the repository at `repo` (the path git config is
+/// read from) whose private git dir is `git_dir` and whose common dir (objects,
+/// packed-refs) is `common_dir`. For a linked worktree the two differ and the
+/// graph lives in the common dir.
+pub fn inspect(repo: &Path, git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
     let objects = common_dir.join("objects");
     let info = objects.join("info");
     let has_alternates = objects.join("info").join("alternates").exists();
@@ -685,8 +562,19 @@ pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
 
     // `core.commitGraph=false` makes git ignore the files below, so neither a
     // verdict on them nor a "write one" hint is true.
-    let config = read_config_facts(git_dir, common_dir);
-    if config.commit_graph_off {
+    let config = match crate::engine::git_reader::config_snapshot(repo) {
+        Ok(config) => config,
+        Err(why) => {
+            return CommitGraphReport::unknown(
+                CommitGraphLayout::None,
+                format!("could not read git config, which may switch the graph off: {why}"),
+            )
+        }
+    };
+    if config
+        .get("core.commitgraph")
+        .is_some_and(|v| config_value_is_false(v))
+    {
         return CommitGraphReport::unknown(
             CommitGraphLayout::None,
             "core.commitGraph is false, so git ignores the commit-graph",
@@ -732,13 +620,10 @@ pub fn inspect(git_dir: &Path, common_dir: &Path) -> CommitGraphReport {
             }
         }
     }
-    if let Some(why) = &config.unreadable {
-        return CommitGraphReport::unknown(
-            layout,
-            format!("could not read git config, which may switch the graph off: {why}"),
-        );
-    }
-    if let Err(why) = check_layers(&graphs, &chain_hashes, config.sha256) {
+    let sha256 = config
+        .get("extensions.objectformat")
+        .is_some_and(|v| v.eq_ignore_ascii_case("sha256"));
+    if let Err(why) = check_layers(&graphs, &chain_hashes, sha256) {
         return CommitGraphReport::unknown(layout, format!("could not read it: {why}"));
     }
     let commits: u64 = graphs.iter().map(|g| g.commits).sum();
