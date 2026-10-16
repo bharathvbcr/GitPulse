@@ -110,9 +110,12 @@ describe.skipIf(spawnSync("git", ["--version"]).status !== 0)(
   () => {
     for (const [oldBlob, newBlob] of PAIRS) {
       for (const mode of ["stage", "unstage"] as const) {
+        // Every selection subset is a real `git apply`: dozens of git processes
+        // a case, so vitest's 5 s default fails it on a loaded host (it did,
+        // 4 cases, in a full ci:local at load ~90) though it passes alone.
         it(`${mode} ${JSON.stringify(oldBlob)} -> ${JSON.stringify(newBlob)}, every selection`, () => {
           checkPair(oldBlob, newBlob, mode);
-        });
+        }, 60_000);
       }
     }
   }

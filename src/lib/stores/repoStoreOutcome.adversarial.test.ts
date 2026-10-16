@@ -89,10 +89,12 @@ describe("attack 3: control and derivation", () => {
     expect(scan("await repoStore.createBranch(name);")).toEqual([1]);
   });
 
+  // Parses all of repoStore.ts with the TypeScript compiler: vitest's 5 s
+  // default timed it out in a full ci:local at load ~90 though it passes alone.
   it("BREAK: the derived set contains a non-mutation, because the last member's body runs on into runMutating's own definition", () => {
     const names = mutationNames(readFileSync(join(SRC, "lib", "stores", "repoStore.ts"), "utf8"));
     expect(names.has("setAmending")).toBe(false);
-  });
+  }, 60_000);
 });
 
 describe("attack 3: the repository scan is blind where the real discards are", () => {
