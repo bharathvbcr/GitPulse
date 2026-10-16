@@ -379,46 +379,48 @@ mod tests {
 
     #[test]
     fn caches_negative_answer() {
-        invalidate_all();
+        // A private cache: the process-wide one is invalidated by every
+        // install and config test running beside this one.
+        let cache = CapabilityCache::new();
         let mut probes = 0;
-        let first = resolve_cached(ExternalTool::Devmap, || {
+        let first = cache.resolve(ExternalTool::Devmap, Instant::now, || {
             probes += 1;
             Err("missing".into())
         });
         assert!(first.is_err());
         assert_eq!(probes, 1);
-        let second = resolve_cached(ExternalTool::Devmap, || {
+        let second = cache.resolve(ExternalTool::Devmap, Instant::now, || {
             probes += 1;
             Err("should not run".into())
         });
         assert_eq!(second.unwrap_err(), "missing");
         assert_eq!(probes, 1, "negative answer must be cached");
-        invalidate(ExternalTool::Devmap);
-        let third = resolve_cached(ExternalTool::Devmap, || {
+        cache.invalidate(ExternalTool::Devmap);
+        let third = cache.resolve(ExternalTool::Devmap, Instant::now, || {
             probes += 1;
             Ok("/bin/devmap".into())
         });
         assert_eq!(third.unwrap(), "/bin/devmap");
         assert_eq!(probes, 2);
-        invalidate_all();
     }
 
     #[test]
     fn invalidate_all_clears_both() {
-        invalidate_all();
-        set(
-            ExternalTool::Devmap,
-            CapabilityAnswer::Present { path: "/a".into() },
-        );
-        set(
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        cache.set(
             ExternalTool::Manvi,
             CapabilityAnswer::Absent {
                 reason: "no".into(),
             },
+            Instant::now(),
         );
-        invalidate_all();
-        assert!(get(ExternalTool::Devmap).is_none());
-        assert!(get(ExternalTool::Manvi).is_none());
+        assert!(cache.get(ExternalTool::Devmap, Instant::now).is_some());
+        cache.invalidate_all();
+        assert!(cache.get(ExternalTool::Devmap, Instant::now).is_none());
+        assert!(cache.get(ExternalTool::Manvi, Instant::now).is_none());
     }
 
     /// A clock the test moves by hand: every timing assertion below goes
