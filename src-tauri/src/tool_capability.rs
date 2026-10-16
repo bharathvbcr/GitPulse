@@ -3,14 +3,15 @@
 //! Caches both positive and negative answers. A tool that will never be found
 //! was previously re-searched on every save burst / Map reload; caching the
 //! *absent* answer is the actual fix. Invalidated on install, config change,
-//! and explicit refresh.
+//! and explicit refresh; a found path also ends when the file at it changes
+//! or goes, and an absent answer ends after [`ABSENT_TTL`].
 
 use crate::tool_install::ExternalTool;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -19,17 +20,130 @@ pub enum CapabilityAnswer {
     Absent { reason: String },
 }
 
+/// How long a cached "not found" is believed. A tool installed from a terminal
+/// is picked up within this window; GitPulse's own installer and config changes
+/// still invalidate at once. The probe cannot tell a transient failure from a
+/// real absence, so this bounds how long either is remembered.
+pub(crate) const ABSENT_TTL: Duration = Duration::from_secs(60);
+
+/// One cached answer. A found tool carries the stamp of the file it was found
+/// at, so the answer ends when that file is replaced or removed; a missing tool
+/// carries when it was asked, so the answer ends after [`ABSENT_TTL`].
 #[derive(Debug, Clone)]
-struct Cached {
-    answer: CapabilityAnswer,
-    #[allow(dead_code)]
-    at: Instant,
+enum Entry {
+    Present { path: String, stamp: BinaryStamp },
+    Absent { reason: String, at: Instant },
 }
 
-fn store() -> &'static Mutex<[Option<Cached>; 2]> {
-    static STORE: OnceLock<Mutex<[Option<Cached>; 2]>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new([None, None]))
+impl Entry {
+    fn answer(&self) -> CapabilityAnswer {
+        match self {
+            Self::Present { path, .. } => CapabilityAnswer::Present { path: path.clone() },
+            Self::Absent { reason, .. } => CapabilityAnswer::Absent {
+                reason: reason.clone(),
+            },
+        }
+    }
 }
+
+/// The per-tool answers plus one gate per tool that lets a single thread
+/// re-probe an expired entry while the others wait for its answer.
+struct CapabilityCache {
+    slots: Mutex<[Option<Entry>; 2]>,
+    gates: [Mutex<()>; 2],
+}
+
+impl CapabilityCache {
+    const fn new() -> Self {
+        Self {
+            slots: Mutex::new([None, None]),
+            gates: [Mutex::new(()), Mutex::new(())],
+        }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, [Option<Entry>; 2]> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The live answer for `tool`: a stale one is dropped, never returned. A
+    /// hit on a found tool costs one `stat`, taken outside the lock.
+    fn get(&self, tool: ExternalTool, now: impl FnOnce() -> Instant) -> Option<CapabilityAnswer> {
+        let entry = self.slots()[idx(tool)].clone()?;
+        let live = match &entry {
+            Entry::Present { path, stamp } => stamp_of(Path::new(path)).as_ref() == Some(stamp),
+            Entry::Absent { at, .. } => now().saturating_duration_since(*at) < ABSENT_TTL,
+        };
+        if live {
+            return Some(entry.answer());
+        }
+        // Evict only the entry that was judged stale: another thread may have
+        // replaced it with a fresh answer in the meantime.
+        let mut slots = self.slots();
+        if slots[idx(tool)]
+            .as_ref()
+            .is_some_and(|held| held.answer() == entry.answer())
+        {
+            slots[idx(tool)] = None;
+        }
+        None
+    }
+
+    fn set(&self, tool: ExternalTool, answer: CapabilityAnswer, at: Instant) {
+        // A found path that is not a regular file right now has no stamp to
+        // validate against, so it is not kept: it is asked again every time.
+        let entry = match answer {
+            CapabilityAnswer::Present { path } => {
+                stamp_of(Path::new(&path)).map(|stamp| Entry::Present { path, stamp })
+            }
+            CapabilityAnswer::Absent { reason } => Some(Entry::Absent { reason, at }),
+        };
+        self.slots()[idx(tool)] = entry;
+    }
+
+    fn invalidate(&self, tool: ExternalTool) {
+        self.slots()[idx(tool)] = None;
+    }
+
+    fn invalidate_all(&self) {
+        *self.slots() = [None, None];
+    }
+
+    /// Miss or stale: one thread probes, the rest wait on the gate and are
+    /// answered from what it stored, so an expired entry costs one probe.
+    fn resolve(
+        &self,
+        tool: ExternalTool,
+        now: impl Fn() -> Instant,
+        probe: impl FnOnce() -> Result<String, String>,
+    ) -> Result<String, String> {
+        let answered = |answer| match answer {
+            CapabilityAnswer::Present { path } => Ok(path),
+            CapabilityAnswer::Absent { reason } => Err(reason),
+        };
+        if let Some(answer) = self.get(tool, &now) {
+            return answered(answer);
+        }
+        let _flight = self.gates[idx(tool)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(answer) = self.get(tool, &now) {
+            return answered(answer);
+        }
+        let result = probe();
+        let answer = match &result {
+            Ok(path) => CapabilityAnswer::Present { path: path.clone() },
+            Err(reason) => CapabilityAnswer::Absent {
+                reason: reason.clone(),
+            },
+        };
+        self.set(tool, answer, now());
+        result
+    }
+}
+
+static CACHE: CapabilityCache = CapabilityCache::new();
 
 fn idx(tool: ExternalTool) -> usize {
     match tool {
@@ -39,63 +153,27 @@ fn idx(tool: ExternalTool) -> usize {
 }
 
 pub fn get(tool: ExternalTool) -> Option<CapabilityAnswer> {
-    let guard = store()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard[idx(tool)].as_ref().map(|c| c.answer.clone())
+    CACHE.get(tool, Instant::now)
 }
 
 pub fn set(tool: ExternalTool, answer: CapabilityAnswer) {
-    let mut guard = store()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard[idx(tool)] = Some(Cached {
-        answer,
-        at: Instant::now(),
-    });
+    CACHE.set(tool, answer, Instant::now());
 }
 
 pub fn invalidate(tool: ExternalTool) {
-    let mut guard = store()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard[idx(tool)] = None;
+    CACHE.invalidate(tool);
 }
 
 pub fn invalidate_all() {
-    let mut guard = store()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard[0] = None;
-    guard[1] = None;
+    CACHE.invalidate_all();
 }
 
-/// Resolve through the cache: miss → probe → store (including Absent).
+/// Resolve through the cache: miss or stale, probe, store (including Absent).
 pub fn resolve_cached(
     tool: ExternalTool,
     probe: impl FnOnce() -> Result<String, String>,
 ) -> Result<String, String> {
-    if let Some(cached) = get(tool) {
-        return match cached {
-            CapabilityAnswer::Present { path } => Ok(path),
-            CapabilityAnswer::Absent { reason } => Err(reason),
-        };
-    }
-    match probe() {
-        Ok(path) => {
-            set(tool, CapabilityAnswer::Present { path: path.clone() });
-            Ok(path)
-        }
-        Err(reason) => {
-            set(
-                tool,
-                CapabilityAnswer::Absent {
-                    reason: reason.clone(),
-                },
-            );
-            Err(reason)
-        }
-    }
+    CACHE.resolve(tool, Instant::now, probe)
 }
 
 /// What a binary on disk looked like when it was probed: replacing or
@@ -104,6 +182,20 @@ pub fn resolve_cached(
 struct BinaryStamp {
     len: u64,
     modified: Option<SystemTime>,
+}
+
+/// The stamp of the regular file at an absolute `path` (symlinks followed), or
+/// `None` when there is no such file: a bare name, a directory, a dangling
+/// link. The one place a binary is stamped, for both caches in this file.
+fn stamp_of(path: &Path) -> Option<BinaryStamp> {
+    path.is_absolute()
+        .then(|| std::fs::metadata(path).ok())
+        .flatten()
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| BinaryStamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
 }
 
 /// Probe answers for CLI binaries (`gh --version`, an agent's `--version` and
@@ -156,15 +248,7 @@ impl<T: Clone> BinaryProbeCache<T> {
             return probe().0;
         }
         let path = PathBuf::from(program);
-        let stamp = path
-            .is_absolute()
-            .then(|| std::fs::metadata(&path).ok())
-            .flatten()
-            .filter(std::fs::Metadata::is_file)
-            .map(|meta| BinaryStamp {
-                len: meta.len(),
-                modified: meta.modified().ok(),
-            });
+        let stamp = stamp_of(&path);
         let Some(stamp) = stamp else {
             return probe().0;
         };
@@ -307,5 +391,294 @@ mod tests {
         invalidate_all();
         assert!(get(ExternalTool::Devmap).is_none());
         assert!(get(ExternalTool::Manvi).is_none());
+    }
+
+    /// A clock the test moves by hand: every timing assertion below goes
+    /// through it, so none depends on how long the machine takes.
+    struct Clock {
+        base: Instant,
+        offset_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl Clock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset_ms: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+        fn now(&self) -> Instant {
+            self.base
+                + Duration::from_millis(self.offset_ms.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn advance(&self, by: Duration) {
+            let ms = u64::try_from(by.as_millis()).unwrap();
+            self.offset_ms
+                .fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn found(path: &Path) -> Result<String, String> {
+        Ok(path.to_str().unwrap().to_string())
+    }
+
+    fn present(path: &Path) -> CapabilityAnswer {
+        CapabilityAnswer::Present {
+            path: path.to_str().unwrap().into(),
+        }
+    }
+
+    #[test]
+    fn an_absent_answer_expires_at_the_ttl_and_the_tool_is_found() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut probes = 0;
+        let miss = cache.resolve(
+            ExternalTool::Devmap,
+            || clock.now(),
+            || {
+                probes += 1;
+                Err("not installed".into())
+            },
+        );
+        assert_eq!(miss.unwrap_err(), "not installed");
+        // Installed from a terminal while the entry is cached.
+        let bin = stub(dir.path(), "devmap", "v1");
+        clock.advance(ABSENT_TTL - Duration::from_millis(1));
+        let still = cache.resolve(
+            ExternalTool::Devmap,
+            || clock.now(),
+            || {
+                probes += 1;
+                found(&bin)
+            },
+        );
+        assert_eq!(
+            (still.unwrap_err(), probes),
+            ("not installed".to_string(), 1),
+            "one millisecond inside the TTL the answer is kept"
+        );
+        clock.advance(Duration::from_millis(1));
+        let now_found = cache.resolve(
+            ExternalTool::Devmap,
+            || clock.now(),
+            || {
+                probes += 1;
+                found(&bin)
+            },
+        );
+        assert_eq!(
+            (now_found.unwrap(), probes),
+            (bin.to_str().unwrap().to_string(), 2),
+            "exactly at the TTL the answer has ended and the tool is re-probed"
+        );
+    }
+
+    #[test]
+    fn a_transient_probe_error_is_remembered_only_for_the_ttl() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "manvi", "v1");
+        let mut probes = 0;
+        let mut ask = |fail: bool| {
+            cache.resolve(
+                ExternalTool::Manvi,
+                || clock.now(),
+                || {
+                    probes += 1;
+                    if fail {
+                        Err("spawn failed: EAGAIN".into())
+                    } else {
+                        found(&bin)
+                    }
+                },
+            )
+        };
+        assert!(ask(true).is_err());
+        assert!(ask(false).is_err(), "the failure is cached inside the TTL");
+        clock.advance(ABSENT_TTL);
+        assert!(ask(false).is_ok(), "and is gone once the TTL has passed");
+        assert_eq!(probes, 2);
+    }
+
+    #[test]
+    fn a_present_answer_is_dropped_when_the_binary_is_deleted() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        let probes = std::cell::Cell::new(0);
+        let ask = || {
+            cache.resolve(
+                ExternalTool::Devmap,
+                || clock.now(),
+                || {
+                    probes.set(probes.get() + 1);
+                    found(&bin)
+                },
+            )
+        };
+        assert!(ask().is_ok());
+        assert!(ask().is_ok());
+        assert_eq!(
+            probes.get(),
+            1,
+            "an unchanged binary is served from the cache"
+        );
+        std::fs::remove_file(&bin).unwrap();
+        assert_eq!(ask().unwrap(), bin.to_str().unwrap());
+        assert_eq!(
+            probes.get(),
+            2,
+            "the deleted binary was not served from the cache"
+        );
+        assert_eq!(
+            cache.get(ExternalTool::Devmap, || clock.now()),
+            None,
+            "a path that is not a file is not kept"
+        );
+    }
+
+    #[test]
+    fn a_present_answer_is_dropped_when_the_length_changes() {
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        assert!(cache.get(ExternalTool::Devmap, Instant::now).is_some());
+        std::fs::write(&bin, "a longer v2").unwrap();
+        assert_eq!(cache.get(ExternalTool::Devmap, Instant::now), None);
+    }
+
+    #[test]
+    fn a_replacement_of_the_same_length_with_a_new_mtime_is_seen() {
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        std::fs::write(&bin, "v2").unwrap();
+        let file = std::fs::File::options().write(true).open(&bin).unwrap();
+        file.set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&bin).unwrap().len(),
+            2,
+            "same length as before"
+        );
+        assert_eq!(cache.get(ExternalTool::Devmap, Instant::now), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_replaced_by_a_symlink_to_another_file_is_seen() {
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        let other = stub(dir.path(), "devmap-next", "a different, longer binary");
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        std::fs::remove_file(&bin).unwrap();
+        std::os::unix::fs::symlink(&other, &bin).unwrap();
+        assert_eq!(
+            cache.get(ExternalTool::Devmap, Instant::now),
+            None,
+            "the link points at a file with another stamp"
+        );
+        // A link that dangles is no file at all.
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        assert!(cache.get(ExternalTool::Devmap, Instant::now).is_some());
+        std::fs::remove_file(&other).unwrap();
+        assert_eq!(cache.get(ExternalTool::Devmap, Instant::now), None);
+    }
+
+    #[test]
+    fn a_path_that_becomes_a_directory_is_dropped_and_never_kept() {
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        assert_eq!(cache.get(ExternalTool::Devmap, Instant::now), None);
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        assert_eq!(
+            cache.get(ExternalTool::Devmap, Instant::now),
+            None,
+            "a directory has no stamp to hold an answer against"
+        );
+        cache.set(
+            ExternalTool::Devmap,
+            CapabilityAnswer::Present {
+                path: "devmap".into(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            cache.get(ExternalTool::Devmap, Instant::now),
+            None,
+            "a bare name is searched for again every time"
+        );
+    }
+
+    #[test]
+    fn a_stale_entry_costs_one_probe_however_many_threads_arrive() {
+        let cache = CapabilityCache::new();
+        let clock = Clock::new();
+        cache.set(
+            ExternalTool::Manvi,
+            CapabilityAnswer::Absent {
+                reason: "old".into(),
+            },
+            clock.now(),
+        );
+        clock.advance(ABSENT_TTL);
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "manvi", "v1");
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    start.wait();
+                    let got = cache.resolve(
+                        ExternalTool::Manvi,
+                        || clock.now(),
+                        || {
+                            probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            found(&bin)
+                        },
+                    );
+                    assert_eq!(got.unwrap(), bin.to_str().unwrap());
+                });
+            }
+        });
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalidation_still_ends_both_kinds_of_answer_at_once() {
+        let cache = CapabilityCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "devmap", "v1");
+        cache.set(ExternalTool::Devmap, present(&bin), Instant::now());
+        cache.set(
+            ExternalTool::Manvi,
+            CapabilityAnswer::Absent {
+                reason: "no".into(),
+            },
+            Instant::now(),
+        );
+        cache.invalidate(ExternalTool::Devmap);
+        assert_eq!(cache.get(ExternalTool::Devmap, Instant::now), None);
+        assert!(cache.get(ExternalTool::Manvi, Instant::now).is_some());
+        cache.invalidate_all();
+        assert_eq!(cache.get(ExternalTool::Manvi, Instant::now), None);
     }
 }
