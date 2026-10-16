@@ -1269,6 +1269,16 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::checkout_outcome(&repo)
     }
 
+    /// Runs `checkout_branch` for a caller that already had `judged` approved.
+    pub fn checkout_branch_judged(
+        repo_path: &str,
+        branch_name: &str,
+        judged: &[String],
+    ) -> Result<CheckoutOutcome, String> {
+        let _ = judged;
+        Self::checkout_branch(repo_path, branch_name)
+    }
+
     /// Checks out a commit, tag or other revision with HEAD detached. This is
     /// the named way to detach: [`Self::checkout_branch`] never does.
     pub fn checkout_detached_argv(revision: &str) -> Result<Vec<String>, String> {
@@ -6108,3 +6118,7 @@ mod bound_to_checked_state {
         assert_eq!(ours.email.as_deref(), Some("env@example.test"));
     }
 }
+
+#[cfg(test)]
+#[path = "git_writer_adv_tests.rs"]
+mod adv_tests;
