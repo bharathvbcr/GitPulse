@@ -1430,26 +1430,45 @@ impl GitReader {
         Self::merge_render_args(git_cli::git_supports(git_cli::DIFF_MERGES_OPTION))
     }
 
-    /// The one `git show` argv for a commit's patch, whole or narrowed to one
-    /// path. The file list and the details read below take their merge
+    /// The one `git show` argv for a commit's patch, whole or narrowed to
+    /// `pathspecs`. The file list and the details read below take their merge
     /// rendering from [`Self::merge_render_args`] too, so the list, the counts
-    /// and the hunks cannot disagree about a merge.
-    fn commit_show_args<'a>(commit_id: &'a str, pathspec: Option<&'a str>) -> Vec<&'a str> {
+    /// and the hunks cannot disagree about a merge. A narrowed read must carry
+    /// every path a rename or copy pairs (see [`Self::paired_sources`]).
+    fn commit_show_args<'a>(commit_id: &'a str, pathspecs: &'a [String]) -> Vec<&'a str> {
         let mut args = vec!["-c", "core.quotepath=off", "show", "--unified=3"];
         args.extend_from_slice(Self::merge_render_args_here());
         args.push("--format=");
         args.push(commit_id);
-        if let Some(spec) = pathspec {
+        if !pathspecs.is_empty() {
             args.push("--");
-            args.push(spec);
+            args.extend(pathspecs.iter().map(String::as_str));
         }
         args
+    }
+
+    /// The source paths of the renames and copies the commit shows for `path`
+    /// (or, for a directory, for anything under it), read with the same merge
+    /// rendering and rename detection as the whole-commit view. Git pairs a
+    /// rename only when both its ends survive the pathspec, so a one-path read
+    /// that leaves the old path out shows the new file as wholly added while
+    /// the file list, which was never narrowed, counts it as the rename it is.
+    ///
+    /// Best effort past the byte cap: a cut list pairs what it holds and the
+    /// rest read as additions, exactly as before this read existed.
+    fn paired_sources(repo: &Path, commit_id: &str, path: &str) -> Result<Vec<String>, String> {
+        let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.push("--format=");
+        args.push(commit_id);
+        let (stdout, _cut) = git_text_capped(repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
+        Ok(parse_paired_sources(&stdout, path))
     }
 
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, None))
+        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[]))
     }
 
     pub fn get_commit_file_diff(
@@ -1460,8 +1479,11 @@ impl GitReader {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         sandbox_join(&repo, file_path)?;
-        let spec = literal_pathspec(file_path);
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, Some(&spec)))
+        let mut specs = vec![literal_pathspec(file_path)];
+        for source in Self::paired_sources(&repo, commit_id, file_path)? {
+            specs.push(literal_pathspec(&source));
+        }
+        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs))
     }
 
     pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
@@ -5125,6 +5147,23 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
     files
 }
 
+/// The old paths of the renames and copies in `git show --name-status
+/// --diff-filter=RC -z` output, whose records are all `R100\0old\0new\0` or
+/// `C75\0src\0copy\0`, for the entries whose new path is `path` or under it.
+/// A trailing record cut by the byte cap is ignored.
+fn parse_paired_sources(stdout: &str, path: &str) -> Vec<String> {
+    let under = format!("{}/", path.trim_end_matches('/'));
+    let mut sources: Vec<String> = Vec::new();
+    let mut tokens = stdout.split('\0');
+    while let (Some(_status), Some(old), Some(new)) = (tokens.next(), tokens.next(), tokens.next())
+    {
+        if (new == path || new.starts_with(&under)) && !sources.iter().any(|s| s == old) {
+            sources.push(old.to_string());
+        }
+    }
+    sources
+}
+
 /// The metadata `git show` prints before a commit's numstat, NUL-separated.
 /// The body is last and free text, but git cannot put a NUL in a message, so
 /// the Nth NUL is always the end of field N.
@@ -7404,6 +7443,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_paired_sources_matches_the_new_path_or_a_directory_and_drops_a_cut_record() {
+        let out = "R100\0Report.txt\0C.txt\0C75\0src.txt\0pkg/copy.txt\0R90\0a\0pkg/b\0R50\0cut\0";
+        assert_eq!(parse_paired_sources(out, "C.txt"), ["Report.txt"]);
+        assert_eq!(parse_paired_sources(out, "pkg"), ["src.txt", "a"]);
+        assert!(parse_paired_sources(out, "cut").is_empty());
+        assert!(parse_paired_sources("", "x").is_empty());
+    }
+
+    #[test]
     fn list_tags_caps_payload_at_tag_list_cap() {
         use std::io::Write;
         let dir = init_repo_with_remotes(&[], "main");
@@ -9275,13 +9323,273 @@ mod tests {
         let renamed = GitReader::get_commit_file_diff(path, &oid, "renamed.txt")
             .expect("renamed")
             .text;
-        // The row exists and opens a diff. (Its counts are the rename's 0/0
-        // while the one-path read shows the file as added: a narrowed pathspec
-        // cannot pair the rename, merge or not.)
+        // The row exists and opens a diff, paired as a rename (see
+        // `merge_rename_on_second_parent_pairs_in_the_one_path_view`).
         let listed = GitReader::get_commit_files(path, &oid).expect("list");
         assert!(listed.iter().any(|f| f.path == "renamed.txt"), "{listed:?}");
         assert!(renamed.contains("renamed.txt"), "{renamed}");
         assert!(!renamed.contains("@@@"), "{renamed}");
+    }
+
+    /// Builds `main` with `base` committed, a `second` branch from it that
+    /// `on_second` edits (it commits itself), then a diverging `main` commit
+    /// and a no-ff merge of `second`. Returns the merge's id.
+    fn merge_with_second_parent(
+        dir: &Path,
+        base: &[(&str, &[u8])],
+        on_second: impl FnOnce(&Path),
+        on_main: impl FnOnce(&Path),
+    ) -> String {
+        for (name, body) in base {
+            if let Some(parent) = dir.join(name).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-m", "base"]);
+        git_in(dir, &["checkout", "-q", "-b", "second"]);
+        on_second(dir);
+        git_in(dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("main-only.txt"), "m\n").unwrap();
+        on_main(dir);
+        commit_all(dir, "main");
+        git_in(dir, &["merge", "--no-ff", "-q", "second", "-m", "merge"]);
+        rev_parse_at(dir, "HEAD")
+    }
+
+    /// [`merge_with_second_parent`] for a repo that already has history.
+    fn merge_with_second_parent_on(
+        dir: &Path,
+        branch: &str,
+        on_second: impl FnOnce(&Path),
+        on_main: impl FnOnce(&Path),
+    ) -> String {
+        git_in(dir, &["checkout", "-q", "-b", branch]);
+        on_second(dir);
+        git_in(dir, &["checkout", "-q", "main"]);
+        on_main(dir);
+        commit_all(dir, "main again");
+        git_in(
+            dir,
+            &["merge", "--no-ff", "-q", branch, "-m", "merge again"],
+        );
+        rev_parse_at(dir, "HEAD")
+    }
+
+    fn commit_all(dir: &Path, msg: &str) {
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-m", msg]);
+    }
+
+    /// The row for a renamed (or copied) path, read every way, must agree and
+    /// the one-path view must pair the rename rather than show an addition.
+    fn assert_rename_pairs(path: &str, oid: &str, new: &str, old: &str, label: &str) {
+        assert_commit_view_agrees(path, oid, label);
+        let one = GitReader::get_commit_file_diff(path, oid, new)
+            .expect(label)
+            .text;
+        assert!(
+            one.contains(&format!("rename from {old}"))
+                || one.contains(&format!("copy from {old}")),
+            "{label}: {new} is not paired with {old}\n{one}"
+        );
+        assert!(!one.contains("new file mode"), "{label}: {one}");
+    }
+
+    const EIGHT: &[u8] = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+
+    /// The reported bug: a path renamed on the second parent is listed as 0/0
+    /// but its one-path diff showed every line added.
+    #[test]
+    fn merge_rename_on_second_parent_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                commit_all(d, "rename");
+            },
+            |_| {},
+        );
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        let row = listed.iter().find(|f| f.path == "new.txt").expect("row");
+        assert_eq!((row.additions, row.deletions), (0, 0), "{listed:?}");
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "rename");
+    }
+
+    #[test]
+    fn merge_rename_plus_edit_on_second_parent_counts_only_the_edit() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                std::fs::write(d.join("new.txt"), "l1\nl2\nEDIT\nl4\nl5\nl6\nl7\nl8\nl9\n")
+                    .unwrap();
+                commit_all(d, "rename and edit");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "rename+edit");
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        let row = listed.iter().find(|f| f.path == "new.txt").expect("row");
+        assert_eq!((row.additions, row.deletions), (2, 1), "{listed:?}");
+    }
+
+    /// A rename made on both parents leaves nothing to show against the first
+    /// parent; a rename made on the first parent only is the same.
+    #[test]
+    fn merge_rename_on_both_parents_and_on_the_first_only_agree() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let both = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                commit_all(d, "rename on second");
+            },
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+            },
+        );
+        assert_commit_view_agrees(path, &both, "rename on both parents");
+        let whole = GitReader::get_commit_diff(path, &both).expect("whole").text;
+        assert!(!whole.contains("new.txt"), "{whole}");
+
+        let first_only = merge_with_second_parent_on(
+            dir.path(),
+            "second2",
+            |d| {
+                std::fs::write(d.join("side.txt"), "s\n").unwrap();
+                commit_all(d, "side");
+            },
+            |d| {
+                git_in(d, &["mv", "new.txt", "newer.txt"]);
+            },
+        );
+        assert_commit_view_agrees(path, &first_only, "rename on first parent only");
+    }
+
+    #[test]
+    fn merge_copy_detection_pairs_the_copy_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("src.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("copy.txt"), EIGHT).unwrap();
+                std::fs::write(d.join("src.txt"), "l1\nCHANGED\nl3\nl4\nl5\nl6\nl7\nl8\n").unwrap();
+                commit_all(d, "copy and touch source");
+            },
+            |_| {},
+        );
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        assert!(whole.contains("copy from src.txt"), "fixture: {whole}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "copy.txt")
+            .expect("copy")
+            .text;
+        assert!(one.contains("copy from src.txt"), "{one}");
+        assert!(!one.contains("new file mode"), "{one}");
+    }
+
+    #[test]
+    fn merge_binary_rename_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let blob: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 255, 254, 0, 1, 2];
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.bin", blob)],
+            |d| {
+                git_in(d, &["mv", "old.bin", "new.bin"]);
+                commit_all(d, "rename binary");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, "new.bin", "old.bin", "binary rename");
+    }
+
+    #[test]
+    fn merge_rename_with_spaces_and_unicode_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let old = "dir one/old na\u{ef}ve.txt";
+        let new = "d\u{fc}r two/new caf\u{e9}.txt";
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[(old, EIGHT)],
+            |d| {
+                std::fs::create_dir_all(d.join("d\u{fc}r two")).unwrap();
+                git_in(d, &["mv", old, new]);
+                commit_all(d, "rename with odd names");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, new, old, "odd names");
+    }
+
+    /// The old path comes back as a different file: git calls that a modified
+    /// old path and an added new one, so there is no pair to build, and the
+    /// one-path view must say what the whole commit says.
+    #[test]
+    fn merge_rename_whose_old_path_is_reused_matches_the_whole_commit() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                std::fs::write(d.join("old.txt"), "completely\ndifferent\n").unwrap();
+                commit_all(d, "move away and reuse the name");
+            },
+            |_| {},
+        );
+        assert_commit_view_agrees(path, &oid, "reused old path");
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        let one = GitReader::get_commit_file_diff(path, &oid, "new.txt")
+            .expect("new")
+            .text;
+        assert_eq!(
+            whole.contains("rename from old.txt"),
+            one.contains("rename from old.txt"),
+            "one-path view pairs differently from the whole commit\n{whole}\n---\n{one}"
+        );
+    }
+
+    /// The same narrowing hurt an ordinary (non-merge) rename commit.
+    #[test]
+    fn plain_and_first_parent_renames_pair_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("old.txt"), EIGHT).unwrap();
+        commit_all(dir.path(), "old");
+        git_in(dir.path(), &["mv", "old.txt", "new.txt"]);
+        commit_all(dir.path(), "plain rename");
+        let plain = rev_parse_at(dir.path(), "HEAD");
+        assert_rename_pairs(path, &plain, "new.txt", "old.txt", "plain rename");
+
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "s\n").unwrap();
+        commit_all(dir.path(), "side");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        git_in(dir.path(), &["mv", "new.txt", "newer.txt"]);
+        commit_all(dir.path(), "first-parent rename");
+        let renamed = rev_parse_at(dir.path(), "HEAD");
+        assert_rename_pairs(path, &renamed, "newer.txt", "new.txt", "first-parent");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "side", "-m", "merge"],
+        );
+        assert_commit_view_agrees(path, &rev_parse_at(dir.path(), "HEAD"), "merge");
     }
 
     /// A submodule added on the second parent: the list row and the per-file
