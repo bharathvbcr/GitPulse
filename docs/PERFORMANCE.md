@@ -1002,6 +1002,34 @@ serial chain per byte; the shipped digest takes four lanes a word at a time.
 It is an accidental-change detector, not collision-resistant against a crafted
 input (see `digest` in `diff/conflict_fs.rs`).
 
+Ledger redactor (ft-1de1ff48), `repo_read` rows `redact::text 4 fields`, `7
+fields` and `transcript edit` (2,000 redactions per sample; the transcript edit
+is the object path plus the 4-field `detail_json`), and `transcript_pass`. Five
+interleaved A/B pairs (base, new, base, ...) of the release bench binary in
+`--smoke` mode (3 samples per row per run), so N = 15 per side, min over all
+15, host load 38 to 95 on 18 CPUs (so the absolute times are inflated; the
+ratio held in every pair). "Base" is `1b3175dd` (the bench row added to the
+unmodified redactor); "new" parses each string once, gates the 15-pattern
+contextual chain with one `RegexSet`, and copies on write through the chain and
+the vendor-token pass.
+
+| row | base (min) | new (min) | change |
+| --- | --- | --- | --- |
+| redact::text 4 fields | 32.17 ms (16.1 us/call) | 23.70 ms (11.9 us/call) | -26% |
+| redact::text 7 fields | 60.17 ms (30.1 us/call) | 42.72 ms (21.4 us/call) | -29% |
+| redact::text transcript edit | 38.94 ms (9.7 us/call) | 28.17 ms (7.0 us/call) | -28% |
+| transcript_pass 100k lines | 4.376 s | 3.606 s | -18% |
+| transcript_pass 10k cwds | 441.3 ms | 360.7 ms | -18% |
+| transcript_pass 10k departed cwds | 497.4 ms | 403.9 ms | -19% |
+
+This is about a quarter off, not an order of magnitude: the remaining cost is
+dominated by dc-redact's per-segment `contains_secret` (its own pattern set,
+vendored, not editable here) and by the one failed JSON parse per leaf. The
+vendor-token skip is exact (`!contains_secret(segment)` implies
+`redact_secrets(segment) == segment` for a segment with no whitespace; see the
+property test `a_segment_dc_redact_does_not_detect_is_returned_unchanged`), so
+a cheaper pre-filter has to come from dc-redact itself.
+
 `command_timings` (N = 15, cold N = 5; 600 files, 61 commits, 18 worktrees, 17
 dirty):
 
