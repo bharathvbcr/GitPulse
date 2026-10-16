@@ -1454,8 +1454,9 @@ impl GitReader {
     /// that leaves the old path out shows the new file as wholly added while
     /// the file list, which was never narrowed, counts it as the rename it is.
     ///
-    /// Best effort past the byte cap: a cut list pairs what it holds and the
-    /// rest read as additions, exactly as before this read existed.
+    /// Best effort past the byte cap: when the list is cut, a rename whose
+    /// record fell past the cut stays unpaired and is shown as an addition,
+    /// with no signal that the list was cut.
     fn paired_sources(repo: &Path, commit_id: &str, path: &str) -> Result<Vec<String>, String> {
         let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
         args.extend_from_slice(Self::merge_render_args_here());
@@ -1480,10 +1481,22 @@ impl GitReader {
         validate_oid(commit_id)?;
         sandbox_join(&repo, file_path)?;
         let mut specs = vec![literal_pathspec(file_path)];
-        for source in Self::paired_sources(&repo, commit_id, file_path)? {
-            specs.push(literal_pathspec(&source));
+        let narrowed = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs))?;
+        // Only an added file can be the other end of a rename or copy, so a
+        // modified or deleted one costs exactly the one `git show` above.
+        if !has_new_file_section(&narrowed.text) {
+            return Ok(narrowed);
         }
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs))
+        let sources = Self::paired_sources(&repo, commit_id, file_path)?;
+        if sources.is_empty() {
+            return Ok(narrowed);
+        }
+        specs.extend(sources.iter().map(|source| literal_pathspec(source)));
+        let mut paired = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs))?;
+        // The source pathspecs can pull in another file's section (a copy's
+        // source that was also edited, an old path reused by a new file).
+        paired.text = keep_sections_under(&paired.text, file_path);
+        Ok(paired)
     }
 
     pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
@@ -5164,6 +5177,84 @@ fn parse_paired_sources(stdout: &str, path: &str) -> Vec<String> {
     sources
 }
 
+/// Whether a patch has a section that adds a whole file, the only section a
+/// rename or copy can re-pair. Header lines never begin like content lines
+/// (`+`, `-`, space), so a line-start match is exact.
+fn has_new_file_section(patch: &str) -> bool {
+    patch.lines().any(|line| line.starts_with("new file mode "))
+}
+
+/// The post-image path of one patch section (`diff --git` through its last
+/// line), read from the lines that name it unambiguously: `rename to` /
+/// `copy to`, then `+++ b/` (or `--- a/` for a deletion), then the binary
+/// notice, and last a header whose two paths are equal. `None` when the name
+/// is quoted or otherwise not readable, which the caller treats as "keep".
+fn section_post_path(section: &str) -> Option<String> {
+    let header: Vec<&str> = section
+        .lines()
+        .take_while(|line| !line.starts_with("@@"))
+        .collect();
+    let named = |prefix: &str| {
+        header
+            .iter()
+            .find_map(|line| line.strip_prefix(prefix))
+            .map(|rest| rest.trim_end_matches('\t').to_string())
+    };
+    let readable = |path: String| (!path.starts_with('"')).then_some(path);
+    if let Some(path) = named("rename to ").or_else(|| named("copy to ")) {
+        return readable(path);
+    }
+    if let Some(path) = named("+++ b/") {
+        return readable(path);
+    }
+    if named("+++ /dev/null").is_some() {
+        return named("--- a/").and_then(readable);
+    }
+    if let Some(path) = header.iter().find_map(|line| {
+        line.strip_prefix("Binary files ")
+            .and_then(|rest| rest.strip_suffix(" differ"))
+            .and_then(|rest| rest.rsplit_once(" and b/"))
+            .map(|(_, new)| new.to_string())
+    }) {
+        return readable(path);
+    }
+    let rest = header.first()?.strip_prefix("diff --git a/")?;
+    let (old, new) = rest.split_at(rest.len().checked_sub(2)? / 2);
+    let new = new.strip_prefix(" b/")?;
+    (old == new).then(|| new.to_string()).and_then(readable)
+}
+
+/// `patch` reduced to the sections whose post-image path is `path` or under
+/// it. A section whose path cannot be read is kept: showing one extra file is
+/// safer than hiding the requested one.
+fn keep_sections_under(patch: &str, path: &str) -> String {
+    let dir = format!("{}/", path.trim_end_matches('/'));
+    let mut out = String::with_capacity(patch.len());
+    let mut section_start: Option<usize> = None;
+    let flush = |out: &mut String, section: &str| {
+        let keep =
+            section_post_path(section).is_none_or(|post| post == path || post.starts_with(&dir));
+        if keep {
+            out.push_str(section);
+        }
+    };
+    let mut offset = 0;
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            if let Some(start) = section_start {
+                flush(&mut out, &patch[start..offset]);
+            }
+            section_start = Some(offset);
+        }
+        offset += line.len();
+    }
+    match section_start {
+        Some(start) => flush(&mut out, &patch[start..]),
+        None => out.push_str(patch),
+    }
+    out
+}
+
 /// The metadata `git show` prints before a commit's numstat, NUL-separated.
 /// The body is last and free text, but git cannot put a NUL in a message, so
 /// the Nth NUL is always the end of field N.
@@ -7452,6 +7543,29 @@ mod tests {
     }
 
     #[test]
+    fn keep_sections_under_reads_the_post_image_path_not_the_ambiguous_header() {
+        let patch = "diff --git a/a b/x b/y z.txt\nsimilarity index 90%\nrename from a b/x\nrename to y z.txt\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git a/other.txt b/other.txt\nnew file mode 100644\n--- /dev/null\n+++ b/other.txt\t\n@@ -0,0 +1 @@\n+x\n\
+diff --git a/pkg/in.bin b/pkg/in.bin\nnew file mode 100644\nBinary files /dev/null and b/pkg/in.bin differ\n\
+diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n\
+diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
+        let only = |path: &str| keep_sections_under(patch, path);
+        assert!(only("y z.txt").starts_with("diff --git a/a b/x b/y z.txt"));
+        assert_eq!(only("y z.txt").matches("diff --git").count(), 1);
+        assert_eq!(only("other.txt").matches("diff --git").count(), 1);
+        assert!(only("pkg").contains("pkg/in.bin"));
+        assert_eq!(only("pkg").matches("diff --git").count(), 1);
+        assert!(only("gone.txt").contains("deleted file mode"));
+        assert!(only("mode.sh").contains("new mode 100755"));
+        assert!(only("nothing.txt").is_empty());
+        assert_eq!(
+            only("pk").matches("diff --git").count(),
+            0,
+            "prefix is not a directory"
+        );
+    }
+
+    #[test]
     fn list_tags_caps_payload_at_tag_list_cap() {
         use std::io::Write;
         let dir = init_repo_with_remotes(&[], "main");
@@ -9498,6 +9612,84 @@ mod tests {
             .text;
         assert!(one.contains("copy from src.txt"), "{one}");
         assert!(!one.contains("new file mode"), "{one}");
+        // The source was edited in the same commit, but it is another file.
+        assert!(whole.contains("diff --git a/src.txt b/src.txt"), "{whole}");
+        assert!(!one.contains("diff --git a/src.txt b/src.txt"), "{one}");
+        assert_eq!(
+            patch_file_counts(&one).keys().collect::<Vec<_>>(),
+            ["copy.txt"],
+            "{one}"
+        );
+    }
+
+    /// The old path holds a different file now and the new path carries the
+    /// old content as a copy: the one-path view of the copy must not drag the
+    /// reused path's own section in.
+    #[test]
+    fn merge_copy_from_a_reused_old_path_shows_only_the_requested_file() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("new.txt"), EIGHT).unwrap();
+                std::fs::write(d.join("old.txt"), "an\nentirely\ndifferent\nfile\n").unwrap();
+                commit_all(d, "old content moves on, old name is reused");
+            },
+            |_| {},
+        );
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        assert!(whole.contains("copy from old.txt"), "fixture: {whole}");
+        assert!(whole.contains("diff --git a/old.txt b/old.txt"), "{whole}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "new.txt")
+            .expect("copy")
+            .text;
+        assert!(one.contains("copy from old.txt"), "{one}");
+        assert!(!one.contains("diff --git a/old.txt b/old.txt"), "{one}");
+        assert_commit_view_agrees(path, &oid, "copy from reused path");
+    }
+
+    /// Only an added file can need its pairing read: a modified file starts
+    /// one `git show`, a renamed one the narrowed read, the pairing read and
+    /// the re-read, and an addition with no source stops after the pairing.
+    #[test]
+    fn one_file_diff_pays_for_pairing_only_when_the_file_is_added() {
+        use crate::engine::git_cli::spawn_log::spawns_in;
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("keep.txt", EIGHT), ("old.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("keep.txt"), "l1\nCHANGED\nl3\n").unwrap();
+                git_in(d, &["mv", "old.txt", "renamed.txt"]);
+                std::fs::write(d.join("fresh.txt"), "brand\nnew\n").unwrap();
+                commit_all(d, "edit, rename, add");
+            },
+            |_| {},
+        );
+        let repo = crate::engine::git_cli::canonicalize_plain(dir.path()).unwrap();
+        // (all `show` spawns, those that are the pairing read)
+        let shows = |file: &str| {
+            let before = spawns_in(&repo).len();
+            let diff = GitReader::get_commit_file_diff(path, &oid, file).expect(file);
+            assert!(!diff.text.is_empty(), "{file}");
+            let used: Vec<Vec<String>> = spawns_in(&repo)[before..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "show"))
+                .cloned()
+                .collect();
+            let pairing = used
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "--name-status"))
+                .count();
+            (used.len(), pairing)
+        };
+        assert_eq!(shows("keep.txt"), (1, 0), "modified file");
+        assert_eq!(shows("renamed.txt"), (3, 1), "renamed file");
+        assert_eq!(shows("fresh.txt"), (2, 1), "added file without a source");
     }
 
     #[test]
