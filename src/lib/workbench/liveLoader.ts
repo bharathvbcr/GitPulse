@@ -14,7 +14,16 @@ export interface LiveLoaderOptions<Mode> {
   onError(cause: unknown): void;
   /** How long a change burst is coalesced before one re-read. */
   delayMs?: number;
+  /**
+   * The least time between the starts of two change-driven reads. A store
+   * that commits every second sends a change every second; without a floor
+   * each one was a full re-read. `load()` itself is never held back.
+   */
+  minGapMs?: number;
 }
+
+/** Changes reach a surface within this long, however often they come. */
+export const LIVE_MIN_GAP_MS = 1_500;
 
 /**
  * The load/coalesce/refresh loop the Task archive and the Attention inbox
@@ -30,6 +39,10 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
   let loading = false;
   let again = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  /** When the last read started or, once it has, ended; the gap for change-driven reads counts from it. */
+  let lastReadAt = -Infinity;
+  /** A change-driven read came due while a read was running; it is scheduled once that read ends. */
+  let owed = false;
 
   async function load(mode?: Mode): Promise<void> {
     if (!options.canRun() || disposed) return;
@@ -40,23 +53,46 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
     const epoch = generation;
     const isCurrent = () => epoch === generation && !disposed;
     loading = true;
+    lastReadAt = Date.now();
     try {
       await options.read(mode, isCurrent);
     } catch (cause) {
       if (isCurrent()) options.onError(cause);
     } finally {
       loading = false;
+      lastReadAt = Date.now();
       if (again) {
         again = false;
+        owed = false;
         void load();
+      } else if (owed) {
+        owed = false;
+        schedule();
       }
     }
   }
 
+  /**
+   * One re-read for a burst of changes. A pending re-read is kept, not pushed
+   * back: restarting the timer on each change put the read off for as long
+   * as changes kept arriving faster than the delay.
+   */
   function schedule(): void {
-    if (!options.canRun() || disposed) return;
+    if (!options.canRun() || disposed || timer !== undefined) return;
+    if (loading) { owed = true; return; }
+    const gap = lastReadAt + (options.minGapMs ?? LIVE_MIN_GAP_MS) - Date.now();
+    timer = setTimeout(() => {
+      timer = undefined;
+      // A read began meanwhile (an explicit load): this one waits for it.
+      if (loading) owed = true;
+      else void load();
+    }, Math.max(options.delayMs ?? 200, gap));
+  }
+
+  function cancelScheduled(): void {
     clearTimeout(timer);
-    timer = setTimeout(() => void load(), options.delayMs ?? 200);
+    timer = undefined;
+    owed = false;
   }
 
   return {
@@ -65,14 +101,14 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
     /** The list is a different list now: orphan the read in flight and any pending refresh. */
     reset(): void {
       generation += 1;
-      clearTimeout(timer);
+      cancelScheduled();
     },
     /** For callbacks guarded by "still mounted". */
     isDisposed: () => disposed,
     dispose(): void {
       disposed = true;
       generation += 1;
-      clearTimeout(timer);
+      cancelScheduled();
     },
     /**
      * Subscribes to workbench changes and to the window returning to the

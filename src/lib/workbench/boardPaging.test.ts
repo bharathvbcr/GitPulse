@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_COLUMN_PAGES, MAX_RELOAD_PAGES, pagesLoaded, readToEnd, reloadPaged } from "./boardPaging";
+import { MAX_COLUMN_PAGES, MAX_RELOAD_PAGES, pagesLoaded, readToEnd, reloadPaged, samePage, sameRecords } from "./boardPaging";
 import type { Page } from "./client";
 
 type Row = { id: string };
@@ -105,5 +105,27 @@ describe("readToEnd", () => {
     reads.length = 0;
     expect(await readToEnd(read, first)).toBeNull();
     expect(reads).toHaveLength(MAX_COLUMN_PAGES);
+  });
+});
+
+describe("samePage", () => {
+  const card = (id: string, revision = 1) => ({ id, revision });
+  const page = (items: { id: string; revision: number }[], extra: Partial<Page<{ id: string; revision: number }>> = {}) =>
+    ({ items, total: items.length, shown: items.length, has_more: false, next_cursor: null, ...extra });
+
+  it("is the same answer when every record, revision, total and cursor match", () => {
+    expect(samePage(page([card("a"), card("b")]), page([card("a"), card("b")]))).toBe(true);
+    expect(samePage(undefined, undefined)).toBe(true);
+  });
+
+  it("is a different answer for any change a card or the column could show", () => {
+    const base = page([card("a"), card("b")]);
+    expect(samePage(base, page([card("a"), card("b", 2)]))).toBe(false);
+    expect(samePage(base, page([card("b"), card("a")]))).toBe(false);
+    expect(samePage(base, page([card("a")]))).toBe(false);
+    expect(samePage(base, page([card("a"), card("b")], { total: 3 }))).toBe(false);
+    expect(samePage(base, page([card("a"), card("b")], { next_cursor: "b", has_more: true }))).toBe(false);
+    expect(samePage(base, undefined)).toBe(false);
+    expect(sameRecords([card("a")], [card("c")])).toBe(false);
   });
 });

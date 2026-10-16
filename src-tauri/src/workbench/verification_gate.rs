@@ -111,6 +111,49 @@ pub(crate) fn latest(store: &Store, item_id: &str) -> Result<Option<Record>, Str
     Ok(None)
 }
 
+/// [`latest`] for many tasks at once: each task's newest verification record,
+/// absent for a task that has none.
+///
+/// The board asks this for every card it shows, on every refresh. `evidence`
+/// has no index on `task_id` (dc-store's schema), so [`latest`] per card was
+/// one walk of the whole table per card: 4 s for 60 cards on an 82k-row
+/// profile, holding a storage slot throughout. This is one walk for them all.
+/// Only `work.verify.task` rows are read, so a task with many other rows is
+/// never "too long to establish", as it can be through [`latest`].
+pub(crate) fn latest_many(
+    store: &Store,
+    item_ids: &[String],
+) -> Result<std::collections::HashMap<String, Record>, String> {
+    let mut found = std::collections::HashMap::new();
+    if item_ids.is_empty() {
+        return Ok(found);
+    }
+    let unreadable = |e: rusqlite::Error| format!("the verification evidence could not be read: {e}");
+    let ids = serde_json::to_string(item_ids).map_err(|e| e.to_string())?;
+    let mut statement = store
+        .connection()
+        .prepare(
+            "SELECT e.task_id, e.data_json FROM evidence e
+             JOIN (SELECT MAX(id) AS id FROM evidence
+                   WHERE type = ?1 AND task_id IN (SELECT value FROM json_each(?2))
+                   GROUP BY task_id) newest ON newest.id = e.id",
+        )
+        .map_err(unreadable)?;
+    let rows = statement
+        .query_map(rusqlite::params![EVIDENCE_TYPE, ids], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(unreadable)?;
+    for row in rows {
+        let (task, data) = row.map_err(unreadable)?;
+        let record: Record = serde_json::from_str(&data).map_err(|e| {
+            format!("the newest verification record could not be parsed, so no verdict is established: {e}")
+        })?;
+        found.insert(task, record);
+    }
+    Ok(found)
+}
+
 /// The gate for a claim of `done` on `item_id`, a task of the repository whose
 /// identity is `repository_identity`.
 pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> Gate {

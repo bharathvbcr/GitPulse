@@ -16,7 +16,8 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
-  import { readToEnd, reloadPaged } from "../workbench/boardPaging";
+  import { readToEnd, reloadPaged, samePage, sameRecords } from "../workbench/boardPaging";
+  import { createLiveLoader } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask, suggestTasks,
@@ -80,7 +81,7 @@
   import TaskActionDialog from "./TaskActionDialog.svelte";
   import TaskMergeDialog from "./TaskMergeDialog.svelte";
   import CardVerdict from "./CardVerdict.svelte";
-  import { getVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
+  import { getVerdicts, sameVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
   import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
@@ -261,7 +262,11 @@
   let handoff = $state<{ card: TaskCard; settings: HandoffSettings } | null>(null);
   let now = $state(Math.floor(Date.now() / 1000));
   let boardEl: HTMLDivElement | undefined = $state();
-  let revision = 0; let disposed = false; let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let revision = 0; let disposed = false;
+  /** Bumped by each read the reader asks for, so a background read begun before it is not applied over it. */
+  let interactions = 0;
+  /** The banner's error came from a background read, so the next one that succeeds may clear it. */
+  let refreshError = false;
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const openTabRefs = $derived($repoStore.openTabs.map((tab) => ({ path: tab.path, label: tab.label })));
   const catalogIds = $derived(repositories.map((repo) => repo.id));
@@ -540,12 +545,38 @@
       reloadPaged((cursor) => listWorkspaces(cursor), workspaces.length, NAVIGATOR_PAGE_SIZE),
     ]);
     if (disposed || ticket !== catalogRevision) return;
-    repositories = repos.items; repositoryTotal = repos.total; repositoryCursor = repos.next_cursor;
-    workspaces = groups.items; workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
+    // An unchanged list keeps its identity, so the navigator and everything
+    // derived from it (the search plan, completions) are not recomputed.
+    if (!sameRecords(repositories, repos.items)) repositories = repos.items;
+    repositoryTotal = repos.total; repositoryCursor = repos.next_cursor;
+    if (!sameRecords(workspaces, groups.items)) workspaces = groups.items;
+    workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
     catalogError = "";
   }
-  async function loadBoard(target: Scope = scope, current: SearchPlan = plan) {
-    const generation = ++revision, key = JSON.stringify([target, current.key]); loading = true; error = "";
+  /** Each column as read, keeping the column already shown wherever the read found nothing new. */
+  function keepUnchanged(next: Partial<Record<TaskStatus, Page<TaskCard>>>): Partial<Record<TaskStatus, Page<TaskCard>>> {
+    const kept = Object.fromEntries(Object.entries(next).map(([status, page]) => {
+      const shown = columns[status as TaskStatus];
+      return [status, samePage(shown, page) ? shown : page];
+    })) as Partial<Record<TaskStatus, Page<TaskCard>>>;
+    const keys = Object.keys(kept);
+    const same = keys.length === Object.keys(columns).length && keys.every((status) => kept[status as TaskStatus] === columns[status as TaskStatus]);
+    return same ? columns : kept;
+  }
+  /**
+   * Read the board for `target`. Returns whether the answer was applied.
+   *
+   * A `quiet` read is the board keeping itself current after a change made
+   * elsewhere: it shows no loading state (which blanked the count and
+   * disabled every button once a second while the store was busy), leaves an
+   * error the reader caused alone, and is dropped if the reader started
+   * anything meanwhile — a "Load more" or a move would otherwise be
+   * overwritten by an answer read before it.
+   */
+  async function loadBoard(target: Scope = scope, current: SearchPlan = plan, quiet = false): Promise<boolean> {
+    const generation = ++revision, key = JSON.stringify([target, current.key]), touched = interactions;
+    if (!quiet) { loading = true; error = ""; refreshError = false; }
+    const stale = () => generation !== revision || disposed || key !== boardKey || (quiet && (loading || moving || touched !== interactions));
     try {
       // Columns hold what is on the board: an archived task leaves them
       // whatever its status. The badge is the archive's own total for the
@@ -559,13 +590,14 @@
           current.word ? listTasks(current.scope, null, current.word, undefined, CANDIDATE_PAGE, BOARD) : null,
           archived,
         ]);
-        if (generation !== revision || disposed || key !== boardKey) return;
+        if (stale()) return false;
         const set = mergeCandidates(null, broad, text);
         const pages = bucketByStatus(set.cards);
-        candidates = set; columns = pages; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+        candidates = set; columns = keepUnchanged(pages); loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
         if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = pages.in_progress?.total ?? 0;
-        selected = new Set([...selected].filter((id) => loadedHas(id, pages)));
-        return;
+        keepSelected(pages);
+        settled(quiet);
+        return true;
       }
       // Columns are re-read as far as they were paged in (`boardPaging.ts`),
       // so a refresh after any write keeps "Load more" where the reader left
@@ -576,13 +608,28 @@
         Promise.all(STATUSES.map(async (status) => [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, TASK_PAGE_SIZE, BOARD), kept ? columns[status]?.items.length ?? 0 : 0, TASK_PAGE_SIZE)] as const)),
         archived,
       ]);
-      if (generation !== revision || disposed || key !== boardKey) return;
-      columns = Object.fromEntries(pages); candidates = null; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+      if (stale()) return false;
+      const read = Object.fromEntries(pages);
+      columns = keepUnchanged(read); candidates = null; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
       inProgressCount = columns.in_progress?.total ?? 0;
-      selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
+      keepSelected(read);
+      settled(quiet);
       void loadVerdicts(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
-    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
-    finally { if (generation === revision && !disposed) loading = false; }
+      return true;
+    } catch (cause) {
+      // A background read that failed says so, and the next one that
+      // succeeds clears what it said; neither touches the reader's own error.
+      if (generation === revision && !disposed && !(quiet && error && !refreshError)) { error = explainError(cause); refreshError = quiet; }
+      return false;
+    }
+    finally { if (!quiet && generation === revision && !disposed) loading = false; }
+  }
+  /** A read landed: a failure only an earlier background read reported is over. */
+  function settled(quiet: boolean) { if (quiet && refreshError) { error = ""; refreshError = false; } }
+  /** Drops from the selection what the read no longer holds; an unchanged selection keeps its identity. */
+  function keepSelected(pages: Partial<Record<TaskStatus, Page<TaskCard>>>) {
+    const kept = [...selected].filter((id) => loadedHas(id, pages));
+    if (kept.length !== selected.size) selected = new Set(kept);
   }
   /**
    * One batched read of the verdicts for every card just loaded. A failure is
@@ -592,7 +639,7 @@
   async function loadVerdicts(ids: string[], generation: number) {
     try {
       const read = await getVerdicts(ids);
-      if (generation === revision && !disposed) { verdicts = read; verdictError = ""; }
+      if (generation === revision && !disposed) { if (!sameVerdicts(verdicts, read)) verdicts = read; verdictError = ""; }
     } catch (cause) {
       if (generation === revision && !disposed) { verdicts = new Map(); verdictError = explainError(cause); }
     }
@@ -634,17 +681,28 @@
     try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
     if (initialized && active && !disposed) { await loadBoard(); await loadUnread(); }
   }
-  function scheduleRefresh() {
-    if (!active || disposed) return;
-    clearTimeout(refreshTimer);
-    refreshTimer = undefined;
-    if (readBackgroundDocument()) return;
-    refreshTimer = setTimeout(() => {
-      refreshTimer = undefined;
-      if (readBackgroundDocument() || !active || disposed) return;
-      void refresh();
-    }, 200);
-  }
+  /**
+   * Keeping the board current after a change made elsewhere — an agent over
+   * MCP, a background sweep, another window — or the window coming back.
+   * Through the same loader as the archive dock and the inbox: one read at a
+   * time, at most one every `LIVE_MIN_GAP_MS`, and quiet (see `loadBoard`).
+   * A read that had to give way to the reader is asked again afterwards.
+   */
+  const background = createLiveLoader({
+    canRun: () => initialized && active && !disposed && !readBackgroundDocument(),
+    read: async () => {
+      // The agents on the cards follow the same spaced, foreground-only
+      // cadence; on every change they cost a read of runs and one per live run.
+      void boardAgents.refresh();
+      if (loading || moving) { background.schedule(); return; }
+      membershipToken++;
+      try { await catalog(); } catch (cause) { if (!disposed) catalogError = explainError(cause); }
+      if (!(await loadBoard(scope, plan, true)) && !disposed) background.schedule();
+      await loadUnread();
+    },
+    onError: (cause) => { if (!disposed) liveNotice = `Live updates failed: ${explainError(cause)}. Use Refresh.`; },
+  });
+  function scheduleRefresh() { background.schedule(); }
   async function initialize(path: string | null = repositoryPath) {
     const ticket = ++initializationRevision;
     revision++; unreadRevision++; initialized = false; loading = true; catalogError = "";
@@ -704,7 +762,7 @@
   }
   onMount(() => {
     const listeners = createListenerTracker();
-    const changed = () => { scheduleRefresh(); void boardAgents.refresh(); };
+    const changed = () => { scheduleRefresh(); };
     listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Live updates unavailable: ${message}. Use Refresh.`; } }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     const onForeground = () => {
@@ -713,8 +771,7 @@
       // window is when that can have happened.
       if (!readBackgroundDocument()) checkoutToken++;
       if (readBackgroundDocument()) {
-        clearTimeout(refreshTimer);
-        refreshTimer = undefined;
+        background.reset();
         return;
       }
       scheduleRefresh();
@@ -722,7 +779,7 @@
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
-      disposed = true; suggestWatch.reset(); revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); clearTimeout(skipClickTimer); dropFrame.cancel(); listeners.dispose();
+      disposed = true; suggestWatch.reset(); revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); background.dispose(); clearTimeout(undoTimer); clearTimeout(skipClickTimer); dropFrame.cancel(); listeners.dispose();
       // Leaving the board ends the undo window rather than dropping it: the
       // reader saw these tasks go, so they go.
       if (pendingDelete && !pendingDelete.running) void commitPendingDelete();
@@ -1099,7 +1156,7 @@
     const set = candidates, current = plan;
     if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
     const generation = revision, key = boardKey;
-    loading = true; error = "";
+    interactions++; loading = true; error = ""; refreshError = false;
     try {
       const [broad, text] = await Promise.all([
         set.broad.cursor ? listTasks(current.scope, null, "", set.broad.cursor, CANDIDATE_PAGE, BOARD) : null,
@@ -1128,7 +1185,7 @@
     const page = columns[status];
     if (searching || !page || loadedKey !== boardKey) { error = refusal; return false; }
     const generation = revision, key = boardKey;
-    loading = true; error = "";
+    interactions++; loading = true; error = ""; refreshError = false;
     try {
       const all = await readToEnd((cursor) => listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD), page);
       if (generation !== revision || disposed || key !== boardKey) return false;
@@ -1141,7 +1198,7 @@
   async function pageColumn(status: TaskStatus, cursor?: string) {
     if (searching || loading || moving || loadedKey !== boardKey) return;
     const generation = revision, key = boardKey;
-    loading = true; error = "";
+    interactions++; loading = true; error = ""; refreshError = false;
     try {
       const result = await listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
@@ -1491,7 +1548,7 @@
   }
   async function applyUpdate(batch: TaskBatch) {
     if (moving || pendingUpdate && pendingUpdate !== batch) return;
-    moving = true; error = ""; pendingUpdate = batch;
+    interactions++; moving = true; error = ""; refreshError = false; pendingUpdate = batch;
     try {
       await batch.run();
       if (disposed) return;

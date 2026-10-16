@@ -41,6 +41,7 @@
     type IssueInfo,
   } from "../ops/model";
   import { registerRepository, subscribeWorkbenchChanges, type TaskCard } from "../workbench/client";
+  import { createLiveLoader } from "../workbench/liveLoader";
   import {
     createTaskFromIssue,
     batchCreateTasksFromIssues,
@@ -453,19 +454,22 @@
   let repoTasksGeneration = 0;
   /** True once the `workbench-changed` listener is attached; tasks then reload on change, not on a timer. */
   let tasksFollowChanges = false;
-  let refreshTasksTimer: number | null = null;
-
-  function scheduleRefreshRepoTasks() {
-    if (refreshTasksTimer !== null) window.clearTimeout(refreshTasksTimer);
-    refreshTasksTimer = null;
-    if (readBackgroundDocument()) return;
-    refreshTasksTimer = window.setTimeout(() => {
-      refreshTasksTimer = null;
-      if (readBackgroundDocument()) return;
+  /**
+   * Change-driven task reloads through the shared live loader: one at a time,
+   * spaced (a store written every second no longer means a reload every
+   * second), never while the window is behind. The timer this replaces was
+   * restarted by each change, so changes closer together than its delay put
+   * the reload off for as long as they kept coming.
+   */
+  const repoTaskLoader = createLiveLoader({
+    canRun: () => !readBackgroundDocument(),
+    read: async () => {
       const repo = $repoStore.currentPath;
-      if (repo) void loadRepoTasks(repo);
-    }, 200);
-  }
+      if (repo) await loadRepoTasks(repo);
+    },
+    onError: (cause) => { repoTasksError = formatError(cause); },
+  });
+  function scheduleRefreshRepoTasks() { repoTaskLoader.schedule(); }
 
   async function loadRepoTasks(repoPath: string = $repoStore.currentPath ?? "") {
     if (!repoPath) {
@@ -678,10 +682,7 @@
     }
     const onForeground = () => {
       if (readBackgroundDocument()) {
-        if (refreshTasksTimer !== null) {
-          window.clearTimeout(refreshTasksTimer);
-          refreshTasksTimer = null;
-        }
+        repoTaskLoader.reset();
         return;
       }
       scheduleRefreshRepoTasks();
@@ -692,10 +693,7 @@
       stopInterval();
       tasksFollowChanges = false;
       listeners.dispose();
-      if (refreshTasksTimer !== null) {
-        window.clearTimeout(refreshTasksTimer);
-        refreshTasksTimer = null;
-      }
+      repoTaskLoader.dispose();
     };
   });
 
