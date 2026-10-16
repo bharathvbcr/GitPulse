@@ -12356,4 +12356,522 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             "{recomputed} computations for {CALLS} sequential asks"
         );
     }
+
+    // ---- adversarial tests for the one-path commit diff (bl/ccf03e33-adv) ----
+
+    /// `(additions, deletions)` of every `diff --git` section of a patch, in
+    /// order, counted only below the section's first hunk header so a header
+    /// line can never be mistaken for a content line.
+    fn adv_section_counts(patch: &str) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut in_hunk = false;
+        for line in patch.split_inclusive('\n') {
+            if line.starts_with("diff --git ") {
+                out.push((0, 0));
+                in_hunk = false;
+            } else if line.starts_with("@@") {
+                in_hunk = true;
+            } else if in_hunk {
+                if let Some(last) = out.last_mut() {
+                    if line.starts_with('+') {
+                        last.0 += 1;
+                    } else if line.starts_with('-') {
+                        last.1 += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every row the file list shows, opened one path at a time, must open one
+    /// section with the list's counts, and the multiset of the whole commit's
+    /// section counts must be the list's. Returns the problems found.
+    fn adv_agreement_problems(path: &str, oid: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        let listed = GitReader::get_commit_files(path, oid).expect("list");
+        let whole = GitReader::get_commit_diff(path, oid).expect("whole");
+        let mut from_whole = adv_section_counts(&whole.text);
+        let mut from_list: Vec<(usize, usize)> =
+            listed.iter().map(|f| (f.additions, f.deletions)).collect();
+        from_whole.sort_unstable();
+        from_list.sort_unstable();
+        if from_whole != from_list {
+            problems.push(format!("whole {from_whole:?} vs list {from_list:?}"));
+        }
+        for row in &listed {
+            let one = match GitReader::get_commit_file_diff(path, oid, &row.path) {
+                Ok(one) => one,
+                Err(err) => {
+                    problems.push(format!("{:?}: error {err}", row.path));
+                    continue;
+                }
+            };
+            let sections = adv_section_counts(&one.text);
+            if sections != [(row.additions, row.deletions)] {
+                problems.push(format!(
+                    "{:?}: one-path sections {sections:?} (truncated {}) vs list ({}, {})\n{}",
+                    row.path,
+                    one.truncated,
+                    row.additions,
+                    row.deletions,
+                    one.text
+                        .lines()
+                        .filter(|l| l.starts_with("diff --git")
+                            || l.starts_with("copy ")
+                            || l.starts_with("rename "))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+        problems
+    }
+
+    fn adv_tracked(dir: &Path) -> Vec<String> {
+        let out = git_output(dir, &["ls-files", "-z"]);
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn adv_commit(dir: &Path, msg: &str) {
+        git_output(dir, &["add", "-A"]);
+        git_output(dir, &["commit", "-q", "--allow-empty", "-m", msg]);
+    }
+
+    struct AdvRng(u64);
+    impl AdvRng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn adv_body(family: usize, tweak: usize) -> String {
+        let mut text = String::new();
+        for i in 0..14 {
+            if tweak > 0 && i == tweak % 14 {
+                text.push_str(&format!("tweak {tweak}\n"));
+            } else {
+                text.push_str(&format!(
+                    "family {family} line {i} with some padding text\n"
+                ));
+            }
+        }
+        text
+    }
+
+    const ADV_NAMES: &[&str] = &[
+        "a.txt",
+        "b c.txt",
+        "d b/e.txt",
+        "rename to x.txt",
+        "t\tab.txt",
+        "q\"uote.txt",
+        "back\\slash.txt",
+        "caf\u{e9}.txt",
+        "trail .txt",
+        "\"lead.txt",
+        "new\nline.txt",
+        "copy to y.txt",
+    ];
+
+    fn adv_pick_new(rng: &mut AdvRng, taken: &[String]) -> String {
+        loop {
+            let dirs = ["", "pkg/", "pkg2/"];
+            let name = format!(
+                "{}{}",
+                dirs[rng.below(dirs.len())],
+                ADV_NAMES[rng.below(ADV_NAMES.len())]
+            );
+            if !taken.contains(&name) {
+                return name;
+            }
+            if taken.len() > ADV_NAMES.len() * 3 - 2 {
+                return format!("overflow{}.txt", taken.len());
+            }
+        }
+    }
+
+    fn adv_write(dir: &Path, name: &str, body: &str) {
+        let file = dir.join(name);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(file, body).unwrap();
+    }
+
+    /// One random change to the working tree.
+    fn adv_random_op(dir: &Path, rng: &mut AdvRng) {
+        let tracked: Vec<String> = adv_tracked(dir)
+            .into_iter()
+            .filter(|name| dir.join(name).is_file())
+            .collect();
+        let existing = |rng: &mut AdvRng| tracked[rng.below(tracked.len())].clone();
+        match if tracked.is_empty() { 0 } else { rng.below(8) } {
+            0 => {
+                let name = adv_pick_new(rng, &tracked);
+                adv_write(dir, &name, &adv_body(rng.below(3), 0));
+            }
+            1 => {
+                let name = existing(rng);
+                adv_write(dir, &name, &adv_body(rng.below(3), 1 + rng.below(20)));
+            }
+            2 => {
+                let name = existing(rng);
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+            3 | 4 => {
+                let old = existing(rng);
+                let new = adv_pick_new(rng, &tracked);
+                adv_write(dir, &new, &std::fs::read_to_string(dir.join(&old)).unwrap());
+                std::fs::remove_file(dir.join(&old)).unwrap();
+                if rng.below(3) == 0 {
+                    adv_write(dir, &new, &adv_body(rng.below(3), 1 + rng.below(20)));
+                }
+                if rng.below(4) == 0 {
+                    // the old name comes back as another file
+                    adv_write(dir, &old, &adv_body(rng.below(3), 7));
+                }
+            }
+            5 => {
+                let src = existing(rng);
+                let copy = adv_pick_new(rng, &tracked);
+                adv_write(
+                    dir,
+                    &copy,
+                    &std::fs::read_to_string(dir.join(&src)).unwrap(),
+                );
+                if rng.below(2) == 0 {
+                    adv_write(dir, &src, &adv_body(rng.below(3), 1 + rng.below(20)));
+                }
+            }
+            6 if tracked.len() >= 2 => {
+                let a = existing(rng);
+                let b = existing(rng);
+                if a != b {
+                    let ta = std::fs::read_to_string(dir.join(&a)).unwrap();
+                    let tb = std::fs::read_to_string(dir.join(&b)).unwrap();
+                    std::fs::write(dir.join(&a), tb).unwrap();
+                    std::fs::write(dir.join(&b), ta).unwrap();
+                }
+            }
+            _ => {
+                // move a whole directory
+                let from = if rng.below(2) == 0 { "pkg" } else { "pkg2" };
+                let to = if from == "pkg" { "pkg2" } else { "pkg" };
+                if dir.join(from).is_dir() && !dir.join(to).exists() {
+                    std::fs::rename(dir.join(from), dir.join(to)).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The seeded agreement oracle over renames, copies, edits, deletes, adds,
+    /// swaps, directory moves and merges, with copy detection on or off.
+    fn adv_run_oracle(seed: u64, copies: bool, steps: usize) -> Vec<String> {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        if copies {
+            git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        }
+        let mut rng = AdvRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        for i in 0..6 {
+            adv_write(
+                dir.path(),
+                &format!("{}seed{i}.txt", if i % 2 == 0 { "pkg/" } else { "" }),
+                &adv_body(i % 3, 0),
+            );
+        }
+        adv_commit(dir.path(), "seed files");
+        for step in 0..steps {
+            if rng.below(4) == 0 {
+                let side = format!("side{step}");
+                git_in(dir.path(), &["checkout", "-q", "-b", &side]);
+                for _ in 0..1 + rng.below(2) {
+                    adv_random_op(dir.path(), &mut rng);
+                    adv_commit(dir.path(), "side");
+                }
+                git_in(dir.path(), &["checkout", "-q", "main"]);
+                adv_random_op(dir.path(), &mut rng);
+                adv_commit(dir.path(), "main");
+                let merged = git_output(
+                    dir.path(),
+                    &["merge", "--no-ff", "-q", &side, "-m", "merge"],
+                );
+                if !merged.status.success() {
+                    git_output(dir.path(), &["merge", "--abort"]);
+                }
+            } else {
+                for _ in 0..1 + rng.below(2) {
+                    adv_random_op(dir.path(), &mut rng);
+                }
+                adv_commit(dir.path(), "step");
+            }
+        }
+        let revs = git_output(dir.path(), &["rev-list", "--all"]);
+        let mut problems = Vec::new();
+        for oid in String::from_utf8_lossy(&revs.stdout).lines() {
+            for problem in adv_agreement_problems(path, oid) {
+                problems.push(format!("seed {seed} copies {copies} {oid}: {problem}"));
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn adv_oracle_one_path_view_agrees_with_list_and_whole_commit() {
+        let mut problems = Vec::new();
+        for seed in 1..=14u64 {
+            problems.extend(adv_run_oracle(seed, seed % 2 == 0, 14));
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
+    /// A name git C-quotes (a tab, a newline, a backslash, a double quote, a
+    /// leading quote) must be read, not "kept": a kept unreadable section
+    /// leaks into another file's view and a quoted request must still match.
+    #[test]
+    fn adv_keep_sections_under_reads_c_quoted_names() {
+        let patch = "diff --git \"a/t\\tab.txt\" \"b/t\\tab.txt\"\nindex 1..2 100644\n--- \"a/t\\tab.txt\"\n+++ \"b/t\\tab.txt\"\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git a/other.txt b/other.txt\nnew file mode 100644\n--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1 @@\n+x\n\
+diff --git \"a/q\\\"uote.txt\" \"b/pkg/new\\nline.txt\"\nsimilarity index 90%\ncopy from \"q\\\"uote.txt\"\ncopy to \"pkg/new\\nline.txt\"\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0..1\n";
+        let sections = |path: &str| {
+            keep_sections_under(patch, path)
+                .matches("diff --git")
+                .count()
+        };
+        assert_eq!(sections("other.txt"), 1, "a quoted section leaked");
+        assert_eq!(sections("t\tab.txt"), 1);
+        assert_eq!(sections("pkg/new\nline.txt"), 1);
+        assert_eq!(
+            sections("pkg"),
+            1,
+            "a directory request leaks quoted sections"
+        );
+        assert_eq!(sections("\"lead.txt"), 1);
+        assert_eq!(sections("nothing.txt"), 0);
+    }
+
+    /// A binary notice names two paths in one line; a directory called
+    /// `z and b` must not make the file under it read as `y.bin`.
+    #[test]
+    fn adv_keep_sections_under_binary_notice_with_and_b_in_the_name() {
+        let patch = "diff --git a/z and b/y.bin b/z and b/y.bin\nnew file mode 100644\nindex 0..1\nBinary files /dev/null and b/z and b/y.bin differ\n";
+        assert_eq!(keep_sections_under(patch, "y.bin"), "", "misread as y.bin");
+        assert_eq!(keep_sections_under(patch, "z and b/y.bin"), patch);
+    }
+
+    /// Every awkward name, as a rename target and as an edited copy source on
+    /// a merge's second parent, must agree between list, whole and one path.
+    #[test]
+    fn adv_awkward_names_agree_as_rename_target_and_copy_source() {
+        let mut problems = Vec::new();
+        for name in ADV_NAMES {
+            let rename = init_repo_with_remotes(&[], "main");
+            let path = rename.path().to_str().unwrap();
+            let oid = merge_with_second_parent(
+                rename.path(),
+                &[("old.txt", EIGHT)],
+                |d| {
+                    adv_write(d, name, std::str::from_utf8(EIGHT).unwrap());
+                    std::fs::remove_file(d.join("old.txt")).unwrap();
+                    commit_all(d, "rename to the awkward name");
+                },
+                |_| {},
+            );
+            for p in adv_agreement_problems(path, &oid) {
+                problems.push(format!("rename to {name:?}: {p}"));
+            }
+
+            let copy = init_repo_with_remotes(&[], "main");
+            let path = copy.path().to_str().unwrap();
+            git_in(copy.path(), &["config", "diff.renames", "copies"]);
+            let oid = merge_with_second_parent(
+                copy.path(),
+                &[(name, EIGHT)],
+                |d| {
+                    adv_write(d, "a-copy.txt", std::str::from_utf8(EIGHT).unwrap());
+                    adv_write(d, name, "l1\nCHANGED\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                    commit_all(d, "copy from the awkward name, which is also edited");
+                },
+                |_| {},
+            );
+            for p in adv_agreement_problems(path, &oid) {
+                problems.push(format!("copy from {name:?}: {p}"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// `pkg` is not `pkg2`: each directory's request shows its own rows.
+    #[test]
+    fn adv_directory_request_does_not_take_a_prefix_sibling() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("pkg/s.txt", EIGHT), ("pkg2/t.txt", EIGHT)],
+            |d| {
+                adv_write(d, "pkg2/s.txt", std::str::from_utf8(EIGHT).unwrap());
+                adv_write(d, "pkg/s.txt", "l1\nEDIT\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                adv_write(d, "pkg/u.txt", "fresh\nfile\n");
+                commit_all(d, "copy across siblings");
+            },
+            |_| {},
+        );
+        let two = GitReader::get_commit_file_diff(path, &oid, "pkg2").expect("pkg2");
+        let sections = adv_section_counts(&two.text);
+        assert_eq!(sections.len(), 1, "pkg2 request: {}", two.text);
+        assert!(two.text.contains("copy from pkg/s.txt"), "{}", two.text);
+        let one = GitReader::get_commit_file_diff(path, &oid, "pkg").expect("pkg");
+        assert!(
+            !one.text.contains("pkg2/"),
+            "pkg request took pkg2: {}",
+            one.text
+        );
+    }
+
+    /// A directory rename of thousands of files requested as the directory:
+    /// the pairing must not put every source on one command line.
+    #[test]
+    fn adv_directory_rename_of_thousands_of_files_opens() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let long = "n".repeat(200);
+        for i in 0..6000 {
+            adv_write(
+                dir.path(),
+                &format!("pkg/{long}{i:05}.txt"),
+                &format!("file {i}\nbody\nbody\nbody\n"),
+            );
+        }
+        adv_commit(dir.path(), "many files");
+        std::fs::rename(dir.path().join("pkg"), dir.path().join("pkg2")).unwrap();
+        adv_commit(dir.path(), "move the directory");
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "pkg2");
+        let one = one.unwrap_or_else(|err| panic!("directory request failed: {err}"));
+        assert_eq!(
+            adv_section_counts(&one.text).len(),
+            6000,
+            "truncated {}",
+            one.truncated
+        );
+    }
+
+    /// A copy whose source is also rewritten by a huge edit that sorts first:
+    /// the paired read runs out of budget inside the source's section, and the
+    /// requested file must still open.
+    #[test]
+    fn adv_copy_whose_edited_source_eats_the_budget_still_opens() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        adv_write(dir.path(), "a.txt", std::str::from_utf8(EIGHT).unwrap());
+        adv_commit(dir.path(), "base");
+        let mut huge = String::from(std::str::from_utf8(EIGHT).unwrap());
+        for i in 0..400_000 {
+            huge.push_str(&format!("appended line number {i:08} padding padding\n"));
+        }
+        adv_write(dir.path(), "a.txt", &huge);
+        adv_write(dir.path(), "z.txt", std::str::from_utf8(EIGHT).unwrap());
+        adv_commit(dir.path(), "copy z from a while a grows enormous");
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "z.txt").expect("z");
+        assert_eq!(
+            adv_section_counts(&one.text).len(),
+            1,
+            "z.txt opened {} bytes, truncated {}",
+            one.text.len(),
+            one.truncated
+        );
+    }
+
+    /// A rename on the second parent with edits on both sides, and an octopus
+    /// merge with a rename on each of two side branches.
+    #[test]
+    fn adv_conflicting_edit_and_octopus_merges_agree() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT), ("c.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                adv_write(d, "new.txt", "l1\nSIDE\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                commit_all(d, "rename and edit on the side");
+            },
+            |d| {
+                adv_write(d, "old.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nMAIN\n");
+            },
+        );
+        assert_eq!(
+            adv_agreement_problems(path, &oid),
+            Vec::<String>::new(),
+            "rename + edits both sides"
+        );
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "conflicting edits");
+
+        git_in(dir.path(), &["checkout", "-q", "-b", "o1"]);
+        git_in(dir.path(), &["mv", "c.txt", "d.txt"]);
+        commit_all(dir.path(), "o1 renames c");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "o2"]);
+        adv_write(dir.path(), "e.txt", std::str::from_utf8(EIGHT).unwrap());
+        git_in(dir.path(), &["mv", "new.txt", "f.txt"]);
+        commit_all(dir.path(), "o2 renames new and adds e");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        adv_write(dir.path(), "m.txt", "m\n");
+        commit_all(dir.path(), "main moves on");
+        git_in(
+            dir.path(),
+            &["merge", "-q", "--no-ff", "o1", "o2", "-m", "octopus"],
+        );
+        let octo = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(
+            adv_agreement_problems(path, &octo),
+            Vec::<String>::new(),
+            "octopus"
+        );
+    }
+
+    /// An evil merge: a rename that exists only in the merge commit's own
+    /// content change (committed with `--amend` after a clean merge).
+    #[test]
+    fn adv_evil_merge_rename_agrees() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        merge_with_second_parent(
+            dir.path(),
+            &[("keep.txt", EIGHT), ("old.txt", EIGHT)],
+            |d| {
+                adv_write(d, "side.txt", "s\n");
+                commit_all(d, "side");
+            },
+            |_| {},
+        );
+        git_in(dir.path(), &["mv", "old.txt", "evil.txt"]);
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-q", "--amend", "--no-edit"]);
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(
+            adv_agreement_problems(path, &oid),
+            Vec::<String>::new(),
+            "evil merge"
+        );
+        assert_rename_pairs(path, &oid, "evil.txt", "old.txt", "evil merge");
+    }
 }
