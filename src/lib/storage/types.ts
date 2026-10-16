@@ -113,6 +113,29 @@ export interface ScanStats {
   truncated: boolean;
 }
 
+/** Mirrors the Rust `CommitGraphState`; `unknown` is "could not check", never "missing". */
+export type CommitGraphState =
+  | "present"
+  | "no_bloom"
+  | "stale"
+  | "missing"
+  | "no_history"
+  | "unknown";
+
+/** Mirrors the Rust `CommitGraphLayout`. */
+export type CommitGraphLayout = "none" | "single" | "split";
+
+/** Read-only census of the repository's commit-graph (storage/commit_graph.rs). */
+export interface CommitGraphReport {
+  state: CommitGraphState;
+  layout: CommitGraphLayout;
+  layers: number;
+  commits: number | null;
+  bloom: boolean | null;
+  head_covered: boolean | null;
+  note: string | null;
+}
+
 export interface StorageReport {
   repo_path: string;
   generated_at_epoch_secs: number;
@@ -125,5 +148,7 @@ export interface StorageReport {
   branches: BranchStorageSummary;
   reclaim: ReclaimItem[];
   reclaim_summary: ReclaimSummary;
+  /** Absent in payloads from before the detector existed. */
+  commit_graph?: CommitGraphReport;
   scan: ScanStats;
 }

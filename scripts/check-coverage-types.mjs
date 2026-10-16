@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 100 contracts over
- * 248 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 102 contracts over
+ * 250 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -207,6 +207,9 @@ export const CONTRACTS = Object.freeze([
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "conflict-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictSnapshot", "ConflictStage", "ConflictSaveRequest", "ConflictSaveOutcome"] },
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
+  // The commit-graph census inside StorageReport. `unknown` and the nullable
+  // facts are what keep "could not check" from rendering as "missing".
+  { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport"] },
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
   { label: "commit-signature", rustPath: rust("engine", "commit_signature.rs"), tsPath: ts("pulse", "types.ts"), structs: ["CommitSignatureCheck"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
@@ -264,6 +267,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repo-operation", rustPath: rust("engine", "repo_op.rs"), tsPath: ts("repos", "operation.ts"), structs: ["RepoOperation"] },
   { label: "stash-options", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashSaveOptions"] },
   { label: "file-delete", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("files", "types.ts"), structs: ["DeleteOutcome"] },
+  { label: "checkout-outcome", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["CheckoutOutcome"] },
   { label: "content-search", rustPath: rust("engine", "content_search.rs"), tsPath: ts("search", "types.ts"), structs: ["ContentMatch", "ContentSearchReport", "ContentSearchOptions"] },
   { label: "stash", rustPath: rust("engine", "stash.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashEntry", "StashList"] },
   { label: "remotes", rustPath: rust("engine", "remotes.rs"), tsPath: ts("repos", "remotes.ts"), structs: ["RemoteInfo", "RemoteList"] },

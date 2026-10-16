@@ -48,6 +48,15 @@ export interface MutationTarget {
   readonly path: string;
 }
 
+/**
+ * Mirrors the Rust `CheckoutOutcome` (engine/git_writer.rs): the `output` of
+ * `cmd_checkout_branch` and `cmd_checkout_detached`. `detached` is read from
+ * HEAD after the switch, so a branch checkout that somehow detached says so.
+ */
+export interface CheckoutOutcome {
+  detached: boolean;
+}
+
 /** Mirrors the Rust `ResetMode` under `rename_all = "lowercase"`. */
 export type ResetMode = "soft" | "mixed" | "keep" | "hard";
 export type IndexAction = "stage" | "unstage";

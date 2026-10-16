@@ -1610,3 +1610,28 @@ on 18 cores, min-of-N, first visible row):
 
 Not yet a row in the Rust bench harness above: this is a TypeScript bench with its
 own JSON line, kept beside the harness until that harness can ingest it.
+
+## 2026-10-16: commit-graph off, on, and with Bloom filters (ft-9cfa487403d331dc25e75cdb97176bf7, S4-05)
+
+GitPulse now reads whether a repository has a commit-graph (`storage/commit_graph.rs`, surfaced under Git internals in the Storage view with the command to run). It reads the graph files and HEAD from the git directory and spawns nothing; writing or refreshing a graph from the app is Owner Decision 3 and is not built. This section measures what a missing graph costs.
+
+`cargo bench --manifest-path src-tauri/Cargo.toml --bench commit_graph_history` (`-- --smoke`, `-- --json <path>`). Argv mirrors `engine/git_reader.rs` (topo-order history page, `--parents` path log, `for-each-ref %(ahead-behind:)`, `rev-list --count`, `blame --line-porcelain`), run through `git_cli::git_text` so the readers' caches do not hide the walk. Fixture: bare repositories built with `git fast-import`, 5k and 50k linear commits on `main`, a path (`rare/target.txt`) touched by 50 of them, and 20 branches three commits ahead of fork points along `main`. Each size is cloned three times (graph-off; `commit-graph write --reachable --no-changed-paths`; `--changed-paths`) and the 3 states are measured interleaved, 9 samples per row after 1 warm-up round, warm page cache. Each copy's state is asserted with the new detector, and each operation's output is asserted identical across the three, so a row cannot get faster by answering differently. The graph writes are fixture setup only.
+
+**Load: 46 to 60 on 18 cores (2.6x to 3.3x oversubscribed; other agent sessions were building), git 2.54.0 (Apple Git-157), macOS arm64.** Absolute times are inflated and p95 is noise; read the min column and the ratios.
+
+| operation (min of 9, ms) | 5k off | 5k graph | 5k +bloom | 50k off | 50k graph | 50k +bloom |
+| --- | --- | --- | --- | --- | --- | --- |
+| history page, first | 21.4 | 8.5 (2.5x) | 9.1 | 168.1 | 15.5 (10.8x) | 14.6 (11.6x) |
+| history page, deep (skip n/2) | 20.1 | 8.1 (2.5x) | 9.2 | 162.6 | 17.6 (9.2x) | 14.6 (11.2x) |
+| path log (rare path) | 25.0 | 12.9 (1.9x) | 10.9 (2.3x) | 260.0 | 115.4 (2.3x) | 38.7 (6.7x) |
+| ahead/behind, 20 branches | 19.9 | 9.0 (2.2x) | 8.3 (2.4x) | 168.7 | 17.8 (9.5x) | 18.1 (9.3x) |
+| `rev-list --count` | 10.8 | 7.0 (1.5x) | 8.0 | 50.1 | 11.2 (4.5x) | 10.2 (4.9x) |
+| blame (rare path) | 21.8 | 13.9 (1.6x) | 13.1 (1.7x) | 209.0 | 91.1 (2.3x) | 44.5 (4.7x) |
+
+Parenthesised figures are off divided by the state. Where the +bloom column carries none, the difference from `graph` is inside the noise of a loaded host (a Bloom filter does not help a walk that never filters by path).
+
+Reading it: a missing graph costs a roughly linear walk, so it is invisible at 5k commits (about 10 ms to 20 ms extra) and large at 50k (150 ms on every history page and every ahead/behind listing, roughly 5x on path-limited reads). Changed-path Bloom filters matter only for path-limited reads, where they are worth another 3x on top of the graph at 50k (path log 115 to 39 ms, blame 91 to 44 ms). That is the shape the hint follows: it is advice only, it is shown for a missing graph, a graph without HEAD, and a graph without Bloom filters, and it names a single command (`git commit-graph write --reachable --changed-paths`).
+
+Not measured: a repository where auto-maintenance keeps the graph fresh (this repository, 1,398 commits, topo 5000 in 29 ms, cannot show a gap); cold page cache; split chains versus a single file; the cost of writing a graph; repositories with many merges (the fixture is linear, which is the best case for the no-graph walk).
+
+**Not in the committed baseline.** `benches/baselines/` is untouched and the bench is not wired into the scheduled `benches.yml` gate; whether to baseline it is a separate decision. The numbers above are a one-off run.
