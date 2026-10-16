@@ -21,9 +21,16 @@
 //! (`src/lib/health/commitGraph.ts`) shows the command for the person to run,
 //! because writing or refreshing a commit-graph from GitPulse is an undecided
 //! owner decision (OD 3).
-//! It validates the header, chunk table and object-id table bounds, not the
-//! trailing checksum, so a graph that is structurally sound but bit-rotted
-//! reads as present.
+//! It validates the header, chunk table, required chunk sizes, layer order and
+//! hash version, and spot-checks the OID table under its fanout. It does not
+//! read the whole file or the trailing checksum, so a graph that is
+//! structurally sound but bit-rotted in the commit data reads as present;
+//! `git commit-graph verify` is the only full check.
+//!
+//! It also reads git config (user, repository, worktree; includes followed,
+//! bounded) for `core.commitGraph` and `extensions.objectFormat`. System config
+//! and `-c` overrides are not seen. `fetch.writeCommitGraph` only governs
+//! whether fetches refresh a graph, so it does not change what a graph means.
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};

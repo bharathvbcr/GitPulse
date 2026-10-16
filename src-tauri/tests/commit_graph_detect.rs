@@ -1096,7 +1096,7 @@ fn structural_mutations_of_a_chain_layer_git_rejects_never_read_as_a_verdict() {
     let good = std::fs::read(&layer).unwrap();
     let table_end = 8 + (good[6] as usize + 1) * 12;
     let structural = table_end + 1024;
-    let mut rng = Rng(0x0ddc_0ffe_e15_600d);
+    let mut rng = Rng(0x00dd_c0ff_ee15_600d);
     let mut offenders = Vec::new();
     let mut rejected = 0;
     for round in 0..80 {
