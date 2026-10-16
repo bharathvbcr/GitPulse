@@ -1379,3 +1379,63 @@ The 13 after are the call's fixed reads (config, ref listings, the base
 probes, the `for-each-ref` ahead-behind listing) and the one ancestry check.
 `merge-base` is 0 before because `diff --shortstat <base>...<tip>` finds its
 own merge base inside the shortstat process.
+
+## 2026-10-16: `local-macos-aarch64` baseline brought up to the integration head (ft-f069aa425202f3abe84fe2a573dbbf6a)
+
+The committed baseline had drifted from `bl/integrate-1013` (`c462eda6`), so the
+gate failed on counters. A fresh `command_timings` run at that head against the
+old baseline reported exactly one counter change; the two new benches had no
+rows at all. Every counter that moved, and what moved it:
+
+| bench / row | counter | before | after | cause |
+| --- | --- | --- | --- | --- |
+| `command_timings` / list_worktrees full | git_processes | 38 | **42** | CARD 20 (ft-9d044274, merge `94443dfb`): destructive callers read the default base fresh, not from the cache |
+| `command_timings` / commit details | git_processes | 1 | **1** (no baseline change) | the bench counted the one-time `git version` probe as 2; the warm-up below removes it |
+| `graph_spawns` (3 rows) | git_processes 11, 9, 0 | no row | added | CARD 17 (ft-9cfa4f74): the rows this card's own section above records as its "After" |
+| `churn_spawns` (1 row) | git_processes 13 | no row | added | CARD 19 (ft-9cfa4974): the "after" row of the churn table above |
+
+**list_worktrees full, 38 to 42.** Measured, not inferred: the same bench with
+`src-tauri/src` taken from `94443dfb^1` (the integration head without CARD 20)
+counts 38, and at `c462eda6` it counts 42. The `git` argv list at 42 is 18
+`status --porcelain -z`, 17 `diff --no-ext-diff HEAD --shortstat`, one
+`worktree list`, one `for-each-ref` over the ahead/behind listing and the
+default-branch names, and the four default-base reads: `config --list -z`,
+`symbolic-ref --quiet HEAD`, `symbolic-ref --quiet refs/remotes/origin/HEAD`
+and `remote`. The listing is intended to start those four: the default-branch
+protection (`is_default_branch`) and the default base now read config and HEAD
+straight from git (`Reads::Fresh`) so an `include.path` change or a moved HEAD is
+seen at once. The cached `default_base` path is unchanged.
+
+**commit details, and the `git version` probe.** The old baseline said 1 and the
+integration head's bench reads 2 without a warm-up (measured with the warm-up
+removed, `--smoke`: the two processes are `git version` and the `git show`). The
+second process is `git version`, the process-wide probe `git_preflight` runs once and
+caches when it passes. `GitReader::get_commit_details` reaches it through
+`git_supports(DIFF_MERGES_OPTION)`, so whichever row calls it first in a process
+pays for it; the counted commit details pass was the first. Production does not
+pay it per call: it is one process per run of the app, and a later call finds the
+cached answer. The bench now calls `git_preflight` before the first counted pass
+and asserts the status is Ok (a failed probe is never cached, so a broken git
+would put the probe back inside a counted row), and the commit details pass
+records its argvs and asserts none of them is `git version` (trace2's argv starts
+with the git binary and the app's `-c` pairs, so the subcommand is matched as a
+whole word after argv[0]). With the warm-up removed the assertion fails and
+prints both argvs; with it restored the counter is 1.
+
+**New rows.** `graph_spawns` and `churn_spawns` are seeded into the baseline
+with `scripts/bench-compare.mjs --write-baseline` run over a directory holding
+only their two reports, and those two benches spliced into the committed file
+(load 0.4 to 0.5x when they ran). The existing `command_timings` times were not
+re-seeded: that run was at load 19.5 on 18 cores (1.1x), and a baseline taken
+then would loosen the time gate for every row. Only the `list_worktrees full`
+counter was changed in that bench. Its min-of-N (349.1 ms) was left as it is;
+the fresh run measured 321.2 ms with the extra four processes, so the time gate
+is not weakened by the counter change.
+
+`.github/workflows/benches.yml` runs a fixed `BENCHES` list that does not name
+`graph_spawns` or `churn_spawns`. A class with a committed baseline that carries
+them would fail the compare with "baselined but produced no report". Only
+`local-macos-aarch64` carries a baseline today, and it is compared by hand; add
+both benches to that list in the same change that seeds `ubuntu-latest` or
+`macos-latest`.
+
