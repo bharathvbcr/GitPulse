@@ -18,6 +18,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("supervisor.rs", 3, "the supervisor itself"),
     ("procguard/mod.rs", 2, "below the supervisor: the shutdown hook runner and the signal watcher run while the process is exiting"),
     ("teardown.rs", 1, "a one-shot, deadline-bounded helper that is abandoned on timeout; its result is the report"),
+    ("ledger/anchor.rs", 1, "first_occupied's one-shot probe of earlier locations, abandoned at its deadline; a panic drops the sender and the caller reports a refusal"),
     ("hooks/mod.rs", 1, "per-call budget worker in a short-lived hook process that exits right after"),
     ("ai/discovery.rs", 1, "per-call model listing joined by its caller, which reports a panic as an error"),
     ("engine/git_cli/thread_io.rs", 1, "per-command pipe drain joined by the command runner"),
@@ -70,13 +71,29 @@ const NEEDLES: &[&str] = &[
     "spawn_scoped",
 ];
 
-/// Raw starts in the production part of a file: up to its `mod tests {`.
+/// Raw starts in the production part of a file: up to its top-level
+/// `mod tests {`. A nested, indented test module (one inside a `cfg` module of
+/// platform code) is skipped to its closing brace, which rustfmt puts at the
+/// module's own indent, and the scan goes on: production code after it is
+/// still production code.
 fn raw_starts(text: &str) -> usize {
     let mut count = 0;
+    let mut skip_to: Option<String> = None;
     for line in text.lines() {
+        if let Some(end) = &skip_to {
+            if line == end {
+                skip_to = None;
+            }
+            continue;
+        }
         let trimmed = line.trim_start();
         if trimmed.starts_with("mod tests") || trimmed.starts_with("mod verification_note_tests") {
-            break;
+            let indent = &line[..line.len() - trimmed.len()];
+            if indent.is_empty() {
+                break;
+            }
+            skip_to = Some(format!("{indent}}}"));
+            continue;
         }
         if trimmed.starts_with("//") {
             continue;
@@ -151,4 +168,13 @@ fn test_only_modules_are_declared_under_cfg_test() {
             "{file} is exempt as test-only but {parent} declares it without #[cfg(test)]"
         );
     }
+}
+
+/// A test module nested in a platform `cfg` module hides nothing after it: the
+/// production spawn below it is counted, its own test spawns are not, and a
+/// top-level `mod tests` still ends the scan.
+#[test]
+fn the_scan_skips_a_nested_test_module_and_counts_what_follows() {
+    let text = "mod sys {\n    fn a() { std::thread::spawn(|| {}); }\n    #[cfg(test)]\n    mod tests {\n        fn t() { std::thread::spawn(|| {}); }\n    }\n}\nfn b() { std::thread::Builder::new(); }\nmod tests {\n    fn t() { std::thread::spawn(|| {}); }\n}\n";
+    assert_eq!(raw_starts(text), 2);
 }
