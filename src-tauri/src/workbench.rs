@@ -6,8 +6,9 @@ use dc_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
@@ -33,6 +34,13 @@ pub(crate) mod verification_gate;
 pub(crate) mod verify_status;
 
 const MAX_IN_FLIGHT: usize = 8;
+/// Requests that may wait for one of the [`MAX_IN_FLIGHT`] slots. Each waits
+/// on a blocking-pool thread, so this bounds the threads a burst can hold.
+const MAX_QUEUED: usize = 32;
+/// How long a request waits for a slot before it is answered `busy`. One
+/// change makes every open surface re-read together; a short queue absorbs
+/// that burst, where refusing on the spot showed "Task storage is busy".
+const ADMIT_WAIT: Duration = Duration::from_secs(3);
 const MAX_INPUT: usize = 1024 * 1024;
 const MAX_MODEL_BASE_URL: usize = 512;
 const MAX_MODEL_ID: usize = 128;
@@ -94,7 +102,9 @@ impl From<dc_store::workbench::Error> for WorkbenchError {
 struct Inner {
     store: Mutex<Option<Store>>,
     closed: AtomicBool,
-    in_flight: AtomicUsize,
+    admission: Mutex<Admission>,
+    /// Signalled when a slot frees, and on shutdown.
+    admitted: Condvar,
     // Only tests supply a path. IPC cannot select a repository lease database.
     path: Option<PathBuf>,
     notifications: OnceLock<notifications::Coordinator>,
@@ -129,10 +139,24 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct WorkbenchState(Arc<Inner>);
 
+/// Store requests running, and waiting to run.
+#[derive(Default)]
+struct Admission {
+    in_flight: usize,
+    queued: usize,
+}
+
 struct Reservation(Arc<Inner>);
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+        let mut slots = self
+            .0
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        slots.in_flight = slots.in_flight.saturating_sub(1);
+        drop(slots);
+        self.0.admitted.notify_one();
     }
 }
 
@@ -290,6 +314,15 @@ impl WorkbenchState {
 
     pub(crate) fn shutdown(&self) {
         self.0.closed.store(true, Ordering::Release);
+        // Waiting requests are refused now rather than at their deadline.
+        // Taking the lock orders this wake after any waiter's check of `closed`.
+        drop(
+            self.0
+                .admission
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        self.0.admitted.notify_all();
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
@@ -300,15 +333,65 @@ impl WorkbenchState {
             }
         }
     }
+    /// A slot now, or `busy`.
+    #[cfg(test)]
     fn reserve(&self) -> Result<Reservation, WorkbenchError> {
+        self.reserve_within(Duration::ZERO)
+    }
+
+    /// A slot, waiting at most `limit` for one to free. Blocks: call it on a
+    /// blocking-pool thread ([`Self::admit`]). Refused at once when
+    /// [`MAX_QUEUED`] requests are already waiting, and on shutdown.
+    fn reserve_within(&self, limit: Duration) -> Result<Reservation, WorkbenchError> {
+        let busy = || WorkbenchError::new("busy", "Task storage is busy. Try again shortly.");
+        let deadline = Instant::now() + limit;
+        let mut slots = self
+            .0
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.check_open()?;
-        self.0
-            .in_flight
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_IN_FLIGHT).then_some(n + 1)
-            })
-            .map_err(|_| WorkbenchError::new("busy", "Task storage is busy. Try again shortly."))?;
+        if slots.in_flight >= MAX_IN_FLIGHT {
+            if limit.is_zero() || slots.queued >= MAX_QUEUED {
+                return Err(busy());
+            }
+            slots.queued += 1;
+            while slots.in_flight >= MAX_IN_FLIGHT && self.check_open().is_ok() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                slots = self
+                    .0
+                    .admitted
+                    .wait_timeout(slots, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            slots.queued -= 1;
+            // Shutdown woke every waiter, so none is owed this wake-up.
+            self.check_open()?;
+            if slots.in_flight >= MAX_IN_FLIGHT {
+                return Err(busy());
+            }
+        }
+        slots.in_flight += 1;
         Ok(Reservation(Arc::clone(&self.0)))
+    }
+
+    /// [`Self::reserve_within`] off the async runtime: a queued request holds
+    /// a blocking-pool thread, never an async worker.
+    async fn admit(&self) -> Result<Reservation, WorkbenchError> {
+        // A free slot, or a closed host, is answered here: only a request that
+        // must wait costs a blocking-pool thread.
+        match self.reserve_within(Duration::ZERO) {
+            Err(error) if error.code == "busy" => {}
+            done => return done,
+        }
+        let state = self.clone();
+        tauri::async_runtime::spawn_blocking(move || state.reserve_within(ADMIT_WAIT))
+            .await
+            .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))?
     }
 
     fn with_store<T>(
@@ -447,7 +530,9 @@ impl WorkbenchState {
                 .map(|id| id.as_str().map(str::to_owned))
                 .collect::<Option<_>>()
                 .ok_or_else(|| WorkbenchError::new("invalid_input", "ids are strings."))?;
-            let store = Store::open(&self.profile_path()?)
+            // Read-only: a view the board takes on every refresh runs no DDL
+            // and can never contend for the profile's write lock.
+            let store = Store::open_readonly(&self.profile_path()?)
                 .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
             return verification_driver::status_batch(
                 &store,
@@ -465,8 +550,16 @@ impl WorkbenchState {
                     "A task id is required.",
                 ));
             }
-            let store = Store::open(&self.profile_path()?)
-                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            // The status read is polled while a verification runs. A
+            // read-write open commits (it re-applies the schema), and each
+            // commit woke every open surface as a change, so it reads only.
+            let path = self.profile_path()?;
+            let store = if method == "verifications.status" {
+                Store::open_readonly(&path)
+            } else {
+                Store::open(&path)
+            }
+            .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
             let backend = verification_driver::HostBackend(self.clone());
             return if method == "verifications.status" {
                 verification_driver::status(&store, &backend, id)
@@ -911,7 +1004,7 @@ pub async fn cmd_workbench_launch_terminal(
     on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, WorkbenchError> {
     let launch = terminal_run::parse(&input)?;
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let terminals = terminals.inner().clone();
     let output = crate::terminal::OutputSink::channel(on_output);
@@ -930,7 +1023,7 @@ pub async fn cmd_workbench_request(
     method: String,
     input: String,
 ) -> Result<String, WorkbenchError> {
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
@@ -956,7 +1049,7 @@ pub async fn cmd_workbench_register_repository(
             "Repository request exceeds the size limit.",
         ));
     }
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
@@ -992,7 +1085,7 @@ pub async fn cmd_workbench_relink_repository(
             "Only a registered repository can be relinked.",
         ));
     }
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
@@ -1010,7 +1103,7 @@ mod profile_owner_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT};
+    use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT, MAX_QUEUED};
 
     #[test]
     fn record_ids_are_plain_tokens_within_their_length_cap() {
@@ -1519,6 +1612,85 @@ done
         drop(permits);
         assert!(host.reserve().is_ok());
         assert!(host.0.store.lock().unwrap().is_none());
+    }
+
+    /// One change makes every surface re-read at once (board columns, the
+    /// archive, the unread count, verdicts, agents). A burst one past the cap
+    /// used to be refused on the spot as "Task storage is busy"; it waits for
+    /// the first slot that frees instead.
+    #[test]
+    fn a_request_past_the_cap_waits_for_a_slot_instead_of_being_refused() {
+        let host = WorkbenchState::default();
+        let permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| host.reserve().unwrap())
+            .collect();
+        let waiter = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                host.reserve_within(std::time::Duration::from_secs(10))
+                    .map(drop)
+            })
+        };
+        while host.0.admission.lock().unwrap().queued == 0 {
+            std::thread::yield_now();
+        }
+        drop(permits);
+        assert!(waiter.join().unwrap().is_ok());
+        let slots = host.0.admission.lock().unwrap();
+        assert_eq!((slots.in_flight, slots.queued), (0, 0));
+    }
+
+    /// The wait is bounded twice: in time, and in how many may wait at all,
+    /// so a storm of requests cannot hold every blocking thread.
+    #[test]
+    fn the_wait_for_a_slot_is_bounded_in_time_and_in_waiters() {
+        let host = WorkbenchState::default();
+        let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| host.reserve().unwrap())
+            .collect();
+        let started = std::time::Instant::now();
+        let error = host
+            .reserve_within(std::time::Duration::from_millis(50))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "busy");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        host.0.admission.lock().unwrap().queued = MAX_QUEUED;
+        let started = std::time::Instant::now();
+        let error = host
+            .reserve_within(std::time::Duration::from_secs(10))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "busy");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a full queue refuses at once"
+        );
+        host.0.admission.lock().unwrap().queued = 0;
+    }
+
+    /// Shutdown wakes the waiters; none of them is admitted to a closed host.
+    #[test]
+    fn shutdown_wakes_a_waiting_request_and_refuses_it() {
+        let host = WorkbenchState::default();
+        let permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| host.reserve().unwrap())
+            .collect();
+        let waiter = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                host.reserve_within(std::time::Duration::from_secs(30))
+                    .map(drop)
+            })
+        };
+        while host.0.admission.lock().unwrap().queued == 0 {
+            std::thread::yield_now();
+        }
+        let started = std::time::Instant::now();
+        host.shutdown();
+        assert_eq!(waiter.join().unwrap().err().unwrap().code, "closed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(permits);
     }
 
     #[test]

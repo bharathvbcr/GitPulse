@@ -5,7 +5,19 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(
 const answer = (value: unknown) => invoke.mockResolvedValue(JSON.stringify(value));
 const sent = () => invoke.mock.calls.map(([, args]) => JSON.parse((args as { input: string }).input));
 
-import { MAX_VERDICT_BATCH, getVerdicts } from "./verification";
+import { MAX_VERDICT_BATCH, getVerdicts, sameVerdicts, type CardVerdict } from "./verification";
+
+describe("sameVerdicts", () => {
+  const v = (state: CardVerdict["state"], stale = false): CardVerdict => ({ state, stale });
+  it("matches reads that say the same about every card, and nothing else", () => {
+    const shown = new Map([["a", v("passed")], ["b", v("failed")]]);
+    expect(sameVerdicts(shown, new Map([["b", v("failed")], ["a", v("passed")]]))).toBe(true);
+    expect(sameVerdicts(shown, new Map([["a", v("passed", true)], ["b", v("failed")]]))).toBe(false);
+    expect(sameVerdicts(shown, new Map([["a", v("passed")], ["b", v("degraded")]]))).toBe(false);
+    expect(sameVerdicts(shown, new Map([["a", v("passed")]]))).toBe(false);
+    expect(sameVerdicts(shown, new Map([["a", v("passed")], ["c", v("failed")]]))).toBe(false);
+  });
+});
 
 beforeEach(() => invoke.mockReset());
 

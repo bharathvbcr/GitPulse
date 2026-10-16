@@ -9,7 +9,7 @@ use crate::workbench::verification_driver::{
     decide, run_now, status, status_batch, target_of, Backend, Driver, Facts, Report, Step, Target,
     MAX_ACTIVE,
 };
-use crate::workbench::verification_gate::{self as gate, Record};
+use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
 use crate::workbench::WorkbenchError;
 use dc_store::Store;
 use serde_json::{json, Value};
@@ -401,6 +401,140 @@ fn decide_is_a_pure_function_of_what_it_is_given() {
         ..passed
     };
     assert_eq!(base(Some(other_head), "h1", None), Step::Start);
+}
+
+/// A claim whose worktree is gone was recorded as `could_not_run` once, then
+/// again on every sweep: 920 identical blocks filled one card's log and its
+/// evidence rows ran into the thousands, each write waking every open board.
+/// An unreadable head records that once; a verdict already stored for the
+/// claim — that one, or a settled one — is not written over.
+#[test]
+fn an_unreadable_head_is_recorded_once_and_never_over_a_stored_verdict() {
+    let target = Target {
+        worktree: "/gone".into(),
+        head: "h1".into(),
+    };
+    let decide_with = |latest: Result<Option<Record>, String>| {
+        decide(&Facts {
+            revision: 3,
+            logs: "",
+            target: &target,
+            current_head: Err("Cannot access path '/gone'".into()),
+            latest,
+            attempt: None,
+            item_id: "i",
+        })
+    };
+    assert!(matches!(decide_with(Ok(None)), Step::CouldNotRun(_)));
+    let recorded = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: STATE_COULD_NOT_RUN.into(),
+        request_id: "auto-i-h1".into(),
+        ..Record::default()
+    };
+    assert_eq!(decide_with(Ok(Some(recorded.clone()))), Step::Skip);
+    let settled = Record {
+        state: "settled".into(),
+        outcome: "failed".into(),
+        ..recorded.clone()
+    };
+    assert_eq!(decide_with(Ok(Some(settled))), Step::Skip);
+    // A record for another claim says nothing about this one.
+    let older = Record {
+        head: "h0".into(),
+        ..recorded
+    };
+    assert!(matches!(decide_with(Ok(Some(older))), Step::CouldNotRun(_)));
+    // A store that cannot be read is asked again, not written to.
+    assert_eq!(decide_with(Err("locked".into())), Step::Skip);
+}
+
+/// The same, end to end: sweeps over a card whose worktree was deleted leave
+/// one evidence row and one note, not one per sweep.
+#[test]
+fn sweeps_over_a_deleted_worktree_write_one_could_not_run() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    std::fs::remove_dir_all(repo.path()).unwrap();
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    let mut total = 0;
+    for _ in 0..5 {
+        total += driver.sweep(&store, &fake).could_not_run;
+        // A fresh driver, as after a restart, has no memory to lean on.
+        driver = Driver::default();
+    }
+    assert_eq!(total, 1, "an unreadable head was recorded {total} times");
+    assert_eq!(
+        logs(&store, &id).matches("Verification could not run").count(),
+        1
+    );
+    assert_eq!(status_of(&store, &id), "review");
+}
+
+/// The board's one-scan read gives every card the record the per-card read
+/// gives it: the newest verification, past newer rows of other kinds, and
+/// nothing for a card never verified.
+#[test]
+fn the_batched_verdict_read_agrees_with_the_per_card_read() {
+    let (_d, store, repo, id) = setup();
+    let other = filed(&store, &repo, "gp-other", "Another");
+    let never = filed(&store, &repo, "gp-never", "Never verified");
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "failed", "settled", &repo, &head));
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
+    store_record(&store, &other, &record(&other, "", "running", &repo, &head));
+    store
+        .evidence_append("other.kind", Some(&other), None, None, "{\"not\":\"a verdict\"}")
+        .unwrap();
+    let ids = [id.clone(), other.clone(), never.clone()];
+    let batch = gate::latest_many(&store, &ids).unwrap();
+    for one in &ids {
+        assert_eq!(
+            batch.get(one),
+            gate::latest(&store, one).unwrap().as_ref(),
+            "{one}"
+        );
+    }
+    assert_eq!(batch[&id].outcome, "passed");
+    assert!(!batch.contains_key(&never));
+    assert!(gate::latest_many(&store, &[]).unwrap().is_empty());
+}
+
+/// The board reads verdicts on every refresh. That read commits nothing: a
+/// commit there would itself be announced as a change and read again.
+#[test]
+fn the_host_verdict_read_leaves_the_profile_unchanged() {
+    let (dir, path) = profile();
+    let host = crate::workbench::WorkbenchState::for_profile(&path);
+    let store = Store::open(&path).unwrap();
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let id = filed(&store, &repo, "gp-ro", "Read me");
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head_of(&repo)));
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    let version = || -> i64 {
+        observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = version();
+    let out = host
+        .request("verifications.board", &json!({"ids": [id]}).to_string())
+        .unwrap();
+    assert_eq!(out["items"][&id]["state"], "passed", "{out}");
+    assert_eq!(version(), before, "the verdict read committed to the profile");
+    // The task sheet polls this one every few seconds while a run is open.
+    let out = host
+        .request("verifications.status", &json!({"id": id}).to_string())
+        .unwrap();
+    assert_eq!(out["state"], "passed", "{out}");
+    assert_eq!(version(), before, "the status read committed to the profile");
+    drop(dir);
 }
 
 #[test]

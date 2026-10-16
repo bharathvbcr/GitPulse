@@ -25,6 +25,9 @@
 //!   arrives is recorded as `could_not_run`: its own state, in the logs and
 //!   as an evidence row, so it reads as neither a failure nor a pass. The gate
 //!   treats it as a hold. It is not retried on its own; Verify on the card is.
+//! - A worktree whose head cannot be read (deleted, moved) is recorded as
+//!   `could_not_run` once per claim. The stored record is read before the
+//!   head, so neither that record nor a settled verdict is written again.
 //! - A host that is shutting down stops the sweep without writing.
 
 use super::intake::{self, HELD_MARKER};
@@ -137,15 +140,6 @@ pub(crate) struct Facts<'a> {
 
 /// The state machine. Pure: every input is in `facts`.
 pub(crate) fn decide(facts: &Facts<'_>) -> Step {
-    let head = match &facts.current_head {
-        Ok(head) => head,
-        Err(error) => {
-            return Step::CouldNotRun(format!("the worktree's head could not be read: {error}"))
-        }
-    };
-    if *head != facts.target.head {
-        return Step::Skip;
-    }
     let record = match &facts.latest {
         // A store that cannot be read now is read again on the next sweep.
         Err(_) => return Step::Skip,
@@ -153,6 +147,23 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
             .as_ref()
             .filter(|r| r.head == facts.target.head && r.item_id == facts.item_id),
     };
+    let head = match &facts.current_head {
+        Ok(head) => head,
+        // Read before the head: a claim whose worktree is gone stays gone, and
+        // without this every sweep wrote another `could_not_run` for it. A
+        // settled verdict is not written over either.
+        Err(_)
+            if record.is_some_and(|r| r.state == STATE_COULD_NOT_RUN || r.state == "settled") =>
+        {
+            return Step::Skip
+        }
+        Err(error) => {
+            return Step::CouldNotRun(format!("the worktree's head could not be read: {error}"))
+        }
+    };
+    if *head != facts.target.head {
+        return Step::Skip;
+    }
     let waited = |elapsed: Duration| {
         if elapsed >= WAIT_LIMIT {
             Step::CouldNotRun(format!(
@@ -487,10 +498,11 @@ pub(crate) fn status_batch(
     }
     let mut heads = HashMap::new();
     let mut items = serde_json::Map::new();
+    let mut records =
+        gate::latest_many(store, ids).map_err(|m| WorkbenchError::new("store_error", m))?;
     for id in ids {
-        let record = gate::latest(store, id).map_err(|m| WorkbenchError::new("store_error", m))?;
-        if record.is_some() {
-            items.insert(id.clone(), describe(record, backend, &mut heads, false));
+        if let Some(record) = records.remove(id) {
+            items.insert(id.clone(), describe(Some(record), backend, &mut heads, false));
         }
     }
     Ok(json!({"ok": true, "items": items}))

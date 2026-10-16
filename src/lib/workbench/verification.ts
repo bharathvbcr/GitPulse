@@ -90,6 +90,16 @@ export async function runVerification(id: string): Promise<void> {
 /** What a board card shows: the state, and whether it is for an earlier commit. */
 export interface CardVerdict { state: Exclude<VerdictState, "none">; stale: boolean }
 
+/** Whether two verdict reads say the same about every card; a board keeps the one it shows when they do. */
+export function sameVerdicts(a: ReadonlyMap<string, CardVerdict>, b: ReadonlyMap<string, CardVerdict>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [id, verdict] of b) {
+    const shown = a.get(id);
+    if (!shown || shown.state !== verdict.state || shown.stale !== verdict.stale) return false;
+  }
+  return true;
+}
+
 /** The host's cap on one batched read (a board page is 30 cards in each of 7 columns). */
 export const MAX_VERDICT_BATCH = 256;
 
