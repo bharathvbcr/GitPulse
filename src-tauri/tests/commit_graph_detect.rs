@@ -653,6 +653,44 @@ fn every_truncation_of_a_graph_is_unknown() {
     }
 }
 
+/// Every bucket edge moved down by one: git rejects each, and none reads as
+/// a verdict. The fuzz below finds these only when the clock-derived OIDs put
+/// a mutated byte on an edge; this tries every edge on every run.
+#[test]
+fn a_fanout_shifted_at_any_bucket_edge_is_unknown() {
+    let _g = serial();
+    let (dir, graph, good) = graph_repo(40);
+    let table = 8 + (good[6] as usize + 1) * 12;
+    let at = (8..table)
+        .step_by(12)
+        .find(|&row| &good[row..row + 4] == b"OIDF")
+        .unwrap();
+    let oidf = u64::from_be_bytes(good[at + 4..at + 12].try_into().unwrap()) as usize;
+    let fan =
+        |i: usize| u32::from_be_bytes(good[oidf + 4 * i..oidf + 4 * i + 4].try_into().unwrap());
+    let mut tried = 0;
+    for i in 0..255 {
+        if fan(i) == if i == 0 { 0 } else { fan(i - 1) } {
+            continue;
+        }
+        let mut bytes = good.clone();
+        bytes[oidf + 4 * i..oidf + 4 * i + 4].copy_from_slice(&(fan(i) - 1).to_be_bytes());
+        reseal(&mut bytes);
+        put_graph(&graph, &bytes);
+        assert!(
+            !git_accepts_graph(dir.path()),
+            "git accepted fanout[{i}] - 1"
+        );
+        assert_eq!(
+            inspect_only(dir.path()).state,
+            CommitGraphState::Unknown,
+            "fanout[{i}] - 1"
+        );
+        tried += 1;
+    }
+    assert!(tried > 2, "only {tried} bucket edges in the fixture");
+}
+
 #[test]
 fn structural_mutations_git_rejects_never_read_as_a_verdict() {
     let _g = serial();

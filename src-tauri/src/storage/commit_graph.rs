@@ -22,7 +22,8 @@
 //! because writing or refreshing a commit-graph from GitPulse is an undecided
 //! owner decision (OD 3).
 //! It validates the header, chunk table, required chunk sizes, layer order and
-//! hash version, and spot-checks the OID table under its fanout. It does not
+//! hash version, and checks every fanout bucket edge against the first byte
+//! of the OIDs on either side of it (at most 512 one-byte reads). It does not
 //! read the whole file or the trailing checksum, so a graph that is
 //! structurally sound but bit-rotted in the commit data reads as present;
 //! `git commit-graph verify` is the only full check.
@@ -270,6 +271,24 @@ fn open_graph(path: &Path) -> Result<GraphFile, String> {
     let commits = u64::from(fanout[255]);
     if commits.saturating_mul(hash_len as u64) != lookup_len {
         return Err("OID lookup size disagrees with the fanout".to_string());
+    }
+    // fanout[i] counts the OIDs whose first byte is at most i
+    // (gitformat-commit-graph), and `git commit-graph verify` recomputes it. A
+    // bucket whose edge moved by one passes the monotonic and size checks
+    // above, so the first and last OID of every non-empty bucket must start
+    // with that bucket's byte. The size check bounds every offset read here.
+    for i in 0..256 {
+        let lo = if i == 0 { 0 } else { u64::from(fanout[i - 1]) };
+        let hi = u64::from(fanout[i]);
+        if lo == hi {
+            continue;
+        }
+        for at in [lo, hi - 1] {
+            let first = read_exact_at(&mut file, lookup_off + at * hash_len as u64, 1)?;
+            if usize::from(first[0]) != i {
+                return Err("OID fanout disagrees with the OID table".to_string());
+            }
+        }
     }
     let (_, cdat_len) =
         span(CHUNK_COMMIT_DATA).ok_or_else(|| "missing commit data chunk".to_string())?;
