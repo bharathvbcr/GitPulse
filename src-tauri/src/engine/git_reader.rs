@@ -499,9 +499,18 @@ pub struct KnowledgeReport {
     /// `areas_total` is the uncapped count.
     pub areas: Vec<AreaCoverage>,
     pub areas_total: usize,
+    /// The churn ranking read only the newest [`OWNERSHIP_CHURN_COMMITS`]
+    /// commits (or its output was cut), so a file busy only before that
+    /// window ranks as untouched.
+    pub churn_window_capped: bool,
+    /// The churn walk failed, so the sample is in path order, not ranked.
+    pub churn_unavailable: bool,
+    /// Submodule entries (gitlinks) in the tree: not files, never blamed, and
+    /// not counted in `candidate_files`.
+    pub submodules_skipped: usize,
 }
 
-/// One top-level area (a first path component; `(root)` for files at the top)
+/// One top-level area (a first path component; empty for files at the top)
 /// and how much of it the ownership sample covers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AreaCoverage {
@@ -2243,6 +2252,9 @@ impl GitReader {
                     duration_ms: started.elapsed().as_millis() as u64,
                     areas: Vec::new(),
                     areas_total: 0,
+                    churn_window_capped: false,
+                    churn_unavailable: false,
+                    submodules_skipped: 0,
                 });
             }
             Err(e) => return Err(e),
@@ -2263,7 +2275,7 @@ impl GitReader {
             mailmap.as_deref().unwrap_or(""),
         ];
         let stamp = ref_cache::stamp(&repo, &[]);
-        let answered = ref_cache::through_stamped(&repo, &key, stamp.as_ref(), || {
+        let answered = ref_cache::through_stamped_coalesced(&repo, &key, stamp.as_ref(), || {
             let (report, complete) =
                 Self::measure_ownership(&repo, &head, cap, blame_cap, started)?;
             let text = serde_json::to_string(&report)
@@ -2284,14 +2296,17 @@ impl GitReader {
         blame_cap: usize,
         started: Instant,
     ) -> Result<(KnowledgeReport, bool), String> {
-        let stdout = git_text(repo, &["ls-tree", "-r", "-z", "--name-only", head])?;
+        let stdout = git_text(repo, &["ls-tree", "-r", "-z", head])?;
+        let entries = parse_ls_tree_z(stdout.as_bytes())?;
+        // A gitlink is a pointer into another repository: blame cannot read
+        // it, and it is not a file this report missed.
+        let submodules_skipped = entries.iter().filter(|e| e.mode == "160000").count();
 
-        let all_candidates: Vec<String> = stdout
-            .split('\0')
+        let all_candidates: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.mode != "160000")
+            .map(|entry| entry.path)
             .filter_map(|p| {
-                if p.is_empty() {
-                    return None;
-                }
                 let ext = p.rsplit('.').next().unwrap_or("");
                 if matches!(
                     ext,
@@ -2314,7 +2329,7 @@ impl GitReader {
                 ) {
                     None
                 } else {
-                    Some(p.to_string())
+                    Some(p)
                 }
             })
             .collect();
@@ -2325,9 +2340,9 @@ impl GitReader {
         let churn = if truncated {
             ownership_churn(repo, head)
         } else {
-            HashMap::new()
+            OwnershipChurn::default()
         };
-        let sample = select_ownership_sample(all_candidates, &churn, cap);
+        let sample = select_ownership_sample(all_candidates, &churn.by_path, cap);
         let selected_files = sample.files;
 
         let now_secs = SystemTime::now()
@@ -2472,7 +2487,9 @@ impl GitReader {
         orphaned_files.sort_by_key(|a| std::cmp::Reverse(a.lines_count));
         orphaned_files.truncate(50);
 
-        let complete = !(blame_cut_short || deadline_hit || blame_failed);
+        // A report ranked by a walk that failed is not what the next call
+        // would measure, so it is answered but not kept.
+        let complete = !(blame_cut_short || deadline_hit || blame_failed || churn.unavailable);
         let report = KnowledgeReport {
             scanned_files,
             candidate_files,
@@ -2486,6 +2503,9 @@ impl GitReader {
             duration_ms: started.elapsed().as_millis() as u64,
             areas: sample.areas,
             areas_total: sample.areas_total,
+            churn_window_capped: churn.window_capped,
+            churn_unavailable: churn.unavailable,
+            submodules_skipped,
         };
         Ok((report, complete))
     }
@@ -2793,8 +2813,13 @@ fn ownership_mailmap_inputs(repo: &Path) -> Option<String> {
         let (name, value) = entry.split_once('\n').unwrap_or((entry, ""));
         match name.to_ascii_lowercase().as_str() {
             "mailmap.file" => {
+                // `~/` is the caller's home, as git reads it. `~user/` is
+                // another account's, which is looked up in the password
+                // database, not here: a path that cannot be resolved the way
+                // git does is not fingerprinted, so nothing is kept.
                 let path = match value.strip_prefix("~/") {
                     Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
+                    None if value.starts_with('~') => return None,
                     None => repo.join(value),
                 };
                 inputs.push(format!("file={}", content_of(&path)?));
@@ -2816,11 +2841,30 @@ fn ownership_mailmap_inputs(repo: &Path) -> Option<String> {
     Some(inputs.join("\u{1}"))
 }
 
-/// Lines changed per path over the recent history `head` reaches, from one
-/// `git log --numstat` walk (never a spawn per file). A walk that fails ranks
-/// by path alone, which is what the sample did before it was ranked.
-fn ownership_churn(repo: &Path, head: &str) -> HashMap<String, usize> {
-    let count = OWNERSHIP_CHURN_COMMITS.to_string();
+/// Most renames one churn walk follows. A history with more moves than this
+/// stops carrying older history onto new names (and says the walk is capped).
+const MAX_CHURN_RENAMES: usize = 50_000;
+
+/// What the churn walk measured, and how far it could be trusted.
+#[derive(Default)]
+struct OwnershipChurn {
+    by_path: HashMap<String, usize>,
+    /// The walk saw only the newest [`OWNERSHIP_CHURN_COMMITS`] commits, or
+    /// its output or rename tracking was cut.
+    window_capped: bool,
+    /// The walk failed; `by_path` is empty and the sample is in path order.
+    unavailable: bool,
+}
+
+/// Lines changed per current path over the recent history `head` reaches, from
+/// one `git log --numstat` walk (never a spawn per file). The walk is newest
+/// first, so a rename `old -> new` moves everything older that was recorded
+/// under `old` onto `new`'s current name, through any chain of moves; a moved
+/// hot file or directory keeps its rank.
+fn ownership_churn(repo: &Path, head: &str) -> OwnershipChurn {
+    // One commit past the window tells a history that ends exactly at it from
+    // one that goes on.
+    let count = (OWNERSHIP_CHURN_COMMITS + 1).to_string();
     let args = [
         "log",
         "-n",
@@ -2828,19 +2872,42 @@ fn ownership_churn(repo: &Path, head: &str) -> HashMap<String, usize> {
         "--no-merges",
         "--numstat",
         "-z",
-        "--format=",
+        "--format=%x01",
         head,
     ];
-    let stdout = match git_text_capped(repo, &args, budget::MAX_PULSE_BYTES) {
-        Ok((out, _)) => out,
+    let (stdout, cut) = match git_text_capped(repo, &args, budget::MAX_PULSE_BYTES) {
+        Ok(out) => out,
         Err(e) => {
             log::warn!(target: "pulse", "ownership churn for {}: {e}", repo.display());
-            return HashMap::new();
+            return OwnershipChurn {
+                unavailable: true,
+                ..OwnershipChurn::default()
+            };
         }
     };
-    let mut churn: HashMap<String, usize> = HashMap::new();
-    for change in parse_numstat_files(&stdout) {
-        *churn.entry(change.path).or_insert(0) += change.additions + change.deletions;
+    let stream = parse_numstat_records(&stdout);
+    let mut churn = OwnershipChurn {
+        window_capped: cut.is_some() || stream.commits > OWNERSHIP_CHURN_COMMITS,
+        ..OwnershipChurn::default()
+    };
+    // Name in an older commit -> the path it has at `head`.
+    let mut current: HashMap<String, String> = HashMap::new();
+    for record in stream.records {
+        if record.commit > OWNERSHIP_CHURN_COMMITS {
+            break;
+        }
+        let path = current
+            .get(&record.path)
+            .cloned()
+            .unwrap_or_else(|| record.path.clone());
+        *churn.by_path.entry(path.clone()).or_insert(0) += record.additions + record.deletions;
+        if let Some(old) = record.old_path {
+            if current.len() < MAX_CHURN_RENAMES {
+                current.insert(old, path);
+            } else {
+                churn.window_capped = true;
+            }
+        }
     }
     churn
 }
@@ -2852,9 +2919,13 @@ struct OwnershipSample {
     areas_total: usize,
 }
 
-/// First path component, or `(root)` for a file at the top level.
+/// Area of files at the top level. Empty, which no path component can be, so a
+/// directory with any name stays a different area; the UI supplies the label.
+const ROOT_AREA: &str = "";
+
+/// First path component, or [`ROOT_AREA`] for a file at the top level.
 fn ownership_area(path: &str) -> &str {
-    path.split_once('/').map_or("(root)", |(area, _)| area)
+    path.split_once('/').map_or(ROOT_AREA, |(area, _)| area)
 }
 
 /// Picks up to `cap` of `candidates`: the busiest file of each area first
@@ -5429,56 +5500,96 @@ fn parse_numstat_with_issues(stdout: &str) -> NumstatParse {
 /// [`CommitFileChange`]; renames are reported once under their post-image
 /// path with status "R", binary files keep status "B".
 fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
-    let mut files = Vec::new();
-    let mut tokens = stdout.split('\0').peekable();
+    parse_numstat_records(stdout)
+        .records
+        .into_iter()
+        .map(|record| CommitFileChange {
+            status_code: match (&record.old_path, record.binary) {
+                (Some(_), _) => "R",
+                (None, true) => "B",
+                (None, false) => "M",
+            }
+            .to_string(),
+            path: record.path,
+            additions: record.additions,
+            deletions: record.deletions,
+        })
+        .collect()
+}
+
+/// One record of a `git log --numstat -z` or `git show --numstat -z` stream.
+struct NumstatRecord {
+    /// 1-based commit this record belongs to when the stream carries
+    /// [`NUMSTAT_COMMIT_MARK`] records; 0 when it carries none.
+    commit: usize,
+    /// The pre-image path of a rename, absent for anything else.
+    old_path: Option<String>,
+    path: String,
+    binary: bool,
+    additions: usize,
+    deletions: usize,
+}
+
+/// A record a caller's `--format=%x01` puts before each commit's numstat.
+const NUMSTAT_COMMIT_MARK: &str = "\u{1}";
+
+/// Reads a `-z` numstat stream by its structure, not by what its paths look
+/// like. A record is `add TAB del TAB path NUL`; with an empty `path` the next
+/// two NUL-separated fields are the rename's old and new names, whatever they
+/// contain (a name that looks like a header is still a name). A commit's first
+/// header carries the newline `--format` leaves behind, which is not part of
+/// the count. A stream cut inside a rename keeps the half it has as a plain
+/// change.
+fn parse_numstat_records(stdout: &str) -> NumstatStream {
+    let mut records = Vec::new();
+    let mut commit = 0;
+    let mut tokens = stdout.split('\0');
     while let Some(head) = tokens.next() {
-        if head.is_empty() {
+        if head == NUMSTAT_COMMIT_MARK {
+            commit += 1;
             continue;
         }
+        let head = head.trim_start_matches('\n');
         let mut fields = head.splitn(3, '\t');
         let add_s = fields.next().unwrap_or("");
-        let del_s = match fields.next() {
-            Some(d) => d,
-            None => continue,
+        let Some(del_s) = fields.next() else {
+            continue;
         };
-        let additions = add_s.parse().unwrap_or(0);
-        let deletions = del_s.parse().unwrap_or(0);
         let binary = add_s == "-" && del_s == "-";
+        let (additions, deletions) = (add_s.parse().unwrap_or(0), del_s.parse().unwrap_or(0));
         let path_field = fields.next().unwrap_or("");
-        if path_field.is_empty() {
-            if let Some(first_path) = tokens.next().filter(|s| !s.is_empty()) {
-                let is_rename = tokens
-                    .peek()
-                    .is_some_and(|next| !next.is_empty() && !is_numstat_header(next));
-                if is_rename {
-                    let second_path = tokens.next().unwrap();
-                    files.push(CommitFileChange {
-                        path: second_path.to_string(),
-                        status_code: "R".to_string(),
-                        additions,
-                        deletions,
-                    });
-                } else {
-                    let status_code = if binary { "B" } else { "M" };
-                    files.push(CommitFileChange {
-                        path: first_path.to_string(),
-                        status_code: status_code.to_string(),
-                        additions,
-                        deletions,
-                    });
+        let (old_path, path) = if path_field.is_empty() {
+            match (tokens.next(), tokens.next()) {
+                (Some(old), Some(new)) if !old.is_empty() && !new.is_empty() => {
+                    (Some(old.to_string()), new.to_string())
                 }
+                (Some(only), _) if !only.is_empty() => (None, only.to_string()),
+                _ => continue,
             }
         } else {
-            let status_code = if binary { "B" } else { "M" };
-            files.push(CommitFileChange {
-                path: path_field.to_string(),
-                status_code: status_code.to_string(),
-                additions,
-                deletions,
-            });
-        }
+            (None, path_field.to_string())
+        };
+        records.push(NumstatRecord {
+            commit,
+            old_path,
+            path,
+            binary,
+            additions,
+            deletions,
+        });
     }
-    files
+    NumstatStream {
+        records,
+        commits: commit,
+    }
+}
+
+/// What [`parse_numstat_records`] read: the records, and how many
+/// [`NUMSTAT_COMMIT_MARK`] records preceded them (commits with no numstat
+/// lines, an empty commit say, still count).
+struct NumstatStream {
+    records: Vec<NumstatRecord>,
+    commits: usize,
 }
 
 /// Most source paths a one-path read puts on the command line, and the most
@@ -10927,7 +11038,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(cut.areas.iter().filter(|a| a.sampled_files > 0).count(), 2);
         let src = cut.areas.iter().find(|a| a.area == "src").expect("src");
         assert_eq!(src.candidate_files, 20);
-        let root = cut.areas.iter().find(|a| a.area == "(root)").expect("root");
+        let root = cut.areas.iter().find(|a| a.area.is_empty()).expect("root");
         assert_eq!(root.candidate_files, 2);
         assert!(
             root.sampled_files > 0,
@@ -13683,7 +13794,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 .args(["fast-import", "--quiet"])
                 .current_dir(dir)
                 .stdin(std::process::Stdio::piped())
-                .spawn()
+                .spawn_locked()
                 .expect("spawn fast-import");
             child
                 .stdin
@@ -13839,7 +13950,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 .current_dir(dir)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .spawn()
+                .spawn_locked()
                 .expect("spawn git");
             child
                 .stdin
@@ -13934,7 +14045,6 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         /// A directory literally named `(root)` is a different area from the
         /// top-level files, which are labelled `(root)`.
         #[test]
-        #[ignore = "break: a top-level directory named `(root)` merges with the root-file area label"]
         fn a_directory_named_root_is_not_the_root_area() {
             let sample = select_ownership_sample(
                 vec!["(root)/a.rs".to_string(), "top.rs".to_string()],
@@ -13981,9 +14091,8 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         /// A tab-bearing name that itself looks like a numstat header, as the
         /// new path of a rename, must not be taken for the next record.
         #[test]
-        #[ignore = "break: a rename whose new path looks like `1<TAB>2<TAB>x` is parsed as a plain change"]
         fn a_rename_to_a_header_shaped_name_is_a_rename() {
-            let files = parse_numstat_files("0\t0\t\0old.txt\01\t2\tx.txt\0");
+            let files = parse_numstat_files("0\t0\t\0old.txt\x001\t2\tx.txt\0");
             assert_eq!(files.len(), 1, "{files:?}");
             assert_eq!(files[0].path, "1\t2\tx.txt");
         }
@@ -13992,7 +14101,6 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         /// new name for the rename commit, so a heavily churned file that was
         /// moved ranks as untouched and falls out of the sample.
         #[test]
-        #[ignore = "break: churn is not carried across a rename, so a moved hot file ranks last"]
         fn a_renamed_hot_file_keeps_its_churn_rank() {
             let dir = init_repo_with_remotes(&[], "main");
             for n in 0..130 {
@@ -14019,7 +14127,6 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         /// not a failure of the sample, and must not defeat the memo or make
         /// every report permanently `truncated`.
         #[test]
-        #[ignore = "break: one gitlink makes blame_failed true, so the report is never kept and always truncated"]
         fn a_submodule_does_not_defeat_the_memo_or_truncate_the_report() {
             let _kept = ref_cache::retention();
             ref_cache::eager(|| {
@@ -14044,6 +14151,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                     !first.truncated,
                     "a gitlink is not a missed file: {first:?}"
                 );
+                assert_eq!((first.candidate_files, first.submodules_skipped), (1, 1));
                 let cold = blame_spawns(&root);
                 GitReader::knowledge_report(path, None).expect("second");
                 assert_eq!(blame_spawns(&root), cold, "the second call must be kept");
@@ -14053,7 +14161,6 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         /// Two simultaneous cold calls each blame: nothing coalesces them, so
         /// Pulse and an MCP caller activating together double the work.
         #[test]
-        #[ignore = "break: no single-flight, two concurrent cold calls blame every file twice"]
         fn concurrent_cold_calls_blame_once() {
             let _kept = ref_cache::retention();
             ref_cache::eager(|| {
@@ -14074,11 +14181,11 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         }
 
         /// More than OWNERSHIP_CHURN_COMMITS commits: a file that was busy
-        /// only before the window ranks as untouched, and nothing in the
-        /// report says the ranking saw a capped history.
+        /// only before the window ranks as untouched. One log walk cannot see
+        /// further, so the report says the ranking saw a capped history; a
+        /// history that ends inside the window says nothing.
         #[test]
-        #[ignore = "break: the 5,000-commit churn window is silent; a file busy before it is dropped and nothing is flagged"]
-        fn a_file_busy_before_the_churn_window_is_still_sampled() {
+        fn a_capped_churn_window_is_reported() {
             let dir = init_repo_with_remotes(&[], "main");
             let mut commits: Vec<Vec<(String, String)>> = Vec::new();
             let mut seed: Vec<(String, String)> = (0..200)
@@ -14103,10 +14210,65 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             let report =
                 GitReader::knowledge_report(dir.path().to_str().unwrap(), None).expect("report");
             assert_eq!(report.candidate_files, 201);
+            assert!(report.churn_window_capped, "{report:?}");
+            assert!(!report.churn_unavailable);
+            let short = churn_fixture(200, 2);
+            let report =
+                GitReader::knowledge_report(short.path().to_str().unwrap(), None).expect("short");
+            assert!(!report.churn_window_capped, "{report:?}");
+        }
+
+        /// `mailmap.file = ~user/...` is another account's home, which this
+        /// code does not resolve: not fingerprinted, so never kept.
+        #[test]
+        fn a_mailmap_file_under_another_users_home_is_not_kept() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                write(dir.path(), "code.rs", "fn a() {}\n");
+                commit_as(dir.path(), "feat: code", "A <a@example.com>");
+                git_in(
+                    dir.path(),
+                    &["config", "mailmap.file", "~nobody/people.mailmap"],
+                );
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                GitReader::knowledge_report(path, None).expect("first");
+                let cold = blame_spawns(&root);
+                GitReader::knowledge_report(path, None).expect("second");
+                assert!(
+                    blame_spawns(&root) > cold,
+                    "an unresolvable map is not kept"
+                );
+            });
+        }
+
+        /// A moved directory keeps the rank of everything under it, through a
+        /// second move of one of its files.
+        #[test]
+        fn churn_follows_a_directory_move_and_a_second_rename() {
+            let dir = init_repo_with_remotes(&[], "main");
+            for n in 0..130 {
+                write(dir.path(), &format!("cold/c{n:03}.rs"), "fn cold() {}\n");
+            }
+            write(dir.path(), "old/hot.rs", "fn hot() {}\n");
+            commit_as(dir.path(), "feat: seed", "A <a@example.com>");
+            for round in 0..5 {
+                write(dir.path(), "old/hot.rs", &lines(60, &format!("r{round}")));
+                commit_as(dir.path(), "feat: churn", "A <a@example.com>");
+            }
+            git_in(dir.path(), &["mv", "old", "zz"]);
+            commit_as(dir.path(), "refactor: move dir", "A <a@example.com>");
+            git_in(dir.path(), &["mv", "zz/hot.rs", "zz/moved.rs"]);
+            commit_as(dir.path(), "refactor: move file", "A <a@example.com>");
+            let churn = ownership_churn(dir.path(), "HEAD");
+            assert!(!churn.unavailable && !churn.window_capped);
             assert!(
-                report.scanned_lines >= 50 + 127,
-                "the hot file (50 lines) is sampled: {report:?}"
+                churn.by_path["zz/moved.rs"] > 5 * 60,
+                "{:?}",
+                churn.by_path.get("zz/moved.rs")
             );
+            assert!(!churn.by_path.contains_key("old/hot.rs") || churn.by_path["old/hot.rs"] == 0);
         }
 
         /// Spawn budget for one cold call and one warm call on a 2,000-file
