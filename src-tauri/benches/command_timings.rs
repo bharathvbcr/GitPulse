@@ -568,7 +568,7 @@ fn main() {
             assert_eq!(report.scanned_files, size, "the sample was not fully blamed");
             std::hint::black_box(&report);
             Sample::default()
-                .counter("scanned_files", report.scanned_files as u64)
+                .metric("scanned_files", report.scanned_files as f64)
                 .elapsed(elapsed)
         }),
         Case::new("ownership warm", || {
