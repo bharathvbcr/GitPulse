@@ -1,77 +1,86 @@
-# GitPulse 1.5.0 — release notes
+# GitPulse 1.5.0
 
-**The release being cut is 1.5.0.** The owner withdrew 1.3.5: that label was a mistake, there is no 1.3.4 section, and there is no `[1.3.5]` heading. **1.4.0 remains the previous changelog section** (`## [1.4.0] - 2026-10-11`). Product stamps are 1.5.0. Local tags `v1.3.5` (`3d21d7f6`) and `v1.4.0` (`ed54ac18`) stay where they are.
-
-`## [1.5.0] - 2026-10-17` is only the text that was `[Unreleased]` before `690094b5` (GPU terminal rendering, the host-load governor, snapshot reads, the scrollback setting, idle wakes, and the other bullets that sat above the old `[1.4.0]` heading). `## [Unreleased]` is empty. Compare links:
-
-- `[Unreleased]: …/compare/v1.5.0...HEAD`
-- `[1.5.0]: …/compare/v1.4.0...v1.5.0`
-- `[1.4.0]: …/compare/v1.3.1...v1.4.0`
-
-The Documentation subsection of the 1.4.0 body still says the feature reference covers "the 1.3.5 behaviour". That sentence was not edited.
-
-The 528 commits after the local `v1.4.0` tag are the 1.5.0 work: mostly fixes and tests (157 `fix`, 138 `test`, 33 `perf`, 26 `docs`, 20 `feat`). The busiest scopes are terminal, ledger, mcp, repostore, pulse, ingest, files, and git.
-
-The GitHub release body is still produced by `scripts/release-notes.mjs` from the changelog section for the tag being built. This file groups the 1.5.0 section. Highlights that belong to the previous section are marked Previous 1.4.0.
+GitPulse 1.5.0 is a large release: agents that run in the background with a pane of everyone at work, a much richer task board, pull-request review, repository-wide search, and a lot of work on terminal reliability and idle cost. It covers everything since v1.3.1, the last published release, because v1.3.5 and v1.4.0 were never published and their changes are included here. To upgrade, install the 1.5.0 build, then read Breaking changes below: the task profile is migrated one way, and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
 
 ## Highlights
 
-Each item is the changelog's own claim. "Former Unreleased" means the block now under `## [1.5.0] - 2026-10-17`. "Previous 1.4.0" means the body dated 2026-10-11.
-
-- **Background agents, stacked worktree tabs, and a model per agent.** Agents start in the background with a pane of everyone at work; every checkout of one repository stacks as tabs; Settings → Agents → Agent models chooses the model. One agent guidance is included in every handoff. Previous 1.4.0 intro and Added ("Stacked worktree tabs", "Choose each agent's model").
-- **The task board can delete, merge, group, undo, and run in waves.** Agents can delete and merge tasks and are asked to group findings onto one card. People get Undo, bulk changes, swimlanes, saved views, work-in-progress limits, checklists, and links. "Run in waves" launches the top N suggested tasks in their own worktrees and merges only a `passed` verdict, and nothing is pushed. Previous 1.4.0 intro and Added ("Run the board in waves", "Undo on the task board", "Agents can delete a board task", "Agents can merge duplicate board tasks", "Agents group work instead of filing a card per finding", "Board views").
-- **Pull requests, file search, and file rename/move/delete.** Code → Search searches file contents. The file tree renames, moves, and deletes tracked files. A pull request expands in place and can be reviewed and merged. Previous 1.4.0 Added ("Search file contents", "Rename, move and delete from the file tree", "Open, review and merge pull requests").
-- **Git work is admitted by class.** A refresh storm can no longer starve an action you asked for. All GitPulse processes share one spawn budget (`spawn-budget.v2` in the former Unreleased Changed entry "The spawn budget shared between GitPulse processes is versioned"). Previous 1.4.0 Fixed ("A refresh storm can no longer refuse your own actions", "All GitPulse processes share one spawn budget").
-- **Two agents in one worktree show up in collision risk.** Previous 1.4.0 Added ("Two agents in one worktree are no longer invisible").
-- **Dead-branch cleanup keeps backups, and a partial secret scan is not "clean".** Previous 1.4.0 Added ("Dead-branch cleanup", "Secrets panel") and Fixed ("Secrets no longer reports a partial scan as clean").
-- **A terminal agent ends only on its own exit, Close, or Quit.** A stalled or hidden view does not kill it. On macOS, Cmd-Q, the Dock, and a Quit Apple event reach the quit confirmation, and a second launch hands its request to the running GitPulse. Previous 1.4.0 Fixed ("A terminal agent is no longer ended…", "Cmd-Q, Dock → Quit…", "One GitPulse per profile on macOS").
-- **The code graph opens the maps a current devmap writes, and schema parity is checked.** `bun run check:schema-parity` compares DevCouncil's checkout with every installed reader. Previous 1.4.0 Added (`check:schema-parity`) and Fixed ("The code graph opens maps the current devmap CLI writes").
-- **GPU terminal rendering, still gated.** Visible terminals can draw through `@xterm/addon-webgl` 0.19.0, at most 8 contexts, with an immediate DOM fallback after a lost context. Settings → Appearance → GPU terminal rendering turns it off. The deciding bench has not run. Former Unreleased Added ("GPU terminal rendering"). Commit `feat(terminal): WebGL renderer on attended sessions, DOM after a loss; A/B not yet run`.
-- **A host-load governor refuses agent launches under memory pressure.** One verdict (`sysload::governor`) refuses launches at severe pressure and sheds background work through the existing spawn gate. The user's shell, and stop, kill, cancel, save, commit, release, and reconcile, are not gated. **Admit anyway** admits for two minutes. Former Unreleased Added ("Host load governor"). Commit `feat(sysload): one load-governor verdict refuses agent launches and sheds the spawn gate under memory pressure`.
-- **A repository is read one snapshot at a time.** A watcher, poll, activation, or refresh that arrives during a snapshot shares one trailing read. Switching back to a tab whose snapshot landed in the last 5 seconds issues no snapshot read. Former Unreleased Changed ("A repository is read one snapshot at a time"). Commit `perf(hydrate): one snapshot in flight per tab…`.
-- **Open tabs keep less history.** The graph keeps rows for the 6 most recently used repositories. Terminal scrollback is a setting (5,000 rows for shells, 1,000 for agent CLIs and task runs). On macOS, Option is Meta in the terminal unless turned off. Former Unreleased Changed ("Open tabs no longer hold their commit history, and terminal history is a setting").
-- **Idle GitPulse wakes on events.** Watched repositories, the single-instance mailbox, the task-board check, and idle PTY readers no longer poll on short timers. Former Unreleased Changed ("An idle GitPulse wakes far less often", "An idle terminal no longer wakes its reader ten times a second").
-- **Ledger rows record when the event happened.** `detail_json.occurred_at` and the task bound at that time replace a stamp from the catch-up pass. The event contract and schema are unchanged. Former Unreleased Fixed ("Ledger rows say when the thing happened"). Commits `feat(ledger): event time in detail_json…` and `feat(ledger): the journal shows event time…`.
-- **Manvi proposals and a verification verdict on GitHub.** A Proposals panel reviews Manvi's proposals. A task's verification verdict can be posted as the `devcouncil/verify` commit status. An agent's `gitpulse_complete_task(done)` lands in `done` only with a settled `passed` verdict for the current head; otherwise it stays in `review`. Previous 1.4.0 Added ("Review Manvi's proposals", "Post a task's verification verdict") and Changed ("An agent's `gitpulse_complete_task(done)` no longer takes its own word").
+- **Agents start in the background.** Launching an agent from a task no longer closes the task sheet. The task's Agents pane lists every attempt working on it, and board cards show how many agents work on them and how many need you. (`576e005c`, `389a3498`)
+- **Several agents at once, each in its own worktree.** You choose how many agents run at once (Settings, Agents, default 8) and how many terminal sessions may be open (default 32, up to 128). An agent can mark its own task done when the work is finished. (`a16e9171`, `5e547be5`, `421b4404`, `acd6116c`)
+- **Stacked worktree tabs.** Every checkout of one repository shares one tab with a switcher, so agent worktrees stop pushing other repositories off the tab strip. (`88ae7ae9`, `d127042c`)
+- **A model for each agent.** Settings, Agents, Agent models sets the default model per agent CLI, and a task handoff can pick a model, effort and advisor for a single launch. Every handoff now opens with the same agent guidance. (`16c79e71`, `35ea0410`, `c68e9b3a`)
+- **A fuller task board.** Undo, swimlanes, saved views and work-in-progress limits, checklists and task links, restore from a Deleted view, a query language for search, and Suggest next. "Run in waves" launches the top suggested tasks in their own worktrees and merges only work with a passed verification, never pushing. (`389a3498`, `cb4ab882`, `3a7de123`, `f0c78a46`, `69d91131`, `d7545e04`)
+- **Agents can delete and merge board tasks, and must group findings.** `gitpulse_delete_task` and `gitpulse_merge_tasks` exist, and `gitpulse_add_task` refuses a new card that looks like open work until the agent has read the related cards. (`f9d4fc9d`, `0f0ffbda`, `607ad2da`)
+- **Pull requests, search and file operations.** A pull request can be viewed, reviewed, merged and opened from GitPulse through `gh`. Code, Search searches file contents. The file tree renames, moves and deletes tracked files. (`ff0e7c40`, `bcf18867`, `d5f159df`)
+- **More history tools.** From a reflog entry you can create a branch or reset the current branch. Blame can show a file at a revision and step to a line's parent commit. (`3c27d41c`, `75e393ad`)
+- **Two agents in one worktree are visible.** Collision risk now flags dirty files in any worktree two live sessions share. Codex keeps no session registry, so it is reported as unknown. (`2c3d6707`)
+- **Dead-branch cleanup and a Secrets scan.** Stale branches are scanned and cleaned with a restorable backup per repository. An optional secrets scan locates each finding and never calls a partial scan clean. (`9706f20d`, `a20f8d58`, `86fdf28c`)
+- **Agents keep running when their view goes away.** A stalled, hidden or reloaded view no longer kills an agent. On macOS, Cmd-Q, Dock Quit and the Quit Apple event reach the quit confirmation, and a second launch hands over to the running GitPulse. (`fe6236ef`, `8c9feada`, `998c43a2`, `b862aa28`)
+- **Optional terminal host.** Settings, Agents, "Keep terminals running when GitPulse quits" (off by default) holds terminals in a separate `gitpulse-ptyd` process so they survive a quit or crash and are adopted on the next launch. (`9d693711`, `6ca14b3a`)
+- **Git work is admitted by class.** Interactive, reactive and background git work are admitted separately, and all GitPulse processes share one per-user spawn budget, so a refresh storm can no longer starve an action you asked for. (`e9a64486`)
+- **A host-load governor.** Under severe memory pressure GitPulse refuses agent launches with a clear reason and sheds its own background work. Your shell and stop, kill, cancel, save and commit are never gated. Health shows the state and offers **Admit anyway** (two minutes, after a native confirmation). (`73163a50`, `e96541bb`)
+- **Lighter at idle and with many tabs.** A repository is read one snapshot at a time, switching back to a freshly read tab costs no read, open tabs keep history for only the 6 most recent repositories, terminal scrollback is a setting, and idle watchers, the single-instance mailbox and idle terminals wait for events instead of polling. Switching tabs no longer rebuilds the sidebar or status bar. (`296eb20b`, `5b419492`, `7dc5c132`, `3d1c9bae`, `05e734a7`)
+- **GPU terminal rendering, on by default.** Visible terminals draw through WebGL (at most 8 at once) and fall back to the DOM renderer after a lost context. Settings, Appearance, GPU terminal rendering turns it off. See Known issues. (`75bee0f9`)
+- **Ledger rows record when things happened,** not when a catch-up pass saw them, and the journal shows event time. (`8221b353`, `c71e8daf`)
+- **Manvi proposals and verification verdicts.** A Proposals panel reviews Manvi's scan and refine proposals. A task's verdict can be posted to GitHub as a `devcouncil/verify` commit status, per repository and opt-in. (`cf07ebc2`, `03ca87ad`)
 
 ## Fixes
 
-- A slow host no longer kills terminal input. Input waits for the real answer, queues keystrokes, and stops only when the session is gone or nothing answers for 60 seconds. Former Unreleased Fixed ("A slow host no longer kills a terminal's input").
-- Terminal output travels on a per-session channel of raw bytes, up to 64 KiB a message, instead of a global event. Former Unreleased Fixed ("Terminal output travels on a channel of its own"). Commit `perf(terminal): a session's output goes down its own Channel of raw bytes, in 64 KiB messages`.
-- Typing and resizing no longer wait behind git. They run on a thread per session. Former Unreleased Fixed ("Typing and resizing a terminal no longer wait behind git").
-- Branch names git allows (`fix/a&b`, `feat(ui)=x`, `a]b`) work. A name still may not start with `-` or contain C1 controls. Former Unreleased Fixed ("Branch names that git allows now work").
-- A commit that finishes after a repository-tab switch no longer clears the other repository's message. Former Unreleased Fixed ("A commit that finished after you switched repository tabs").
-- One failing GitHub alert tier is named as missing; Health shows "Incomplete" instead of hiding the other tiers. Former Unreleased Fixed ("One failing GitHub alert tier no longer hides the others").
-- A file-system event with a non-UTF-8 path, an unknown flag bit, or a panic in the watch handler no longer aborts GitPulse on macOS. Former Unreleased Fixed ("A file-system event can no longer abort GitPulse on macOS").
-- Send to agent from a board card no longer crashes. Branch-menu Push, Pull, and Checkout run again. Previous 1.4.0 Fixed ("Send to agent from a board card crashed on every launch", "A branch's menu Push, Pull and Checkout did nothing and threw").
-- Open repository tabs and their groups survive quitting. Repository trust survives reboots and toolchain updates. Previous 1.4.0 Fixed ("Open repository tabs and their groups survive quitting the app", "Repository trust survives reboots and toolchain updates").
-- A partial dependency or coverage scan is not reported as measured. One `AUDIT_TIMEOUT` (90 s) covers the dependency scan; a cut coverage report is `truncated` and is not cached. Former Unreleased Fixed ("A dependency or coverage scan returns by one deadline").
-- Closing a tab group releases its tabs the way closing a single tab does. Former Unreleased Fixed ("Closing a tab group now releases its tabs").
+- **A slow host no longer kills terminal input.** Input waits for the real answer, shows one "responding slowly" notice, and stops only when the session is gone or nothing answers for 60 seconds. (`2e313355`)
+- **Typing and resizing no longer queue behind git.** Terminal commands run on their own bounded executor instead of the pool git shares. (`e2c11933`)
+- **Terminal output travels on a per-session channel** of raw bytes, up to 64 KiB a message, instead of a global event sent to every webview. (`3b1cf774`)
+- **A Claude tab ended by a signal offers Resume** for the same conversation, directory and mode. (`6fc50cb2`)
+- **Branch names git allows now work,** such as `fix/a&b`, `feat(ui)=x` and `a]b`. A leading `-` and control characters are still refused. (`de7b53f2`, `2dba1c9e`)
+- **A commit that finishes after you switch repository tabs** no longer clears the other repository's message or amend flag. (`05e734a7`)
+- **Send to agent from a board card no longer crashes,** and the branch menu's Push, Pull and Checkout work again. (`dc045c1f`)
+- **Remote branch rows check out as a local branch** and no longer detach HEAD. (`d7ca958e`, `ff3c9628`)
+- **Open tabs and groups survive quitting, and repository trust survives reboots** and toolchain updates. (`c6214518`, `a3323787`)
+- **More than 24 repositories can be open,** and agents in worktrees no longer need a repository tab of their own. (`fe4393d3`, `edb364c1`)
+- **Closing a working agent asks first,** and names its task. (`e27e6daf`)
+- **Removing or merging a worktree refuses while any process is working in it.** (`438a21e2`)
+- **The file editor no longer rewrites non-UTF-8 or mixed line-ending files.** Saves are compare-and-save with a conflict banner, and New File and New Folder create only. (`a4149eb1`, `30e30fdb`, `4c34c5c4`)
+- **A partial scan is not reported as complete.** Dependency and coverage scans return by one 90-second deadline and a cut coverage report is marked truncated. A secrets scan that could not read a file is not "clean". (`1b91f9a6`, `86fdf28c`)
+- **One failing GitHub alert tier no longer hides the others.** The failing tier is named and Health shows the result as incomplete. (`3cafbd11`)
+- **A file-system event with an odd path or a panic in the handler no longer aborts GitPulse on macOS.** (`4d4c04d2`)
+- **The update check announces published releases, not tags,** and a check that cannot be made fails rather than guessing. (`cf0fe90f`)
+- **An update check that could not reach GitHub no longer reports "up to date".** A failed lookup, timeout, refusal or server error used to read as "not published"; now only a "not found" does, and anything else fails the check with its reason. (`d414ad3f`)
+- **Closing a tab group releases its tabs** the way closing a single tab does. (`8b47801d`)
+- **A moved or renamed repository takes its ledger over** instead of refusing to record. (`fbe3e99b`)
 
 ## Hardening
 
-- The app enforces an ACL on its own commands. The main window is granted only the commands the frontend calls; the status popover only its three; six commands nothing calls are denied. Webviews cannot navigate off the app origin. Previous 1.4.0 Security.
-- Trusting a repository, or pointing devmap or manvi at a new binary or source root, asks in a native dialog the page cannot answer. Open-in-default-app confirms executables and related launch files. Previous 1.4.0 Security.
-- Remote images in repository Markdown do not load until clicked. Previous 1.4.0 Security.
-- Remote tool installs build one pinned commit. curl is confined to https. Clone refuses Git older than 2.45.1; submodule recursion refuses Git older than 2.50.1. Previous 1.4.0 Security.
-- A released app's hook that cannot launch refuses the call (exit status 2) instead of failing open. Previous 1.4.0 Changed ("A released app's safety hooks and MCP server now resolve").
-- Repository hooks (`.gitpulse/hooks.json` and `hooks.toml`) run only after the exact file text is approved, and "Run repository hooks" is off by default. Previous 1.4.0 Changed ("Repository hooks need your approval").
-- Every signal GitPulse sends goes through `procguard::signal`, which refuses pid 0, 1, and negative ids, the app's own process, and a pid whose start time moved. Former Unreleased Fixed ("Every signal GitPulse sends now goes through one guarded primitive").
-- Code-intelligence previews and file saves refuse oversized content before work starts (2 MiB per previewed file, 8 MiB and 256 files per preview batch, 8 MiB per save). Former Unreleased Fixed.
-- Copying build caches into a new worktree is all or nothing, and the target must be one of that repository's worktrees. Former Unreleased Fixed.
-- A peer that sends a byte at a time cannot hold the alert bridge or the code-index daemon probe open past one wall-clock deadline. Former Unreleased Fixed.
-- A build that would ship source maps fails. Former Unreleased Fixed ("A build that would ship source maps now fails").
+- **The app enforces an ACL on its own commands.** The main window gets only the commands the frontend calls, the status popover only its three, and webviews cannot navigate off the app origin. (`08607bfd`)
+- **Trust and tool changes ask in a native dialog the page cannot answer.** Trusting a repository, and repointing devmap or manvi at a new binary or source root, need a native confirmation. Open-in-default-app requires a trusted repository and confirms executables. (`87d03fc8`)
+- **Remote images in repository Markdown stay withheld until you click them,** and load over https only. (`08607bfd`, `a047354d`)
+- **Remote tool installs are pinned.** They build one exact commit from a fixed directory, curl is confined to https, and clone refuses Git older than 2.45.1 (submodule recursion older than 2.50.1). (`3f09e029`)
+- **Every signal GitPulse sends goes through one guarded primitive** that refuses pid 0, 1 and negative ids, its own process, and a pid whose start time moved. (`0709eded`)
+- **Agents' kill commands are checked.** The command gate refuses a `pkill`, `killall` or similar that would reach agent sessions, GitPulse or more than 25 processes. (`8c03e89e`)
+- **Previews and saves refuse oversized content at the command boundary,** before any copy is made. (`2105086c`)
+- **Copying build caches into a worktree is all or nothing,** and only into a worktree of the same repository. (`80bd78c4`)
+- **A peer that drips bytes cannot hold the alert bridge or the code-index probe open.** One wall-clock deadline covers both. (`c4155156`)
+- **The shared spawn budget no longer resets to a full burst when its record is unreadable.** (`6ab65c15`)
+- **Merging an agent attempt nobody reviewed is refused,** behind a per-repository opt-in. (`03b6b700`)
+- **The file sandbox refuses reads and writes of `.git` metadata** from the webview. (`30e30fdb`)
+- **A build that would ship source maps fails,** and the release job no longer runs install scripts with the GitHub token or persists checkout credentials. (`b9b9e116`, `4a8b4eb0`)
+- **Every workflow pins its actions to commits.** No checkout keeps its token, Bun's version comes from `package.json`, and `check:workflows` refuses an unpinned action or a credential-keeping checkout. (`1603c69d`)
 
 ## Breaking changes
 
-- **dc-store schema 11 is a one-way migration.** A host built against schema 10 refuses a migrated profile. Rebuild GitPulse, Manvi, and DevCouncil from a schema 11 dc-store before any of them opens the profile. Previous 1.4.0 Upgrade. The same Changed body later records schema 12: a profile Manvi's dc-store has taken to 12 is refused by a GitPulse built at 11, and the installer requires a `dcstore` that reports schema 12.
-- **Reinstall `gitpulse-mcp` and `gitpulse-hook`** (`bun run mcp:install`). A 1.4.0 binary built before 2026-10-08 carries the schema 25 `devmap-store` and cannot read a store a current `devmap` has built. Previous 1.4.0 Upgrade.
-- **Child processes drop relative `PATH` entries** (`.`, `bin`, `./node_modules/.bin`). A setup that relied on one must use an absolute path. The Manvi sidecar starts from an allowlisted environment, so provider API keys and tokens set in the launching shell no longer reach it. Previous 1.4.0 Security.
-- **An agent can no longer mark a task done on its own word.** Without a settled `passed` `work.verify.task` verdict for the worktree's current head, `gitpulse_complete_task(done)` leaves the task in `review`. A person moving a card is unaffected. Previous 1.4.0 Changed. The changelog's security note: this narrows what an agent can do; the check fails closed.
-- **The update check announces published releases, not tags.** A tag newer than the running build is announced only after its release is published, confirmed by one bounded `HEAD` of the release's checksum asset. A check that cannot be made fails rather than guessing. Previous 1.4.0 Changed ("The update check announces releases, not tags").
+- **The task profile is migrated one way, to dc-store workbench schema 13.** A host built against an older schema refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from the same dc-store before any of them opens the profile. (`3a7de123`, `c6b92930`, `6c0e1faa`)
+- **Reinstall `gitpulse-mcp` and `gitpulse-hook`** (`bun run mcp:install`). An older binary carries an older `devmap-store` and cannot read a store a current `devmap` has built. `bun run check:schema-parity` asks every installed reader which schemas it reads. (`710aa9e0`, `650a587a`)
+- **Child processes drop relative `PATH` entries** (`.`, `bin`, `./node_modules/.bin`). A setup that relied on one must use an absolute path. The Manvi sidecar starts from an allowlisted environment, so provider keys and tokens set in the launching shell no longer reach it. (`87d03fc8`)
+- **An agent can no longer mark a task done on its own word.** `gitpulse_complete_task(done)` leaves the task in review unless Manvi recorded a passed verification for the worktree's current head. A person moving a card is unaffected. (`50eedd43`)
+- **`gitpulse_add_task` refuses a new task that looks like open work.** An agent must fold into a listed card, or call again naming every listed `item_id` in `reviewed_related`. (`607ad2da`)
+- **Repository hooks (`.gitpulse/hooks.json` and `hooks.toml`) no longer run until you approve the file.** Any edit asks again. (`782cd07d`)
+- **Clone refuses Git older than 2.45.1,** and submodule recursion refuses Git older than 2.50.1. (`3f09e029`)
+- **A released app whose `gitpulse-hook` cannot be found now blocks agent calls** instead of letting them through. Make sure the hook resolves beside the app. (`32fe572c`)
+- **On macOS, Option is Meta in the terminal by default.** A layout that types a character with Option (such as `@` on a German keyboard) must turn off Settings, Appearance, Option as Meta in terminals. (`d6c5a40d`)
 
 ## Known issues
 
-- **The GPU terminal renderer is not cleared to ship on the bench that decides it.** `docs/PERFORMANCE.md`'s TUI-redraw A/B has not run. The setting exists and a lost context falls back to the DOM renderer. Former Unreleased Added ("GPU terminal rendering").
-- **Prebuilt remote installs are unavailable.** None are pinned yet, so that rung reports itself unavailable. Previous 1.4.0 Security ("Remote tool installs").
-- **Local tags `v1.4.0` and `v1.3.5` were left in place.** `v1.4.0` still names `ed54ac18`. `v1.3.5` still names `3d21d7f6`.
+- **The GPU terminal renderer shipped before its deciding benchmark ran.** It is on by default. The TUI-redraw A/B in `docs/PERFORMANCE.md` has not been run. A lost context falls back to the DOM renderer, and the setting turns it off. (`75bee0f9`)
+- **Prebuilt remote installs are unavailable.** None are pinned yet, so that install option reports itself unavailable and installs build from source. (`3f09e029`)
+- **Collision risk cannot see running Codex sessions.** Codex keeps no session registry, so Codex is reported as unknown rather than zero. (`2c3d6707`)
+- **The macOS build is ad-hoc signed and not notarized, and Windows builds are unsigned.** Gatekeeper and SmartScreen warn on first launch. (`src-tauri/tauri.conf.json` `signingIdentity: "-"`; no signing secrets in `release.yml`.)
+- **An installed 1.3.1 may announce 1.5.0 before its installers exist.** Builds older than the published-release check announce the newest tag as soon as it is pushed, so for the minutes before the draft is published that link leads nowhere. 1.5.0 itself waits for the published checksum file. (`cf0fe90f`)
+- **v1.4.0 and v1.3.5 were never published.** Their changes are included in this release. v1.3.5 was withdrawn, and 1.4.0 remains the previous changelog section. People upgrading from v1.3.1 receive everything since v1.3.1. (`00ec2567`)
+

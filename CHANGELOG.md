@@ -13,6 +13,12 @@ before that tag is pushed.
 
 ## [1.5.0] - 2026-10-17
 
+1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
+1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
+the 1.4.0 section of `CHANGELOG.md`. Read its **Upgrade** steps first: the task
+profile is migrated one way, and `gitpulse-mcp` and `gitpulse-hook` need
+reinstalling.
+
 ### Added
 
 - **GPU terminal rendering**, gated on the TUI-redraw A/B in
@@ -374,6 +380,22 @@ before that tag is pushed.
   repository's message.** The commit box wiped the draft and the amend flag of
   whichever repository was showing when the commit returned, not the one it ran
   in. It now leaves the repository you are looking at alone.
+
+- **An update check that could not reach GitHub no longer says "up to date".**
+  The check confirms a release by asking for its checksum file. A failed
+  lookup, a timeout, a refusal or a server error used to read as "that release
+  is not published", so the check reported nothing newer. Now only a "not
+  found" means not published; anything else fails the check and says why. The
+  prebuilt-install option reports the same way.
+
+### Security
+
+- **The release job no longer runs package install scripts with the GitHub
+  token, and no checkout keeps its credentials.** Every workflow pins each
+  third-party action to a commit rather than a tag or branch, reads Bun's
+  version from `package.json`, and pins the SBOM tool's version.
+  `bun run check:workflows` now fails on an action that is not pinned to a
+  commit, and on a checkout that keeps its token.
 
 ## [1.4.0] - 2026-10-11
 
@@ -1471,7 +1493,7 @@ reads.
   history. Commands that must see the whole stream still fail, and a slot wait
   is still a slot wait.
 - **No test or bench process draws from the per-user spawn budget any more.**
-  1.3.5 kept six stress tests off it, but every other integration test that
+  An earlier build kept six stress tests off it, but every other integration test that
   ran git still opened `spawn-budget.v1`, spent what the running app and
   agent sessions share, and could be deferred by them. Sharing is now opt-in:
   the app, `gitpulse-mcp`, `gitpulsed` and `gitpulse-hook` opt in at the top of
@@ -1731,7 +1753,7 @@ reads.
 
 ### Documentation
 
-- **Feature reference, terminal, performance and README now cover the 1.3.5
+- **Feature reference, terminal, performance and README now cover the
   behaviour they had skipped:** Secrets locations, scope, age and single-scan
   rule; coloured tabs and restore; stacked notices; terminal foreground
   reporting; and background timers that stop.
@@ -4301,7 +4323,7 @@ Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the com
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
 [Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.5.0...HEAD
-[1.5.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.4.0...v1.5.0
+[1.5.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.5.0
 [1.4.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...v1.3.0

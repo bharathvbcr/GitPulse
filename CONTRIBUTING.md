@@ -299,6 +299,34 @@ several were added after the drift had already happened.
 Adding a contract test is preferred over adding a `check:*` script unless the
 check is something you would want to run on its own.
 
+### Releasing and rolling back
+
+A release is a `vX.Y.Z` tag on a commit whose `ci.yml` and `coverage.yml` push
+runs have already succeeded on GitHub. `release.yml` refuses any other commit,
+and `bun run release:ready` asks the same question without creating anything.
+Push the branch, wait for both workflows to go green on that commit, then push
+that one tag (`git push origin vX.Y.Z`; never `--tags`). The workflow builds
+a **draft**. Nothing is public until a person publishes it, after `verify`
+reports the complete asset set.
+
+The opt-in update check (`src-tauri/src/updates`) announces a version only
+once its `GitPulse_X.Y.Z_SHA256SUMS.txt` asset answers an anonymous request,
+which a draft's assets do not. That decides how to take a release back:
+
+- **Delete the release, or revert it to a draft.** Its assets stop answering
+  and the check stops announcing it at once. It does not make anyone who
+  already installed it downgrade.
+- **Marking it a pre-release does nothing.** The check never reads that flag,
+  and the checksum asset stays public.
+- **Fix forward with a higher patch version.** Never move or re-push a tag
+  that was published: someone has already installed that build under that
+  name. Deleting the tag is optional once the release is gone, because a tag
+  with no published release is never announced.
+
+Builds older than 1.4.0's update check announce the newest tag, published or
+not, so those users can see a version from the moment its tag is pushed. Publish
+the draft promptly, or delete the tag if the run fails.
+
 ---
 
 ## 5. Architecture Orientation
