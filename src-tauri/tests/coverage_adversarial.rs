@@ -581,3 +581,38 @@ fn absent_spec_paths_do_not_starve_late_present_artifacts() {
     );
     assert!(report.truncated);
 }
+
+/// E-integrations-01: a Cobertura `<source>` holding 8 MiB of '&' (the
+/// artifact cap) reaches `decode_xml_entities` through `add_source_root`.
+/// The scan runs on a worker so a quadratic decode fails the test on a clock
+/// instead of hanging the suite.
+#[test]
+fn cobertura_source_of_ampersands_scans_within_budget() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "pub fn a() {}\n");
+    let head = "<coverage><sources><source>";
+    let tail = "</source></sources><packages><package><classes>\
+                <class filename=\"src/lib.rs\"><lines><line number=\"1\" hits=\"1\"/></lines>\
+                </class></classes></package></packages></coverage>";
+    let limits = ScanLimits::default();
+    let amps = limits.max_artifact_bytes as usize - head.len() - tail.len();
+    let artifact = format!("{head}{}{tail}", "&".repeat(amps));
+    assert_eq!(artifact.len() as u64, limits.max_artifact_bytes);
+    write(repo.path(), "cobertura.xml", &artifact);
+
+    let root = repo.path().to_str().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(CoverageScanner::scan_with_limits(&root, limits));
+    });
+    let (report, maps) = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("scan exceeded its budget on an 8 MiB <source> of '&'")
+        .expect("scan");
+    assert!(
+        !artifact_row(&report, "cobertura.xml").skipped,
+        "{:?}",
+        report.artifacts
+    );
+    assert!(maps.contains_key("src/lib.rs"));
+}
