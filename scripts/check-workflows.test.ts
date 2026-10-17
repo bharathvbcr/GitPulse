@@ -145,7 +145,13 @@ describe("check:workflows", () => {
         fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)),
         "utf8",
       );
-      const caches = source.split("uses: Swatinem/rust-cache@v2");
+      // release.yml pins the same action to the commit v2 resolved to. The other
+      // workflows in this loop still name the tag, and this check still requires that.
+      const caches = source.split(
+        name === "release.yml"
+          ? "uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+          : "uses: Swatinem/rust-cache@v2",
+      );
       expect(caches.length, name).toBeGreaterThan(1);
       for (const block of caches.slice(1)) {
         // ImageOS is a runner process env var, not a workflow `env` key, so
