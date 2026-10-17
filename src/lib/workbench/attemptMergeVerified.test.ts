@@ -50,6 +50,22 @@ describe("mergeVerifiedAttempt", () => {
     expect(invoke.mock.calls.map((c) => String(c[0])).filter((c) => /push|remote/.test(c))).toEqual([]);
   });
 
+  it("adv: carries the target's tip before and after the merge, and a null after-oid as null, never as the head", async () => {
+    setup();
+    const full = await mergeVerifiedAttempt(run, "1234567890abcdef");
+    expect([full.beforeOid, full.afterOid]).toEqual(["a", "1234567890abcdef"]);
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+      if (cmd === "cmd_list_worktrees") return [
+        entry({ path: "/work/repo", head: "mainhead", branch: "main", is_main: true, dirty_files: 0 }),
+        entry({ path: WT, head: "1234567890abcdef", branch: "gitpulse/fix", is_main: false, dirty_files: 0 }),
+      ];
+      return { policy: null, output: teardown({ before_oid: "b0", after_oid: null }) };
+    });
+    const unknown = await mergeVerifiedAttempt(run, "1234567890abcdef");
+    expect([unknown.beforeOid, unknown.afterOid]).toEqual(["b0", null]);
+  });
+
   it.each([
     ["the worktree moved past the verified head", { head: "fedcba0987654321" }, {}, /moved to fedcba09 after 12345678/],
     ["the worktree has uncommitted files", { dirty_files: 2 }, {}, /2 uncommitted files no verdict covered/],
