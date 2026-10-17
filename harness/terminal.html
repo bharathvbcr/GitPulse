@@ -29,6 +29,10 @@
       const detachedIds = new Set();
       /** `startDir` of every `cmd_terminal_spawn`, in order. */
       const startDirs = [];
+      /** The launch half of every `cmd_terminal_spawn`: program, mode, acknowledgement. */
+      const launches = [];
+      /** `cmd_agent_defaults` answers a saved "Skip permissions" for Claude; otherwise it is unimplemented, as before. */
+      let bypassDefaults = false;
       /** Every `cmd_terminal_run` the Console sent, and the replies it gets, in order. */
       const consoleRuns = [], consoleReplies = [];
       /** Every URL handed to the OS opener, so a refused scheme is provably
@@ -60,6 +64,7 @@
             adoptOutput(id, args);
             sessions.set(id, args.repoPath);
             startDirs.push(args.startDir ?? null);
+            launches.push({ program: args.program ?? null, permissionMode: args.permissionMode ?? null, acknowledged: args.acknowledged ?? null });
             if (earlyLoss) {
               earlyLoss = false;
               // Listeners are already attached. These bytes have to land before
@@ -83,6 +88,9 @@
             showReport();
             return { id, cwd: args.repoPath, shell: "/bin/zsh" };
           }
+          case "cmd_agent_defaults":
+            if (!bypassDefaults) throw new Error(`Unimplemented fixture: ${cmd}`);
+            return { defaults: { permission: { claude: "bypass" } }, modes: ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"], launchers: ["claude", "codex", "grok", "agy"] };
           case "cmd_terminal_ack":
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
@@ -1007,6 +1015,71 @@
         return results;
       }
 
+      /**
+       * A saved "Skip permissions" default for Claude, through the real dock
+       * and on the renderer the app uses. The agreement is an overlay laid on
+       * the grid; WebGL adds a full-size link-layer canvas with its own
+       * z-index, which once stacked above the overlay and took every click,
+       * so "Start this session" did nothing. `element.click()` cannot see
+       * that, so the pointer's target is read with `elementFromPoint`.
+       *
+       * Runs last: it opens a Claude tab and leaves it, which would shift the
+       * spawn counts every earlier check reads.
+       */
+      async function runBypass() {
+        const { results, check, stopped } = createChecks();
+        try {
+          interfaceStore.setTerminalGpu(true);
+          bypassDefaults = true;
+          const spawnedBefore = report.spawned;
+          button("New session type").click(); await wait();
+          const option = visible('[aria-label="Session types"] [role="option"]').find((el) => el.textContent.trim() === "Claude");
+          if (!option) throw new Error("the launcher menu has no Claude option");
+          option.click(); await wait();
+          const create = button("New Claude session");
+          check("a Claude session can be opened (no session limit in the way)", () => !create.disabled);
+          create.click();
+          const overlay = () => visible("[data-terminal-acknowledge]")[0];
+          const askedDeadline = performance.now() + 3000;
+          while (performance.now() < askedDeadline && !overlay()) await wait(20);
+          check("a saved bypass default asks before anything spawns", () => !!overlay() && report.spawned === spawnedBefore);
+          const host = overlay().parentElement.querySelector("[data-terminal-session]");
+          const glDeadline = performance.now() + 3000;
+          while (performance.now() < glDeadline && !(host.dataset.renderer === "webgl" && host.querySelector("canvas.xterm-link-layer"))) await wait(20);
+          // Without this the hit tests below pass on the DOM renderer for free.
+          check("the waiting Claude tab draws through WebGL, with its full-size link layer",
+            () => host.dataset.renderer === "webgl" && !!host.querySelector("canvas.xterm-link-layer"));
+          const reaches = (el) => {
+            const box = el.getBoundingClientRect();
+            const top = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+            if (el === top || el.contains(top)) return true;
+            throw new Error(`the pointer lands on ${top?.tagName}.${top?.className}`);
+          };
+          const ack = overlay().querySelector('[data-testid="bypass-acknowledge"]');
+          const decline = overlay().querySelector('[data-testid="bypass-decline"]');
+          check("the pointer reaches Start this session", () => reaches(ack));
+          check("the pointer reaches the ask-every-time choice", () => reaches(decline));
+          ack.click();
+          const spawnDeadline = performance.now() + 3000;
+          while (performance.now() < spawnDeadline && report.spawned === spawnedBefore) await wait(20);
+          check("Start this session spawns Claude in bypass, acknowledged", () => {
+            const launch = launches.at(-1);
+            if (report.spawned !== spawnedBefore + 1) throw new Error(`${report.spawned - spawnedBefore} spawns`);
+            return launch.program === "claude" && launch.permissionMode === "bypass" && launch.acknowledged === true;
+          });
+          check("the agreement is gone once the session starts", () => !overlay());
+          check("no runtime errors", () => report.errors.length === 0);
+        } catch (error) {
+          stopped(error);
+        } finally {
+          bypassDefaults = false;
+          interfaceStore.setTerminalGpu(false);
+        }
+        report.bypass = results;
+        showReport();
+        return results;
+      }
+
       document.querySelector("#checks").onclick = async (event) => { event.currentTarget.disabled = true; await runChecks(); };
       document.querySelector("#stress").onclick = async (event) => { event.currentTarget.disabled = true; await runStress(); };
       document.querySelector("#checks").disabled = false;
@@ -1027,7 +1100,8 @@
         await wait(600);
         const checks = await runChecks();
         const stress = checks.every((row) => row.pass) ? await runStress() : [];
-        const results = [...checks, ...stress];
+        const bypass = stress.length && stress.every((row) => row.pass) ? await runBypass() : [];
+        const results = [...checks, ...stress, ...bypass];
         document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
       }

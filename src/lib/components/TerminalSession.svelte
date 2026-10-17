@@ -1462,9 +1462,13 @@
     </div>
   {/if}
   <div class="flex-1 min-h-0 relative p-2">
+    <!-- `isolate`: xterm stacks its own layers with z-indexes (WebGL's
+         full-size link canvas is z-index 2). Contained here, none of them can
+         rise above the overlays below; uncontained, that canvas took every
+         click meant for "Start this session". -->
     <div
       bind:this={container}
-      class="h-full w-full bg-surface overflow-hidden"
+      class="h-full w-full bg-surface overflow-hidden isolate"
       data-terminal-session
       data-renderer={renderer}
     ></div>
