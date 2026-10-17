@@ -3036,12 +3036,31 @@ mod tests {
         }
         let window = started.elapsed();
         std::fs::write(dir.path().join("sentinel-src.rs"), "fn x() {}").unwrap();
-        std::thread::sleep(Duration::from_millis(800));
+        // FSEvents reports canonical paths (`/private/var`); TempDir hands out
+        // `/var`. Either spelling of `target` itself is the directory entry.
+        let reported_target = target.canonicalize().unwrap();
         let mut events = 0u32;
         let mut target_events = 0u32;
         let mut sentinel_events = 0u32;
         let mut sample = String::new();
-        while let Ok(item) = watcher.receiver.try_recv() {
+        // Read until the sentinel arrives (a fixed 800 ms window read nothing
+        // on a loaded host), then whatever is already queued behind it.
+        let deadline = Instant::now() + PRIME_DEADLINE;
+        loop {
+            let item = if sentinel_events == 0 {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match watcher.receiver.recv_timeout(left) {
+                    Ok(item) => item,
+                    Err(_) => break,
+                }
+            } else {
+                match watcher.receiver.try_recv() {
+                    Ok(item) => item,
+                    Err(_) => break,
+                }
+            };
             events += 1;
             if let Ok(event) = item {
                 // Below `target/`, not `target` itself: Windows reports the
@@ -3050,6 +3069,7 @@ mod tests {
                 // watch. That event is shown below to carry no signal.
                 let names_target = event.paths.iter().any(|path| {
                     path != &target
+                        && path != &reported_target
                         && path
                             .components()
                             .any(|component| component.as_os_str() == "target")
