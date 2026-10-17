@@ -3720,7 +3720,18 @@ fn decode_xml_entities(value: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
-        let semi = tail.find(';');
+        // The reference ends at the first ';' that comes before the next '&':
+        // a body holding '&' is never a valid entity, so the search stops
+        // there. Every scan therefore covers bytes no later scan revisits
+        // (the next '&' starts where this one stopped), which makes the whole
+        // decode linear. An unbounded `find(';')` per '&' rescanned the rest
+        // of the value each time, so a value of 4M '&' took ~30 CPU-minutes.
+        // No length cap is applied, so zero-padded references such as
+        // `&#x0000041;` keep decoding exactly as before.
+        let semi = tail[1..]
+            .find([';', '&'])
+            .map(|i| i + 1)
+            .filter(|&i| tail.as_bytes()[i] == b';');
         let decode = semi.and_then(|s| {
             let body = &tail[1..s];
             match body {
@@ -6827,6 +6838,75 @@ src/main.go:4.1,4.8 1 0
         // Malformed entities stay verbatim rather than being dropped.
         assert_eq!(decode_xml_entities("x&nosuchy"), "x&nosuchy");
         assert_eq!(decode_xml_entities("&#65;&#x42;"), "AB");
+    }
+
+    /// Runs `decode_xml_entities` on a worker and fails the test if it has not
+    /// finished by `budget`, instead of hanging the suite when it is quadratic.
+    fn decode_within(input: String, budget: std::time::Duration) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(decode_xml_entities(&input));
+        });
+        rx.recv_timeout(budget)
+            .unwrap_or_else(|_| panic!("decode_xml_entities exceeded {budget:?}"))
+    }
+
+    /// E-integrations-01: a '&' run with no ';' used to rescan the whole tail
+    /// for every '&' (quadratic). 2M '&' took minutes; linear takes well under
+    /// a second even unoptimised.
+    #[test]
+    fn decode_xml_entities_is_linear_on_an_ampersand_run() {
+        let n = 2_000_000;
+        let out = decode_within("&".repeat(n), std::time::Duration::from_secs(20));
+        assert_eq!(out.len(), n);
+        assert!(out.bytes().all(|b| b == b'&'));
+    }
+
+    /// Same shape, with the entities a real name would carry between the runs.
+    #[test]
+    fn decode_xml_entities_is_linear_on_mixed_garbage() {
+        let unit = "&&#&#x&#xZZ&amp&lt;&";
+        let input = unit.repeat(150_000);
+        let out = decode_within(input, std::time::Duration::from_secs(20));
+        assert_eq!(out, "&&#&#x&#xZZ&amp<&".repeat(150_000));
+    }
+
+    /// Release-only budget check: `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore = "timing budget for release builds"]
+    fn decode_xml_entities_8_mib_of_ampersands_under_one_second_in_release() {
+        let started = std::time::Instant::now();
+        let out = decode_xml_entities(&"&".repeat(8 * 1024 * 1024));
+        let took = started.elapsed();
+        assert_eq!(out.len(), 8 * 1024 * 1024);
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    }
+
+    #[test]
+    fn decode_xml_entities_edge_cases_keep_their_meaning() {
+        // '&' at the end of the input, and a lone entity opener.
+        assert_eq!(decode_xml_entities("a&"), "a&");
+        assert_eq!(decode_xml_entities("&"), "&");
+        // An 11-byte run then ';' is not an entity and stays verbatim.
+        assert_eq!(decode_xml_entities("&abcdefghijk;"), "&abcdefghijk;");
+        // A multi-byte char right after '&' is never split.
+        assert_eq!(decode_xml_entities("&\u{e9}x;"), "&\u{e9}x;");
+        assert_eq!(decode_xml_entities("&\u{1F600}&amp;"), "&\u{1F600}&");
+        // Digit runs: huge, empty, zero padded (still valid), out of range.
+        let huge = format!("&#{};", "9".repeat(5_000));
+        assert_eq!(decode_xml_entities(&huge), huge);
+        assert_eq!(decode_xml_entities("&#x;"), "&#x;");
+        assert_eq!(decode_xml_entities("&#;"), "&#;");
+        assert_eq!(decode_xml_entities("&#x0000041;"), "A");
+        assert_eq!(decode_xml_entities("&#x10FFFF;"), "\u{10FFFF}");
+        assert_eq!(decode_xml_entities("&#x110000;"), "&#x110000;");
+        // Surrogates are not scalar values and stay verbatim.
+        assert_eq!(decode_xml_entities("&#xD800;"), "&#xD800;");
+        assert_eq!(decode_xml_entities("&#55296;"), "&#55296;");
+        // The five predefined entities and an entity after a stray '&'.
+        assert_eq!(decode_xml_entities("&amp;&lt;&gt;&quot;&apos;"), "&<>\"'");
+        assert_eq!(decode_xml_entities("&&amp;"), "&&");
+        assert_eq!(decode_xml_entities("&a&amp;b;"), "&a&b;");
     }
 
     /// Detail payloads are capped per file; totals still reflect every line.

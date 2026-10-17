@@ -1169,7 +1169,7 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCl
                 }
             }
             JsLockKind::Bun if report.bun_cli_present => {
-                if dispatch_bun_audit(&cwd, report, env, &label) {
+                if dispatch_bun_audit(repo, &cwd, report, env, &label) {
                     bun = true;
                     mark_audited(report, format!("npm:{rel_dir}"));
                 }
@@ -1189,7 +1189,7 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCl
             JsLockKind::Npm | JsLockKind::Bun | JsLockKind::Missing => {}
         }
         if report.npm_cli_present {
-            dispatch_npm_outdated(&cwd, report, env, &label);
+            dispatch_npm_outdated(repo, &cwd, report, env, &label);
         }
     }
     JsCliDispatch { npm, bun }
@@ -1229,6 +1229,7 @@ fn dispatch_npm_audit(
 
 /// True when the audit ran and its report parsed.
 fn dispatch_bun_audit(
+    repo: &Path,
     cwd: &Path,
     report: &mut DepsHealthReport,
     env: &ScanEnv,
@@ -1247,7 +1248,7 @@ fn dispatch_bun_audit(
     match run_json_cli(cwd, bun_program(), &["audit", "--json"], env) {
         Ok(text) => match parse_bun_audit_json(&text) {
             Ok(mut vulns) => {
-                let sections = declared_dependency_sections(&cwd.join("package.json"));
+                let sections = declared_sections_or_issue(repo, cwd, report, label);
                 for vuln in &mut vulns {
                     vuln.is_direct = sections.contains_key(&vuln.name);
                 }
@@ -1260,14 +1261,18 @@ fn dispatch_bun_audit(
     }
 }
 
-fn dispatch_npm_outdated(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, label: &str) {
+fn dispatch_npm_outdated(
+    repo: &Path,
+    cwd: &Path,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+    label: &str,
+) {
     match run_npm_json(cwd, &["outdated", "--json"], env) {
         Ok(text) => match parse_npm_outdated_json(&text) {
             Ok(mut rows) => {
-                fill_dependency_types(
-                    &mut rows,
-                    &declared_dependency_sections(&cwd.join("package.json")),
-                );
+                let sections = declared_sections_or_issue(repo, cwd, report, label);
+                fill_dependency_types(&mut rows, &sections);
                 report.outdated.append(&mut rows);
             }
             Err(e) => push_issue(
@@ -1943,7 +1948,13 @@ fn auditable_config_path(repo: &Path, locks: &[String]) -> Option<String> {
             if !canon.starts_with(repo) {
                 continue;
             }
-            let Some(text) = std::fs::read_to_string(&canon).ok() else {
+            // Bounded and non-following, like every manifest read: the size
+            // gate above measured the entry, this measures what is read.
+            let Some(text) =
+                crate::fs_entry::read_bounded_nofollow(&canon, MAX_MANIFEST_BYTES as usize)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            else {
                 continue;
             };
             if text.to_ascii_lowercase().contains("auditable") {
@@ -2827,29 +2838,35 @@ fn list_repo_files(repo: &Path) -> Result<(Vec<String>, Option<ScanLimitNotice>)
     Ok((out, limit))
 }
 
+/// Reads a manifest the one safe way: resolve it inside the repository
+/// (`sandbox_join_canonical`), then open the resolved path without following a
+/// link, non-blocking, and read at most [`MAX_MANIFEST_BYTES`] from the opened
+/// descriptor. The size gate therefore measures the file actually read (not a
+/// symlink's own length), a FIFO or device is refused instead of parking the
+/// caller, and a file that grows after the open is cut off.
+///
+/// `Ok(None)` is "no manifest here" (absent, or a directory). A file that is
+/// present but refused (oversized, not regular, unreadable) is an `Err` the
+/// caller reports, never an empty result.
+fn read_manifest_bytes(repo: &Path, rel: &str) -> Result<Option<Vec<u8>>, String> {
+    use crate::fs_entry::{read_bounded_nofollow, BoundedRead};
+    let canon = sandbox_join_canonical(repo, rel)?;
+    match read_bounded_nofollow(&canon, MAX_MANIFEST_BYTES as usize) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(BoundedRead::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(BoundedRead::NotRegular) if canon.is_dir() => Ok(None),
+        Err(BoundedRead::NotRegular) => Err(format!("{rel} is not a regular file")),
+        Err(BoundedRead::TooLarge | BoundedRead::Grew) => {
+            Err(format!("{rel} exceeds {MAX_MANIFEST_BYTES} byte limit"))
+        }
+        Err(BoundedRead::Io(e)) => Err(format!("Cannot read {rel}: {e}")),
+    }
+}
+
 fn read_npm_manifest(repo: &Path, rel: &str) -> Result<Option<NpmManifest>, String> {
-    let dest = sandbox_join(repo, rel)?;
-    let meta = match std::fs::symlink_metadata(&dest) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-    if meta.is_dir() {
+    let Some(bytes) = read_manifest_bytes(repo, rel)? else {
         return Ok(None);
-    }
-    let canon = dest
-        .canonicalize()
-        .map_err(|e| format!("Cannot read {rel}: {e}"))?;
-    if !canon.starts_with(repo) {
-        return Err(format!("{rel} escaped the repository"));
-    }
-    if meta.len() > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "{rel} exceeds {} byte limit ({})",
-            MAX_MANIFEST_BYTES,
-            meta.len()
-        ));
-    }
-    let bytes = std::fs::read(&canon).map_err(|e| format!("Cannot read {rel}: {e}"))?;
+    };
     if bytes.contains(&0) {
         return Err(format!("{rel} is binary"));
     }
@@ -2975,17 +2992,14 @@ fn declares_workspaces(repo: &Path, dir: &str) -> bool {
     if sandbox_join(repo, &join("pnpm-workspace.yaml")).is_ok_and(|p| p.is_file()) {
         return true;
     }
-    let Ok(path) = sandbox_join(repo, &join("package.json")) else {
-        return false;
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return false;
-    };
-    if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
-        return false;
-    }
-    std::fs::read_to_string(&path)
+    // A refused manifest (oversized, not regular, outside the repository)
+    // declares nothing here. This is a yes/no question with no issue list to
+    // report into; a tracked ancestor manifest is itself a scan candidate, and
+    // `read_npm_manifest` reports its refusal there.
+    read_manifest_bytes(repo, &join("package.json"))
         .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
         .and_then(|value| {
             value
@@ -3606,10 +3620,14 @@ pub(crate) fn parse_npm_outdated_json(text: &str) -> Result<Vec<OutdatedPackage>
 /// from the `location` path, which says where a package was installed and not
 /// how it was asked for.
 ///
-/// A manifest that cannot be read or parsed yields an empty map, leaving
-/// `dep_type` blank exactly as it was before — degrading to "unknown", never
-/// to a guess.
-fn declared_dependency_sections(manifest_path: &Path) -> BTreeMap<String, String> {
+/// An absent or unparsable manifest yields an empty map, leaving `dep_type`
+/// blank exactly as it was before — degrading to "unknown", never to a guess.
+/// One that is present but refused (oversized, not a regular file, outside the
+/// repository) is an `Err` the caller reports.
+fn declared_dependency_sections(
+    repo: &Path,
+    manifest_path: &Path,
+) -> Result<BTreeMap<String, String>, String> {
     const SECTIONS: [&str; 4] = [
         "dependencies",
         "devDependencies",
@@ -3617,11 +3635,12 @@ fn declared_dependency_sections(manifest_path: &Path) -> BTreeMap<String, String
         "peerDependencies",
     ];
     let mut sections = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(manifest_path) else {
-        return sections;
+    let rel = repo_relative(repo, manifest_path);
+    let Some(bytes) = read_manifest_bytes(repo, &rel)? else {
+        return Ok(sections);
     };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return sections;
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(sections);
     };
     for section in SECTIONS {
         let Some(entries) = value.get(section).and_then(|v| v.as_object()) else {
@@ -3636,7 +3655,27 @@ fn declared_dependency_sections(manifest_path: &Path) -> BTreeMap<String, String
                 .or_insert_with(|| section.to_string());
         }
     }
-    sections
+    Ok(sections)
+}
+
+/// The declared-section map for the manifest in `cwd`, with a refused manifest
+/// reported as an issue (and the map left empty) instead of read.
+fn declared_sections_or_issue(
+    repo: &Path,
+    cwd: &Path,
+    report: &mut DepsHealthReport,
+    label: &str,
+) -> BTreeMap<String, String> {
+    declared_dependency_sections(repo, &cwd.join("package.json")).unwrap_or_else(|message| {
+        push_issue(
+            &mut report.issues,
+            "warning",
+            "manifest_unreadable",
+            message,
+            Some(label.to_string()),
+        );
+        BTreeMap::new()
+    })
 }
 
 /// Fill in `dep_type` for rows npm did not label.
@@ -4870,7 +4909,8 @@ mod tests {
             }"#,
         )
         .expect("write manifest");
-        let sections = declared_dependency_sections(&dir.path().join("package.json"));
+        let sections = declared_dependency_sections(dir.path(), &dir.path().join("package.json"))
+            .expect("sections");
         assert_eq!(
             sections
                 .get("@sveltejs/vite-plugin-svelte")
@@ -4926,9 +4966,156 @@ mod tests {
     fn an_unreadable_manifest_leaves_types_blank_rather_than_wrong() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         // No manifest at all, then one that is not JSON.
-        assert!(declared_dependency_sections(&dir.path().join("package.json")).is_empty());
+        assert!(
+            declared_dependency_sections(dir.path(), &dir.path().join("package.json"))
+                .expect("sections")
+                .is_empty()
+        );
         std::fs::write(dir.path().join("package.json"), "{ not json").expect("write");
-        assert!(declared_dependency_sections(&dir.path().join("package.json")).is_empty());
+        assert!(
+            declared_dependency_sections(dir.path(), &dir.path().join("package.json"))
+                .expect("sections")
+                .is_empty()
+        );
+    }
+
+    /// A canonical in-repo fixture root: the manifest reads compare canonical
+    /// targets against the repo path, as `local_scan` supplies it.
+    #[cfg(unix)]
+    fn canonical_repo() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        (dir, root)
+    }
+
+    /// E-integrations-04: the size gate used to measure the symlink itself
+    /// (a few bytes) and then read the whole target.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_symlinked_to_a_large_in_repo_file_is_refused() {
+        let (_guard, repo) = canonical_repo();
+        fs::write(repo.join("big.json"), vec![b' '; 5 * 1024 * 1024]).expect("write big");
+        std::os::unix::fs::symlink("big.json", repo.join("package.json")).expect("symlink");
+        let err = read_npm_manifest(&repo, "package.json").expect_err("oversized target");
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_symlinked_outside_the_repo_is_refused_by_declares_workspaces() {
+        let (_guard, repo) = canonical_repo();
+        let (_outside_guard, outside) = canonical_repo();
+        let workspaces = r#"{ "workspaces": ["packages/*"] }"#;
+        fs::write(outside.join("package.json"), workspaces).expect("write outside");
+        std::os::unix::fs::symlink(outside.join("package.json"), repo.join("package.json"))
+            .expect("symlink");
+        assert!(
+            !declares_workspaces(&repo, ""),
+            "a link out of the repository must not be opened"
+        );
+        // Control: the same bytes in the repository are honoured.
+        fs::remove_file(repo.join("package.json")).expect("unlink");
+        fs::write(repo.join("package.json"), workspaces).expect("write inside");
+        assert!(declares_workspaces(&repo, ""));
+    }
+
+    /// A FIFO named package.json (reached directly or through an in-repo
+    /// link) parked `std::fs::read` forever; it must be refused promptly.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_package_json_is_refused_without_blocking() {
+        let (_guard, repo) = canonical_repo();
+        let status = Command::new("mkfifo")
+            .arg(repo.join("fifo.json"))
+            .status_locked()
+            .expect("mkfifo");
+        assert!(status.success());
+        std::os::unix::fs::symlink("fifo.json", repo.join("package.json")).expect("symlink");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_repo = repo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                read_npm_manifest(&worker_repo, "package.json"),
+                declares_workspaces(&worker_repo, ""),
+            ));
+        });
+        let (read, workspaces) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("manifest reads must not block on a FIFO");
+        let err = read.expect_err("a FIFO is not a manifest");
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!workspaces);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_normal_manifest_still_parses() {
+        let (_guard, repo) = canonical_repo();
+        fs::write(
+            repo.join("package.json"),
+            r#"{ "name": "ok", "workspaces": ["packages/*"] }"#,
+        )
+        .expect("write");
+        let manifest = read_npm_manifest(&repo, "package.json")
+            .expect("readable")
+            .expect("present");
+        assert_eq!(manifest.path, "package.json");
+        assert!(declares_workspaces(&repo, ""));
+        assert!(read_npm_manifest(&repo, "missing/package.json")
+            .expect("absent is not an error")
+            .is_none());
+    }
+
+    /// The declared-section read (after an audit finds vulnerabilities) had no
+    /// cap or link check at all; a refused manifest is now an error the
+    /// dispatcher turns into an issue.
+    #[cfg(unix)]
+    #[test]
+    fn declared_sections_refuse_an_oversized_or_escaping_manifest() {
+        let (_guard, repo) = canonical_repo();
+        let manifest = repo.join("package.json");
+        fs::write(repo.join("big.json"), vec![b' '; 5 * 1024 * 1024]).expect("write big");
+        std::os::unix::fs::symlink("big.json", &manifest).expect("symlink");
+        let err = declared_dependency_sections(&repo, &manifest).expect_err("oversized");
+        assert!(err.contains("exceeds"), "{err}");
+
+        let (_outside_guard, outside) = canonical_repo();
+        fs::write(
+            outside.join("package.json"),
+            r#"{"dependencies":{"x":"1"}}"#,
+        )
+        .expect("outside");
+        fs::remove_file(&manifest).expect("unlink");
+        std::os::unix::fs::symlink(outside.join("package.json"), &manifest).expect("symlink");
+        let err = declared_dependency_sections(&repo, &manifest).expect_err("escaping");
+        assert!(err.contains("escapes the repository"), "{err}");
+
+        fs::remove_file(&manifest).expect("unlink");
+        fs::write(&manifest, r#"{"dependencies":{"x":"1"}}"#).expect("inside");
+        let sections = declared_dependency_sections(&repo, &manifest).expect("sections");
+        assert_eq!(sections.get("x").map(String::as_str), Some("dependencies"));
+    }
+
+    /// The `.cargo/config.toml` read shared the same size-gate bypass.
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_config_symlinked_to_a_large_file_is_not_read() {
+        let (_guard, repo) = canonical_repo();
+        fs::create_dir(repo.join(".cargo")).expect("mkdir");
+        let mut big = b"# auditable\n".to_vec();
+        big.resize(5 * 1024 * 1024, b' ');
+        fs::write(repo.join("big.toml"), big).expect("write big");
+        std::os::unix::fs::symlink("../big.toml", repo.join(".cargo/config.toml"))
+            .expect("symlink");
+        fs::write(repo.join("Cargo.lock"), "").expect("lock");
+        assert_eq!(auditable_config_path(&repo, &["Cargo.lock".into()]), None);
+        // Control: a small config is read.
+        fs::remove_file(repo.join(".cargo/config.toml")).expect("unlink");
+        fs::write(repo.join(".cargo/config.toml"), "# auditable\n").expect("small");
+        assert_eq!(
+            auditable_config_path(&repo, &["Cargo.lock".into()]).as_deref(),
+            Some(".cargo/config.toml")
+        );
     }
 
     #[test]
