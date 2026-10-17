@@ -1,12 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
-  carriesEmbeddedCredential,
   describeRemotes,
   effectivePushUrl,
   hasSplitUrls,
   isDestructiveRemoteChange,
   parseRemoteList,
-  redactRemoteUrl,
   remoteChangeConsequence,
   remoteHost,
   validateRemoteName,
@@ -20,55 +18,12 @@ function remote(extra: Partial<RemoteInfo> = {}): RemoteInfo {
     name: "origin",
     fetch_url: "https://github.com/owner/repo.git",
     push_url: null,
+    has_credentials: false,
     tracking_branches: 3,
     is_default: true,
     ...extra,
   };
 }
-
-describe("redactRemoteUrl", () => {
-  it("removes an embedded token while keeping the account visible", () => {
-    // The failure this prevents: a personal access token rendered on screen,
-    // captured in a screenshot, and pasted into a bug report.
-    expect(redactRemoteUrl("https://alice:ghp_secrettoken@github.com/o/r.git")).toBe(
-      "https://alice@github.com/o/r.git",
-    );
-  });
-
-  it("keeps a plain userinfo with no password intact", () => {
-    expect(redactRemoteUrl("ssh://git@github.com/o/r.git")).toBe("ssh://git@github.com/o/r.git");
-  });
-
-  it("drops userinfo entirely when it is only a password", () => {
-    expect(redactRemoteUrl("https://:token@github.com/o/r.git")).toBe("https://github.com/o/r.git");
-  });
-
-  it("leaves URLs without userinfo untouched", () => {
-    for (const url of [
-      "https://github.com/o/r.git",
-      "git@github.com:o/r.git",
-      "/Volumes/Disk/repo.git",
-      "../sibling-repo",
-    ]) {
-      expect(redactRemoteUrl(url)).toBe(url);
-    }
-  });
-});
-
-describe("carriesEmbeddedCredential", () => {
-  it("detects a password in the URL", () => {
-    expect(carriesEmbeddedCredential("https://alice:token@github.com/o/r.git")).toBe(true);
-  });
-
-  it("does not flag a bare username, which is normal for ssh", () => {
-    expect(carriesEmbeddedCredential("ssh://git@github.com/o/r.git")).toBe(false);
-    expect(carriesEmbeddedCredential("git@github.com:o/r.git")).toBe(false);
-  });
-
-  it("handles an absent URL", () => {
-    expect(carriesEmbeddedCredential(null)).toBe(false);
-  });
-});
 
 describe("push URL handling", () => {
   it("falls back to the fetch URL when no push URL is set", () => {
@@ -240,6 +195,13 @@ describe("parseRemoteList", () => {
     expect(parseRemoteList({ remotes: [] }).failed).toBe(true);
     expect(parseRemoteList({ remotes: [remote()], truncated: "yes" }).failed).toBe(true);
     expect(parseRemoteList(null).failed).toBe(true);
+  });
+
+  it("carries has_credentials and fails closed when the backend omits it", () => {
+    const parsed = parseRemoteList({ remotes: [remote({ has_credentials: true })], truncated: false });
+    expect(parsed.remotes[0].has_credentials).toBe(true);
+    const { has_credentials: _omitted, ...legacy } = remote();
+    expect(parseRemoteList({ remotes: [legacy], truncated: false }).failed).toBe(true);
   });
 
   it("carries the truncated flag through", () => {

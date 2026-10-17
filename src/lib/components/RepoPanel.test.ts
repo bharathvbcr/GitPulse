@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import RepoPanel from "./RepoPanel.svelte";
+import { parseRemoteList } from "../repos/remotes";
 
 const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "RepoPanel.svelte"), "utf8");
 
@@ -28,6 +29,24 @@ describe("RepoPanel remotes", () => {
   it("says when the remote list was capped instead of looking complete", () => {
     expect(source).toContain("remotesTruncated");
     expect(source).toContain("More exist in .git/config and are not listed.");
+  });
+
+  it("prefills Set URL from the backend's display URL, never a token", () => {
+    // The backend owns redaction and re-attaches stored credentials when the
+    // display form is submitted unchanged, so the prefill is the display URL
+    // and the panel carries no second redactor of its own.
+    expect(source).toContain('editUrl = remote.fetch_url ?? "";');
+    expect(source).not.toContain("redactRemoteUrl");
+    expect(source).not.toContain("carriesEmbeddedCredential");
+    expect(source).toContain("{#if remote.has_credentials}");
+    // The only value the list handler can prefill from is the parsed payload.
+    const parsed = parseRemoteList({
+      remotes: [
+        { name: "origin", fetch_url: "https://user@host/o/r.git", push_url: null, has_credentials: true, tracking_branches: 0, is_default: true },
+      ],
+      truncated: false,
+    });
+    expect(parsed.remotes[0].fetch_url).not.toMatch(/:[^@/]+@/);
   });
 
   it("arms destructive remote changes before executing them", () => {

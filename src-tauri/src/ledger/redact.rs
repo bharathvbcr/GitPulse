@@ -783,6 +783,75 @@ pub fn carries_secret(value: &str) -> bool {
     text(value) != value
 }
 
+/// A remote URL as it may be shown, and whether the original embedded a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlDisplay {
+    pub display: String,
+    pub has_credentials: bool,
+}
+
+/// The display form of a remote URL: the userinfo's password is dropped and
+/// the username kept, so the configured account stays visible without the
+/// token.
+///
+/// - `https://user:tok@host/p` becomes `https://user@host/p`.
+/// - A lone userinfo on a non-ssh scheme (`https://ghp_xxx@host`) is dropped
+///   when [`text`] judges it a token; a plain name (`https://alice@host`) is
+///   kept. A lone `ssh://` / `git+ssh://` userinfo is an account name, kept.
+/// - scp-like `git@host:path`, local paths and URLs without userinfo are
+///   returned unchanged: they carry no password component.
+///
+/// The authority is read as git does (up to the first `/`, `?` or `#`) and its
+/// userinfo ends at the last `@`, so percent-encoded userinfo and bracketed
+/// IPv6 hosts survive. The result is also passed through [`text`], so any
+/// other secret shape in the string is removed too.
+pub fn url_for_display(url: &str) -> UrlDisplay {
+    let unchanged = |url: &str| {
+        let display = text(url);
+        UrlDisplay {
+            has_credentials: display != url,
+            display,
+        }
+    };
+    let Some((scheme, after)) = url.split_once("://") else {
+        return unchanged(url);
+    };
+    let scheme_ok = scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+    let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..authority_end];
+    let Some(at) = authority.rfind('@').filter(|_| scheme_ok) else {
+        return unchanged(url);
+    };
+    let (userinfo, host) = (&authority[..at], &authority[at + 1..]);
+    let tail = &after[authority_end..];
+    let (user, password) = match userinfo.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (userinfo, None),
+    };
+    let is_ssh = scheme.to_ascii_lowercase().ends_with("ssh");
+    let user_is_secret = !is_ssh && {
+        let probe = format!("{scheme}://{user}@{host}");
+        text(&probe) != probe
+    };
+    let keep_user = !user.is_empty() && !user_is_secret;
+    let has_credentials = password.is_some_and(|p| !p.is_empty()) || user_is_secret;
+    let display = if keep_user {
+        format!("{scheme}://{user}@{host}{tail}")
+    } else {
+        format!("{scheme}://{host}{tail}")
+    };
+    UrlDisplay {
+        display: text(&display),
+        has_credentials,
+    }
+}
+
 /// The redactor as it was before the single-parse, gated, copy-on-write
 /// rewrite: the oracle every equivalence test compares against.
 ///

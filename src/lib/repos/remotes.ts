@@ -15,8 +15,12 @@
 /** Mirrors the Rust `RemoteInfo`. */
 export interface RemoteInfo {
   name: string;
+  /** Display form: the backend has already removed any password or token. */
   fetch_url: string | null;
+  /** Display form, like `fetch_url`. */
   push_url: string | null;
+  /** Either URL embeds a password or token the display form dropped. */
+  has_credentials: boolean;
   tracking_branches: number;
   is_default: boolean;
 }
@@ -63,45 +67,28 @@ export function parseRemoteList(value: unknown): {
       name?: unknown;
       fetch_url?: unknown;
       push_url?: unknown;
+      has_credentials?: unknown;
       tracking_branches?: unknown;
       is_default?: unknown;
     };
-    if (typeof r.name !== "string" || typeof r.tracking_branches !== "number" || typeof r.is_default !== "boolean") {
+    if (
+      typeof r.name !== "string" ||
+      typeof r.tracking_branches !== "number" ||
+      typeof r.is_default !== "boolean" ||
+      typeof r.has_credentials !== "boolean"
+    ) {
       return { remotes: [], truncated: false, failed: true };
     }
     remotes.push({
       name: r.name,
       fetch_url: typeof r.fetch_url === "string" ? r.fetch_url : null,
       push_url: typeof r.push_url === "string" ? r.push_url : null,
+      has_credentials: r.has_credentials,
       tracking_branches: r.tracking_branches,
       is_default: r.is_default,
     });
   }
   return { remotes, truncated: rec.truncated, failed: false };
-}
-
-/**
- * Strips userinfo from a URL for display.
- *
- * `https://user:ghp_secret@github.com/o/r.git` renders as
- * `https://user@github.com/o/r.git` — enough to see which account is
- * configured, without putting the token on screen. Non-URL remotes (local
- * paths, scp-style `git@host:path`) are returned unchanged: they carry no
- * password component, and mangling a path would misrepresent the remote.
- */
-export function redactRemoteUrl(url: string): string {
-  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/@]*)@(.*)$/.exec(url);
-  if (!match) return url;
-  const [, scheme, userinfo, rest] = match;
-  const user = userinfo.split(":")[0];
-  return user ? `${scheme}${user}@${rest}` : `${scheme}${rest}`;
-}
-
-/** True when this remote's URL carries an embedded password or token. */
-export function carriesEmbeddedCredential(url: string | null): boolean {
-  if (!url) return false;
-  const match = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/@]*)@/.exec(url);
-  return Boolean(match && match[1].includes(":"));
 }
 
 /** The URL pushes actually go to: the push URL when set, else the fetch URL. */

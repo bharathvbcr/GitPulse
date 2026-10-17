@@ -92,7 +92,7 @@ describe("native repository commands", () => {
   it("opens the default remote website without credentials and surfaces handoff errors", async () => {
     const h = harness();
     h.deps.repo.listRemotes = async () => ({ remotes: [{ name: "origin", fetch_url: "https://user:secret@example.com/team/app.git",
-      push_url: null, is_default: true, tracking_branches: 0 }], truncated: false });
+      push_url: null, has_credentials: false, is_default: true, tracking_branches: 0 }], truncated: false });
     await h.commands.openRemote();
     expect(h.deps.open).toHaveBeenCalledExactlyOnceWith("https://example.com/team/app");
     h.deps.open = async () => { throw new Error("Browser refused"); };
@@ -102,7 +102,7 @@ describe("native repository commands", () => {
   it("does not infer a sole remote from a capped list", async () => {
     const h = harness();
     h.deps.repo.listRemotes = async () => ({ remotes: [{ name: "other", fetch_url: "git@example.com:team/app.git",
-      push_url: null, is_default: false, tracking_branches: 0 }], truncated: true });
+      push_url: null, has_credentials: false, is_default: false, tracking_branches: 0 }], truncated: true });
     await h.commands.openRemote();
     expect(h.deps.open).not.toHaveBeenCalled();
     expect(h.deps.error).toHaveBeenCalled();

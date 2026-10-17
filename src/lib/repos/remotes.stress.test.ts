@@ -14,6 +14,7 @@ function remote(name: string, extra: Partial<RemoteInfo> = {}): RemoteInfo {
     name,
     fetch_url: `https://example.test/${name}.git`,
     push_url: null,
+    has_credentials: false,
     tracking_branches: 0,
     is_default: name === "origin",
     ...extra,

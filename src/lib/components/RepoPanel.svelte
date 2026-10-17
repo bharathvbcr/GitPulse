@@ -33,10 +33,8 @@
   import { DEFAULT_AUTO_FETCH_MINUTES, MAX_AUTO_FETCH_MINUTES, MIN_AUTO_FETCH_MINUTES } from "../repos/autoFetch";
   import {
     describeRemotes,
-    carriesEmbeddedCredential,
     hasSplitUrls,
     isDestructiveRemoteChange,
-    redactRemoteUrl,
     remoteChangeConsequence,
     remoteHost,
     validateRemoteName,
@@ -461,7 +459,7 @@
                 </span>
               </div>
               <p class="mt-1 truncate font-mono text-[11px] text-textMuted">
-                {remote.fetch_url ? redactRemoteUrl(remote.fetch_url) : "no fetch URL"}
+                {remote.fetch_url ?? "no fetch URL"}
                 {#if remoteHost(remote.fetch_url)}
                   <span class="text-textMuted/70"> · {remoteHost(remote.fetch_url)}</span>
                 {/if}
@@ -472,14 +470,14 @@
                 <p class="mt-1 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
                   <AlertTriangle size={11} class="mt-0.5 shrink-0" />
                   <span class="min-w-0 break-all">
-                    Pushes go elsewhere: <span class="font-mono">{redactRemoteUrl(remote.push_url ?? "")}</span>
+                    Pushes go elsewhere: <span class="font-mono">{remote.push_url}</span>
                   </span>
                 </p>
               {/if}
-              {#if carriesEmbeddedCredential(remote.fetch_url) || carriesEmbeddedCredential(remote.push_url)}
+              {#if remote.has_credentials}
                 <p class="mt-1 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
                   <ShieldAlert size={11} class="mt-0.5 shrink-0" />
-                  <span>This URL embeds a password or token. It is hidden here, but it is stored in plain text in .git/config.</span>
+                  <span>This URL embeds a password or token. It is hidden here and kept when you apply the URL shown, but it is stored in plain text in .git/config.</span>
                 </p>
               {/if}
               <div class="mt-2 flex flex-wrap items-center gap-1.5">
