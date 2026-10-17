@@ -1006,3 +1006,134 @@ fn a_named_base_that_judges_nothing_or_is_not_a_commit_is_refused_without_starti
         "nothing may be started for a refused base"
     );
 }
+
+// ---- adversarial review of the post-merge base (b17/007a2b4b-adv) ----
+
+/// A claimed attempt in its own worktree and branch, so two members can coexist.
+fn claimed_named_attempt(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+    parent: &tempfile::TempDir,
+    name: &str,
+) -> String {
+    let linked = parent.path().join(name);
+    let linked_str = linked.to_str().unwrap().to_owned();
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "add", "-q", "-b", name, &linked_str],
+    );
+    crate::test_support::git_in(
+        &linked,
+        &["commit", "-q", "--allow-empty", "-m", &format!("work of {name}")],
+    );
+    let claimed = complete_task(store, &linked_str, id, "done", None, Some("done"), None).unwrap();
+    assert_eq!(claimed["status"], "review", "{claimed}");
+    linked_str
+}
+
+#[test]
+fn two_members_merged_in_turn_are_each_judged_over_their_own_pre_merge_tip() {
+    let (_d, store, repo, id_a) = setup();
+    let id_b = filed(&store, &repo, "gp-drv-b", "Ship the importer");
+    let parent = tempfile::tempdir().unwrap();
+    let lin_a = claimed_named_attempt(&store, &repo, &id_a, &parent, "mem-a");
+    let lin_b = claimed_named_attempt(&store, &repo, &id_b, &parent, "mem-b");
+    let before_a = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--no-ff", "-m", "A", "mem-a"]);
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &lin_a]);
+    let before_b = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--no-ff", "-m", "B", "mem-b"]);
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &lin_b]);
+    let tip = head_of(&repo);
+    assert_ne!(before_a, before_b);
+    let fake = Fake::new();
+    run_now(&store, &fake, &id_a, Some(&before_a)).expect("A over A's merge and B's");
+    run_now(&store, &fake, &id_b, Some(&before_b)).expect("B over B's merge");
+    let sent = fake.starts.borrow();
+    assert_eq!(sent[0]["base"], before_a.as_str());
+    assert_eq!(sent[0]["head"], tip.as_str());
+    assert_eq!(sent[1]["base"], before_b.as_str());
+    assert_eq!(sent[1]["head"], tip.as_str());
+    assert_ne!(sent[0]["base"], sent[1]["base"]);
+}
+
+#[test]
+fn a_short_uppercase_or_padded_base_resolves_to_the_full_commit_id() {
+    let (_d, store, repo, id) = setup();
+    let first = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    let fake = Fake::new();
+    let forms = [
+        first[..7].to_owned(),
+        first.to_uppercase(),
+        format!("  {first}\n"),
+    ];
+    for form in &forms {
+        run_now(&store, &fake, &id, Some(form)).unwrap_or_else(|e| panic!("{form:?}: {e:?}"));
+    }
+    for sent in fake.starts.borrow().iter() {
+        assert_eq!(sent["base"], first.as_str(), "the full id is what is started");
+    }
+}
+
+#[test]
+fn a_64_hex_base_in_a_sha1_repository_and_other_malformed_bases_start_nothing() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    let fake = Fake::new();
+    let sha256 = "a".repeat(64);
+    let too_long = "a".repeat(65);
+    let too_short = "abcdef".to_owned();
+    let empty = String::new();
+    for named in [&sha256, &too_long, &too_short, &empty] {
+        let error = run_now(&store, &fake, &id, Some(named)).expect_err(named);
+        assert!(
+            error.code == "invalid_input" || error.code == "repository_unavailable",
+            "{named}: {error:?}"
+        );
+    }
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn a_target_force_moved_after_the_merge_refuses_the_recorded_base() {
+    let (_d, store, repo, id) = setup();
+    let before = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "-c", "side"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "side"]);
+    let side = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "merge"]);
+    let merged = head_of(&repo);
+    // Force-moved onto an unrelated line: the recorded base is no ancestor of the head.
+    crate::test_support::git_in(repo.path(), &["reset", "-q", "--hard", &side]);
+    let fake = Fake::new();
+    let e = run_now(&store, &fake, &id, Some(&merged)).expect_err("merged is not below side");
+    assert_eq!(e.code, "invalid_input", "{e:?}");
+    // Force-moved back to the pre-merge tip: an empty range.
+    crate::test_support::git_in(repo.path(), &["reset", "-q", "--hard", &before]);
+    let e = run_now(&store, &fake, &id, Some(&before)).expect_err("base == head");
+    assert_eq!(e.code, "invalid_input", "{e:?}");
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+#[ignore = "break: a hex-looking base that is also a branch name resolves to the branch, not the commit id; named_base passes the caller's text to rev-parse instead of checking it is an object id"]
+fn a_hex_base_that_is_also_a_branch_name_is_not_read_as_the_branch() {
+    let (_d, store, repo, id) = setup();
+    let root = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "before"]);
+    let before = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    // A branch named like the abbreviated id of `before`, pointing at the root commit.
+    crate::test_support::git_in(repo.path(), &["branch", &before[..12], &root]);
+    let fake = Fake::new();
+    let _ = run_now(&store, &fake, &id, Some(&before[..12]));
+    let sent = fake.starts.borrow();
+    assert!(
+        sent.is_empty() || sent[0]["base"] == before.as_str(),
+        "the base asked for was {before} but the range starts at {}",
+        sent[0]["base"]
+    );
+}
