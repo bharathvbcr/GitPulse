@@ -269,11 +269,48 @@ pub(super) fn network_probes() -> usize {
     NETWORK_PROBES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Prefix of the line `curl_head_args` asks curl to print after the headers:
+/// the final response's status, after every redirect.
+const HEAD_STATUS_PREFIX: &str = "gitpulse-http-status:";
+
+/// No `-f`: with it a 404 exits with a code (56 on a HEAD to GitHub, measured
+/// 2026-10-17) that does not tell "the asset is not there" from "the server
+/// could not be asked". The status is read from `-w` instead.
 fn curl_head_args(url: &str) -> Vec<String> {
-    let mut args: Vec<String> = ["-fsI", "-L"].map(String::from).into();
+    let mut args: Vec<String> = ["-sI", "-L"].map(String::from).into();
     args.extend(CURL_HTTPS_ONLY.map(String::from));
-    args.extend(["--max-time".to_string(), "15".to_string(), url.to_string()]);
+    args.extend([
+        "--max-time".to_string(),
+        "15".to_string(),
+        "-w".to_string(),
+        format!("\n{HEAD_STATUS_PREFIX}%{{http_code}}\n"),
+        url.to_string(),
+    ]);
     args
+}
+
+/// What a HEAD answered: `Ok(true)` for a 2xx, `Ok(false)` only when the
+/// server said the thing is not there (404, 410), and `Err` for everything
+/// else. A DNS failure, a timeout, a 403 or a 5xx is a question that went
+/// unanswered, never evidence of absence.
+fn head_verdict(success: bool, stdout: &[u8]) -> Result<bool, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let code = text
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(HEAD_STATUS_PREFIX))
+        .map(str::trim)
+        .ok_or_else(|| "curl reported no HTTP status".to_string())?;
+    let status: u16 = code
+        .parse()
+        .map_err(|_| format!("curl reported an unreadable HTTP status '{code}'"))?;
+    match (success, status) {
+        (true, 200..=299) => Ok(true),
+        (true, 404 | 410) => Ok(false),
+        (_, 0) => Err("no HTTP response (name resolution, connection or deadline)".into()),
+        (false, _) => Err(format!("the request ended early after HTTP {status}")),
+        (true, _) => Err(format!("HTTP {status}")),
+    }
 }
 
 fn curl_download_args(url: &str, dest: &Path) -> Vec<String> {
@@ -298,7 +335,8 @@ pub(crate) fn http_head_ok(url: &str) -> Result<bool, String> {
     cmd.args(curl_head_args(url));
     let run =
         git_cli::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
-    Ok(run.success)
+    head_verdict(run.success, &run.stdout)
+        .map_err(|e| format!("{e} (curl exit {})", run.status_code))
 }
 
 fn download_to(url: &str, dest: &Path) -> Result<(), String> {
@@ -739,6 +777,62 @@ mod tests {
                 .expect("--proto-redir");
             assert_eq!(args[at + 1], "=https");
         }
+    }
+
+    /// What curl printed for a HEAD, as `head_verdict` reads it: the headers,
+    /// then the status line `curl_head_args` asks for.
+    fn head_output(final_code: &str) -> Vec<u8> {
+        format!(
+            "HTTP/2 302 \r\nlocation: https://release-assets.example/a\r\n\r\nHTTP/2 {final_code} \r\n\r\n{HEAD_STATUS_PREFIX}{final_code}\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_head_is_published_only_on_a_2xx_and_absent_only_on_a_404() {
+        assert_eq!(head_verdict(true, &head_output("200")), Ok(true));
+        assert_eq!(head_verdict(true, &head_output("404")), Ok(false));
+        assert_eq!(head_verdict(true, &head_output("410")), Ok(false));
+    }
+
+    #[test]
+    fn a_head_that_could_not_be_answered_is_an_error_not_an_absent_asset() {
+        // These used to read as Ok(false), "not published", and the update
+        // check then said "up to date" about a check that never happened.
+        for (success, out) in [
+            (true, head_output("503")),
+            (true, head_output("403")),
+            // Name resolution or connection failure: curl reports 000.
+            (false, head_output("000")),
+            // A deadline cut the transfer after a 200 arrived.
+            (false, head_output("200")),
+            // No status line at all.
+            (false, Vec::new()),
+            (true, b"garbage".to_vec()),
+        ] {
+            let verdict = head_verdict(success, &out);
+            assert!(
+                verdict.is_err(),
+                "{verdict:?} for {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn the_head_request_reports_its_status_instead_of_failing_on_it() {
+        let args = curl_head_args("https://example.com/a");
+        // `-f` turns a 404 into an exit code that a 5xx and a dropped
+        // connection share, which is how "absent" and "could not ask" merged.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('f')),
+            "{args:?}"
+        );
+        let at = args.iter().position(|a| a == "-w").expect("-w");
+        assert!(args[at + 1].contains(HEAD_STATUS_PREFIX));
+        assert!(args[at + 1].contains("%{http_code}"));
     }
 
     #[test]
