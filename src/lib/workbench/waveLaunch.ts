@@ -220,13 +220,46 @@ export interface WaveRunner {
   readonly record: () => WaveRecord;
   /** Resolves when the wave is no longer running. */
   readonly finished: Promise<WaveRecord>;
+  /** A stop was asked for and the wave has not settled yet: a merge in flight is let finish, so the panel says it is stopping after it. */
+  readonly stopping: () => boolean;
   /** Stops launching and merging. Runs already started are left to their agents. */
   cancel(): Promise<void>;
 }
 
+/** At most `limit` of the works handed to `run` are in flight at once; the rest wait their turn, and leave the queue when `signal` aborts. */
+class Limiter {
+  private active = 0;
+  private readonly waiting: (() => void)[] = [];
+  constructor(private readonly limit: number) {}
+
+  async run<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    while (this.active >= this.limit) {
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) { reject(new Error("The wave was stopped.")); return; }
+        const turn = () => { signal.removeEventListener("abort", stop); resolve(); };
+        const stop = () => {
+          const at = this.waiting.indexOf(turn);
+          if (at >= 0) this.waiting.splice(at, 1);
+          reject(new Error("The wave was stopped."));
+        };
+        this.waiting.push(turn);
+        signal.addEventListener("abort", stop, { once: true });
+      });
+    }
+    this.active += 1;
+    try { return await work(); } finally { this.active -= 1; this.waiting.shift()?.(); }
+  }
+}
+
+/** Whether a priority filter is one the panel can have chosen. */
+function validPriority(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 9;
+}
+
 /** Starts a new wave and returns at once; `finished` settles when it stops running. */
-export async function startWave(input: { repositoryId: string; n: number; waves: number; acceptUnchecked?: boolean }, deps: WaveDeps): Promise<WaveRunner> {
+export async function startWave(input: { repositoryId: string; n: number; waves: number; acceptUnchecked?: boolean; maxPriority?: number }, deps: WaveDeps): Promise<WaveRunner> {
   const record: WaveRecord = { v: 1, id: deps.id(), repositoryId: input.repositoryId, n: clampWaveSize(input.n), batchesLeft: clampWaves(input.waves), batch: 0, state: "running", members: [], attempted: [], note: "", seq: 0, acceptUnchecked: input.acceptUnchecked === true };
+  if (validPriority(input.maxPriority)) record.maxPriority = input.maxPriority;
   return drive(record, deps, true);
 }
 
@@ -235,16 +268,34 @@ export function resumeWave(record: WaveRecord, deps: WaveDeps): Promise<WaveRunn
   return drive(record, deps, false);
 }
 
+/** Why a verdict for the merged checkout is not a pass, or null when it is one for exactly `tip`. */
+function gateFault(verdict: VerdictRead | null, why: string, tip: string): string | null {
+  if (!verdict) return `could not run (${why})`;
+  if (verdict.state !== "passed") return `was ${verdict.state.replace("_", " ")}`;
+  if (verdict.stale || !verdict.head || verdict.head !== tip) return "was not a verdict for the merged checkout's tip";
+  return null;
+}
+
 async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise<WaveRunner> {
   // A merge interrupted by a restart may or may not have happened; it is never repeated blind.
+  // A member left in `verifying_merge` did merge: it stays there, and its gate runs again.
   let record = fresh ? start : { ...start, members: start.members.map((m) => (m.phase === "merging" ? { ...m, phase: "held" as MemberPhase, detail: "Interrupted while merging; check the branch before merging again." } : m)) };
   // A merge cut off by a restart may have conflicted and been rolled back, or landed: its outcome is unknown, and every member behind it was cut from the same base.
   const interrupted = !fresh && start.state === "running" ? start.members.find((m) => m.phase === "merging") : undefined;
   const abort = new AbortController();
+  const limiter = new Limiter(Math.max(1, Math.floor(deps.verifyLimit) || 1));
+  const inflight = new Map<string, Promise<void>>();
+  // A verification that settled badly (its record could not be written) is the wave's failure; the loop rethrows it.
+  const fatal: { raised: boolean; cause: unknown } = { raised: false, cause: undefined };
   let cancelled = false;
+  // Verifications settle concurrently, but the record is written one write at a time, in seq order.
+  let writing: Promise<void> = Promise.resolve();
   const save = async (change: Partial<WaveRecord> = {}) => {
     record = { ...record, ...change, seq: record.seq + 1 };
-    await deps.persist(record);
+    const snapshot = record;
+    const turn = writing.then(() => deps.persist(snapshot));
+    writing = turn.then(() => undefined, () => undefined);
+    await turn;
   };
   const stopTerminal = async (state: WaveState, note: string) => {
     const members = record.members.map((m) => (TERMINAL.has(m.phase) ? m : { ...m, phase: "stopped" as MemberPhase, detail: m.detail || note }));
@@ -287,7 +338,9 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     return true;
   };
 
+  /** Changes one member of a wave that is still running; a verification that settles after the wave ended writes nothing. */
   const update = async (taskId: string, change: Partial<WaveMember>) => {
+    if (record.state !== "running") return;
     await save({ members: record.members.map((m) => (m.taskId === taskId ? { ...m, ...change } : m)) });
   };
 
@@ -318,26 +371,73 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         return;
       }
       await update(m.taskId, { phase: "verifying" });
-      return;
-    }
-    if (m.phase === "verifying") {
-      let verdict: VerdictRead, head: string;
-      try {
-        verdict = await deps.verify(m.taskId, abort.signal);
-        head = m.cwd ? await deps.headOf(m.cwd, abort.signal) : "";
-      } catch (cause) {
-        if (cancelled) return;
-        await update(m.taskId, { phase: "held", detail: `Verification could not run: ${message(cause)}` }); return; }
-      if (verdict.state !== "passed") { await update(m.taskId, { phase: "held", detail: `Verification ${verdict.state.replace("_", " ")}; this is not a pass, so it is left for review.` }); return; }
-      if (verdict.stale || !verdict.head || !head || verdict.head !== head) {
-        await update(m.taskId, { phase: "held", detail: "The passing verdict is not for the commit the worktree is at, so it is left for review." });
-        return;
-      }
-      await update(m.taskId, { phase: "ready", head });
     }
   };
 
-  /** One merge at a time, in launch order, each followed by a re-verify; a failed one halts the merges. */
+  /** One member's verification, started once and left to settle beside the others, at most `verifyLimit` at a time. */
+  const verifyMember = async (m: WaveMember) => {
+    let verdict: VerdictRead, head: string;
+    try {
+      verdict = await limiter.run(() => deps.verify(m.taskId, abort.signal), abort.signal);
+      head = m.cwd ? await deps.headOf(m.cwd, abort.signal) : "";
+    } catch (cause) {
+      if (cancelled) return;
+      await update(m.taskId, { phase: "held", detail: `Verification could not run: ${message(cause)}` }); return; }
+    if (verdict.state !== "passed") { await update(m.taskId, { phase: "held", detail: `Verification ${verdict.state.replace("_", " ")}; this is not a pass, so it is left for review.` }); return; }
+    if (verdict.stale || !verdict.head || !head || verdict.head !== head) {
+      await update(m.taskId, { phase: "held", detail: "The passing verdict is not for the commit the worktree is at, so it is left for review." });
+      return;
+    }
+    await update(m.taskId, { phase: "ready", head });
+  };
+
+  const startVerification = (m: WaveMember) => {
+    const settled = verifyMember(m)
+      .catch((cause: unknown) => { if (!fatal.raised) { fatal.raised = true; fatal.cause = cause; } })
+      .finally(() => { inflight.delete(m.taskId); });
+    inflight.set(m.taskId, settled);
+  };
+
+  /**
+   * The gate after a merge: re-verifies every member merged so far in this batch
+   * over the range from the target's tip before its own merge to the checkout's
+   * tip now. Only then is the member that just merged `merged`; a fault halts the
+   * wave and is written on the member it was found in.
+   */
+  const gateMerge = async () => {
+    const landed = record.members.find((m) => m.phase === "verifying_merge");
+    if (!landed) return;
+    if (cancelled) {
+      await update(landed.taskId, { phase: "held", detail: `${landed.detail} The wave was stopped before the merge was re-verified; check the main checkout.`.trim() });
+      return;
+    }
+    const tip = landed.mergeAfter, base = landed.mergeBefore;
+    if (!tip || !base) {
+      // Fail closed: without where the merge landed there is no range to judge, and nothing may read as verified.
+      await update(landed.taskId, { phase: "held", detail: `${landed.detail} Where the merge landed was not recorded, so it was not re-verified; check the main checkout.`.trim() });
+      await stopTerminal("halted", `Re-verification after merging "${landed.title}" could not run (where the merge landed was not recorded); no further merge was made.`);
+      return;
+    }
+    const judged = record.members.flatMap((m) => ((m.phase === "merged" || m.phase === "verifying_merge") && m.mergeBefore ? [{ m, base: m.mergeBefore }] : []));
+    const results = await Promise.all(judged.map(async ({ m, base: from }) => {
+      try { return { m, verdict: await limiter.run(() => deps.verify(m.taskId, abort.signal, { base: from, head: tip }), abort.signal), why: "" }; }
+      catch (cause) { return { m, verdict: null, why: message(cause) }; }
+    }));
+    if (cancelled) {
+      await update(landed.taskId, { phase: "held", detail: `${landed.detail} The wave was stopped before the merge was re-verified; check the main checkout.`.trim() });
+      return;
+    }
+    const faults = results.flatMap((r) => { const fault = gateFault(r.verdict, r.why, tip); return fault ? [{ m: r.m, fault }] : []; });
+    const own = faults.find((f) => f.m.taskId === landed.taskId);
+    await update(landed.taskId, { phase: "merged", detail: own ? `${landed.detail} Re-verification after the merge ${own.fault}.` : landed.detail });
+    for (const f of faults) {
+      if (f.m.taskId !== landed.taskId) await update(f.m.taskId, { detail: `${f.m.detail} Re-verification after merging "${landed.title}" ${f.fault}.`.trim() });
+    }
+    const first = own ?? faults[0];
+    if (first) await stopTerminal("halted", `Re-verification after merging "${landed.title}" ${first === own ? first.fault : `found "${first.m.title}" ${first.fault}`}; no further merge was made.`);
+  };
+
+  /** One merge at a time, in launch order; the merge is recorded as `verifying_merge`, and the gate runs on the loop's next turn. */
   const mergeNext = async (): Promise<boolean> => {
     const next = record.members.find((m) => m.phase === "ready");
     if (!next || !next.cwd || !next.head) return false;
@@ -349,9 +449,9 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       return true;
     }
     await update(next.taskId, { phase: "merging" });
+    let said: MergeRead;
     try {
-      const said = await deps.merge({ taskId: next.taskId, runId: next.runId, cwd: next.cwd, head: next.head });
-      await update(next.taskId, { phase: "merged", detail: said });
+      said = await deps.merge({ taskId: next.taskId, runId: next.runId, cwd: next.cwd, head: next.head });
     } catch (cause) {
       const halting = haltingCode(cause);
       if (halting) {
@@ -366,12 +466,9 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
       return true;
     }
-    let again: VerdictRead | null = null, why = "";
-    try { again = await deps.verify(next.taskId, abort.signal); } catch (cause) { why = message(cause); }
-    if (cancelled) return true;
-    if (!again || again.state !== "passed") {
-      await stopTerminal("halted", `Re-verification after merging "${next.title}" ${again ? `was ${again.state.replace("_", " ")}` : `could not run (${why})`}; no further merge was made.`);
-    }
+    // Written before the gate runs, so a restart between the merge and its re-verify finds the member here and runs the gate.
+    // Outside the try: a record that cannot be kept after a merge landed is the wave's failure, never "not merged".
+    await update(next.taskId, { phase: "verifying_merge", detail: said.message, mergeBefore: said.beforeOid || null, mergeAfter: said.afterOid || null });
     return true;
   };
 
@@ -383,12 +480,16 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         await stopTerminal("halted", `The merge of "${interrupted.title}" was interrupted by a restart; check the main checkout and the branch before merging anything else. Nothing was launched or merged.`);
       }
       while (record.state === "running") {
+        if (fatal.raised) throw fatal.cause;
+        // A merge that has no gate outcome yet comes first, after a restart as after a merge.
+        if (record.members.some((m) => m.phase === "verifying_merge")) { await gateMerge(); continue; }
         if (cancelled) { await stopTerminal("cancelled", "Stopped by the person; no further task was launched or merged."); break; }
-        const live = record.members.find((m) => m.phase === "launching" || m.phase === "running" || m.phase === "verifying");
-        // Phases advance one member at a time so every transition is persisted before the next effect.
+        // Phases advance one member at a time so every transition is persisted before the next effect;
+        // verifications are only started here and settle on their own, up to the host's limit.
         for (const m of record.members) {
           if (cancelled || record.state !== "running") break;
-          if (m.phase === "launching" || m.phase === "running" || m.phase === "verifying") await stepMember(m);
+          if (m.phase === "launching" || m.phase === "running") await stepMember(m);
+          else if (m.phase === "verifying" && !inflight.has(m.taskId)) startVerification(m);
         }
         if (cancelled || record.state !== "running") continue;
         if (await mergeNext()) continue;
@@ -397,7 +498,9 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
           await save({ state: "done", note: record.note || "Every batch has run." });
           break;
         }
-        if (live || record.members.some((m) => m.phase === "ready")) await deps.sleep(deps.pollMs, abort.signal);
+        // A run is polled; a verification says when it settles, so waiting on it alone needs no timer.
+        if (record.members.some((m) => m.phase === "launching" || m.phase === "running" || m.phase === "ready")) await Promise.race([deps.sleep(deps.pollMs, abort.signal), ...inflight.values()]);
+        else if (inflight.size > 0) await Promise.race(inflight.values());
       }
     } catch (cause) {
       if (cancelled && record.state === "running") {
@@ -407,12 +510,16 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         try { await save({ state: "failed", note: `The wave stopped because its state could not be kept or read: ${message(cause)}` }); } catch { record = { ...record, state: "failed", note: `The wave stopped and its state could not be saved: ${message(cause)}` }; }
       }
     }
+    // Whatever the wave ended on, no verification of it is left waiting out its deadline.
+    abort.abort();
+    await Promise.allSettled([...inflight.values()]);
     return record;
   })();
 
   return {
     record: () => record,
     finished: loop,
+    stopping: () => cancelled && record.state === "running",
     async cancel() { cancelled = true; abort.abort(); await loop; },
   };
 }

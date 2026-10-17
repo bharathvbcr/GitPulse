@@ -72,6 +72,15 @@ describe("WavePanel", () => {
     expect(body).toContain("Refused to launch from a partial ranking: batch 1");
   });
 
+  it("says which priority filter the wave asks with, and labels a member whose merge is being re-verified", () => {
+    wave.record = running([member("verifying_merge")]);
+    const any = html("repo-1");
+    expect(any).toContain("Verifying the merge");
+    expect(any).toMatch(/data-testid="wave-priority"[^>]*>Asks for tasks of any priority/);
+    const urgent = render(WavePanel, { props: { repositoryId: "repo-1", maxPriority: 0 } }).body;
+    expect(urgent).toMatch(/data-testid="wave-priority"[^>]*>Asks for tasks at priority Urgent or higher/);
+  });
+
   it("is mounted on the board beside Suggest next, scoped to the repository board only", () => {
     const board = readFileSync(new URL("./TaskBoard.svelte", import.meta.url), "utf8");
     expect(board).toContain('<WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} />');

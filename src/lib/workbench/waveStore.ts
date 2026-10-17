@@ -26,7 +26,7 @@ export interface WaveTaskApi {
   listCards(status: TaskStatus, cursor?: string): Promise<{ items: TaskCard[]; has_more: boolean; next_cursor: string | null }>;
 }
 
-const PHASES: readonly MemberPhase[] = ["launching", "running", "verifying", "ready", "merging", "merged", "held", "stopped"];
+const PHASES: readonly MemberPhase[] = ["launching", "running", "verifying", "ready", "merging", "verifying_merge", "merged", "held", "stopped"];
 const STATES: readonly WaveState[] = ["running", "done", "cancelled", "halted", "failed", "refused"];
 const MAX_TEXT = 4096;
 
@@ -50,7 +50,15 @@ function decodeMember(value: unknown): WaveMember | null {
   const cwd = nullable(m.cwd, 4096), head = nullable(m.head, 128);
   const startedAt = typeof m.startedAt === "number" && Number.isFinite(m.startedAt) ? m.startedAt : null;
   if (!phase || !taskId || title === null || !runId || !requestId || detail === null || !cwd.ok || !head.ok || startedAt === null) return null;
-  return { taskId, title, phase, runId, requestId, cwd: cwd.value, head: head.value, detail, startedAt };
+  const decoded: WaveMember = { taskId, title, phase, runId, requestId, cwd: cwd.value, head: head.value, detail, startedAt };
+  // Written with `verifying_merge`; a record from before the gate has neither, and still decodes. A present but malformed value does not.
+  for (const key of ["mergeBefore", "mergeAfter"] as const) {
+    if (m[key] === undefined) continue;
+    const oid = nullable(m[key], 128);
+    if (!oid.ok) return null;
+    decoded[key] = oid.value;
+  }
+  return decoded;
 }
 
 /** The record in a card's logs, or null when there is none or it is not a record this build can trust. */
@@ -73,6 +81,11 @@ export function decodeWave(logs: string | undefined): WaveRecord | null {
   if (r.acceptUnchecked !== undefined && typeof r.acceptUnchecked !== "boolean") return null;
   const decoded: WaveRecord = { v: 1, id, repositoryId, n, batchesLeft, batch, state, members: members as WaveMember[], attempted: attempted as string[], note, seq };
   if (r.acceptUnchecked !== undefined) decoded.acceptUnchecked = r.acceptUnchecked;
+  if (r.maxPriority !== undefined) {
+    const priority = int(r.maxPriority, 0, 9);
+    if (priority === null) return null;
+    decoded.maxPriority = priority;
+  }
   return decoded;
 }
 

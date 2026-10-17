@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { explainError, getRepository } from "../workbench/client";
+  import { priorityLabel } from "../workbench/taskOrganize";
   import { beginWave, currentWave, resumeActiveWave } from "../workbench/waveHost";
   import { DEFAULT_WAVES, DEFAULT_WAVE_SIZE, MAX_WAVES, MAX_WAVE_SIZE, clampWaveSize, clampWaves, type MemberPhase, type WaveRecord, type WaveRunner } from "../workbench/waveLaunch";
 
@@ -11,8 +12,12 @@
    * It only drives `waveHost`; the wave itself outlives this panel (closing
    * it does not stop it) and survives a restart on the cards it is working on.
    */
-  interface Props { repositoryId: string | null }
-  let { repositoryId }: Props = $props();
+  interface Props {
+    repositoryId: string | null;
+    /** The Suggest next panel's priority filter (a level 0-3, or "all"); a wave asks Manvi for suggestions with the same one. */
+    maxPriority?: number | "all";
+  }
+  let { repositoryId, maxPriority = "all" }: Props = $props();
 
   let size = $state(DEFAULT_WAVE_SIZE);
   let waves = $state(DEFAULT_WAVES);
@@ -21,6 +26,8 @@
   let error = $state("");
   let partial = $state(false);
   let busy = $state(false);
+  /** A stop was pressed and the wave has not settled: a merge in flight is let finish first. */
+  let stopping = $state(false);
   let acceptUnchecked = $state(false);
   let names = $state<Record<string, string>>({});
   let stopPoll: (() => void) | null = null;
@@ -32,7 +39,7 @@
   const nameOf = (id: string | null) => (id ? names[id] ?? id : "no repository");
   const LABELS: Record<MemberPhase, string> = {
     launching: "Launching", running: "Agent working", verifying: "Verifying", ready: "Verified, waiting to merge",
-    merging: "Merging", merged: "Merged", held: "Held for review", stopped: "Stopped",
+    merging: "Merging", verifying_merge: "Verifying the merge", merged: "Merged", held: "Held for review", stopped: "Stopped",
   };
   const STATES: Record<WaveRecord["state"], string> = {
     running: "Running", done: "Finished", cancelled: "Stopped", halted: "Halted after a failed re-verify", failed: "Stopped: its state could not be kept", refused: "Refused to launch from a partial ranking",
@@ -76,16 +83,20 @@
   async function start() {
     if (!repositoryId || busy || running) return;
     busy = true; error = "";
-    try { watch(await beginWave({ repositoryId, n: clampWaveSize(size), waves: clampWaves(waves), acceptUnchecked })); }
+    try { watch(await beginWave({ repositoryId, n: clampWaveSize(size), waves: clampWaves(waves), acceptUnchecked, ...(maxPriority === "all" ? {} : { maxPriority }) })); }
     catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) busy = false; }
   }
   async function stop() {
     if (!runner || busy) return;
-    busy = true;
-    try { await runner.cancel(); if (!disposed && runner) record = runner.record(); }
+    busy = true; stopping = true;
+    // Every wait but a merge ends at once; a merge in flight finishes or rolls back first, and the panel says so meanwhile.
+    const settling = runner.cancel();
+    const watching = runner;
+    const follow = setInterval(() => { if (!disposed && runner === watching) record = watching.record(); }, 250);
+    try { await settling; if (!disposed && runner) record = runner.record(); }
     catch (cause) { if (!disposed) error = explainError(cause); }
-    finally { if (!disposed) busy = false; }
+    finally { clearInterval(follow); if (!disposed) { busy = false; stopping = false; } }
   }
 </script>
 
@@ -107,6 +118,8 @@
       <button type="button" class="gp-btn-primary" onclick={() => void start()} disabled={busy || !repositoryId} title={repositoryId ? "Launch the top suggested tasks, verify, merge the passing ones, then the next." : "Choose a repository board: a wave launches in one repository."} data-testid="wave-start">{busy ? "Starting…" : "Start"}</button>
     {/if}
   </div>
+  <p class="note" data-testid="wave-priority">Asks for {maxPriority === "all" ? "tasks of any priority" : `tasks at priority ${priorityLabel(maxPriority)} or higher`}, as Suggest next does.</p>
+  {#if stopping && record?.members.some((m) => m.phase === "merging" || m.phase === "verifying_merge")}<p class="note" role="status" data-testid="wave-stopping">Stopping after the current merge: it finishes or rolls back first, and nothing else is launched or merged.</p>{/if}
   {#if error}<p class="note" role="alert" data-testid="wave-error">{error}</p>{/if}
   {#if partial}<p class="note" role="status" data-testid="wave-partial">Not every task was read while looking for a wave left running, so none being shown is not proof there is none.</p>{/if}
   {#if record && foreign}

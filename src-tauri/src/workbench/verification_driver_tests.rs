@@ -942,7 +942,10 @@ fn the_base_after_a_teardown_merge_is_the_pre_merge_target_tip_not_head() {
     assert_ne!(before, after);
     // What `HostBackend::base_of` answers in the primary checkout after the merge.
     let base = verification_base(repo.path(), &after).expect("a merge commit has a first parent");
-    assert_eq!(base, before, "the base is the target's tip before the merge");
+    assert_eq!(
+        base, before,
+        "the base is the target's tip before the merge"
+    );
     assert_ne!(base, after, "an empty range judges nothing");
 }
 
@@ -980,7 +983,10 @@ fn a_named_base_is_diffed_against_in_the_merged_checkout() {
 fn a_named_base_that_judges_nothing_or_is_not_a_commit_is_refused_without_starting() {
     let (_d, store, repo, id) = setup();
     crate::test_support::git_in(repo.path(), &["switch", "-q", "-c", "side"]);
-    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "side"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "side"],
+    );
     let side = head_of(&repo);
     crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
     crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);

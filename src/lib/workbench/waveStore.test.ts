@@ -31,6 +31,31 @@ function board(statusOf: Record<string, TaskStatus> = {}) {
   return { api, tasks, add, saves };
 }
 
+describe("record codec: the merge gate", () => {
+  it("round-trips verifying_merge with where the merge landed, and the priority filter", () => {
+    const r = record({ maxPriority: 1, members: [{ ...member("a", "verifying_merge"), mergeBefore: "b".repeat(40), mergeAfter: "c".repeat(40) }] });
+    expect(decodeWave(encodeWave(r))).toEqual(r);
+  });
+
+  it("decodes a record written before the gate existed: no merge oids, no priority", () => {
+    const old = JSON.parse(encodeWave(record({ members: [member("a", "merged")] })).slice(WAVE_MARK.length));
+    expect(old.members[0]).not.toHaveProperty("mergeBefore");
+    expect(old).not.toHaveProperty("maxPriority");
+    const decoded = decodeWave(`${WAVE_MARK}${JSON.stringify(old)}`);
+    expect(decoded?.members[0]?.phase).toBe("merged");
+    expect(decoded?.members[0]?.mergeBefore).toBeUndefined();
+    expect(decoded?.maxPriority).toBeUndefined();
+  });
+
+  it("refuses a malformed oid or priority rather than guessing", () => {
+    const base = JSON.parse(encodeWave(record({ members: [member("a", "verifying_merge")] })).slice(WAVE_MARK.length));
+    const badOid = structuredClone(base); badOid.members[0].mergeBefore = 7;
+    expect(decodeWave(`${WAVE_MARK}${JSON.stringify(badOid)}`)).toBeNull();
+    const badPriority = { ...structuredClone(base), maxPriority: -1 };
+    expect(decodeWave(`${WAVE_MARK}${JSON.stringify(badPriority)}`)).toBeNull();
+  });
+});
+
 describe("record codec", () => {
   it("round-trips a record through a card's logs, beside other log text", () => {
     const r = record();
