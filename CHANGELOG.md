@@ -11,6 +11,15 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Pulse's ownership and bus-factor report samples the highest-churn files of
+  every top-level area instead of the first 128 paths, and names the areas it
+  did and did not sample. It is blamed at `HEAD` and kept until `HEAD`, the ref
+  stamp or the mailmap inputs move, so a second call spawns no blame. A
+  repository with a `.mailmap` no longer reports zero scanned files: `git blame`
+  rejects `--use-mailmap` and applies the map itself.
+
 ## [1.5.0] - 2026-10-17
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and

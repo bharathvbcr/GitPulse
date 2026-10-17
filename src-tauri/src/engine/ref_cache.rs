@@ -60,7 +60,7 @@ pub(crate) const ALL_REFS: &str = "refs";
 /// Identity of one file or directory: git replaces config, HEAD, packed-refs
 /// and loose refs by lockfile rename, which gives each write a new inode, and
 /// adding or removing an entry moves its directory's mtime.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FileIdentity {
     inode: u64,
     len: u64,
@@ -196,6 +196,15 @@ impl RefStamp {
             entries: walk.entries,
             newest: walk.newest.unwrap_or(SystemTime::UNIX_EPOCH),
         })
+    }
+
+    /// A hash of exactly what equality compares, to tell two stamps apart in a
+    /// map key. Not an identity: callers only coalesce on it.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.entries.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// False while a write inside the same timestamp tick could still be
@@ -410,6 +419,36 @@ pub(crate) fn through_stamped(
         );
     }
     Ok(value)
+}
+
+/// [`through_stamped`] for an answer that costs far more than a listing
+/// (a blame over a sample of files), where two callers asking at once must not
+/// both compute it. Callers join one run only when the repository, the
+/// question, the admission class and the stamp are all the same, so a caller
+/// that wrote to the repository after the run began never inherits its answer.
+/// A caller with no stamp cannot be told apart from a later state and runs on
+/// its own.
+pub(crate) fn through_stamped_coalesced(
+    repo: &Path,
+    args: &[&str],
+    stamp: Option<&Stamp>,
+    run: impl FnOnce() -> Result<(String, bool), String>,
+) -> Result<String, String> {
+    type Key = (PathBuf, Vec<String>, u64, git_cli::Admission);
+    type Flights = crate::singleflight::SingleFlight<Key, Result<String, String>>;
+    static FLIGHTS: OnceLock<Flights> = OnceLock::new();
+    let Some(stamped) = stamp else {
+        return through_stamped(repo, args, None, run);
+    };
+    let key = (
+        repo.to_path_buf(),
+        args.iter().map(|arg| (*arg).to_string()).collect(),
+        stamped.0.fingerprint(),
+        git_cli::current_admission(),
+    );
+    FLIGHTS
+        .get_or_init(Flights::default)
+        .run(key, || through_stamped(repo, args, stamp, run))
 }
 
 #[cfg(not(test))]

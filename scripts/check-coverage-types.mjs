@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 103 contracts over
- * 251 structs, spanning both wire surfaces: command returns and event payloads.
+ * 252 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -213,7 +213,7 @@ export const CONTRACTS = Object.freeze([
   // The commit-graph census inside StorageReport. `unknown` and the nullable
   // facts are what keep "could not check" from rendering as "missing".
   { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport"] },
-  { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
+  { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "AreaCoverage", "DoraReport"] },
   { label: "commit-signature", rustPath: rust("engine", "commit_signature.rs"), tsPath: ts("pulse", "types.ts"), structs: ["CommitSignatureCheck"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },

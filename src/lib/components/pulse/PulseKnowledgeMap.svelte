@@ -15,6 +15,13 @@
     onRefresh?: () => void;
   } = $props();
 
+  /** Areas the sample never blamed: their authors are absent from every figure. */
+  const unsampledAreas = $derived(
+    (knowledge?.areas ?? [])
+      .filter((a) => a.sampled_files === 0)
+      .map((a) => (a.area === "" ? "(top-level files)" : a.area)),
+  );
+
   function formatRelativeDays(timestampSecs: number): string {
     if (!timestampSecs) return "Unknown";
     const nowSecs = Math.floor(Date.now() / 1000);
@@ -199,7 +206,25 @@
     <!-- Truncation / Honesty Note -->
     {#if knowledge.truncated}
       <div class="text-[11px] text-textMuted/80 italic flex items-center gap-1.5 border-t border-border/30 pt-2">
-        <span>* Scan capped at {knowledge.scanned_files} candidate files to bound execution time. Large repositories retain honest bounds.</span>
+        <span>
+          * Sampled {knowledge.scanned_files} of {knowledge.candidate_files} files at HEAD, highest
+          churn first in each of {knowledge.areas_total} areas.
+          {#if unsampledAreas.length > 0}
+            Not sampled: {unsampledAreas.join(", ")}{knowledge.areas_total > knowledge.areas.length
+              ? ` and ${knowledge.areas_total - knowledge.areas.length} more`
+              : ""}.
+          {/if}
+          {#if knowledge.churn_unavailable}
+            Churn could not be read, so files were taken in path order.
+          {:else if knowledge.churn_window_capped}
+            Churn covers only the newest commits; a file busy only before that ranks low.
+          {/if}
+        </span>
+      </div>
+    {/if}
+    {#if knowledge.submodules_skipped > 0}
+      <div class="text-[11px] text-textMuted/80 italic">
+        {knowledge.submodules_skipped} submodule{knowledge.submodules_skipped === 1 ? "" : "s"} not blamed.
       </div>
     {/if}
   {/if}

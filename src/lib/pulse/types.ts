@@ -197,6 +197,24 @@ export interface KnowledgeReport {
   half_life_days: number;
   truncated: boolean;
   duration_ms: number;
+  /** Top-level areas, busiest first; `sampled_files === 0` means not blamed. */
+  areas: AreaCoverage[];
+  /** Uncapped count of areas; `areas` holds at most the first 256. */
+  areas_total: number;
+  /** The churn ranking saw only the newest commits, so older busy files rank low. */
+  churn_window_capped: boolean;
+  /** The churn walk failed: the sample is in path order, not ranked. */
+  churn_unavailable: boolean;
+  /** Submodules in the tree: never blamed, not counted as candidate files. */
+  submodules_skipped: number;
+}
+
+/** One top-level area and how much of it the ownership sample covers. */
+export interface AreaCoverage {
+  /** First path component; the empty string is the files at the top level. */
+  area: string;
+  candidate_files: number;
+  sampled_files: number;
 }
 
 /** Wire report received from cmd_get_dora_report */
