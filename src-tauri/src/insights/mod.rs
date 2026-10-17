@@ -2313,6 +2313,53 @@ pub fn mcp_info() -> McpInfo {
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+
+    /// Measurement, not a gate: the spawns one snapshot of `GP_MEASURE_REPO`
+    /// makes, by argv, across every worktree directory.
+    #[test]
+    #[ignore = "measures a real repository named by GP_MEASURE_REPO"]
+    fn measure_snapshot_spawns_on_a_real_repository() {
+        let repo = std::env::var("GP_MEASURE_REPO").expect("GP_MEASURE_REPO");
+        crate::test_support::trust_repo(std::path::Path::new(&repo));
+        let dirs: Vec<std::path::PathBuf> = worktree::list_worktrees_lite(&repo)
+            .expect("list")
+            .iter()
+            .map(|w| std::path::PathBuf::from(&w.path))
+            .collect();
+        for dir in &dirs {
+            crate::test_support::trust_repo(dir);
+        }
+        let count = |dirs: &[std::path::PathBuf]| -> usize {
+            dirs.iter()
+                .map(|d| crate::engine::git_cli::spawn_log::spawns_in(d).len())
+                .sum()
+        };
+        for round in 0..3 {
+            let before = count(&dirs);
+            let started = Instant::now();
+            let snap = snapshot(&repo);
+            println!(
+                "round {round}: {} worktrees, {} spawns, {:?}, ok(worktrees={}, changes={}, collisions={})",
+                dirs.len(),
+                count(&dirs) - before,
+                started.elapsed(),
+                snap.worktrees.ok,
+                snap.changes.ok,
+                snap.collisions.ok
+            );
+        }
+        let mut by_argv: std::collections::BTreeMap<String, usize> = Default::default();
+        for d in &dirs {
+            for argv in crate::engine::git_cli::spawn_log::spawns_in(d) {
+                *by_argv
+                    .entry(argv.join(" ").chars().take(70).collect())
+                    .or_default() += 1;
+            }
+        }
+        for (argv, n) in by_argv {
+            println!("{n:5} {argv}");
+        }
+    }
     use serde_json::json;
     use std::fs;
 

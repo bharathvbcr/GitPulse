@@ -2514,6 +2514,33 @@ pub fn run_process_as_background() {
     PROCESS_BACKGROUND.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether background spawns in this process wait for the rate budget instead
+/// of being shed (see [`run_process_awaiting_background_budget`]).
+static PROCESS_BACKGROUND_AWAITS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Background spawns of this process wait, for at most [`SPAWN_QUEUE_BUDGET`],
+/// for the budget to climb back above the background reserve, rather than
+/// being shed at once. Call before any thread is started, like
+/// [`run_process_as_background`].
+///
+/// Admission class of an agent-initiated MCP read: **Background, waiting**.
+/// It is not Reactive, because the reserve exists so that the edit-time hook
+/// (Reactive, gating the user's own tool call) and the app's reads keep budget
+/// while agent traffic is heavy; fifteen agent sessions each taking an
+/// insights snapshot (about 20 spawns on 18 worktrees, measured) would
+/// otherwise spend the shared record to zero and get hooks refused. It is not
+/// plain Background, because that sheds at 0.000s whenever the shared or local
+/// budget sits at or below the reserve, and a caller blocked on the answer then
+/// gets a refusal for a condition that clears in a fraction of a second at 8
+/// tokens a second. Waiting keeps the floor (this class never spends the
+/// reserve, so the shared budget still bounds it exactly as before) and turns
+/// "shed while low" into "paced at the refill rate", bounded by the same 2 s
+/// wait a Reactive read gets. Scheduled work (`gitpulsed`) keeps shedding.
+pub fn run_process_awaiting_background_budget() {
+    PROCESS_BACKGROUND_AWAITS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Set by [`run_process_with_unlimited_spawn_rate`]; never set in a shipped
 /// binary.
 static PROCESS_UNLIMITED_RATE: std::sync::atomic::AtomicBool =
@@ -2579,6 +2606,10 @@ fn thread_default_admission() -> Admission {
 
 thread_local! {
     static ADMISSION: Cell<Admission> = Cell::new(thread_default_admission());
+    /// Whether this thread's background spawns wait for budget; a thread
+    /// starts in the process default, like [`ADMISSION`].
+    static AWAITS_BUDGET: Cell<bool> =
+        Cell::new(PROCESS_BACKGROUND_AWAITS.load(std::sync::atomic::Ordering::Relaxed));
     /// The repository the guarded mutation running on this thread named, so
     /// the refresh that follows it can be credited (see [`run_command_scope`]).
     static MARKED_REPO: std::cell::RefCell<Option<PathBuf>> =
@@ -2608,6 +2639,20 @@ pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T
         }
     }
     let _restore = Restore(ADMISSION.replace(class));
+    body()
+}
+
+/// Runs `body` with background spawns waiting for budget (`awaits`) or shed
+/// at once, restoring the thread's previous setting on return and unwinding.
+#[cfg(test)]
+pub(crate) fn with_background_budget_wait<T>(awaits: bool, body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AWAITS_BUDGET.set(self.0);
+        }
+    }
+    let _restore = Restore(AWAITS_BUDGET.replace(awaits));
     body()
 }
 
@@ -3101,6 +3146,7 @@ impl SpawnGate {
         let class = current_admission();
         let background = class == Admission::Background;
         let interactive = class == Admission::Interactive;
+        let awaits_budget = background && AWAITS_BUDGET.get();
         // The load governor's verdict, one owner (`sysload::governor`): under
         // memory pressure these classes are refused at once with the
         // deferral marker. A user action is never shed, and neither is a read
@@ -3244,7 +3290,10 @@ impl SpawnGate {
             if !tokens_ok {
                 // Background is shed at once: it is the first thing to go
                 // under load, and waiting would only hold a pool thread.
-                if background {
+                // Unless this process asked to wait (an agent's MCP read: see
+                // [`run_process_awaiting_background_budget`]), which then
+                // waits like a reactive read, still above the reserve.
+                if background && !awaits_budget {
                     break Err(Refusal::Shed);
                 }
                 let started = *token_wait_started.get_or_insert(now);
@@ -5220,6 +5269,75 @@ mod tests {
             "the reserve is for refreshes"
         );
         assert_eq!(gate.counters()[Admission::Background.index()].shed, 1);
+    }
+
+    /// An agent's MCP read is background work that waits: at the reserve it is
+    /// paced by the refill, not shed at 0.000s for a condition that clears in
+    /// a fraction of a second. Shed work (the default, and the scheduled
+    /// daemon) is the control, in the same gate and state.
+    #[test]
+    fn awaiting_background_work_is_paced_by_the_refill_where_shed_work_is_refused() {
+        use super::{with_background_budget_wait, with_background_processes, Admission, Refusal};
+        let gate = super::SpawnGate::with_rate(16, 8, 8);
+        assert_eq!(gate.background_reserve(), 2);
+        let far = || Instant::now() + std::time::Duration::from_secs(10);
+        for _ in 0..6 {
+            drop(with_background_processes(|| gate.acquire(far())).expect("above reserve"));
+        }
+        // Control: at the reserve, shed work is refused at once.
+        let shed = with_background_processes(|| gate.acquire_until(far(), &|| false).err());
+        assert_eq!(shed, Some(Refusal::Shed));
+        // The same spawn, waiting: the next token (125 ms at 8/s) is admitted.
+        let began = Instant::now();
+        let permit = with_background_budget_wait(true, || {
+            with_background_processes(|| gate.acquire_until(far(), &|| false))
+        });
+        assert!(
+            permit.is_ok(),
+            "a waiting background read was refused: {:?}",
+            permit.err()
+        );
+        assert!(
+            began.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(1_900)),
+            "paced by the refill, not by the whole wait budget: {:?}",
+            began.elapsed()
+        );
+        let counters = gate.counters()[Admission::Background.index()];
+        assert_eq!(counters.shed, 1, "only the control was shed");
+    }
+
+    /// Waiting is bounded and never spends the reserve: with the budget empty
+    /// and a refill too slow to clear the reserve inside the wait budget, the
+    /// waiting read is refused after the same 2 s a reactive read gets, and a
+    /// reactive read still has its token.
+    #[test]
+    fn awaiting_background_work_waits_a_bounded_time_and_leaves_the_reserve() {
+        use super::{with_admission, with_background_budget_wait, with_background_processes};
+        use super::{Admission, Refusal};
+        let gate = super::SpawnGate::with_rate(16, 64, 1);
+        assert_eq!(gate.background_reserve(), 16);
+        let far = || Instant::now() + std::time::Duration::from_secs(30);
+        for _ in 0..64 {
+            drop(with_admission(Admission::Reactive, || gate.acquire(far())).expect("burst"));
+        }
+        let began = Instant::now();
+        let refusal = with_background_budget_wait(true, || {
+            with_background_processes(|| gate.acquire_until(far(), &|| false).err())
+        });
+        assert!(
+            matches!(refusal, Some(Refusal::Refused { .. })),
+            "expected a bounded wait that ends refused, got {refusal:?}"
+        );
+        assert!(
+            began.elapsed() >= std::time::Duration::from_millis(1_900),
+            "gave up before the wait budget: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            with_admission(Admission::Reactive, || gate.acquire(far())).is_some(),
+            "the waiting read did not spend what the refill gave back: reactive still admitted"
+        );
     }
 
     /// Under memory pressure (the load governor's verdict) the gate sheds its
