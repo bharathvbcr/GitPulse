@@ -40,6 +40,8 @@ const DERIVED_ARGV = Object.freeze({
   cmd_unstage_file: "change_index_with shares the path-limited reset plan with the gate; native tests cover unborn branches and preservation of working files",
   cmd_change_index: "change_index_with judges every bounded chunk before the first write; native stress tests inspect exact argv and late gate denial",
   cmd_stash_save: "handler and writer both use StashSaveOptions::argv; native option tests verify staged and untracked behavior",
+  cmd_checkout_branch: "GitWriter::checkout_branch_argv builds the line the gate judges; checkout_branch_judged re-derives it under the repository lock and refuses to run if it differs",
+  cmd_checkout_detached: "GitWriter::checkout_detached_argv builds the line the gate judges, and checkout_detached runs that same function's argv",
   cmd_hygiene_execute: "hygiene::execute owns the backend plan and gives its exact argv or file boundary to the command gate; native hygiene tests cover denial, changed plans, exact scope and single use",
   cmd_rebase_interactive: "derives the planned sequence; rebase_planned_commands_* mirror tests cover it",
   cmd_stash_action: "argv built from the selected stash OID at runtime",
@@ -155,7 +157,8 @@ describe("the command gate judges the command that actually runs", () => {
   it("compares a real share of the guarded commands", () => {
     // Vacuity guard: a parser that silently stopped matching would make every
     // comparison below pass while examining nothing.
-    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(15);
+    // 14 since cmd_checkout_branch moved to a writer-built argv (DERIVED_ARGV).
+    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(14);
     for (const anchor of ["cmd_push", "cmd_commit", "cmd_delete_branch", "cmd_fetch"]) {
       expect(compared.map((c) => c.name), `${anchor} must be compared`).toContain(anchor);
     }
@@ -265,9 +268,15 @@ describe("the command gate judges the command that actually runs", () => {
     expect(executor).toContain("judge(&args)?");
     expect(executor).toContain("git_with_stdin(&repo, &args, &input)");
     expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_with_stdin(&repo, &args, &input)"));
-    expect(executor.match(/for path in &paths \{/g)).toHaveLength(2);
-    expect(executor).toContain("argv.push(path.clone())");
+    expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_text(&repo, &args)"));
+    // The judged lines are the bounded chunks of `paths`; the stdin and the
+    // argument-form chunks are the two halves of that same list.
+    expect(executor).toContain("index_chunks(&prefix, &paths)");
+    expect(executor).toContain("paths.iter().partition(");
+    expect(executor).toContain("for path in &plain {");
     expect(executor).toContain("input.extend_from_slice(path.as_bytes())");
+    expect(executor).toContain("index_chunks(&prefix, &accented)");
+    expect(fnBody(PRODUCTION_WRITER, "index_chunks")).toContain("argv.push(path.clone())");
   });
 
   it("stash save shares its options with the gate", () => {

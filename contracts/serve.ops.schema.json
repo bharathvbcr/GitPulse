@@ -359,6 +359,18 @@
         "protocol": {
           "type": "integer",
           "required": true
+        },
+        "withheld_provider_env": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "withholds_provider_credentials": {
+          "type": "boolean",
+          "required": true
         }
       }
     },
@@ -803,6 +815,10 @@
               "required": true
             },
             "review": {
+              "type": "integer",
+              "required": true
+            },
+            "unread": {
               "type": "integer",
               "required": true
             }

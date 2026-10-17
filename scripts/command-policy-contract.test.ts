@@ -51,7 +51,11 @@ describe("native mutation policy contract", () => {
         const start = source.indexOf(`fn ${delegate}(`);
         expect(start, `${name} delegates to ${delegate}, which must exist`).toBeGreaterThanOrEqual(0);
         body = source.slice(start, source.indexOf("\n}\n", start));
-        expect(body, `${delegate} must judge each path it rewrites`).toContain('guard_file(repo_path, path, "modify")');
+        // Each rewritten path is judged on its own path: one at a time, or as
+        // one batch of per-path verdicts (`guard_files`), every one recorded.
+        const perPath = body.includes('guard_file(repo_path, path, "modify")')
+          || (body.includes('guard_files(repo_path, &rewrites, "modify")') && /for verdict in guard_files\([^)]*\)\?\s*\{\s*fold\.record\(verdict\)/.test(body));
+        expect(perPath, `${delegate} must judge each path it rewrites`).toBe(true);
       }
       // `guard` judges a rendered command line; `guard_file` judges a path.
       // Both are the canonical harness entry points; anything else is a
