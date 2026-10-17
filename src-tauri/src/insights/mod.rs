@@ -444,6 +444,76 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
     }
 }
 
+/// Wire fields a facet carries when it failed because the spawn gate deferred
+/// its Git read: `deferred: true`, and how long to wait before asking again.
+pub const DEFERRED_FIELD: &str = "deferred";
+pub const RETRY_AFTER_FIELD: &str = "retry_after_ms";
+
+/// The soonest a deferred read is worth repeating: one refill interval of the
+/// spawn rate budget (the time it takes to mint one token), rounded up. The
+/// budget refills at a fixed rate, so this is derived from it rather than
+/// guessed; it is a floor, not a promise that the next attempt is admitted.
+pub fn deferral_retry_after_ms() -> u64 {
+    let (_burst, per_sec) = crate::engine::git_cli::production_spawn_rate();
+    1000u64.div_ceil(u64::from(per_sec.max(1)))
+}
+
+/// True when `value` is a string the spawn gate's deferral wording (or the
+/// ledger's typed `deferred_worktree` code) produced. One predicate for the
+/// whole seam: [`crate::engine::git_cli::is_deferred_under_load`].
+fn is_deferral_text(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        crate::engine::git_cli::is_deferred_under_load(text)
+            || text == crate::ledger::bindings::DEFERRED_WORKTREE
+    })
+}
+
+/// Adds `deferred: true` and `retry_after_ms` to every failed facet of a
+/// serialized insights payload whose failure was a deferral, and returns
+/// whether any was found.
+///
+/// A deferral is the gate declining to start Git under load: nothing about the
+/// repository was examined, and asking again may answer. The payload already
+/// says `ok: false` with the gate's sentence; this adds the typed form so a
+/// consumer branches on a field instead of a substring. Additive only: a facet
+/// that ran, or that failed for any other reason, is left exactly as it was,
+/// and a facet that failed for a *real* reason is never marked.
+///
+/// A failed object is marked when it carries a deferral error of its own or
+/// any object beneath it does, so `agents`, `agents.live` and each kind that
+/// could not be observed are all marked, not only the leaves.
+pub fn mark_deferrals(payload: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+    match payload {
+        Value::Object(map) => {
+            let mut found = false;
+            for child in map.values_mut() {
+                found |= mark_deferrals(child);
+            }
+            let own = map
+                .iter()
+                .any(|(key, value)| key.ends_with("error") && is_deferral_text(value))
+                || map.get("error_code").is_some_and(is_deferral_text);
+            let failed = map.get("ok") == Some(&Value::Bool(false))
+                || map.get("recording") == Some(&Value::Bool(false))
+                || own;
+            if own || (found && failed) {
+                map.insert(DEFERRED_FIELD.to_string(), Value::Bool(true));
+                map.insert(
+                    RETRY_AFTER_FIELD.to_string(),
+                    Value::from(deferral_retry_after_ms()),
+                );
+                found = true;
+            }
+            found
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |found, item| mark_deferrals(item) | found),
+        _ => false,
+    }
+}
+
 /// Every kind that could not be fully observed, and why, as one sentence.
 fn sessions_error(live: &LiveSessionFacet) -> String {
     live.kinds
@@ -1951,6 +2021,7 @@ pub fn mcp_info() -> McpInfo {
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+    use serde_json::json;
     use std::fs;
 
     use crate::test_support::git_in;
@@ -2189,6 +2260,118 @@ mod tests {
             .iter()
             .all(|k| !k.ok && !k.error.is_empty()));
         assert!(!snap.collisions.sessions_ok);
+    }
+
+    /// Walks a serialized payload and collects every object that says it
+    /// failed (`ok: false`, or `recording: false`), keyed by its path.
+    fn failed_facets<'a>(
+        path: String,
+        value: &'a serde_json::Value,
+        out: &mut Vec<(String, &'a serde_json::Value)>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("ok") == Some(&json!(false))
+                    || map.get("recording") == Some(&json!(false))
+                {
+                    out.push((path.clone(), value));
+                }
+                for (key, child) in map {
+                    failed_facets(format!("{path}.{key}"), child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    failed_facets(format!("{path}[{index}]"), child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Under a spawn gate that sheds the read, every failed facet says it was a
+    /// deferral, with when to ask again, and none calls it an invalid worktree.
+    #[test]
+    fn a_snapshot_under_a_forced_deferral_marks_every_failed_facet_deferred() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        let mut wire = crate::engine::git_cli::with_forced_deferral(|| json!(snapshot(repo)));
+        assert!(mark_deferrals(&mut wire), "{wire}");
+
+        let mut failed = Vec::new();
+        failed_facets("snapshot".to_string(), &wire, &mut failed);
+        let named: Vec<&str> = failed.iter().map(|(path, _)| path.as_str()).collect();
+        for facet in [
+            "snapshot.worktrees",
+            "snapshot.agents",
+            "snapshot.changes",
+            "snapshot.collisions",
+            "snapshot.ledger",
+        ] {
+            assert!(named.contains(&facet), "{facet} did not fail: {named:?}");
+        }
+        for (path, facet) in &failed {
+            assert_eq!(facet["deferred"], json!(true), "{path}: {facet}");
+            assert_eq!(
+                facet["retry_after_ms"],
+                json!(deferral_retry_after_ms()),
+                "{path}: {facet}"
+            );
+        }
+        assert!(
+            !wire.to_string().contains("invalid_worktree"),
+            "a deferral was called invalid: {wire}"
+        );
+        assert_eq!(wire["ledger"]["error_code"], json!("deferred_worktree"));
+    }
+
+    /// A facet that ran keeps its exact shape, and a facet that failed for a
+    /// real reason is never dressed up as a deferral, even beside one that was.
+    #[test]
+    fn deferral_marks_only_the_failures_that_were_deferrals() {
+        let deferral = "git status deferred under load after 2.013s: the git spawn rate limit \
+                        admitted nothing sooner";
+        let mut payload = json!({
+            "worktrees": { "ok": true, "error": "", "count": 3 },
+            "changes": { "ok": false, "error": deferral },
+            "collisions": { "ok": false, "error": "fatal: not a git repository",
+                            "sessions_ok": false, "sessions_error": "" },
+            "ledger": { "recording": false, "error": "[invalid_worktree] fatal: not a git repository",
+                        "error_code": "invalid_worktree" }
+        });
+        let ran = payload["worktrees"].clone();
+        assert!(mark_deferrals(&mut payload));
+        assert_eq!(payload["worktrees"], ran, "a facet that ran is untouched");
+        assert_eq!(payload["changes"]["deferred"], json!(true));
+        assert_eq!(
+            payload["changes"]["retry_after_ms"],
+            json!(deferral_retry_after_ms())
+        );
+        for real in ["collisions", "ledger"] {
+            assert!(
+                payload[real].get("deferred").is_none(),
+                "{real}: {}",
+                payload[real]
+            );
+            assert!(payload[real].get("retry_after_ms").is_none(), "{real}");
+        }
+        assert_eq!(payload["ledger"]["error_code"], json!("invalid_worktree"));
+
+        let mut clean = json!({ "worktrees": { "ok": true, "error": "" } });
+        assert!(!mark_deferrals(&mut clean));
+        assert_eq!(clean, json!({ "worktrees": { "ok": true, "error": "" } }));
+    }
+
+    /// The hint is the budget's own refill interval, not a magic number: 8
+    /// tokens a second is one every 125 ms.
+    #[test]
+    fn the_retry_hint_is_one_refill_interval_of_the_spawn_budget() {
+        let (_, per_sec) = crate::engine::git_cli::production_spawn_rate();
+        assert_eq!(
+            deferral_retry_after_ms(),
+            1000u64.div_ceil(u64::from(per_sec))
+        );
+        assert!(deferral_retry_after_ms() > 0);
     }
 
     #[test]

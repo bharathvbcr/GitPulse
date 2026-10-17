@@ -21,6 +21,10 @@ pub const UNBIND: &str = "worktree.unbind";
 /// The error code for a checkout path that no longer exists on disk.
 pub const MISSING_WORKTREE: &str = "missing_worktree";
 
+/// The error code for a resolution Git never started, because the spawn gate
+/// deferred it under load. A refusal to look, not a verdict on the checkout.
+pub const DEFERRED_WORKTREE: &str = "deferred_worktree";
+
 /// The authenticated repository-wide address behind one binding lookup.
 ///
 /// The ledger and DevCouncil task store live at `anchor`; `worktree` remains
@@ -45,37 +49,48 @@ fn resolve_address(repo_path: &str, worktree_path: &str) -> Result<FamilyAddress
             },
             members: family.members,
         })
-        .map_err(|message| {
-            // A checkout that is no longer on disk is neither untrusted nor
-            // broken: it was removed or moved. Named first and on its own,
-            // because "could not resolve this worktree's task binding" read as
-            // a policy failure and was rendered as a hard harness block on a
-            // worktree that had simply been deleted. `try_exists` answers
-            // `Ok(false)` only for a definite absence; a path that could not
-            // be examined (permissions) is left to the codes below.
-            if [repo_path, worktree_path]
-                .iter()
-                .any(|path| std::path::Path::new(path).try_exists().ok() == Some(false))
-            {
-                return LedgerError::new(MISSING_WORKTREE, message);
-            }
-            // Trust first, and not merely for tidiness: resolution runs Git,
-            // so an untrusted checkout fails before anything about the
-            // worktree has been examined. Reading that refusal as one of the
-            // verdicts below would report a repository we never looked at as
-            // one we looked at and rejected.
-            let code = if crate::repository_trust::refused(&message) {
-                "untrusted_worktree"
-            } else if message.contains("does not belong")
-                || message.contains("not registered")
-                || message.contains("different repository")
-            {
-                "unrelated_worktree"
-            } else {
-                "invalid_worktree"
-            };
-            LedgerError::new(code, message)
-        })
+        .map_err(|message| classify(repo_path, worktree_path, message))
+}
+
+/// The ledger error for a failed family resolution, told apart by *why* it
+/// failed. Each code names a different thing the caller must do, so the order
+/// below is the order of "what could we establish before it failed".
+fn classify(repo_path: &str, worktree_path: &str, message: String) -> LedgerError {
+    // A checkout that is no longer on disk is neither untrusted nor
+    // broken: it was removed or moved. Named first and on its own,
+    // because "could not resolve this worktree's task binding" read as
+    // a policy failure and was rendered as a hard harness block on a
+    // worktree that had simply been deleted. `try_exists` answers
+    // `Ok(false)` only for a definite absence; a path that could not
+    // be examined (permissions) is left to the codes below.
+    if [repo_path, worktree_path]
+        .iter()
+        .any(|path| std::path::Path::new(path).try_exists().ok() == Some(false))
+    {
+        return LedgerError::new(MISSING_WORKTREE, message);
+    }
+    // Trust first, and not merely for tidiness: resolution runs Git,
+    // so an untrusted checkout fails before anything about the
+    // worktree has been examined. Reading that refusal as one of the
+    // verdicts below would report a repository we never looked at as
+    // one we looked at and rejected.
+    let code = if crate::repository_trust::refused(&message) {
+        "untrusted_worktree"
+    } else if crate::engine::git_cli::is_deferred_under_load(&message) {
+        // The same shape as trust: Git never ran, because the spawn gate
+        // declined to start it under load. Nothing about the worktree was
+        // examined, so it is neither invalid nor unrelated, and asking
+        // again once load falls may well answer.
+        DEFERRED_WORKTREE
+    } else if message.contains("does not belong")
+        || message.contains("not registered")
+        || message.contains("different repository")
+    {
+        "unrelated_worktree"
+    } else {
+        "invalid_worktree"
+    };
+    LedgerError::new(code, message)
 }
 
 fn address(repo_path: &str, worktree_path: &str) -> Result<BindingAddress, LedgerError> {
@@ -294,6 +309,94 @@ mod tests {
         let dir = git_repo();
         let path = dir.path().to_str().unwrap().to_string();
         (dir, path)
+    }
+
+    /// The messages the spawn gate produces when it declines to start Git, in
+    /// every wording it has: shed at once (`0.000s`, background work) and
+    /// refused after waiting out the rate budget (any duration).
+    fn gate_deferrals() -> Vec<String> {
+        use crate::engine::git_cli::{refusal_message, Refusal};
+        vec![
+            refusal_message("git worktree", Refusal::Shed),
+            refusal_message(
+                "git worktree",
+                Refusal::Refused {
+                    waited: std::time::Duration::from_millis(2_013),
+                },
+            ),
+            "git worktree deferred under load after 0.000s: background work is shed while the \
+             git spawn rate budget is low"
+                .to_string(),
+        ]
+    }
+
+    /// A load-shed `git worktree list` is a refusal to look, not a verdict.
+    #[test]
+    fn a_deferred_resolution_is_not_reported_as_an_invalid_worktree() {
+        let (_dir, path) = repo();
+        for message in gate_deferrals() {
+            let error = classify(&path, &path, message.clone());
+            assert_eq!(error.code, DEFERRED_WORKTREE, "{message}");
+            assert!(
+                crate::engine::git_cli::is_deferred_under_load(&error.message),
+                "the cause stays in the message: {error}"
+            );
+        }
+    }
+
+    /// The sibling arms keep their codes: a deferral must not swallow a real
+    /// verdict, and a verdict must not be mistaken for a deferral.
+    #[test]
+    fn real_verdicts_keep_their_codes_beside_the_deferral_code() {
+        let (dir, path) = repo();
+        assert_eq!(
+            classify(&path, &path, "fatal: not a git repository".into()).code,
+            "invalid_worktree"
+        );
+        assert_eq!(
+            classify(
+                &path,
+                &path,
+                "worktree does not belong to this repository".into()
+            )
+            .code,
+            "unrelated_worktree"
+        );
+        // A timeout is the hang it says it is, never a deferral.
+        assert_eq!(
+            classify(&path, &path, "git worktree timed out after 5.000s".into()).code,
+            "invalid_worktree"
+        );
+        // A path with nothing on disk is the absence it is, even when the
+        // message that came with it was a deferral.
+        let gone = dir.path().join("deleted-worktree");
+        let gone = gone.to_str().expect("utf8 path");
+        assert_eq!(
+            classify(gone, gone, gate_deferrals().remove(0)).code,
+            MISSING_WORKTREE
+        );
+    }
+
+    /// End to end through the real resolver: a spawn gate that sheds the read
+    /// yields the deferral code, and what the hook's scope lookup
+    /// (`resolve_binding`, then `scope_for`'s match on `error.code`) sees is
+    /// unchanged in kind: neither `untrusted_worktree` nor the missing-path
+    /// code, so it still takes the same `_ =>` arm as before. The one visible
+    /// difference is the bracketed code in the error's text.
+    #[test]
+    fn the_hooks_scope_lookup_still_sees_a_failure_it_does_not_special_case() {
+        let (_dir, path) = repo();
+        let error = crate::engine::git_cli::with_forced_deferral(|| resolve_binding(&path, &path))
+            .expect_err("a shed read must not resolve");
+        assert_eq!(error.code, DEFERRED_WORKTREE, "{error}");
+        assert_ne!(error.code, "untrusted_worktree");
+        assert_ne!(error.code, MISSING_WORKTREE);
+        assert!(
+            error
+                .to_string()
+                .contains("git worktree deferred under load"),
+            "the text the hook shows still carries the gate's own sentence: {error}"
+        );
     }
 
     /// A checkout nobody let us open is not a broken checkout.

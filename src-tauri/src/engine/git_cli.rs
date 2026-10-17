@@ -3090,6 +3090,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static FORCE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    /// Every spawn on this thread is refused as the gate sheds background work.
+    #[cfg(test)]
+    static FORCE_DEFERRAL: Cell<bool> = const { Cell::new(false) };
     /// Runs at every forced failure, so a test can tell when a computation
     /// is in progress, or stretch it, without timing guesses.
     #[cfg(test)]
@@ -3169,6 +3172,22 @@ pub(crate) fn with_forced_spawn_failure<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// Every child spawned on this thread inside `body` is refused exactly as the
+/// gate refuses shed background work ([`Refusal::Shed`]): the error a
+/// `gitpulse-mcp` read gets when the spawn budget is low, independent of
+/// machine load.
+#[cfg(test)]
+pub(crate) fn with_forced_deferral<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_DEFERRAL.set(self.0);
+        }
+    }
+    let _restore = Restore(FORCE_DEFERRAL.replace(true));
+    body()
+}
+
 /// [`with_forced_spawn_failure`] for only the spawns whose arguments include
 /// `arg` (a subcommand such as `"symbolic-ref"`), so a test can refuse one read
 /// of a computation and let the rest answer.
@@ -3226,6 +3245,10 @@ fn run_admitted(
     gate: &'static SpawnGate,
     on_admitted: &dyn Fn(),
 ) -> Result<BoundedRun, String> {
+    #[cfg(test)]
+    if FORCE_DEFERRAL.get() {
+        return Err(refusal_message(label, Refusal::Shed));
+    }
     #[cfg(test)]
     if FORCE_SPAWN_FAILURE.get() || forced_failure_matches(cmd) {
         FORCED_FAILURE_HOOK.with(|slot| {
