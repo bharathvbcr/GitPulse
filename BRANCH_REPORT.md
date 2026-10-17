@@ -1,3 +1,137 @@
+# Branch consolidation report — 2026-10-17 (landing run, 07:56)
+
+Scope: local branches only; nothing was pushed. **Main moved 8026dd7e → dc331e8c (fast-forward to
+`consolidate/1017`, 311 commits, 377 files), then 329b8be1 committed the untracked reports. `main`
+is now the only branch.** The owner said "merge all" this run, with no agent sessions in the repo.
+
+## Inventory (07:56)
+
+`gitpulse_insights` and `gitpulse_collision_risk`: every facet `ok`, 7 of 7 worktrees scanned. One
+live Claude session, pid 51822, which is this consolidator; 19544 from the previous run is gone.
+0 Codex. Only collision: BRANCH_REPORT.md, untracked in both main and bl-integrate (different files).
+No branch tip had moved since the 23:00 section.
+
+| Branch | Ahead/behind main | Last commit | Worktree (dirty) | Live session | Task | Class |
+|---|---|---|---|---|---|---|
+| main | 0/0 | 10-13 | main checkout (2 modified, = 4f6a0235; 5 untracked) | 51822 (this) | — | keep |
+| consolidate/1017 | 311/0 | 10-16 23:37 | none (webcontent-snap detached at its tip) | — | — | mergeable: landing head |
+| consolidate/1016 | 309/0 | 10-16 21:34 | consolidate-1016 (ignored tmp/ only) | — | — | contained in 1017 |
+| bl/integrate-1013 | 286/0 | 10-16 17:23 | bl-integrate (2 untracked reports) | — | — | contained |
+| pf/434d7bef-sidecar-rtt, -adv | 287/0 | 10-16 18:35 | none | — | ft-434d7bef review | contained |
+| pf/434d7bef-sidecar-rtt-real | 288/0 | 10-16 19:31 | none | — | ft-434d7bef review | contained |
+| wip/webcontent-snapshot | 1/0 | 10-16 23:32 | none | — | ft-bc59566c review | contained |
+| gitpulse/webcontent-…-0d178c24 | 0/0 | 10-13 | .gitpulse worktree (10) | — | ft-bc59566c review | merged; dirty files = b1ac76b7 |
+
+Fable reviewed the classification and agreed with every row. It verified:
+
+- `merge-base --is-ancestor` for every tip, plus the detached worktree heads;
+- that the webcontent worktree's 10 dirty files match `b1ac76b7:` (sha256, all 10), and that 3 of
+  them are older than main, so discard them and never re-apply them;
+- that, of the 7 `in_progress` tasks, only ft-626b25fc has commits in the range. Those are the test
+  slices that the integrator merged on 10-16. They are partial work on a long-running card, not a
+  branch bound to it. The other 6 have no commits in the range.
+
+## Backups
+
+- Refs: `refs/backup/2026-10-17/*`, the 9 branches at inventory, plus `stash-verifdriver` (216b22e3).
+- Bundle: `/Users/bharath/branch-backups/GitPulse-2026-10-17.bundle`, 9 branches, verified okay.
+
+## Merged
+
+- **main → dc331e8c**, `git merge --ff-only consolidate/1017`. A fast-forward has no conflicts and
+  no merge commit; the conflicts inside it were resolved and Opus-reviewed in the 23:00 and earlier
+  sections.
+  - Main's two modified verification_driver files blocked the fast-forward. They are byte-identical
+    to `4f6a0235:`, which is inside 1017, and the tip has later edits to them, so committing them on
+    main would have forked main and conflicted.
+  - They were set aside with a path-limited stash, stash@{0} 216b22e3 (also at
+    `refs/backup/2026-10-17/stash-verifdriver`). `git diff 4f6a0235 216b22e3` on both paths is
+    empty. The owner cancelled the `stash drop`, so the entry is still there; drop it at will.
+- **329b8be1** `docs(reports)`. It commits main's 5 untracked reports, and folds in bl-integrate's
+  two reports, which existed nowhere else:
+  - its 2026-10-14 consolidation section, now in date order below;
+  - `BUILD_REPORT-backlog-2026-10-13.md`.
+  Both were checked against HEAD byte for byte (`tmp/check-folded.py`).
+
+## Other work searched for
+
+- **Old backup refs.** 48 refs under `refs/backup/2026-10-1{3,4}*` are not reachable from main.
+  `git cherry` left 19 distinct patch-unique commits, and every one is on main or superseded:
+  - 10 have a commit with the same subject on main (re-landed after rebase).
+  - e5ad40ae's cherry-pick onto main changes nothing.
+  - The rest were checked by content markers on main:
+    - the shared_budget mutex and thread tests;
+    - the language-stats SingleFlight and racy-clean cache;
+    - the AgentsView visible-timer contract;
+    - all 35 entity_collision adversarial tests and every be97d16f function;
+    - `ScanDeadline`, `changed_paths_within` and `scan_in_waves`.
+  - f2166f9f is a scan bench against the deleted `read_range()`, superseded by its own account.
+  - Scripts: `tmp/cherry-unreached.sh`, `tmp/subject-match.sh`, `tmp/already-applied.sh`.
+- **Session scratchpads** (`/private/tmp/claude-501/-Users-bharath-Code-devtools-GitPulse*`):
+  - The `clone` and `tagless` scratch trees: 3,658 files, every blob already in the object store
+    (`tmp/blob-known.sh`).
+  - `shallow-s4`: a clean clone of 8026dd7e.
+  - `save/storm.rs`: an older draft of `watcher/storm.rs` (main has 555be54e and dbcf8142).
+  - The 10-14 branch bundle: all of its heads are covered above.
+  - 27 edit fragments: 24 are 80–100% on main. `hosted.rs` landed as `pass.rs` `hosted_owner`.
+    `inj.rs` tests an injected existence check that 25d8b3e0 (on main) removed. `w.rs` is a
+    socket-backlog probe.
+  - Nothing to merge.
+- **stash@{1}** "wip task compose (not 0.1.0 CI)", from 2026-09-09. It is unrelated, and was left
+  alone as in earlier runs.
+
+## Deleted
+
+| Branch | Was | Backup ref |
+|---|---|---|
+| consolidate/1016 | 6b7c42fa | refs/backup/2026-10-17/consolidate/1016 |
+| consolidate/1017 | dc331e8c | refs/backup/2026-10-17/consolidate/1017 |
+| bl/integrate-1013 | b91c79fc | refs/backup/2026-10-17/bl/integrate-1013 |
+| pf/434d7bef-sidecar-rtt | 0e357b70 | refs/backup/2026-10-17/pf/434d7bef-sidecar-rtt |
+| pf/434d7bef-sidecar-rtt-adv | 0e357b70 | refs/backup/2026-10-17/pf/434d7bef-sidecar-rtt-adv |
+| pf/434d7bef-sidecar-rtt-real | d1f7c9b3 | refs/backup/2026-10-17/pf/434d7bef-sidecar-rtt-real |
+| wip/webcontent-snapshot | b1ac76b7 | refs/backup/2026-10-17/wip/webcontent-snapshot |
+| gitpulse/webcontent-…-0d178c24 | 8026dd7e | refs/backup/2026-10-17/gitpulse/webcontent-memory-attribute-the-290-mb-w-0d178c24 |
+
+All were deleted with `git branch -d`; none needed `-D`.
+
+Worktrees removed:
+
+- consolidate-1016: plain `git worktree remove`.
+- bl-integrate: `--force`, after its two untracked reports were committed and checked.
+- webcontent-…-0d178c24: `--force`, because its 10 files are in b1ac76b7.
+- agent-aa5d0005: clean and reachable.
+
+The ignored `tmp/` contents of consolidate-1016 and bl-integrate (CI logs, merge scripts) are kept
+in the main checkout's `tmp/worktree-archive/`.
+
+## Kept
+
+- `main`.
+- `seed`, a detached worktree at ed54ac18: clean and reachable, with a seeded `src-tauri/target`
+  that lanes clone from.
+- `webcontent-snap`, a detached worktree at dc331e8c that is running this run's ci:local.
+  Remove it once its log is read.
+- No release branches exist.
+
+## Blocked
+
+None.
+
+## Gate (ci:local on dc331e8c, the tree now on main)
+
+GATE_RESULT_PLACEHOLDER
+
+## Restore
+
+```
+git branch <name> refs/backup/2026-10-17/<name>
+git fetch /Users/bharath/branch-backups/GitPulse-2026-10-17.bundle 'refs/heads/*:refs/restored/*'
+git reset --keep 8026dd7e   # only to undo the landing itself; refs/backup/2026-10-17/main
+```
+
+---
+
 # Branch consolidation report — 2026-10-16 (late run, 23:00)
 
 Scope: local branches only; nothing was pushed. **Everything is merged into `consolidate/1017`
