@@ -1943,6 +1943,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The first word that is not a flag is git's repository slot. It is
+        // re-checked here, under the lock, so a planned argv that was edited
+        // or went stale between plan and run cannot reach an unconfigured
+        // repository.
+        if let Some(repository) = args
+            .iter()
+            .skip(1)
+            .find(|arg| arg.as_str() != "--force-with-lease" && arg.as_str() != "-u")
+        {
+            crate::engine::remotes::require_configured(&repo, repository)?;
+        }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         git_text_network(&repo, &refs)
     }
@@ -3048,11 +3059,37 @@ fn plan_push_argv(
             args.push(branch.to_string());
         }
         (None, Some(branch)) => {
+            // git reads a lone word after `push` as the repository, so a
+            // branch given without a remote must never be emitted alone: it
+            // would turn any caller-supplied word into a push target. The
+            // remote is resolved explicitly, from a configured name.
             validate_ref_name(branch)?;
+            let remote = implicit_push_remote(repo)?;
+            validate_ref_name(&remote)?;
+            args.push(remote);
             args.push(branch.to_string());
         }
     }
     Ok(args)
+}
+
+/// The configured remote a push with no named remote goes to: the current
+/// branch's own `branch.<name>.remote` when it names a configured remote,
+/// else the same choice an unpublished branch makes.
+fn implicit_push_remote(repo: &Path) -> Result<String, String> {
+    if let Ok(branch) = current_branch_name(repo) {
+        let key = format!("branch.{branch}.remote");
+        if let Ok(configured) = git_text(repo, &["config", "--get", &key]) {
+            let name = configured.trim();
+            if crate::engine::remotes::list_names(repo)?
+                .iter()
+                .any(|remote| remote == name)
+            {
+                return Ok(name.to_string());
+            }
+        }
+    }
+    unpublished_push_remote(repo)
 }
 
 /// The one validator for a branch, tag, remote or revision name that reaches a
@@ -5492,6 +5529,50 @@ mod tests {
             .expect("push to team/fork");
         git_in(repo.path(), &["tag", "v1"]);
         GitWriter::push_tag(&repo_path(&repo), "team/fork", "v1").expect("push tag to team/fork");
+    }
+
+    #[test]
+    fn a_branch_without_a_remote_is_planned_against_a_resolved_configured_remote() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("main"), false).unwrap();
+        assert_eq!(
+            argv,
+            vec!["push", "origin", "main"],
+            "the branch must never be the lone word git reads as the repository"
+        );
+    }
+
+    #[test]
+    fn push_planned_refuses_an_unconfigured_repository_slot_but_allows_flags_and_remotes() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let args: Vec<String> = ["push", "--force-with-lease", "-u", "elsewhere", "main"]
+            .map(String::from)
+            .to_vec();
+        let err = GitWriter::push_planned(&repo_path(&repo), &args).unwrap_err();
+        assert!(
+            err.contains("elsewhere") && err.contains("not a configured remote"),
+            "{err}"
+        );
+        let ok: Vec<String> = ["push", "origin", "main"].map(String::from).to_vec();
+        GitWriter::push_planned(&repo_path(&repo), &ok).expect("a configured remote pushes");
+    }
+
+    #[test]
+    fn push_planned_refuses_an_unconfigured_repository_slot_alone() {
+        let repo = init_repo_with_commit();
+        let err = GitWriter::push_planned(&repo_path(&repo), &["push".into(), "victim.git".into()])
+            .unwrap_err();
+        assert!(err.contains("victim.git"), "{err}");
     }
 
     #[test]

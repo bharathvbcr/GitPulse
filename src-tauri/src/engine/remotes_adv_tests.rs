@@ -97,12 +97,15 @@ fn display_never_contains_a_password_on_any_known_scheme_shape() {
         format!("https://user:{SECRET}:more@host/x"),
         format!("https://:{SECRET}@host/x"),
     ] {
-        assert!(!leaks(&input), "{input} -> {}", url_for_display(&input).display);
+        assert!(
+            !leaks(&input),
+            "{input} -> {}",
+            url_for_display(&input).display
+        );
     }
 }
 
 #[test]
-#[ignore = "break: an scp-like URL with a password (user:pw@host:path) is shown verbatim and has_credentials=false"]
 fn scp_like_url_with_password_is_redacted() {
     let input = format!("user:{SECRET}@host:path");
     assert!(!leaks(&input), "{}", url_for_display(&input).display);
@@ -122,7 +125,10 @@ fn lone_unrecognised_token_is_not_shown_as_a_username() {
     ] {
         let shown = url_for_display(input);
         assert!(
-            shown.has_credentials && !shown.display.contains("a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0")
+            shown.has_credentials
+                && !shown
+                    .display
+                    .contains("a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0")
                 && !shown.display.contains("abcdefghijklmnopqrstuvwxyz234567"),
             "{input} -> {shown:?}"
         );
@@ -136,7 +142,11 @@ fn query_string_credentials_are_redacted() {
         format!("https://host/x.git?password={SECRET}"),
         format!("https://host/x.git?access_token={SECRET}"),
     ] {
-        assert!(!leaks(&input), "{input} -> {}", url_for_display(&input).display);
+        assert!(
+            !leaks(&input),
+            "{input} -> {}",
+            url_for_display(&input).display
+        );
     }
 }
 
@@ -168,13 +178,15 @@ fn add_stored(dir: &tempfile::TempDir, url: &str) {
 }
 
 fn stored(dir: &tempfile::TempDir, key: &str) -> Option<String> {
-    git_text(dir.path(), &["config", "--get", &format!("remote.origin.{key}")])
-        .ok()
-        .map(|v| v.trim().to_string())
+    git_text(
+        dir.path(),
+        &["config", "--get", &format!("remote.origin.{key}")],
+    )
+    .ok()
+    .map(|v| v.trim().to_string())
 }
 
 #[test]
-#[ignore = "break: there is no way to strip stored credentials via Set URL while keeping host/path; the display form is always re-attached"]
 fn user_can_remove_stored_credentials_without_changing_the_host() {
     let dir = repo();
     let path = dir.path().to_str().unwrap();
@@ -183,16 +195,49 @@ fn user_can_remove_stored_credentials_without_changing_the_host() {
         name: "origin".into(),
         url: "https://user@host/o/r.git".into(),
         push: false,
+        drop_credentials: true,
     };
     apply_with(path, &change, |_| Ok(())).unwrap();
-    assert!(!stored(&dir, "url").unwrap().contains(SECRET));
+    assert_eq!(stored(&dir, "url").unwrap(), "https://user@host/o/r.git");
+    assert!(!list(path).unwrap().remotes[0].has_credentials);
+}
+
+#[test]
+fn the_verdict_the_webview_receives_has_no_secret() {
+    let dir = repo();
+    let path = dir.path().to_str().unwrap();
+    add_stored(&dir, &format!("https://user:{SECRET}@host/o/r.git"));
+    let shown = list(path).unwrap().remotes.remove(0).fetch_url.unwrap();
+    let change = RemoteChange::SetUrl {
+        name: "origin".into(),
+        url: shown,
+        push: false,
+        drop_credentials: false,
+    };
+    // The real gate, whatever it answers here: its verdict (or its error)
+    // is what crosses IPC.
+    let (verdict, _) = apply_with(path, &change, |argv| {
+        Ok(match crate::harness::guard_command(path, argv) {
+            Ok(verdict) => serde_json::to_string(&verdict).unwrap(),
+            Err(error) => error,
+        })
+    })
+    .unwrap();
+    assert!(!verdict.contains(SECRET), "verdict leaks: {verdict}");
+    assert!(
+        verdict.contains("host"),
+        "judge still sees the host: {verdict}"
+    );
+    assert_eq!(
+        stored(&dir, "url").unwrap(),
+        format!("https://user:{SECRET}@host/o/r.git")
+    );
 }
 
 /// The argv handed to the judge carries the re-attached stored secret. The
 /// real judge (`harness::guard_command`) builds `PolicyVerdict::target` from
 /// that argv and the verdict is returned to the webview in `Guarded.policy`.
 #[test]
-#[ignore = "break: re-attached stored credentials are in the argv the judge sees; PolicyVerdict.target (the rendered command) crosses IPC"]
 fn the_judge_never_sees_the_stored_secret() {
     let dir = repo();
     let path = dir.path().to_str().unwrap();
@@ -202,6 +247,7 @@ fn the_judge_never_sees_the_stored_secret() {
         name: "origin".into(),
         url: shown,
         push: false,
+        drop_credentials: false,
     };
     let seen = std::cell::RefCell::new(String::new());
     apply_with(path, &change, |argv| {
@@ -209,7 +255,11 @@ fn the_judge_never_sees_the_stored_secret() {
         Ok(())
     })
     .unwrap();
-    assert!(!seen.borrow().contains(SECRET), "judge saw: {}", seen.borrow());
+    assert!(
+        !seen.borrow().contains(SECRET),
+        "judge saw: {}",
+        seen.borrow()
+    );
 }
 
 #[test]
@@ -221,10 +271,14 @@ fn set_url_with_a_changed_path_replaces_and_drops_credentials() {
         name: "origin".into(),
         url: "https://user@host/o/other.git".into(),
         push: false,
+        drop_credentials: false,
     };
     apply_with(path, &change, |_| Ok(())).unwrap();
     // Documented behaviour: editing the path drops the credentials.
-    assert_eq!(stored(&dir, "url").unwrap(), "https://user@host/o/other.git");
+    assert_eq!(
+        stored(&dir, "url").unwrap(),
+        "https://user@host/o/other.git"
+    );
 }
 
 #[test]
@@ -238,6 +292,7 @@ fn push_url_display_does_not_reattach_the_fetch_credentials_to_a_pushurl() {
         name: "origin".into(),
         url: "https://user@host/o/r.git".into(),
         push: true,
+        drop_credentials: false,
     };
     apply_with(path, &change, |_| Ok(())).unwrap();
     assert_eq!(
@@ -247,18 +302,27 @@ fn push_url_display_does_not_reattach_the_fetch_credentials_to_a_pushurl() {
 }
 
 #[test]
-#[ignore = "break: has_credentials is OR-ed across multiple url entries while only the last is displayed"]
 fn multiple_url_entries_do_not_report_credentials_that_are_not_shown() {
     let dir = repo();
     let path = dir.path().to_str().unwrap();
     add_stored(&dir, "https://clean@host/o/r.git");
     git_in(
         dir.path(),
-        &["config", "--add", "remote.origin.url", "https://u:pw@host/o/r2.git"],
+        &[
+            "config",
+            "--add",
+            "remote.origin.url",
+            "https://u:pw@host/o/r2.git",
+        ],
     );
     git_in(
         dir.path(),
-        &["config", "--add", "remote.origin.url", "https://clean@host/o/r3.git"],
+        &[
+            "config",
+            "--add",
+            "remote.origin.url",
+            "https://clean@host/o/r3.git",
+        ],
     );
     let r = list(path).unwrap().remotes.remove(0);
     // last value wins in display; has_credentials is OR-ed across entries.
@@ -278,8 +342,9 @@ fn a_failed_fetch_error_does_not_contain_the_token() {
     // Nothing listens on port 1: the fetch fails fast with a connection error.
     add_stored(&dir, &format!("http://user:{SECRET}@127.0.0.1:1/x.git"));
     crate::test_support::trust_repo(dir.path());
-    let err = crate::engine::git_writer::GitWriter::fetch(dir.path().to_str().unwrap(), Some("origin"))
-        .expect_err("fetch must fail");
+    let err =
+        crate::engine::git_writer::GitWriter::fetch(dir.path().to_str().unwrap(), Some("origin"))
+            .expect_err("fetch must fail");
     assert!(!err.contains(SECRET), "fetch error leaks the token: {err}");
 }
 
@@ -288,8 +353,9 @@ fn a_failed_fetch_from_a_credentialed_path_like_url_does_not_leak() {
     let dir = repo();
     add_stored(&dir, &format!("ssh://user:{SECRET}@127.0.0.1:1/x.git"));
     crate::test_support::trust_repo(dir.path());
-    let err = crate::engine::git_writer::GitWriter::fetch(dir.path().to_str().unwrap(), Some("origin"))
-        .expect_err("fetch must fail");
+    let err =
+        crate::engine::git_writer::GitWriter::fetch(dir.path().to_str().unwrap(), Some("origin"))
+            .expect_err("fetch must fail");
     assert!(!err.contains(SECRET), "fetch error leaks the token: {err}");
 }
 
@@ -299,7 +365,15 @@ fn a_failed_fetch_from_a_credentialed_path_like_url_does_not_leak() {
 fn membership_is_exact_not_case_whitespace_or_lookalike_tolerant() {
     let dir = repo();
     git_in(dir.path(), &["remote", "add", "Origin", "/tmp/x"]);
-    for name in ["origin", "ORIGIN", "Origin ", " Origin", "Origin\n", "Orig\u{0131}n", "Or\u{0069}gin\u{200b}"] {
+    for name in [
+        "origin",
+        "ORIGIN",
+        "Origin ",
+        " Origin",
+        "Origin\n",
+        "Orig\u{0131}n",
+        "Or\u{0069}gin\u{200b}",
+    ] {
         assert!(
             require_configured(dir.path(), name).is_err(),
             "{name:?} must not match 'Origin'"
@@ -311,28 +385,25 @@ fn membership_is_exact_not_case_whitespace_or_lookalike_tolerant() {
 #[test]
 fn a_configured_remote_with_a_local_path_url_is_allowed() {
     let dir = repo();
-    git_in(dir.path(), &["remote", "add", "local", "/tmp/some-other-repo"]);
+    git_in(
+        dir.path(),
+        &["remote", "add", "local", "/tmp/some-other-repo"],
+    );
     assert!(require_configured(dir.path(), "local").is_ok());
 }
 
 #[test]
-#[ignore = "break: push with no remote and a path in the branch slot plans `git push <path>`; git reads that lone word as the repository, so membership is bypassed"]
 fn push_with_a_path_in_the_branch_slot_is_refused() {
     let dir = repo();
     git_in(dir.path(), &["commit", "--allow-empty", "-q", "-m", "x"]);
     let path = dir.path().to_str().unwrap();
     git_in(dir.path(), &["init", "-q", "--bare", "victim.git"]);
-    let planned = crate::engine::git_writer::GitWriter::plan_push(
-        path,
-        None,
-        Some("victim.git"),
-        false,
-    );
+    let planned =
+        crate::engine::git_writer::GitWriter::plan_push(path, None, Some("victim.git"), false);
     assert!(planned.is_err(), "planned argv would run: {planned:?}");
 }
 
 #[test]
-#[ignore = "break: push_planned (pub) validates names only; a planned argv naming an unconfigured path runs"]
 fn push_planned_alone_refuses_an_unconfigured_remote() {
     let dir = repo();
     git_in(dir.path(), &["commit", "--allow-empty", "-q", "-m", "x"]);
@@ -343,11 +414,12 @@ fn push_planned_alone_refuses_an_unconfigured_remote() {
         "victim.git".to_string(),
         "main".to_string(),
     ];
-    let result = crate::engine::git_writer::GitWriter::push_planned(
-        dir.path().to_str().unwrap(),
-        &args,
+    let result =
+        crate::engine::git_writer::GitWriter::push_planned(dir.path().to_str().unwrap(), &args);
+    assert!(
+        result.is_err(),
+        "push to an unconfigured path ran: {result:?}"
     );
-    assert!(result.is_err(), "push to an unconfigured path ran: {result:?}");
 }
 
 #[test]

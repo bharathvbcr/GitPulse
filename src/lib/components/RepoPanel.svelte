@@ -120,6 +120,7 @@
   let addError = $state<string | null>(null);
   let editingRemote = $state<string | null>(null);
   let editUrl = $state("");
+  let editDropCredentials = $state(false);
   let renamingRemote = $state<string | null>(null);
   let renameTo = $state("");
   let renameError = $state<string | null>(null);
@@ -351,7 +352,7 @@
       addError = urlErr;
       return;
     }
-    activateRemote({ kind: "seturl", name, url: editUrl.trim(), push: false });
+    activateRemote({ kind: "seturl", name, url: editUrl.trim(), push: false, drop_credentials: editDropCredentials });
   }
 
   function submitRename(name: string) {
@@ -488,6 +489,7 @@
                   onclick={() => {
                     editingRemote = remote.name;
                     editUrl = remote.fetch_url ?? "";
+                    editDropCredentials = false;
                     renamingRemote = null;
                     renameError = null;
                     armed = null;
@@ -550,6 +552,12 @@
                     aria-label="New URL for {remote.name}"
                     placeholder="https://github.com/owner/repo.git"
                   />
+                  {#if remote.has_credentials}
+                    <label class="flex w-full items-center gap-1.5 text-[11px] text-textMuted">
+                      <input type="checkbox" bind:checked={editDropCredentials} />
+                      Remove the saved password or token (otherwise it is kept)
+                    </label>
+                  {/if}
                   <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]!" disabled={busy !== null}>
                     {armed?.key === setKey ? "Confirm URL" : "Apply URL"}
                   </button>

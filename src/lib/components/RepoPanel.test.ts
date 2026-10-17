@@ -49,6 +49,12 @@ describe("RepoPanel remotes", () => {
     expect(parsed.remotes[0].fetch_url).not.toMatch(/:[^@/]+@/);
   });
 
+  it("offers an explicit way to remove saved credentials from Set URL", () => {
+    expect(source).toContain("drop_credentials: editDropCredentials");
+    expect(source).toContain("bind:checked={editDropCredentials}");
+    expect(source).toMatch(/\{#if remote\.has_credentials\}\s*<label/);
+  });
+
   it("arms destructive remote changes before executing them", () => {
     expect(source).toContain("Confirm prune");
     expect(source).toContain("Confirm remove");

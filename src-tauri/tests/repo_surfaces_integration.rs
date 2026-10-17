@@ -442,6 +442,7 @@ fn a_separate_push_url_is_reported_alongside_the_fetch_url() {
             name: "origin".into(),
             url: "ssh://git@example.test/fork.git".into(),
             push: true,
+            drop_credentials: false,
         },
         allow,
     )

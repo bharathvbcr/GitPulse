@@ -790,6 +790,30 @@ pub struct UrlDisplay {
     pub has_credentials: bool,
 }
 
+/// The scp-like form with a password (`user:pw@host:path`,
+/// `user:pw@host:22/path`): the password is dropped and the user kept. `None`
+/// for anything that is not that shape, including a plain `git@host:path`.
+fn scp_display(url: &str) -> Option<UrlDisplay> {
+    let head_end = url.find('/').unwrap_or(url.len());
+    let at = url[..head_end].rfind('@')?;
+    let (userinfo, rest) = (&url[..at], &url[at + 1..]);
+    let (user, password) = userinfo.split_once(':')?;
+    // `host:path` after the `@` is what makes this scp-like rather than a
+    // path that happens to contain `@`; user names carry no `.` or `\`.
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    if password.is_empty()
+        || user.is_empty()
+        || user.contains('.')
+        || !rest[..host_end].contains(':')
+    {
+        return None;
+    }
+    Some(UrlDisplay {
+        display: text(&format!("{user}@{rest}")),
+        has_credentials: true,
+    })
+}
+
 /// The display form of a remote URL: the userinfo's password is dropped and
 /// the username kept, so the configured account stays visible without the
 /// token.
@@ -798,8 +822,9 @@ pub struct UrlDisplay {
 /// - A lone userinfo on a non-ssh scheme (`https://ghp_xxx@host`) is dropped
 ///   when [`text`] judges it a token; a plain name (`https://alice@host`) is
 ///   kept. A lone `ssh://` / `git+ssh://` userinfo is an account name, kept.
-/// - scp-like `git@host:path`, local paths and URLs without userinfo are
-///   returned unchanged: they carry no password component.
+/// - scp-like `user:pw@host:path` loses its password (`user@host:path`); a
+///   plain `git@host:path` has none and is unchanged, as are local paths and
+///   URLs without userinfo.
 ///
 /// The authority is read as git does (up to the first `/`, `?` or `#`) and its
 /// userinfo ends at the last `@`, so percent-encoded userinfo and bracketed
@@ -814,7 +839,7 @@ pub fn url_for_display(url: &str) -> UrlDisplay {
         }
     };
     let Some((scheme, after)) = url.split_once("://") else {
-        return unchanged(url);
+        return scp_display(url).unwrap_or_else(|| unchanged(url));
     };
     let scheme_ok = scheme
         .chars()

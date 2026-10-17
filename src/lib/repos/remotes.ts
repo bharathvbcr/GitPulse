@@ -30,7 +30,7 @@ export type RemoteChange =
   | { kind: "add"; name: string; url: string }
   | { kind: "remove"; name: string }
   | { kind: "rename"; name: string; new_name: string }
-  | { kind: "seturl"; name: string; url: string; push: boolean }
+  | { kind: "seturl"; name: string; url: string; push: boolean; drop_credentials?: boolean }
   | { kind: "prune"; name: string };
 
 /** Wire shape of `cmd_list_remotes`. A bare array could not say when the cap cut remotes. */

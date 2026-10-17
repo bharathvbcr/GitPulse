@@ -125,6 +125,8 @@ pub(crate) fn split_tracking_ref<'a>(
 fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteList {
     let mut by_name: BTreeMap<String, RemoteInfo> = BTreeMap::new();
     let mut truncated = false;
+    // [fetch, push] credential flags of the URL each remote currently shows.
+    let mut shown_credentials: BTreeMap<String, [bool; 2]> = BTreeMap::new();
     for (key, value) in records {
         let Some((name, field)) = split_remote_key(key) else {
             continue;
@@ -142,20 +144,28 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
             is_default: false,
         });
         match field.as_str() {
+            // A key can repeat; the last value wins, in the display and in
+            // the credential flag alike, so the flag describes what is shown.
             "url" => {
                 let shown = url_for_display(value);
-                entry.has_credentials |= shown.has_credentials;
+                shown_credentials.entry(entry.name.clone()).or_default()[0] = shown.has_credentials;
                 entry.fetch_url = Some(shown.display);
             }
             "pushurl" => {
                 let shown = url_for_display(value);
-                entry.has_credentials |= shown.has_credentials;
+                shown_credentials.entry(entry.name.clone()).or_default()[1] = shown.has_credentials;
                 entry.push_url = Some(shown.display);
             }
             // `fetch`, `tagopt` and friends are configuration this surface does
             // not present; they still prove the remote exists, which is why the
             // entry above is created before this match.
             _ => {}
+        }
+    }
+
+    for (name, flags) in &shown_credentials {
+        if let Some(entry) = by_name.get_mut(name) {
+            entry.has_credentials = flags.iter().any(|flag| *flag);
         }
     }
 
@@ -251,10 +261,18 @@ pub enum RemoteChange {
         new_name: String,
     },
     /// Repoints the fetch URL, or the push URL when `push` is set.
+    ///
+    /// The webview only ever holds display URLs. A `url` equal to the display
+    /// form of the stored URL keeps the stored credentials, unless
+    /// `drop_credentials` is set: then the URL is applied exactly as given,
+    /// which is how a user removes saved credentials without retyping the
+    /// host and path.
     SetUrl {
         name: String,
         url: String,
         push: bool,
+        #[serde(default)]
+        drop_credentials: bool,
     },
     /// Deletes remote-tracking refs whose upstream branch is gone.
     Prune {
@@ -265,8 +283,9 @@ pub enum RemoteChange {
 impl RemoteChange {
     /// The argv this change would execute, for the gate and the executor.
     ///
-    /// Borrowed from `self` so the judged line and the run line are literally
-    /// the same strings, not two renderings that could diverge.
+    /// Borrowed from `self`. The executor runs `argv()` of the change as
+    /// resolved; the judge is shown `redacted().argv()`, which differs only in
+    /// carrying display URLs (see [`apply_with`]).
     pub fn argv(&self) -> Vec<&str> {
         match self {
             RemoteChange::Add { name, url } => vec!["git", "remote", "add", name, url],
@@ -274,7 +293,9 @@ impl RemoteChange {
             RemoteChange::Rename { name, new_name } => {
                 vec!["git", "remote", "rename", name, new_name]
             }
-            RemoteChange::SetUrl { name, url, push } => {
+            RemoteChange::SetUrl {
+                name, url, push, ..
+            } => {
                 let mut argv = vec!["git", "remote", "set-url"];
                 if *push {
                     argv.push("--push");
@@ -296,6 +317,29 @@ impl RemoteChange {
                 Some(CREDENTIAL_WARNING)
             }
             _ => None,
+        }
+    }
+
+    /// This change with any URL replaced by its display form: what the judge,
+    /// the verdict and the ledger are shown.
+    fn redacted(&self) -> RemoteChange {
+        match self {
+            RemoteChange::Add { name, url } => RemoteChange::Add {
+                name: name.clone(),
+                url: url_for_display(url).display,
+            },
+            RemoteChange::SetUrl {
+                name,
+                url,
+                push,
+                drop_credentials,
+            } => RemoteChange::SetUrl {
+                name: name.clone(),
+                url: url_for_display(url).display,
+                push: *push,
+                drop_credentials: *drop_credentials,
+            },
+            other => other.clone(),
         }
     }
 
@@ -381,15 +425,22 @@ where
     // what was re-attached.
     let warning = change.credential_warning();
     let resolved = keep_stored_credentials(&repo, change)?;
-    let change = resolved.as_ref().unwrap_or(change);
+    let executed = resolved.as_ref().unwrap_or(change);
 
-    let argv = change.argv();
-    let verdict = judge(&argv)?;
-    let output = if change.is_network() {
-        git_text_network(repo.as_path(), &argv[1..])?
+    // The judge, the verdict it returns (`PolicyVerdict.target` crosses IPC)
+    // and the ledger row see the display form: scheme, host and path, never a
+    // password or token. Only the argv that runs carries the credentialed URL.
+    let judged = executed.redacted();
+    let verdict = judge(&judged.argv())?;
+    let argv = executed.argv();
+    let output = if executed.is_network() {
+        git_text_network(repo.as_path(), &argv[1..])
     } else {
-        git_text(repo.as_path(), &argv[1..])?
-    };
+        git_text(repo.as_path(), &argv[1..])
+    }
+    // git can echo the URL in a failure; the caller's error text is not a
+    // place for the credentialed form.
+    .map_err(|e| crate::ledger::redact::text(&e))?;
     let output = match warning {
         Some(warning) if output.trim().is_empty() => warning.to_string(),
         Some(warning) => format!("{output}\n{warning}"),
@@ -409,7 +460,13 @@ fn keep_stored_credentials(
     repo: &Path,
     change: &RemoteChange,
 ) -> Result<Option<RemoteChange>, String> {
-    let RemoteChange::SetUrl { name, url, push } = change else {
+    let RemoteChange::SetUrl {
+        name,
+        url,
+        push,
+        drop_credentials: false,
+    } = change
+    else {
         return Ok(None);
     };
     let key = if *push { "pushurl" } else { "url" };
@@ -428,6 +485,7 @@ fn keep_stored_credentials(
             name: name.clone(),
             url: stored,
             push: *push,
+            drop_credentials: false,
         };
         resolved.validate()?;
         return Ok(Some(resolved));
@@ -648,6 +706,7 @@ mod tests {
             name: "origin".into(),
             url: "https://example.test/a.git".into(),
             push: true,
+            drop_credentials: false,
         };
         assert_eq!(
             change.argv(),
@@ -665,6 +724,7 @@ mod tests {
             name: "origin".into(),
             url: "https://example.test/a.git".into(),
             push: false,
+            drop_credentials: false,
         };
         assert_eq!(
             fetch_side.argv(),
@@ -768,6 +828,8 @@ mod tests {
             true,
         ),
         ("git@host:o/r.git", "git@host:o/r.git", false),
+        ("user:pw@host:o/r.git", "user@host:o/r.git", true),
+        ("user:pw@host:22/o/r.git", "user@host:22/o/r.git", true),
         ("https://host/o/r.git", "https://host/o/r.git", false),
         ("/Volumes/Disk/repo.git", "/Volumes/Disk/repo.git", false),
         ("../sibling", "../sibling", false),
@@ -846,6 +908,7 @@ mod tests {
             name: "origin".into(),
             url: url.into(),
             push: false,
+            drop_credentials: false,
         };
         apply_with(path, &change, |_| Ok(())).unwrap().1
     }
