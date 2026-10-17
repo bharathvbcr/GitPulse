@@ -828,6 +828,26 @@ describe("stopping", () => {
   });
 });
 
+describe("a scope entry that cannot be read overlaps everything", () => {
+  const ci = { caseInsensitive: false };
+  it("fails closed on an empty, outside-the-repository or unreadable entry, and reads . as the whole repository", () => {
+    for (const bad of ["", "   ", "../outside.ts", "..", "a\u0001b"]) {
+      expect(scopesOverlap([bad], ["src/a.ts"], ci), JSON.stringify(bad)).toBe(true);
+      expect(scopesOverlap(["src/a.ts"], ["docs/x.md", bad], ci), JSON.stringify(bad)).toBe(true);
+    }
+    expect(scopesOverlap(["."], ["src/a.ts"], ci)).toBe(true);
+    expect(scopesOverlap(["src/.."], ["src/a.ts"], ci)).toBe(true);
+    expect(scopesOverlap(["src/a.ts"], ["docs/x.md"], ci)).toBe(false);
+    expect(scopesOverlap([], ["src/a.ts"], ci)).toBe(false);
+  });
+
+  it("runs a task alone when one of its scope entries cannot be read, rather than dropping the entry", () => {
+    const scopes = new Map([["a", ["src/a.ts", ""]], ["b", ["docs/b.md"]]]);
+    expect(planBatch([task("a"), task("b")], scopes, 2, new Set(), ci).chosen.map((c) => c.id)).toEqual(["a"]);
+    expect(planBatch([task("b"), task("a")], scopes, 2, new Set(), ci).chosen.map((c) => c.id)).toEqual(["b"]);
+  });
+});
+
 describe("file scopes follow the filesystem's case rules", () => {
   it("treats src/A.ts and src/a.ts as overlapping on a case-insensitive filesystem, and as distinct on a case-sensitive one", () => {
     expect(scopesOverlap(["src/A.ts"], ["src/a.ts"], { caseInsensitive: true })).toBe(true);

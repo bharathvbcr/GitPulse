@@ -214,7 +214,34 @@ describe("dot segments", () => {
     expect(normalizeRepoPath("/../a")).toBe("/a");
     expect(normalizeRepoPath("C:/work/../x")).toBe("C:/x");
     expect(normalizeRepoPath("//host/share/./x")).toBe("//host/share/x");
-    expect(normalizeRepoPath("a/..")).toBeNull();
-    expect(normalizeRepoPath("/x/..")).toBeNull();
+    // What folds to nothing is "." or its root, never null: null stays the input's own (empty, control, bare root).
+    expect(normalizeRepoPath("a/..")).toBe(".");
+    expect(normalizeRepoPath("./")).toBe(".");
+    expect(normalizeRepoPath(".")).toBe(".");
+    expect(normalizeRepoPath("/x/..")).toBe("/");
+    expect(normalizeRepoPath("/")).toBeNull();
+    expect(normalizeRepoPath("//")).toBeNull();
+    expect(normalizeRepoPath("")).toBeNull();
+    expect(normalizeRepoPath("a\u0001b")).toBeNull();
+  });
+
+  it("never lets .. climb above a drive letter or a UNC server and share", () => {
+    expect(normalizeRepoPath("C:/..")).toBe("C:");
+    expect(normalizeRepoPath("C:/a/../../x")).toBe("C:/x");
+    expect(normalizeRepoPath("//server/share/../x")).toBe("//server/share/x");
+    expect(normalizeRepoPath("//server/../x")).toBe("//server/x");
+    expect(normalizeRepoPath("//server/share/a/../../..")).toBe("//server/share");
+    expect(normalizeRepoPath("\\\\server\\share\\a\\..\\b")).toBe("//server/share/b");
+  });
+
+  it("leaves the absolute paths callers persist and compare exactly as they were", () => {
+    for (const same of ["/Users/me/Code/repo", "/Users/me/Code/repo/.claude/worktrees/x", "/a", "C:/Users/me/repo", "//server/share/repo", "/Users/me/.hidden/repo", "/Users/me/a..b/repo", "/Users/me/...", "relative/dir"]) {
+      expect(normalizeRepoPath(same), same).toBe(same);
+    }
+    expect(normalizeRepoPath("/Users/me/Code/repo/")).toBe("/Users/me/Code/repo");
+    expect(normalizeRepoPath("/Users//me///repo")).toBe("/Users/me/repo");
+    expect(normalizeRepoPath("C:\\Users\\me\\repo\\")).toBe("C:/Users/me/repo");
+    expect(normalizeRepoPath("  /Users/me/repo  ")).toBe("/Users/me/repo");
+    expect(identityKey("/Users/Me/Repo/", { caseInsensitive: true })).toBe("/users/me/repo");
   });
 });

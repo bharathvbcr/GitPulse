@@ -175,11 +175,20 @@ const hostOptions = (): PathIdentityOptions => ({ caseInsensitive: isCaseInsensi
 
 /** Whether two path sets touch the same file: equal paths, or one inside a directory the other names. */
 export function scopesOverlap(a: readonly string[], b: readonly string[], options: PathIdentityOptions = hostOptions()): boolean {
-  const left = a.map((p) => normalizePath(p, options)).filter(Boolean), right = b.map((p) => normalizePath(p, options)).filter(Boolean);
-  for (const x of left) for (const y of right) {
-    if (x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
+  if (a.length === 0 || b.length === 0) return false;
+  const left = a.map((p) => scopeKey(p, options)), right = b.map((p) => scopeKey(p, options));
+  // An entry that cannot be read as a path inside the repository could be anywhere in it: it overlaps everything, never nothing.
+  if (left.includes(null) || right.includes(null)) return true;
+  for (const x of left as string[]) for (const y of right as string[]) {
+    if (x === "." || y === "." || x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
   }
   return false;
+}
+
+/** A scope entry's identity, or null when it names nothing usable: empty, or outside the repository (`..`). `.` is the whole repository. */
+function scopeKey(path: string, options: PathIdentityOptions): string | null {
+  const key = normalizePath(path, options);
+  return !key || key === ".." || key.startsWith("../") ? null : key;
 }
 
 export interface BatchPlan { chosen: Candidate[]; skipped: { id: string; title: string; reason: string }[] }
@@ -191,7 +200,11 @@ export interface BatchPlan { chosen: Candidate[]; skipped: { id: string; title: 
  */
 export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions()): BatchPlan {
   const chosen: Candidate[] = [], skipped: BatchPlan["skipped"] = [];
-  const known = (id: string) => (scopes.get(id) ?? []).map((p) => normalizePath(p, options)).filter(Boolean);
+  // A scope with any entry that cannot be read is an unknown scope, which runs alone.
+  const known = (id: string) => {
+    const keys = (scopes.get(id) ?? []).map((p) => scopeKey(p, options));
+    return keys.includes(null) ? [] : (keys as string[]);
+  };
   for (const candidate of candidates) {
     if (chosen.length >= n) break;
     if (excluded.has(candidate.id) || chosen.some((c) => c.id === candidate.id)) continue;
