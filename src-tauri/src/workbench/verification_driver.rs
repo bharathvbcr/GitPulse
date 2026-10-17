@@ -25,6 +25,11 @@
 //!   arrives is recorded as `could_not_run`: its own state, in the logs and
 //!   as an evidence row, so it reads as neither a failure nor a pass. The gate
 //!   treats it as a hold. It is not retried on its own; Verify on the card is.
+//! - A head or base that could not be read because git was deferred under
+//!   load, or was waiting for a process slot, writes nothing and is asked
+//!   again on the next sweep. A `could_not_run` whose cause is that deferral
+//!   is asked again once the head can be read. A sidecar that is down stays
+//!   terminal.
 //! - A host that is shutting down stops the sweep without writing.
 
 use super::intake::{self, HELD_MARKER};
@@ -94,7 +99,7 @@ pub(crate) trait Backend {
     fn start(&self, params: Value) -> Result<Value, WorkbenchError>;
     fn head_of(&self, worktree: &str) -> Result<String, String>;
     /// The revision verification diffs against: where `head` left the default
-    /// branch.
+    /// branch, or its first parent when `head` is on that branch.
     fn base_of(&self, worktree: &str, head: &str) -> Result<String, String>;
     fn now(&self) -> Instant;
     fn cancelled(&self) -> bool;
@@ -139,6 +144,10 @@ pub(crate) struct Facts<'a> {
 pub(crate) fn decide(facts: &Facts<'_>) -> Step {
     let head = match &facts.current_head {
         Ok(head) => head,
+        // The spawn was declined. Nothing was read, so this is not a verdict
+        // and the next sweep asks again. Writing `could_not_run` here made a
+        // two-second rate-limit into a permanent hold for that commit.
+        Err(error) if git_question_unasked(error) => return Step::Skip,
         Err(error) => {
             return Step::CouldNotRun(format!("the worktree's head could not be read: {error}"))
         }
@@ -168,7 +177,19 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
             Some((elapsed, _)) => waited(elapsed),
             None => Step::Start,
         },
-        Some(r) if r.state == STATE_COULD_NOT_RUN => Step::Skip,
+        Some(r) if r.state == STATE_COULD_NOT_RUN => {
+            // A deferral stored by an older build is the same unasked
+            // question. A sidecar that was down, or any other cause, stays
+            // terminal: Verify on the card is what retries those.
+            if r.degraded.iter().any(|line| git_question_unasked(line)) {
+                match facts.attempt {
+                    Some((elapsed, _)) => waited(elapsed),
+                    None => Step::Start,
+                }
+            } else {
+                Step::Skip
+            }
+        }
         Some(r) if r.state != "settled" => {
             waited(facts.attempt.map_or(Duration::ZERO, |(elapsed, _)| elapsed))
         }
@@ -334,6 +355,9 @@ impl Driver {
                         );
                         report.started += 1;
                     }
+                    // Same class as a deferred head read: the base was not
+                    // read, so there is no verdict to store.
+                    Err(why) if git_question_unasked(&why) => {}
                     Err(why) => {
                         self.could_not_run(store, card, id, target, &why, report);
                     }
@@ -614,6 +638,101 @@ pub(crate) fn run_now(
     backend.start(params)
 }
 
+/// True when `err` is a git question that was not asked: the spawn gate
+/// deferred it under load, or the child never got a process slot. The command
+/// did not run, so the error is not an answer about the repository.
+fn git_question_unasked(err: &str) -> bool {
+    crate::engine::git_cli::is_deferred_under_load(err)
+        || crate::engine::git_cli::is_slot_wait_timeout(err)
+}
+
+const NO_PARENT: &str = "the claimed commit is on the default branch and has no parent, so there is no earlier revision to diff against";
+
+/// What a `rev-parse` of `{head}^` means for the verification base.
+///
+/// A deferred or slot-wait error is returned unchanged. An unknown parent is
+/// the root-commit error. Any other git failure stays that failure.
+pub(crate) fn base_from_parent_read(
+    read: Result<String, String>,
+    head: &str,
+) -> Result<String, String> {
+    match read {
+        Err(err) if git_question_unasked(&err) => Err(err),
+        Err(err) if missing_parent(&err) => Err(NO_PARENT.to_owned()),
+        Err(err) => Err(err),
+        Ok(parent) => {
+            let parent = parent.trim().to_owned();
+            if parent.is_empty() || parent == head {
+                Err(NO_PARENT.to_owned())
+            } else {
+                Ok(parent)
+            }
+        }
+    }
+}
+
+fn missing_parent(err: &str) -> bool {
+    err.contains("Needed a single revision")
+        || err.contains("unknown revision")
+        || err.contains("bad revision")
+}
+
+/// The commit verification diffs against.
+///
+/// The fork is `merge-base` of the default-branch tip and `head`. A commit
+/// that left that branch diffs from the fork. A commit that is on the branch
+/// would otherwise diff against itself, an empty range, so the base is its
+/// first parent and the tip commit is what gets judged. Several commits
+/// landed directly on the default branch still contribute only the tip: the
+/// range is one commit. An empty diff is never treated as a pass; this
+/// function only refuses to hand back `head` itself. A root commit has no
+/// earlier revision and is an error.
+///
+/// A git question that was not asked is returned as that error. It is not
+/// rewritten into "no parent" or "no default branch".
+pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, String> {
+    let head = resolve_commit(worktree, head)?;
+    let fork = default_fork(worktree, &head)?;
+    if fork != head {
+        return Ok(fork);
+    }
+    let spec = format!("{head}^");
+    base_from_parent_read(
+        crate::engine::git_cli::git_text(
+            worktree,
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        ),
+        &head,
+    )
+}
+
+fn resolve_commit(worktree: &Path, head: &str) -> Result<String, String> {
+    let spec = format!("{head}^{{commit}}");
+    let full = crate::engine::git_cli::git_text(
+        worktree,
+        &["rev-parse", "--verify", "--end-of-options", &spec],
+    )?;
+    let full = full.trim().to_owned();
+    if full.is_empty() {
+        return Err(format!("the claimed commit {head} could not be resolved"));
+    }
+    Ok(full)
+}
+
+fn default_fork(worktree: &Path, head: &str) -> Result<String, String> {
+    let base = crate::engine::git_reader::default_base(worktree)
+        .checked()?
+        .base
+        .map(|(_, oid)| oid)
+        .ok_or_else(|| "the repository has no default branch to verify against".to_owned())?;
+    let fork = crate::engine::git_cli::git_text(worktree, &["merge-base", "--", &base, head])?;
+    let fork = fork.trim().to_owned();
+    if fork.is_empty() {
+        return Err("merge-base returned no commit".into());
+    }
+    Ok(fork)
+}
+
 /// The live backend: Manvi through the host's profile worker, git through the
 /// engine.
 pub(crate) struct HostBackend(pub WorkbenchState);
@@ -626,14 +745,7 @@ impl Backend for HostBackend {
         gate::current_head(worktree)
     }
     fn base_of(&self, worktree: &str, head: &str) -> Result<String, String> {
-        let path = Path::new(worktree);
-        let base = crate::engine::git_reader::default_base(path)
-            .checked()?
-            .base
-            .map(|(_, oid)| oid)
-            .ok_or_else(|| "the repository has no default branch to verify against".to_owned())?;
-        crate::engine::git_cli::git_text(path, &["merge-base", &base, head])
-            .map(|out| out.trim().to_owned())
+        verification_base(Path::new(worktree), head)
     }
     fn now(&self) -> Instant {
         Instant::now()
