@@ -128,4 +128,14 @@ describe("samePage", () => {
     expect(samePage(base, undefined)).toBe(false);
     expect(sameRecords([card("a")], [card("c")])).toBe(false);
   });
+
+  it("is a different answer when a field changed under the same revision", () => {
+    // A workspace's repository_count is derived: membership changes it without
+    // the workspace's own revision moving. Neither may keep the stale row.
+    const space = (count: number) => ({ id: "w", revision: 3, repository_count: count });
+    expect(sameRecords([space(0)], [space(1)])).toBe(false);
+    const task = (severity: string) => ({ id: "t", revision: 1, severity });
+    expect(samePage(page([task("")]), page([task("High")]))).toBe(false);
+    expect(sameRecords([space(2)], [space(2)])).toBe(true);
+  });
 });

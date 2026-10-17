@@ -18,12 +18,15 @@ export const MAX_RELOAD_PAGES = 20;
 export const MAX_COLUMN_PAGES = 100;
 
 /**
- * Whether two reads of a list hold the same records at the same revisions,
- * in the same order. A background refresh that found nothing new keeps the
- * list it has, so the screen is not redrawn for an answer it already shows.
+ * Whether two reads of a list hold the same records, field for field, in the
+ * same order. A background refresh that found nothing new keeps the list it
+ * has, so the screen is not redrawn for an answer it already shows. The
+ * revision alone does not decide it: a row carries derived fields (a
+ * workspace's `repository_count`) that change without its revision moving.
  */
 export function sameRecords(a: readonly { id: string; revision: number }[], b: readonly { id: string; revision: number }[]): boolean {
-  return a.length === b.length && a.every((row, i) => row.id === b[i].id && row.revision === b[i].revision);
+  return a.length === b.length
+    && a.every((row, i) => row.id === b[i].id && row.revision === b[i].revision && JSON.stringify(row) === JSON.stringify(b[i]));
 }
 
 /** `sameRecords` for a page, with its totals and cursor. */
