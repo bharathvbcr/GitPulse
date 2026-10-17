@@ -102,6 +102,18 @@ describe("TerminalSession PTY contracts", () => {
     expect(ensureBody).not.toMatch(/scrollback:\s*\d/);
   });
 
+  it("releases scrollback only for an ended session that is off screen", () => {
+    expect(source).toContain("shouldReleaseEndedBuffer(exited ? \"exited\" : \"running\", onscreen)");
+    expect(source).toContain("releaseEndedScrollback(current)");
+    // The trim keeps the last screen. Replaying the tail on top of it would
+    // duplicate the transcript, so the write is gated on an empty viewport.
+    expect(source).toContain("if (retainedOutput().trim()) return;");
+    // A restart or resume reset the screen before `exited` went false; the
+    // ended tail must not be written into the new session.
+    expect(source).toContain("if (!exited) { forgetEndedTail(id); return; }");
+    expect(source).toContain('current.write(tail.replace(/\\r?\\n/g, "\\r\\n"))');
+  });
+
   it("applies the Option-as-Meta setting to live sessions", () => {
     expect(source).toContain("$interfaceStore.terminalOptionAsMeta");
     expect(source).toContain("term.options.macOptionIsMeta = options.macOptionIsMeta");

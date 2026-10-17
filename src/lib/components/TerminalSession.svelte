@@ -103,6 +103,14 @@
   import { sessionActivity } from "../terminal/sessionActivity";
   import { createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
   import { createFrameProbe, FRAME_PROBE_OSC, handleFrameProbeCommand } from "../diagnostics/frameProbe";
+  import {
+    clipEndedTail,
+    endedTail,
+    forgetEndedTail,
+    releaseEndedScrollback,
+    rememberEndedTail,
+    shouldReleaseEndedBuffer,
+  } from "../terminal/endedBuffer";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -1315,11 +1323,56 @@
 
   /**
    * Scrollback follows its setting on live sessions too. Lowering it trims the
-   * oldest rows at once, which is the point of lowering it.
+   * oldest rows at once, which is the point of lowering it. An ended session
+   * that is off screen is left at the released value; raising it here would
+   * only undo that release.
    */
   $effect(() => {
     const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
+    const release = shouldReleaseEndedBuffer(exited ? "exited" : "running", onscreen);
+    if (release) return;
     if (term && term.options.scrollback !== rows) term.options.scrollback = rows;
+  });
+
+  /**
+   * An ended session nobody is looking at does not keep its scrollback.
+   * The last screen stays in the viewport. A plain-text tail is written back
+   * only when that viewport is empty, so it is not appended onto the screen
+   * the trim already kept. A live session, hidden or not, is not touched.
+   * The scrollback setting is read here so a later change cannot raise the
+   * option back while the session stays ended and off screen.
+   */
+  let endedReleased = false;
+  let endedReplayed = false;
+  $effect(() => {
+    const release = shouldReleaseEndedBuffer(exited ? "exited" : "running", onscreen);
+    const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
+    const current = term;
+    const id = tabId;
+    if (!current) return;
+    untrack(() => {
+      if (release) {
+        if (!endedReleased) {
+          const tail = clipEndedTail(retainedOutput());
+          if (tail) rememberEndedTail(id, tail);
+          endedReleased = true;
+          endedReplayed = false;
+        }
+        releaseEndedScrollback(current);
+        return;
+      }
+      if (!endedReleased || endedReplayed) return;
+      if (current.options.scrollback !== rows) current.options.scrollback = rows;
+      endedReplayed = true;
+      endedReleased = false;
+      // A restart or resume cleared the screen on purpose; the old tail is not
+      // this session's output.
+      if (!exited) { forgetEndedTail(id); return; }
+      if (retainedOutput().trim()) return;
+      const tail = endedTail(id);
+      // convertEol is off, and retainedOutput joins lines with a bare \n.
+      if (tail) current.write(tail.replace(/\r?\n/g, "\r\n"));
+    });
   });
 
   /**

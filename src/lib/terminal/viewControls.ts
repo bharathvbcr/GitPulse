@@ -17,9 +17,12 @@ export function clampTerminalFontSize(size: number): number {
  * xterm holds a scrollback row as `cols * 12` bytes whether or not it has
  * text in it, so a filled 5,000-row session at 200 columns holds 11.6 MB
  * (measured against the bundled xterm 6.0.0 with `node --expose-gc`; the
- * numbers are in the CHANGELOG entry that introduced this setting). Every
- * visited repository tab keeps its terminals mounted, so the figure is paid
- * once per session, not once per window.
+ * numbers are in the CHANGELOG entry that introduced this setting). A live
+ * session pays it while its terminal stays mounted, including while hidden.
+ * An ended session that is off screen drops those rows. The last screen stays
+ * in the viewport, and a short plain-text tail (`endedBuffer.ts`) is kept for
+ * an empty one, so finished tabs do not accumulate the full figure once per
+ * repository.
  *
  * Two settings, because the two kinds of session want different things: an
  * interactive shell is where someone scrolls back to what a command printed,

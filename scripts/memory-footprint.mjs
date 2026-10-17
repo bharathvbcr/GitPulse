@@ -18,10 +18,26 @@
  *   ArrayBuffer deltas.
  *
  * It reports; it asserts nothing. The installed app's WebContent RSS is a
- * separate measurement (`scripts/native-sample.mjs`).
+ * separate measurement (`scripts/native-sample.mjs`). WebKit Malloc is not
+ * this process: pass a `footprint -v` capture and this script prints that
+ * category instead of running the microbench.
+ *
+ *   node scripts/memory-footprint.mjs --footprint <footprint -v file>
  */
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+import { formatFootprintSummary, parseFootprint } from "./footprint-summary.mjs";
+
+const footprintFlag = process.argv.indexOf("--footprint");
+if (footprintFlag !== -1) {
+  const file = process.argv[footprintFlag + 1];
+  if (!file) {
+    console.error("usage: node scripts/memory-footprint.mjs --footprint <footprint -v file>");
+    process.exit(2);
+  }
+  console.log(formatFootprintSummary(parseFootprint(readFileSync(file, "utf8"))));
+  process.exit(0);
+}
 
 if (typeof global.gc !== "function") {
   console.error("run with: node --expose-gc scripts/memory-footprint.mjs");
