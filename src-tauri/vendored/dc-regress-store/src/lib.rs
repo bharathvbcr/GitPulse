@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use dc_regress::{AffectedTestFile, BlobIdentity, CodeGraph, ConeEntry, GraphSymbol};
+use dc_regress::{AffectedTestFile, BlobIdentity, BlobReader, CodeGraph, ConeEntry, GraphSymbol};
 use devmap_query::model::Request;
 use devmap_query::StoreQueryEngine;
 use devmap_store::Store;
@@ -86,6 +86,10 @@ pub struct StoreGraph<'a> {
     /// whole file is a real question — without letting the file node reach
     /// [`CodeGraph::symbols_in`].
     file_nodes: std::collections::BTreeSet<String>,
+    /// Where blob ids come from. One reader for the graph's life, so the
+    /// basis of every file costs one `cat-file` process between them, and an
+    /// analysis run over this graph reads its blobs through the same one.
+    blobs: BlobReader,
 }
 
 impl<'a> StoreGraph<'a> {
@@ -123,7 +127,16 @@ impl<'a> StoreGraph<'a> {
             head_sha,
             by_file,
             file_nodes,
+            blobs: BlobReader::new(std::ffi::OsStr::new("git"), repo),
         })
+    }
+
+    /// The same graph reading git through `program` — a test's stand-in for
+    /// `git`, or an operator's own build. The analysis it is handed to must
+    /// be given the same program to share this graph's reader.
+    pub fn with_program(mut self, program: &std::ffi::OsStr) -> Self {
+        self.blobs = BlobReader::new(program, &self.repo);
+        self
     }
 
     /// A graph rooted at the repository the generation was *built from*,
@@ -175,8 +188,8 @@ impl<'a> StoreGraph<'a> {
         let Some(head) = &self.head_sha else {
             return BlobIdentity::Unknown;
         };
-        match dc_regress::history::resolve_blob(&self.repo, head, file) {
-            Ok(resolved) => resolved.identity,
+        match self.blobs.identity(head, file) {
+            Ok(identity) => identity,
             // A file the indexed commit does not contain has no blob, and
             // `Unknown` compares equal to nothing — so the join refuses it by
             // name instead of reading its spans against someone else's lines.
@@ -227,6 +240,10 @@ fn fold_band(nodes: &[String], distance: u32, nearest: &mut HashMap<String, (Str
 }
 
 impl CodeGraph for StoreGraph<'_> {
+    fn blob_reader(&self) -> Option<&BlobReader> {
+        Some(&self.blobs)
+    }
+
     fn symbols_in(&self, file: &str) -> (Vec<GraphSymbol>, BlobIdentity) {
         let symbols = self.by_file.get(file).cloned().unwrap_or_default();
         (symbols, self.basis_for(file))

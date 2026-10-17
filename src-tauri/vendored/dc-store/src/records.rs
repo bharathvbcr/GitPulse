@@ -7,7 +7,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{Result, StoreError};
+use crate::{Result, StoreError, write_transaction};
 
 /// Refuses a value bound for a column the store later embeds *raw* into its
 /// replies. A shape check (leading `{`, trailing `]`) lets text through that
@@ -286,15 +286,19 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
         &gap.evidence_json,
         crate::json::check_array,
     )?;
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: `current_run` reads `gap_runs` before anything is written.
+    write_transaction(conn, |tx| gap_upsert_in(tx, gap))
+}
+
+fn gap_upsert_in(tx: &Connection, gap: &GapRow) -> Result<()> {
     if let Some(task_id) = gap
         .task_id
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
     {
-        let run = current_run(&tx, task_id)?;
-        record_sighting(&tx, task_id, &gap.id, &gap.gap_type, run)?;
+        let run = current_run(tx, task_id)?;
+        record_sighting(tx, task_id, &gap.id, &gap.gap_type, run)?;
     }
     let blocking: i64 = if gap.blocking { 1 } else { 0 };
     tx.execute(
@@ -338,7 +342,6 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
             gap.stderr_path,
         ],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -358,10 +361,8 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
 /// The counter advances on every call, including one with no gaps, which is
 /// what makes a disappearance observable at all.
 pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    gaps_replace_in(&tx, task_id, gaps)?;
-    tx.commit()?;
-    Ok(())
+    // IMMEDIATE: `advance_run` reads `gap_runs` before anything is written.
+    write_transaction(conn, |tx| gaps_replace_in(tx, task_id, gaps))
 }
 
 /// The most gaps one replacement may carry. A set past it is refused loudly:
@@ -479,13 +480,13 @@ pub fn verification_commit(
             ),
         });
     }
-    let tx = conn.unchecked_transaction()?;
-    if let Some(run) = run {
-        run_record(&tx, run)?;
-    }
-    gaps_replace_in(&tx, task_id, gaps)?;
-    tx.commit()?;
-    Ok(())
+    // IMMEDIATE: with no run the first statement is `advance_run`'s read.
+    write_transaction(conn, |tx| {
+        if let Some(run) = run {
+            run_record(tx, run)?;
+        }
+        gaps_replace_in(tx, task_id, gaps)
+    })
 }
 
 /// Starts a new run for a task and returns its number.

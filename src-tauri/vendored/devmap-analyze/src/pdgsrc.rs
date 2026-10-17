@@ -26,7 +26,87 @@
 //! are a heuristic list of well-known sinks. A finding is evidence; the absence
 //! of one is not.
 
-use crate::pdg::{FunctionPdgInput, PdgStatement, PdgStatementKind, MAX_PDG_NESTING_DEPTH};
+use crate::pdg::{
+    ElifArm, FunctionPdgInput, PdgStatement, PdgStatementKind, MAX_PDG_NESTING_DEPTH,
+};
+use serde::Serialize;
+
+/// Most skipped regions [`PythonPdgExtraction::skipped`] lists. A hostile
+/// file can produce one syntax error per line; past this many the list stops
+/// growing and [`PythonPdgExtraction::skipped_total`] keeps counting, so the
+/// list is never mistaken for every gap.
+pub const MAX_SKIPPED_LISTED: usize = 256;
+
+/// What a Python file yielded, and what it could not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PythonPdgExtraction {
+    /// Inputs for every function that parsed whole.
+    pub functions: Vec<FunctionPdgInput>,
+    /// Parts of the file that produced no input, each with its reason. At most
+    /// [`MAX_SKIPPED_LISTED`]; `skipped_total` is the real count.
+    pub skipped: Vec<SkippedSource>,
+    pub skipped_total: usize,
+    pub parse: ParseStatus,
+}
+
+impl PythonPdgExtraction {
+    fn failed(whole_file: SkippedSource) -> Self {
+        Self {
+            functions: Vec::new(),
+            skipped: vec![whole_file],
+            skipped_total: 1,
+            parse: ParseStatus::Failed,
+        }
+    }
+
+    fn skip(&mut self, skipped: SkippedSource) {
+        self.skipped_total += 1;
+        if self.skipped.len() < MAX_SKIPPED_LISTED {
+            self.skipped.push(skipped);
+        }
+    }
+
+    /// True only when every function in the file is in `functions`.
+    pub fn is_complete(&self) -> bool {
+        self.skipped_total == 0
+    }
+}
+
+/// How far the grammar got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseStatus {
+    /// The whole file parsed. An empty module is `Ok` with no functions.
+    Ok,
+    /// The file parsed with errors: some regions or functions are skipped.
+    Partial,
+    /// Nothing usable: the grammar could not load, produced no tree, or gave
+    /// up on the file at its root.
+    Failed,
+}
+
+/// A region of the file, or one function, that yielded no PDG input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedSource {
+    pub start_line: u32,
+    pub end_line: u32,
+    /// The qualified function, when what was skipped is one function.
+    pub function: Option<String>,
+    pub reason: SkipReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The Python grammar could not be loaded into the parser.
+    GrammarUnavailable,
+    /// The parser returned no tree at all.
+    NoParseTree,
+    /// An `ERROR` or `MISSING` region, or a function containing one.
+    SyntaxError,
+    /// A function whose statements nest deeper than [`MAX_PDG_NESTING_DEPTH`].
+    TooDeep,
+}
 
 /// Calls whose arguments are security-sensitive, by the name written at the call
 /// site.
@@ -78,127 +158,222 @@ mod parsing {
     use super::*;
     use tree_sitter::{Node, Parser};
 
-    /// Every function and method in `source`, as PDG inputs.
+    /// Every function and method in `source`, as PDG inputs, and every part of
+    /// the file that produced none.
     ///
-    /// Returns an empty vector rather than an error when the source does not
-    /// parse: a file the grammar cannot read has no statements to analyse, and
-    /// a caller asking "what are the PDGs here" is better served by "none" than
-    /// by a failure it must special-case. A file that parses to *nothing* and a
-    /// file with no functions are the same answer to this question.
+    /// Never an error: a file the grammar cannot read still has an answer.
+    /// But an unreadable file is not an *empty* one, so what could not be read
+    /// is named in [`PythonPdgExtraction::skipped`] and
+    /// [`PythonPdgExtraction::parse`] says how far the parse got. A module that
+    /// parses and defines nothing answers `functions: []` with status
+    /// [`ParseStatus::Ok`]; one the grammar gave up on answers the same empty
+    /// list with [`ParseStatus::Failed`].
     pub fn python_function_pdgs(
         source: &str,
         qualifier: &str,
         generation_id: u32,
         content_hash: u64,
-    ) -> Vec<FunctionPdgInput> {
+    ) -> PythonPdgExtraction {
+        let whole_file = SkippedSource {
+            start_line: 1,
+            end_line: u32::try_from(source.lines().count().max(1)).unwrap_or(u32::MAX),
+            function: None,
+            reason: SkipReason::GrammarUnavailable,
+        };
         let mut parser = Parser::new();
         if parser
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .is_err()
         {
-            return Vec::new();
+            return PythonPdgExtraction::failed(whole_file);
         }
         let Some(tree) = parser.parse(source, None) else {
-            return Vec::new();
+            return PythonPdgExtraction::failed(SkippedSource {
+                reason: SkipReason::NoParseTree,
+                ..whole_file
+            });
         };
-        let bytes = source.as_bytes();
-        let mut out = Vec::new();
+        let root = tree.root_node();
+        let mut out = PythonPdgExtraction {
+            functions: Vec::new(),
+            skipped: Vec::new(),
+            skipped_total: 0,
+            parse: ParseStatus::Ok,
+        };
+        for region in error_regions(root) {
+            out.skip(SkippedSource {
+                start_line: line_of(region),
+                end_line: end_line_of(region),
+                function: None,
+                reason: SkipReason::SyntaxError,
+            });
+        }
         collect_functions(
-            tree.root_node(),
-            bytes,
+            root,
+            source.as_bytes(),
             qualifier,
-            &mut Vec::new(),
             generation_id,
             content_hash,
             &mut out,
-            0,
         );
+        out.parse = if root.is_error() {
+            ParseStatus::Failed
+        } else if out.skipped_total > 0 {
+            ParseStatus::Partial
+        } else {
+            ParseStatus::Ok
+        };
         out
     }
 
-    /// Walk for `function_definition`, carrying the enclosing class names so a
-    /// method is qualified the way the graph qualifies it.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_functions(
-        node: Node,
-        bytes: &[u8],
-        qualifier: &str,
-        scope: &mut Vec<String>,
-        generation_id: u32,
-        content_hash: u64,
-        out: &mut Vec<FunctionPdgInput>,
-        depth: usize,
-    ) {
-        // The builder refuses a tree deeper than this, so there is nothing to
-        // gain by walking past it — and a hostile file should not be able to
-        // overflow the stack before the refusal can be reported.
-        if depth > MAX_PDG_NESTING_DEPTH {
-            return;
+    fn line_of(node: Node) -> u32 {
+        u32::try_from(node.start_position().row)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    }
+
+    fn end_line_of(node: Node) -> u32 {
+        u32::try_from(node.end_position().row)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    }
+
+    /// The outermost `ERROR` and `MISSING` nodes, in source order.
+    ///
+    /// Walked with a cursor, not recursion: the regions worth reporting are
+    /// most often in exactly the files deep enough to overflow a recursive
+    /// walk.
+    fn error_regions(root: Node) -> Vec<Node> {
+        let mut regions = Vec::new();
+        if !root.has_error() {
+            return regions;
         }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "class_definition" => {
-                    let name = field_text(child, "name", bytes).unwrap_or_default();
-                    scope.push(name);
-                    collect_functions(
-                        child,
-                        bytes,
-                        qualifier,
-                        scope,
-                        generation_id,
-                        content_hash,
-                        out,
-                        depth + 1,
-                    );
-                    scope.pop();
+        let mut cursor = root.walk();
+        loop {
+            let node = cursor.node();
+            let is_region = node.is_error() || node.is_missing();
+            if is_region {
+                regions.push(node);
+            }
+            // Descend only into subtrees that still hold an error, and never
+            // into a region already reported whole.
+            if !is_region && node.has_error() && cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
                 }
-                "function_definition" => {
-                    if let Some(input) =
-                        function_input(child, bytes, qualifier, scope, generation_id, content_hash)
-                    {
-                        out.push(input);
-                    }
-                    // Nested functions are their own PDGs: the builder is
-                    // intra-procedural, so a closure's body is not part of its
-                    // enclosing function's control flow.
-                    let name = field_text(child, "name", bytes).unwrap_or_default();
-                    scope.push(name);
-                    collect_functions(
-                        child,
-                        bytes,
-                        qualifier,
-                        scope,
-                        generation_id,
-                        content_hash,
-                        out,
-                        depth + 1,
-                    );
-                    scope.pop();
+                if !cursor.goto_parent() {
+                    return regions;
                 }
-                _ => collect_functions(
-                    child,
-                    bytes,
-                    qualifier,
-                    scope,
-                    generation_id,
-                    content_hash,
-                    out,
-                    depth + 1,
-                ),
             }
         }
     }
 
-    fn function_input(
+    /// One step of the iterative walk in [`collect_functions`].
+    enum Frame<'tree> {
+        Walk(Node<'tree>),
+        Emit(Node<'tree>),
+        Enter(String),
+        Leave,
+    }
+
+    /// Walk for `function_definition`, carrying the enclosing class and
+    /// function names so a method is qualified the way the graph qualifies it.
+    ///
+    /// Iterative, so no AST depth is too deep to *find* a function in. This
+    /// walk used to stop at [`MAX_PDG_NESTING_DEPTH`] and say nothing, and a
+    /// function below that depth vanished from an answer that read as
+    /// complete.
+    fn collect_functions(
+        root: Node,
+        bytes: &[u8],
+        qualifier: &str,
+        generation_id: u32,
+        content_hash: u64,
+        out: &mut PythonPdgExtraction,
+    ) {
+        let mut scope: Vec<String> = Vec::new();
+        let mut stack = vec![Frame::Walk(root)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(name) => scope.push(name),
+                Frame::Leave => {
+                    scope.pop();
+                }
+                Frame::Emit(node) => emit_function(
+                    node,
+                    bytes,
+                    qualifier,
+                    &scope,
+                    generation_id,
+                    content_hash,
+                    out,
+                ),
+                Frame::Walk(node) => {
+                    let mut cursor = node.walk();
+                    let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                    // Pushed in reverse so they pop in source order.
+                    for child in children.into_iter().rev() {
+                        match child.kind() {
+                            "class_definition" => {
+                                let name = field_text(child, "name", bytes).unwrap_or_default();
+                                stack.push(Frame::Leave);
+                                stack.push(Frame::Walk(child));
+                                stack.push(Frame::Enter(name));
+                            }
+                            "function_definition" => {
+                                // Nested functions are their own PDGs: the
+                                // builder is intra-procedural, so a closure's
+                                // body is not part of its enclosing function's
+                                // control flow.
+                                let name = field_text(child, "name", bytes).unwrap_or_default();
+                                stack.push(Frame::Leave);
+                                stack.push(Frame::Walk(child));
+                                stack.push(Frame::Enter(name));
+                                stack.push(Frame::Emit(child));
+                            }
+                            _ => stack.push(Frame::Walk(child)),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One `function_definition`: its PDG input, or the reason it has none.
+    ///
+    /// A function whose subtree holds a syntax error is refused rather than
+    /// built: the grammar's recovery leaves out whatever it could not read,
+    /// and a PDG built from what is left is a graph of a different function.
+    fn emit_function(
         node: Node,
         bytes: &[u8],
         qualifier: &str,
         scope: &[String],
         generation_id: u32,
         content_hash: u64,
-    ) -> Option<FunctionPdgInput> {
-        let name = field_text(node, "name", bytes)?;
+        out: &mut PythonPdgExtraction,
+    ) {
+        let name = qualified_name(node, bytes, qualifier, scope);
+        let refusal = |reason| SkippedSource {
+            start_line: line_of(node),
+            end_line: end_line_of(node),
+            function: Some(name.clone()),
+            reason,
+        };
+        if node.has_error() {
+            out.skip(refusal(SkipReason::SyntaxError));
+            return;
+        }
+        match function_input(node, bytes, &name, generation_id, content_hash) {
+            Ok(input) => out.functions.push(input),
+            Err(reason) => out.skip(refusal(reason)),
+        }
+    }
+
+    fn qualified_name(node: Node, bytes: &[u8], qualifier: &str, scope: &[String]) -> String {
         let mut qualified = String::from(qualifier);
         if !qualified.is_empty() {
             qualified.push_str("::");
@@ -207,22 +382,38 @@ mod parsing {
             qualified.push_str(enclosing);
             qualified.push('.');
         }
-        qualified.push_str(&name);
+        qualified.push_str(&field_text(node, "name", bytes).unwrap_or_default());
+        qualified
+    }
 
+    fn function_input(
+        node: Node,
+        bytes: &[u8],
+        qualified: &str,
+        generation_id: u32,
+        content_hash: u64,
+    ) -> Result<FunctionPdgInput, SkipReason> {
+        // A definition the grammar accepted without a name or a body is not one
+        // this producer can describe; name it rather than drop it.
+        if node.child_by_field_name("name").is_none() {
+            return Err(SkipReason::SyntaxError);
+        }
+        let body = node
+            .child_by_field_name("body")
+            .ok_or(SkipReason::SyntaxError)?;
         let params = node
             .child_by_field_name("parameters")
             .map(|p| parameter_names(p, bytes))
             .unwrap_or_default();
-        let body = node.child_by_field_name("body")?;
 
-        Some(FunctionPdgInput {
-            function_name: qualified,
+        Ok(FunctionPdgInput {
+            function_name: qualified.to_string(),
             generation_id,
             content_hash,
-            start_line: node.start_position().row as u32 + 1,
-            end_line: node.end_position().row as u32 + 1,
+            start_line: line_of(node),
+            end_line: end_line_of(node),
             params,
-            body: statements(body, bytes, 0),
+            body: statements(body, bytes, 0)?,
         })
     }
 
@@ -258,9 +449,17 @@ mod parsing {
     }
 
     /// A `block`'s statements, recursively.
-    fn statements(block: Node, bytes: &[u8], depth: usize) -> Vec<PdgStatement> {
+    ///
+    /// Deeper than the builder's cap is a refusal of the whole function, not
+    /// an empty block: an empty block here used to hand the builder a tree
+    /// missing its innermost statements, which it then built as though whole.
+    pub(super) fn statements(
+        block: Node,
+        bytes: &[u8],
+        depth: usize,
+    ) -> Result<Vec<PdgStatement>, SkipReason> {
         if depth > MAX_PDG_NESTING_DEPTH {
-            return Vec::new();
+            return Err(SkipReason::TooDeep);
         }
         let mut out = Vec::new();
         let mut cursor = block.walk();
@@ -269,11 +468,9 @@ mod parsing {
             if matches!(child.kind(), "function_definition" | "class_definition") {
                 continue;
             }
-            if let Some(statement) = statement(child, bytes, depth) {
-                out.push(statement);
-            }
+            out.push(statement(child, bytes, depth)?);
         }
-        out
+        Ok(out)
     }
 
     /// The block a construct owns, by whichever field name the grammar gives it.
@@ -283,15 +480,18 @@ mod parsing {
     /// Looking only for `body` silently returned an empty `then_body` for every
     /// `if` in the corpus — a branch whose taken arm contains nothing, which the
     /// builder would have faithfully turned into a graph of the wrong program.
-    fn body_of(node: Node, bytes: &[u8], depth: usize) -> Vec<PdgStatement> {
-        node.child_by_field_name("consequence")
+    fn body_of(node: Node, bytes: &[u8], depth: usize) -> Result<Vec<PdgStatement>, SkipReason> {
+        match node
+            .child_by_field_name("consequence")
             .or_else(|| node.child_by_field_name("body"))
-            .map(|block| statements(block, bytes, depth + 1))
-            .unwrap_or_default()
+        {
+            Some(block) => statements(block, bytes, depth + 1),
+            None => Ok(Vec::new()),
+        }
     }
 
-    fn statement(node: Node, bytes: &[u8], depth: usize) -> Option<PdgStatement> {
-        let line = node.start_position().row as u32 + 1;
+    fn statement(node: Node, bytes: &[u8], depth: usize) -> Result<PdgStatement, SkipReason> {
+        let line = line_of(node);
         let mut facts = Facts::default();
 
         let kind = match node.kind() {
@@ -307,18 +507,31 @@ mod parsing {
                 if let Some(condition) = node.child_by_field_name("condition") {
                     facts.read_subtree(condition, bytes);
                 }
-                let then_body = body_of(node, bytes, depth);
-                // `elif` is sugar for a nested `if` in the else branch, and the
-                // builder has no elif of its own — flattening it into a nested
-                // Branch is what preserves the real control flow.
+                let then_body = body_of(node, bytes, depth)?;
+                // Each `elif` is an arm of this branch, in source order, at the
+                // same depth as the `if`: a chain is long, not deep. Nesting
+                // each one in the previous one's else made a 64-arm chain hit
+                // the depth cap that exists for hostile nesting.
+                let mut elif_arms = Vec::new();
                 let mut else_body = Vec::new();
                 let mut cursor = node.walk();
-                let mut elifs: Vec<Node> = Vec::new();
                 for child in node.named_children(&mut cursor) {
                     match child.kind() {
-                        "elif_clause" => elifs.push(child),
+                        "elif_clause" => {
+                            let mut arm_facts = Facts::default();
+                            if let Some(condition) = child.child_by_field_name("condition") {
+                                arm_facts.read_subtree(condition, bytes);
+                            }
+                            elif_arms.push(ElifArm {
+                                line: line_of(child),
+                                definitions: arm_facts.definitions,
+                                uses: arm_facts.uses,
+                                taint_sinks: arm_facts.sinks,
+                                body: body_of(child, bytes, depth)?,
+                            });
+                        }
                         "else_clause" => {
-                            else_body = body_of(child, bytes, depth);
+                            else_body = body_of(child, bytes, depth)?;
                         }
                         _ => {}
                     }
@@ -327,24 +540,9 @@ mod parsing {
                     node.child_by_field_name("consequence").is_some(),
                     "an if_statement always has a consequence block"
                 );
-                for elif in elifs.into_iter().rev() {
-                    let mut elif_facts = Facts::default();
-                    if let Some(condition) = elif.child_by_field_name("condition") {
-                        elif_facts.read_subtree(condition, bytes);
-                    }
-                    else_body = vec![PdgStatement {
-                        line: elif.start_position().row as u32 + 1,
-                        definitions: elif_facts.definitions,
-                        uses: elif_facts.uses,
-                        taint_sinks: elif_facts.sinks,
-                        kind: PdgStatementKind::Branch {
-                            then_body: body_of(elif, bytes, depth),
-                            else_body,
-                        },
-                    }];
-                }
                 PdgStatementKind::Branch {
                     then_body,
+                    elif_arms,
                     else_body,
                 }
             }
@@ -356,7 +554,7 @@ mod parsing {
                     facts.read_subtree(iterable, bytes);
                 }
                 PdgStatementKind::Loop {
-                    body: body_of(node, bytes, depth),
+                    body: body_of(node, bytes, depth)?,
                 }
             }
             "while_statement" => {
@@ -364,7 +562,7 @@ mod parsing {
                     facts.read_subtree(condition, bytes);
                 }
                 PdgStatementKind::Loop {
-                    body: body_of(node, bytes, depth),
+                    body: body_of(node, bytes, depth)?,
                 }
             }
             "try_statement" => {
@@ -378,13 +576,13 @@ mod parsing {
                             // the handler's first statement is where it is
                             // defined. Recorded on the try itself would place
                             // the definition outside the block that can see it.
-                            let mut handler = body_of_except(child, bytes, depth);
+                            let mut handler = body_of_except(child, bytes, depth)?;
                             if let Some(bound) = except_binding(child, bytes) {
                                 if let Some(first) = handler.first_mut() {
                                     push_unique(&mut first.definitions, bound);
                                 } else {
                                     handler.push(PdgStatement {
-                                        line: child.start_position().row as u32 + 1,
+                                        line: line_of(child),
                                         definitions: vec![bound],
                                         uses: Vec::new(),
                                         taint_sinks: Vec::new(),
@@ -395,13 +593,13 @@ mod parsing {
                             handlers.push(handler);
                         }
                         "finally_clause" => {
-                            finally_body = body_of_except(child, bytes, depth);
+                            finally_body = body_of_except(child, bytes, depth)?;
                         }
                         _ => {}
                     }
                 }
                 PdgStatementKind::Try {
-                    body: body_of(node, bytes, depth),
+                    body: body_of(node, bytes, depth)?,
                     handlers,
                     finally_body,
                 }
@@ -418,7 +616,7 @@ mod parsing {
                         facts.bind_with_clause(child, bytes);
                     }
                 }
-                let mut body = body_of(node, bytes, depth);
+                let mut body = body_of(node, bytes, depth)?;
                 let head = PdgStatement {
                     line,
                     definitions: std::mem::take(&mut facts.definitions),
@@ -428,7 +626,7 @@ mod parsing {
                 };
                 // The `with` itself, then its body, spliced into the enclosing
                 // sequence. Returning only the head would drop the body.
-                return Some(splice(head, &mut body));
+                return Ok(splice(head, &mut body));
             }
             _ => {
                 facts.read_statement(node, bytes);
@@ -436,7 +634,7 @@ mod parsing {
             }
         };
 
-        Some(PdgStatement {
+        Ok(PdgStatement {
             line,
             definitions: facts.definitions,
             uses: facts.uses,
@@ -458,20 +656,25 @@ mod parsing {
         PdgStatement {
             kind: PdgStatementKind::Branch {
                 then_body: std::mem::take(body),
+                elif_arms: Vec::new(),
                 else_body: Vec::new(),
             },
             ..head
         }
     }
 
-    fn body_of_except(node: Node, bytes: &[u8], depth: usize) -> Vec<PdgStatement> {
+    fn body_of_except(
+        node: Node,
+        bytes: &[u8],
+        depth: usize,
+    ) -> Result<Vec<PdgStatement>, SkipReason> {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "block" {
                 return statements(child, bytes, depth + 1);
             }
         }
-        Vec::new()
+        Ok(Vec::new())
     }
 
     /// The name bound by `except E as err`.
@@ -569,23 +772,31 @@ mod parsing {
             }
         }
 
-        /// Names *read* in a subtree, plus any sink arguments it carries.
+        /// Names *read* in a subtree, plus the arguments of every sink call
+        /// anywhere inside it.
+        ///
+        /// Every call in the subtree is tested, not only the root: a sink is
+        /// as live as a `return` operand (`return subprocess.run(cmd)`), a
+        /// nested argument (`print(eval(x))`), a condition, or a chained
+        /// receiver (`os.popen(c).read()`) as it is as a whole statement.
+        /// Testing only the root missed every one of those.
         fn read_subtree(&mut self, node: Node, bytes: &[u8]) {
-            if node.kind() == "call" {
-                if let Some(function) = node.child_by_field_name("function") {
-                    let name = dotted_name(function, bytes);
-                    if is_sink(&name) {
-                        if let Some(arguments) = node.child_by_field_name("arguments") {
-                            let mut sink_names = Vec::new();
-                            collect_identifiers(arguments, bytes, &mut sink_names);
-                            for name in sink_names {
-                                // Every sink must also appear in `uses`; the
-                                // builder's contract says so, and a sink that is
-                                // not a use has no def to flow from.
-                                push_unique(&mut self.sinks, name.clone());
-                                push_unique(&mut self.uses, name);
-                            }
-                        }
+            for call in descendants_of_kind(node, "call") {
+                let Some(function) = call.child_by_field_name("function") else {
+                    continue;
+                };
+                if !is_sink(&dotted_name(function, bytes)) {
+                    continue;
+                }
+                if let Some(arguments) = call.child_by_field_name("arguments") {
+                    let mut sink_names = Vec::new();
+                    collect_identifiers(arguments, bytes, &mut sink_names);
+                    for name in sink_names {
+                        // Every sink must also appear in `uses`; the builder's
+                        // contract says so, and a sink that is not a use has no
+                        // def to flow from.
+                        push_unique(&mut self.sinks, name.clone());
+                        push_unique(&mut self.uses, name);
                     }
                 }
             }
@@ -625,22 +836,46 @@ mod parsing {
     /// Skips the `attribute` half of `obj.field` and the `name` of a keyword
     /// argument: neither is a variable, and counting them puts method names into
     /// the def-use graph as though they were locals.
+    ///
+    /// Walked with an explicit stack in source order: expression nesting is
+    /// whatever the file says it is, and a recursive walk over it is a stack
+    /// overflow a hostile file can choose.
     fn collect_identifiers(node: Node, bytes: &[u8], out: &mut Vec<String>) {
-        if node.kind() == "identifier" {
-            push_unique(out, text(node, bytes));
-            return;
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if node.kind() == "attribute" && Some(child) == node.child_by_field_name("attribute") {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" {
+                push_unique(out, text(node, bytes));
                 continue;
             }
-            if node.kind() == "keyword_argument" && Some(child) == node.child_by_field_name("name")
-            {
-                continue;
-            }
-            collect_identifiers(child, bytes, out);
+            let skipped = match node.kind() {
+                "attribute" => node.child_by_field_name("attribute"),
+                "keyword_argument" => node.child_by_field_name("name"),
+                _ => None,
+            };
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node
+                .named_children(&mut cursor)
+                .filter(|child| Some(*child) != skipped)
+                .collect();
+            pending.extend(children.into_iter().rev());
         }
+    }
+
+    /// Every node of `kind` in the subtree rooted at `node`, itself included,
+    /// in source order. Iterative, for the same reason as
+    /// [`collect_identifiers`].
+    fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+        let mut found = Vec::new();
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if node.kind() == kind {
+                found.push(node);
+            }
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.named_children(&mut cursor).collect();
+            pending.extend(children.into_iter().rev());
+        }
+        found
     }
 
     fn first_identifier(node: Node) -> Option<Node> {
@@ -680,8 +915,14 @@ mod tests {
 
     fn only(source: &str) -> FunctionPdgInput {
         let mut all = python_function_pdgs(source, "m.py", 1, 7);
-        assert_eq!(all.len(), 1, "expected exactly one function: {all:#?}");
-        all.remove(0)
+        assert_eq!(all.parse, ParseStatus::Ok, "{all:#?}");
+        assert!(all.is_complete(), "{all:#?}");
+        assert_eq!(
+            all.functions.len(),
+            1,
+            "expected exactly one function: {all:#?}"
+        );
+        all.functions.remove(0)
     }
 
     #[test]
@@ -711,7 +952,8 @@ mod tests {
             "m.py",
             1,
             0,
-        );
+        )
+        .functions;
         let names: Vec<&str> = all.iter().map(|f| f.function_name.as_str()).collect();
         assert_eq!(names, vec!["m.py::outer", "m.py::outer.inner"]);
         let outer = &all[0];
@@ -804,10 +1046,12 @@ mod tests {
     }
 
     #[test]
-    fn elif_becomes_a_nested_branch_rather_than_being_dropped() {
-        // The builder has no elif. Flattening it into the else branch is what
-        // preserves the control flow; dropping it would make the third arm
-        // unreachable in the graph while it runs in the program.
+    fn elif_becomes_an_arm_of_the_branch_rather_than_being_dropped() {
+        // Dropping an elif would make its arm unreachable in the graph while
+        // it runs in the program. It is carried as an arm of the `if`, in
+        // order, between the taken body and the else — not as a Branch nested
+        // in the else, which made a long chain read as deep nesting
+        // (devmap-query-04).
         let pdg = only(
             "def f(n):\n\
              \x20   if n > 1:\n\
@@ -819,21 +1063,18 @@ mod tests {
         );
         let PdgStatementKind::Branch {
             then_body,
+            elif_arms,
             else_body,
         } = &pdg.body[0].kind
         else {
             panic!("expected a branch: {:#?}", pdg.body[0]);
         };
         assert_eq!(then_body[0].definitions, vec!["a"]);
-        let PdgStatementKind::Branch {
-            then_body: elif_then,
-            else_body: elif_else,
-        } = &else_body[0].kind
-        else {
-            panic!("elif must nest as a branch: {else_body:#?}");
-        };
-        assert_eq!(elif_then[0].definitions, vec!["b"]);
-        assert_eq!(elif_else[0].definitions, vec!["c"]);
+        assert_eq!(elif_arms.len(), 1, "{elif_arms:#?}");
+        assert_eq!(elif_arms[0].line, 4);
+        assert_eq!(elif_arms[0].uses, vec!["n"], "the elif's test reads n");
+        assert_eq!(elif_arms[0].body[0].definitions, vec!["b"]);
+        assert_eq!(else_body[0].definitions, vec!["c"]);
     }
 
     #[test]
@@ -914,10 +1155,198 @@ mod tests {
         assert!(pdg.body[0].taint_sinks.is_empty(), "{:?}", pdg.body[0]);
     }
 
+    fn sink_variables(pdg: &FunctionPdgInput) -> Vec<String> {
+        pdg.taint_sinks()
+            .into_iter()
+            .map(|(_, variable)| variable)
+            .collect()
+    }
+
+    /// devmap-query-03: the sink table was tested only on the node handed to
+    /// `read_subtree`, so any sink that was not the outermost expression of an
+    /// assignment's right side or an expression statement was missed.
     #[test]
-    fn source_that_does_not_parse_yields_no_functions_rather_than_an_error() {
-        assert!(python_function_pdgs("def (:::", "m.py", 1, 0).is_empty());
-        assert!(python_function_pdgs("", "m.py", 1, 0).is_empty());
+    fn sinks_are_found_wherever_the_call_sits_in_the_statement() {
+        for (source, variable) in [
+            (
+                "def run(cmd):\n    return subprocess.run(cmd, shell=True)\n",
+                "cmd",
+            ),
+            ("def f(x):\n    raise ValueError(eval(x))\n", "x"),
+            ("def f(x):\n    print(eval(x))\n", "x"),
+            ("def f(c):\n    data = os.popen(c).read()\n", "c"),
+            ("def f(c):\n    if os.system(c):\n        pass\n", "c"),
+            ("def f(c):\n    while os.system(c):\n        pass\n", "c"),
+            (
+                "def f(q):\n    rows = [cursor.execute(q) for _ in range(1)]\n",
+                "q",
+            ),
+        ] {
+            let pdg = only(source);
+            let sinks = sink_variables(&pdg);
+            assert!(
+                sinks.contains(&variable.to_string()),
+                "{source} -> {:#?}",
+                pdg.body
+            );
+            crate::pdg::build_function_pdg(&pdg)
+                .unwrap_or_else(|error| panic!("{source} must build: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_nested_ordinary_call_records_no_sink() {
+        for source in [
+            "def f(x):\n    helper(other(x))\n",
+            "def f(x):\n    return helper(x).read()\n",
+            "def f(x):\n    raise ValueError(x)\n",
+        ] {
+            let pdg = only(source);
+            assert!(
+                sink_variables(&pdg).is_empty(),
+                "{source} -> {:#?}",
+                pdg.body
+            );
+        }
+    }
+
+    /// devmap-query-04: each `elif` used to nest one more `Branch`, so a long
+    /// chain hit the 64-level depth cap that exists for hostile nesting.
+    #[test]
+    fn a_two_hundred_arm_elif_chain_builds() {
+        let mut source = String::from("def f(n):\n    if n == 0:\n        a = 0\n");
+        for arm in 1..200 {
+            source.push_str(&format!("    elif n == {arm}:\n        a = {arm}\n"));
+        }
+        source.push_str("    else:\n        a = -1\n    return a\n");
+        let pdg = only(&source);
+        let built = crate::pdg::build_function_pdg(&pdg)
+            .unwrap_or_else(|error| panic!("a 200-arm chain must build: {error}"));
+        // Every arm's body is in the graph: one node per `a = …`.
+        let assignments = built
+            .nodes
+            .values()
+            .filter(|node| node.kind == crate::pdg::CfgNodeKind::Block)
+            .count();
+        assert_eq!(assignments, 201, "200 arms plus the else");
+        // And every arm's definition reaches the return.
+        let return_line = built
+            .nodes
+            .values()
+            .find(|node| node.kind == crate::pdg::CfgNodeKind::Return)
+            .map(|node| node.id.clone())
+            .expect("the return has a node");
+        let reaching = built
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.target_node == return_line
+                    && edge.edge_kind == "data"
+                    && edge.variable.as_deref() == Some("a")
+            })
+            .count();
+        assert_eq!(reaching, 201);
+    }
+
+    #[test]
+    fn source_that_does_not_parse_yields_no_functions_and_says_so() {
+        // Still never a panic and never an error: an unreadable file has an
+        // answer. But it is not the empty module's answer — the two used to be
+        // indistinguishable (J-1).
+        let broken = python_function_pdgs("def (:::", "m.py", 1, 0);
+        assert!(broken.functions.is_empty(), "{broken:#?}");
+        assert_ne!(broken.parse, ParseStatus::Ok, "{broken:#?}");
+        assert!(!broken.is_complete(), "{broken:#?}");
+        assert!(
+            broken
+                .skipped
+                .iter()
+                .any(|skipped| skipped.reason == SkipReason::SyntaxError),
+            "{broken:#?}"
+        );
+
+        let empty = python_function_pdgs("", "m.py", 1, 0);
+        assert!(empty.functions.is_empty());
+        assert_eq!(empty.parse, ParseStatus::Ok);
+        assert!(empty.is_complete());
+        assert!(empty.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_function_with_a_syntax_error_is_named_not_built_from_what_survived() {
+        let out = python_function_pdgs(
+            "def good(x):\n    return x\n\ndef bad(y):\n    z = (y +\n    return z\n",
+            "m.py",
+            1,
+            0,
+        );
+        let built: Vec<&str> = out
+            .functions
+            .iter()
+            .map(|f| f.function_name.as_str())
+            .collect();
+        assert_eq!(built, vec!["m.py::good"], "{out:#?}");
+        assert_eq!(out.parse, ParseStatus::Partial);
+        assert!(
+            out.skipped.iter().any(|skipped| {
+                skipped.function.as_deref() == Some("m.py::bad")
+                    && skipped.reason == SkipReason::SyntaxError
+            }),
+            "{out:#?}"
+        );
+    }
+
+    /// devmap-query-05: the function walk stopped at AST depth 64 and said
+    /// nothing, so a function defined below that depth vanished from an
+    /// answer that read as complete. It is now found at any depth; this one
+    /// sits under 70 nested classes and still yields its PDG.
+    #[test]
+    fn a_function_below_the_old_walk_depth_is_still_found() {
+        let mut source = String::new();
+        let levels = MAX_PDG_NESTING_DEPTH + 6;
+        for level in 0..levels {
+            source.push_str(&" ".repeat(level));
+            source.push_str(&format!("class C{level}:\n"));
+        }
+        source.push_str(&" ".repeat(levels));
+        source.push_str("def deep(cmd):\n");
+        source.push_str(&" ".repeat(levels + 1));
+        source.push_str("os.system(cmd)\n");
+        let out = python_function_pdgs(&source, "m.py", 1, 0);
+        assert_eq!(out.parse, ParseStatus::Ok, "{:#?}", out.skipped);
+        assert!(out.is_complete());
+        assert_eq!(out.functions.len(), 1);
+        assert!(
+            out.functions[0].function_name.ends_with(".C69.deep"),
+            "{}",
+            out.functions[0].function_name
+        );
+        assert_eq!(
+            out.functions[0].taint_sinks(),
+            vec![(levels as u32 + 2, "cmd".to_string())]
+        );
+    }
+
+    /// Statements nested past the builder's cap refuse the function by name,
+    /// instead of handing the builder a body with its innermost block missing.
+    /// The grammar gives up first on `if` nesting (see the next test), so this
+    /// drives the producer's own bound through `statements` directly.
+    #[test]
+    fn a_body_deeper_than_the_cap_refuses_the_function() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let source = "def f():\n    pass\n";
+        let tree = parser.parse(source, None).unwrap();
+        let function = tree.root_node().named_child(0).unwrap();
+        let body = function.child_by_field_name("body").unwrap();
+        let bytes = source.as_bytes();
+        assert_eq!(
+            parsing::statements(body, bytes, MAX_PDG_NESTING_DEPTH + 1),
+            Err(SkipReason::TooDeep)
+        );
+        assert!(parsing::statements(body, bytes, MAX_PDG_NESTING_DEPTH).is_ok());
     }
 
     #[test]
@@ -947,16 +1376,27 @@ mod tests {
         };
 
         let deep = python_function_pdgs(&nest(40), "m.py", 1, 0);
-        assert_eq!(deep.len(), 1, "40 levels is within the grammar's reach");
-        assert!(crate::pdg::build_function_pdg(&deep[0]).is_ok());
+        assert_eq!(
+            deep.functions.len(),
+            1,
+            "40 levels is within the grammar's reach"
+        );
+        assert!(deep.is_complete(), "{:#?}", deep.skipped);
+        assert!(crate::pdg::build_function_pdg(&deep.functions[0]).is_ok());
 
         // Far past anything real — CPython's own compiler caps nesting at 20.
         for depth in [64, 256, 1024] {
             let pathological = python_function_pdgs(&nest(depth), "m.py", 1, 0);
             assert!(
-                pathological.is_empty(),
+                pathological.functions.is_empty(),
                 "{depth} levels must yield nothing rather than a partial tree"
             );
+            // ...and that nothing is not the empty module's nothing.
+            assert!(
+                !pathological.is_complete(),
+                "{depth} levels must be reported as skipped, not as a file with no functions"
+            );
+            assert_ne!(pathological.parse, ParseStatus::Ok);
         }
     }
 

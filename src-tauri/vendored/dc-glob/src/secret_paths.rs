@@ -42,6 +42,13 @@ pub const SECRET_PATH_PATTERNS: &[&str] = &[
     "**/.pypirc",
     ".netrc",
     "**/.netrc",
+    ".aws/credentials",
+    "**/.aws/credentials",
+    ".envrc",
+    "**/.envrc",
+    ".git-credentials",
+    "**/.git-credentials",
+    "*.p12",
 ];
 
 /// Whether `path`, repository-relative, names a file whose contents are
@@ -155,6 +162,14 @@ mod tests {
             ".npmrc",
             "pkg/.pypirc",
             ".netrc",
+            ".aws/credentials",
+            "home/.aws/credentials",
+            ".envrc",
+            "app/.envrc",
+            ".git-credentials",
+            "home/.git-credentials",
+            "client.p12",
+            "certs/client.p12",
         ] {
             assert!(is_secret_path(path), "{path} should be secret");
         }
@@ -181,7 +196,7 @@ mod tests {
             "docs/secrets.md",
             "src/credentials_test.go",
             "keys.rs",
-            ".envrc",
+            "notes/envrc.txt",
         ] {
             assert!(!is_secret_path(path), "{path} should not be secret");
         }

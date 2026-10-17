@@ -693,9 +693,25 @@ impl Store {
     }
 
     pub fn latest_extractions(&self) -> Result<Vec<Extraction>> {
+        Ok(self
+            .latest_extractions_until(&mut || false)?
+            .unwrap_or_default())
+    }
+
+    /// [`Self::latest_extractions`], abandoned when `stop` says so.
+    ///
+    /// `stop` is asked before each row is decoded. The decode is the cost —
+    /// one JSON payload per file, with the connection held throughout — so a
+    /// caller that has stopped waiting must be able to give the connection
+    /// back between rows rather than after the whole generation. `None` means
+    /// stopped; an empty vector still means "no generation".
+    pub fn latest_extractions_until(
+        &self,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Vec<Extraction>>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         let mut stmt = snapshot.prepare(
             "SELECT f.extraction_json, p.path
@@ -709,13 +725,16 @@ impl Store {
         })?;
         let mut extractions = Vec::new();
         for row in rows {
+            if stop() {
+                return Ok(None);
+            }
             let (json, path) = row?;
             let extraction = serde_json::from_str(&json).map_err(|error| {
                 refusal(format!("stored extraction for {path} is invalid: {error}"))
             })?;
             extractions.push(extraction);
         }
-        Ok(extractions)
+        Ok(Some(extractions))
     }
 
     /// One file's stored extraction, or `None` when the latest generation does

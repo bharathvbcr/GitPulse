@@ -337,9 +337,15 @@ context."
         role_buckets_step(map),
         cross_subsystem_step(map),
         "7. For dead code, run `devmap dead --json` and read each row's own `confidence` \
-before acting — a high-confidence row is a parsed fact (no inbound evidence), a low one \
-is unconfirmed (`only_ambiguous_callers`, unresolved namesake, or coverage-capped), and \
-the command returns both rather than pre-filtering. `NoNamesake` sites are explained gaps \
+before acting. Only 0.9 is the act-on tier: no inbound evidence *and* a language that has \
+earned the confident tier against a labelled fixture and corpus record. A 0.4 row is unconfirmed \
+(`only_ambiguous_callers`, unresolved namesake, coverage-capped, `confident_tier_unproven` \
+for a language that has not earned the tier, `external_supertype` or `object_literal_member` \
+when something outside the graph may call it by name, or `exported_unreferenced` for an export \
+the manifest or the language proves module-private) and its `evidence` names the unbound sites and the first \
+`path:line` to check; the command returns both rather than pre-filtering. `excluded` counts, \
+per language, the uncalled symbols never examined (`not_examined` for visibility, `exempt` \
+by reason), so a short list over a mostly-exported corpus is not \"no dead code\". `NoNamesake` sites are explained gaps \
 in the unresolved ledger, not dead findings. Every answer also carries `walk_incomplete` when \
 unattributed calls mean the list is a lower bound. Prefer `unwired_candidates` / \
 `dead_symbol_candidates` in the map over `unreachable_files` (static BFS is noisy for routers, \
@@ -903,6 +909,29 @@ mod tests {
             !text.contains("re-run `devmap build`"),
             "a database-only build cannot repair an exported map: {text}"
         );
+    }
+
+    // The dead step described a high-confidence row as "a parsed fact (no
+    // inbound evidence)" after the confident tier became something a language
+    // earns, and never named the excluded population — so an agent reading
+    // CLAUDE.md acted on a tier contract that no longer existed.
+    #[test]
+    fn the_guide_describes_the_earned_dead_tier_and_the_excluded_population() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        for phrase in [
+            "Only 0.9 is the act-on tier",
+            "earned the confident tier against a labelled fixture and corpus record",
+            "`external_supertype`",
+            "`object_literal_member`",
+            "`confident_tier_unproven`",
+            "`exported_unreferenced`",
+            "`evidence` names the unbound sites",
+            "`excluded` counts",
+            "`not_examined`",
+        ] {
+            assert!(text.contains(phrase), "dead step lost {phrase:?}: {text}");
+        }
+        assert!(!text.contains("a parsed fact"), "{text}");
     }
 
     #[test]

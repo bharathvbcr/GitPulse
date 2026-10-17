@@ -35,6 +35,9 @@ const ENTRY_CRITICAL_CAP: usize = 40;
 const SUBSYSTEM_LANG_CAP: usize = 8;
 /// Languages in the repo-wide bar before the tail folds into "Other".
 const REPO_LANG_CAP: usize = 32;
+/// Unplaceable handoff texts listed in the payload, across every subsystem.
+/// The total and the per-subsystem counts are never capped.
+const UNRESOLVED_HANDOFF_CAP: usize = 100;
 
 /// The vendored force-graph build, inlined so the page works offline.
 ///
@@ -447,7 +450,24 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
             );
         }
     }
-    unresolved.truncate(100);
+    // Counted before the list is cut: a capped list with no total lets the
+    // majority case read as a handful. Per subsystem too, so a detail pane can
+    // say "3 of 12" even when the global cap left it none to list.
+    let unresolved_total = unresolved.len();
+    let mut unresolved_by_subsystem: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (index, row) in unresolved.iter().enumerate() {
+        let from = row["from"].as_str().unwrap_or_default().to_string();
+        let counts = unresolved_by_subsystem.entry(from).or_default();
+        counts.0 += 1;
+        if index < UNRESOLVED_HANDOFF_CAP {
+            counts.1 += 1;
+        }
+    }
+    unresolved.truncate(UNRESOLVED_HANDOFF_CAP);
+    let unresolved_by_subsystem: Map<String, Value> = unresolved_by_subsystem
+        .into_iter()
+        .map(|(area, (total, listed))| (area, json!({"total": total, "listed": listed})))
+        .collect();
 
     let repo_ranked = rank(&files.repo_languages, REPO_LANG_CAP);
     let palette_ids: Vec<&str> = files.repo_languages.keys().map(String::as_str).collect();
@@ -496,6 +516,8 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
         "links": links,
         "subsystems": subsystems.into_iter().map(Value::Object).collect::<Vec<_>>(),
         "unresolved_handoffs": unresolved,
+        "unresolved_handoffs_total": unresolved_total,
+        "unresolved_handoffs_by_subsystem": unresolved_by_subsystem,
         "liveness": {
             "counts": {
                 "entry_roots": liveness_count("entry_roots", "entry_roots"),
@@ -760,6 +782,67 @@ mod tests {
         assert!(links
             .iter()
             .any(|l| l["kind"] == "handoff" && l["target"] == "crates/core"));
+    }
+
+    /// A sample map whose `src/cli` subsystem names `n` handoffs no drawn
+    /// subsystem contains, so none of them can become an edge.
+    fn map_with_unplaceable_handoffs(n: usize) -> Value {
+        let mut map = sample_map();
+        map["subsystems"][0]["handoff_paths"] = json!((0..n)
+            .map(|i| format!("nowhere/{i}.py -> elsewhere/{i}.py"))
+            .collect::<Vec<_>>());
+        map
+    }
+
+    #[test]
+    fn a_handoff_the_view_cannot_place_is_reported_not_dropped() {
+        let payload = build_preview_payload(&map_with_unplaceable_handoffs(1));
+        assert_eq!(payload["unresolved_handoffs_total"], 1);
+        assert_eq!(
+            payload["unresolved_handoffs"][0]["text"],
+            "nowhere/0.py -> elsewhere/0.py"
+        );
+        assert_eq!(
+            payload["unresolved_handoffs_by_subsystem"],
+            json!({"src/cli": {"total": 1, "listed": 1}})
+        );
+        // And the page carries it: the embedded payload is what the script reads.
+        let html = render_map_preview_html(&map_with_unplaceable_handoffs(1), &fp());
+        assert!(html.contains("\"unresolved_handoffs_total\":1"));
+        assert!(html.contains("unplaced"), "the page states the count");
+    }
+
+    #[test]
+    fn the_unresolved_list_is_capped_but_its_true_total_is_not() {
+        let payload = build_preview_payload(&map_with_unplaceable_handoffs(150));
+        assert_eq!(
+            payload["unresolved_handoffs"].as_array().unwrap().len(),
+            UNRESOLVED_HANDOFF_CAP
+        );
+        assert_eq!(payload["unresolved_handoffs_total"], 150);
+        assert_eq!(
+            payload["unresolved_handoffs_by_subsystem"]["src/cli"],
+            json!({"total": 150, "listed": UNRESOLVED_HANDOFF_CAP})
+        );
+    }
+
+    #[test]
+    fn a_map_with_every_handoff_placed_reports_zero_not_nothing() {
+        let payload = build_preview_payload(&sample_map());
+        assert_eq!(payload["unresolved_handoffs_total"], 0);
+        assert_eq!(payload["unresolved_handoffs_by_subsystem"], json!({}));
+    }
+
+    /// The page reads only what the payload carries. The original port read a
+    /// total no producer emitted, so a capped list read as the whole set.
+    #[test]
+    fn every_key_the_page_reads_is_one_the_payload_carries() {
+        let payload = build_preview_payload(&map_with_unplaceable_handoffs(3));
+        let missing = crate::viz::page_reads_missing_from(
+            MAP_HTML_TEMPLATE,
+            &[("DATA", &payload), ("META", &payload["meta"])],
+        );
+        assert!(missing.is_empty(), "the page reads {missing:?}");
     }
 
     #[test]

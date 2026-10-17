@@ -245,8 +245,17 @@ fn is_generated_dir_name(part: &str) -> bool {
     GENERATED_DIR_NAMES.contains(&part) || devmap_extract::paths::is_state_dir_name(part)
 }
 
+///
+/// A name discovery refuses to key is excluded too, through the same
+/// [`devmap_extract::repo_relative_key`] the walk uses: on Unix `src/a\b.py` is
+/// one file name that discovery refuses rather than fold onto the real
+/// `src/a/b.py`, so the map never covers it and the inventory must not count
+/// it. Folding it here instead kept it as indexable source under the real
+/// file's spelling.
 pub fn is_runtime_or_generated_file(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
+    let Ok(normalized) = devmap_extract::repo_relative_key(path) else {
+        return true;
+    };
     let name = normalized.rsplit('/').next().unwrap_or("");
     let lower_name = name.to_lowercase();
 
@@ -314,11 +323,17 @@ pub(crate) fn ls_files(
     // `-z` so non-ASCII paths arrive unquoted; lossy decoding matches the
     // Python reader's `errors="replace"`, so a path neither side can decode
     // still hashes to the same string on both.
+    //
+    // Entries are git's own spelling, which is `/`-separated on every host,
+    // and are passed through verbatim. Folding `\` here turned a Unix name
+    // `src/a\b.py` into the real `src/a/b.py`, so the inventory listed that
+    // path twice; whether such a name is keyable is decided once, by
+    // `devmap_extract::repo_relative_key` in `is_runtime_or_generated_file`.
     Ok(captured
         .stdout_lossy()
         .split('\0')
         .filter(|entry| !entry.is_empty())
-        .map(|entry| entry.replace('\\', "/"))
+        .map(str::to_string)
         .collect())
 }
 
@@ -672,6 +687,19 @@ mod tests {
         ] {
             assert!(!is_runtime_or_generated_file(path), "{path} must be kept");
         }
+    }
+
+    /// On Unix `\` is a byte of a name, so `src\a.py` is one file at the root
+    /// that discovery refuses (`devmap_extract::repo_relative_key`). Folded, it
+    /// read as `src/a.py` and was kept as indexable source.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_discovery_refuses_is_never_part_of_the_inventory() {
+        assert!(
+            is_runtime_or_generated_file("src\\a.py"),
+            "a backslash name is refused by discovery, so the inventory excludes it"
+        );
+        assert!(!is_runtime_or_generated_file("src/a.py"));
     }
 
     #[test]

@@ -29,8 +29,9 @@ pub struct PythonSourceRoots {
 
 /// `dir` joined with a manifest-relative `path`, normalised, or an error when
 /// the result leaves the repository. `Ok(None)` is the manifest's own
-/// directory.
-fn anchor(dir: &str, path: &str) -> Result<Option<String>, String> {
+/// directory. Shared with the Cargo reader, whose target paths obey the same
+/// rule.
+pub(crate) fn anchor(dir: &str, path: &str) -> Result<Option<String>, String> {
     let mut parts: Vec<&str> = if dir.is_empty() {
         Vec::new()
     } else {

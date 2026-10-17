@@ -41,13 +41,15 @@ use std::path::Path;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::cancel::Cancel;
+
 /// How much of the tree the client scan may read.
 ///
 /// The Python scans every file in the graph, whole, with no cap on count or
 /// size — 2,363 files on this repository, re-read from scratch by `route_map`,
 /// again by `shape_check`, and twice more by `api_impact`, which calls both.
 /// A view that walks the tree needs a bound, and a bound needs to be reported.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct ScanBudget {
     /// Files opened before the scan stops.
     pub max_files: usize,
@@ -56,6 +58,10 @@ pub struct ScanBudget {
     pub max_file_bytes: u64,
     /// Call sites kept.
     pub max_sites: usize,
+    /// The caller's "stop": consulted before each file is opened, so a scan
+    /// whose caller has gone stops reading rather than walking the whole
+    /// file and byte cap for nobody. The default is a flag nobody trips.
+    pub cancel: Cancel,
 }
 
 impl Default for ScanBudget {
@@ -64,7 +70,20 @@ impl Default for ScanBudget {
             max_files: 5_000,
             max_file_bytes: 1 << 20,
             max_sites: 2_000,
+            cancel: Cancel::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for ScanBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScanBudget")
+            .field("max_files", &self.max_files)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("max_sites", &self.max_sites)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .finish()
     }
 }
 
@@ -83,6 +102,11 @@ pub struct ScanReport {
     pub files_over_size: usize,
     pub files_unreadable: usize,
     pub files_skipped_budget: usize,
+    /// Files never opened because the caller cancelled. Counted apart from
+    /// the budget: "you stopped waiting" is a different reason from "the cap
+    /// was reached", and both mean the scan did not finish.
+    pub files_skipped_cancelled: usize,
+    pub cancelled: bool,
     pub sites_found: usize,
     pub sites_dropped_budget: usize,
     /// Client call sites seen whose URL this scan cannot read: `fetch(url)`,
@@ -100,6 +124,7 @@ const UNREADABLE_EXAMPLES: usize = 5;
 impl ScanReport {
     fn complete(&self) -> bool {
         self.files_skipped_budget == 0
+            && !self.cancelled
             && self.sites_dropped_budget == 0
             && self.files_unreadable == 0
             && self.files_over_size == 0
@@ -118,6 +143,8 @@ impl ScanReport {
             "files_over_size": self.files_over_size,
             "files_unreadable": self.files_unreadable,
             "files_skipped_budget": self.files_skipped_budget,
+            "files_skipped_cancelled": self.files_skipped_cancelled,
+            "cancelled": self.cancelled,
             "sites_found": self.sites_found,
             "sites_dropped_budget": self.sites_dropped_budget,
             "sites_unreadable_shape": self.sites_unreadable_shape,
@@ -334,7 +361,12 @@ fn scan_sites(
     let mut sites: Vec<Site> = Vec::new();
     let mut sources = BTreeMap::new();
 
-    for rel in &files {
+    for (position, rel) in files.iter().enumerate() {
+        if budget.cancel.check().is_err() {
+            report.cancelled = true;
+            report.files_skipped_cancelled = files.len() - position;
+            break;
+        }
         if report.files_attempted >= budget.max_files.min(5_000)
             || report.source_bytes_read >= SOURCE_BYTES_LIMIT
         {
@@ -1816,6 +1848,65 @@ async function load() {
         let impact = api_impact(&root, &g, &ScanBudget::default(), "/api/me");
         assert_eq!(impact["found"], json!(true));
         assert_eq!(impact["risk"], "medium");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A caller that stops waiting stops the scan between files, and the
+    /// files it never opened are counted as cancelled — not as read, and not
+    /// as a budget cut — so the answer cannot read as a finished scan.
+    #[test]
+    fn a_cancelled_scan_stops_between_files_and_says_so() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = tempdir("cancel");
+        write(&root, "a.ts", "// nothing here\n");
+        write(&root, "b.ts", "fetch('/api/thing');\n");
+        write(&root, "c.ts", "fetch('/api/thing');\n");
+        let g = graph(
+            json!([
+                {"id": "a.ts", "name": "a", "path": "a.ts", "line": 0, "kind": "file"},
+                {"id": "b.ts", "name": "b", "path": "b.ts", "line": 0, "kind": "file"},
+                {"id": "c.ts", "name": "c", "path": "c.ts", "line": 0, "kind": "file"},
+                {"id": "h", "name": "h", "path": "a.ts", "line": 1, "kind": "function"},
+            ]),
+            json!([{"kind": "routes_to", "source": "GET /api/thing", "target": "h"}]),
+        );
+        // The caller gives up while the scan is on its second file: the check
+        // before b.ts is the second one the scan makes.
+        let cancel = crate::cancel::Cancel::new();
+        let trigger = cancel.clone();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let cancel = cancel.with_check_probe(move || {
+            if observed.fetch_add(1, Ordering::Relaxed) == 1 {
+                trigger.cancel();
+            }
+        });
+        let budget = ScanBudget {
+            cancel,
+            ..ScanBudget::default()
+        };
+        let impact = api_impact(&root, &g, &budget, "/api/thing");
+
+        assert_eq!(impact["scan"]["files_read"], 1, "{impact}");
+        assert_eq!(impact["scan"]["files_skipped_cancelled"], 2, "{impact}");
+        assert_eq!(impact["scan"]["cancelled"], json!(true));
+        assert_eq!(impact["scan"]["complete"], json!(false));
+        // Two real callers were never read; zero consumers here is not "low".
+        assert_eq!(impact["consumers"].as_array().unwrap().len(), 0);
+        assert_eq!(impact["risk"], "unknown");
+        assert_eq!(
+            checks.load(Ordering::Relaxed),
+            2,
+            "the scan must stop at the check that observed cancellation"
+        );
+
+        // An uncancelled budget over the same tree reads every file.
+        let full = api_impact(&root, &g, &ScanBudget::default(), "/api/thing");
+        assert_eq!(full["scan"]["files_read"], 3);
+        assert_eq!(full["scan"]["cancelled"], json!(false));
+        assert_eq!(full["consumers"].as_array().unwrap().len(), 2);
         std::fs::remove_dir_all(&root).ok();
     }
 

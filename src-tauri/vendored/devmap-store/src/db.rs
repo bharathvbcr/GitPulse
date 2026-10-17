@@ -1969,6 +1969,20 @@ fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) ->
         && !matches!(engine, ExtractionEngine::NotApplicable { .. })
 }
 
+/// Whether a stored `parse_outcome_json` is a wall-clock parse-budget refusal,
+/// by the rule `Extraction::is_budget_refusal` applies to a live outcome: a
+/// `Failed` whose reason starts with
+/// [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`]. A value that does not
+/// decode is not one; the payload's own readers refuse it loudly elsewhere.
+#[cfg(feature = "parse")]
+fn is_budget_refusal_json(outcome_json: &str) -> bool {
+    matches!(
+        serde_json::from_str::<ParseOutcome>(outcome_json),
+        Ok(ParseOutcome::Failed { reason })
+            if reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)
+    )
+}
+
 /// The FTS5 `MATCH` expression for a user's search string, or an error naming
 /// why the store cannot express it.
 ///

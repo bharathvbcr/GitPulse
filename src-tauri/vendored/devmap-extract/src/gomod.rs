@@ -200,36 +200,178 @@ pub struct GradleSettings {
     pub modules: Vec<String>,
 }
 
-/// One `Cargo.toml` package: the directory it governs and the crate names its
+/// One `Cargo.toml` package: the directory it governs, the crate names its
 /// library answers to — `[package] name` with `-` read as `_`, and `[lib]
-/// name` when set.
+/// name` when set — and the target root files its manifest places by hand.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RustCrateManifest {
     /// Repo-relative directory holding the `Cargo.toml`; empty at the root.
     pub dir: String,
     pub names: Vec<String>,
+    /// The library's root file, repo-relative, when `[lib] path` names one.
+    /// `None` is Cargo's default, `<dir>/src/lib.rs`.
+    ///
+    /// A crate root is where `crate::` and `mod x;` are relative to. Without
+    /// this a library at `lib/core.rs` had no root at all: no `src` ancestor
+    /// placed it, and its name pointed at a `src/lib.rs` that does not exist.
+    pub lib_path: Option<String>,
+    /// The binary roots `[[bin]] path` names, repo-relative. A `[[bin]]`
+    /// without a `path` is Cargo's auto-discovered `src/bin/<name>.rs` or
+    /// `src/main.rs`, which the path convention already places.
+    pub bin_paths: Vec<String>,
 }
 
-/// The library names a `Cargo.toml` declares, or `None` when it declares no
-/// package (a virtual workspace manifest) or does not parse.
-pub fn parse_cargo_crate_names(source: &str) -> Option<Vec<String>> {
-    let manifest: toml::Table = source.parse().ok()?;
-    let package = manifest.get("package")?.as_table()?;
-    let mut names = Vec::new();
-    if let Some(name) = package.get("name").and_then(toml::Value::as_str) {
-        names.push(name.replace('-', "_"));
-    }
-    if let Some(name) = manifest
-        .get("lib")
-        .and_then(toml::Value::as_table)
-        .and_then(|lib| lib.get("name"))
+/// What one `Cargo.toml` declares: its package (absent for a virtual
+/// workspace) and its `[workspace] members`, each as written relative to the
+/// manifest's directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CargoManifest {
+    pub package: Option<RustCrateManifest>,
+    pub workspace_members: Vec<String>,
+}
+
+/// A target `path` from a manifest at `dir`, repo-relative.
+fn cargo_target_path(dir: &str, key: &str, value: &toml::Value) -> Result<String, String> {
+    let Some(path) = value.as_str() else {
+        return Err(format!("`{key}` is not a string"));
+    };
+    crate::pyproject::anchor(dir, path)
+        .map_err(|reason| format!("`{key}`: {reason}"))?
+        .ok_or_else(|| format!("`{key}` names the manifest's own directory, not a file"))
+}
+
+/// Read one `Cargo.toml` at repo-relative `dir`.
+///
+/// `Err` is a manifest that does not say what its crate is: TOML that does
+/// not parse, neither `[package]` nor `[workspace]` (Cargo refuses that too),
+/// a package with no name, or a target path or member list of the wrong shape.
+/// A virtual workspace is `Ok` with no package — a different answer from a
+/// manifest that could not be read, which used to share `None` with it and be
+/// dropped without a record.
+pub fn parse_cargo_manifest(dir: &str, source: &str) -> Result<CargoManifest, String> {
+    let manifest: toml::Table = source
+        .parse()
+        .map_err(|error| format!("could not be parsed as TOML: {error}"))?;
+    let workspace_members = match manifest.get("workspace") {
+        None => Vec::new(),
+        Some(workspace) => {
+            let workspace = workspace.as_table().ok_or("`workspace` is not a table")?;
+            match workspace.get("members") {
+                None => Vec::new(),
+                Some(members) => members
+                    .as_array()
+                    .ok_or("`workspace.members` is not an array")?
+                    .iter()
+                    .map(|member| {
+                        member
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or("`workspace.members` holds an entry that is not a string")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
+    };
+    let Some(package) = manifest.get("package") else {
+        if manifest.contains_key("workspace") {
+            return Ok(CargoManifest {
+                package: None,
+                workspace_members,
+            });
+        }
+        return Err("declares neither a `[package]` nor a `[workspace]`".to_string());
+    };
+    let package = package.as_table().ok_or("`package` is not a table")?;
+    let name = package
+        .get("name")
         .and_then(toml::Value::as_str)
-    {
-        names.push(name.replace('-', "_"));
+        .ok_or("`[package]` has no `name`")?;
+    let mut names = vec![name.replace('-', "_")];
+    let mut lib_path = None;
+    if let Some(lib) = manifest.get("lib") {
+        let lib = lib.as_table().ok_or("`lib` is not a table")?;
+        if let Some(name) = lib.get("name") {
+            let name = name.as_str().ok_or("`lib.name` is not a string")?;
+            names.push(name.replace('-', "_"));
+        }
+        if let Some(path) = lib.get("path") {
+            lib_path = Some(cargo_target_path(dir, "lib.path", path)?);
+        }
+    }
+    let mut bin_paths = Vec::new();
+    if let Some(bins) = manifest.get("bin") {
+        for bin in bins.as_array().ok_or("`bin` is not an array of tables")? {
+            let bin = bin
+                .as_table()
+                .ok_or("`bin` holds an entry that is not a table")?;
+            if let Some(path) = bin.get("path") {
+                bin_paths.push(cargo_target_path(dir, "bin.path", path)?);
+            }
+        }
     }
     names.sort();
     names.dedup();
-    (!names.is_empty()).then_some(names)
+    bin_paths.sort();
+    bin_paths.dedup();
+    Ok(CargoManifest {
+        package: Some(RustCrateManifest {
+            dir: dir.to_string(),
+            names,
+            lib_path,
+            bin_paths,
+        }),
+        workspace_members,
+    })
+}
+
+/// The library names a `Cargo.toml` declares, or `None` when it declares no
+/// package (a virtual workspace manifest) or does not parse. The collector
+/// reads [`parse_cargo_manifest`], which tells those two apart.
+pub fn parse_cargo_crate_names(source: &str) -> Option<Vec<String>> {
+    parse_cargo_manifest("", source)
+        .ok()?
+        .package
+        .map(|package| package.names)
+}
+
+/// The declared paths of one read `Cargo.toml` that do not exist: target
+/// roots that are not files and workspace members with no manifest.
+///
+/// A glob member (`crates/*`) is checked by its literal leading directory: the
+/// walk finds whatever manifests are under it, and only a base that does not
+/// exist is certainly wrong.
+fn cargo_missing_paths(root: &Path, dir: &str, manifest: &CargoManifest) -> Vec<String> {
+    let mut missing = Vec::new();
+    if let Some(package) = &manifest.package {
+        for path in package.lib_path.iter().chain(&package.bin_paths) {
+            if !root.join(path).is_file() {
+                missing.push(format!("target `{path}`"));
+            }
+        }
+    }
+    for member in &manifest.workspace_members {
+        let literal: Vec<&str> = member
+            .split('/')
+            .take_while(|part| !part.contains(['*', '?', '[']))
+            .collect();
+        let is_glob = literal.len() != member.split('/').count();
+        let anchored = match crate::pyproject::anchor(dir, &literal.join("/")) {
+            Ok(path) => path.unwrap_or_default(),
+            Err(_) => {
+                missing.push(format!("member `{member}` (outside the repository)"));
+                continue;
+            }
+        };
+        let present = if is_glob {
+            anchored.is_empty() || root.join(&anchored).is_dir()
+        } else {
+            root.join(&anchored).join("Cargo.toml").is_file()
+        };
+        if !present {
+            missing.push(format!("member `{member}`"));
+        }
+    }
+    missing
 }
 
 impl ProjectManifests {
@@ -340,12 +482,40 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         found.examined.insert(rel_str.clone());
         match read {
             ManifestRead::Read(source) => {
-                if let Some(names) = parse_cargo_crate_names(&source) {
-                    let dir = rel_str
-                        .rsplit_once('/')
-                        .map(|(dir, _)| dir.to_string())
-                        .unwrap_or_default();
-                    found.rust_crates.push(RustCrateManifest { dir, names });
+                let dir = rel_str
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir.to_string())
+                    .unwrap_or_default();
+                match parse_cargo_manifest(&dir, &source) {
+                    Ok(manifest) => {
+                        // A path the manifest names that is not there is a
+                        // gap, reported the way a missing Python root is; what
+                        // the manifest does name correctly is still used.
+                        let missing = cargo_missing_paths(root, &dir, &manifest);
+                        if !missing.is_empty() {
+                            found.refusals.push((
+                                rel_str,
+                                DiscoverySkipReason::Unreadable {
+                                    reason: format!(
+                                        "names paths that do not exist: {}",
+                                        missing.join(", ")
+                                    ),
+                                },
+                            ));
+                        }
+                        if let Some(package) = manifest.package {
+                            found.rust_crates.push(package);
+                        }
+                    }
+                    // A manifest that does not say what its crate is takes the
+                    // crate's name with it, and every `use <name>::…` would be
+                    // filed `External` with nothing saying why.
+                    Err(reason) => found.refusals.push((
+                        rel_str,
+                        DiscoverySkipReason::Unreadable {
+                            reason: format!("could not be read as a Cargo manifest: {reason}"),
+                        },
+                    )),
                 }
             }
             ManifestRead::Absent | ManifestRead::Skipped => {}

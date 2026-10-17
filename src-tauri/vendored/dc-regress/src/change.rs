@@ -152,6 +152,11 @@ pub enum ChangeStatus {
     Deleted,
     /// Git reported the content as binary, so it has no lines at all.
     Binary,
+    /// The file changed, but its path cannot be carried as text, so nothing
+    /// can be placed for it. Only this file is lost; the rest of the change
+    /// is read. `path` on the [`FileChange`] is a lossy rendering, for
+    /// naming it and nothing else.
+    Unreadable { reason: String },
 }
 
 /// One file's participation in a change.
@@ -299,6 +304,23 @@ pub fn changes_between(repo: &Path, since: &str, until: &str) -> Result<ChangeSe
     changes_between_with_program(std::ffi::OsStr::new("git"), repo, since, until)
 }
 
+/// The options both reads of the diff carry, so they describe one set of file
+/// pairs in one order.
+///
+/// The prefixes are pinned: `diff.noprefix`, `diff.srcPrefix`,
+/// `diff.dstPrefix` and `diff.mnemonicPrefix` all rewrite the `a/` and `b/`
+/// this reader's header cross-check expects, and a command-line prefix
+/// outranks every one of them (verified against git 2.54).
+const DIFF_SHAPE: [&str; 4] = [
+    "--no-color",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    // Rename detection on, so an edited-and-renamed file is one entry under
+    // its post-image name rather than a delete plus an add whose added half
+    // looks like a wholly new file. Also outranks `diff.renames=copies`.
+    "--find-renames",
+];
+
 #[doc(hidden)]
 pub fn changes_between_with_program(
     program: &std::ffi::OsStr,
@@ -311,59 +333,52 @@ pub fn changes_between_with_program(
     };
     let since = commit_oid(program, repo, since).map_err(git_refusal)?;
     let until = commit_oid(program, repo, until).map_err(git_refusal)?;
-    let captured = run_git(
-        program,
-        repo,
-        &[
-            // Raw bytes for non-ASCII paths. A path that is *still* quoted
-            // after this contains control characters and is refused below
-            // rather than unescaped by hand.
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            // No context. Context lines would widen every hunk by three lines
-            // in each direction and pull in neighbouring symbols that the
-            // change did not touch.
-            "--unified=0",
-            "--no-color",
-            // Rename detection on, so an edited-and-renamed file is one entry
-            // under its post-image name rather than a delete plus an add whose
-            // added half looks like a wholly new file.
-            "--find-renames",
-            &since,
-            &until,
-        ],
-        "git diff",
-        DIFF_OUTPUT_CAP,
-    )
-    .map_err(|refusal| match refusal {
-        // The commonest way this command is refused, and the one whose
-        // generic wording helps least: a caller who asked about a release-
-        // sized range gets told a byte count. The cap is deliberate — a
-        // prefix of a diff is a change set missing exactly the files it did
-        // not reach — but a refusal that does not name the remedy reads as a
-        // defect rather than as a bound.
-        //
-        // Widening the cap is not the remedy either: past
-        // [`crate::blast::MAX_SEED_SYMBOLS`] the walk is already running from
-        // a trimmed seed set, so a larger range buys a *less* precise answer,
-        // not a fuller one.
-        HistoryRefusal::OutputCapped { cap, .. } => ChangeRefusal::DiffTooLarge { cap },
-        other => ChangeRefusal::Git {
-            reason: other.describe(),
-        },
-    })?;
-    parse_diff(&captured.stdout_lossy())
+    // The command is refused in one place, and the wording that helps least —
+    // a byte count for a release-sized range — is replaced by the remedy. The
+    // cap is deliberate: a prefix of a diff is a change set missing exactly
+    // the files it did not reach. Widening it is not the remedy either: past
+    // [`crate::blast::MAX_SEED_SYMBOLS`] the walk is already running from a
+    // trimmed seed set, so a larger range buys a *less* precise answer.
+    let read = |args: &[&str], what: &str| {
+        run_git(program, repo, args, what, DIFF_OUTPUT_CAP).map_err(|refusal| match refusal {
+            HistoryRefusal::OutputCapped { cap, .. } => ChangeRefusal::DiffTooLarge { cap },
+            other => ChangeRefusal::Git {
+                reason: other.describe(),
+            },
+        })
+    };
+    // Two reads of the same diff. The names come from `--raw -z`, which
+    // states each path as the bytes it is and never quotes one; the ranges
+    // come from the patch, whose headers quote any name with a control
+    // character and are not read for names at all.
+    let mut raw_args = vec!["diff", "--raw", "-z"];
+    raw_args.extend(DIFF_SHAPE);
+    raw_args.extend([since.as_str(), until.as_str()]);
+    let raw = read(&raw_args, "git diff --raw")?;
+    let mut patch_args = vec!["-c", "core.quotePath=false", "diff", "--unified=0"];
+    patch_args.extend(DIFF_SHAPE);
+    patch_args.extend([since.as_str(), until.as_str()]);
+    let patch = read(&patch_args, "git diff")?;
+    parse_changes(&raw.stdout, &patch.stdout_lossy())
 }
 
-/// Parse `git diff --unified=0` output into per-file post-image ranges.
-pub fn parse_diff(diff: &str) -> Result<ChangeSet, ChangeRefusal> {
-    let mut files: Vec<FileChange> = Vec::new();
-    let mut current: Option<FileChange> = None;
-    // Set by the `---`/`+++` pair, which is the only place a rename's two
-    // names both appear in a form this parser reads.
-    let mut pre_image: Option<String> = None;
-    // False until this file's first `@@`. Everything after that point is hunk
+/// One name from a patch header: the path it states, `None` for `/dev/null`,
+/// or the quoted text git wrote instead of one.
+type Side = Result<Option<String>, String>;
+
+/// One `diff --git` block of a patch.
+#[derive(Default)]
+struct Block {
+    pre: Option<Side>,
+    post: Option<Side>,
+    binary: bool,
+    ranges: Vec<ChangedRange>,
+}
+
+/// Splits `git diff --unified=0` output into its blocks.
+fn scan_blocks(diff: &str) -> Result<Vec<Block>, ChangeRefusal> {
+    let mut blocks: Vec<Block> = Vec::new();
+    // False until a block's first `@@`. Everything after that point is hunk
     // *content*, and content is not a header however much it looks like one.
     //
     // This is not defensive padding. `--unified=0` drops context lines but
@@ -375,7 +390,6 @@ pub fn parse_diff(diff: &str) -> Result<ChangeSet, ChangeRefusal> {
     // one**: a whole file's changes vanishing from the report with nothing to
     // say they had. Verified against git rather than reasoned about.
     let mut in_hunks = false;
-
     for raw in diff.lines() {
         // A combined diff's header is `@@@`, and its ranges belong one to each
         // parent. Checked before the two-way header so it can never be read as
@@ -384,124 +398,277 @@ pub fn parse_diff(diff: &str) -> Result<ChangeSet, ChangeRefusal> {
         if raw.starts_with("@@@") {
             return Err(ChangeRefusal::CombinedDiff);
         }
-
         if raw.starts_with("diff --git ") {
-            if let Some(done) = current.take() {
-                files.push(done);
-            }
-            pre_image = None;
+            blocks.push(Block::default());
             in_hunks = false;
-            // The path is not taken from this line: `diff --git a/x b/y` is
-            // ambiguous when a name contains a space, and the `---`/`+++` pair
-            // below states each side on its own line.
             continue;
         }
-
+        let Some(block) = blocks.last_mut() else {
+            continue;
+        };
         if !in_hunks && (raw.starts_with("Binary files ") || raw.starts_with("GIT binary patch")) {
-            if let Some(file) = current.as_mut() {
-                file.status = ChangeStatus::Binary;
-                file.ranges.clear();
-            }
+            block.binary = true;
+            block.ranges.clear();
             // Binary payload lines follow and are not diff syntax. Treated as
             // hunk content so nothing in them is read as a header.
             in_hunks = true;
             continue;
         }
-
         if !in_hunks {
             if let Some(rest) = raw.strip_prefix("--- ") {
-                pre_image = strip_side(rest)?;
+                block.pre = Some(side(rest));
+                continue;
+            }
+            if let Some(rest) = raw.strip_prefix("+++ ") {
+                block.post = Some(side(rest));
                 continue;
             }
         }
-
-        if let Some(rest) = raw.strip_prefix("+++ ").filter(|_| !in_hunks) {
-            let post = strip_side(rest)?;
-            match post {
-                // `+++ /dev/null` — the file is gone in the post-image.
-                None => {
-                    let path = pre_image.clone().unwrap_or_default();
-                    if !path.is_empty() {
-                        current = Some(FileChange {
-                            path,
-                            renamed_from: None,
-                            status: ChangeStatus::Deleted,
-                            ranges: Vec::new(),
-                        });
-                    }
-                }
-                Some(path) => {
-                    // `--- /dev/null` — the file is new in the post-image.
-                    let status = if pre_image.is_none() {
-                        ChangeStatus::Added
-                    } else {
-                        ChangeStatus::Modified
-                    };
-                    let renamed_from = pre_image
-                        .as_ref()
-                        .filter(|before| *before != &path)
-                        .cloned();
-                    current = Some(FileChange {
-                        path,
-                        renamed_from,
-                        status,
-                        ranges: Vec::new(),
-                    });
-                }
-            }
-            continue;
-        }
-
         if raw.starts_with("@@ ") {
             in_hunks = true;
-            let range = parse_hunk(raw)?;
-            if let Some(file) = current.as_mut() {
-                // Only a file that *has* a post-image has post-image ranges.
-                // A deleted file still emits a hunk — `@@ -1,9 +0,0 @@` — and
-                // reading its `+0,0` as a deletion boundary would manufacture
-                // a range at line 1 of a file that no longer exists, which
-                // then matches whatever the graph still holds under that path.
-                // A binary file has no lines at all.
-                if matches!(file.status, ChangeStatus::Modified | ChangeStatus::Added) {
-                    file.ranges.push(range);
-                }
-            }
-            continue;
+            block.ranges.push(parse_hunk(raw)?);
         }
     }
-    if let Some(done) = current.take() {
-        files.push(done);
-    }
+    Ok(blocks)
+}
 
-    // A file may appear once per `diff --git` block; ranges inside one arrive
-    // in ascending order from git. Merging touching or overlapping ranges
-    // keeps the later line-count arithmetic a plain sum.
+/// Parse `git diff --unified=0` output into per-file post-image ranges, naming
+/// each file by the paths the patch's own headers state.
+///
+/// A header that quotes its path refuses the whole change: the name cannot be
+/// recovered from this format without unescaping it by hand. The diff
+/// [`changes_between`] runs names its files from `--raw -z` instead, through
+/// [`parse_changes`], and never meets that refusal.
+pub fn parse_diff(diff: &str) -> Result<ChangeSet, ChangeRefusal> {
+    let mut files = Vec::new();
+    for block in scan_blocks(diff)? {
+        let (Some(pre), Some(post)) = (block.pre.clone(), block.post.clone()) else {
+            // No `---`/`+++` pair: a pure rename, a mode change or a binary
+            // file, none of which has a line to place.
+            continue;
+        };
+        let pre = named(pre)?;
+        let (path, renamed_from, status) = match named(post)? {
+            // `+++ /dev/null` — the file is gone in the post-image.
+            None => (pre.unwrap_or_default(), None, ChangeStatus::Deleted),
+            Some(path) => {
+                // `--- /dev/null` — the file is new in the post-image.
+                let status = if pre.is_none() {
+                    ChangeStatus::Added
+                } else {
+                    ChangeStatus::Modified
+                };
+                let renamed_from = pre.filter(|before| *before != path);
+                (path, renamed_from, status)
+            }
+        };
+        if path.is_empty() {
+            continue;
+        }
+        files.push(file_change(path, renamed_from, status, block));
+    }
+    Ok(finish(files))
+}
+
+fn named(side: Side) -> Result<Option<String>, ChangeRefusal> {
+    side.map_err(|raw| ChangeRefusal::QuotedPath { raw })
+}
+
+/// A file's participation, from its status and the block that carries its
+/// ranges.
+fn file_change(
+    path: String,
+    renamed_from: Option<String>,
+    status: ChangeStatus,
+    block: Block,
+) -> FileChange {
+    let status = match status {
+        ChangeStatus::Deleted => ChangeStatus::Deleted,
+        _ if block.binary => ChangeStatus::Binary,
+        other => other,
+    };
+    // Only a file that *has* a post-image has post-image ranges. A deleted
+    // file still emits a hunk — `@@ -1,9 +0,0 @@` — and reading its `+0,0` as
+    // a deletion boundary would manufacture a range at line 1 of a file that
+    // no longer exists, which then matches whatever the graph still holds
+    // under that path. A binary file has no lines at all.
+    let ranges = if matches!(status, ChangeStatus::Modified | ChangeStatus::Added) {
+        block.ranges
+    } else {
+        Vec::new()
+    };
+    FileChange {
+        path,
+        renamed_from,
+        status,
+        ranges,
+    }
+}
+
+/// A file may appear once per `diff --git` block; ranges inside one arrive in
+/// ascending order from git. Merging touching or overlapping ranges keeps the
+/// later line-count arithmetic a plain sum.
+fn finish(mut files: Vec<FileChange>) -> ChangeSet {
     for file in &mut files {
         file.ranges = merge_ranges(std::mem::take(&mut file.ranges));
     }
-
     let capped = files.len() > MAX_CHANGED_FILES;
     files.truncate(MAX_CHANGED_FILES);
-    Ok(ChangeSet { files, capped })
+    ChangeSet { files, capped }
 }
 
-/// The path from a `---`/`+++` line, or `None` for `/dev/null`.
+/// One entry of `git diff --raw -z`.
+struct RawEntry {
+    status: u8,
+    old: Vec<u8>,
+    /// The second path of a rename or copy.
+    new: Option<Vec<u8>>,
+}
+
+/// Reads `git diff --raw -z`: `:<modes> <ids> <status>[score] NUL <path> NUL`,
+/// with a second path for a rename or copy.
+fn parse_raw(raw: &[u8]) -> Result<Vec<RawEntry>, ChangeRefusal> {
+    let unreadable = |what: &str| ChangeRefusal::Git {
+        reason: format!("git diff --raw -z output could not be read: {what}"),
+    };
+    let mut fields = raw.split(|b| *b == 0);
+    let mut entries = Vec::new();
+    while let Some(meta) = fields.next() {
+        if meta.is_empty() {
+            // The terminator after the last entry.
+            continue;
+        }
+        if meta.first() != Some(&b':') {
+            return Err(unreadable("an entry without a metadata field"));
+        }
+        let status = *meta
+            .split(|b| *b == b' ')
+            .next_back()
+            .and_then(|field| field.first())
+            .ok_or_else(|| unreadable("an entry without a status"))?;
+        let old = fields
+            .next()
+            .ok_or_else(|| unreadable("an entry without a path"))?
+            .to_vec();
+        let new = if matches!(status, b'R' | b'C') {
+            Some(
+                fields
+                    .next()
+                    .ok_or_else(|| unreadable("a rename without its second path"))?
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+        entries.push(RawEntry { status, old, new });
+    }
+    Ok(entries)
+}
+
+/// The change `--raw -z` and the patch describe together.
 ///
-/// Refuses a quoted path rather than unescaping it: git quotes exactly when
+/// `--raw -z` is the authority for names and status: paths are bytes with no
+/// quoting, so a name with a quote, backslash, tab or newline is the name it
+/// is. The patch is the authority for ranges. Both come from one diff with one
+/// set of options, so they list the same file pairs in the same order, and
+/// block *n* of the patch is entry *n* of the raw listing — except a type
+/// change, which the raw listing shows once and the patch shows as a deletion
+/// and an addition.
+///
+/// A path that is not UTF-8 is refused alone, as a [`ChangeStatus::Unreadable`]
+/// file: it cannot be a `String` key into a graph, and the files beside it
+/// still seed. The pairing is checked, not assumed: counts that disagree, or a
+/// plain header name that is neither of an entry's paths, refuse the change,
+/// because ranges attached to the wrong name are worse than none.
+pub fn parse_changes(raw: &[u8], patch: &str) -> Result<ChangeSet, ChangeRefusal> {
+    let entries = parse_raw(raw)?;
+    let blocks = scan_blocks(patch)?;
+    let lost = |why: String| ChangeRefusal::Git {
+        reason: format!("the raw and patch forms of the diff do not line up: {why}"),
+    };
+    let expected: usize = entries
+        .iter()
+        .map(|entry| if entry.status == b'T' { 2 } else { 1 })
+        .sum();
+    if expected != blocks.len() {
+        return Err(lost(format!(
+            "{} raw entries expect {expected} patch blocks, the patch has {}",
+            entries.len(),
+            blocks.len()
+        )));
+    }
+    let mut blocks = blocks.into_iter();
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let first = blocks.next().unwrap_or_default();
+        // A type change's patch is two blocks; the second is the new file.
+        let block = if entry.status == b'T' {
+            blocks.next().unwrap_or_default()
+        } else {
+            first
+        };
+        for header in [&block.pre, &block.post].into_iter().flatten() {
+            if let Ok(Some(stated)) = header {
+                let agrees = [Some(&entry.old), entry.new.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|name| name == stated.as_bytes());
+                if !agrees {
+                    return Err(lost(format!(
+                        "a patch header names {stated:?}, which is none of this entry's paths"
+                    )));
+                }
+            }
+        }
+        let post = entry.new.as_ref().unwrap_or(&entry.old);
+        let renamed_from = entry.new.as_ref().map(|_| &entry.old);
+        let path = match String::from_utf8(post.clone()) {
+            Ok(path) => path,
+            Err(_) => {
+                files.push(FileChange {
+                    path: String::from_utf8_lossy(post).into_owned(),
+                    renamed_from: None,
+                    status: ChangeStatus::Unreadable {
+                        reason: "the path is not valid UTF-8, so it cannot name an indexed file"
+                            .to_string(),
+                    },
+                    ranges: Vec::new(),
+                });
+                continue;
+            }
+        };
+        let renamed_from = renamed_from
+            .and_then(|old| String::from_utf8(old.clone()).ok())
+            .filter(|old| *old != path);
+        let status = match entry.status {
+            b'A' => ChangeStatus::Added,
+            b'D' => ChangeStatus::Deleted,
+            _ => ChangeStatus::Modified,
+        };
+        files.push(file_change(path, renamed_from, status, block));
+    }
+    Ok(finish(files))
+}
+
+/// A name from a `---`/`+++` line: the path, `None` for `/dev/null`, or the
+/// quoted text itself when git quoted it.
+///
+/// A quoted path is reported rather than unescaped: git quotes exactly when
 /// the name contains bytes that would not survive this line-oriented format,
 /// and a hand-rolled unescape that gets one case wrong produces a path that
 /// silently matches nothing in the graph.
-fn strip_side(rest: &str) -> Result<Option<String>, ChangeRefusal> {
-    let rest = rest.trim_end();
+fn side(rest: &str) -> Side {
+    // Git ends a header's name with a TAB when the name holds a space, so a
+    // name that itself ends in a space survives; only that one TAB is shed.
+    let rest = rest.strip_suffix('\t').unwrap_or(rest);
     if rest == "/dev/null" {
         return Ok(None);
     }
     if rest.starts_with('"') {
-        return Err(ChangeRefusal::QuotedPath {
-            raw: rest.to_string(),
-        });
+        return Err(rest.to_string());
     }
-    // `a/` and `b/` are git's diff prefixes, not part of the path.
+    // `a/` and `b/` are the diff prefixes the caller pinned, not part of the
+    // path.
     let path = rest
         .strip_prefix("a/")
         .or_else(|| rest.strip_prefix("b/"))
@@ -820,6 +987,131 @@ mod tests {
         let set = parse_diff(diff).expect("parses");
         assert_eq!(set.files[0].status, ChangeStatus::Binary);
         assert!(set.files[0].ranges.is_empty());
+    }
+
+    fn raw(entries: &[(&str, &[&[u8]])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (meta, paths) in entries {
+            out.extend_from_slice(meta.as_bytes());
+            out.push(0);
+            for path in *paths {
+                out.extend_from_slice(path);
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    const M: &str = ":100644 100644 aaaaaaa bbbbbbb M";
+
+    /// The name comes from `--raw -z`, so a header git had to quote is not a
+    /// refusal and not a guess: the patch only supplies the ranges.
+    #[test]
+    fn a_path_git_quoted_in_the_patch_is_named_by_the_raw_listing() {
+        let raw = raw(&[(M, &[b"src/nl\nname.py"]), (M, &[b"src/ok.py"])]);
+        let patch = "diff --git \"a/src/nl\\nname.py\" \"b/src/nl\\nname.py\"\n\
+                     --- \"a/src/nl\\nname.py\"\n+++ \"b/src/nl\\nname.py\"\n@@ -1 +1,2 @@\n\
+                     diff --git a/src/ok.py b/src/ok.py\n--- a/src/ok.py\n+++ b/src/ok.py\n@@ -3 +3 @@\n";
+        let set = parse_changes(&raw, patch).expect("parses");
+        let names: Vec<&str> = set.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, ["src/nl\nname.py", "src/ok.py"]);
+        assert_eq!(set.files[0].ranges[0].end_line, 2);
+        assert_eq!(set.files[1].ranges[0].start_line, 3);
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused_alone() {
+        let raw = raw(&[(M, &[b"bad\xff.py"]), (M, &[b"good.py"])]);
+        let patch = "diff --git \"a/bad\\377.py\" \"b/bad\\377.py\"\n--- \"a/bad\\377.py\"\n\
+                     +++ \"b/bad\\377.py\"\n@@ -1 +1 @@\n\
+                     diff --git a/good.py b/good.py\n--- a/good.py\n+++ b/good.py\n@@ -2 +2 @@\n";
+        let set = parse_changes(&raw, patch).expect("the change is still read");
+        assert!(matches!(
+            set.files[0].status,
+            ChangeStatus::Unreadable { .. }
+        ));
+        assert!(set.files[0].ranges.is_empty());
+        assert_eq!(set.files[1].path, "good.py");
+        assert_eq!(set.files[1].status, ChangeStatus::Modified);
+        assert_eq!(set.files[1].ranges.len(), 1);
+    }
+
+    /// A type change is one raw entry and two patch blocks; reading it as one
+    /// would shift every file after it onto the wrong ranges.
+    #[test]
+    fn a_type_change_does_not_shift_the_files_after_it() {
+        let raw = raw(&[
+            (":100644 120000 aaaaaaa bbbbbbb T", &[b"lnk"]),
+            (M, &[b"z.py"]),
+        ]);
+        let patch = "diff --git a/lnk b/lnk\ndeleted file mode 100644\n--- a/lnk\n+++ /dev/null\n\
+                     @@ -1 +0,0 @@\n\
+                     diff --git a/lnk b/lnk\nnew file mode 120000\n--- /dev/null\n+++ b/lnk\n\
+                     @@ -0,0 +1 @@\n\
+                     diff --git a/z.py b/z.py\n--- a/z.py\n+++ b/z.py\n@@ -9 +9 @@\n";
+        let set = parse_changes(&raw, patch).expect("parses");
+        assert_eq!(set.files.len(), 2);
+        assert_eq!(set.files[0].path, "lnk");
+        assert_eq!(set.files[1].path, "z.py");
+        assert_eq!(set.files[1].ranges[0].start_line, 9);
+    }
+
+    #[test]
+    fn a_binary_file_and_a_mode_change_are_files_with_no_ranges() {
+        let raw = raw(&[
+            (M, &[b"i.png"]),
+            (":100644 100755 aaaaaaa aaaaaaa M", &[b"run.sh"]),
+        ]);
+        let patch = "diff --git a/i.png b/i.png\nindex 1..2 100644\n\
+                     Binary files a/i.png and b/i.png differ\n\
+                     diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+        let set = parse_changes(&raw, patch).expect("parses");
+        assert_eq!(set.files[0].status, ChangeStatus::Binary);
+        assert_eq!(set.files[1].path, "run.sh");
+        assert!(set.files[1].ranges.is_empty());
+    }
+
+    #[test]
+    fn a_rename_keeps_its_old_name() {
+        let raw = raw(&[(
+            ":100644 100644 aaaaaaa bbbbbbb R050",
+            &[b"old.py", b"new.py"],
+        )]);
+        let patch = "diff --git a/old.py b/new.py\nsimilarity index 50%\nrename from old.py\n\
+                     rename to new.py\n--- a/old.py\n+++ b/new.py\n@@ -1 +1 @@\n";
+        let set = parse_changes(&raw, patch).expect("parses");
+        assert_eq!(set.files[0].path, "new.py");
+        assert_eq!(set.files[0].renamed_from.as_deref(), Some("old.py"));
+    }
+
+    /// Ranges attached to the wrong file are worse than none: when the two
+    /// forms do not line up the change is refused.
+    #[test]
+    fn a_patch_that_does_not_line_up_with_the_raw_listing_is_refused() {
+        let one = raw(&[(M, &[b"a.py"])]);
+        let two_blocks = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n\
+                          diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n";
+        assert!(matches!(
+            parse_changes(&one, two_blocks),
+            Err(ChangeRefusal::Git { .. })
+        ));
+        let wrong_name = "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n";
+        assert!(matches!(
+            parse_changes(&one, wrong_name),
+            Err(ChangeRefusal::Git { .. })
+        ));
+        assert!(matches!(
+            parse_changes(b"garbage", ""),
+            Err(ChangeRefusal::Git { .. })
+        ));
+    }
+
+    #[test]
+    fn a_name_ending_in_a_space_survives_the_header_cross_check() {
+        let raw = raw(&[(M, &[b"trail "])]);
+        let patch = "diff --git a/trail  b/trail \n--- a/trail \t\n+++ b/trail \t\n@@ -1 +1 @@\n";
+        let set = parse_changes(&raw, patch).expect("parses");
+        assert_eq!(set.files[0].path, "trail ");
     }
 
     #[test]

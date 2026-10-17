@@ -25,10 +25,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// The consequence is stated rather than hidden: DevMap does not report unused
 /// CSS. Svelte's own compiler does, from inside the compilation that knows the
 /// answer, and that is the tool for it.
+///
+/// `Macro` is here for the same reason: a `macro_rules!` macro is linked only to
+/// its invocations in the file that defines it. One invoked from another file
+/// through `#[macro_use]`, a `use` of the macro or `$crate::name!` leaves no
+/// edge, so an unreferenced macro is not evidence of a dead one.
 fn is_never_dead_candidate(kind: SymbolKind) -> bool {
     matches!(
         kind,
-        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule
+        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule | SymbolKind::Macro
     )
 }
 
@@ -1077,8 +1082,11 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// builds every labelled fixture under `testdata/accuracy/` and fails if a
 /// language is listed here while any of its confident-branch rows is not
 /// labelled `truly_dead`, and fails if a language whose fixture is clean — at
-/// least one confident row, no false one, every examined truly-dead marker
-/// found — is *not* listed. So the table cannot rot in either direction: a
+/// least one confident row, no false one, every truly-dead marker in the
+/// confident branch — and whose corpus record (`record.json`) has labelled
+/// rows, at most 5% false on every corpus, is *not* listed. A language the
+/// record never measured, or measured with no row, is unproven: a missing or
+/// unreadable record fails the test. So the table cannot rot in either direction: a
 /// regression that puts one false row in a listed language's confident tier
 /// fails CI, and a fix that earns a language the tier fails CI until it is
 /// listed.
@@ -1094,23 +1102,27 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// silent miss that bypassed the namesake veto — and `CLAUDE.md` tells agents
 /// that tier is the one to act on.
 ///
-/// **What listing rests on today, stated so nobody reads more into it.** Each
-/// language below has zero confident-tier false positives on its committed
-/// fixture after the veto holes were closed (2026-10-09). The fixture counts
-/// are small — Rust, Swift and Kotlin have one confident row each — and the
-/// corpus record (`testdata/accuracy/record.json`, written by the accuracy
-/// harness) does not exist yet. When it does, the binding test also requires
-/// each listed language to be at or under 5% on every corpus it measured, and
-/// a language that is not comes off this list in the same change.
-pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &[
-    "go",
-    "kotlin",
-    "python",
-    "rust",
-    "swift",
-    "tsx",
-    "typescript",
-];
+/// **What listing rests on today, stated so nobody reads more into it.**
+/// (2026-10-10.) Each listed language has zero confident-tier false positives
+/// on its committed fixture, every fixture `truly_dead` marker in the confident
+/// branch, at least one labelled row in the corpus record, and at most 5% false
+/// on every corpus of it (`testdata/accuracy/record.json`: 20 local
+/// repositories, every language each holds listed — `rows: 0` where its
+/// confident branch was empty). Measured there: Go 0/17 (all from one corpus),
+/// TypeScript 0/29, TSX 0/14, Rust 0/3.
+///
+/// Off the list: **Kotlin**, whose only corpus proof was nine ChronosFlow rows
+/// (0/9, all coverage-capped at 0.66) scored on 2026-10-15 (26c5139b). Their
+/// dead labels are lost, so the rows are carried and unverified in
+/// `record.json` (`carried_dead_evidence`) and no longer count; re-labelling
+/// is tracked by ft-8ed75897. **Swift**, measured on ten corpora with no confident-branch
+/// row on any — its examined population is `private` members something
+/// reaches — so nothing beyond one fixture row has ever tested it; **Python**,
+/// 17 of 58 corpus rows false (string dispatch, an aliased import, module
+/// constants read from other files, calls through a Protocol), causes the
+/// L-Python and interface-dispatch cards own. Each comes back when the record
+/// says so.
+pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &["go", "rust", "tsx", "typescript"];
 
 /// Whether `language` may publish dead rows in the confident tier.
 pub fn confident_tier_eligible(language: &str) -> bool {
@@ -1132,8 +1144,8 @@ pub const UNPROVEN_TIER_CONFIDENCE: f32 = 0.4;
 pub fn confident_tier_unproven_reason(language: &str) -> String {
     format!(
         "{CONFIDENT_TIER_UNPROVEN}: no inbound edge names this symbol, but the {language} \
-         confident tier has not been proven against its labelled fixture — capped below the \
-         act-on tier until CONFIDENT_TIER_ELIGIBLE lists {language}"
+         confident tier has not been proven against its labelled fixture and the corpus \
+         record — capped below the act-on tier until CONFIDENT_TIER_ELIGIBLE lists {language}"
     )
 }
 
@@ -1163,6 +1175,261 @@ fn exported_unreferenced_reason(proof: &str) -> String {
         "{EXPORTED_UNREFERENCED}: exported, but {proof}, and nothing in the corpus reaches it — \
          unconfirmed until this language's entry-point model is proven"
     )
+}
+
+/// The machine token a row starts with when its class inherits from a type the
+/// corpus does not declare.
+pub const EXTERNAL_SUPERTYPE: &str = "external_supertype";
+
+/// The machine token a row starts with when it is a member of an object literal.
+pub const OBJECT_LITERAL_MEMBER: &str = "object_literal_member";
+
+/// Languages where a subclass overrides a base method with no keyword saying so.
+///
+/// Kotlin, Java, Swift, C# and Scala require `override` (or `@Override`), and
+/// the extractor already exempts what carries it; a method there without one
+/// cannot be what a base class calls. Python and TypeScript/JavaScript say
+/// nothing at the override, so an uncalled method on a subclass of a library
+/// type may be exactly what the library calls — CodeMirror's `WidgetType.toDOM`,
+/// `HTMLParser.handle_starttag`, watchdog's `on_any_event`. The 2026-10-10
+/// corpus record measured those as confident false positives in both languages.
+fn overrides_without_keyword(language: &str) -> bool {
+    matches!(language, "python" | "typescript" | "tsx" | "javascript")
+}
+
+/// Supertypes that call no subclass method by name, so inheriting from one is
+/// no evidence that an uncalled method is reached.
+///
+/// `object`, the abstract-base and generic markers, enums and record shapes
+/// (pydantic's `BaseModel` among them: it calls decorated validators and
+/// named hooks, never a plain method a model adds), and exception types (by name, including a library's `HTTPException` or a
+/// `ValidationError`): none of them dispatches to a method a subclass adds.
+/// Dunder hooks are already outside the population (leading underscore).
+///
+/// For Swift, the value-semantics and marker protocols whose requirements are
+/// operators or compiler-synthesised members (`Equatable`, `Hashable`,
+/// `Codable`, `Sendable`, `Identifiable`, …) and `NSObject` itself: conforming
+/// to one says nothing about who calls the type's other members.
+fn supertype_dispatches_nothing(name: &str) -> bool {
+    matches!(
+        name,
+        "object"
+            | "ABC"
+            | "Generic"
+            | "Enum"
+            | "IntEnum"
+            | "StrEnum"
+            | "Flag"
+            | "NamedTuple"
+            | "TypedDict"
+            | "BaseModel"
+            | "NSObject"
+            | "Equatable"
+            | "Hashable"
+            | "Comparable"
+            | "Codable"
+            | "Encodable"
+            | "Decodable"
+            | "Sendable"
+            | "Identifiable"
+            | "CaseIterable"
+            | "RawRepresentable"
+            | "ObservableObject"
+            | "AnyObject"
+    ) || name.ends_with("Error")
+        || name.ends_with("Exception")
+}
+
+/// `(file, declaring type)` → the first supertype it names that the corpus does
+/// not declare, for the languages [`overrides_without_keyword`] covers.
+///
+/// A supertype is in the corpus when a resolved `Extends` edge from the type
+/// names it ([`supertypes_by_type`]); a heritage reference with no such edge
+/// is a library type, or one this build could not find — either way something
+/// outside the graph may call the type's methods. A base whose contract the
+/// wiring registry knows (`known_dispatch_contract`: `torch.autograd.Function`,
+/// `torch.nn.Module`, `HTMLElement`, React class components), matched on the
+/// base as [`import_qualified`] names it, is not counted: its dispatched
+/// methods are exempt by name and the rest stay ordinary candidates.
+fn external_supertypes<'e>(
+    extractions: &'e [Extraction],
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> HashMap<(&'e str, &'e str), &'e str> {
+    let mut out = HashMap::new();
+    for ext in extractions {
+        // Swift is tracked for the conformance half: a framework calls a
+        // protocol requirement's witness by name (`swift_member_may_witness`).
+        if !overrides_without_keyword(ext.code_language()) && ext.code_language() != "swift" {
+            continue;
+        }
+        // A dotted base arrives as one `Heritage` reference per segment over
+        // one span, innermost first (`Function`, `autograd`, `torch`), so the
+        // written base is the segments reversed; the bare name is the first.
+        let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
+        for reference in &ext.references {
+            // `implements` names an interface, which has no code to call with.
+            if reference.kind != ReferenceKind::Heritage {
+                continue;
+            }
+            let Some(declarer) = reference
+                .enclosing_symbol
+                .as_deref()
+                .and_then(|owner| owner.rsplit("::").next())
+            else {
+                continue;
+            };
+            let start = reference.span.start_byte;
+            match bases
+                .iter_mut()
+                .find(|(owner, at, _)| *owner == declarer && *at == start)
+            {
+                Some((_, _, segments)) => segments.push(reference.name.as_str()),
+                None => bases.push((declarer, start, vec![reference.name.as_str()])),
+            }
+        }
+        for (declarer, _, segments) in bases {
+            let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
+            if base.is_empty() || supertype_dispatches_nothing(base) {
+                continue;
+            }
+            let written: Vec<&str> = segments.iter().rev().copied().collect();
+            if devmap_extract::wiring::known_dispatch_contract(&import_qualified(ext, &written)) {
+                continue;
+            }
+            let in_corpus = supertypes
+                .get(&(ext.file_path.as_str(), declarer))
+                .is_some_and(|supers| supers.iter().any(|(_, name)| *name == base));
+            if !in_corpus {
+                out.entry((ext.file_path.as_str(), declarer))
+                    .or_insert(segments[0]);
+            }
+        }
+    }
+    out
+}
+
+/// A written base (`["nn", "Module"]`) with its root segment replaced by what
+/// the file's imports bind it to (`torch.nn.Module` under `import torch.nn as
+/// nn`), so the dispatch registry matches the library and not a spelling.
+///
+/// * `from M import X as L` / `import { X as L } from 'M'` binds `L` to `M.X`.
+/// * `import M as L` / `import L from 'M'` / `import * as L from 'M'` binds `L`
+///   to `M` (a JS default import is the module's own export).
+/// * `import torch.nn` binds `torch`, the module's first segment, to itself.
+///
+/// A root no import binds is returned as written: a global (`HTMLElement`) or
+/// a name declared in the file.
+fn import_qualified(ext: &Extraction, written: &[&str]) -> String {
+    let Some((root, rest)) = written.split_first() else {
+        return String::new();
+    };
+    let bound = ext.imports.iter().find_map(|import| {
+        let spec = import.module_specifier.as_str();
+        let named = import
+            .local_names
+            .iter()
+            .zip(&import.imported_names)
+            .find(|(local, _)| local.as_str() == *root)
+            .map(|(_, imported)| {
+                if imported == "*" {
+                    spec.to_string()
+                } else {
+                    format!("{spec}.{imported}")
+                }
+            });
+        named
+            .or_else(|| (import.alias.as_deref() == Some(*root)).then(|| spec.to_string()))
+            .or_else(|| {
+                (import.alias.is_none()
+                    && import.imported_names.is_empty()
+                    && spec.split('.').next() == Some(*root))
+                .then(|| root.to_string())
+            })
+    });
+    let mut qualified = bound.unwrap_or_else(|| root.to_string());
+    for segment in rest {
+        qualified.push('.');
+        qualified.push_str(segment);
+    }
+    qualified
+}
+
+/// The external supertype `declaring_type` inherits from, directly or through
+/// in-corpus ancestors, walked as [`reached_through_a_supertype`] walks them.
+fn external_supertype_of<'e>(
+    file: &str,
+    declaring_type: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    external: &HashMap<(&'e str, &'e str), &'e str>,
+) -> Option<&'e str> {
+    let mut frontier = vec![(file, declaring_type)];
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for _ in 0..HERITAGE_WALK_MAX_DEPTH {
+        let mut next = Vec::new();
+        for key in frontier {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(base) = external.get(&key) {
+                return Some(base);
+            }
+            next.extend(supertypes.get(&key).into_iter().flatten().copied());
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Why an uncalled method that would otherwise be confident is unconfirmed:
+/// something outside the call graph dispatches to it by name.
+///
+/// * **`object_literal_member`** — a TypeScript/JavaScript method declared in
+///   an object literal (`{ startState() {…}, token() {…} }`,
+///   `components={{ pre() {…} }}`) is reached through the object, by key, by
+///   whatever the object is handed to. The extractor parents it on the file,
+///   or on the module-level `const` that holds the object (`parser.startState`),
+///   never on a class, which is how it is told from a class method.
+/// * **`external_supertype`** — a method on a class whose supertype chain
+///   reaches a type the corpus does not declare, in a language where an
+///   override is not marked.
+///
+/// Visible at 0.4 with the reason, never exempt: either can also be dead, and
+/// the reader is told which check to make.
+fn unconfirmed_dispatch_reason(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    identity: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    external: &HashMap<(&str, &str), &str>,
+) -> Option<String> {
+    let language = ext.code_language();
+    if sym.kind != SymbolKind::Method || !overrides_without_keyword(language) {
+        return None;
+    }
+    if matches!(language, "typescript" | "tsx" | "javascript")
+        && sym.parent_symbol.as_deref().is_none_or(|parent| {
+            parent == ext.file_path
+                || ext.symbols.iter().any(|owner| {
+                    owner.qualified_name == parent && owner.kind == SymbolKind::Variable
+                })
+        })
+    {
+        return Some(format!(
+            "{OBJECT_LITERAL_MEMBER}: a method of an object literal, reached through the object \
+             by key wherever the object is passed — no call names it, which is not evidence \
+             nothing calls it"
+        ));
+    }
+    let (declaring_type, _) = identity.rsplit_once('.')?;
+    let base = external_supertype_of(&ext.file_path, declaring_type, supertypes, external)?;
+    Some(format!(
+        "{EXTERNAL_SUPERTYPE}: its class inherits from `{base}`, which the corpus does not \
+         declare, and a base class calls a subclass's methods by name — no call names it, \
+         which is not evidence nothing calls it"
+    ))
 }
 
 /// Why an uncalled symbol was not examined at all: it is exported.
@@ -1653,19 +1920,57 @@ type ManifestScopes<'a> = HashMap<&'static str, Vec<(&'a str, Option<&'a str>)>>
 /// [`devmap_extract::wiring::module_manifest_family`].
 fn manifest_scopes(extractions: &[Extraction]) -> ManifestScopes<'_> {
     let mut scopes: ManifestScopes<'_> = HashMap::new();
+    let indexed: HashSet<&str> = extractions
+        .iter()
+        .map(|ext| ext.file_path.as_str())
+        .collect();
     for ext in extractions {
         let Some(family) = devmap_extract::wiring::module_manifest_family(&ext.file_path) else {
             continue;
         };
-        let proof = ext
+        // A Swift package proves privacy per executable target: the package
+        // directory itself is a scope that proves nothing (so a library target
+        // beside the executable is not widened), and each executable target's
+        // directory, deeper and so nearer, carries the proof.
+        if family == "swiftpm" {
+            let entry = scopes.entry(family).or_default();
+            entry.push((parent_dir(&ext.file_path), None));
+            for annotation in &ext.wiring {
+                if annotation.kind == WiringKind::ModulePrivateScope {
+                    entry.push((
+                        annotation.target_symbol.as_str(),
+                        Some(annotation.details.as_str()),
+                    ));
+                }
+            }
+            continue;
+        }
+        let mut proof = ext
             .wiring
             .iter()
             .find(|annotation| annotation.kind == WiringKind::ModulePrivateScope)
             .map(|annotation| annotation.details.as_str());
-        scopes
-            .entry(family)
-            .or_default()
-            .push((parent_dir(&ext.file_path), proof));
+        // A `Cargo.toml` with no `[lib]` still gets one when `src/lib.rs`
+        // exists — Cargo discovers it — and the manifest cannot see that file.
+        if family == "cargo" {
+            let dir = parent_dir(&ext.file_path);
+            let lib = if dir.is_empty() {
+                "src/lib.rs".to_string()
+            } else {
+                format!("{dir}/src/lib.rs")
+            };
+            if indexed.contains(lib.as_str()) {
+                proof = None;
+            }
+        }
+        // `App.xcodeproj/project.pbxproj` scopes the directory holding the
+        // project bundle, not the bundle itself.
+        let dir = if family == "xcode" {
+            parent_dir(parent_dir(&ext.file_path))
+        } else {
+            parent_dir(&ext.file_path)
+        };
+        scopes.entry(family).or_default().push((dir, proof));
     }
     scopes
 }
@@ -1677,12 +1982,22 @@ fn nearest_manifest_proof<'a>(
     family: &str,
     path: &str,
 ) -> Option<&'a str> {
+    nearest_manifest(scopes, family, path).flatten()
+}
+
+/// The nearest manifest of `family` above `path`: `None` when there is none,
+/// `Some(proof)` — itself possibly `None` — when there is.
+fn nearest_manifest<'a>(
+    scopes: &ManifestScopes<'a>,
+    family: &str,
+    path: &str,
+) -> Option<Option<&'a str>> {
     scopes
         .get(family)?
         .iter()
         .filter(|(dir, _)| dir.is_empty() || path.starts_with(&format!("{dir}/")))
         .max_by_key(|(dir, _)| dir.len())
-        .and_then(|(_, proof)| *proof)
+        .map(|(_, proof)| *proof)
 }
 
 /// Why an exported symbol is nonetheless private to its module, or `None` when
@@ -1701,15 +2016,52 @@ fn nearest_manifest_proof<'a>(
 ///   once Android components (by supertype), DI and serialization annotations,
 ///   `override`s and `@Preview` are entry points.
 ///
-/// Swift and Rust are not here yet: Swift waits on framework-protocol
-/// conformance exemptions, Rust on binary-crate detection.
-fn module_private_proof<'a>(ext: &Extraction, scopes: &ManifestScopes<'a>) -> Option<&'a str> {
+/// * **Rust** — an item written `pub(crate)`, `pub(super)`, `pub(self)` or
+///   `pub(in path)`, which the language confines to its crate (a per-symbol
+///   annotation from the extractor); and every `pub` item of a package whose
+///   `Cargo.toml` declares no library target and which has no `src/lib.rs`.
+///   Trait-impl methods, `#[no_mangle]`/`extern "C"`, `#[tauri::command]` and
+///   the binary entry points are exempt before this point.
+///
+/// * **Swift** — an internal symbol of an `executableTarget` in `Package.swift`,
+///   or of an Xcode project whose every product is an application, extension
+///   or test bundle; a file inside a Swift package is judged by the package
+///   alone. Withheld — left not examined — when its type conforms to a
+///   protocol the corpus does not declare ([`swift_member_may_witness`]): a
+///   framework calls a requirement's witness by name, and an internal member
+///   can be one. `@objc`, `@IBAction`, `override`, `@main` and the runtime
+///   supertypes are exempt before this point.
+fn module_private_proof<'a>(
+    ext: &'a Extraction,
+    sym: &ExtractedSymbol,
+    scopes: &ManifestScopes<'a>,
+    external_bases: &HashMap<(&str, &str), &str>,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> Option<&'a str> {
     if let Some(proof) = go_module_private_proof(ext) {
         return Some(proof);
     }
     let family = match ext.code_language() {
         "typescript" | "tsx" | "javascript" => "js",
         "kotlin" | "java" => "gradle",
+        "rust" => {
+            if let Some(annotation) = ext.wiring.iter().find(|annotation| {
+                annotation.kind == WiringKind::ModulePrivateScope
+                    && annotation.target_symbol == sym.qualified_name
+            }) {
+                return Some(annotation.details.as_str());
+            }
+            "cargo"
+        }
+        "swift" => {
+            if swift_member_may_witness(ext, sym, external_bases, supertypes) {
+                return None;
+            }
+            if let Some(proof) = nearest_manifest(scopes, "swiftpm", &ext.file_path) {
+                return proof;
+            }
+            "xcode"
+        }
         _ => return None,
     };
     nearest_manifest_proof(scopes, family, &ext.file_path)
@@ -1729,6 +2081,31 @@ fn record_namesake_site<'a>(entry: &mut NamesakeSites<'a>, site: (&'a str, &'a s
     {
         entry.1 = Some(site);
     }
+}
+
+/// Whether a Swift member may be the witness of a requirement of a protocol the
+/// corpus does not declare.
+///
+/// `extension Controller: NSTableViewDelegate { func tableViewSelectionDidChange… }`
+/// and `struct Badge: ViewModifier { func body… }` are called by AppKit and
+/// SwiftUI by requirement name. Which members are requirements is in the SDK,
+/// not the corpus, so every member of a conforming type is withheld; the
+/// marker protocols [`supertype_dispatches_nothing`] lists do not count.
+fn swift_member_may_witness(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    external_bases: &HashMap<(&str, &str), &str>,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> bool {
+    let Some(owner) = sym
+        .parent_symbol
+        .as_deref()
+        .filter(|parent| *parent != ext.file_path)
+        .and_then(|parent| parent.rsplit("::").next())
+    else {
+        return false;
+    };
+    external_supertype_of(&ext.file_path, owner, supertypes, external_bases).is_some()
 }
 
 /// Fill in the site evidence of every unconfirmed row in one pass.
@@ -1937,11 +2314,11 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // whose declarations nobody looked for.
             (ExtractionGap::NotParsed, reason.clone())
         } else if a_grammar_read_this_file(ext) {
-            if let ParseOutcome::Partial { error_ranges, .. } = &ext.parse_outcome {
+            if let ParseOutcome::Partial { .. } = &ext.parse_outcome {
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),
                     gap: ExtractionGap::PartialParse,
-                    reason: partial_parse_reason(error_ranges),
+                    reason: partial_parse_reason(ext),
                 });
             }
             // A clean parse in a language this build has no extractor for.
@@ -2007,26 +2384,209 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
 /// The `File` symbol is not a declaration here — its span is the whole file,
 /// which would contain every region.
 fn partial_parse_erased_source(ext: &Extraction) -> bool {
+    partial_region_verdicts(ext)
+        .iter()
+        .any(|(_, verdict)| *verdict == PartialRegionVerdict::Charged)
+}
+
+/// Why one error region of a partial parse is, or is not, charged.
+///
+/// The one owner of the per-region line [`partial_parse_erased_source`]
+/// documents. The charge and the `partial_parse` reason both read it, so the
+/// listing cannot tell a reader a region was lost from the graph while the
+/// ceiling treated it as harmless, which is what one sentence for every
+/// partial file used to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialRegionVerdict<'a> {
+    /// Holds a name and lies outside every surviving declaration.
+    Charged,
+    /// Lies inside this surviving declaration (its name relative to the file).
+    InsideDeclaration(&'a str),
+    /// Of nonzero width, but the extractor found no identifier character in it.
+    Nameless,
+    /// A zero-width `MISSING` token: nothing was consumed.
+    ZeroWidth,
+}
+
+/// Every error region of `ext`'s partial parse with its verdict, in the order
+/// the extractor reported them, duplicates removed. Empty for any other
+/// outcome.
+///
+/// Inside a declaration, the innermost one is named: a method is more use to
+/// a reader than the `impl` around it.
+fn partial_region_verdicts(ext: &Extraction) -> Vec<(TextRange, PartialRegionVerdict<'_>)> {
     let ParseOutcome::Partial {
         error_ranges,
         nameless_ranges,
     } = &ext.parse_outcome
     else {
-        return false;
+        return Vec::new();
     };
-    error_ranges.iter().any(|range| {
-        range.end_byte > range.start_byte
-            && !nameless_ranges.contains(range)
-            && !ext.symbols.iter().any(|symbol| {
-                symbol.kind != SymbolKind::File
-                    && symbol.span.start_byte <= range.start_byte
-                    && range.end_byte <= symbol.span.end_byte
-            })
-    })
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    error_ranges
+        .iter()
+        .filter(|range| seen.insert((range.start_byte, range.end_byte)))
+        .map(|range| {
+            let verdict = if range.end_byte <= range.start_byte {
+                PartialRegionVerdict::ZeroWidth
+            } else if nameless_ranges.contains(range) {
+                PartialRegionVerdict::Nameless
+            } else {
+                ext.symbols
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.kind != SymbolKind::File
+                            && symbol.span.start_byte <= range.start_byte
+                            && range.end_byte <= symbol.span.end_byte
+                    })
+                    .min_by_key(|symbol| symbol.span.end_byte - symbol.span.start_byte)
+                    .map_or(PartialRegionVerdict::Charged, |symbol| {
+                        PartialRegionVerdict::InsideDeclaration(
+                            symbol
+                                .qualified_name
+                                .strip_prefix(ext.file_path.as_str())
+                                .and_then(|rest| rest.strip_prefix("::"))
+                                .unwrap_or(symbol.name.as_str()),
+                        )
+                    })
+            };
+            (range.clone(), verdict)
+        })
+        .collect()
+}
+
+/// Whether a partially parsed file is charged against the dead-code ceiling.
+///
+/// File-level gates first — a grammar read it, its language extracts calls,
+/// it is not vendored — then the per-region verdict. One predicate, read by
+/// the count in [`extraction_coverage`] and the sentence in
+/// [`partial_parse_reason`].
+fn partial_parse_charged(ext: &Extraction) -> bool {
+    partial_parse_file_exemption(ext).is_none() && partial_parse_erased_source(ext)
+}
+
+/// Why a partially parsed file is not charged whatever its regions hold, or
+/// `None` when its regions decide.
+///
+/// A vendored file is excluded by the rule over-limit files are charged by: a
+/// vendored grammar's `parser.c` cannot call this repository's code. A file in
+/// a language with no call extractor is already charged as `call_blind`, and
+/// charging it again would double its weight in the share.
+fn partial_parse_file_exemption(ext: &Extraction) -> Option<String> {
+    if !a_grammar_read_this_file(ext) {
+        return Some("no grammar read this file".to_string());
+    }
+    if !ext.capabilities().contains(Capability::Calls) {
+        return Some(format!(
+            "`{}` has no call extractor in this build, so the file is charged as call_blind instead",
+            ext.language
+        ));
+    }
+    if devmap_extract::wiring::is_vendored_path(&ext.file_path) {
+        return Some(
+            "the file is vendored, and a vendored file cannot call this repository's code"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Most merged error regions a `partial_parse` reason spells out.
 const PARTIAL_PARSE_RANGE_SAMPLE: usize = 8;
+
+/// `ranges` as `a..b` items, at most [`PARTIAL_PARSE_RANGE_SAMPLE`] of them and
+/// how many more when cut — both numbers, never a sample read as the whole.
+fn partial_parse_range_list(ranges: &[String]) -> String {
+    let shown = ranges.len().min(PARTIAL_PARSE_RANGE_SAMPLE);
+    let more = ranges.len() - shown;
+    format!(
+        "{}{}",
+        ranges[..shown].join(", "),
+        if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// What a partial parse lost, and which of it is charged, stated.
+///
+/// Every region is named with its verdict from [`partial_region_verdicts`]:
+/// the charged ones, then each exemption with its reason. An exempt region is
+/// listed, never dropped, so the listing still says where the tree was
+/// damaged even where the damage is judged harmless.
+fn partial_parse_reason(ext: &Extraction) -> String {
+    let error_ranges: &[TextRange] = match &ext.parse_outcome {
+        ParseOutcome::Partial { error_ranges, .. } => error_ranges,
+        _ => &[],
+    };
+    let lost = partial_parse_lost(error_ranges);
+    let verdicts = partial_region_verdicts(ext);
+    let named = |pick: &dyn Fn(&PartialRegionVerdict<'_>) -> Option<String>| -> Vec<String> {
+        verdicts
+            .iter()
+            .filter_map(|(range, verdict)| {
+                pick(verdict)
+                    .map(|suffix| format!("{}..{}{suffix}", range.start_byte, range.end_byte))
+            })
+            .collect()
+    };
+    let charged = named(&|verdict| (*verdict == PartialRegionVerdict::Charged).then(String::new));
+    let inside = named(&|verdict| match verdict {
+        PartialRegionVerdict::InsideDeclaration(name) => Some(format!(" in `{name}`")),
+        _ => None,
+    });
+    let nameless = named(&|verdict| (*verdict == PartialRegionVerdict::Nameless).then(String::new));
+    let zero_width =
+        named(&|verdict| (*verdict == PartialRegionVerdict::ZeroWidth).then(String::new));
+
+    let mut sentence = lost;
+    if !charged.is_empty() {
+        let file_exemption = partial_parse_file_exemption(ext);
+        sentence.push_str(&format!(
+            "; {}: {} region(s) outside every surviving declaration ({}){}",
+            if file_exemption.is_some() {
+                "would be charged"
+            } else {
+                "charged"
+            },
+            charged.len(),
+            partial_parse_range_list(&charged),
+            match file_exemption {
+                Some(why) => format!(", but the file is not charged: {why}"),
+                None => " — declarations and calls inside them may be absent from the graph"
+                    .to_string(),
+            }
+        ));
+    }
+    let mut exempt: Vec<String> = Vec::new();
+    if !inside.is_empty() {
+        exempt.push(format!(
+            "{} region(s) inside a surviving declaration ({})",
+            inside.len(),
+            partial_parse_range_list(&inside)
+        ));
+    }
+    if !nameless.is_empty() {
+        exempt.push(format!(
+            "{} region(s) that hold no name ({})",
+            nameless.len(),
+            partial_parse_range_list(&nameless)
+        ));
+    }
+    if !zero_width.is_empty() {
+        exempt.push(format!(
+            "{} zero-width MISSING token(s) ({})",
+            zero_width.len(),
+            partial_parse_range_list(&zero_width)
+        ));
+    }
+    if !exempt.is_empty() {
+        sentence.push_str(&format!("; not charged: {}", exempt.join(", ")));
+    }
+    sentence
+}
 
 /// The byte ranges a partial parse lost, merged and stated.
 ///
@@ -2035,7 +2595,7 @@ const PARTIAL_PARSE_RANGE_SAMPLE: usize = 8;
 /// those would claim more bytes lost than the file holds. Both numbers are
 /// given when the list is cut: a sample presented as the whole is how a hole
 /// comes to look smaller than it is.
-fn partial_parse_reason(error_ranges: &[TextRange]) -> String {
+fn partial_parse_lost(error_ranges: &[TextRange]) -> String {
     let mut ranges: Vec<(usize, usize)> = error_ranges
         .iter()
         .map(|range| (range.start_byte, range.end_byte.max(range.start_byte)))
@@ -2056,8 +2616,7 @@ fn partial_parse_reason(error_ranges: &[TextRange]) -> String {
         .collect();
     let more = merged.len().saturating_sub(shown.len());
     format!(
-        "the tree holds ERROR/MISSING nodes over {} region(s), {lost} byte(s) lost: {}{} — \
-         declarations and calls inside them are absent from the graph",
+        "the tree holds ERROR/MISSING nodes over {} region(s), {lost} byte(s) lost: {}{}",
         merged.len(),
         shown.join(", "),
         if more > 0 {
@@ -2083,18 +2642,11 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         .collect();
     // Partially parsed files whose language extracts calls: charged as blind,
     // and so not counted as covered below — one side of the partition each.
-    // Not vendored ones, by the rule over-limit files are charged by: a
-    // vendored grammar's `parser.c` cannot call this repository's code. And
-    // only those whose damage can have erased something — see
-    // `partial_parse_erased_source`.
+    // Which ones is `partial_parse_charged`'s call, the same predicate the
+    // `partial_parse` reason states its verdict from.
     let partial_with_calls: HashSet<&str> = extractions
         .iter()
-        .filter(|ext| {
-            a_grammar_read_this_file(ext)
-                && ext.capabilities().contains(Capability::Calls)
-                && !devmap_extract::wiring::is_vendored_path(&ext.file_path)
-                && partial_parse_erased_source(ext)
-        })
+        .filter(|ext| partial_parse_charged(ext))
         .map(|ext| ext.file_path.as_str())
         .collect();
     for entry in extraction_gaps(extractions) {
@@ -2307,9 +2859,9 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
 /// override, Go interface, C header, exported owner, Go build variant.
 /// Why a Kotlin or Java class is live: an Android manifest declares it as a
 /// component. Matched on the class's package-qualified name, inside the module
-/// directory the manifest governs; a name written `.Name` is relative to the
-/// module's namespace, which only the build script knows, so it matches on its
-/// suffix.
+/// directory the manifest governs; a name written `.Name`, or bare as `Name`,
+/// is relative to the module's namespace, which only the build script knows,
+/// so it matches on its suffix.
 fn android_component_reason(
     ext: &Extraction,
     sym: &ExtractedSymbol,
@@ -2333,8 +2885,14 @@ fn android_component_reason(
                 .file_path
                 .strip_prefix(module)
                 .is_some_and(|rest| rest.starts_with('/'));
+        // `.Sync` and a bare `Sync` are both relative to the namespace; only a
+        // dotted name is written out in full.
         let names_it = if name.starts_with('.') {
             qualified.ends_with(name)
+        } else if !name.contains('.') {
+            qualified
+                .strip_suffix(name)
+                .is_some_and(|head| head.ends_with('.'))
         } else {
             qualified == *name
         };
@@ -2349,6 +2907,10 @@ fn symbol_exemption_index(
     ambiguous: &HashSet<(String, String)>,
 ) -> HashMap<(String, String), String> {
     let supertypes = supertypes_by_type(resolution);
+    // Dispatch candidates are not proven reached. The direct edge to the
+    // interface method is a call, so the heritage exemption would spare every
+    // conformer and the `reached_by_dispatch` verdict would never run.
+    let dispatch_only = dispatch_only_symbols(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
@@ -2460,8 +3022,14 @@ fn symbol_exemption_index(
                 .contains(&(ext.file_path.clone(), sym.name.clone()))
                 || ambiguous.contains(&(ext.file_path.clone(), sym.qualified_name.clone()));
 
-            let heritage =
-                reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called);
+            let reached_only_by_dispatch = dispatch_only
+                .contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()));
+            let heritage = (!reached_only_by_dispatch)
+                .then(|| {
+                    reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called)
+                })
+                .flatten();
 
             let reason: Option<String> = wired
                 .get(sym.qualified_name.as_str())
@@ -2669,6 +3237,8 @@ pub fn analyze_liveness_with_coverage(
     // proportional to the rows that need it rather than to the corpus.
     let mut pending: Vec<(usize, &str, &ExtractedSymbol)> = Vec::new();
     let scopes = manifest_scopes(extractions);
+    let supertypes = supertypes_by_type(resolution);
+    let external_bases = external_supertypes(extractions, &supertypes);
 
     for ext in extractions {
         // X6: Parse-failed files must NEVER be reported as confirmed dead code
@@ -2884,6 +3454,11 @@ pub fn analyze_liveness_with_coverage(
             let unspared = !is_file_exempt && symbol_exemption.is_none() && !overlaps_parse_error;
             let identity = dead_symbol_identity(sym, &ext.file_path);
             let language = ext.code_language();
+            let dispatch_reason = (!is_called && !is_exported && unspared)
+                .then(|| {
+                    unconfirmed_dispatch_reason(ext, sym, &identity, &supertypes, &external_bases)
+                })
+                .flatten();
 
             if !is_called && is_ambiguously_called && !is_exported && unspared {
                 pending.push((reports.len(), ext.file_path.as_str(), sym));
@@ -2927,6 +3502,19 @@ pub fn analyze_liveness_with_coverage(
                     confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some(UNRESOLVED_NAMESAKE_REASON.to_string()),
+                    evidence: Some(DeadEvidence::none()),
+                });
+            } else if let Some(reason) = dispatch_reason {
+                // Something outside the graph dispatches to it by name — a
+                // library base class, or whatever an object literal is handed
+                // to. Same tier as the namesake veto, its own reason.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
+                reports.push(DeadSymbolReport {
+                    symbol_name: identity,
+                    file_path: ext.file_path.clone(),
+                    confidence: cap(0.4),
+                    is_exempt: false,
+                    exemption_reason: Some(reason),
                     evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called && !is_exported && unspared {
@@ -2974,7 +3562,7 @@ pub fn analyze_liveness_with_coverage(
                     });
                 }
             } else if let Some(proof) = (!is_called && is_exported && unspared)
-                .then(|| module_private_proof(ext, &scopes))
+                .then(|| module_private_proof(ext, sym, &scopes, &external_bases, &supertypes))
                 .flatten()
             {
                 // An export the manifest proves module-private. The keyword
@@ -3133,6 +3721,80 @@ mod tests {
         );
         assert_eq!(coverage.blind_by_language.get("python"), Some(&2));
         assert!(!coverage.is_complete());
+    }
+
+    /// The listing says which regions were charged and which were not, and
+    /// why — the same verdict the charge was decided by. Before, every
+    /// partial file read "declarations and calls inside them are absent from
+    /// the graph", including the `&raw` shape whose declaration survived and
+    /// which was never charged: an exemption the reader could not see.
+    #[test]
+    fn a_partial_parse_reason_names_each_exempt_region_and_why() {
+        let region = |start_byte: usize, end_byte: usize| TextRange {
+            start_byte,
+            end_byte,
+        };
+        let partial = |path: &str, errors: Vec<TextRange>, nameless: Vec<TextRange>| {
+            let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
+            ext.file_path = path.to_string();
+            ext.parse_outcome = ParseOutcome::Partial {
+                error_ranges: errors,
+                nameless_ranges: nameless,
+            };
+            ext
+        };
+        let reason_for = |ext: &Extraction| -> String {
+            extraction_gaps(std::slice::from_ref(ext))
+                .into_iter()
+                .find(|entry| entry.gap == ExtractionGap::PartialParse)
+                .map(|entry| entry.reason)
+                .expect("a partial file is listed")
+        };
+
+        // `def x(): pass` spans 0..13. Inside it, a stray nameless `}`
+        // outside it, a zero-width MISSING token, and one charged region.
+        let mixed = partial(
+            "src/mixed.py",
+            vec![region(4, 8), region(20, 21), region(11, 11), region(30, 40)],
+            vec![region(20, 21)],
+        );
+        let reason = reason_for(&mixed);
+        assert!(reason.contains("byte(s) lost"), "{reason}");
+        assert!(
+            reason.contains("charged: 1 region(s) outside every surviving declaration (30..40)"),
+            "{reason}"
+        );
+        assert!(
+            reason
+                .contains("not charged: 1 region(s) inside a surviving declaration (4..8 in `x`)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("1 region(s) that hold no name (20..21)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("1 zero-width MISSING token(s) (11..11)"),
+            "{reason}"
+        );
+
+        // Nothing charged: the reason must not claim anything was lost from
+        // the graph.
+        let exempt = partial("src/raw.py", vec![region(4, 8)], Vec::new());
+        let reason = reason_for(&exempt);
+        assert!(reason.contains("not charged"), "{reason}");
+        assert!(
+            !reason.contains("outside every surviving declaration"),
+            "{reason}"
+        );
+        assert!(!reason.contains("absent from the graph"), "{reason}");
+
+        // A vendored file's charged-shape region is named, and so is the
+        // reason the file as a whole is not charged.
+        let vendored = partial("vendor/lib/x.py", vec![region(30, 40)], Vec::new());
+        let reason = reason_for(&vendored);
+        assert!(reason.contains("vendored"), "{reason}");
+        assert_eq!(extraction_coverage(&[vendored]).partial_parse_files, 0);
     }
 
     fn extraction(symbols: Vec<ExtractedSymbol>, error: Option<(usize, usize)>) -> Extraction {

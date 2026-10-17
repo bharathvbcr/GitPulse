@@ -876,6 +876,52 @@ pub struct UnresolvedReference {
     /// what makes "is the `unresolved` tier really only bare names" a query
     /// instead of an instrumented rebuild.
     pub receiver: Option<String>,
+    /// Where in `source_file` the use was written, for a call or reference
+    /// the resolver read from an extraction; `None` for a route, an import, or
+    /// a row built by hand.
+    ///
+    /// The opt-in language-server pass asks a server about *this* site. It
+    /// used to find the site again by `(source_symbol, callee_name)` and take
+    /// the first match, so in `a.run(); b.run();` both rows were asked about
+    /// `a.run` and `b`'s row was given `a`'s target. Not persisted and not
+    /// serialised: a locator for the build that produced the row, not part of
+    /// the ledger's identity on disk.
+    #[serde(skip)]
+    pub site: Option<SiteBytes>,
+}
+
+/// A byte range in a source file: the in-memory locator an
+/// [`UnresolvedReference`] carries back to the site it records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SiteBytes {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl SiteBytes {
+    pub fn of(span: &Span) -> Self {
+        Self {
+            start: span.start_byte,
+            end: span.end_byte,
+        }
+    }
+}
+
+/// The glob re-export expansion stopped at its hop cap, so
+/// [`ResolutionResult::reexport_chains`] is a partial map.
+///
+/// A chain the expansion never built is absent, not wrong — the answer the map
+/// gave before globs were expanded at all — but absent from a *complete* walk
+/// and absent from a *truncated* one are different statements, and the caller
+/// must be able to tell them apart. Read with `Resolver::reexport_glob_cutoff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReexportGlobCutoff {
+    /// The most hops the expansion may hold.
+    pub limit: usize,
+    /// Hops the round that hit the cap proposed and could not insert. A lower
+    /// bound: the rounds after it never ran, so what they would have added is
+    /// not counted.
+    pub dropped_at_least: usize,
 }
 
 /// Aggregate limits for global-candidate lookup and repeated ambiguity evidence.

@@ -37,10 +37,12 @@ use std::time::{Duration, Instant};
 use devmap_extract::model::{LineIndex, Span};
 use serde::{Deserialize, Serialize};
 
+use crate::blob::BlobReader;
+use crate::budget::Budget;
 use crate::change::{
     changes_between_with_program, ChangeSet, ChangeStatus, ChangedRange, FileChange,
 };
-use crate::history::{self, resolve_blob_with_program};
+use crate::history;
 use crate::{CodeGraph, ConeEntry, GraphSymbol, Unavailable};
 
 /// How far the inbound walk goes by default.
@@ -377,6 +379,32 @@ pub fn blast_with_program<G: CodeGraph>(
     until: &str,
     depth: u32,
 ) -> BlastReport {
+    blast_bounded(
+        program,
+        repo,
+        graph,
+        since,
+        until,
+        depth,
+        &Budget::default(),
+    )
+}
+
+/// [`blast_with_program`] under a [`Budget`]: a deadline and a cancel hook
+/// for the whole analysis. A budget that runs out ends the walk over changed
+/// files and says so as [`Unavailable::BudgetExhausted`].
+#[doc(hidden)]
+pub fn blast_bounded<G: CodeGraph>(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    graph: &G,
+    since: &str,
+    until: &str,
+    depth: u32,
+    budget: &Budget,
+) -> BlastReport {
+    // One config listing per repository for the whole analysis, not one per read.
+    let _config = dc_proc::config_scope();
     let label = format!("{since}..{until}");
     let change = match changes_between_with_program(program, repo, since, until) {
         Ok(change) => change,
@@ -389,7 +417,7 @@ pub fn blast_with_program<G: CodeGraph>(
             )
         }
     };
-    blast_change_with_program(program, repo, graph, &change, &label, until, depth)
+    blast_change_bounded(program, repo, graph, &change, &label, until, depth, budget)
 }
 
 /// The analysis proper, over a change set already in hand.
@@ -408,6 +436,44 @@ pub fn blast_change_with_program<G: CodeGraph>(
     until: &str,
     depth: u32,
 ) -> BlastReport {
+    blast_change_bounded(
+        program,
+        repo,
+        graph,
+        change,
+        label,
+        until,
+        depth,
+        &Budget::default(),
+    )
+}
+
+/// [`blast_change_with_program`] under a [`Budget`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn blast_change_bounded<G: CodeGraph>(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    graph: &G,
+    change: &ChangeSet,
+    label: &str,
+    until: &str,
+    depth: u32,
+    budget: &Budget,
+) -> BlastReport {
+    // One config listing per repository for the whole analysis, not one per read.
+    let _config = dc_proc::config_scope();
+    // One reader for the whole change: the graph's own when it reads this
+    // repository through this program, so a blob it identified for its basis
+    // is not identified again, and a local one otherwise.
+    let local;
+    let blobs = match graph.blob_reader() {
+        Some(shared) if shared.reads(program, repo) => shared,
+        _ => {
+            local = BlobReader::new(program, repo);
+            &local
+        }
+    };
     let mut unavailable: Vec<Unavailable> = Vec::new();
     let mut unattributed: Vec<UnattributedChange> = Vec::new();
     // qualified name -> (file, span lines, changed lines, deletion-only so far)
@@ -420,16 +486,18 @@ pub fn blast_change_with_program<G: CodeGraph>(
         });
     }
 
-    for file in &change.files {
-        place_file(
-            program,
-            repo,
-            graph,
-            file,
-            until,
-            &mut seeds,
-            &mut unattributed,
-        );
+    let mut exhausted = false;
+    for (placed, file) in change.files.iter().enumerate() {
+        if let Err(stop) = budget.check() {
+            unavailable.push(Unavailable::BudgetExhausted {
+                reason: stop.describe(),
+                completed: placed,
+                total: change.files.len(),
+            });
+            exhausted = true;
+            break;
+        }
+        place_file(blobs, graph, file, until, &mut seeds, &mut unattributed);
     }
 
     // Every unattributed range means the walk started from fewer places than
@@ -516,13 +584,20 @@ pub fn blast_change_with_program<G: CodeGraph>(
         tests_incomplete,
     );
 
-    let (owners, owner_gaps) = owners_for_paths_with_program(
-        program,
-        repo,
-        &owner_paths(&change.files),
-        OWNER_COMMIT_CAP,
-        OWNER_DEADLINE,
-    );
+    // An analysis that ran out of budget does not start another read; the
+    // exhaustion is already named and owners are one more list it did not
+    // reach.
+    let (owners, owner_gaps) = if exhausted {
+        (Vec::new(), Vec::new())
+    } else {
+        owners_for_paths_with_program(
+            program,
+            repo,
+            &owner_paths(&change.files),
+            OWNER_COMMIT_CAP,
+            OWNER_DEADLINE.min(budget.remaining()),
+        )
+    };
     unavailable.extend(owner_gaps);
 
     BlastReport::new(
@@ -541,8 +616,7 @@ pub fn blast_change_with_program<G: CodeGraph>(
 
 /// Place one file's changed ranges into the symbols that span them.
 fn place_file<G: CodeGraph>(
-    program: &std::ffi::OsStr,
-    repo: &Path,
+    blobs: &BlobReader,
     graph: &G,
     file: &FileChange,
     until: &str,
@@ -567,6 +641,18 @@ fn place_file<G: CodeGraph>(
         });
         return;
     }
+    if let ChangeStatus::Unreadable { reason } = &file.status {
+        // Refused alone: the files beside this one are still placed.
+        unattributed.push(UnattributedChange {
+            path: file.path.clone(),
+            start_line: 0,
+            end_line: 0,
+            reason: UnattributedReason::ContentUnavailable {
+                reason: reason.clone(),
+            },
+        });
+        return;
+    }
     if file.ranges.is_empty() {
         // A mode-only change, or a rename with no edits. Nothing changed
         // inside the content, so there is nothing to place and nothing
@@ -585,7 +671,7 @@ fn place_file<G: CodeGraph>(
         return;
     }
 
-    let resolved = match resolve_blob_with_program(program, repo, until, &file.path) {
+    let resolved = match blobs.read(until, &file.path) {
         Ok(resolved) => resolved,
         Err(refusal) => {
             push_all(

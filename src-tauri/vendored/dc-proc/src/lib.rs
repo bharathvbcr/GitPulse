@@ -63,6 +63,8 @@
 //! two fingerprints, churn reports `computed: false` with the reason. Each
 //! caller keeps its contract and gains the bounds.
 
+pub mod diskio;
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
@@ -493,6 +495,7 @@ const REPOSITORY_CONFIG_PATTERN: &str =
     "^(filter\\.|extensions\\.partialclone$|remote\\..*\\.(promisor|partialclonefilter)$)";
 
 /// What the guards need from the repository's config.
+#[derive(Clone)]
 struct RepositoryConfig {
     /// `-c` arguments neutralizing the repository's filter drivers.
     filters: Vec<String>,
@@ -508,7 +511,7 @@ struct RepositoryConfig {
 /// repository's config is read first (reading config runs nothing). A root
 /// git cannot enter has no repository config to neutralize; the read that
 /// follows reports the root itself.
-fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
+fn probe_repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
     let program = git.display().to_string();
     let mut command = Command::new(git);
     command.arg("-C").arg(root).args([
@@ -559,6 +562,113 @@ fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failur
         filters: filter_overrides(&captured.stdout).map_err(refuse)?,
         partial_clone: is_partial_clone(&captured.stdout),
     })
+}
+
+/// What one operation remembers about the repositories it reads: their
+/// config listings, keyed by the git that listed them and the root it listed.
+///
+/// An operation — one `blast`, one `suspects`, one verify — runs dozens of git
+/// reads against one repository, and each non-trivial read began by spawning
+/// `git config` for the same answer. Opening a [`config_scope`] makes the
+/// listing once per root for as long as the scope lives, on the thread that
+/// opened it. Nothing outlives the operation: a config edited between two
+/// operations is read afresh by the second, and inside one the entry is also
+/// dropped when the repository's own `config` file changes size, modification
+/// time or inode.
+#[derive(Default)]
+struct ConfigScope {
+    entries: std::collections::HashMap<(PathBuf, PathBuf), (ConfigStamp, RepositoryConfig)>,
+}
+
+/// Entries one scope keeps; an operation reading more roots than this reads
+/// the rest uncached.
+const CONFIG_SCOPE_ENTRIES: usize = 32;
+
+/// What a config file looked like when it was listed.
+type ConfigStamp = (u64, Option<std::time::SystemTime>, u64);
+
+thread_local! {
+    static CONFIG_SCOPE: std::cell::RefCell<Option<ConfigScope>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Guard returned by [`config_scope`]; dropping it ends the scope.
+#[must_use = "the scope ends when this is dropped"]
+pub struct ConfigScopeGuard {
+    /// False for a scope opened inside another, which leaves the outer one's
+    /// entries and lifetime alone.
+    owner: bool,
+}
+
+impl Drop for ConfigScopeGuard {
+    fn drop(&mut self) {
+        if self.owner {
+            CONFIG_SCOPE.with(|scope| *scope.borrow_mut() = None);
+        }
+    }
+}
+
+/// Opens an operation scope on this thread: until the guard drops, every
+/// [`git_with_program`] lists a repository's filter and promisor config once.
+/// Nested scopes share the outermost one.
+pub fn config_scope() -> ConfigScopeGuard {
+    let owner = CONFIG_SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        if scope.is_some() {
+            false
+        } else {
+            *scope = Some(ConfigScope::default());
+            true
+        }
+    });
+    ConfigScopeGuard { owner }
+}
+
+/// The stamp of `root`'s repository config, or `None` when it cannot be read
+/// as one file (a worktree's `.git` is a file pointing elsewhere); such a
+/// repository is listed every time rather than cached on a guess.
+fn config_stamp(root: &Path) -> Option<(PathBuf, ConfigStamp)> {
+    let top = repository_top(root).ok()?;
+    let meta = std::fs::metadata(top.join(".git").join("config")).ok()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some((top, (meta.len(), meta.modified().ok(), inode)))
+}
+
+/// The repository's filter and partial-clone config, from the open
+/// [`config_scope`] when there is one and its entry is current.
+fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
+    let scoped = CONFIG_SCOPE.with(|scope| scope.borrow().is_some());
+    let stamp = if scoped { config_stamp(root) } else { None };
+    let key = stamp
+        .as_ref()
+        .map(|(top, _)| (git.to_path_buf(), top.clone()));
+    if let (Some(key), Some((_, stamp))) = (&key, &stamp) {
+        let hit = CONFIG_SCOPE.with(|scope| {
+            scope
+                .borrow()
+                .as_ref()
+                .and_then(|scope| scope.entries.get(key))
+                .filter(|(held, _)| held == stamp)
+                .map(|(_, config)| config.clone())
+        });
+        if let Some(config) = hit {
+            return Ok(config);
+        }
+    }
+    let fresh = probe_repository_config(git, root)?;
+    if let (Some(key), Some((_, stamp))) = (key, stamp) {
+        CONFIG_SCOPE.with(|scope| {
+            if let Some(scope) = scope.borrow_mut().as_mut()
+                && (scope.entries.len() < CONFIG_SCOPE_ENTRIES || scope.entries.contains_key(&key))
+            {
+                scope.entries.insert(key, (stamp, fresh.clone()));
+            }
+        });
+    }
+    Ok(fresh)
 }
 
 /// Whether a `--show-scope -z` listing names a promisor:

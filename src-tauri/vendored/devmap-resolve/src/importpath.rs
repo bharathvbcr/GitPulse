@@ -356,6 +356,65 @@ pub fn module_candidates(
     out
 }
 
+/// Candidate paths for a JVM import under the importing file's own Gradle
+/// source set, then its module's `main` set:
+/// `<module>/src/<set>/{java,kotlin}/<spec>.<ext>`.
+///
+/// The set is read off the importer's own path, so it covers what no fixed
+/// list can: a product flavor (`src/free/kotlin`), a build type
+/// (`src/debug/java`), a flavor's test set (`src/testFree/kotlin`), in a
+/// module `settings.gradle` names or not. Flavors are read from the tree, not
+/// from `productFlavors { }`, which is build-script code. Tried before any
+/// repository-level root because a variant compiles exactly its own set plus
+/// `main`: a `free` file importing `fl.pricing.Tier` means the `free` Tier,
+/// never the `paid` one that shares its package and name.
+pub fn source_set_candidates(
+    rule: &ImportPathRule,
+    importing_file: &str,
+    specifier: &str,
+) -> Vec<String> {
+    let spec = specifier.trim().trim_matches(|c| c == '"' || c == '\'');
+    if spec.is_empty() || is_relative_specifier(spec) {
+        return Vec::new();
+    }
+    let components: Vec<&str> = importing_file.split('/').collect();
+    let Some(at) = (0..components.len().saturating_sub(3))
+        .rev()
+        .find(|&index| {
+            components[index] == "src"
+                && !components[index + 1].is_empty()
+                && matches!(components[index + 2], "java" | "kotlin")
+        })
+    else {
+        return Vec::new();
+    };
+    let module = components[..at].join("/");
+    let own_set = components[at + 1];
+    let form = spec.replace(rule.separator, "/");
+    let mut out: Vec<String> = Vec::new();
+    let sets: &[&str] = if own_set == "main" {
+        &["main"]
+    } else {
+        &[own_set, "main"]
+    };
+    for set in sets {
+        for language in ["java", "kotlin"] {
+            for extension in rule.extensions {
+                if out.len() >= MAX_CANDIDATES_PER_SPECIFIER {
+                    return out;
+                }
+                let rooted = format!("src/{set}/{language}/{form}{extension}");
+                out.push(if module.is_empty() {
+                    rooted
+                } else {
+                    format!("{module}/{rooted}")
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Strip a Dart `package:<name>/` prefix, which names a pubspec package rather
 /// than a directory. The remainder is `lib`-relative, which the Dart row's
 /// roots already carry.

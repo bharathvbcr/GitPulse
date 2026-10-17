@@ -32,8 +32,9 @@ pub const MAX_PDG_NESTING_DEPTH: usize = 64;
 
 /// Most statements one function's PDG may hold, counting every nesting level.
 ///
-/// Breadth is a ceiling for a different reason than depth: every statement
-/// becomes a CFG node, and both fixpoints below sweep every node on every pass,
+/// Breadth is a ceiling for a different reason than depth: every statement and
+/// every `elif` test becomes a CFG node (plus at most one exception dispatch
+/// per `try`), and both fixpoints below sweep every node on every pass,
 /// so the build is quadratic in this number. Measured on the debug profile with
 /// a def-use chain — the worst shape — 800 statements took 1.3 s and the cost
 /// grows with the square, which is why this sits at 2,000 and not higher. A
@@ -51,6 +52,11 @@ pub enum CfgNodeKind {
     Try,
     Return,
     Raise,
+    /// Where an exception raised anywhere in a `try` body goes: to each
+    /// handler, and — because a typed `except` may not match — onward through
+    /// the `finally` or out of the function. One node per `try`, so the edge
+    /// count stays linear in the body rather than body × handlers.
+    ExceptionDispatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,11 +110,37 @@ pub struct PdgStatement {
     pub kind: PdgStatementKind,
 }
 
+/// One `elif` of a [`PdgStatementKind::Branch`]: its condition's facts and the
+/// body it guards.
+///
+/// An `elif` is a branch in the false arm of the one before it, but it is not
+/// one nesting level deeper in the program, and modelling it as a nested
+/// `Branch` made a 64-arm chain hit [`MAX_PDG_NESTING_DEPTH`] — the cap that
+/// exists for hostile nesting, refusing ordinary dispatch code. The arms are
+/// walked iteratively, so a chain costs statements against
+/// [`MAX_PDG_STATEMENTS`], never depth.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElifArm {
+    pub line: u32,
+    #[serde(default)]
+    pub definitions: Vec<String>,
+    #[serde(default)]
+    pub uses: Vec<String>,
+    /// Same contract as [`PdgStatement::taint_sinks`]: each is also a use.
+    #[serde(default)]
+    pub taint_sinks: Vec<String>,
+    pub body: Vec<PdgStatement>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PdgStatementKind {
     Basic,
+    /// `if`, its `elif` arms in source order, and the `else`. The false edge of
+    /// each test enters the next arm's test; the last one's enters `else_body`.
     Branch {
         then_body: Vec<PdgStatement>,
+        #[serde(default)]
+        elif_arms: Vec<ElifArm>,
         else_body: Vec<PdgStatement>,
     },
     Loop {
@@ -123,6 +155,57 @@ pub enum PdgStatementKind {
     Raise,
 }
 
+impl FunctionPdgInput {
+    /// Every `(line, variable)` a sink consumes, anywhere in the body, sorted
+    /// by line and without duplicates.
+    ///
+    /// Walked with an explicit stack: the input is untrusted, and this is
+    /// callable before [`build_function_pdg`] has validated its depth.
+    pub fn taint_sinks(&self) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        let mut pending: Vec<&[PdgStatement]> = vec![&self.body];
+        while let Some(statements) = pending.pop() {
+            for statement in statements {
+                for sink in &statement.taint_sinks {
+                    out.push((statement.line, sink.clone()));
+                }
+                match &statement.kind {
+                    PdgStatementKind::Branch {
+                        then_body,
+                        elif_arms,
+                        else_body,
+                    } => {
+                        pending.push(then_body);
+                        for arm in elif_arms {
+                            for sink in &arm.taint_sinks {
+                                out.push((arm.line, sink.clone()));
+                            }
+                            pending.push(&arm.body);
+                        }
+                        pending.push(else_body);
+                    }
+                    PdgStatementKind::Loop { body } => pending.push(body),
+                    PdgStatementKind::Try {
+                        body,
+                        handlers,
+                        finally_body,
+                    } => {
+                        pending.push(body);
+                        pending.extend(handlers.iter().map(Vec::as_slice));
+                        pending.push(finally_body);
+                    }
+                    PdgStatementKind::Basic
+                    | PdgStatementKind::Return
+                    | PdgStatementKind::Raise => {}
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct NodeFacts {
     definitions: BTreeSet<String>,
@@ -130,10 +213,42 @@ struct NodeFacts {
     sinks: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Incoming {
     node: String,
     edge_kind: &'static str,
+}
+
+/// Where control goes once a statement list is done with it.
+#[derive(Debug, Default)]
+struct Flow {
+    /// Edges that fall through to whatever follows the list.
+    normal: Vec<Incoming>,
+    /// Edges that leave the function: a `return`, a `raise`, an exception no
+    /// handler took. They are carried outward rather than wired to exit where
+    /// they occur, because on the way out they run every `finally` that
+    /// encloses them — wiring them straight to exit is what left a `finally`
+    /// off every terminating path, and with no node at all when every path
+    /// into it terminated.
+    abrupt: Vec<Incoming>,
+}
+
+impl Flow {
+    fn absorb(&mut self, other: Flow) {
+        self.normal.extend(other.normal);
+        self.abrupt.extend(other.abrupt);
+    }
+
+    /// Duplicate `(node, edge kind)` pairs add nothing but work: the edges
+    /// they produce are deduplicated at the end anyway. Without this, a `try`
+    /// with many empty handlers would hand the next statement the same
+    /// predecessor once per handler.
+    fn dedup(&mut self) {
+        self.normal.sort();
+        self.normal.dedup();
+        self.abrupt.sort();
+        self.abrupt.dedup();
+    }
 }
 
 struct PdgBuilder<'a> {
@@ -142,6 +257,9 @@ struct PdgBuilder<'a> {
     facts: BTreeMap<String, NodeFacts>,
     edges: Vec<PdgEdge>,
     next_node: usize,
+    /// Every statement node in creation order, so a `try` can name the nodes
+    /// its body created — each one a point an exception can leave from.
+    created: Vec<String>,
     entry: String,
     exit: String,
 }
@@ -156,6 +274,7 @@ impl<'a> PdgBuilder<'a> {
             facts: BTreeMap::new(),
             edges: Vec::new(),
             next_node: 0,
+            created: Vec::new(),
             entry: entry.clone(),
             exit: exit.clone(),
         };
@@ -198,6 +317,24 @@ impl<'a> PdgBuilder<'a> {
         });
     }
 
+    fn add_node(&mut self, line: u32, kind: CfgNodeKind, facts: NodeFacts) -> String {
+        let id = format!("{}:{}:n{}", self.input.function_name, line, self.next_node);
+        self.next_node += 1;
+        self.nodes.insert(
+            id.clone(),
+            CfgNode {
+                id: id.clone(),
+                kind,
+                symbol: self.input.function_name.clone(),
+                leader_line: line,
+                line_range: (line, line),
+            },
+        );
+        self.facts.insert(id.clone(), facts);
+        self.created.push(id.clone());
+        id
+    }
+
     fn add_statement_node(&mut self, statement: &PdgStatement) -> String {
         let kind = match statement.kind {
             PdgStatementKind::Basic => CfgNodeKind::Block,
@@ -207,30 +344,12 @@ impl<'a> PdgBuilder<'a> {
             PdgStatementKind::Return => CfgNodeKind::Return,
             PdgStatementKind::Raise => CfgNodeKind::Raise,
         };
-        let id = format!(
-            "{}:{}:n{}",
-            self.input.function_name, statement.line, self.next_node
+        let facts = node_facts(
+            &statement.definitions,
+            &statement.uses,
+            &statement.taint_sinks,
         );
-        self.next_node += 1;
-        self.nodes.insert(
-            id.clone(),
-            CfgNode {
-                id: id.clone(),
-                kind,
-                symbol: self.input.function_name.clone(),
-                leader_line: statement.line,
-                line_range: (statement.line, statement.line),
-            },
-        );
-        self.facts.insert(
-            id.clone(),
-            NodeFacts {
-                definitions: statement.definitions.iter().cloned().collect(),
-                uses: statement.uses.iter().cloned().collect(),
-                sinks: statement.taint_sinks.iter().cloned().collect(),
-            },
-        );
-        id
+        self.add_node(statement.line, kind, facts)
     }
 
     /// Thread the CFG for one statement list.
@@ -242,73 +361,94 @@ impl<'a> PdgBuilder<'a> {
     /// aborting the process again. Exceeding it is an error, never a shorter
     /// graph — a CFG missing the body of a loop is not a smaller answer, it is
     /// a wrong one.
+    ///
+    /// A statement after one every path out of which terminates gets no node:
+    /// nothing reaches it. Terminating paths are returned in [`Flow::abrupt`]
+    /// for the enclosing `try` or [`Self::finish`] to route.
     fn build_sequence(
         &mut self,
         statements: &[PdgStatement],
-        mut incoming: Vec<Incoming>,
+        incoming: Vec<Incoming>,
         depth: usize,
-    ) -> anyhow::Result<Vec<Incoming>> {
+    ) -> anyhow::Result<Flow> {
         if depth > MAX_PDG_NESTING_DEPTH {
             anyhow::bail!(
                 "PDG statement nesting exceeds the {MAX_PDG_NESTING_DEPTH}-level depth cap"
             );
         }
+        let mut flow = Flow {
+            normal: incoming,
+            abrupt: Vec::new(),
+        };
         for statement in statements {
-            if incoming.is_empty() {
+            if flow.normal.is_empty() {
                 break;
             }
             let node = self.add_statement_node(statement);
-            for source in &incoming {
+            for source in &flow.normal {
                 self.add_control(&source.node, &node, source.edge_kind);
             }
             let inner = depth + 1;
-            incoming = match &statement.kind {
-                PdgStatementKind::Basic => vec![Incoming {
-                    node,
-                    edge_kind: "control:fallthrough",
-                }],
-                PdgStatementKind::Return | PdgStatementKind::Raise => {
-                    self.add_control(&node, &self.exit.clone(), "control:terminate");
-                    Vec::new()
-                }
+            let after = match &statement.kind {
+                PdgStatementKind::Basic => Flow {
+                    normal: vec![Incoming {
+                        node,
+                        edge_kind: "control:fallthrough",
+                    }],
+                    abrupt: Vec::new(),
+                },
+                PdgStatementKind::Return | PdgStatementKind::Raise => Flow {
+                    normal: Vec::new(),
+                    abrupt: vec![Incoming {
+                        node,
+                        edge_kind: "control:terminate",
+                    }],
+                },
                 PdgStatementKind::Branch {
                     then_body,
+                    elif_arms,
                     else_body,
                 } => {
-                    let then_exits = if then_body.is_empty() {
+                    let mut out = self.build_sequence(
+                        then_body,
                         vec![Incoming {
                             node: node.clone(),
                             edge_kind: "control:true",
-                        }]
-                    } else {
-                        self.build_sequence(
-                            then_body,
+                        }],
+                        inner,
+                    )?;
+                    // Each arm's test hangs off the false edge of the one
+                    // before it, at this same depth: an `elif` chain is long,
+                    // not deep.
+                    let mut otherwise = Incoming {
+                        node,
+                        edge_kind: "control:false",
+                    };
+                    for arm in elif_arms {
+                        let test = self.add_node(
+                            arm.line,
+                            CfgNodeKind::Branch,
+                            node_facts(&arm.definitions, &arm.uses, &arm.taint_sinks),
+                        );
+                        self.add_control(&otherwise.node, &test, otherwise.edge_kind);
+                        out.absorb(self.build_sequence(
+                            &arm.body,
                             vec![Incoming {
-                                node: node.clone(),
+                                node: test.clone(),
                                 edge_kind: "control:true",
                             }],
                             inner,
-                        )?
-                    };
-                    let else_exits = if else_body.is_empty() {
-                        vec![Incoming {
-                            node,
+                        )?);
+                        otherwise = Incoming {
+                            node: test,
                             edge_kind: "control:false",
-                        }]
-                    } else {
-                        self.build_sequence(
-                            else_body,
-                            vec![Incoming {
-                                node,
-                                edge_kind: "control:false",
-                            }],
-                            inner,
-                        )?
-                    };
-                    then_exits.into_iter().chain(else_exits).collect()
+                        };
+                    }
+                    out.absorb(self.build_sequence(else_body, vec![otherwise], inner)?);
+                    out
                 }
                 PdgStatementKind::Loop { body } => {
-                    let body_exits = self.build_sequence(
+                    let body_flow = self.build_sequence(
                         body,
                         vec![Incoming {
                             node: node.clone(),
@@ -316,53 +456,124 @@ impl<'a> PdgBuilder<'a> {
                         }],
                         inner,
                     )?;
-                    for tail in body_exits {
+                    for tail in body_flow.normal {
                         self.add_control(&tail.node, &node, "control:loop");
                     }
-                    vec![Incoming {
-                        node,
-                        edge_kind: "control:false",
-                    }]
+                    Flow {
+                        normal: vec![Incoming {
+                            node,
+                            edge_kind: "control:false",
+                        }],
+                        abrupt: body_flow.abrupt,
+                    }
                 }
                 PdgStatementKind::Try {
                     body,
                     handlers,
                     finally_body,
-                } => {
-                    let mut exits = self.build_sequence(
-                        body,
-                        vec![Incoming {
-                            node: node.clone(),
-                            edge_kind: "control:try",
-                        }],
-                        inner,
-                    )?;
-                    for handler in handlers {
-                        exits.extend(self.build_sequence(
-                            handler,
-                            vec![Incoming {
-                                node: node.clone(),
-                                edge_kind: "control:exception",
-                            }],
-                            inner,
-                        )?);
-                    }
-                    if finally_body.is_empty() {
-                        exits
-                    } else {
-                        for incoming in &mut exits {
-                            incoming.edge_kind = "control:finally";
-                        }
-                        self.build_sequence(finally_body, exits, inner)?
-                    }
-                }
+                } => self.build_try(statement.line, node, body, handlers, finally_body, inner)?,
             };
+            flow.normal = after.normal;
+            flow.abrupt.extend(after.abrupt);
         }
-        Ok(incoming)
+        flow.dedup();
+        Ok(flow)
+    }
+
+    /// `try` / `except` / `finally`.
+    ///
+    /// * The header enters the body, and enters each handler directly.
+    /// * Every node the body creates — nested ones included — has an
+    ///   exception edge to one [`CfgNodeKind::ExceptionDispatch`] node, which
+    ///   enters each handler. That is what lets a definition made in the body
+    ///   reach a use in a handler; a single edge from the header never could.
+    /// * The dispatch also leaves abruptly, because a typed `except` may not
+    ///   match.
+    /// * The `finally` is entered by everything that leaves the body and the
+    ///   handlers, normal and abrupt alike. Its tail continues normally if
+    ///   anything entered normally, and continues outward (to an enclosing
+    ///   `finally`, then exit) if anything entered abruptly.
+    fn build_try(
+        &mut self,
+        line: u32,
+        header: String,
+        body: &[PdgStatement],
+        handlers: &[Vec<PdgStatement>],
+        finally_body: &[PdgStatement],
+        inner: usize,
+    ) -> anyhow::Result<Flow> {
+        let first_body_node = self.created.len();
+        let mut out = self.build_sequence(
+            body,
+            vec![Incoming {
+                node: header.clone(),
+                edge_kind: "control:try",
+            }],
+            inner,
+        )?;
+        if handlers.is_empty() && finally_body.is_empty() {
+            return Ok(out);
+        }
+        let raisers = self.created[first_body_node..].to_vec();
+        let dispatch = self.add_node(line, CfgNodeKind::ExceptionDispatch, NodeFacts::default());
+        for raiser in &raisers {
+            self.add_control(raiser, &dispatch, "control:exception");
+        }
+        for handler in handlers {
+            out.absorb(self.build_sequence(
+                handler,
+                vec![
+                    Incoming {
+                        node: header.clone(),
+                        edge_kind: "control:exception",
+                    },
+                    Incoming {
+                        node: dispatch.clone(),
+                        edge_kind: "control:exception",
+                    },
+                ],
+                inner,
+            )?);
+        }
+        out.abrupt.push(Incoming {
+            node: dispatch,
+            edge_kind: "control:unhandled",
+        });
+        if finally_body.is_empty() {
+            return Ok(out);
+        }
+        let entered_normally = !out.normal.is_empty();
+        let entered_abruptly = !out.abrupt.is_empty();
+        let entry = out
+            .normal
+            .into_iter()
+            .chain(out.abrupt)
+            .map(|source| Incoming {
+                node: source.node,
+                edge_kind: "control:finally",
+            })
+            .collect();
+        let finally = self.build_sequence(finally_body, entry, inner)?;
+        let mut result = Flow {
+            normal: Vec::new(),
+            abrupt: finally.abrupt,
+        };
+        if entered_abruptly {
+            result
+                .abrupt
+                .extend(finally.normal.iter().map(|tail| Incoming {
+                    node: tail.node.clone(),
+                    edge_kind: "control:terminate",
+                }));
+        }
+        if entered_normally {
+            result.normal = finally.normal;
+        }
+        Ok(result)
     }
 
     fn finish(mut self) -> anyhow::Result<FunctionPdg> {
-        let tails = self.build_sequence(
+        let flow = self.build_sequence(
             &self.input.body,
             vec![Incoming {
                 node: self.entry.clone(),
@@ -370,7 +581,7 @@ impl<'a> PdgBuilder<'a> {
             }],
             0,
         )?;
-        for tail in tails {
+        for tail in flow.normal.into_iter().chain(flow.abrupt) {
             self.add_control(&tail.node, &self.exit.clone(), tail.edge_kind);
         }
         self.add_data_edges()?;
@@ -552,6 +763,14 @@ impl<'a> PdgBuilder<'a> {
     }
 }
 
+fn node_facts(definitions: &[String], uses: &[String], sinks: &[String]) -> NodeFacts {
+    NodeFacts {
+        definitions: definitions.iter().cloned().collect(),
+        uses: uses.iter().cloned().collect(),
+        sinks: sinks.iter().cloned().collect(),
+    }
+}
+
 fn merge_definitions(
     destination: &mut BTreeMap<String, BTreeSet<(String, u32)>>,
     source: &BTreeMap<String, BTreeSet<(String, u32)>>,
@@ -614,42 +833,36 @@ fn validate_statements(
     }
     let inner = depth + 1;
     for statement in statements {
-        let Some(remaining) = budget.statements.checked_sub(1) else {
-            anyhow::bail!(
-                "PDG function exceeds the {MAX_PDG_STATEMENTS}-statement cap; \
-                 the graph is refused rather than built from part of the function"
-            );
-        };
-        budget.statements = remaining;
-        if !(start_line..=end_line).contains(&statement.line) {
-            anyhow::bail!(
-                "PDG statement line {} is outside the function",
-                statement.line
-            );
-        }
-        let uses: BTreeSet<_> = statement.uses.iter().collect();
-        if statement
-            .definitions
-            .iter()
-            .chain(&statement.uses)
-            .chain(&statement.taint_sinks)
-            .any(|variable| variable.trim().is_empty())
-        {
-            anyhow::bail!("PDG variables must not be empty");
-        }
-        if statement
-            .taint_sinks
-            .iter()
-            .any(|sink| !uses.contains(sink))
-        {
-            anyhow::bail!("every PDG taint sink must be an exact statement use");
-        }
+        validate_point(
+            statement.line,
+            &statement.definitions,
+            &statement.uses,
+            &statement.taint_sinks,
+            start_line,
+            end_line,
+            budget,
+        )?;
         match &statement.kind {
             PdgStatementKind::Branch {
                 then_body,
+                elif_arms,
                 else_body,
             } => {
                 validate_statements(then_body, start_line, end_line, inner, budget)?;
+                // Iterated, not recursed: each arm costs one statement of the
+                // budget and its body is one level in, like `then_body`.
+                for arm in elif_arms {
+                    validate_point(
+                        arm.line,
+                        &arm.definitions,
+                        &arm.uses,
+                        &arm.taint_sinks,
+                        start_line,
+                        end_line,
+                        budget,
+                    )?;
+                    validate_statements(&arm.body, start_line, end_line, inner, budget)?;
+                }
                 validate_statements(else_body, start_line, end_line, inner, budget)?;
             }
             PdgStatementKind::Loop { body } => {
@@ -668,6 +881,43 @@ fn validate_statements(
             }
             PdgStatementKind::Basic | PdgStatementKind::Return | PdgStatementKind::Raise => {}
         }
+    }
+    Ok(())
+}
+
+/// The checks every CFG point carries — a statement or an `elif` test: one
+/// statement of the budget, a line inside the function, non-empty variables,
+/// and every sink an exact use.
+fn validate_point(
+    line: u32,
+    definitions: &[String],
+    uses: &[String],
+    taint_sinks: &[String],
+    start_line: u32,
+    end_line: u32,
+    budget: &mut Budget,
+) -> anyhow::Result<()> {
+    let Some(remaining) = budget.statements.checked_sub(1) else {
+        anyhow::bail!(
+            "PDG function exceeds the {MAX_PDG_STATEMENTS}-statement cap; \
+             the graph is refused rather than built from part of the function"
+        );
+    };
+    budget.statements = remaining;
+    if !(start_line..=end_line).contains(&line) {
+        anyhow::bail!("PDG statement line {line} is outside the function");
+    }
+    if definitions
+        .iter()
+        .chain(uses)
+        .chain(taint_sinks)
+        .any(|variable| variable.trim().is_empty())
+    {
+        anyhow::bail!("PDG variables must not be empty");
+    }
+    let uses: BTreeSet<_> = uses.iter().collect();
+    if taint_sinks.iter().any(|sink| !uses.contains(sink)) {
+        anyhow::bail!("every PDG taint sink must be an exact statement use");
     }
     Ok(())
 }
@@ -726,6 +976,7 @@ mod tests {
                             &["arg"],
                             PdgStatementKind::Basic,
                         )],
+                        elif_arms: Vec::new(),
                         else_body: vec![statement(13, &["value"], &[], PdgStatementKind::Basic)],
                     },
                 ),
@@ -779,12 +1030,27 @@ mod tests {
                     && edge.edge_kind == kind
             }));
         }
+        // The raise is inside a `try` with a `finally`, so it leaves through
+        // the finally (line 19) and the finally's tail carries it to exit.
+        // This used to assert a raise → exit edge that bypassed the finally,
+        // which is the defect devmap-query-01 names: a finally never on a
+        // terminating path.
         let raise = node_at(&pdg, 18);
+        let finally = node_at(&pdg, 19);
         assert!(pdg.edges.iter().any(|edge| {
             edge.source_node == raise
+                && edge.target_node == finally
+                && edge.edge_kind == "control:finally"
+        }));
+        assert!(pdg.edges.iter().any(|edge| {
+            edge.source_node == finally
                 && edge.target_node == "process:exit"
                 && edge.edge_kind == "control:terminate"
         }));
+        assert!(!pdg
+            .edges
+            .iter()
+            .any(|edge| { edge.source_node == raise && edge.target_node == "process:exit" }));
     }
 
     #[test]
@@ -836,6 +1102,148 @@ mod tests {
                 && edge.edge_kind == "taint"
                 && edge.variable.as_deref() == Some("value_extra")
         }));
+    }
+
+    fn has_edge(pdg: &FunctionPdg, source: &str, target: &str, kind: &str) -> bool {
+        pdg.edges.iter().any(|edge| {
+            edge.source_node == source && edge.target_node == target && edge.edge_kind == kind
+        })
+    }
+
+    fn sink(line: u32, variable: &str) -> PdgStatement {
+        let mut statement = statement(line, &[], &[variable], PdgStatementKind::Basic);
+        statement.taint_sinks = vec![variable.to_string()];
+        statement
+    }
+
+    fn function(params: &[&str], body: Vec<PdgStatement>) -> FunctionPdgInput {
+        FunctionPdgInput {
+            function_name: "f".into(),
+            generation_id: 1,
+            content_hash: 2,
+            start_line: 1,
+            end_line: 40,
+            params: params.iter().map(|value| (*value).to_string()).collect(),
+            body,
+        }
+    }
+
+    /// devmap-query-01: `try: return` / `finally: sink(arg)`. The finally runs
+    /// on the way out of the return, so it must get a node, a taint edge, a
+    /// control edge from the return, and a path to exit.
+    #[test]
+    fn finally_runs_on_the_path_out_of_a_return_or_raise() {
+        let input = function(
+            &["arg"],
+            vec![statement(
+                2,
+                &[],
+                &[],
+                PdgStatementKind::Try {
+                    body: vec![statement(3, &[], &["arg"], PdgStatementKind::Return)],
+                    handlers: vec![vec![statement(5, &[], &["arg"], PdgStatementKind::Raise)]],
+                    finally_body: vec![sink(7, "arg")],
+                },
+            )],
+        );
+        let pdg = build_function_pdg(&input).unwrap();
+        let finally = node_at(&pdg, 7).to_string();
+        let ret = node_at(&pdg, 3).to_string();
+        let raise = node_at(&pdg, 5).to_string();
+        assert!(
+            has_edge(&pdg, &ret, &finally, "control:finally"),
+            "{:#?}",
+            pdg.edges
+        );
+        assert!(has_edge(&pdg, &raise, &finally, "control:finally"));
+        assert!(
+            has_edge(&pdg, &finally, "f:exit", "control:terminate"),
+            "the finally tail must reach exit: {:#?}",
+            pdg.edges
+        );
+        // Neither terminator bypasses the finally on its way out.
+        assert!(!has_edge(&pdg, &ret, "f:exit", "control:terminate"));
+        assert!(!has_edge(&pdg, &raise, "f:exit", "control:terminate"));
+        assert!(pdg.edges.iter().any(|edge| {
+            edge.target_node == finally
+                && edge.edge_kind == "taint"
+                && edge.variable.as_deref() == Some("arg")
+        }));
+    }
+
+    #[test]
+    fn statements_after_a_return_in_a_plain_sequence_are_not_emitted() {
+        let input = function(
+            &["arg"],
+            vec![
+                statement(2, &[], &["arg"], PdgStatementKind::Return),
+                sink(3, "arg"),
+            ],
+        );
+        let pdg = build_function_pdg(&input).unwrap();
+        assert!(!pdg.nodes.values().any(|node| node.leader_line == 3));
+        let ret = node_at(&pdg, 2);
+        assert!(has_edge(&pdg, ret, "f:exit", "control:terminate"));
+    }
+
+    /// devmap-query-02: an exception can leave the try body after any of its
+    /// statements, so a definition made there reaches the handler.
+    #[test]
+    fn a_try_body_definition_reaches_a_handler_use() {
+        let input = function(
+            &["arg"],
+            vec![statement(
+                2,
+                &[],
+                &[],
+                PdgStatementKind::Try {
+                    body: vec![
+                        statement(3, &["value"], &["arg"], PdgStatementKind::Basic),
+                        statement(4, &[], &["value"], PdgStatementKind::Basic),
+                    ],
+                    handlers: vec![vec![sink(6, "value")]],
+                    finally_body: Vec::new(),
+                },
+            )],
+        );
+        let pdg = build_function_pdg(&input).unwrap();
+        let definition = node_at(&pdg, 3);
+        let handler = node_at(&pdg, 6);
+        for kind in ["data", "taint"] {
+            assert!(
+                pdg.edges.iter().any(|edge| {
+                    edge.source_node == definition
+                        && edge.target_node == handler
+                        && edge.edge_kind == kind
+                        && edge.variable.as_deref() == Some("value")
+                }),
+                "missing {kind} edge into the handler: {:#?}",
+                pdg.edges
+            );
+        }
+        // The try header still enters the handler directly: an exception can
+        // be raised before the first body statement completes.
+        let header = node_at(&pdg, 2);
+        assert!(has_edge(&pdg, header, handler, "control:exception"));
+    }
+
+    #[test]
+    fn a_65_deep_nested_if_is_still_refused() {
+        let mut body = vec![statement(2, &[], &[], PdgStatementKind::Basic)];
+        for _ in 0..=MAX_PDG_NESTING_DEPTH {
+            body = vec![statement(
+                2,
+                &[],
+                &[],
+                PdgStatementKind::Branch {
+                    then_body: body,
+                    elif_arms: Vec::new(),
+                    else_body: Vec::new(),
+                },
+            )];
+        }
+        let error = build_function_pdg(&function(&[], body)).unwrap_err();
+        assert!(error.to_string().contains("depth cap"), "{error}");
     }
 
     #[test]

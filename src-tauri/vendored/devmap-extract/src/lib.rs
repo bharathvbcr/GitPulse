@@ -701,13 +701,27 @@ fn walk_verdict(
 /// a query.
 #[cfg(feature = "parse")]
 pub fn extract_file(path: &str, source: &str) -> Extraction {
-    let mut extraction = extract_file_unfiltered(path, source);
+    extract_file_with_budget(path, source, treesitter::DEFAULT_PARSE_BUDGET)
+}
+
+/// [`extract_file`] under an explicit per-file parse budget.
+///
+/// The one place the budget enters the whole-file path, so the parallel pass
+/// and the serial retry of [`retry_budget_refusals`] differ only in the value
+/// they pass here.
+#[cfg(feature = "parse")]
+pub fn extract_file_with_budget(
+    path: &str,
+    source: &str,
+    budget: std::time::Duration,
+) -> Extraction {
+    let mut extraction = extract_file_unfiltered(path, source, budget);
     secret::withhold_secret_values(&mut extraction);
     extraction
 }
 
 #[cfg(feature = "parse")]
-fn extract_file_unfiltered(path: &str, source: &str) -> Extraction {
+fn extract_file_unfiltered(path: &str, source: &str, budget: std::time::Duration) -> Extraction {
     if source.len() as u64 > MAX_SOURCE_BYTES {
         return treesitter::refused_extraction(
             path,
@@ -748,10 +762,10 @@ fn extract_file_unfiltered(path: &str, source: &str) -> Extraction {
     // reconstructed buffer straight to the extractor would produce symbols
     // whose spans index a string that exists only in memory.
     if notebook::is_notebook(path) {
-        return notebook::extract_notebook_bounded(path, source);
+        return notebook::extract_notebook_bounded(path, source, budget);
     }
     let lang = detect_language(Path::new(path));
-    extract_treesitter(path, lang, source)
+    treesitter::extract_treesitter_with_budget(path, lang, source, budget)
 }
 
 #[cfg(feature = "parse")]
@@ -764,19 +778,187 @@ pub fn extract_all_with_progress(
     files: &[FileRef],
     progress: Option<&progress::FileProgress>,
 ) -> Vec<Extraction> {
+    extract_all_with_budgets(files, progress, ParseBudgets::default(), None).0
+}
+
+/// The two per-file parse budgets of a build: the wall-clock bound each file
+/// gets in the parallel pass, and the larger one a budget-refused file gets
+/// when it is re-run serially.
+#[cfg(feature = "parse")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseBudgets {
+    pub first_pass: std::time::Duration,
+    pub retry: std::time::Duration,
+}
+
+#[cfg(feature = "parse")]
+impl Default for ParseBudgets {
+    fn default() -> Self {
+        let first_pass = treesitter::DEFAULT_PARSE_BUDGET;
+        Self {
+            first_pass,
+            retry: first_pass.saturating_mul(treesitter::RETRY_BUDGET_FACTOR),
+        }
+    }
+}
+
+/// Most refused paths a [`BudgetRetryReport`] names. The total is carried
+/// beside the list, so a capped list is never read as the whole set.
+#[cfg(feature = "parse")]
+pub const MAX_NAMED_BUDGET_REFUSALS: usize = 50;
+
+/// What the serial budget retry did.
+///
+/// Counts are of files, not of paths: two inputs with one path are two files.
+/// `devmap status` reaches the same files through the `parse_failed` gap
+/// inventory, whose reason for each still-refused file begins with
+/// [`model::BUDGET_REFUSAL_PREFIX`] and states the retry budget it overran.
+#[cfg(feature = "parse")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BudgetRetryReport {
+    /// Files the parallel pass refused for budget.
+    pub first_pass_refused: usize,
+    /// Of those, files the serial retry actually re-ran.
+    pub retried: usize,
+    /// Of those retried, files that parsed (cleanly or partially).
+    pub recovered: usize,
+    /// Refused files never re-run: past [`treesitter::MAX_BUDGET_RETRIES`], or
+    /// the retry was cancelled first. They stay refused.
+    pub not_retried: usize,
+    /// Files refused for budget in the final result: `first_pass_refused -
+    /// recovered`. The number to alarm on.
+    pub still_refused_total: usize,
+    /// At most [`MAX_NAMED_BUDGET_REFUSALS`] of their paths, in input order.
+    pub still_refused: Vec<String>,
+}
+
+#[cfg(feature = "parse")]
+impl BudgetRetryReport {
+    /// Whether `still_refused` names every still-refused file.
+    pub fn names_all(&self) -> bool {
+        self.still_refused.len() == self.still_refused_total
+    }
+}
+
+/// [`extract_all_with_progress`] with explicit budgets, a cancellation flag
+/// for the retry, and the retry's report.
+///
+/// Pass one is the parallel extraction under `budgets.first_pass`. Pass two,
+/// [`retry_budget_refusals`], re-runs serially every file pass one refused for
+/// budget. Output order is the input order, so the result is independent of
+/// scheduling.
+#[cfg(feature = "parse")]
+pub fn extract_all_with_budgets(
+    files: &[FileRef],
+    progress: Option<&progress::FileProgress>,
+    budgets: ParseBudgets,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> (Vec<Extraction>, BudgetRetryReport) {
     if let Some(progress) = progress {
         progress.start(files.len());
     }
-    files
+    let mut extractions: Vec<Extraction> = files
         .par_iter()
         .map(|f| {
-            let extraction = extract_file(f.path, f.source);
+            let extraction = extract_file_with_budget(f.path, f.source, budgets.first_pass);
+            // A budget refusal is not final yet; the retry reports it.
             if let Some(progress) = progress {
-                progress.finish_file(false, extraction.is_parse_failure());
+                if !extraction.is_budget_refusal() {
+                    progress.finish_file(false, extraction.is_parse_failure());
+                }
             }
             extraction
         })
-        .collect()
+        .collect();
+    let report = retry_budget_refusals(files, &mut extractions, progress, budgets, cancel);
+    (extractions, report)
+}
+
+/// Re-run, serially and under `budgets.retry`, every file whose extraction was
+/// refused for budget, replacing that extraction in place.
+///
+/// Serial because the refusal is usually self-inflicted: the parallel pass runs
+/// one file per core, and under machine load a legitimate large file's wall
+/// time stretches past the budget. Alone, it does not. At most
+/// [`treesitter::MAX_BUDGET_RETRIES`] files are retried; `cancel` is checked
+/// before each. Only budget refusals are retried: a grammar fault, a depth
+/// refusal or a malformed notebook fails the same way at any budget, and is
+/// left exactly as the first pass reported it.
+///
+/// `extractions[i]` must be the first-pass result for `files[i]`. When
+/// `progress` is given, every budget-refused file is counted here (the first
+/// pass withholds it), as failed only if it is still refused.
+#[cfg(feature = "parse")]
+pub fn retry_budget_refusals(
+    files: &[FileRef],
+    extractions: &mut [Extraction],
+    progress: Option<&progress::FileProgress>,
+    budgets: ParseBudgets,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> BudgetRetryReport {
+    debug_assert_eq!(files.len(), extractions.len());
+    let refused: Vec<usize> = extractions
+        .iter()
+        .enumerate()
+        .filter(|(_, extraction)| extraction.is_budget_refusal())
+        .map(|(index, _)| index)
+        .collect();
+    let mut report = BudgetRetryReport {
+        first_pass_refused: refused.len(),
+        ..BudgetRetryReport::default()
+    };
+    for index in refused {
+        let cancelled = cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        // What the final reason says happened after the first pass, so a
+        // reader of `parse_failed` can tell the three refusals apart.
+        let verdict = if cancelled {
+            report.not_retried += 1;
+            "; not retried: the build was cancelled before the serial retry reached this file"
+                .to_string()
+        } else if report.retried >= treesitter::MAX_BUDGET_RETRIES {
+            report.not_retried += 1;
+            format!(
+                "; not retried: more than {} files were refused for budget, the cap on serial retries",
+                treesitter::MAX_BUDGET_RETRIES
+            )
+        } else {
+            report.retried += 1;
+            let file = &files[index];
+            extractions[index] = extract_file_with_budget(file.path, file.source, budgets.retry);
+            if !extractions[index].is_budget_refusal() {
+                report.recovered += 1;
+            }
+            format!(
+                "; refused again by the serial retry at the {:?} budget",
+                budgets.retry
+            )
+        };
+        if extractions[index].is_budget_refusal() {
+            if let model::ParseOutcome::Failed { reason } = &mut extractions[index].parse_outcome {
+                reason.push_str(&verdict);
+            }
+        }
+        let still_refused = extractions[index].is_budget_refusal();
+        if still_refused {
+            report.still_refused_total += 1;
+            if report.still_refused.len() < MAX_NAMED_BUDGET_REFUSALS {
+                report.still_refused.push(files[index].path.to_string());
+            }
+        }
+        if let Some(progress) = progress {
+            progress.finish_file(false, extractions[index].is_parse_failure());
+        }
+    }
+    if let Some(progress) = progress {
+        progress.record_budget_retry(progress::BudgetRetryCounts {
+            refused: report.first_pass_refused,
+            retried: report.retried,
+            recovered: report.recovered,
+            not_retried: report.not_retried,
+            still_refused: report.still_refused_total,
+        });
+    }
+    report
 }
 
 #[cfg(test)]
@@ -792,6 +974,30 @@ mod content_hash_tests {
 
 /// Collect indexable source files under `root` as owned `(relative_path, source)` pairs.
 /// Skips non-source paths and unreadable / non-UTF8 files (fail-closed: omit, do not invent).
+/// The key a repo-relative path is stored under: `/`-separated, spelled the
+/// same on every host.
+///
+/// On Windows `\` is the separator and is folded to `/`. Everywhere else it is
+/// an ordinary byte of a file name, and folding it there made `src/a\b.py` and
+/// `src/a/b.py` one key: discovery yielded both, so whichever was written last
+/// owned the row and the other file silently vanished from the graph. A key
+/// cannot spell that name without colliding, so it is refused, with the reason
+/// — a hole a reader can see, as `NonUtf8Path` is for a name UTF-8 cannot
+/// spell.
+pub fn repo_relative_key(relative: &str) -> Result<String, DiscoverySkipReason> {
+    if cfg!(windows) {
+        return Ok(relative.replace('\\', "/"));
+    }
+    if relative.contains('\\') {
+        return Err(DiscoverySkipReason::Unreadable {
+            reason: "a backslash in a file name is a path separator on Windows, so this \
+                     name cannot be stored without colliding with a real path; refused"
+                .to_string(),
+        });
+    }
+    Ok(relative.to_string())
+}
+
 pub fn collect_sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let (sources, _) = collect_sources_with_report(root)?;
     Ok(sources)
@@ -1349,7 +1555,21 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
             ));
             continue;
         };
-        let rel_str = rel_str.replace('\\', "/");
+        let rel_str = match repo_relative_key(rel_str) {
+            Ok(key) => key,
+            // A hole only where a source file was lost: `notes\todo.txt` is
+            // passed over like any other non-source name, or every repository
+            // holding one would read as permanently degraded.
+            Err(reason) => {
+                let reason = if is_indexable_source(rel_str) {
+                    reason
+                } else {
+                    DiscoverySkipReason::NonSource
+                };
+                report.skipped_paths.push((rel_str.to_string(), reason));
+                continue;
+            }
+        };
         // A symlinked *directory* that leaves the repository is refused before
         // the source gate, not after it. The gate asks whether a path's name is
         // a source file's, and `crates/dc-verify` is not — so a link to a whole

@@ -141,6 +141,28 @@ impl Pattern {
         })
     }
 
+    /// Heap bytes this pattern holds: its token array at capacity, plus each
+    /// class's character and range lists at capacity.
+    ///
+    /// A token is far wider than the character it came from — a class token
+    /// carries two vectors inline — so a caller bounding how many patterns it
+    /// keeps must count this, not the pattern's length. The allocator's own
+    /// per-block overhead is not included.
+    pub fn heap_bytes(&self) -> usize {
+        let classes: usize = self
+            .tokens
+            .iter()
+            .map(|token| match token {
+                Token::Class(class) => {
+                    class.singles.capacity() * std::mem::size_of::<char>()
+                        + class.ranges.capacity() * std::mem::size_of::<(char, char)>()
+                }
+                Token::Star | Token::Any | Token::Literal(_) => 0,
+            })
+            .sum();
+        self.tokens.capacity() * std::mem::size_of::<Token>() + classes
+    }
+
     /// [`try_matches`] for this pattern.
     pub fn try_matches(&self, name: &Name) -> Option<bool> {
         match_tokens(&self.tokens, self.units, &name.text)
@@ -636,5 +658,29 @@ mod tests {
         assert!(matches("*", &"a".repeat(MAX_UNITS)));
         let huge = "💩".repeat(MAX_UNITS + 1);
         assert!(!matches("*", &huge));
+    }
+
+    /// One byte of pattern is one token, and a token is many bytes: a
+    /// registry charging a small multiple of the pattern length admitted
+    /// several times its bound.
+    #[test]
+    fn heap_bytes_counts_every_token_at_its_real_width() {
+        let token = std::mem::size_of::<Token>();
+        assert!(token > 6, "a token is wider than the 6 bytes once assumed");
+        let literal = Pattern::compile(&"x".repeat(MAX_UNITS)).unwrap();
+        assert!(literal.heap_bytes() >= MAX_UNITS * token);
+        assert_eq!(
+            literal.heap_bytes(),
+            literal.tokens.capacity() * token,
+            "a literal holds nothing beyond its token array"
+        );
+        // A class's members live outside the token, and are counted too.
+        let class = Pattern::compile("[abcdefgh]").unwrap();
+        assert_eq!(
+            class.heap_bytes(),
+            class.tokens.capacity() * token + 8 * std::mem::size_of::<char>()
+        );
+        let ranged = Pattern::compile("[a-z0-9_]").unwrap();
+        assert!(ranged.heap_bytes() >= token + 2 * std::mem::size_of::<(char, char)>());
     }
 }

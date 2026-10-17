@@ -60,10 +60,41 @@ fn is_metal_path(path: &str) -> bool {
 /// a repository containing one would look like a hang, and a daemon rebuild
 /// would hold its lock for the duration.
 ///
-/// Five seconds is far above any legitimate file measured on the corpora in
-/// this repository (the slowest real source parses in single-digit
-/// milliseconds) and far below the pathological case.
+/// Five seconds is far above what a legitimate file costs on an idle machine
+/// and far below the pathological case. Measured on the real corpora: the
+/// largest source seen (624 KB, 12,353 lines) takes **875 ms** standalone at a
+/// load average of 85, and most files take single-digit milliseconds.
+///
+/// It is a *wall-clock* bound, so it is not load-independent: the parallel
+/// pass runs one file per rayon worker, and under heavy contention (load
+/// 100-300) that 875 ms file stretches past five seconds and is refused. That
+/// is a property of the clock, not of the file, so a budget refusal in the
+/// parallel pass is not final: `extract_all_with_budgets` and
+/// `retry_budget_refusals` re-run each such file serially, with no sibling
+/// competing for the cores, under [`RETRY_BUDGET_FACTOR`] times this budget
+/// (25 s). Only a file that overruns that too stays refused, and it is named
+/// in the extraction report and in `devmap status` (`parse_failed`).
 pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How much larger the serial retry budget is than the parallel-pass budget.
+///
+/// Five: enough to absorb the 6x contention stretch measured on the 875 ms
+/// file's worst case once the contention within the process is gone, while
+/// keeping the retry bounded at 25 s per file against the 131 s pathological
+/// C++ input.
+pub const RETRY_BUDGET_FACTOR: u32 = 5;
+
+/// At most this many files are retried per build, so a corpus full of
+/// pathological inputs costs at most `MAX_BUDGET_RETRIES x 25 s` of serial
+/// retry rather than `N x 25 s`. Files past the cap stay refused and are
+/// counted in `BudgetRetryReport::not_retried`.
+pub const MAX_BUDGET_RETRIES: usize = 16;
+
+/// Stamp a budget-overrun reason so [`crate::model::Extraction::is_budget_refusal`]
+/// can recognise it. The single constructor of such reasons.
+pub(crate) fn budget_refusal_reason(detail: String) -> String {
+    format!("{}{detail}", crate::model::BUDGET_REFUSAL_PREFIX)
+}
 
 /// Grammars deliberately not routed to, and why.
 ///
@@ -237,24 +268,31 @@ enum ParseAttempt {
     NoTree,
 }
 
-fn parse_within_budget(
+/// Parse `source`, cancelled once `deadline` passes: `(tree, cancelled)`.
+///
+/// **Every parse in this crate goes through this.** The progress callback is
+/// polled by tree-sitter during the parse and returning `true` cancels it; it
+/// is the only way to bound a parse that has already entered a pathological
+/// state, because a byte cap only bounds what is offered to the parser, not
+/// how long the parser spends on it. The macro-body probes used to call
+/// `parser.parse(text, None)` with no callback at all, after the file's own
+/// parse had been bounded, inside the walk the daemon holds its writer lock
+/// across.
+///
+/// A cancelled parse leaves the parser holding its partial state, and the next
+/// `parse` on it would *resume* that state instead of starting on the new
+/// text. The probes reuse one parser per thread, so a cancel resets it here
+/// rather than relying on every caller to.
+fn parse_until(
     parser: &mut Parser,
     source: &str,
     deadline: std::time::Instant,
-) -> ParseAttempt {
-    let started = std::time::Instant::now();
-    let mut over_budget = false;
+) -> (Option<tree_sitter::Tree>, bool) {
+    let mut cancelled = false;
     let tree = {
-        // The progress callback is polled by tree-sitter during the parse and
-        // returning `true` cancels it; this is the only way to bound a parse
-        // that has already entered a pathological state.
-        //
-        // Against the *shared* deadline, not a budget of its own: the parse is
-        // the first phase of the file's extraction, not a separately funded
-        // one.
         let mut cancel = |_: &tree_sitter::ParseState| -> bool {
             if std::time::Instant::now() >= deadline {
-                over_budget = true;
+                cancelled = true;
                 return true;
             }
             false
@@ -273,6 +311,55 @@ fn parse_within_budget(
             Some(options),
         )
     };
+    if cancelled {
+        parser.reset();
+    }
+    (tree, cancelled)
+}
+
+/// Parse an in-memory fragment — a macro body, a macro's expansion — against
+/// the deadline of the file whose walk asked for it.
+///
+/// A probe is part of that file's extraction, not a separately funded one, so
+/// it gets no budget of its own: it stops at the same instant
+/// `parse_within_budget` and the walk do. A probe that crosses it latches
+/// `WALK_OVERRAN`, so the file is refused rather than published with the calls
+/// the probe never read. Outside an armed extraction (a unit test calling a
+/// helper directly) it is held to [`DEFAULT_PARSE_BUDGET`] from now, never to
+/// nothing.
+fn parse_probe(parser: &mut Parser, text: &str) -> Option<tree_sitter::Tree> {
+    #[cfg(test)]
+    PROBE_START_HOOK.with(|hook| {
+        if let Some(start) = hook.take() {
+            start();
+        }
+    });
+    // A probe that starts after the deadline does not start: a small fragment
+    // can finish before tree-sitter first polls the callback, and that parse
+    // would still be work done past the point the file was promised to stop.
+    if walk_overran() || walk_deadline_passed() {
+        return None;
+    }
+    let deadline = WALK_DEADLINE
+        .with(|slot| slot.get())
+        .unwrap_or_else(|| std::time::Instant::now() + DEFAULT_PARSE_BUDGET);
+    let (tree, cancelled) = parse_until(parser, text, deadline);
+    if cancelled {
+        WALK_OVERRAN.with(|slot| slot.set(true));
+        return None;
+    }
+    tree
+}
+
+fn parse_within_budget(
+    parser: &mut Parser,
+    source: &str,
+    deadline: std::time::Instant,
+) -> ParseAttempt {
+    let started = std::time::Instant::now();
+    // Against the *shared* deadline, not a budget of its own: the parse is the
+    // first phase of the file's extraction, not a separately funded one.
+    let (tree, over_budget) = parse_until(parser, source, deadline);
     match tree {
         Some(tree) if !over_budget => ParseAttempt::Parsed(tree),
         // A cancelled parse can still hand back a partial tree. It describes a
@@ -287,6 +374,8 @@ fn parse_within_budget(
 #[cfg(test)]
 thread_local! {
     static EXTRACTION_FINISH_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    /// Run once as the next macro-body probe starts, before its parse.
+    static PROBE_START_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
 }
 
 pub fn extract_treesitter_with_budget(
@@ -320,9 +409,9 @@ pub fn extract_treesitter_with_budget(
             path,
             lang,
             source,
-            format!(
+            budget_refusal_reason(format!(
                 "extraction finalization exceeded the {budget:?} budget; no symbols are claimed for this file"
-            ),
+            )),
         )
     } else {
         extraction
@@ -419,12 +508,12 @@ fn extract_treesitter_before_deadline(
                     path,
                     lang,
                     source,
-                    format!(
+                    budget_refusal_reason(format!(
                         "parse of {} bytes exceeded the {:?} budget for grammar {grammar} \
                          (stopped at {elapsed:?}); no symbols are claimed for this file",
                         source.len(),
                         budget
-                    ),
+                    )),
                 );
             }
             ParseAttempt::GrammarLoadFailed => {
@@ -503,11 +592,11 @@ fn extract_treesitter_before_deadline(
                 // in the tail cannot be reported differently from one cut short
                 // in the walk.
                 let over_budget = |phase: &str| {
-                    format!(
+                    budget_refusal_reason(format!(
                         "extraction of {} bytes exceeded the {budget:?} budget for grammar \
                          {grammar} while {phase}; no symbols are claimed for this file",
                         source.len()
-                    )
+                    ))
                 };
                 let walk_completed = walk_tree(
                     root,
@@ -608,6 +697,9 @@ fn extract_treesitter_before_deadline(
                 };
                 if matches!(lang, "typescript" | "tsx") {
                     ts_ambient_exemptions(path, root, &symbols, &mut wiring);
+                }
+                if lang == "rust" {
+                    rust_crate_private_scopes(root, source, &symbols, &mut wiring);
                 }
                 if extraction_overran(deadline) {
                     // Labelled by what actually ran for *this* language. The
@@ -734,9 +826,11 @@ fn extract_treesitter_before_deadline(
                         root,
                         source,
                         &file_symbol_name,
+                        &mut symbols,
                         &mut calls,
                         &mut references,
                     );
+                    rust_calls_through_fn_pointer_items(root, source, &mut calls);
                 }
                 references.sort_by(|a, b| {
                     (a.span.start_byte, a.span.end_byte, &a.name).cmp(&(
@@ -812,11 +906,12 @@ fn extract_treesitter_before_deadline(
                     );
                 }
 
-                let (rust_inline_modules, rust_deref_targets) = if lang == "rust" {
-                    collect_rust_item_facts(root, source)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
+                let (rust_inline_modules, rust_deref_targets, rust_blanket_impl_params) =
+                    if lang == "rust" {
+                        collect_rust_item_facts(root, source)
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
+                    };
                 // Bound rather than returned: the embedded-script merge below
                 // still has to run, and it mutates this value in place.
                 let mut extraction = Extraction {
@@ -847,6 +942,11 @@ fn extract_treesitter_before_deadline(
                     } else {
                         Vec::new()
                     },
+                    swift_type_aliases: if lang == "swift" {
+                        crate::swiftscope::declared_aliases(root, source)
+                    } else {
+                        Vec::new()
+                    },
                     go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
@@ -859,7 +959,13 @@ fn extract_treesitter_before_deadline(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name, lang),
                     rust_inline_modules,
                     rust_deref_targets,
+                    rust_blanket_impl_params,
                     rust_implicit_calls,
+                    rust_try_conversions: if lang == "rust" {
+                        rust_collect_try_conversions(root, source, &file_symbol_name)
+                    } else {
+                        Vec::new()
+                    },
                     local_bindings,
                     source_code: Some(source.to_string()),
                     literals: Vec::new(),
@@ -908,6 +1014,7 @@ fn extract_treesitter_before_deadline(
                 );
                 extraction.literals = literals;
                 extraction.diagnostics.append(&mut notes);
+                extraction.diagnostics.extend(take_nesting_cap_notes());
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -987,7 +1094,9 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool, is_python: bool) -
             since_check = 0;
             if walk_deadline_passed() {
                 return ParseOutcome::Failed {
-                    reason: "parse outcome validation exceeded the extraction budget".to_string(),
+                    reason: budget_refusal_reason(
+                        "parse outcome validation exceeded the extraction budget".to_string(),
+                    ),
                 };
             }
         }
@@ -2034,6 +2143,7 @@ fn unparsed_extraction(
         go_package: None,
         jvm_package: None,
         scope_receivers: Vec::new(),
+        swift_type_aliases: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
@@ -2042,7 +2152,9 @@ fn unparsed_extraction(
         scope_locals: Vec::new(),
         rust_inline_modules: Vec::new(),
         rust_deref_targets: Vec::new(),
+        rust_blanket_impl_params: Vec::new(),
         rust_implicit_calls: Vec::new(),
+        rust_try_conversions: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2248,6 +2360,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_package: None,
         jvm_package: None,
         scope_receivers: Vec::new(),
+        swift_type_aliases: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
@@ -2256,7 +2369,9 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         scope_locals: Vec::new(),
         rust_inline_modules: Vec::new(),
         rust_deref_targets: Vec::new(),
+        rust_blanket_impl_params: Vec::new(),
         rust_implicit_calls: Vec::new(),
+        rust_try_conversions: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2910,6 +3025,28 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         let text = receiver_identity(target, source, 0);
         return (!text.is_empty()).then_some(text);
     }
+    // Kotlin's `callable_reference` has no fields either: `Type::m` names the
+    // receiver type in its first named child and the member in its last.
+    // Without the receiver the member arrived as a bare name, which never
+    // matches an extension keyed `Type.m` and which the resolver declines
+    // silently, so the namesake veto never saw it. An unbound `::f` has no
+    // receiver. (`template::m`, a bound reference on a value, parses as the
+    // fieldless `navigation_expression` below.)
+    if parent.kind() == "callable_reference" {
+        let mut cursor = parent.walk();
+        let named: Vec<Node> = parent.named_children(&mut cursor).collect();
+        let [receiver @ .., member] = named.as_slice() else {
+            return None;
+        };
+        if member.id() != node.id() {
+            return None;
+        }
+        let receiver = receiver
+            .iter()
+            .rfind(|child| child.kind() != "type_modifiers")?;
+        let text = receiver_identity(*receiver, source, 0);
+        return (!text.is_empty()).then_some(text);
+    }
     // Kotlin's `navigation_expression` has no fields: the object is the first
     // named child and the member the last (`task.label`, `a.b.c`).
     if parent.kind() == "navigation_expression" {
@@ -3006,11 +3143,12 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
-            "class_definition"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "trait_item" => {
+            "class_definition" | "class_declaration" | "abstract_class_declaration" => {
                 return get_child_text(parent, "name", source);
+            }
+            "trait_item" => {
+                let name = get_child_text(parent, "name", source)?;
+                return Some(rust_function_local_type(parent, source, &name).unwrap_or(name));
             }
             // An impl's methods belong to the TYPE, including in
             // `impl Trait for Type` (SC11).
@@ -3036,7 +3174,8 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
                     .child_by_field_name("type")
                     .or_else(|| parent.child_by_field_name("trait"))?;
                 let text = get_node_text(owner, source);
-                return Some(text.split('<').next().unwrap_or(&text).trim().to_string());
+                let bare = text.split('<').next().unwrap_or(&text).trim().to_string();
+                return Some(rust_function_local_type(parent, source, &bare).unwrap_or(bare));
             }
             // A nested function is not a class method merely because a class
             // occurs farther up the ancestor chain. Rust spells the same node
@@ -3051,6 +3190,75 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
             | "method_definition"
             | "function_item"
             | "closure_expression" => return None,
+            _ => ancestor = bounded_parent(parent),
+        }
+    }
+    None
+}
+
+/// The interface a `method_signature` belongs to, or `None` when it does not.
+///
+/// A class overload is the same node kind (`area(): number;` beside
+/// `area(): number { … }`) and is the method body's declaration, not a second
+/// symbol. Stopping at a class or a function keeps that signature — and a
+/// signature nested inside one — from being filed under an outer interface.
+fn enclosing_interface_name(node: Node, source: &str) -> Option<String> {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "interface_declaration" => return get_child_text(parent, "name", source),
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "function_expression"
+            | "arrow_function" => return None,
+            _ => ancestor = bounded_parent(parent),
+        }
+    }
+    None
+}
+
+/// The owner name of a Rust type declared inside a function body, keyed under
+/// that function: `with_guard.Guard` for `fn with_guard() { struct Guard; impl
+/// Drop for Guard { fn drop(..) } }`.
+///
+/// The struct itself is already keyed that way (`scoped_qualified_name`), so
+/// its methods must be too, or the method's `parent_symbol` names a type the
+/// graph does not hold and a module-level `Guard::drop` in the same file shares
+/// the local one's identity. A qualified name is the join key; this is the one
+/// place a method's owner is computed, so the symbol emitters and the call
+/// attribution in `enclosing_callable_qualified` move together.
+///
+/// `item` is the `impl_item` or `trait_item`. Only a type declared in a block
+/// of the same function counts: `impl Display for Outer` written inside a
+/// function still implements the module-level `Outer`, and keying it under the
+/// function would sever it from that type. `None` keeps the bare name.
+fn rust_function_local_type(item: Node, source: &str, bare: &str) -> Option<String> {
+    let mut ancestor = bounded_parent(item);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "block" => {
+                let mut cursor = parent.walk();
+                let declared = parent.named_children(&mut cursor).any(|child| {
+                    matches!(
+                        child.kind(),
+                        "struct_item" | "enum_item" | "union_item" | "trait_item"
+                    ) && get_child_text(child, "name", source).as_deref() == Some(bare)
+                });
+                if declared {
+                    // An empty file prefix yields `::scope`; the callers add
+                    // the file themselves, exactly as for a bare type name.
+                    let scope = enclosing_callable_qualified(item, source, "")?;
+                    return Some(format!("{}.{bare}", scope.trim_start_matches("::")));
+                }
+                ancestor = bounded_parent(parent);
+            }
+            "function_item" | "closure_expression" | "source_file" | "declaration_list" => {
+                return None
+            }
             _ => ancestor = bounded_parent(parent),
         }
     }
@@ -3626,6 +3834,53 @@ fn ts_ambient_exemptions(
     }
 }
 
+/// Why a Rust item written `pub(crate)`, `pub(super)`, `pub(self)` or
+/// `pub(in path)` cannot be called from outside its crate.
+pub const RUST_CRATE_PRIVATE_PROOF: &str = "its restricted `pub(…)` visibility confines it to its \
+     own crate, so nothing outside the corpus can call it";
+
+/// Mark every Rust item whose visibility is restricted to its crate.
+///
+/// The extractor answers `is_exported` from the `pub` keyword, so `pub(crate)`
+/// reads as exported and the item was never examined — yet the language itself
+/// proves no other crate can name it, the same proof Go's `internal/` gives.
+/// Emitted per symbol as [`WiringKind::ModulePrivateScope`]; liveness widens
+/// it into the unconfirmed tier as `exported_unreferenced`, never above.
+///
+/// Joined by span start: an item's symbol span starts where its node does,
+/// visibility included (attributes are sibling nodes).
+fn rust_crate_private_scopes(
+    root: Node,
+    source: &str,
+    symbols: &[ExtractedSymbol],
+    wiring: &mut Vec<WiringAnnotation>,
+) {
+    let mut restricted: HashSet<usize> = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        if node.children(&mut cursor).any(|child| {
+            child.kind() == "visibility_modifier"
+                && get_node_text(child, source).starts_with("pub(")
+        }) {
+            restricted.insert(node.start_byte());
+        }
+        push_children(node, &mut stack);
+    }
+    if restricted.is_empty() {
+        return;
+    }
+    for symbol in symbols {
+        if symbol.is_exported && restricted.contains(&symbol.span.start_byte) {
+            wiring.push(WiringAnnotation {
+                kind: WiringKind::ModulePrivateScope,
+                target_symbol: symbol.qualified_name.clone(),
+                details: RUST_CRATE_PRIVATE_PROOF.to_string(),
+            });
+        }
+    }
+}
+
 /// Whether a declaration sits at module/package level rather than inside a
 /// callable or type body.
 ///
@@ -4164,12 +4419,21 @@ fn extract_node(
                     .map(|module| python_module_path(module, source))
                     .unwrap_or_default();
                 let (imported_names, local_names) = python_import_bindings(node, source);
+                // `from m import *` names nothing, so it has no `imported_names`
+                // (a `*` there once bound a local called `*`); it is marked by
+                // the alias `*` instead, as a Go dot-import is by `.`: the
+                // marker for "binds whatever this module exports", and still
+                // evidence about every bare name the file uses.
+                let mut cursor = node.walk();
+                let wildcard = node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "wildcard_import");
                 imports.push(ExtractedImport {
                     raw_import: get_node_text(node, source),
                     module_specifier,
                     imported_names,
                     local_names,
-                    alias: None,
+                    alias: wildcard.then(|| "*".to_string()),
                     span,
                     path_load: None,
                 });
@@ -4437,6 +4701,35 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                }
+            }
+            // An interface method is a requirement a call through the interface
+            // can name. A class overload signature is the same node and is not:
+            // the method body is already the symbol. Property, call, construct
+            // and index signatures are not methods.
+            "method_signature" => {
+                if let Some(interface) = enclosing_interface_name(node, source) {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        if name_node.kind() == "property_identifier" {
+                            let n = get_node_text(name_node, source);
+                            if !n.is_empty() {
+                                let parent = format!("{file_symbol_name}::{interface}");
+                                symbols.push(ExtractedSymbol {
+                                    name: n.clone(),
+                                    qualified_name: format!("{parent}.{n}"),
+                                    kind: SymbolKind::Method,
+                                    span,
+                                    is_exported: js_symbol_is_exported(node, source),
+                                    docstring: None,
+                                    signature: None,
+                                    parent_symbol: Some(parent),
+                                    body_signature: None,
+                                    declaration_hash: None,
+                                    return_type: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             "interface_declaration" | "type_alias_declaration" => {
@@ -6395,7 +6688,7 @@ pub(crate) const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// Parse a C-family fragment that exists only in memory — a macro body, or a
 /// macro invocation's expansion — with `lang`'s grammar, on this thread's
-/// reused probe parser.
+/// reused probe parser, against the file's deadline ([`parse_probe`]).
 pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree> {
     let (grammar, language) = grammar_for(lang)?;
     C_MACRO_PROBE_PARSER.with(|cell| {
@@ -6408,7 +6701,7 @@ pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree>
             *slot = Some((grammar, parser));
         }
         slot.as_mut()
-            .and_then(|(_, parser)| parser.parse(text, None))
+            .and_then(|(_, parser)| parse_probe(parser, text))
     })
 }
 
@@ -7104,12 +7397,28 @@ fn rust_collect_implicit_calls(
 
 /// The receiver text for an operand whose type is stated: see
 /// [`rust_collect_implicit_calls`].
+///
+/// Parentheses and borrows are unwrapped in a loop, at most
+/// [`TYPE_NESTING_MAX_DEPTH`] of them: this runs on the left operand of every
+/// binary expression, and recursing once per `(` let a source of nested
+/// parentheses overflow the extraction thread's stack.
 fn rust_typed_operand(operand: Node, source: &str) -> Option<String> {
-    match operand.kind() {
-        "parenthesized_expression" | "reference_expression" => operand
+    let mut operand = operand;
+    let mut unwrapped = 0usize;
+    while matches!(
+        operand.kind(),
+        "parenthesized_expression" | "reference_expression"
+    ) {
+        if unwrapped == TYPE_NESTING_MAX_DEPTH {
+            note_nesting_cap("rust_typed_operand");
+            return None;
+        }
+        unwrapped += 1;
+        operand = operand
             .child_by_field_name("value")
-            .or_else(|| operand.named_child(0))
-            .and_then(|inner| rust_typed_operand(inner, source)),
+            .or_else(|| operand.named_child(0))?;
+    }
+    match operand.kind() {
         "identifier" => Some(get_node_text(operand, source)),
         "struct_expression" => rust_type_name(operand.child_by_field_name("name")?, source, 0),
         "call_expression" => {
@@ -7158,7 +7467,195 @@ fn rust_let_implicit_call(node: Node, source: &str) -> Option<(&'static str, Opt
     Some(("drop", receiver))
 }
 
-/// Most calls one file's `macro_rules!` expansions may add.
+/// The `From::from` candidates a file's `?` operators make: see
+/// `Extraction::rust_try_conversions`.
+fn rust_collect_try_conversions(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+) -> Vec<ExtractedCall> {
+    // Each function of this file by name, with its declared error type; a name
+    // declared twice with different error types (cfg twins, methods of two
+    // types) is not one function and identifies nothing.
+    let mut error_types: HashMap<String, Option<String>> = HashMap::new();
+    let mut functions = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            return Vec::new();
+        }
+        if node.kind() == "function_item" {
+            if let Some(name) = get_child_text(node, "name", source) {
+                let error = rust_result_error_type(node, source);
+                error_types
+                    .entry(name)
+                    .and_modify(|known| {
+                        if *known != error {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(error);
+            }
+            functions.push(node);
+        }
+        push_named_children(node, &mut stack);
+    }
+
+    let mut calls = Vec::new();
+    for function in functions {
+        let Some(error) = rust_result_error_type(function, source) else {
+            continue;
+        };
+        let Some(body) = function.child_by_field_name("body") else {
+            continue;
+        };
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if walk_deadline_passed() || calls.len() >= MAX_IMPLICIT_CALLS {
+                return calls;
+            }
+            match node.kind() {
+                // These return their own type, so a `?` inside converts into
+                // theirs; a nested function is visited as its own.
+                "closure_expression" | "async_block" | "function_item" => continue,
+                "try_expression" => {
+                    let identity = node
+                        .named_child(0)
+                        .and_then(|operand| rust_called_function_name(operand, source))
+                        .and_then(|name| error_types.get(&name))
+                        .is_some_and(|known| known.as_deref() == Some(error.as_str()));
+                    if !identity {
+                        calls.push(ExtractedCall {
+                            caller_symbol: enclosing_callable_qualified(
+                                node,
+                                source,
+                                file_symbol_name,
+                            ),
+                            callee_name: "from".to_string(),
+                            receiver_expr: Some(error.clone()),
+                            span: node_span(node),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            push_named_children(node, &mut stack);
+        }
+    }
+    calls.sort_by_key(|call| call.span.start_byte);
+    calls
+}
+
+/// `E` for a function declared `-> Result<T, E>` (any path ending `Result`
+/// with exactly two type arguments), reduced to its bare name. An alias with
+/// one argument (`io::Result<T>`) states no error type here.
+fn rust_result_error_type(function: Node, source: &str) -> Option<String> {
+    let returned = function.child_by_field_name("return_type")?;
+    if returned.kind() != "generic_type" {
+        return None;
+    }
+    let head = get_node_text(returned.child_by_field_name("type")?, source);
+    if head.rsplit("::").next() != Some("Result") {
+        return None;
+    }
+    let arguments = returned.child_by_field_name("type_arguments")?;
+    let mut cursor = arguments.walk();
+    let types: Vec<Node> = arguments
+        .named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    match types.as_slice() {
+        [_, error] => rust_type_name(*error, source, 0),
+        _ => None,
+    }
+}
+
+/// The function a call expression names by its last segment: `f(..)`,
+/// `m::f(..)`, `Self::f(..)`, `x.f(..)`. Anything else is not a named call.
+fn rust_called_function_name(operand: Node, source: &str) -> Option<String> {
+    if operand.kind() != "call_expression" {
+        return None;
+    }
+    let mut function = operand.child_by_field_name("function")?;
+    // `f::<T>(..)`: the turbofish wraps the path once.
+    if function.kind() == "generic_function" {
+        function = function.child_by_field_name("function")?;
+    }
+    match function.kind() {
+        "identifier" => Some(get_node_text(function, source)),
+        "scoped_identifier" => get_child_text(function, "name", source),
+        "field_expression" => get_child_text(function, "field", source),
+        _ => None,
+    }
+}
+
+/// Give a call through a `const`/`static` function pointer this file declares
+/// the call the pointer makes.
+///
+/// `pub const F: fn() -> u8 = helper;` then `F()` calls `helper`, and the only
+/// place that is written is the item's initializer. Like the macro expansion
+/// above, textual and stated as such: only an item whose declared type is a
+/// function pointer and whose value is a plain path (`helper`, `m::helper`),
+/// called by its bare name; a closure, a cast, or a name declared twice with
+/// different targets adds nothing. The call to the item itself stays.
+fn rust_calls_through_fn_pointer_items(root: Node, source: &str, calls: &mut Vec<ExtractedCall>) {
+    let mut targets: HashMap<String, Option<(String, Option<String>)>> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            return;
+        }
+        if matches!(node.kind(), "const_item" | "static_item")
+            && node
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "function_type")
+        {
+            let target = node
+                .child_by_field_name("value")
+                .and_then(|value| match value.kind() {
+                    "identifier" => Some((get_node_text(value, source), None)),
+                    "scoped_identifier" => Some((
+                        get_child_text(value, "name", source)?,
+                        Some(get_node_text(value.child_by_field_name("path")?, source)),
+                    )),
+                    _ => None,
+                });
+            if let Some(name) = get_child_text(node, "name", source) {
+                targets
+                    .entry(name)
+                    .and_modify(|known| {
+                        if *known != target {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(target);
+            }
+            continue;
+        }
+        push_named_children(node, &mut stack);
+    }
+    if targets.values().all(Option::is_none) {
+        return;
+    }
+    let added: Vec<ExtractedCall> = calls
+        .iter()
+        .filter(|call| call.receiver_expr.is_none())
+        .filter_map(|call| {
+            let (callee_name, receiver_expr) = targets.get(&call.callee_name)?.clone()?;
+            Some(ExtractedCall {
+                caller_symbol: call.caller_symbol.clone(),
+                callee_name,
+                receiver_expr,
+                span: call.span.clone(),
+            })
+        })
+        .take(MAX_IMPLICIT_CALLS)
+        .collect();
+    calls.extend(added);
+}
+
+/// Most calls and invocation references one file's `macro_rules!` expansions
+/// may add.
 const MAX_MACRO_EXPANSION_CALLS: usize = 10_000;
 
 /// Give each invocation of a `macro_rules!` macro this file defines the calls
@@ -7177,10 +7674,17 @@ const MAX_MACRO_EXPANSION_CALLS: usize = 10_000;
 ///
 /// An invocation inside a macro definition is not expanded, so a macro that
 /// invokes itself cannot grow the result, and the total is bounded.
+///
+/// Each definition is also a [`SymbolKind::Macro`] symbol (exported when it is
+/// `#[macro_export]`, keyed under its function when it is declared inside
+/// one), and each invocation of it in this file references it by name. An
+/// invocation of a macro another file defines (`#[macro_use]`, a `use`, or
+/// `$crate::m!`) is not linked, which is why liveness never reports a macro.
 fn rust_expand_local_macros(
     root: Node,
     source: &str,
     file_symbol_name: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
     calls: &mut Vec<ExtractedCall>,
     references: &mut Vec<ExtractedReference>,
 ) {
@@ -7194,6 +7698,33 @@ fn rust_expand_local_macros(
         match node.kind() {
             "macro_definition" => {
                 if let Some(name) = get_child_text(node, "name", source) {
+                    let parent = enclosing_callable_qualified(node, source, file_symbol_name);
+                    let qualified_name = match &parent {
+                        Some(function) => format!("{function}.{name}"),
+                        None => format!("{file_symbol_name}::{name}"),
+                    };
+                    if !symbols
+                        .iter()
+                        .any(|symbol| symbol.qualified_name == qualified_name)
+                    {
+                        symbols.push(ExtractedSymbol {
+                            name: name.clone(),
+                            qualified_name,
+                            kind: SymbolKind::Macro,
+                            span: node_span(node),
+                            is_exported: rust_attribute_paths(node, source)
+                                .iter()
+                                .any(|path| path == "macro_export"),
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(
+                                parent.unwrap_or_else(|| file_symbol_name.to_string()),
+                            ),
+                            body_signature: None,
+                            declaration_hash: None,
+                            return_type: None,
+                        });
+                    }
                     let mut found = Vec::new();
                     let mut cursor = node.walk();
                     for rule in node
@@ -7237,6 +7768,18 @@ fn rust_expand_local_macros(
         let Some(body) = bodies.get(&name) else {
             continue;
         };
+        added += 1;
+        if added > MAX_MACRO_EXPANSION_CALLS {
+            return;
+        }
+        references.push(extracted_reference(
+            node,
+            source,
+            file_symbol_name,
+            name.clone(),
+            ReferenceKind::Name,
+            None,
+        ));
         let caller = enclosing_callable_qualified(node, source, file_symbol_name);
         for (callee_name, receiver_expr) in body {
             added += 1;
@@ -7354,10 +7897,16 @@ fn probe_macro_body(inner: &str) -> (Vec<(String, Option<String>)>, Vec<String>)
             *slot = Some(parser);
         }
         slot.as_mut()
-            .and_then(|parser| parser.parse(&probe_source, None))
+            .and_then(|parser| parse_probe(parser, &probe_source))
     });
 
     let Some(tree) = parsed else {
+        // A probe stopped by the file's deadline has latched the refusal of
+        // the whole file; the token scan is for a parser that declined, not
+        // more unbounded work after the clock ran out.
+        if walk_overran() {
+            return (Vec::new(), Vec::new());
+        }
         return (scan_rust_token_tree_calls(inner), Vec::new());
     };
     let root = tree.root_node();
@@ -7682,6 +8231,8 @@ fn rust_type_name_is_reachable(node: Node) -> bool {
         "reference_type"
             | "pointer_type"
             | "generic_type"
+            | "dynamic_type"
+            | "abstract_type"
             | "type_identifier"
             | "scoped_type_identifier"
     )
@@ -7697,6 +8248,19 @@ pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<S
             .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "generic_type" => rust_generic_identity_node(node, source)
             .and_then(|inner| rust_type_name(inner, source, depth + 1)),
+        // `dyn Render` / `impl Render`: a value of some type implementing
+        // `Render`, so the trait is where a method on it is declared. Only a
+        // single named bound: `dyn A + Send` is a `bounded_type` and stays
+        // unnamed rather than being read as one of its traits.
+        "dynamic_type" | "abstract_type" => node
+            .child_by_field_name("trait")
+            .filter(|bound| {
+                matches!(
+                    bound.kind(),
+                    "type_identifier" | "scoped_type_identifier" | "generic_type"
+                )
+            })
+            .and_then(|bound| rust_type_name(bound, source, depth + 1)),
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
             let bare = text.rsplit("::").next().unwrap_or(&text);
@@ -7914,9 +8478,13 @@ fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<Stri
 /// A `mod name;` declaration has no body and names a file, so it is not an
 /// inline module. The walk is an explicit worklist, bounded by the same
 /// deadline every other whole-tree pass here honours.
-fn collect_rust_item_facts(root: Node, source: &str) -> (Vec<String>, Vec<(String, String)>) {
+fn collect_rust_item_facts(
+    root: Node,
+    source: &str,
+) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
     let mut modules = BTreeSet::new();
     let mut derefs = BTreeSet::new();
+    let mut blankets = BTreeSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if walk_deadline_passed() {
@@ -7932,12 +8500,42 @@ fn collect_rust_item_facts(root: Node, source: &str) -> (Vec<String>, Vec<(Strin
                 if let Some(pair) = rust_deref_impl(node, source) {
                     derefs.insert(pair);
                 }
+                if let Some(param) = rust_blanket_impl_param(node, source) {
+                    blankets.insert(param);
+                }
             }
             _ => {}
         }
         push_named_children(node, &mut stack);
     }
-    (modules.into_iter().collect(), derefs.into_iter().collect())
+    (
+        modules.into_iter().collect(),
+        derefs.into_iter().collect(),
+        blankets.into_iter().collect(),
+    )
+}
+
+/// `T` for a blanket impl, `impl<T: Display> Describe for T`: a trait impl
+/// whose self type is one of the impl's own type parameters.
+fn rust_blanket_impl_param(node: Node, source: &str) -> Option<String> {
+    node.child_by_field_name("trait")?;
+    let self_type = node.child_by_field_name("type")?;
+    if self_type.kind() != "type_identifier" {
+        return None;
+    }
+    let self_type = get_node_text(self_type, source);
+    let params = node.child_by_field_name("type_parameters")?;
+    let mut cursor = params.walk();
+    let declared = params.named_children(&mut cursor).any(|param| {
+        let name = match param.kind() {
+            "type_identifier" => Some(get_node_text(param, source)),
+            "constrained_type_parameter" => get_child_text(param, "left", source),
+            "type_parameter" | "optional_type_parameter" => get_child_text(param, "name", source),
+            _ => None,
+        };
+        name.as_deref() == Some(self_type.as_str())
+    });
+    declared.then_some(self_type)
 }
 
 /// `(Guard, Inner)` for `impl Deref for Guard { type Target = Inner; .. }`.
@@ -8904,15 +9502,26 @@ fn field_contains(parent: Node, field: &str, needle: Node) -> bool {
         .is_some_and(|haystack| node_contains(haystack, needle))
 }
 
+/// Whether `needle` is `haystack` or one of its descendants.
+///
+/// An explicit stack, not a recursion: the haystack is a whole field — a
+/// `let`'s initializer, an assignment's left side — and one frame per level
+/// let `let g = ((((g()))))` 20,000 deep abort the process on a 256 KiB stack.
+/// Only children whose bytes enclose the needle's are entered, since a node's
+/// span encloses every descendant's; that leaves the one path down plus the
+/// zero-width nodes at its edges, rather than the whole field.
 fn node_contains(haystack: Node, needle: Node) -> bool {
-    if haystack.id() == needle.id() {
-        return true;
-    }
-    let mut cursor = haystack.walk();
-    for child in haystack.children(&mut cursor) {
-        if node_contains(child, needle) {
+    let (start, end) = (needle.start_byte(), needle.end_byte());
+    let mut stack = vec![haystack];
+    while let Some(node) = stack.pop() {
+        if node.id() == needle.id() {
             return true;
         }
+        let mut cursor = node.walk();
+        stack.extend(
+            node.children(&mut cursor)
+                .filter(|child| child.start_byte() <= start && end <= child.end_byte()),
+        );
     }
     false
 }
@@ -9283,6 +9892,10 @@ thread_local! {
     static WALK_OVERRAN: Cell<bool> = const { Cell::new(false) };
     /// Ancestor steps taken since the clock was last read. See `bounded_parent`.
     static PARENT_STEPS: Cell<u32> = const { Cell::new(0) };
+    /// Type walkers that stopped at [`TYPE_NESTING_MAX_DEPTH`] in this file,
+    /// and how often. See [`note_nesting_cap`].
+    static NESTING_CAPS: RefCell<BTreeMap<&'static str, usize>> =
+        const { RefCell::new(BTreeMap::new()) };
     #[cfg(test)]
     static NATIVE_PARENT_READS: Cell<usize> = const { Cell::new(0) };
 }
@@ -9307,6 +9920,7 @@ impl BudgetGuard {
         WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
+        NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
         BudgetGuard
     }
 }
@@ -9419,6 +10033,44 @@ pub(crate) fn walk_deadline_passed() -> bool {
         }
         _ => false,
     }
+}
+
+/// Deepest type or operand nesting a type walker follows.
+///
+/// The walkers that read a written type — an operand under parentheses, an
+/// array type's element — used to recurse once per level with no bound, and a
+/// 1 MiB source holds a few hundred thousand levels: 20,000 `(` aborted the
+/// process on a 256 KiB stack, and extraction runs on rayon's 2 MiB worker
+/// stacks, where a stack overflow is not a panic anyone can catch. No real
+/// type nests anywhere near this; the sibling walkers (`rust_type_name`,
+/// `receiver_identity`) stop at the same depth.
+pub(crate) const TYPE_NESTING_MAX_DEPTH: usize = 16;
+
+/// Record that `walker` stopped at [`TYPE_NESTING_MAX_DEPTH`] and abstained.
+///
+/// The walker's answer past the cap is "no type stated", which is the
+/// conservative one for every caller — an operand with no type records no
+/// implicit call, a binding with no type binds nothing — but it is not what the
+/// text says, so the file says it was not read that far:
+/// [`take_nesting_cap_notes`] turns these into the extraction's diagnostics.
+pub(crate) fn note_nesting_cap(walker: &'static str) {
+    NESTING_CAPS.with(|caps| *caps.borrow_mut().entry(walker).or_default() += 1);
+}
+
+/// One diagnostic per walker that hit [`TYPE_NESTING_MAX_DEPTH`] in this file.
+fn take_nesting_cap_notes() -> Vec<String> {
+    NESTING_CAPS.with(|caps| {
+        std::mem::take(&mut *caps.borrow_mut())
+            .into_iter()
+            .map(|(walker, count)| {
+                format!(
+                    "{walker} stopped at {TYPE_NESTING_MAX_DEPTH} levels of nesting {count} \
+                     time(s) and stated no type there; what those types would have bound is \
+                     not recorded"
+                )
+            })
+            .collect()
+    })
 }
 
 /// Drop the per-scope local-name cache between files.
@@ -9922,6 +10574,14 @@ fn collect_site_bindings(
                     // reader; the shared passes read `identifier` and a
                     // `parameters` list, neither of which the grammar has.
                     let bound = crate::swiftscope::bindings(scope, source);
+                    // `if let task = task(from: x)`: the binding is not in scope in
+                    // its own initializer, so the use names the outer `task`.
+                    if bound.contains_key(name)
+                        && crate::swiftscope::use_is_in_own_initializer(node, source, name)
+                    {
+                        ancestor = bounded_parent(scope);
+                        continue;
+                    }
                     if let Some(written) = bound.get(name) {
                         let initializer = written.init.clone();
                         let written = written.ty.clone();
@@ -10698,6 +11358,37 @@ fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet
     }
 }
 
+/// Every name a JS/TS file's top-level `const`/`let`/`var` declarations bind,
+/// destructuring included, whether or not the declaration is exported.
+fn js_module_scope_names(root: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let declaration = match statement.kind() {
+            "export_statement" => statement.child_by_field_name("declaration"),
+            _ => Some(statement),
+        };
+        let Some(declaration) = declaration.filter(|declaration| {
+            matches!(
+                declaration.kind(),
+                "lexical_declaration" | "variable_declaration"
+            )
+        }) else {
+            continue;
+        };
+        let mut inner = declaration.walk();
+        for declarator in declaration.named_children(&mut inner) {
+            if declarator.kind() != "variable_declarator" {
+                continue;
+            }
+            if let Some(target) = declarator.child_by_field_name("name") {
+                names.extend(js_pattern_bound_names(target, source));
+            }
+        }
+    }
+    names
+}
+
 fn collect_scope_locals(
     root: Node,
     source: &str,
@@ -10743,12 +11434,32 @@ fn collect_scope_locals(
                     // per-scope set.
                     collect_type_parameter_names(node, source, entry);
                     if lang == "swift" {
-                        entry.extend(crate::swiftscope::bindings(node, source).keys().cloned());
+                        // A dotted key (`open.transform`) types a member path, not a name.
+                        entry.extend(
+                            crate::swiftscope::bindings(node, source)
+                                .keys()
+                                .filter(|name| !name.contains('.'))
+                                .cloned(),
+                        );
                     }
                 }
             }
         }
         push_children(node, &mut worklist);
+    }
+    // A JS/TS module-scope `const x = …` is a binding of the file itself, keyed
+    // by the file's own name — the caller a module-level call reports. Only the
+    // exported ones become symbols, so without this a private
+    // `const fetchThing = vi.fn()` was invisible and `fetchThing()` bound to
+    // whichever other file exports that name.
+    if matches!(lang, "javascript" | "typescript" | "tsx") {
+        let module_names = js_module_scope_names(root, source);
+        if !module_names.is_empty() {
+            by_scope
+                .entry(file_symbol_name.to_string())
+                .or_default()
+                .extend(module_names);
+        }
     }
     by_scope
         .into_iter()
@@ -12636,11 +13347,10 @@ mod tests {
     /// qualification of impl items, and `f.go::Client.Run` is SC9's receiver
     /// ownership, without which Go method edges do not join at all.
     ///
-    /// This is a record of current behavior, not an endorsement of it. Two
-    /// entries are parity artifacts rather than intent: a TS `type` alias is
-    /// reported as `Interface`, and a Go `interface` type as `Struct`. They are
-    /// pinned so that changing them is a visible decision instead of a silent
-    /// drift.
+    /// This is a record of current behavior, not an endorsement of it. One
+    /// entry is a parity artifact rather than intent: a TS `type` alias is
+    /// reported as `Interface`. It is pinned so that changing it is a visible
+    /// decision instead of a silent drift.
     ///
     /// Exported module-level bindings *are* emitted now (`f.go::Limit`); this
     /// golden previously pinned their absence as deliberate, which is how the
@@ -12674,6 +13384,7 @@ mod tests {
                 &[
                     (SymbolKind::File, "f.ts", true),
                     (SymbolKind::Interface, "f.ts::Shape", true),
+                    (SymbolKind::Method, "f.ts::Shape.area", true),
                     (SymbolKind::Interface, "f.ts::Alias", true),
                     (SymbolKind::Class, "f.ts::Box", true),
                     (SymbolKind::Method, "f.ts::Box.area", true),
@@ -15534,5 +16245,230 @@ mod parent_work_regression {
             reads < 500,
             "reconstructed {reads} root walks for 500 functions"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_deadlines_and_nesting_caps {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A C macro body inside [`C_MACRO_BODY_MAX_BYTES`] whose parse is real
+    /// work: thousands of calls, so the parser is polled many times before it
+    /// could finish.
+    fn c_macro_body() -> String {
+        let mut body = String::new();
+        while body.len() + 32 < 60 * 1024 {
+            body.push_str("helper(a, b); other(c); ");
+        }
+        assert!(
+            body.len() <= C_MACRO_BODY_MAX_BYTES,
+            "the byte cap stays the bound"
+        );
+        body
+    }
+
+    #[test]
+    fn a_c_probe_stops_at_the_file_deadline_and_refuses_the_file() {
+        let body = c_macro_body();
+        {
+            // The file's deadline has already passed when the probe starts: a
+            // parse that ran to completion here returned after its deadline.
+            let _armed = BudgetGuard::arm(Instant::now());
+            let started = Instant::now();
+            assert!(
+                parse_c_probe("c", &body).is_none(),
+                "a probe past the file's deadline must not hand back a tree"
+            );
+            assert!(walk_overran(), "the probe's stop must refuse the file");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+        // The reused probe parser was reset by the cancel: the next fragment is
+        // parsed from its own start, not appended to the cancelled parse.
+        let _armed = BudgetGuard::arm(Instant::now() + Duration::from_secs(30));
+        let text = "int f(void) { return g(); }";
+        let tree = parse_c_probe("c", text).expect("a probe inside its deadline parses");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(tree.root_node().end_byte(), text.len());
+    }
+
+    #[test]
+    fn a_cancelled_parse_leaves_its_parser_ready_for_new_text() {
+        let (_, language) = grammar_for("c").expect("the C grammar is linked");
+        let mut parser = Parser::new();
+        parser.set_language(&language).expect("the C grammar loads");
+        let (tree, cancelled) = parse_until(&mut parser, &c_macro_body(), Instant::now());
+        assert!(
+            cancelled && tree.is_none(),
+            "the parse must be cancelled mid-way"
+        );
+        let text = "int f(void) { return g(); }";
+        let (tree, cancelled) =
+            parse_until(&mut parser, text, Instant::now() + Duration::from_secs(30));
+        let tree = tree.expect("the next parse completes");
+        assert!(!cancelled);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(tree.root_node().end_byte(), text.len());
+    }
+
+    #[test]
+    fn a_rust_macro_probe_stops_at_the_file_deadline() {
+        let inner = "a.work(), helper(b)";
+        let (calls, nested) = {
+            let _armed = BudgetGuard::arm(Instant::now() + Duration::from_secs(30));
+            probe_macro_body(inner)
+        };
+        assert!(
+            calls.iter().any(|(name, _)| name == "helper"),
+            "inside its deadline the probe reads the body: {calls:?}"
+        );
+        assert!(nested.is_empty());
+
+        let _armed = BudgetGuard::arm(Instant::now());
+        let (calls, nested) = probe_macro_body(inner);
+        assert!(
+            calls.is_empty() && nested.is_empty(),
+            "past the deadline the probe neither parses nor falls back to a scan: {calls:?}"
+        );
+        assert!(walk_overran(), "the probe's stop must refuse the file");
+    }
+
+    fn expire_the_armed_deadline() {
+        let deadline = WALK_DEADLINE.with(|slot| slot.get().expect("armed extraction"));
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(remaining);
+        }
+    }
+
+    /// Clears the probe hook even when an assertion fails first.
+    struct ClearProbeHook;
+    impl Drop for ClearProbeHook {
+        fn drop(&mut self) {
+            PROBE_START_HOOK.with(|hook| hook.set(None));
+        }
+    }
+
+    #[test]
+    fn a_file_whose_macro_probe_crosses_the_deadline_is_refused_not_published() {
+        let _clear = ClearProbeHook;
+        let source = format!(
+            "#define STAMP(x) {}\nint main(void) {{ return STAMP(1); }}\n",
+            c_macro_body()
+        );
+        PROBE_START_HOOK.with(|hook| hook.set(Some(expire_the_armed_deadline)));
+        let started = Instant::now();
+        let extraction =
+            extract_treesitter_with_budget("stamp.c", "c", &source, Duration::from_millis(300));
+        assert!(
+            PROBE_START_HOOK.with(|hook| hook.get().is_none()),
+            "the macro-body probe must be reached"
+        );
+        assert!(
+            matches!(&extraction.parse_outcome, ParseOutcome::Failed { reason } if reason.contains("budget")),
+            "a probe stopped by the deadline must refuse the file, got {:?}",
+            extraction.parse_outcome
+        );
+        assert_eq!(extraction.symbols.len(), 1, "only the File node may remain");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_c_probe_inside_its_deadline_reads_the_macro_body() {
+        let extraction = extract_treesitter_with_budget(
+            "stamp.c",
+            "c",
+            "void helper(int);\n#define STAMP(x) helper(x);\nint main(void) { STAMP(1); return 0; }\n",
+            Duration::from_secs(5),
+        );
+        assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+        assert!(
+            extraction
+                .calls
+                .iter()
+                .any(|call| call.callee_name == "helper"
+                    && call.caller_symbol.as_deref() == Some("stamp.c::STAMP")),
+            "{:?}",
+            extraction.calls
+        );
+    }
+
+    fn implicit_add_receivers(operand: &str) -> (Vec<Option<String>>, Vec<String>) {
+        let source = format!("struct V;\nfn f(a: V, b: V) {{ let _ = {operand} + b; }}\n");
+        let extraction =
+            extract_treesitter_with_budget("ops.rs", "rust", &source, Duration::from_secs(10));
+        assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+        let receivers = extraction
+            .rust_implicit_calls
+            .iter()
+            .filter(|call| call.callee_name == "add")
+            .map(|call| call.receiver_expr.clone())
+            .collect();
+        (receivers, extraction.diagnostics)
+    }
+
+    #[test]
+    fn shallow_rust_operands_keep_their_receiver_and_say_nothing() {
+        for operand in ["a", "(a)", "&a", "(&(a))", "&&a"] {
+            let (receivers, diagnostics) = implicit_add_receivers(operand);
+            assert_eq!(receivers, vec![Some("a".to_string())], "{operand}");
+            assert!(diagnostics.is_empty(), "{operand}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn a_rust_operand_is_unwrapped_to_the_cap_and_no_further() {
+        let at_cap = format!(
+            "{}a{}",
+            "(".repeat(TYPE_NESTING_MAX_DEPTH),
+            ")".repeat(TYPE_NESTING_MAX_DEPTH)
+        );
+        let (receivers, diagnostics) = implicit_add_receivers(&at_cap);
+        assert_eq!(receivers, vec![Some("a".to_string())]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let past_cap = format!("({at_cap})");
+        let (receivers, diagnostics) = implicit_add_receivers(&past_cap);
+        assert!(
+            receivers.is_empty(),
+            "past the cap no receiver is claimed: {receivers:?}"
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the abstention is recorded once: {diagnostics:?}"
+        );
+        assert!(diagnostics[0]
+            .starts_with("rust_typed_operand stopped at 16 levels of nesting 1 time(s)"));
+    }
+
+    #[test]
+    fn a_deep_let_initializer_still_answers_same_name_shadowing() {
+        // `let g = ((g()))` calls the item `g`: the binding is not in scope in
+        // its own initializer. Asked through `node_contains`, which no longer
+        // recurses; shallow and deep answers must agree.
+        for depth in [0usize, 3, 40] {
+            let source = format!(
+                "fn g() -> u8 {{ 1 }}\nfn f() {{ let g = {}g(){}; }}\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            let extraction =
+                extract_treesitter_with_budget("let.rs", "rust", &source, Duration::from_secs(10));
+            assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+            assert!(
+                extraction.calls.iter().any(|call| call.callee_name == "g"
+                    && call.caller_symbol.as_deref() == Some("let.rs::f")),
+                "depth {depth}: {:?}",
+                extraction.calls
+            );
+        }
     }
 }

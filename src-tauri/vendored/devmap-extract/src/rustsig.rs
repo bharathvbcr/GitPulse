@@ -237,6 +237,90 @@ fn bound_of<'a>(header: &Header<'a>, name: &str) -> Option<&'a str> {
     None
 }
 
+/// The one trait a bound list (`Render + Send + 'a`) names. Lifetimes,
+/// `?Sized`-style relaxations and the auto traits declare no methods and are
+/// skipped; `None` when no named bound or more than one remains, so
+/// `A + B` is never read as one of its traits.
+pub fn single_trait_bound(bounds: &str) -> Option<&str> {
+    let mut named = split_top(bounds, '+')
+        .into_iter()
+        .map(str::trim)
+        .filter(|bound| names_a_trait(bound));
+    let only = named.next()?;
+    named.next().is_none().then_some(only)
+}
+
+/// Whether one written bound can supply methods: not a lifetime, not a
+/// `?Sized`-style relaxation, not an auto trait.
+fn names_a_trait(bound: &str) -> bool {
+    const AUTO_TRAITS: &[&str] = &["Send", "Sync", "Unpin"];
+    !bound.is_empty()
+        && !bound.starts_with('\'')
+        && !bound.starts_with('?')
+        && !AUTO_TRAITS.contains(&bound)
+}
+
+/// What a fn header says about the name `name` used as a type inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericParam<'a> {
+    /// The header declares no generic parameter of that name.
+    NotDeclared,
+    /// A generic parameter bounded by exactly one named trait, as written.
+    OneTrait(&'a str),
+    /// A generic parameter with no usable bound, or several: it is not any
+    /// one type, and a namesake type elsewhere is not what it means.
+    Other,
+}
+
+/// Whether `name` is a generic type parameter of this header, and its one
+/// trait bound — gathered from the angle brackets and the `where` clause
+/// together, since `fn f<T: A>(..) where T: B` bounds `T` by both.
+pub fn generic_param<'a>(header: &Header<'a>, name: &str) -> GenericParam<'a> {
+    let declared = header.generics.is_some_and(|list| {
+        split_top(list, ',').into_iter().any(|clause| {
+            let head = split_once_top(clause, ':').map_or(clause, |(head, _)| head);
+            let head = split_once_top(head, '=').map_or(head, |(head, _)| head);
+            head.trim() == name
+        })
+    });
+    if !declared {
+        return GenericParam::NotDeclared;
+    }
+    let mut bounds: Vec<&str> = Vec::new();
+    let clauses = header
+        .generics
+        .into_iter()
+        .chain(header.where_clause)
+        .flat_map(|list| split_top(list, ','));
+    for clause in clauses {
+        let Some((bounded, written)) = split_once_top(clause, ':') else {
+            continue;
+        };
+        if bounded.trim() != name {
+            continue;
+        }
+        let written = split_once_top(written, '=').map_or(written, |(bound, _)| bound);
+        bounds.extend(
+            split_top(written, '+')
+                .into_iter()
+                .map(str::trim)
+                .filter(|bound| !bound.is_empty()),
+        );
+    }
+    let named: Vec<&str> = bounds.into_iter().filter(|b| names_a_trait(b)).collect();
+    match named.as_slice() {
+        [one] => {
+            let bare = one.rsplit("::").next().unwrap_or(one);
+            if is_ident(bare) {
+                GenericParam::OneTrait(bare)
+            } else {
+                GenericParam::Other
+            }
+        }
+        _ => GenericParam::Other,
+    }
+}
+
 /// `self`, `mut self`, `&self`, `&mut self`, `&'a self`, `self: Box<Self>`.
 fn is_self_param(param: &str) -> bool {
     let param = param.trim();

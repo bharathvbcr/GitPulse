@@ -507,6 +507,16 @@ pub struct BlastLayer {
     /// the band is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lowest_confidence: Option<f32>,
+    /// Sampled nodes first reached by an edge that is not interface dispatch.
+    /// Empty, and omitted, when this radius contains no dispatch edge — a
+    /// direct-only answer keeps the wire form it had before these fields.
+    /// A node reached by both kinds in the same band is listed in both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct: Vec<String>,
+    /// Sampled nodes first reached by a `Dispatch` edge. Same omission rule
+    /// as `direct`. Depth is unchanged: a dispatch caller is still one hop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch: Vec<String>,
 }
 
 /// What an inbound walk from a set of seeds reaches, banded by distance.

@@ -20,6 +20,13 @@ use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
 
 mod pytypes;
 
+/// The key a wildcard import (`from m import *`, `export * from 'm'`) takes in
+/// `external_imports` and `unindexed_local_imports` when its module is not
+/// indexed. Not a spelling any identifier can have, so it never collides with a
+/// bound name; it is read by [`Resolver::names_a_non_local_import`], which is
+/// why a star import blocks bare-name binding to a namesake.
+const STAR_IMPORT: &str = "*";
+
 /// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
 /// the file that declares it, its qualified name, and its kind.
 type PackageDecl = (String, String, SymbolKind);
@@ -315,6 +322,15 @@ pub struct Resolver {
     /// [`Self::index_project_manifests`], which a caller runs before
     /// [`Self::index_extractions`]; that one builds `rust_crate_roots` from it.
     rust_manifest_crates: Vec<devmap_extract::RustCrateManifest>,
+    /// Indexed crate root files a manifest places by hand (`[lib] path`,
+    /// `[[bin]] path`), keyed by the directory each keeps its modules in.
+    /// The path convention (`src/lib.rs`, `src/main.rs`) cannot see them: a
+    /// library at `lib/core.rs` has no `src` ancestor to be relative to and a
+    /// stem that reads as a leaf module. Built with `rust_crate_roots`.
+    rust_declared_roots: BTreeMap<String, BTreeSet<String>>,
+    /// The library root file a manifest's `[lib] path` names, by the directory
+    /// `rust_crate_roots` records for that crate — what a bare crate name is.
+    rust_declared_libs: BTreeMap<String, String>,
     /// The Python source roots each manifest declares, deepest directory
     /// first. Set by [`Self::index_project_manifests`]; read by
     /// [`Self::python_root_candidates`].
@@ -338,6 +354,14 @@ pub struct Resolver {
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
+    /// Set when the glob expansion behind `reexport_chains` stopped at
+    /// `REEXPORT_GLOB_MAX_HOPS`, so the chains are a partial map. See
+    /// [`Self::reexport_glob_cutoff`].
+    reexport_glob_cutoff: Option<ReexportGlobCutoff>,
+    /// Rust: `<file>` -> the module files its `pub use m::*;` globs name. A
+    /// module path segment that is no child of a file may be a module one of
+    /// these publishes (see `rust_module_through_globs`).
+    rust_module_globs: BTreeMap<String, Vec<String>>,
     /// `<file>` -> the local binding its `export default` publishes. What an
     /// importer's `import X from` and a barrel's `export { default } from` ask
     /// for by the name `default`; see `default_binding`.
@@ -553,6 +577,9 @@ pub struct Resolver {
     /// Kotlin/Java `package` header per file: every file of one package shares
     /// an unqualified namespace, test source sets included.
     jvm_package_by_file: BTreeMap<String, String>,
+    /// Every name any Swift file declares with `typealias`; see
+    /// [`Extraction::swift_type_aliases`].
+    swift_type_aliases: BTreeSet<String>,
     /// `(package, declared name)` to the files of that package declaring it:
     /// what a Kotlin/Java `import a.b.name` is read against, because a
     /// top-level function or an extension is not in a file named for it.
@@ -593,6 +620,10 @@ pub struct Resolver {
     /// Rust type name → the type it `Deref`s to; `None` when two indexed
     /// `impl Deref` blocks disagree about a type of that name.
     rust_deref_targets: BTreeMap<String, Option<String>>,
+    /// Method name → every Rust method a blanket impl declares under that name
+    /// (`T.describe` for `impl<T: Display> Describe for T`), as `(file,
+    /// identity)`. See `Extraction::rust_blanket_impl_params`.
+    rust_blanket_methods: BTreeMap<String, Vec<(String, String)>>,
     /// Slash-separated components in the deepest path this resolver indexed.
     ///
     /// The module ladders in [`Self::resolve_import_path`] walk a specifier
@@ -642,12 +673,16 @@ impl Resolver {
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
             rust_manifest_crates: Vec::new(),
+            rust_declared_roots: BTreeMap::new(),
+            rust_declared_libs: BTreeMap::new(),
             python_manifest_roots: Vec::new(),
             py_package_parents: BTreeMap::new(),
             swift_targets: Vec::new(),
             rust_signatures: BTreeMap::new(),
             unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
+            reexport_glob_cutoff: None,
+            rust_module_globs: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -681,6 +716,7 @@ impl Resolver {
             go_model: GoModel::default(),
             swift_module_by_file: BTreeMap::new(),
             jvm_package_by_file: BTreeMap::new(),
+            swift_type_aliases: BTreeSet::new(),
             jvm_package_symbols: BTreeMap::new(),
             field_initializers: BTreeMap::new(),
             gradle_module_dirs: Vec::new(),
@@ -689,6 +725,7 @@ impl Resolver {
             scope_locals: BTreeSet::new(),
             rust_inline_modules: BTreeMap::new(),
             rust_deref_targets: BTreeMap::new(),
+            rust_blanket_methods: BTreeMap::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
         }
@@ -1501,6 +1538,18 @@ impl Resolver {
             ))
     }
 
+    /// Whether `file` itself binds `name` at module scope without declaring a
+    /// symbol for it — a JS/TS private `const fetchThing = vi.fn()`, which the
+    /// extractor files under the file's own name in `scope_locals`.
+    ///
+    /// Deliberately not folded into [`Self::scope_declares_local`]: that one is
+    /// asked about receivers too, and a module-scope singleton is a receiver
+    /// the member rungs already type; this answers the bare-name question only.
+    fn file_scope_declares(&self, file: &str, name: &str) -> bool {
+        self.scope_locals
+            .contains(&(file.to_string(), file.to_string(), name.to_string()))
+    }
+
     /// Whether `root`, written as a receiver's first segment, is a **value**
     /// at this site rather than a module or crate name.
     ///
@@ -1538,6 +1587,24 @@ impl Resolver {
     /// one-hop field receivers (`w.Priority.valid()`, `h.engine.tick()`) via
     /// the field's Type ref keyed by owning type.
     fn receiver_type_for(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        name: &str,
+        binding: Option<&devmap_extract::model::LocalBinding>,
+    ) -> Option<String> {
+        let ty = self.receiver_type_unchecked(file, scope, name, binding)?;
+        // A Swift file that writes `Entry` cannot tell a top-level `Entry` from
+        // a member alias another file introduces (`extension Host { typealias
+        // Entry = Item }`); only this pass sees every file. A name some file
+        // declares with `typealias` types nothing, as the in-file case already
+        // does in the extractor.
+        let aliased = self.family_of_file(file) == Some(LangFamily::Swift)
+            && self.swift_type_aliases.contains(ty.as_str());
+        (!aliased).then_some(ty)
+    }
+
+    fn receiver_type_unchecked(
         &self,
         file: &str,
         scope: Option<&str>,
@@ -1634,8 +1701,14 @@ impl Resolver {
             {
                 return Some(typed.clone());
             }
-            if let Some(declared) = self.lookup_declared_type_name(file, Some(scope), name) {
-                return Some(declared);
+            // This scope's own declaration only: the owner-less `file:name@type`
+            // slot is the file-wide rung's, asked last, because it holds
+            // whichever type in the file wrote that name.
+            if let Some(typed) = self
+                .declared_types
+                .get(&format!("{file}:{scope}:{name}@type"))
+            {
+                return Self::admissible_nominal_type(typed);
             }
             if self.scope_declares_local(file, scope, name) {
                 return None;
@@ -1647,6 +1720,21 @@ impl Resolver {
             // knows nothing about which type a name belongs to.
             if let Some(member) = self.member_declared_type(file, Some(scope), name) {
                 return Some(member);
+            }
+            // A member the enclosing type constructs (`var engine = Other()`)
+            // is typed under that type's own scope. Asked before the
+            // file-wide maps below, which hold one slot per name and would
+            // answer with a sibling type's same-named member.
+            if let Some(owner) = self.declaring_type_of(file, scope) {
+                if let Some(typed) = [
+                    format!("{file}:{file}::{owner}:{name}"),
+                    format!("{file}:{owner}:{name}"),
+                ]
+                .iter()
+                .find_map(|key| self.scoped_receiver_types.get(key))
+                {
+                    return Some(typed.clone());
+                }
             }
         }
         self.receiver_types
@@ -1703,6 +1791,22 @@ impl Resolver {
 
     /// How many `Deref` hops a method lookup follows.
     const RUST_DEREF_HOPS: usize = 4;
+
+    /// The one method a Rust blanket impl declares under `method`, for a
+    /// receiver whose own type (and every type it derefs to) declares none.
+    ///
+    /// The impl's bound is not checked — that needs the trait solver — so two
+    /// blanket impls declaring the name abstain rather than pick one. One is
+    /// bound as `UniqueGlobal` (HIGH), not `ReceiverType`: nothing about the
+    /// receiver's type names it, only being the one blanket declaration of the
+    /// name in the family. It does not see a method the standard library
+    /// supplies under the same name.
+    fn rust_blanket_method(&self, method: &str) -> Option<&(String, String)> {
+        match self.rust_blanket_methods.get(method)?.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
 
     /// `x` for the guard chains `x.borrow`, `x.borrow_mut`, `x.lock.unwrap`,
     /// `x.lock.expect`, `x.read.unwrap`, `x.write.unwrap` (and `expect`) the
@@ -1895,8 +1999,65 @@ impl Resolver {
             nominal = self.declaring_type_of(callee_file, callee)?.to_string();
         }
         (self.unique_indexed_type(LangFamily::Rust, &nominal)
+            || self.unique_indexed_trait(&nominal)
             || self.names_one_type_in_both(file, callee_file, &nominal))
         .then_some(nominal)
+    }
+
+    /// A Rust receiver typed `T`, where `T` is a generic parameter of the
+    /// calling fn: the one trait that bounds it (`fn f<T: Render>(t: &T)`), so
+    /// the call reaches that trait's declaration of the method. A generic with
+    /// no usable bound, or several, is no type at all — `None`, rather than
+    /// letting a struct elsewhere that happens to be called `T` answer.
+    /// Any other type, and every other family, passes through unchanged.
+    fn rust_generic_receiver_type(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        ty: String,
+    ) -> Option<String> {
+        use devmap_extract::rustsig::{generic_param, parse_header, GenericParam};
+        if family != LangFamily::Rust {
+            return Some(ty);
+        }
+        let Some(header) = caller
+            .and_then(|caller| {
+                self.rust_signatures
+                    .get(&(file.to_string(), caller.to_string()))
+            })
+            .and_then(|signature| parse_header(signature))
+        else {
+            return Some(ty);
+        };
+        match generic_param(&header, &ty) {
+            GenericParam::NotDeclared => Some(ty),
+            GenericParam::OneTrait(bound) => Some(bound.to_string()),
+            GenericParam::Other => None,
+        }
+    }
+
+    /// Whether exactly one indexed Rust declaration of this name exists and it
+    /// is a trait: what `-> impl Render` / `-> Box<dyn Render>` names. A name
+    /// that is a trait in one crate and a struct in another is not one.
+    fn unique_indexed_trait(&self, name: &str) -> bool {
+        let mut rust = self.symbol_index.get(name).into_iter().flatten().filter(
+            |(_, kind, candidate_family, _)| {
+                LangFamily::Rust.admits(*candidate_family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+            },
+        );
+        matches!(
+            (rust.next(), rust.next()),
+            (Some((_, SymbolKind::Trait, _, _)), None)
+        )
     }
 
     /// The type a Rust binding has according to a **function header** in the
@@ -2064,6 +2225,16 @@ impl Resolver {
         // are transparent. `Vec<Service>` is still refused here, exactly as
         // before, because `Vec` is not in that list.
         s = devmap_extract::deref::strip_deref_transparent(s);
+        // A Rust trait object or opaque type, `dyn Render` / `impl Render`: the
+        // value is "some Render", so the trait is the type a method on it is
+        // looked up in — which reaches the trait's declaration of the method,
+        // never an impl's (see `protocol_dispatch`). Only one named bound
+        // qualifies; auto traits and lifetimes add nothing a method can come
+        // from, but `dyn A + B` names two traits and is refused.
+        let s = match s.strip_prefix("dyn ").or_else(|| s.strip_prefix("impl ")) {
+            Some(bounds) => devmap_extract::rustsig::single_trait_bound(bounds)?,
+            None => s,
+        };
         if s.is_empty()
             || s.contains('<')
             || s.contains('>')
@@ -2157,7 +2328,6 @@ impl Resolver {
         let keys = [
             format!("{file}:{file}::{owner}:{field}@type"),
             format!("{file}:{owner}:{field}@type"),
-            format!("{file}:{field}@type"),
         ];
         for key in &keys {
             if let Some(typed) = self
@@ -2168,11 +2338,17 @@ impl Resolver {
                 return Some(typed);
             }
         }
-        // Unique Class/Struct hit for the field name when the Type ref only
-        // populated receiver_types (assigned_to = field name).
-        self.receiver_types
-            .get(&format!("{file}:{field}"))
-            .and_then(|t| Self::admissible_nominal_type(t))
+        // Unique Class/Struct hit for the field when the Type ref only
+        // populated the scoped receiver map. Keyed by the owning class like
+        // the declared slots above: the owner-less `file:field` key is one
+        // slot per file, so another class's same-named field would answer.
+        [
+            format!("{file}:{file}::{owner}:{field}"),
+            format!("{file}:{owner}:{field}"),
+        ]
+        .iter()
+        .find_map(|key| self.scoped_receiver_types.get(key))
+        .and_then(|t| Self::admissible_nominal_type(t))
     }
 
     /// Bare-name miss: [`NoNamesake`] when the corpus has no symbol of that
@@ -2259,7 +2435,9 @@ impl Resolver {
             if path != file {
                 return None;
             }
-            if family == LangFamily::Go && *kind == SymbolKind::Method {
+            if (family == LangFamily::Go && *kind == SymbolKind::Method)
+                || Self::never_a_call_target(family, *kind)
+            {
                 return None;
             }
             let identity = identity.as_ref();
@@ -2412,6 +2590,14 @@ impl Resolver {
             if local_gap.is_some_and(|imports| imports.contains_key(callee_name)) {
                 return UnresolvedClass::Unresolved;
             }
+            // A module-scope binding of the file itself (`const fetchThing =
+            // vi.fn()`). After the two import rungs, not with the enclosing
+            // scope's own binding above: a `const { x } = require('m')` is a
+            // module-scope declarator too, and the import is what says where
+            // it came from.
+            if self.file_scope_declares(file_path, callee_name) {
+                return UnresolvedClass::LocalBinding;
+            }
             // Type names obey the same binding precedence as callees:
             // `use other::String` and a generic `<String>` both shadow the
             // prelude. Qualified types were handled above; only a bare name
@@ -2452,12 +2638,26 @@ impl Resolver {
             // runtime puts it on the global object. Checked *after* the import
             // rung on purpose — an explicit `import { fetch } from 'node-fetch'`
             // is file-specific evidence and outranks a global name list.
-            return match crate::builtins::host_global_environment(family, callee_name) {
-                Some(environment) => UnresolvedClass::HostGlobal {
+            if let Some(environment) = crate::builtins::host_global_environment(family, callee_name)
+            {
+                return UnresolvedClass::HostGlobal {
                     environment: environment.to_string(),
-                },
-                None => self.bare_name_miss(callee_name),
-            };
+                };
+            }
+            // `from numpy import *`: nothing binds `zeros` by name, but the
+            // star import is where it may have come from, which is the evidence
+            // that kept it from a namesake. Last, so that a name an explicit
+            // import, a builtin or a host global already accounts for keeps
+            // the more specific label.
+            if let Some(module) = external.and_then(|imports| imports.get(STAR_IMPORT)) {
+                return UnresolvedClass::External {
+                    module: module.clone(),
+                };
+            }
+            if local_gap.is_some_and(|imports| imports.contains_key(STAR_IMPORT)) {
+                return UnresolvedClass::Unresolved;
+            }
+            return self.bare_name_miss(callee_name);
         };
 
         // A path receiver is rooted at its leftmost segment, so
@@ -2823,9 +3023,13 @@ impl Resolver {
         self.path_module_bindings.clear();
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
+        self.rust_declared_roots.clear();
+        self.rust_declared_libs.clear();
         self.rust_signatures.clear();
         self.unexported_symbols.clear();
         self.reexport_chains.clear();
+        self.reexport_glob_cutoff = None;
+        self.rust_module_globs.clear();
         self.default_exports.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -2854,6 +3058,7 @@ impl Resolver {
         self.go_model = GoModel::default();
         self.swift_module_by_file.clear();
         self.jvm_package_by_file.clear();
+        self.swift_type_aliases.clear();
         self.jvm_package_symbols.clear();
         self.field_initializers.clear();
         self.swift_module_files.clear();
@@ -2861,6 +3066,7 @@ impl Resolver {
         self.scope_locals.clear();
         self.rust_inline_modules.clear();
         self.rust_deref_targets.clear();
+        self.rust_blanket_methods.clear();
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -3007,6 +3213,31 @@ impl Resolver {
                     })
                     .or_insert_with(|| Some(target.clone()));
             }
+            if !ext.rust_blanket_impl_params.is_empty() {
+                for sym in ext
+                    .symbols
+                    .iter()
+                    .filter(|sym| sym.kind == SymbolKind::Method)
+                {
+                    let blanket = sym
+                        .parent_symbol
+                        .as_deref()
+                        .and_then(|parent| parent.rsplit("::").next())
+                        .is_some_and(|owner| {
+                            ext.rust_blanket_impl_params.iter().any(|p| p == owner)
+                        });
+                    if blanket {
+                        let hit = (ext.file_path.clone(), sym.qualified_name.clone());
+                        let hits = self
+                            .rust_blanket_methods
+                            .entry(sym.name.clone())
+                            .or_default();
+                        if !hits.contains(&hit) {
+                            hits.push(hit);
+                        }
+                    }
+                }
+            }
             if !ext.rust_inline_modules.is_empty() {
                 self.rust_inline_modules.insert(
                     ext.file_path.clone(),
@@ -3070,6 +3301,8 @@ impl Resolver {
                 self.go_package_dirs_unvouched
                     .insert(Self::parent_dir(&ext.file_path));
             }
+            self.swift_type_aliases
+                .extend(ext.swift_type_aliases.iter().cloned());
             if let Some(package) = ext.jvm_package.as_deref() {
                 self.jvm_package_by_file
                     .insert(ext.file_path.clone(), package.to_string());
@@ -3101,6 +3334,18 @@ impl Resolver {
                                 .as_deref()
                                 .is_none_or(|parent| parent == ext.file_path);
                             if !file_level {
+                                continue;
+                            }
+                            // `private` and `fileprivate` — the two levels Swift's
+                            // `is_exported` answers false for — confine a name to
+                            // its own file, so neither a sibling of the module nor
+                            // an importer can bind it. Indexing one anyway let
+                            // `import ChronosCore` put `DialDrag.swift`'s private
+                            // `forwardSpan` in scope for an app file whose struct
+                            // declares its own, and the struct's method — the real
+                            // target — was published dead (the audit's Swift row).
+                            // Same-file references never consult this index.
+                            if !sym.is_exported {
                                 continue;
                             }
                             self.swift_module_symbols
@@ -3192,33 +3437,79 @@ impl Resolver {
             let root = src_root.to_string();
             Self::claim_rust_crate_name(&mut rust_crate_roots, name, root);
         }
-        // The names a manifest gives the same roots. A package whose library
-        // is `[lib] name = "xlib"` is spelled `use xlib::…` by every caller,
-        // and its directory name is no help (GitPulse: `src-tauri`, package
-        // `gitpulse`, lib `gitpulse_lib`). Only where the crate's own root
-        // file is indexed, and under the same abstain-on-conflict rule.
+        // The target roots a manifest places by hand. Only indexed ones: a
+        // path the manifest names that is not in the corpus is the manifest
+        // pass's refusal row, not a root to resolve against.
+        let mut declared_roots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut declared_libs: BTreeMap<String, String> = BTreeMap::new();
+        let mut shared_lib_dirs: BTreeSet<String> = BTreeSet::new();
         for manifest in &self.rust_manifest_crates {
-            let src_root = if manifest.dir.is_empty() {
-                "src".to_string()
-            } else {
-                format!("{}/src", manifest.dir)
-            };
-            let indexed = ["lib.rs", "main.rs"].iter().any(|file| {
-                self.file_symbols
-                    .contains_key(&format!("{src_root}/{file}"))
-            });
-            if !indexed {
-                continue;
-            }
-            for name in &manifest.names {
-                if rust_crate_roots.get(name).and_then(Option::as_deref) == Some(src_root.as_str())
-                {
-                    continue;
+            for file in manifest.lib_path.iter().chain(&manifest.bin_paths) {
+                if self.file_symbols.contains_key(file) {
+                    declared_roots
+                        .entry(Self::parent_dir(file))
+                        .or_default()
+                        .insert(file.clone());
                 }
-                Self::claim_rust_crate_name(&mut rust_crate_roots, name.clone(), src_root.clone());
+            }
+            if let Some(lib) = manifest
+                .lib_path
+                .as_ref()
+                .filter(|lib| self.file_symbols.contains_key(*lib))
+            {
+                let dir = Self::parent_dir(lib);
+                if declared_libs.get(&dir).is_some_and(|held| held != lib) {
+                    shared_lib_dirs.insert(dir);
+                } else {
+                    declared_libs.insert(dir, lib.clone());
+                }
             }
         }
+        // The names a manifest gives its roots. A package whose library is
+        // `[lib] name = "xlib"` is spelled `use xlib::…` by every caller, and
+        // its directory name is no help (GitPulse: `src-tauri`, package
+        // `gitpulse`, lib `gitpulse_lib`). Only where the crate's own root
+        // file is indexed. Two manifests claiming one name abstain, as two
+        // directories do; a manifest's name outranks a directory's guess at
+        // one, which is a convention and not a declaration.
+        let mut manifest_claims: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for manifest in &self.rust_manifest_crates {
+            let src_root = match &manifest.lib_path {
+                Some(lib) => {
+                    if !self.file_symbols.contains_key(lib) {
+                        continue;
+                    }
+                    Self::parent_dir(lib)
+                }
+                None => {
+                    let src_root = Self::rel_join(&manifest.dir, "src");
+                    let indexed = ["lib.rs", "main.rs"].iter().any(|file| {
+                        self.file_symbols
+                            .contains_key(&format!("{src_root}/{file}"))
+                    });
+                    if !indexed {
+                        continue;
+                    }
+                    src_root
+                }
+            };
+            for name in &manifest.names {
+                // Two libraries rooted in one directory: the directory cannot
+                // say which root a name means.
+                if shared_lib_dirs.contains(&src_root) {
+                    manifest_claims.insert(name.clone(), None);
+                    continue;
+                }
+                Self::claim_rust_crate_name(&mut manifest_claims, name.clone(), src_root.clone());
+            }
+        }
+        rust_crate_roots.extend(manifest_claims);
+        for dir in &shared_lib_dirs {
+            declared_libs.remove(dir);
+        }
         self.rust_crate_roots = rust_crate_roots;
+        self.rust_declared_roots = declared_roots;
+        self.rust_declared_libs = declared_libs;
         // Python packages this corpus indexes, by the name an absolute import
         // would spell: every directory holding an indexed `__init__.py`.
         let python_packages: BTreeSet<String> = self
@@ -3293,7 +3584,9 @@ impl Resolver {
                     .map(|local| (ext.file_path.clone(), local))
             })
             .collect();
-        self.reexport_chains = self.compute_reexport_chains(extractions);
+        (self.reexport_chains, self.reexport_glob_cutoff) =
+            self.compute_reexport_chains(extractions);
+        self.rust_module_globs = self.compute_rust_module_globs(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
@@ -3394,11 +3687,7 @@ impl Resolver {
                 // file edge, which the resolution pass emits.
                 if let Some(load) = &imp.path_load {
                     if let Some(local) = imp.alias.as_ref() {
-                        if let Some(target) = self.resolve_path_load(
-                            &ext.file_path,
-                            &imp.module_specifier,
-                            load.anchor_up,
-                        ) {
+                        if let Some(target) = self.resolve_loaded_module(ext, imp, load) {
                             file_path_modules.insert((load.scope.clone(), local.clone()), target);
                         }
                     }
@@ -3595,6 +3884,33 @@ impl Resolver {
                         unresolved_import(local, &imp.module_specifier);
                         continue;
                     };
+                    // `from m import *`, marked by the alias `*` as a Go
+                    // dot-import is by `.`. The wildcard names nothing, but it is
+                    // evidence about every bare name in the file, and is kept as
+                    // such rather than dropped:
+                    //
+                    // * a source the tree does not index took the early exit
+                    //   above and sits under [`STAR_IMPORT`] in the external or
+                    //   unindexed half, which every bare-name rung reads as "this
+                    //   name may come from there" and so will not bind to a
+                    //   namesake;
+                    // * an indexed source binds the names it declares at file
+                    //   level, as Python does — public ones only, and never over
+                    //   an explicit import, which `or_insert_with` keeps.
+                    if alias == Some(STAR_IMPORT) {
+                        for file in targets.iter().filter(|file| **file != ext.file_path) {
+                            for symbol in self.file_symbols.get(file).into_iter().flatten() {
+                                if !symbol.starts_with('_')
+                                    && self.declared_at_file_level(file, symbol)
+                                {
+                                    file_bindings
+                                        .entry(symbol.clone())
+                                        .or_insert_with(|| (file.clone(), symbol.clone()));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if alias == Some(".") {
                         for file in &targets {
                             // X41. A glob of the file's *own* module —
@@ -3938,7 +4254,8 @@ impl Resolver {
     /// is exactly where it gets large. Past this the expansion stops and the
     /// chains it would have built are simply absent, which is the answer the
     /// map gave before globs were expanded at all: a lost chain costs
-    /// precision, never a wrong edge.
+    /// precision, never a wrong edge. A lost chain is still a loss, so the stop
+    /// is recorded: [`Self::reexport_glob_cutoff`] reports it.
     const REEXPORT_GLOB_MAX_HOPS: usize = 200_000;
 
     /// Turn each glob re-export into one hop per name the target publishes.
@@ -3955,27 +4272,30 @@ impl Resolver {
     /// And a name that *two* globs bring in from two different files has no
     /// single true source — Rust rejects such a program outright — so it is
     /// recorded from neither, on the same rule the cycle follows: picking one
-    /// endpoint would manufacture the certainty the map exists to supply.
+    /// endpoint would manufacture the certainty the map exists to supply. That
+    /// holds across rounds too: a hop a glob swept in on an earlier round is
+    /// reconsidered on every later one, and withdrawn — with every swept hop
+    /// built on it — when a second glob's target comes to publish the name.
+    ///
+    /// Returns the cutoff when the expansion stopped at `max_hops`, so the
+    /// partial map is never mistaken for a complete one.
     fn expand_glob_hops(
         hops: &mut BTreeMap<String, (String, String)>,
+        globs: &BTreeSet<(String, String)>,
         file_symbols: &BTreeMap<String, Vec<String>>,
-    ) {
-        // `(globbing file, target file)` for every `export * from` / `pub use m::*`.
-        let globs: Vec<(String, String)> = hops
-            .iter()
-            .filter(|(_, (_, name))| name == "*")
-            .filter_map(|(key, (target, _))| {
-                key.rsplit_once("::")
-                    .map(|(file, _)| (file.to_string(), target.clone()))
-            })
-            .collect();
+        max_hops: usize,
+    ) -> Option<ReexportGlobCutoff> {
         if globs.is_empty() {
-            return;
+            return None;
         }
 
+        // Keys this expansion inserted. Only these are ever reconsidered: an
+        // explicit re-export is the author's statement and outranks every glob.
+        let mut swept: BTreeSet<String> = BTreeSet::new();
         let mut poisoned: BTreeSet<String> = BTreeSet::new();
+        let mut cutoff = None;
         for _ in 0..Self::REEXPORT_CHAIN_MAX_DEPTH {
-            let additions = {
+            let (additions, conflicts) = {
                 // What each file publishes as of this round.
                 let mut published: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
                 for (file, names) in file_symbols {
@@ -3993,7 +4313,7 @@ impl Resolver {
                 }
 
                 let mut proposals: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-                for (from, target) in &globs {
+                for (from, target) in globs {
                     let Some(names) = published.get(target.as_str()) else {
                         continue;
                     };
@@ -4008,39 +4328,112 @@ impl Resolver {
                     let container = target.rsplit('/').next().unwrap_or(target.as_str());
                     for name in names.iter().filter(|name| **name != container) {
                         let key = format!("{from}::{name}");
-                        if hops.contains_key(&key) || poisoned.contains(&key) {
+                        if poisoned.contains(&key) {
                             continue;
                         }
-                        proposals.entry(key).or_default().insert(target.as_str());
+                        match hops.get(&key) {
+                            Some(_) if !swept.contains(&key) => continue,
+                            // Taken on an earlier round. It stays a candidate
+                            // beside this one, because a glob whose target only
+                            // publishes the name after its *own* expansion is a
+                            // second source the earlier round could not see.
+                            Some((recorded, _)) => {
+                                let sources = proposals.entry(key).or_default();
+                                sources.insert(recorded.as_str());
+                                sources.insert(target.as_str());
+                            }
+                            None => {
+                                proposals.entry(key).or_default().insert(target.as_str());
+                            }
+                        }
                     }
                 }
 
                 let mut additions: Vec<(String, (String, String))> = Vec::new();
+                let mut conflicts: Vec<String> = Vec::new();
                 for (key, targets) in proposals {
-                    let Some(name) = key.rsplit_once("::").map(|(_, name)| name.to_string()) else {
-                        continue;
-                    };
-                    let mut targets = targets.into_iter();
-                    let Some(first) = targets.next() else {
-                        continue;
-                    };
-                    if targets.next().is_some() {
-                        poisoned.insert(key);
+                    if targets.len() > 1 {
+                        conflicts.push(key);
                         continue;
                     }
-                    additions.push((key, (first.to_string(), name)));
+                    if hops.contains_key(&key) {
+                        // Already recorded, from this same source.
+                        continue;
+                    }
+                    let (Some((_, name)), Some(first)) =
+                        (key.rsplit_once("::"), targets.into_iter().next())
+                    else {
+                        continue;
+                    };
+                    let hop = (first.to_string(), name.to_string());
+                    additions.push((key, hop));
                 }
-                additions
+                (additions, conflicts)
             };
 
-            if additions.is_empty() {
+            if additions.is_empty() && conflicts.is_empty() {
                 break;
             }
-            for (key, hop) in additions {
-                if hops.len() >= Self::REEXPORT_GLOB_MAX_HOPS {
-                    return;
+            let total = additions.len();
+            for (inserted, (key, hop)) in additions.into_iter().enumerate() {
+                if hops.len() >= max_hops {
+                    cutoff = Some(ReexportGlobCutoff {
+                        limit: max_hops,
+                        dropped_at_least: total - inserted,
+                    });
+                    break;
                 }
+                swept.insert(key.clone());
                 hops.insert(key, hop);
+            }
+            // Withdrawn after this round's additions, not before, so a hop
+            // swept in *through* a conflicting key on this same round is found
+            // and withdrawn with it.
+            Self::poison_glob_hops(hops, &mut swept, &mut poisoned, conflicts);
+            if cutoff.is_some() {
+                break;
+            }
+        }
+        cutoff
+    }
+
+    /// Withdraw each conflicting key and every swept hop built on it.
+    ///
+    /// A name two globs publish has no source, so the file holding it does not
+    /// publish it either — and a later round's glob over that file swept in a
+    /// hop naming a source that no longer exists. Those are withdrawn and
+    /// poisoned too: the language rejects a use of the name through them for
+    /// the same ambiguity, and leaving them would let them keep publishing it.
+    fn poison_glob_hops(
+        hops: &mut BTreeMap<String, (String, String)>,
+        swept: &mut BTreeSet<String>,
+        poisoned: &mut BTreeSet<String>,
+        conflicts: Vec<String>,
+    ) {
+        if conflicts.is_empty() {
+            return;
+        }
+        // `"<file>::<name>"` a swept hop asks for -> the swept keys asking.
+        // Built once per call, so the cascade is linear in the swept hops
+        // rather than a scan of them per withdrawn key.
+        let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for key in swept.iter() {
+            if let Some((file, name)) = hops.get(key) {
+                dependents
+                    .entry(format!("{file}::{name}"))
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+        let mut queue = conflicts;
+        while let Some(key) = queue.pop() {
+            if !poisoned.insert(key.clone()) {
+                continue;
+            }
+            swept.remove(&key);
+            hops.remove(&key);
+            if let Some(downstream) = dependents.remove(&key) {
+                queue.extend(downstream);
             }
         }
     }
@@ -4128,19 +4521,21 @@ impl Resolver {
     /// site is left to `classify_unresolved`, which files it `external` or
     /// `unresolved` by the same two tables.
     ///
-    /// JS/TS only: its import statement is the one place the module a bare name
-    /// comes from is written, and the rule is not claimed for the other
-    /// families here.
-    fn is_bound_by_non_local_import(&self, file: &str, family: LangFamily, name: &str) -> bool {
-        family == LangFamily::JsTs
-            && (self
-                .external_imports
-                .get(file)
-                .is_some_and(|imports| imports.contains_key(name))
-                || self
-                    .unindexed_local_imports
-                    .get(file)
-                    .is_some_and(|imports| imports.contains_key(name)))
+    /// Every family, because both ladders read it through one owner,
+    /// [`Self::bare_name_has_other_evidence`]. It was JS/TS only in the reference
+    /// ladder while the call ladder applied it to all, which let `from typing
+    /// import Literal` bind a type reference to an in-repo `class Literal`.
+    ///
+    /// A wildcard import is evidence about *every* bare name the file uses: a
+    /// non-indexed `from numpy import *` is where a bare `zeros` may come from,
+    /// so it counts under [`STAR_IMPORT`] exactly as a named import does.
+    fn names_a_non_local_import(&self, file: &str, name: &str) -> bool {
+        let names = |imports: &BTreeMap<String, BTreeMap<String, String>>| {
+            imports.get(file).is_some_and(|imports| {
+                imports.contains_key(name) || imports.contains_key(STAR_IMPORT)
+            })
+        };
+        names(&self.external_imports) || names(&self.unindexed_local_imports)
     }
 
     /// The `(file, declared name)` a default import of `target` binds.
@@ -4210,10 +4605,46 @@ impl Resolver {
         }
     }
 
-    fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
+    /// Every Rust `pub use m::*;` as `(file, the one module file m names)`.
+    fn compute_rust_module_globs(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut globs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            for export in ext
+                .exports
+                .iter()
+                .filter(|export| export.exported_name == "*")
+            {
+                let Some(specifier) = export.module_specifier.as_deref() else {
+                    continue;
+                };
+                if let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, specifier)
+                {
+                    globs.entry(ext.file_path.clone()).or_default().push(target);
+                }
+            }
+        }
+        globs
+    }
+
+    fn compute_reexport_chains(
+        &self,
+        extractions: &[Extraction],
+    ) -> (BTreeMap<String, String>, Option<ReexportGlobCutoff>) {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
         let mut hops: BTreeMap<String, (String, String)> = BTreeMap::new();
+        // `(globbing file, target file)` for every `export * from` /
+        // `pub use m::*`. Kept apart from `hops` because a glob names no symbol:
+        // keyed `<file>::*` there, a file's second glob overwrote its first and
+        // only the last one was ever expanded.
+        let mut globs: BTreeSet<(String, String)> = BTreeSet::new();
         for ext in extractions {
             for export in &ext.exports {
                 let Some(specifier) = export.module_specifier.as_deref() else {
@@ -4231,6 +4662,10 @@ impl Resolver {
                     // would manufacture graph structure.
                     continue;
                 };
+                if export.exported_name == "*" {
+                    globs.insert((ext.file_path.clone(), target));
+                    continue;
+                }
                 // `export { a as b } from './m'` publishes `b` and asks `./m`
                 // for `a`. Defaulting to the exported name covers the common
                 // `export { a } from './m'`, where the two are equal.
@@ -4261,7 +4696,12 @@ impl Resolver {
         // The expansion cannot happen in the extractor, which sees one file at
         // a time while a glob names whatever *another* file declares. Here the
         // whole-corpus symbol table is in hand.
-        Self::expand_glob_hops(&mut hops, &self.file_symbols);
+        let cutoff = Self::expand_glob_hops(
+            &mut hops,
+            &globs,
+            &self.file_symbols,
+            Self::REEXPORT_GLOB_MAX_HOPS,
+        );
 
         let mut chains = BTreeMap::new();
         for key in hops.keys() {
@@ -4305,7 +4745,7 @@ impl Resolver {
                 }
             }
         }
-        chains
+        (chains, cutoff)
     }
 
     pub fn resolve_all(
@@ -4437,11 +4877,7 @@ impl Resolver {
                     let targets = match &imp.path_load {
                         // A `sys.path` entry is not an import of anything.
                         Some(load) if load.kind == PathLoadKind::SearchDirectory => continue,
-                        Some(load) => match self.resolve_path_load(
-                            &ext.file_path,
-                            &imp.module_specifier,
-                            load.anchor_up,
-                        ) {
+                        Some(load) => match self.resolve_loaded_module(ext, imp, load) {
                             // Already linked: neither a second edge nor a
                             // spurious "resolved to nothing" row.
                             Some(target) if !path_loaded.insert(target.clone()) => continue,
@@ -4477,6 +4913,7 @@ impl Resolver {
                             },
                             class: UnresolvedClass::Unresolved,
                             receiver: None,
+                            site: None,
                         });
                     }
                     let edge_targets = if ext.language == "go" {
@@ -4673,6 +5110,11 @@ impl Resolver {
                     // type that lives outside the index binds nothing in it.
                     // What it cannot tell falls through to the rungs below.
                     let mut go_class: Option<UnresolvedClass> = None;
+                    // A Rust receiver typed to an indexed struct or enum that
+                    // declares, derefs to, inherits and is blanket-supplied no
+                    // member of this name (set by the typed-receiver rung).
+                    let mut rust_member_miss = false;
+                    let mut typed_member_absent = false;
                     if resolution.is_none() {
                         if let Some(index) = &go_index {
                             match self.go_call(ext, index, call) {
@@ -4756,6 +5198,14 @@ impl Resolver {
                                 site_binding,
                             )
                             .filter(|_| family.admits(family))
+                            .and_then(|ty| {
+                                self.rust_generic_receiver_type(
+                                    &ext.file_path,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    ty,
+                                )
+                            })
                         {
                             // Python names its class: the file's own `class`
                             // statement, else the import that bound it. A flat
@@ -4792,22 +5242,57 @@ impl Resolver {
                                 .filter(|_| !class_is_known);
                             // Swift: a method the type does not write is the one
                             // a protocol extension or base class supplies.
+                            // Rust: a method the impl does not write is the
+                            // default body of a trait the type implements.
                             let inherited = (own.is_none()
-                                && family == LangFamily::Swift
+                                && matches!(family, LangFamily::Swift | LangFamily::Rust)
                                 && !self.type_methods.contains_key(&key))
-                            .then(|| self.inherited_method(family, &class_type, &call.callee_name))
+                            .then(|| {
+                                self.inherited_method(family, &class_type, &call.callee_name)
+                                    .map(|(file, symbol, _)| (file, symbol))
+                            })
                             .flatten();
+                            // Failing that, the one a Rust blanket impl
+                            // supplies — see `rust_blanket_method` for its tier.
+                            let blanket = (family == LangFamily::Rust
+                                && own.is_none()
+                                && inherited.is_none()
+                                && !self.type_methods.contains_key(&key))
+                            .then(|| self.rust_blanket_method(&call.callee_name))
+                            .flatten();
+                            // The type is known and declares nothing by that
+                            // name: a miss about the member, not the receiver.
+                            if family == LangFamily::Rust
+                                && own.is_none()
+                                && inherited.is_none()
+                                && blanket.is_none()
+                                && self.declares_type(family, &class_type)
+                            {
+                                rust_member_miss = true;
+                            }
+                            if let Some((target_f, target_symbol)) = blanket {
+                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    family,
+                                }));
+                            }
                             if let Some(((target_f, target_symbol), receiver_type)) = own
                                 .map(|(target, receiver_type)| (target.clone(), receiver_type))
                                 .or_else(|| {
-                                    inherited
-                                        .map(|(file, symbol, _)| ((file, symbol), class_type.clone()))
+                                    inherited.map(|(file, symbol)| ((file, symbol), class_type.clone()))
                                 })
                             {
                                 resolution = Some(match family {
-                                    // A receiver typed by a protocol is a call
-                                    // through it: see `protocol_dispatch`.
-                                    LangFamily::Swift => self
+                                    // A receiver typed by a protocol (Swift), a
+                                    // trait (Rust: `dyn T`, `impl T`, a `T`
+                                    // bound) or an interface (TypeScript) is a
+                                    // call through it: see `protocol_dispatch`.
+                                    // A class of the same name stays
+                                    // `ReceiverType`, because `protocol_dispatch`
+                                    // returns `None` unless every indexed hit is
+                                    // an interface or a trait.
+                                    LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => self
                                         .protocol_dispatch(family, &class_type, &call.callee_name)
                                         .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
@@ -4851,6 +5336,57 @@ impl Resolver {
                                     })
                                 }));
                             }
+                            // The method is not on this type, on a supertype, or
+                            // (Rust) on a type it derefs to. A later bare-name
+                            // rung would bind a namesake the type does not have.
+                            // Go has its own answer (`GoCall::Absent`), including
+                            // embeddings the flat tables do not see.
+                            if resolution.is_none()
+                                && family != LangFamily::Go
+                                && (family != LangFamily::Python || class_is_known)
+                                && self.indexed_type_lacks_member(
+                                    family,
+                                    &class_type,
+                                    &call.callee_name,
+                                )
+                            {
+                                resolution = Some(Arc::new(Resolution::Unresolved {
+                                    reason: format!(
+                                        "the receiver is a {class_type}, which declares no member {:?}",
+                                        call.callee_name
+                                    ),
+                                }));
+                                typed_member_absent = true;
+                            }
+                        }
+                    }
+
+                    // 1a. A Rust path through a generic parameter: `T::create()`
+                    // inside `fn f<T: Factory>()` names `Factory::create`, the
+                    // one declaration the bound states. Which impl runs is the
+                    // caller's choice of `T`, so each one is a dispatch candidate.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(bound) = call
+                            .receiver_expr
+                            .as_deref()
+                            .filter(|recv| Self::is_plain_ident(recv))
+                            .and_then(|recv| {
+                                self.rust_generic_receiver_type(
+                                    &ext.file_path,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    recv.to_string(),
+                                )
+                                .filter(|bound| bound != recv)
+                            })
+                        {
+                            if let Some((direct, targets)) =
+                                self.protocol_dispatch(family, &bound, &call.callee_name)
+                            {
+                                resolution = Some(self.dispatch_through_interface(
+                                    ext, call, &mut edges, &bound, direct, targets,
+                                ));
+                            }
                         }
                     }
 
@@ -4876,6 +5412,19 @@ impl Resolver {
                                     target_file: target_f.clone(),
                                     receiver_type: receiver_type.to_string(),
                                 }));
+                            } else if answers.is_empty() && !Self::rust_literal_types(recv).is_empty() {
+                                // No impl for the primitive itself: a blanket
+                                // impl (`impl<T: Display> Describe for T`) is
+                                // the one that can supply it.
+                                if let Some((target_f, target_symbol)) =
+                                    self.rust_blanket_method(&call.callee_name)
+                                {
+                                    resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                        target_symbol: target_symbol.clone(),
+                                        target_file: target_f.clone(),
+                                        family,
+                                    }));
+                                }
                             }
                         }
                     }
@@ -4921,7 +5470,9 @@ impl Resolver {
                                     // Inside a protocol extension `self` is any
                                     // conformer: `greet()` written in `extension
                                     // Greeter` is a call through the protocol.
-                                    let through_protocol = (family == LangFamily::Swift)
+                                    // A Rust trait's default body is the same:
+                                    // `self.hook()` there is any implementor's.
+                                    let through_protocol = matches!(family, LangFamily::Swift | LangFamily::Rust)
                                         .then(|| self.self_type_at(&ext.file_path, family, caller))
                                         .flatten()
                                         .and_then(|own| {
@@ -5124,7 +5675,14 @@ impl Resolver {
                             .is_none_or(Self::receiver_is_self)
                     {
                         if call.receiver_expr.is_none() {
-                            if let Some(target_symbol) = self.lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name) {
+                            if let Some(target_symbol) = self
+                                .lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
+                                .filter(|identity| {
+                                    !self.file_declares_as(&ext.file_path, identity, |kind| {
+                                        Self::never_a_call_target(family, kind)
+                                    })
+                                })
+                            {
                                 resolution = Some(Arc::new(Resolution::SameFile {
                                     target_symbol, target_file: ext.file_path.clone(),
                                 }));
@@ -5581,6 +6139,7 @@ impl Resolver {
                                     resolution: (**resolution).clone(),
                                     class: UnresolvedClass::Unresolved,
                                     receiver: call.receiver_expr.clone(),
+                                    site: Some(SiteBytes::of(&call.span)),
                                 });
                                 emitted = true;
                             }
@@ -5604,6 +6163,7 @@ impl Resolver {
                                         resolution: (**resolution).clone(),
                                         class: UnresolvedClass::Unresolved,
                                         receiver: call.receiver_expr.clone(),
+                                        site: Some(SiteBytes::of(&call.span)),
                                     });
                                 } else {
                                     for (target_f, target_sym) in candidates.iter() {
@@ -5640,20 +6200,32 @@ impl Resolver {
                         // D17 / R5: a call the ladder could not resolve is recorded,
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
-                        let class = go_class.unwrap_or_else(|| {
-                            self.classify_unresolved(
-                                &ext.file_path,
-                                family,
-                                &call.callee_name,
-                                call.receiver_expr.as_deref(),
-                                &caller_sym,
-                                UsePosition::value_at(
-                                    ext,
-                                    call.span.start_byte,
+                        let class = if typed_member_absent {
+                            UnresolvedClass::UnresolvedMember
+                        } else {
+                            go_class.unwrap_or_else(|| {
+                                match self.classify_unresolved(
+                                    &ext.file_path,
+                                    family,
+                                    &call.callee_name,
                                     call.receiver_expr.as_deref(),
-                                ),
-                            )
-                        });
+                                    &caller_sym,
+                                    UsePosition::value_at(
+                                        ext,
+                                        call.span.start_byte,
+                                        call.receiver_expr.as_deref(),
+                                    ),
+                                ) {
+                                    // The receiver was typed; only the member was
+                                    // not found. A class that explains the miss
+                                    // (no namesake anywhere, an external) stands.
+                                    UnresolvedClass::UninferredReceiver if rust_member_miss => {
+                                        UnresolvedClass::UnresolvedMember
+                                    }
+                                    class => class,
+                                }
+                            })
+                        };
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
                             source_symbol: caller_sym,
@@ -5670,8 +6242,46 @@ impl Resolver {
                             },
                             class,
                             receiver: call.receiver_expr.clone(),
+                            site: Some(SiteBytes::of(&call.span)),
                         });
                     }
+                }
+
+                // `?` into a function's `Result<_, E>`: a possible call to the
+                // `From::from` impl `E` declares, at the dispatch tier — the
+                // operand's error type is not known, and when it is already `E`
+                // the identity conversion runs instead (see
+                // `Extraction::rust_try_conversions`). A candidate that names no
+                // indexed impl is dropped, like an operator candidate.
+                for conversion in &ext.rust_try_conversions {
+                    let Some(error_type) = conversion.receiver_expr.as_deref() else {
+                        continue;
+                    };
+                    let key = (family, error_type.to_string(), conversion.callee_name.clone());
+                    let Some((target_f, target_sym)) = self
+                        .type_methods
+                        .get(&key)
+                        .and_then(|hits| self.type_method_target(&ext.file_path, error_type, hits))
+                    else {
+                        continue;
+                    };
+                    let resolution = Arc::new(Resolution::Dispatch {
+                        candidates: vec![(target_f.to_string(), target_sym.to_string())].into(),
+                        via_file: target_f.to_string(),
+                        via_symbol: "core::convert::From.from".to_string(),
+                    });
+                    edges.push(ResolvedEdge::resolved(
+                        ext.file_path.clone(),
+                        target_f.to_string(),
+                        conversion
+                            .caller_symbol
+                            .clone()
+                            .unwrap_or_else(|| ext.file_path.clone()),
+                        self.qualified_for(target_f, target_sym),
+                        EdgeKind::Calls,
+                        resolution,
+                        Some("via From.from (`?`)".to_string()),
+                    ));
                 }
 
                 for reference in &ext.references {
@@ -5789,6 +6399,7 @@ impl Resolver {
                         },
                         class,
                         receiver: reference.receiver_expr.clone(),
+                        site: Some(SiteBytes::of(&reference.span)),
                     });
                 }
 
@@ -5843,6 +6454,7 @@ impl Resolver {
                                     module: module.clone(),
                                 },
                                 receiver: entry.qualifier.clone(),
+                                site: None,
                             });
                             continue;
                         }
@@ -5878,6 +6490,7 @@ impl Resolver {
                                 },
                                 class: UnresolvedClass::Unresolved,
                                 receiver: entry.qualifier.clone(),
+                                site: None,
                             }),
                         }
                     }
@@ -5919,6 +6532,7 @@ impl Resolver {
                             },
                             class: UnresolvedClass::Unresolved,
                             receiver: None,
+                            site: None,
                         });
                         continue;
                         }
@@ -6068,7 +6682,7 @@ impl Resolver {
             Self::parent_dir(file)
         } else if hidden_somewhere && Self::visibility_is_enforced(family) {
             match family {
-                LangFamily::Rust => Self::rust_crate_src_root(file),
+                LangFamily::Rust => self.rust_crate_src_root(file),
                 _ => file.to_string(),
             }
         } else {
@@ -6176,7 +6790,7 @@ impl Resolver {
             return true;
         }
         family == LangFamily::Rust
-            && Self::rust_crate_src_root(file) == Self::rust_crate_src_root(path)
+            && self.rust_crate_src_root(file) == self.rust_crate_src_root(path)
     }
 
     /// Languages whose method is reachable by a bare name only from inside a
@@ -6229,13 +6843,8 @@ impl Resolver {
     /// a host global of the language. Each such name is classified by
     /// `classify_unresolved` instead of being bound to a namesake.
     fn bare_name_has_other_evidence(&self, file: &str, family: LangFamily, name: &str) -> bool {
-        self.external_imports
-            .get(file)
-            .is_some_and(|imports| imports.contains_key(name))
-            || self
-                .unindexed_local_imports
-                .get(file)
-                .is_some_and(|imports| imports.contains_key(name))
+        self.file_scope_declares(file, name)
+            || self.names_a_non_local_import(file, name)
             || crate::builtins::is_builtin(family, name)
             || crate::builtins::host_global_environment(family, name).is_some()
     }
@@ -6254,11 +6863,14 @@ impl Resolver {
     /// SAM conversions) and Java (`new Listener() { … }`) can name an interface
     /// in call position, so they keep the candidate.
     fn never_a_call_target(family: LangFamily, kind: SymbolKind) -> bool {
-        kind == SymbolKind::Interface
-            && matches!(
-                family,
-                LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
-            )
+        // A macro is invoked as `name!(..)`, which its own reference records;
+        // `name()` is a function call, so a macro is never its target.
+        kind == SymbolKind::Macro
+            || (kind == SymbolKind::Interface
+                && matches!(
+                    family,
+                    LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
+                ))
     }
 
     fn parent_dir(current_file: &str) -> String {
@@ -6279,6 +6891,14 @@ impl Resolver {
     /// Call it **after** [`Self::index_extractions`], which resets the set.
     pub fn mark_go_dirs_incomplete(&mut self, dirs: impl IntoIterator<Item = String>) {
         self.go_package_dirs_unvouched.extend(dirs);
+    }
+
+    /// `Some` when the last [`Self::index_extractions`] stopped expanding glob
+    /// re-exports at `REEXPORT_GLOB_MAX_HOPS`, so every `reexport_chains`
+    /// answer derived from it — and every edge resolved through one — rests on
+    /// a partial map. `None` means the expansion ran to its fixpoint.
+    pub fn reexport_glob_cutoff(&self) -> Option<ReexportGlobCutoff> {
+        self.reexport_glob_cutoff
     }
 
     fn go_name_is_unexported(name: &str) -> bool {
@@ -6411,7 +7031,7 @@ impl Resolver {
     /// tried first and the indexed file universe decides; neither can invent a
     /// file that is not there, so the worst case is the answer this rung gave
     /// before.
-    fn rust_module_dirs(file: &str) -> Vec<String> {
+    fn rust_module_dirs(&self, file: &str) -> Vec<String> {
         let dir = Self::parent_dir(file);
         let stem = file
             .rsplit('/')
@@ -6420,8 +7040,15 @@ impl Resolver {
             .strip_suffix(".rs")
             .unwrap_or_default();
         // A directory module's file: its children are its siblings, not its
-        // descendants.
-        if stem.is_empty() || matches!(stem, "mod" | "lib" | "main") {
+        // descendants. A crate root a manifest names (`[lib] path =
+        // "lib/core.rs"`) is one whatever its stem, and that is decidable.
+        if stem.is_empty()
+            || matches!(stem, "mod" | "lib" | "main")
+            || self
+                .rust_declared_roots
+                .get(&dir)
+                .is_some_and(|roots| roots.contains(file))
+        {
             return vec![dir];
         }
         let nested = if dir.is_empty() {
@@ -6445,20 +7072,74 @@ impl Resolver {
     /// in every layout this resolver can be pointed at, single-crate and
     /// workspace alike.
     ///
+    /// A manifest's own word beats the convention: the directory of a root
+    /// file `[lib] path` / `[[bin]] path` names is the root of every file
+    /// under it, unless a `src` nearer the file says otherwise (a deeper crate
+    /// nested inside it).
+    ///
     /// Falls back to the literal `src`, which is what this rung probed
-    /// unconditionally before: a file with no `src` ancestor — `build.rs`, a
-    /// `tests/` integration crate, a bare script — keeps exactly the behaviour
-    /// it had rather than gaining a guess.
-    fn rust_crate_src_root(file: &str) -> String {
+    /// unconditionally before: a file with no `src` ancestor and no declared
+    /// root above it — `build.rs`, a `tests/` integration crate, a bare
+    /// script — keeps exactly the behaviour it had rather than gaining a guess.
+    fn rust_crate_src_root(&self, file: &str) -> String {
         let mut components: Vec<&str> = file.split('/').collect();
         components.pop();
-        while let Some(last) = components.last() {
-            if *last == "src" {
-                return components.join("/");
+        let mut by_convention = None;
+        let mut declared = None;
+        while !(by_convention.is_some() && declared.is_some()) {
+            let dir = components.join("/");
+            if declared.is_none() && self.rust_declared_roots.contains_key(&dir) {
+                declared = Some(dir.clone());
+            }
+            let Some(last) = components.last() else {
+                break;
+            };
+            if by_convention.is_none() && *last == "src" {
+                by_convention = Some(dir);
             }
             components.pop();
         }
-        "src".to_string()
+        match (by_convention, declared) {
+            (Some(src), Some(declared)) if declared.len() > src.len() => declared,
+            (Some(src), _) => src,
+            (None, Some(declared)) => declared,
+            (None, None) => "src".to_string(),
+        }
+    }
+
+    /// `rest` under the repo-relative directory `dir`; the root is `""`.
+    fn rel_join(dir: &str, rest: &str) -> String {
+        if dir.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{dir}/{rest}")
+        }
+    }
+
+    /// The files a crate rooted at `src_root` may be entered through, library
+    /// first: the `[lib] path` a manifest declares there, else `lib.rs`, then
+    /// `main.rs`, then any binary root a manifest declares there.
+    fn rust_root_file_candidates(&self, src_root: &str) -> Vec<String> {
+        let mut files = Vec::new();
+        match self.rust_declared_libs.get(src_root) {
+            Some(lib) => files.push(lib.clone()),
+            None => files.push(Self::rel_join(src_root, "lib.rs")),
+        }
+        files.push(Self::rel_join(src_root, "main.rs"));
+        for declared in self.rust_declared_roots.get(src_root).into_iter().flatten() {
+            if !files.contains(declared) {
+                files.push(declared.clone());
+            }
+        }
+        files
+    }
+
+    /// The library root of the crate at `src_root`: what a bare crate name is.
+    fn rust_library_file(&self, src_root: &str) -> String {
+        self.rust_declared_libs
+            .get(src_root)
+            .cloned()
+            .unwrap_or_else(|| Self::rel_join(src_root, "lib.rs"))
     }
 
     /// The directory this file's own child modules live in.
@@ -6469,8 +7150,8 @@ impl Resolver {
     /// import rung still tries so an old `use` does not go missing. A *call*
     /// must not use it. `helper::run()` in `ledger/bindings.rs` is not the
     /// sibling `ledger/helper.rs`; that path is `super::helper`.
-    fn rust_call_base(file: &str) -> String {
-        Self::rust_module_dirs(file)
+    fn rust_call_base(&self, file: &str) -> String {
+        self.rust_module_dirs(file)
             .into_iter()
             .next()
             .unwrap_or_else(|| Self::parent_dir(file))
@@ -6485,7 +7166,7 @@ impl Resolver {
         if !Self::is_plain_ident(name) {
             return 0;
         }
-        let Some(joined) = Self::normalize_rel(&Self::rust_call_base(file), name) else {
+        let Some(joined) = Self::normalize_rel(&self.rust_call_base(file), name) else {
             return 0;
         };
         let mut shapes = 0usize;
@@ -6519,9 +7200,22 @@ impl Resolver {
         }
     }
 
-    fn consider_crate_root_files(&self, found: &mut Vec<String>, src_root: &str) {
-        self.consider_indexed(found, format!("{src_root}/lib.rs"));
-        self.consider_indexed(found, format!("{src_root}/main.rs"));
+    /// The root file(s) `crate` names from `file`. A crate root a manifest
+    /// declares is its own `crate`, which matters where two binaries share a
+    /// directory; anything else is every root its crate directory holds.
+    fn consider_crate_root_files(&self, found: &mut Vec<String>, file: &str) {
+        let src_root = self.rust_crate_src_root(file);
+        if self
+            .rust_declared_roots
+            .get(&src_root)
+            .is_some_and(|roots| roots.contains(file))
+        {
+            self.consider_indexed(found, file.to_string());
+            return;
+        }
+        for candidate in self.rust_root_file_candidates(&src_root) {
+            self.consider_indexed(found, candidate);
+        }
     }
 
     /// Every conventional file of the module whose directory is `dir`.
@@ -6553,6 +7247,36 @@ impl Resolver {
         self.consider_indexed(found, format!("{joined}/mod.rs"));
     }
 
+    /// The module file `tail` names below the one crate root in `roots`, when
+    /// a segment is not a child module of the file before it but a module that
+    /// file's glob re-export publishes: `pub use geo::*;` in `lib.rs` makes
+    /// `crate::point` mean `geo`'s `mod point`. Each segment must name exactly
+    /// one file, so a module two globs bring in is no answer. Empty on any
+    /// doubt.
+    fn rust_module_through_globs(&self, roots: &[String], tail: &str) -> Vec<String> {
+        let [root] = roots else {
+            return Vec::new();
+        };
+        let mut current = root.clone();
+        for segment in tail.split("::") {
+            let mut next = Vec::new();
+            self.consider_module_rel(&mut next, &self.rust_call_base(&current), segment);
+            // A name the file itself declares shadows anything a glob brings.
+            if next.is_empty() && self.symbol_kind_in(&current, segment).is_none() {
+                for glob in self.rust_module_globs.get(&current).into_iter().flatten() {
+                    self.consider_module_rel(&mut next, &self.rust_call_base(glob), segment);
+                }
+            }
+            next.sort();
+            next.dedup();
+            let [only] = next.as_slice() else {
+                return Vec::new();
+            };
+            current = only.clone();
+        }
+        vec![current]
+    }
+
     /// Indexed files the whole path names, with no segment popped.
     ///
     /// `resolve_import_path` walks a `use` by dropping a trailing type name
@@ -6566,20 +7290,25 @@ impl Resolver {
             return found;
         }
         if path == "crate" {
-            self.consider_crate_root_files(&mut found, &Self::rust_crate_src_root(file));
+            self.consider_crate_root_files(&mut found, file);
             return found;
         }
         if path == "super" {
-            let parent = Self::parent_dir(&Self::rust_call_base(file));
+            let parent = Self::parent_dir(&self.rust_call_base(file));
             self.consider_module_dir(&mut found, &parent);
             return found;
         }
         if let Some(tail) = path.strip_prefix("crate::") {
-            self.consider_module_rel(&mut found, &Self::rust_crate_src_root(file), tail);
+            self.consider_module_rel(&mut found, &self.rust_crate_src_root(file), tail);
+            if found.is_empty() {
+                let mut roots = Vec::new();
+                self.consider_crate_root_files(&mut roots, file);
+                found = self.rust_module_through_globs(&roots, tail);
+            }
             return found;
         }
         if let Some(tail) = path.strip_prefix("self::") {
-            self.consider_module_rel(&mut found, &Self::rust_call_base(file), tail);
+            self.consider_module_rel(&mut found, &self.rust_call_base(file), tail);
             return found;
         }
         if let Some(rest) = path.strip_prefix("super::") {
@@ -6589,7 +7318,7 @@ impl Resolver {
                 hops += 1;
                 tail = more;
             }
-            let mut base = Self::rust_call_base(file);
+            let mut base = self.rust_call_base(file);
             for _ in 0..hops {
                 base = Self::parent_dir(&base);
             }
@@ -6604,19 +7333,24 @@ impl Resolver {
             RustPathRoot::Crate(src_root) => {
                 if let Some((_, tail)) = path.split_once("::") {
                     self.consider_module_rel(&mut found, &src_root, tail);
+                    if found.is_empty() {
+                        let mut roots = Vec::new();
+                        self.consider_indexed(&mut roots, self.rust_library_file(&src_root));
+                        found = self.rust_module_through_globs(&roots, tail);
+                    }
                 } else {
                     // A crate *name* is the library target. A package with
                     // both `lib.rs` and `main.rs` is not ambiguous to an
                     // importer — the binary is not addressable by name — so
                     // `main.rs` answers only when there is no library.
-                    self.consider_indexed(&mut found, format!("{src_root}/lib.rs"));
+                    self.consider_indexed(&mut found, self.rust_library_file(&src_root));
                     if found.is_empty() {
-                        self.consider_indexed(&mut found, format!("{src_root}/main.rs"));
+                        self.consider_indexed(&mut found, Self::rel_join(&src_root, "main.rs"));
                     }
                 }
             }
             RustPathRoot::Child => {
-                self.consider_module_rel(&mut found, &Self::rust_call_base(file), path);
+                self.consider_module_rel(&mut found, &self.rust_call_base(file), path);
             }
             RustPathRoot::Keyword | RustPathRoot::Ambiguous | RustPathRoot::Unknown => {}
         }
@@ -7077,6 +7811,108 @@ impl Resolver {
             }
         }
         files.len() <= 1
+    }
+
+    /// The indexed type declares no member of this name on itself, on any
+    /// supertype, or — for Rust — on a type it derefs to.
+    ///
+    /// False when the name is not one indexed declaration (an external
+    /// annotation, or two files declaring it): absence is only meaningful for
+    /// a type this index can see uniquely. A method that exists but is
+    /// ambiguous is present — `contains_key`, not a unique hit — so an
+    /// abstention is not relabelled as a missing member.
+    fn indexed_type_lacks_member(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        let mut files: BTreeSet<&str> = BTreeSet::new();
+        let mut only_interfaces = true;
+        for (path, kind, candidate_family, _) in
+            self.symbol_index.get(type_name).into_iter().flatten()
+        {
+            if family.admits(*candidate_family)
+                && matches!(
+                    kind,
+                    SymbolKind::Class
+                        | SymbolKind::Struct
+                        | SymbolKind::Enum
+                        | SymbolKind::Interface
+                        | SymbolKind::Trait
+                )
+            {
+                files.insert(path.as_str());
+                only_interfaces &= *kind == SymbolKind::Interface;
+            }
+        }
+        // A TypeScript `type X = number` is indexed as an `Interface` and
+        // declares no member symbols, as does `interface P { x: number }`.
+        // Neither says what the value's members are, so only an interface
+        // with at least one method of its own can show a member absent.
+        if family == LangFamily::JsTs
+            && only_interfaces
+            && !self.type_declares_any_method(family, type_name)
+        {
+            return false;
+        }
+        files.len() == 1 && !self.member_reachable(family, type_name, method)
+    }
+
+    fn type_declares_any_method(&self, family: LangFamily, type_name: &str) -> bool {
+        self.type_methods
+            .range((family, type_name.to_string(), String::new())..)
+            .next()
+            .is_some_and(|((f, t, _), _)| *f == family && t == type_name)
+    }
+
+    fn type_has_method(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        self.type_methods
+            .contains_key(&(family, type_name.to_string(), method.to_string()))
+    }
+
+    /// `method` on `type_name`, or on a Rust `Deref` target within
+    /// [`Self::RUST_DEREF_HOPS`].
+    fn type_or_deref_has_method(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        if self.type_has_method(family, type_name, method) {
+            return true;
+        }
+        if family != LangFamily::Rust {
+            return false;
+        }
+        let mut current = type_name.to_string();
+        for _ in 0..Self::RUST_DEREF_HOPS {
+            let Some(next) = self.rust_deref_targets.get(&current).and_then(Clone::clone) else {
+                return false;
+            };
+            if self.type_has_method(family, &next, method) {
+                return true;
+            }
+            current = next;
+        }
+        false
+    }
+
+    /// Whether `method` is declared on `type_name` or any supertype within
+    /// [`Self::HERITAGE_WALK_MAX_DEPTH`], counting an ambiguous declaration as
+    /// present.
+    fn member_reachable(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut frontier = vec![type_name.to_string()];
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next = Vec::new();
+            for name in frontier.drain(..) {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if self.type_or_deref_has_method(family, &name, method) {
+                    return true;
+                }
+                for supertype in self.supertypes.get(&(family, name)).into_iter().flatten() {
+                    next.push(supertype.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        false
     }
 
     /// X42. Where `self.m()` / `cls.m()` / `this.m()` / a Go receiver's `s.M()`
@@ -7976,7 +8812,8 @@ impl Resolver {
     }
 
     /// Swift: the protocol method `method` of `protocol`, and the in-repo
-    /// conformers' declarations of it.
+    /// conformers' declarations of it. Rust: the same for a trait and its
+    /// `impl Trait for Type` implementors.
     ///
     /// `None` unless `protocol` is one indexed protocol declaration that
     /// declares `method` exactly once. The conformers are the protocol's
@@ -7995,7 +8832,7 @@ impl Resolver {
             let mut kinds = hits
                 .iter()
                 .filter(|(_, _, candidate, _)| family.admits(*candidate));
-            kinds.all(|(_, kind, _, _)| *kind == SymbolKind::Interface)
+            kinds.all(|(_, kind, _, _)| matches!(kind, SymbolKind::Interface | SymbolKind::Trait))
         });
         if !is_protocol || !self.type_name_is_identifiable(family, protocol) {
             return None;
@@ -8505,6 +9342,28 @@ impl Resolver {
             }
         }
         Vec::new()
+    }
+
+    /// The one indexed file a Python module handle's load names: by path
+    /// ([`Self::resolve_path_load`]), or — for `importlib.import_module` with a
+    /// literal — by module name, exactly as `import <name>` here would resolve
+    /// it, and only when that names one file.
+    fn resolve_loaded_module(
+        &self,
+        ext: &Extraction,
+        imp: &ExtractedImport,
+        load: &devmap_extract::model::PathLoad,
+    ) -> Option<String> {
+        if load.kind == PathLoadKind::ModuleName {
+            let mut targets = self.resolve_import_targets_or_search_dirs(ext, imp);
+            targets.sort();
+            targets.dedup();
+            return match targets.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            };
+        }
+        self.resolve_path_load(&ext.file_path, &imp.module_specifier, load.anchor_up)
     }
 
     /// The indexed file a Python path load names, or `None`.
@@ -9339,6 +10198,7 @@ impl Resolver {
             }
         }
 
+        let mut bound_by_unfollowable_import = false;
         if let Some(bindings) = self
             .import_bindings
             .get(&ext.file_path)
@@ -9360,6 +10220,16 @@ impl Resolver {
                         },
                     ));
                 }
+                // Bound by an import, and the module it names holds no
+                // unambiguous declaration of that name — a barrel that
+                // `export *`s a package, a submodule handle. The file said where
+                // the name comes from, so no namesake elsewhere in the tree can
+                // answer for it. The call ladder abstains at this same point
+                // (rung 2a); falling through to the global tier here bound the
+                // reference to whichever repository symbol shared the spelling.
+                // Only the global tier is closed: the package rungs below read
+                // a block the language itself defines, not a spelling.
+                bound_by_unfollowable_import = true;
             }
         }
 
@@ -9450,7 +10320,15 @@ impl Resolver {
             return None;
         }
 
-        if self.is_bound_by_non_local_import(&ext.file_path, family, name) {
+        // The call ladder's own classification, not a second copy of it: a name
+        // the file imports from outside the tree (or may take from a star
+        // import of one), a builtin and a host global all say what the name is,
+        // and a repository declaration that merely shares the spelling is no
+        // evidence about it. This replaced a JS/TS-only import test and a
+        // nine-name Python list.
+        if bound_by_unfollowable_import
+            || self.bare_name_has_other_evidence(&ext.file_path, family, name)
+        {
             return None;
         }
         if let Some(hits) = self.symbol_index.get(name) {
@@ -9470,25 +10348,17 @@ impl Resolver {
                 .collect();
             if family_hits.len() == 1 {
                 let (target_f, _, _, target_identity) = family_hits[0];
-                let stdlib_guard = family == LangFamily::Python
-                    && matches!(
-                        name,
-                        "open" | "dir" | "print" | "type" | "id" | "len" | "str" | "int" | "list"
-                    )
-                    && target_f != &ext.file_path;
-                if !stdlib_guard {
-                    return Some(self.reference_edge(
-                        ext,
-                        target_f,
-                        name,
-                        reference,
-                        Resolution::UniqueGlobal {
-                            target_symbol: target_identity.to_string(),
-                            target_file: target_f.clone(),
-                            family,
-                        },
-                    ));
-                }
+                return Some(self.reference_edge(
+                    ext,
+                    target_f,
+                    name,
+                    reference,
+                    Resolution::UniqueGlobal {
+                        target_symbol: target_identity.to_string(),
+                        target_file: target_f.clone(),
+                        family,
+                    },
+                ));
             }
         }
         None
@@ -10014,18 +10884,18 @@ impl Resolver {
                     .then(|| current_file.to_string());
             }
             if clean_spec == "crate" {
-                let root = Self::rust_crate_src_root(current_file);
-                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
-                    if self.file_symbols.contains_key(&candidate) {
-                        return Some(candidate);
-                    }
+                let mut roots = Vec::new();
+                self.consider_crate_root_files(&mut roots, current_file);
+                if let Some(first) = roots.into_iter().next() {
+                    return Some(first);
                 }
             }
             // The parent module *as a file*: `src/deep/leaf.rs` is `deep::leaf`,
             // so its `super` is `deep`, which lives in `src/deep/mod.rs` or
             // `src/deep.rs`.
             if clean_spec == "super" {
-                for module_dir in Self::rust_module_dirs(current_file)
+                for module_dir in self
+                    .rust_module_dirs(current_file)
                     .iter()
                     .map(|module_dir| Self::parent_dir(module_dir))
                 {
@@ -10051,14 +10921,14 @@ impl Resolver {
             // the tree root answered nothing for every workspace member. That
             // is why this repository produced no `Imports` edge at all for the
             // hundreds of `use crate::…` lines in its own kernel.
-            let root = Self::rust_crate_src_root(current_file);
+            let root = self.rust_crate_src_root(current_file);
             let mut parts: Vec<&str> = crate_tail.split("::").collect();
             self.trim_to_indexed_depth(&mut parts);
             while !parts.is_empty() {
                 let rust_path = parts.join("/");
                 let candidates = [
-                    format!("{root}/{rust_path}.rs"),
-                    format!("{root}/{rust_path}/mod.rs"),
+                    Self::rel_join(&root, &format!("{rust_path}.rs")),
+                    Self::rel_join(&root, &format!("{rust_path}/mod.rs")),
                 ];
                 for cand in &candidates {
                     if self.file_symbols.contains_key(cand) {
@@ -10106,7 +10976,8 @@ impl Resolver {
             // Both readings of "where does this module keep its children", best
             // first — see `rust_module_dirs`. Each `super::` walks one directory
             // up from whichever base is being tried.
-            let bases: Vec<String> = Self::rust_module_dirs(current_file)
+            let bases: Vec<String> = self
+                .rust_module_dirs(current_file)
                 .into_iter()
                 .map(|mut module_dir| {
                     for _ in 0..hops {
@@ -10160,8 +11031,8 @@ impl Resolver {
                 while !parts.is_empty() {
                     let module_path = parts.join("/");
                     for candidate in [
-                        format!("{root}/{module_path}.rs"),
-                        format!("{root}/{module_path}/mod.rs"),
+                        Self::rel_join(&root, &format!("{module_path}.rs")),
+                        Self::rel_join(&root, &format!("{module_path}/mod.rs")),
                     ] {
                         if self.file_symbols.contains_key(&candidate) {
                             return Some(candidate);
@@ -10169,7 +11040,10 @@ impl Resolver {
                     }
                     parts.pop();
                 }
-                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
+                for candidate in [
+                    self.rust_library_file(&root),
+                    Self::rel_join(&root, "main.rs"),
+                ] {
                     if self.file_symbols.contains_key(&candidate) {
                         return Some(candidate);
                     }
@@ -10188,8 +11062,12 @@ impl Resolver {
             let mut candidates = crate::importpath::candidates(rule, &dir, spec);
             // A Gradle module's own source roots: `core/src/main/java/com/..`.
             // The list is the settings script's `include` statements, so a
-            // module nothing includes is not probed.
+            // module nothing includes is not probed. Ahead of all of them,
+            // the importer's own source set and its module's `main`: a
+            // product flavor sees itself and `main`, never a sibling flavor.
             if matches!(lang, "kotlin" | "java") {
+                let own = crate::importpath::source_set_candidates(rule, current_file, spec);
+                candidates.splice(0..0, own);
                 candidates.extend(crate::importpath::module_candidates(
                     rule,
                     &self.gradle_module_dirs,

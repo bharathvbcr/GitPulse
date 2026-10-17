@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::blame::blame_file_with_program;
-use crate::history::{commit_window_with_program, resolve_blob_with_program, HistoryRefusal};
+use crate::blob::BlobReader;
+use crate::budget::Budget;
+use crate::history::{commit_window_with_program, HistoryRefusal};
 use crate::join::{attribute, Attribution};
 use crate::rank::{rank, RankInputs, TouchedSymbol};
 use crate::{CodeGraph, SuspectReport, Unavailable};
@@ -88,6 +90,35 @@ pub fn suspects_with_program<G: CodeGraph>(
     until: &str,
     depth: u32,
 ) -> SuspectReport {
+    suspects_bounded(
+        program,
+        repo,
+        graph,
+        symptom,
+        since,
+        until,
+        depth,
+        &Budget::default(),
+    )
+}
+
+/// [`suspects_with_program`] under a [`Budget`]: a deadline and a cancel hook
+/// for the whole analysis. A budget that runs out ends the walk over blamed
+/// files and says so as [`Unavailable::BudgetExhausted`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn suspects_bounded<G: CodeGraph>(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    graph: &G,
+    symptom: &str,
+    since: &str,
+    until: &str,
+    depth: u32,
+    budget: &Budget,
+) -> SuspectReport {
+    // One config listing per repository for the whole analysis, not one per read.
+    let _config = dc_proc::config_scope();
     let mut unavailable: Vec<Unavailable> = Vec::new();
 
     // 1. What does the symptom name?
@@ -180,7 +211,37 @@ pub fn suspects_with_program<G: CodeGraph>(
     // commit -> (author, time, touched symbols)
     let mut per_commit: BTreeMap<String, (String, i64, Vec<TouchedSymbol>)> = BTreeMap::new();
 
-    for file in files.iter().take(MAX_BLAMED_FILES) {
+    // One reader for every file, and `until` resolved to a commit id once: each
+    // blame below would otherwise resolve the same revision again.
+    let local;
+    let blobs = match graph.blob_reader() {
+        Some(shared) if shared.reads(program, repo) => shared,
+        _ => {
+            local = BlobReader::new(program, repo);
+            &local
+        }
+    };
+    let until_oid = match blobs.commit(until) {
+        Ok(oid) => oid,
+        Err(refusal) => {
+            return SuspectReport::refused(
+                symptom.to_string(),
+                vec![Unavailable::GitUnavailable {
+                    reason: refusal.describe(),
+                }],
+            )
+        }
+    };
+    let blamed_files = files.len().min(MAX_BLAMED_FILES);
+    for (examined, file) in files.iter().take(MAX_BLAMED_FILES).enumerate() {
+        if let Err(stop) = budget.check() {
+            unavailable.push(Unavailable::BudgetExhausted {
+                reason: stop.describe(),
+                completed: examined,
+                total: blamed_files,
+            });
+            break;
+        }
         let (symbols, spans_basis) = graph.symbols_in(file);
         // Only the cone's symbols. A file usually holds many more, and blaming
         // lines for symbols that cannot reach the symptom is the noise this
@@ -193,7 +254,7 @@ pub fn suspects_with_program<G: CodeGraph>(
             continue;
         }
 
-        let resolved = match resolve_blob_with_program(program, repo, until, file) {
+        let resolved = match blobs.read(&until_oid, file) {
             Ok(resolved) => resolved,
             Err(refusal) => {
                 unavailable.push(Unavailable::BlameRefused {
@@ -204,7 +265,7 @@ pub fn suspects_with_program<G: CodeGraph>(
             }
         };
 
-        let mut file_blame = match blame_file_with_program(program, repo, until, file) {
+        let mut file_blame = match blame_file_with_program(program, repo, &until_oid, file) {
             Ok(blame) => blame,
             Err(refusal) => {
                 unavailable.push(Unavailable::BlameRefused {

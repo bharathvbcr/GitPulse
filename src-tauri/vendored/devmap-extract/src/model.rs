@@ -42,6 +42,11 @@ pub enum SymbolKind {
     /// [`Self::MarkupAnchor`], and additionally because a class can be applied
     /// by a runtime string this extractor cannot follow.
     StyleRule,
+    /// A Rust `macro_rules!` definition. Its invocations (`name!(..)`) reference
+    /// it; it is never the target of a call ladder, because `name()` is not how
+    /// a macro is invoked and a macro must not become a namesake that turns a
+    /// function call ambiguous.
+    Macro,
     Dependency,
     Subsystem,
     Community,
@@ -74,6 +79,7 @@ impl SymbolKind {
             SymbolKind::EventSubscriber => "EventSubscriber",
             SymbolKind::MarkupAnchor => "MarkupAnchor",
             SymbolKind::StyleRule => "StyleRule",
+            SymbolKind::Macro => "Macro",
             SymbolKind::Dependency => "Dependency",
             SymbolKind::Subsystem => "Subsystem",
             SymbolKind::Community => "Community",
@@ -98,6 +104,7 @@ impl SymbolKind {
         SymbolKind::EventSubscriber,
         SymbolKind::MarkupAnchor,
         SymbolKind::StyleRule,
+        SymbolKind::Macro,
         SymbolKind::Dependency,
         SymbolKind::Subsystem,
         SymbolKind::Community,
@@ -912,6 +919,12 @@ pub enum PathLoadKind {
     /// ever emitted with an anchor (`anchor_up` is `Some`), and never for a
     /// file that also removes or reassigns `sys.path`.
     SearchDirectory,
+    /// `module_specifier` is an absolute dotted module **name**, not a path:
+    /// `mod = importlib.import_module("pkg.util")` with a literal argument,
+    /// which is `import pkg.util as mod` spelled as a call. It is resolved as
+    /// that import would be, and binds the handle under the same scoped rules
+    /// as a path-loaded one.
+    ModuleName,
 }
 
 impl PathLoadKind {
@@ -1336,6 +1349,10 @@ pub enum WiringKind {
     /// package proves nothing about callers outside the corpus, so an uncalled
     /// one is an `exported_unreferenced` candidate at the unconfirmed tier.
     ///
+    /// Also emitted on a Rust *symbol* whose visibility is `pub(crate)`,
+    /// `pub(super)`, `pub(self)` or `pub(in path)` (target = its qualified
+    /// name): the language, not a manifest, proves it crate-private.
+    ///
     /// Not a liveness exemption of any kind, for the file or its symbols: it
     /// is a fact about who *can* call, which only ever widens what is
     /// examined.
@@ -1506,6 +1523,10 @@ pub fn go_interface_method_matches<'a>(
         .collect()
 }
 
+/// The leading words of every `ParseOutcome::Failed` reason that records a
+/// parse-budget overrun. See [`Extraction::is_budget_refusal`].
+pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     pub file_path: String,
@@ -1544,6 +1565,13 @@ pub struct Extraction {
     /// in scope — which the call alone cannot say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_receivers: Vec<ScopeReceiver>,
+    /// Names a Swift file declares with `typealias`, anywhere in it, sorted. A
+    /// member alias (`extension Host { typealias Entry = Item }`) makes `Entry`
+    /// another spelling of `Item` inside `Host`, and a file that writes `Entry`
+    /// cannot tell that from a top-level `Entry` declared elsewhere; the
+    /// resolver, which sees every file, abstains on such a name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swift_type_aliases: Vec<String>,
     /// Whether a Go file carries a build constraint — a `//go:build` or
     /// `// +build` directive, or an implicit `_GOOS`/`_GOARCH` filename suffix.
     /// Always false for non-Go files.
@@ -1627,6 +1655,16 @@ pub struct Extraction {
     /// Inner>` — and the symbol table has no record that `Guard` derefs at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_deref_targets: Vec<(String, String)>,
+    /// The type parameter each blanket impl in a Rust file implements its
+    /// trait for — `T` for `impl<T: Display> Describe for T`. Sorted and
+    /// deduplicated; empty for every other language.
+    ///
+    /// The impl's methods are filed under that parameter (`T.describe`), which
+    /// names no type, so without this a receiver whose own type declares no
+    /// such method could never reach the one impl that supplies it for every
+    /// type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_blanket_impl_params: Vec<String>,
     /// Calls Rust makes without writing one: `a + b` is `a.add(b)`, `t[i]` is
     /// `t.index(i)`, `let g = Guard::new();` runs `Guard::drop` at the end of
     /// the scope, `let m: Meters = x.into();` calls `Meters::from`. Empty for
@@ -1638,6 +1676,20 @@ pub struct Extraction {
     /// recorded as an unresolved call. One that binds is a real edge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_implicit_calls: Vec<ExtractedCall>,
+    /// The `From::from` a Rust `?` may call: one candidate per `?` in a
+    /// function declared to return `Result<_, E>`, its receiver the bare `E`.
+    /// Empty for every other language.
+    ///
+    /// Apart from [`Self::rust_implicit_calls`] because the evidence is weaker:
+    /// the operand's own error type is not known, and `?` on a value whose
+    /// error already is `E` runs the identity conversion, not `E`'s impl. So a
+    /// candidate that binds is a possible call, scored below the HIGH tier, and
+    /// one that binds nothing is dropped. `?` inside a closure or an async
+    /// block (which return their own type), on an `Option`, or on a call to a
+    /// function of this file whose declared error type is `E` itself yields no
+    /// candidate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_try_conversions: Vec<ExtractedCall>,
     /// Locally bound names at exact call/reference start offsets. Unlike graph
     /// caller identities, these distinguish unnamed callbacks and captures.
     /// Sorted and deduplicated; persists after source text is stripped.
@@ -1733,6 +1785,23 @@ impl Extraction {
     pub fn is_parse_failure(&self) -> bool {
         matches!(self.parse_outcome, ParseOutcome::Failed { .. })
             && !matches!(self.engine, ExtractionEngine::NotApplicable { .. })
+    }
+
+    /// Whether this file was refused because it ran out of parse budget, as
+    /// opposed to failing for any other reason.
+    ///
+    /// The one question the budget retry pass asks: only a budget refusal can
+    /// be cured by a larger budget, so a grammar fault or a depth refusal must
+    /// never be retried or relabelled. Answered by the reason's
+    /// [`BUDGET_REFUSAL_PREFIX`], which `treesitter` stamps on every budget
+    /// refusal through one function, because `ParseOutcome` is a serialized
+    /// shape and a new variant would be a schema change.
+    pub fn is_budget_refusal(&self) -> bool {
+        self.is_parse_failure()
+            && matches!(
+                &self.parse_outcome,
+                ParseOutcome::Failed { reason } if reason.starts_with(BUDGET_REFUSAL_PREFIX)
+            )
     }
 
     /// Whether a grammar actually read this file.

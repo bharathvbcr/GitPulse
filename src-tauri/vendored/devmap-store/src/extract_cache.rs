@@ -89,17 +89,40 @@ fn extract_scanned_with_progress(
     if let Some(progress) = progress {
         progress.start(scanned.sources.len());
     }
-    scanned
+    let mut extractions = scanned
         .sources
         .par_iter()
         .map(|(path, src)| {
             let result = extract_one_cached_with(store, path, src, admission, extract_file);
             if let Some(progress) = progress {
-                finish_extraction_progress(progress, &result);
+                // A budget refusal is not final until the serial retry below
+                // has run, which then counts it.
+                let withheld = result
+                    .as_ref()
+                    .is_ok_and(|(extraction, _)| extraction.is_budget_refusal());
+                if !withheld {
+                    finish_extraction_progress(progress, &result);
+                }
             }
             result.map(|(extraction, _)| extraction)
         })
-        .collect::<anyhow::Result<Vec<_>>>()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let files: Vec<devmap_extract::FileRef<'_>> = scanned
+        .sources
+        .iter()
+        .map(|(path, src)| devmap_extract::FileRef {
+            path: path.as_str(),
+            source: src.as_str(),
+        })
+        .collect();
+    devmap_extract::retry_budget_refusals(
+        &files,
+        &mut extractions,
+        progress,
+        devmap_extract::ParseBudgets::default(),
+        None,
+    );
+    Ok(extractions)
 }
 
 fn finish_extraction_progress(

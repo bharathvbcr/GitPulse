@@ -297,9 +297,13 @@ function renderStats() {
     '<div class="stat" title="' + escapeHtml(t[2]) + '"><div class="n">' + fmt(t[0]) + '</div><div class="k">' + t[1] + '</div></div>'
   ).join('');
   const head = String(META.generated_head || '');
-  document.getElementById('headLine').textContent = head
+  // Handoffs no drawn subsystem could take have no edge; the count says so,
+  // or "nothing crosses here" and "we could not tell" would look the same.
+  const unplaced = DATA.unresolved_handoffs_total || 0;
+  document.getElementById('headLine').textContent = (head
     ? 'HEAD ' + head.slice(0, 10)
-    : 'working tree (no HEAD recorded)';
+    : 'working tree (no HEAD recorded)')
+    + (unplaced ? ' · ' + fmt(unplaced) + ' handoff' + (unplaced === 1 ? '' : 's') + ' unplaced' : '');
 }
 
 /* ---- filtering ---------------------------------------------------------- */
@@ -400,8 +404,12 @@ function showDetail(id) {
   }
 
   const unresolved = (DATA.unresolved_handoffs || []).filter(u => u.from === id);
-  if (unresolved.length) {
-    html += group('Unresolved handoffs (text only)', bullets(unresolved.map(u => u.text), 8),
+  const unplaced = (DATA.unresolved_handoffs_by_subsystem || {})[id] || {total: 0, listed: 0};
+  if (unplaced.total) {
+    const title = 'Unresolved handoffs (text only)' + (unplaced.listed < unplaced.total
+      ? ' · ' + fmt(unplaced.listed) + ' of ' + fmt(unplaced.total) + ' listed'
+      : '');
+    html += group(title, bullets(unresolved.map(u => u.text), 8) || '<div class="none">none listed (page cap)</div>',
       'Handoffs whose target did not match any drawn subsystem, so they have no edge on the canvas.');
   }
   d.innerHTML = html;

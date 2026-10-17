@@ -95,6 +95,7 @@ pub(crate) fn python_path_loads(
         "run_path",
         "SourceFileLoader",
         "load_source",
+        "import_module",
         "sys.path",
     ]
     .iter()
@@ -129,6 +130,8 @@ enum LoadKind {
     RunPath,
     SourceFileLoader,
     LoadSource,
+    /// `importlib.import_module("pkg.mod")`: a module by name, not by path.
+    ImportModule,
 }
 
 impl LoadKind {
@@ -139,7 +142,8 @@ impl LoadKind {
             LoadKind::SourceFileLoader => Some((1, "path")),
             LoadKind::LoadSource => Some((1, "pathname")),
             LoadKind::RunPath => Some((0, "path_name")),
-            LoadKind::ModuleFromSpec => None,
+            // The name is read by `Pass::module_name_of_call`, never as a path.
+            LoadKind::ModuleFromSpec | LoadKind::ImportModule => None,
         }
     }
 }
@@ -163,6 +167,7 @@ fn load_kind(callee: &str) -> Option<LoadKind> {
             Some(LoadKind::SourceFileLoader)
         }
         "load_source" if matches!(qualifier, "" | "imp") => Some(LoadKind::LoadSource),
+        "import_module" if matches!(qualifier, "" | "importlib") => Some(LoadKind::ImportModule),
         _ => None,
     }
 }
@@ -172,6 +177,8 @@ fn load_kind(callee: &str) -> Option<LoadKind> {
 struct Loc {
     path: String,
     anchor_up: Option<u32>,
+    /// `path` is a dotted module name (`importlib.import_module`), not a file.
+    by_name: bool,
 }
 
 /// A path as this pass knows it: a place, or — inside a parameterised loader
@@ -981,6 +988,15 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                             .map_or(Val::Other, Val::Module),
                         // A globals dict, not a module.
                         LoadKind::RunPath => Val::Other,
+                        LoadKind::ImportModule => {
+                            module_name_of_call(value, self.source).map_or(Val::Other, |name| {
+                                Val::Module(PathV::Fixed(Loc {
+                                    path: name,
+                                    anchor_up: None,
+                                    by_name: true,
+                                }))
+                            })
+                        }
                         LoadKind::ModuleFromSpec => match positional_arguments(value).first() {
                             Some(argument) if argument.kind() == "identifier" => {
                                 match self.lookup(scope, text(*argument, self.source)) {
@@ -1576,9 +1592,44 @@ fn path_import(
         path_load: Some(PathLoad {
             scope,
             anchor_up: loc.anchor_up,
-            kind: PathLoadKind::Module,
+            kind: if loc.by_name {
+                PathLoadKind::ModuleName
+            } else {
+                PathLoadKind::Module
+            },
         }),
     }
+}
+
+/// The module an `import_module(..)` call names, when its text fixes it: one
+/// positional argument, a plain string literal (no f-string, escape or
+/// concatenation), naming an absolute dotted module. A `package=` argument
+/// makes a relative name mean something this pass does not track, and any
+/// other argument shape is not read, so both name nothing.
+fn module_name_of_call(call: Node, source: &str) -> Option<String> {
+    let arguments = call.child_by_field_name("arguments")?;
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    let written: Vec<Node> = arguments
+        .named_children(&mut cursor)
+        .filter(|argument| argument.kind() != "comment")
+        .collect();
+    let [literal] = written.as_slice() else {
+        return None;
+    };
+    if literal.kind() != "string" {
+        return None;
+    }
+    let name = string_literal(*literal, source).ok()?;
+    let dotted = !name.is_empty()
+        && name.split('.').all(|segment| {
+            !segment.is_empty()
+                && !segment.starts_with(|c: char| c.is_ascii_digit())
+                && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+    dotted.then_some(name)
 }
 
 /// One line, bounded: this becomes an edge's `details`.
@@ -1698,7 +1749,11 @@ fn loc_from_items(items: &[Item]) -> Option<Loc> {
     if file_name == ".py" || file_name == ".." {
         return None;
     }
-    Some(Loc { path, anchor_up })
+    Some(Loc {
+        path,
+        anchor_up,
+        by_name: false,
+    })
 }
 
 #[cfg(test)]

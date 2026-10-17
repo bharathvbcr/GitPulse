@@ -2,8 +2,8 @@ use super::Store;
 #[cfg(feature = "parse")]
 use super::{
     bucket_identities, charge, claim_matching_candidate, decode_stored_outcome, edge_tuple,
-    lock_conn, refusal, stored_is_parse_failure, validate_head_sha, EdgeTuple, GenerationWriteOpts,
-    RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
+    is_budget_refusal_json, lock_conn, refusal, stored_is_parse_failure, validate_head_sha,
+    EdgeTuple, GenerationWriteOpts, RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
 };
 #[cfg(feature = "parse")]
 use crate::schema::BUILD_HISTORY_RETENTION;
@@ -55,9 +55,9 @@ impl Store {
             engine_json,
             extraction_json,
         } = payload;
-        if let Some(id) = tx
+        if let Some((id, stored_outcome)) = tx
             .prepare_cached(
-                "SELECT payload_id FROM file_payloads
+                "SELECT payload_id, parse_outcome_json FROM file_payloads
                   WHERE file_id = ?1 AND content_hash = ?2 AND language = ?3
                     AND COALESCE(grammar_version, '') = ?4
                     AND COALESCE(analyzer_version, '') = ?5",
@@ -70,10 +70,42 @@ impl Store {
                     grammar_version,
                     analyzer_version
                 ],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
         {
+            // DECLARED INTERIM: a retained-generation immutability exception,
+            // tracked by ft-3bdf1450d4367fc8c7ba0c01fbe7cfe3 (task_id
+            // devmap-payload-identity-budget-refusal), which gives a budget
+            // refusal its own payload identity and removes this UPDATE.
+            //
+            // The key names the content and the extractor, and a wall-clock
+            // budget refusal is neither: it is the machine's load at the
+            // moment of the build. Sharing the row would keep the refusal as
+            // the stored payload of a later generation that parsed the same
+            // bytes. The unique index admits one row per identity, so the
+            // recovered extraction replaces the refused one in place -- which
+            // also rewrites what every retained older generation reads from
+            // this row (`a_retained_older_generation_keeps_the_refusal_it_was_
+            // built_with`, ignored against the card). Only refusal -> non-
+            // refusal is ever promoted; the reverse is not written, and
+            // `latest_budget_refusals` does not read this row, so status does
+            // not depend on either.
+            if is_budget_refusal_json(&stored_outcome)
+                && !is_budget_refusal_json(parse_outcome_json)
+            {
+                tx.prepare_cached(
+                    "UPDATE file_payloads
+                        SET parse_outcome_json = ?2, engine_json = ?3, extraction_json = ?4
+                      WHERE payload_id = ?1",
+                )?
+                .execute(params![
+                    id,
+                    parse_outcome_json,
+                    engine_json,
+                    extraction_json
+                ])?;
+            }
             return Ok(id);
         }
         tx.prepare_cached(
@@ -269,6 +301,25 @@ impl Store {
                     extraction.file_path
                 )));
             }
+        }
+        // An affected path is never carried, and fresh rows are written only
+        // for the extractions in hand, so an affected path that is neither in
+        // the slice nor declared deleted would get no row at all: the file
+        // silently absent from the generation, its symbols dropped by a write
+        // that never said it was deleting them. The caller has to account for
+        // every path it names — an extraction, or a deletion.
+        let declared_deleted: std::collections::HashSet<&str> =
+            opts.deleted_paths.iter().map(String::as_str).collect();
+        let mut unaccounted = opts.affected_paths.iter().filter(|path| {
+            !unique_paths.contains(path.as_str()) && !declared_deleted.contains(path.as_str())
+        });
+        if let Some(first) = unaccounted.next() {
+            return Err(refusal(format!(
+                "{} affected path(s) have neither an extraction nor a deletion in this write \
+                 (for example {first}); name each affected path in the extractions or in \
+                 deleted_paths, or the generation would drop it without a declared deletion",
+                1 + unaccounted.count()
+            )));
         }
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;

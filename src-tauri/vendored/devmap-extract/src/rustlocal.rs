@@ -477,12 +477,23 @@ fn parameter_binder<'tree>(scope: Node<'tree>, name: &str, source: &str) -> Opti
 }
 
 /// `name` or `mut name`, and nothing else.
+///
+/// A `mut_pattern` is `mutable_specifier` then the pattern, and the specifier
+/// is itself a named node, so the bound pattern is the one named child that is
+/// not the specifier — never "the first named child", which is the specifier.
 fn simple_pattern_is(pattern: Node, name: &str, source: &str) -> bool {
     match pattern.kind() {
         "identifier" => get_node_text(pattern, source) == name,
-        "mut_pattern" => pattern
-            .named_child(0)
-            .is_some_and(|inner| simple_pattern_is(inner, name, source)),
+        "mut_pattern" => {
+            let mut cursor = pattern.walk();
+            let mut inner = pattern
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "mutable_specifier");
+            match (inner.next(), inner.next()) {
+                (Some(only), None) => simple_pattern_is(only, name, source),
+                _ => false,
+            }
+        }
         _ => false,
     }
 }

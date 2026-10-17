@@ -160,6 +160,9 @@ fn node_kind_label(kind: SymbolKind) -> &'static str {
         // the store's own `kind` column carries `MarkupAnchor`/`StyleRule`
         // verbatim and every `devmap` query reads that.
         SymbolKind::MarkupAnchor | SymbolKind::StyleRule => "property",
+        // Same projection rule: a `macro_rules!` macro is invoked, and among the
+        // frozen kinds a function is what is invoked. The store keeps `Macro`.
+        SymbolKind::Macro => "function",
     }
 }
 
@@ -2210,25 +2213,7 @@ mod tests {
     /// consumers lose the graph entirely and none of them says why.
     #[test]
     fn every_symbol_kind_maps_into_the_frozen_node_kind_set() {
-        for kind in [
-            SymbolKind::File,
-            SymbolKind::Module,
-            SymbolKind::Class,
-            SymbolKind::Struct,
-            SymbolKind::Enum,
-            SymbolKind::Interface,
-            SymbolKind::Trait,
-            SymbolKind::Function,
-            SymbolKind::Method,
-            SymbolKind::Field,
-            SymbolKind::Variable,
-            SymbolKind::Route,
-            SymbolKind::Endpoint,
-            SymbolKind::EventSubscriber,
-            SymbolKind::Dependency,
-            SymbolKind::Subsystem,
-            SymbolKind::Community,
-        ] {
+        for &kind in SymbolKind::ALL {
             let label = node_kind_label(kind);
             assert!(
                 PYTHON_NODE_KINDS.contains(&label),

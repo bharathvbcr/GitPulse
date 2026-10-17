@@ -1960,6 +1960,7 @@ impl<'a> StoreQueryEngine<'a> {
         // read on purpose, so `budget_take` still sees something it cannot fit
         // and reports `truncated` for the right reason.
         let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
+        self.cancel.check()?;
         let Some(page) = self.store.dead_page(limit)? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
@@ -2027,16 +2028,23 @@ impl<'a> StoreQueryEngine<'a> {
             else {
                 continue;
             };
-            let index = indexes.entry(path.clone()).or_insert_with(|| {
-                devmap_extract::safe_fs::read_repo_source(
+            if !indexes.contains_key(path) {
+                // One source read per distinct path, each up to
+                // `MAX_SOURCE_BYTES`; a caller that has gone is asked first.
+                self.cancel.check()?;
+                let index = devmap_extract::safe_fs::read_repo_source(
                     source_root.as_deref().map(Path::new),
                     path,
                     devmap_extract::MAX_SOURCE_BYTES,
                 )
                 .ok()
-                .map(|source| LineIndex::new(&source))
-            });
-            evidence.first_line = index.as_ref().map(|index| index.line_at(byte as usize));
+                .map(|source| LineIndex::new(&source));
+                indexes.insert(path.clone(), index);
+            }
+            evidence.first_line = indexes
+                .get(path)
+                .and_then(Option::as_ref)
+                .map(|index| index.line_at(byte as usize));
         }
         Ok(())
     }
@@ -2071,7 +2079,11 @@ impl<'a> StoreQueryEngine<'a> {
                 unsigned_symbols: 0,
             });
         }
+        // Both the candidate read and the grouping cover every signed symbol of
+        // the generation before the budget cuts anything.
+        self.cancel.check()?;
         let (candidates, unsigned) = self.store.latest_clone_candidates()?;
+        self.cancel.check()?;
         let summary = group_clones(&candidates, unsigned);
         let matching: Vec<_> = summary
             .groups
@@ -2803,7 +2815,14 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok((self.finish(response), Vec::new()));
         }
 
-        let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
+        // The docstring read decodes every payload of the generation while
+        // holding the store's connection, so a caller that has already gone is
+        // asked first, and again between rows.
+        self.cancel.check()?;
+        let docstrings = crate::ask::docstring_by_qualified_name(&latest_extractions_cancellable(
+            self.store,
+            &self.cancel,
+        )?);
         let texts: Vec<String> = symbols
             .iter()
             .map(|symbol| {
@@ -3613,18 +3632,39 @@ pub fn resolved_edge_from_stored(edge: StoredEdge) -> anyhow::Result<ResolvedEdg
 /// is read (`min_confidence` 0): the views report each edge's own confidence
 /// rather than pre-filtering it away.
 pub fn graph_core_for_store(store: &Store) -> anyhow::Result<serde_json::Value> {
+    graph_core_for_store_cancellable(store, &Cancel::new())
+}
+
+/// [`graph_core_for_store`], stopped when `cancel` is tripped.
+///
+/// Every read here is the whole generation — every extraction payload decoded,
+/// every edge converted — so a caller that has stopped waiting is consulted
+/// before each read, between decoded rows, and through the edge conversion,
+/// rather than after all of it.
+pub fn graph_core_for_store_cancellable(
+    store: &Store,
+    cancel: &Cancel,
+) -> anyhow::Result<serde_json::Value> {
+    cancel.check()?;
     store
         .latest_generation_id()?
         .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
-    let extractions = store.latest_extractions()?;
+    let extractions = latest_extractions_cancellable(store, cancel)?;
+    cancel.check()?;
     let analysis = store
         .latest_analysis()?
         .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    cancel.check()?;
     let edges = store
         .latest_edges(0.0)?
         .into_iter()
-        .map(resolved_edge_from_stored)
+        .enumerate()
+        .map(|(index, edge)| {
+            cancel.check_every(index + 1)?;
+            resolved_edge_from_stored(edge)
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    cancel.check()?;
     let repo_root = store.latest_repo_root()?;
     Ok(crate::build_graph_core_value(
         &extractions,
@@ -3632,6 +3672,18 @@ pub fn graph_core_for_store(store: &Store) -> anyhow::Result<serde_json::Value> 
         &edges,
         repo_root.as_deref(),
     ))
+}
+
+/// Every extraction of the latest generation, abandoned between rows once
+/// `cancel` is tripped. The decode holds the store's connection, so stopping
+/// between rows is what hands it back to the next query.
+fn latest_extractions_cancellable(
+    store: &Store,
+    cancel: &Cancel,
+) -> anyhow::Result<Vec<Extraction>> {
+    store
+        .latest_extractions_until(&mut || cancel.check().is_err())?
+        .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))
 }
 
 fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
@@ -3683,3 +3735,7 @@ mod search_bounds_tests;
 #[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/composition_cancellation_tests.rs"]
 mod composition_cancellation_tests;
+
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/corpus_read_cancellation_tests.rs"]
+mod corpus_read_cancellation_tests;

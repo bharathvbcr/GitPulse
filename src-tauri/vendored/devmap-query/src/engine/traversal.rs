@@ -2,7 +2,7 @@ use super::{blast_layer_tokens, budget_take, edge_kind_name, stored_edge_to_reso
 use crate::cancel::Cancel;
 use crate::model::{BlastLayer, BlastRadius, ResolutionAvailability, UnresolvedNamesakes};
 use devmap_analyze::traversal::TraversalStop;
-use devmap_resolve::model::{LangFamily, ResolvedEdge};
+use devmap_resolve::model::{LangFamily, ResolutionKind, ResolvedEdge};
 use devmap_store::GenerationEdges;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -409,6 +409,8 @@ impl BlastWalk {
                     nodes,
                     node_count: band.node_count,
                     lowest_confidence: band.lowest_confidence,
+                    direct: Vec::new(),
+                    dispatch: Vec::new(),
                 }
             })
             .collect();
@@ -461,34 +463,49 @@ pub(super) fn blast_radius_from_edges(
     // Borrowed keys and a B-tree for the same reasons `AdjacencyIndex` uses
     // them: the edges outlive this call, and a deterministic iteration order is
     // what makes the sampled `nodes` list reproducible.
-    let mut adjacency: BTreeMap<&str, Vec<(&str, f32)>> = BTreeMap::new();
+    // `(next, confidence, reached by a Dispatch edge)`.
+    let mut adjacency: BTreeMap<&str, Vec<(&str, f32, bool)>> = BTreeMap::new();
     for edge in edges {
         let (from, to) = if reverse {
             (edge.target_symbol.as_str(), edge.source_symbol.as_str())
         } else {
             (edge.source_symbol.as_str(), edge.target_symbol.as_str())
         };
+        let dispatch = edge
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.kind == ResolutionKind::Dispatch);
         adjacency
             .entry(from)
             .or_default()
-            .push((to, edge.confidence.0));
+            .push((to, edge.confidence.0, dispatch));
     }
 
     let seed_set: BTreeSet<&str> = seeds.iter().map(String::as_str).collect();
     let mut visited: BTreeSet<&str> = seed_set.clone();
     let mut frontier: Vec<&str> = seed_set.iter().copied().collect();
-    let mut layers: Vec<BlastLayer> = Vec::new();
+    // `(symbol, reached by a non-dispatch edge, reached by a dispatch edge)`.
+    // `(depth, members, weakest confidence on the edges that reached them)`.
+    type Band<'a> = (usize, BTreeMap<&'a str, (bool, bool)>, Option<f32>);
+    let mut bands: Vec<Band<'_>> = Vec::new();
     let mut total_impacted: u32 = 0;
 
     for depth in 1..=depth_cap {
-        let mut members: BTreeSet<&str> = BTreeSet::new();
+        let mut members: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
         let mut lowest: Option<f32> = None;
         for node in &frontier {
-            for (next, confidence) in adjacency.get(node).map(Vec::as_slice).unwrap_or_default() {
+            for (next, confidence, dispatch) in
+                adjacency.get(node).map(Vec::as_slice).unwrap_or_default()
+            {
                 if visited.contains(next) {
                     continue;
                 }
-                members.insert(next);
+                let reached = members.entry(next).or_insert((false, false));
+                if *dispatch {
+                    reached.1 = true;
+                } else {
+                    reached.0 = true;
+                }
                 // The weakest edge that reached anything in this band. A radius
                 // held together by name-only attribution must not read like one
                 // built from resolved calls.
@@ -503,22 +520,53 @@ pub(super) fn blast_radius_from_edges(
         }
         let node_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
         total_impacted = total_impacted.saturating_add(node_count);
-        let nodes: Vec<String> = members
-            .iter()
-            .take(BLAST_LAYER_NODE_SAMPLE)
-            .map(|node| (*node).to_string())
-            .collect();
-        layers.push(BlastLayer {
-            depth,
-            nodes_omitted: node_count
-                .saturating_sub(u32::try_from(nodes.len()).unwrap_or(u32::MAX)),
-            nodes,
-            node_count,
-            lowest_confidence: lowest,
-        });
-        visited.extend(members.iter().copied());
-        frontier = members.into_iter().collect();
+        visited.extend(members.keys().copied());
+        frontier = members.keys().copied().collect();
+        bands.push((depth, members, lowest));
     }
+
+    // A radius with no dispatch edge keeps both lists empty, so its JSON
+    // omits the keys. Depth is the hop, not the kind of evidence.
+    let separates = bands
+        .iter()
+        .any(|(_, members, _)| members.values().any(|(_, dispatch)| *dispatch));
+    let layers: Vec<BlastLayer> = bands
+        .into_iter()
+        .map(|(depth, members, lowest)| {
+            let node_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            let sampled: Vec<_> = members.iter().take(BLAST_LAYER_NODE_SAMPLE).collect();
+            let nodes: Vec<String> = sampled
+                .iter()
+                .map(|(symbol, _)| (*symbol).to_string())
+                .collect();
+            let (direct, dispatch) = if separates {
+                (
+                    sampled
+                        .iter()
+                        .filter(|(_, (direct, _))| *direct)
+                        .map(|(symbol, _)| (*symbol).to_string())
+                        .collect(),
+                    sampled
+                        .iter()
+                        .filter(|(_, (_, dispatch))| *dispatch)
+                        .map(|(symbol, _)| (*symbol).to_string())
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            BlastLayer {
+                depth,
+                nodes_omitted: node_count
+                    .saturating_sub(u32::try_from(nodes.len()).unwrap_or(u32::MAX)),
+                nodes,
+                node_count,
+                lowest_confidence: lowest,
+                direct,
+                dispatch,
+            }
+        })
+        .collect();
 
     let mut response = budget_take(layers, token_budget, blast_layer_tokens);
     response.walk_incomplete = walk_incomplete;
@@ -531,5 +579,90 @@ pub(super) fn blast_radius_from_edges(
         unmatched_targets: Vec::new(),
         layers: response,
         total_impacted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blast_radius_from_edges;
+    use devmap_extract::model::EdgeKind;
+    use devmap_resolve::model::{Resolution, ResolvedEdge};
+    use std::sync::Arc;
+
+    fn edge(caller: &str, callee: &str, resolution: Resolution) -> ResolvedEdge {
+        ResolvedEdge::resolved(
+            caller.to_string(),
+            callee.to_string(),
+            caller.to_string(),
+            callee.to_string(),
+            EdgeKind::Calls,
+            Arc::new(resolution),
+            None,
+        )
+    }
+
+    fn direct(caller: &str, callee: &str) -> ResolvedEdge {
+        edge(
+            caller,
+            callee,
+            Resolution::ReceiverType {
+                target_symbol: callee.to_string(),
+                target_file: callee.to_string(),
+                receiver_type: "T".to_string(),
+            },
+        )
+    }
+
+    fn dispatch(caller: &str, callee: &str) -> ResolvedEdge {
+        edge(
+            caller,
+            callee,
+            Resolution::Dispatch {
+                candidates: Arc::from([("impl".to_string(), "Impl.m".to_string())]),
+                via_file: "iface".to_string(),
+                via_symbol: "Iface.m".to_string(),
+            },
+        )
+    }
+
+    /// `impact --layers` keeps hop depth and names which callers are dispatch.
+    #[test]
+    fn layers_separate_direct_callers_from_dispatch_callers() {
+        let radius = blast_radius_from_edges(
+            &["seed".to_string()],
+            &[
+                direct("direct_caller", "seed"),
+                dispatch("dispatch_caller", "seed"),
+            ],
+            true,
+            4,
+            10_000,
+            None,
+        );
+        assert_eq!(radius.layers.items.len(), 1);
+        let layer = &radius.layers.items[0];
+        assert_eq!(layer.depth, 1);
+        assert_eq!(layer.direct, vec!["direct_caller".to_string()]);
+        assert_eq!(layer.dispatch, vec!["dispatch_caller".to_string()]);
+    }
+
+    /// A radius with no dispatch edge omits both keys.
+    #[test]
+    fn a_direct_only_radius_omits_the_dispatch_fields() {
+        let radius = blast_radius_from_edges(
+            &["seed".to_string()],
+            &[direct("direct_caller", "seed")],
+            true,
+            4,
+            10_000,
+            None,
+        );
+        let layer = &radius.layers.items[0];
+        assert!(layer.direct.is_empty());
+        assert!(layer.dispatch.is_empty());
+        assert_eq!(layer.depth, 1);
+        let json = serde_json::to_value(layer).expect("layer serializes");
+        assert!(json.get("direct").is_none());
+        assert!(json.get("dispatch").is_none());
     }
 }

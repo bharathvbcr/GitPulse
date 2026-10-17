@@ -61,6 +61,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod blame;
 pub mod blast;
+pub mod blob;
+pub mod budget;
 pub mod change;
 pub mod history;
 pub mod join;
@@ -72,6 +74,8 @@ pub use blast::{
     blast, AffectedTestFile, BlastReport, ImpactedFile, ImpactedModule, ImpactedSymbol, Owner,
     SeedSymbol, TestSignal, UnattributedChange, UnattributedReason, DEFAULT_BLAST_DEPTH,
 };
+pub use blob::BlobReader;
+pub use budget::{Budget, Exhausted};
 pub use change::{ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange};
 pub use join::{attribute, Attribution, SymbolBlame};
 pub use rank::{rank, EvidenceClass, RankInputs, Suspect, TouchedSymbol};
@@ -209,6 +213,15 @@ pub enum Unavailable {
     /// owners list is then a lower bound (possibly empty), never evidence that
     /// nobody owns the change.
     OwnersUnavailable { reason: String },
+    /// The analysis ran out of its budget — a deadline or a cancel from the
+    /// caller — after `completed` of `total` units of work. What follows the
+    /// stop was never examined, so every list in the report is a lower
+    /// bound, never a complete answer that happens to be short.
+    BudgetExhausted {
+        reason: String,
+        completed: usize,
+        total: usize,
+    },
 }
 
 impl Unavailable {
@@ -279,6 +292,14 @@ impl Unavailable {
             Unavailable::OwnersUnavailable { reason } => {
                 format!("owners of the changed paths could not be fully read: {reason}")
             }
+            Unavailable::BudgetExhausted {
+                reason,
+                completed,
+                total,
+            } => format!(
+                "{reason}, after {completed} of {total} unit(s) of work; everything past that \
+                 point was not examined, so the report is a lower bound"
+            ),
         }
     }
 }
@@ -368,6 +389,14 @@ pub trait CodeGraph {
     ///
     /// The returned flag is `true` when the list is a lower bound.
     fn affected_tests(&self, seeds: &[String], depth: u32) -> (Vec<blast::AffectedTestFile>, bool);
+
+    /// The reader this graph resolves its spans' basis through, if it has
+    /// one. An analysis handed a graph that reads the same repository through
+    /// the same program reads blobs through it too, so a blob the graph
+    /// identified is not identified a second time.
+    fn blob_reader(&self) -> Option<&BlobReader> {
+        None
+    }
 
     /// Resolve a symptom — a symbol name, a qualified name, or a file path —
     /// to the qualified names it could mean.

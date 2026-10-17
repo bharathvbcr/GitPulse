@@ -29,7 +29,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub mod commit_wire;
 pub mod json;
@@ -522,22 +522,14 @@ impl Store {
         // and inserting the replacement were two autocommits, so a failure
         // between them left the task with neither: the holder had lost its
         // lease and nobody held the task. IMMEDIATE for the reason
-        // `set_agent_appended_planned_files` documents. Only success commits:
+        // [`write_transaction`] documents. Only success commits:
         // every refusal (held, unreadable expiry, bad ttl) happens before this
         // call writes anything the next read would not redo, so rolling back
         // loses nothing and a failure at any step leaves the store as found.
         if let Some(ttl) = req.ttl_seconds {
             validate_ttl(ttl)?;
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let outcome = self.acquire_in_transaction(req);
-        match &outcome {
-            Ok(_) => self.conn.execute_batch("COMMIT")?,
-            Err(_) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
-        }
-        outcome
+        write_transaction(&self.conn, |_| self.acquire_in_transaction(req))
     }
 
     fn acquire_in_transaction(
@@ -1027,28 +1019,15 @@ impl Store {
         // could lapse between being read and being relied on, and the widening
         // would be written on an authority that had already gone.
         //
-        // IMMEDIATE, not the deferred transaction rusqlite hands out by
-        // default. A deferred transaction takes a read lock on its first
-        // statement — the task lookup below — and then has to upgrade to a
-        // write lock for the swap, and SQLite refuses that upgrade with
-        // SQLITE_BUSY *without consulting the busy handler*, because no amount
-        // of waiting resolves two readers that both want to become writers. The
-        // connection's five-second busy timeout therefore never applies, and
-        // two builders widening one task at the same moment surface it as
-        // "database is locked" rather than as the contention it is. Taking the
-        // write lock up front is what lets the timeout do its job.
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let outcome = self.swap_agent_appended(task_id, token, expected, replacement);
-        match &outcome {
-            // Committed on every path that returns an answer, refusals
-            // included: diagnose marks a lapsed lease stale as it reads, and
-            // that observation is exactly the fact worth keeping.
-            Ok(_) => self.conn.execute_batch("COMMIT")?,
-            Err(_) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
-        }
-        outcome
+        // IMMEDIATE, through [`write_transaction`]: the task lookup below is a
+        // read, and a deferred transaction could not then upgrade for the swap
+        // without failing two builders widening one task at the same moment as
+        // "database is locked". Committed on every path that returns an
+        // answer, refusals included: diagnose marks a lapsed lease stale as it
+        // reads, and that observation is exactly the fact worth keeping.
+        write_transaction(&self.conn, |_| {
+            self.swap_agent_appended(task_id, token, expected, replacement)
+        })
     }
 
     /// The body of the swap, inside a transaction its caller owns.
@@ -1276,6 +1255,31 @@ fn holder_of(lease: &Lease) -> String {
 /// It is both the connection's `busy_timeout` and the budget `ensure_wal`
 /// spends, so a caller waits the same bounded time whichever lock it lands on.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `body` inside one write transaction that holds the write lock from its
+/// first statement, committing when it returns `Ok` and rolling back when it
+/// returns `Err` (or panics, or the commit itself fails).
+///
+/// IMMEDIATE, not the deferred transaction rusqlite hands out by default. A
+/// deferred transaction takes a read lock on its first statement and has to
+/// upgrade to a write lock for its first write, and SQLite refuses that
+/// upgrade *without consulting the busy handler*: a writer holding the lock at
+/// that moment is SQLITE_BUSY, and one that committed since the read is
+/// SQLITE_BUSY_SNAPSHOT, because no amount of waiting makes a stale snapshot
+/// current. The connection's five-second busy timeout therefore never applies,
+/// and two writers meeting surface as "database is locked" rather than as the
+/// contention they are. Taking the write lock up front is what lets the
+/// timeout do its job. Every write path that reads before it writes goes
+/// through here.
+pub(crate) fn write_transaction<T>(
+    conn: &Connection,
+    body: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let out = body(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
 
 /// Puts the connection in WAL mode, tolerating another process converting the
 /// same database at the same moment.

@@ -18,6 +18,7 @@ use std::time::Duration;
 use dc_proc::{git_with_program, run_bounded, Bounds, Failure};
 use serde::{Deserialize, Serialize};
 
+use crate::blob::BlobReader;
 use crate::BlobIdentity;
 
 /// Wall clock for one history read.
@@ -302,9 +303,10 @@ pub fn commit_window_with_program(
 
 /// Read `path` at `rev`: its bytes and the object id of those bytes.
 ///
-/// `git rev-parse <rev>:<path>` and `git show <rev>:<path>` name the same
-/// object, so the id returned is the id *of the content returned* — which is
-/// what lets [`crate::join::attribute`] trust the pairing.
+/// One `cat-file` answer carries both, so the id returned is the id *of the
+/// content returned* — which is what lets [`crate::join::attribute`] trust the
+/// pairing. A caller reading several files builds one [`BlobReader`] and
+/// reuses it; this is the one-file form.
 pub fn resolve_blob(repo: &Path, rev: &str, path: &str) -> Result<ResolvedBlob, HistoryRefusal> {
     resolve_blob_with_program(std::ffi::OsStr::new("git"), repo, rev, path)
 }
@@ -316,29 +318,7 @@ pub fn resolve_blob_with_program(
     rev: &str,
     path: &str,
 ) -> Result<ResolvedBlob, HistoryRefusal> {
-    let rev = commit_oid(program, repo, rev)?;
-    let spec = format!("{rev}:{path}");
-    let id = run_git(
-        program,
-        repo,
-        &["rev-parse", &spec],
-        "git rev-parse",
-        4 * 1024,
-    )?;
-    let oid = id.stdout_lossy().trim().to_string();
-    let shown = run_git(program, repo, &["show", &spec], "git show", CONTENT_CAP)?;
-    let content = match String::from_utf8(shown.stdout.clone()) {
-        Ok(content) => content,
-        Err(_) => {
-            return Err(HistoryRefusal::NotText {
-                path: path.to_string(),
-            })
-        }
-    };
-    Ok(ResolvedBlob {
-        content,
-        identity: BlobIdentity::Blob(oid),
-    })
+    BlobReader::new(program, repo).read(rev, path)
 }
 
 /// The files a commit changed, as repository-relative paths.
