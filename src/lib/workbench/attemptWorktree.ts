@@ -198,7 +198,7 @@ function mergedSentence(merged: MergeTeardownResult): string {
 }
 
 /** What an unattended merge did: the commit it merged and the line the board shows. */
-export interface VerifiedMerge { head: string; message: string }
+export interface VerifiedMerge { head: string; message: string; beforeOid: string; afterOid: string | null }
 
 /**
  * Merges an attempt's branch for a caller that already holds the person's
@@ -235,7 +235,8 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (merged.cleanup_error) parts.push(merged.cleanup_error);
   if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
-  return { head: expectedHead, message: parts.join(" ") };
+  // Where the target stood before and after: what a re-verify of the merged checkout is judged over.
+  return { head: expectedHead, message: parts.join(" "), beforeOid: merged.before_oid, afterOid: merged.after_oid };
 }
 
 /**

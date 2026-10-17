@@ -36,7 +36,38 @@ export function normalizeRepoPath(raw: string): string | null {
     value = value.replace(/\/+$/, "");
   }
   if (!value || value === "/" || value === "//") return null;
-  return value;
+  // The null set is the input's alone (empty, control characters, a bare root); a path that folds to nothing is "." or its root, as before.
+  return collapseDotSegments(value);
+}
+
+const DRIVE = /^[A-Za-z]:$/;
+
+/**
+ * Drops `.` segments and folds `name/..` pairs, so two spellings of one path
+ * are one identity. The collapse is lexical (a symlinked directory before a
+ * `..` is not followed). A `..` never climbs above a root: a drive letter, or
+ * the server and share of a UNC path (its first two names), or `/`. A `..`
+ * with nothing to fold stays in a relative path and is dropped at a root.
+ */
+function collapseDotSegments(value: string): string {
+  const unc = value.startsWith("//");
+  const absolute = !unc && value.startsWith("/");
+  const lead = unc ? "//" : absolute ? "/" : "";
+  const segments = value.slice(lead.length).split("/");
+  // How many leading names are the root itself.
+  const rootNames = unc ? 2 : !lead && DRIVE.test(segments[0] ?? "") ? 1 : 0;
+  const kept: string[] = [];
+  for (const segment of segments) {
+    if (segment === "." || segment === "") continue;
+    if (segment === "..") {
+      if (kept.length > rootNames && kept[kept.length - 1] !== "..") kept.pop();
+      else if (!lead && rootNames === 0) kept.push("..");
+      continue;
+    }
+    kept.push(segment);
+  }
+  const joined = kept.join("/");
+  return joined ? `${lead}${joined}` : lead || ".";
 }
 
 export function identityKey(path: string, options: PathIdentityOptions): string {

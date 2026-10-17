@@ -3,18 +3,20 @@ import { MergeTeardownFailure } from "../branches/mergeTeardown";
 import type { MergeTeardownError } from "../branches/types";
 import {
   MAX_WAVE_SIZE, clampWaveSize, clampWaves, planBatch, resumeWave, scopesOverlap, startWave,
-  type Candidate, type MainState, type RunRead, type Suggestion, type VerdictRead, type WaveDeps, type WaveRecord,
+  type Candidate, type MainState, type MergeRead, type PostMerge, type RunRead, type Suggestion, type VerdictRead, type WaveDeps, type WaveRecord,
 } from "./waveLaunch";
 
 const task = (id: string): Candidate => ({ id, title: `Task ${id}` });
 const passed = (head = "h1"): VerdictRead => ({ state: "passed", stale: false, head });
 
 /** A fake sidecar: runs, verdicts, merges and the persisted record, all in memory. */
-function world(options: { candidates?: Candidate[][]; scopes?: Record<string, string[]>; verdict?: (id: string, call: number) => VerdictRead; mergeError?: (id: string) => string | null; mergeFailure?: (id: string) => MergeTeardownError | null; mergeSaid?: (id: string) => string | null; main?: () => MainState; launchError?: (id: string) => string | null; runs?: Map<string, RunRead>; coverage?: Partial<Pick<Suggestion, "unread" | "unchecked">> } = {}) {
+function world(options: { candidates?: Candidate[][]; scopes?: Record<string, string[]>; verdict?: (id: string, call: number, post?: PostMerge) => VerdictRead; mergeRead?: (id: string, call: number, said: string) => MergeRead; mergeError?: (id: string) => string | null; mergeFailure?: (id: string) => MergeTeardownError | null; mergeSaid?: (id: string) => string | null; main?: () => MainState; launchError?: (id: string) => string | null; runs?: Map<string, RunRead>; coverage?: Partial<Pick<Suggestion, "unread" | "unchecked">> } = {}) {
   const batches = options.candidates ?? [[task("a"), task("b"), task("c")]];
   let suggestCalls = 0, tick = 0, ids = 0, mainReads = 0;
   const runs = options.runs ?? new Map<string, RunRead>();
-  const launched: string[] = [], merged: string[] = [], verifies: string[] = [], persisted: WaveRecord[] = [];
+  const launched: string[] = [], merged: string[] = [], verifies: string[] = [], persisted: WaveRecord[] = [], posts: { id: string; post: PostMerge }[] = [];
+  // The target's tip moves with every merge: t0, then t1, t2, ...
+  let tip = "t0";
   const heads = new Map<string, string>();
   const deps: WaveDeps = {
     suggest: async () => ({ candidates: batches[Math.min(suggestCalls++, batches.length - 1)] ?? [], unread: "", unchecked: 0, ...options.coverage }),
@@ -28,7 +30,13 @@ function world(options: { candidates?: Candidate[][]; scopes?: Record<string, st
       return run;
     },
     getRun: async (runId) => runs.get(runId) ?? null,
-    verify: async (id) => { verifies.push(id); return (options.verdict ?? (() => passed()))(id, verifies.filter((v) => v === id).length); },
+    verify: async (id, _signal, post) => {
+      verifies.push(id);
+      if (post) posts.push({ id, post });
+      const verdict = (options.verdict ?? (() => passed()))(id, verifies.filter((v) => v === id).length, post);
+      // A verdict for the merged checkout is for the tip asked about, whatever head the fake's default carries.
+      return post && verdict.state === "passed" && verdict.head === "h1" ? { ...verdict, head: post.head } : verdict;
+    },
     headOf: async () => "h1",
     merge: async ({ taskId: id, head }) => {
       const error = options.mergeError?.(id);
@@ -36,7 +44,10 @@ function world(options: { candidates?: Candidate[][]; scopes?: Record<string, st
       const failure = options.mergeFailure?.(id);
       if (failure) throw new MergeTeardownFailure(failure);
       merged.push(id); heads.set(id, head);
-      return options.mergeSaid?.(id) ?? `Merged ${id}`;
+      const said = options.mergeSaid?.(id) ?? `Merged ${id}`;
+      const read: MergeRead = { message: said, beforeOid: tip, afterOid: `t${merged.length}` };
+      tip = `t${merged.length}`;
+      return options.mergeRead?.(id, merged.length, said) ?? read;
     },
     mainState: async () => { mainReads += 1; return options.main?.() ?? { dirty: 0, operation: null }; },
     persist: async (record) => { persisted.push(structuredClone(record)); },
@@ -44,8 +55,9 @@ function world(options: { candidates?: Candidate[][]; scopes?: Record<string, st
     sleep: async () => { await Promise.resolve(); },
     id: () => `id${(ids += 1)}`,
     pollMs: 1,
+    verifyLimit: 2,
   };
-  return { deps, runs, launched, merged, verifies, persisted, heads, mainReads: () => mainReads };
+  return { deps, runs, launched, merged, verifies, persisted, heads, posts, mainReads: () => mainReads };
 }
 
 const phases = (record: WaveRecord) => Object.fromEntries(record.members.map((m) => [m.taskId, m.phase]));
@@ -104,8 +116,10 @@ describe("a wave end to end against a fake sidecar", () => {
     expect(w.launched).toEqual(["a", "b", "c"]);
     expect(w.merged).toEqual(["a", "b", "c"]);
     expect(phases(done)).toEqual({ a: "merged", b: "merged", c: "merged" });
-    // Each merge was followed by a re-verify: a verify before and one after, per task.
-    for (const id of ["a", "b", "c"]) expect(w.verifies.filter((v) => v === id)).toHaveLength(2);
+    // One verify before the merge, then the gate after each merge re-verifies every member merged so far: a is judged after all three merges, c after its own only.
+    expect(w.verifies.filter((v) => v === "a")).toHaveLength(1 + 3);
+    expect(w.verifies.filter((v) => v === "b")).toHaveLength(1 + 2);
+    expect(w.verifies.filter((v) => v === "c")).toHaveLength(1 + 1);
     // The seq written is strictly increasing, so a resume can trust the highest.
     const seqs = w.persisted.map((r) => r.seq);
     expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
@@ -417,7 +431,7 @@ describe("stop reaches every wait", () => {
     const merge = w.deps.merge;
     w.deps.merge = async (target) => { inMerge = true; await merging; return merge(target); };
     const verify = w.deps.verify;
-    w.deps.verify = (id, signal) => (w.merged.includes(id) ? untilAborted(signal) : verify(id, signal));
+    w.deps.verify = (id, signal, post) => (w.merged.includes(id) ? untilAborted(signal) : verify(id, signal, post));
     const runner = await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps);
     while (!inMerge) await new Promise((resolve) => setTimeout(resolve, 0));
     const stopping = runner.cancel();
@@ -426,7 +440,9 @@ describe("stop reaches every wait", () => {
     const done = runner.record();
     expect(done.state).toBe("cancelled");
     expect(w.merged).toEqual(["a"]);
-    expect(phases(done)).toEqual({ a: "merged", b: "stopped" });
+    // The merge landed, but its gate was cut off: it is held with that said, never `merged` without a gate outcome.
+    expect(phases(done)).toEqual({ a: "held", b: "stopped" });
+    expect(done.members[0]!.detail).toMatch(/stopped before the merge was re-verified/);
   });
 
   it("interrupts a run read, a scope read and a head read that never answer", async () => {
@@ -591,7 +607,7 @@ describe("adversarial: merge halting and main state", () => {
     const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] } });
     w.deps.merge = async ({ taskId }) => {
       if (taskId === "b") throw { code: "conflict", message: "Merging b conflicted in 1 file(s)", total: 1, rolled_back: true, rollback_error: null };
-      w.merged.push(taskId); return `Merged ${taskId}`;
+      w.merged.push(taskId); return { message: `Merged ${taskId}`, beforeOid: `t${w.merged.length - 1}`, afterOid: `t${w.merged.length}` };
     };
     const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
     expect(done.state, JSON.stringify(done.members.map((m) => [m.taskId, m.phase, m.detail]))).toBe("halted");
@@ -628,5 +644,218 @@ describe("adversarial: merge halting and main state", () => {
     const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
     expect(phases(done)).toEqual({ a: "merged" });
     expect(w.verifies.filter((v) => v === "a").length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("the gate after a merge", () => {
+  it("judges the checkout over the range from the pre-merge tip, and re-verifies the whole merged set", async () => {
+    const w = world({ candidates: [[task("a"), task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(phases(done)).toEqual({ a: "merged", b: "merged" });
+    // After a: a over t0..t1. After b: a over t0..t2 (its own pre-merge tip, the tip now) and b over t1..t2.
+    expect(w.posts).toEqual([
+      { id: "a", post: { base: "t0", head: "t1" } },
+      { id: "a", post: { base: "t0", head: "t2" } },
+      { id: "b", post: { base: "t1", head: "t2" } },
+    ]);
+    expect(done.members.map((m) => [m.mergeBefore, m.mergeAfter])).toEqual([["t0", "t1"], ["t1", "t2"]]);
+  });
+
+  it("halts the wave when the second merge breaks a criterion of the first task", async () => {
+    const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, verdict: (id, _call, post) => (id === "a" && post?.head === "t2" ? { state: "failed", stale: false, head: post.head } : passed()) });
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(w.merged).toEqual(["a", "b"]);
+    expect(phases(done)).toEqual({ a: "merged", b: "merged", c: "stopped" });
+    expect(done.note).toMatch(/Re-verification after merging "Task b" found "Task a" was failed/);
+    expect(done.members[0]!.detail).toMatch(/Re-verification after merging "Task b" was failed/);
+  });
+
+  it("does not take an older verdict for the merged checkout's tip", async () => {
+    const w = world({ candidates: [[task("a")]], verdict: (_id, _call, post) => (post ? { state: "passed", stale: false, head: "an-older-tip" } : passed()) });
+    const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(done.note).toMatch(/was not a verdict for the merged checkout's tip/);
+  });
+
+  it("fails closed when the merge did not say where it landed: held, halted, never verified", async () => {
+    const w = world({ scopes: { a: ["a"], b: ["b"] }, mergeRead: (_id, _n, said) => ({ message: said, beforeOid: "t0", afterOid: null }) });
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(w.merged).toEqual(["a"]);
+    expect(phases(done)).toEqual({ a: "held", b: "stopped" });
+    expect(done.members[0]!.detail).toMatch(/Where the merge landed was not recorded/);
+    expect(w.posts).toEqual([]);
+  });
+
+  it("holds a member whose worktree was removed by hand and carries on with the rest", async () => {
+    const w = world({ scopes: { a: ["a"], b: ["b"] }, mergeError: (id) => (id === "a" ? "/wt/a is no longer a worktree of /repo. It may already have been merged or removed." : null) });
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(phases(done)).toEqual({ a: "held", b: "merged" });
+    expect(done.members[0]!.detail).toMatch(/no longer a worktree/);
+  });
+
+  it("never writes a member as merged without having written it as verifying_merge, with where it landed, first", async () => {
+    const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] } });
+    await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    const before = new Map<string, string>();
+    for (const record of w.persisted) {
+      for (const m of record.members) {
+        if (m.phase === "merged" && before.get(m.taskId) !== "merged") expect(before.get(m.taskId), m.taskId).toBe("verifying_merge");
+        if (m.phase === "verifying_merge") { expect(m.mergeBefore).toBeTruthy(); expect(m.mergeAfter).toBeTruthy(); }
+        before.set(m.taskId, m.phase);
+      }
+    }
+    expect([...before.values()]).toEqual(["merged", "merged", "merged"]);
+  });
+
+  it("a restart between the merge and its re-verify resumes in verifying_merge and runs the gate, without merging again", async () => {
+    const w = world({ candidates: [[task("a")]] });
+    let crashed = false;
+    const first = { ...w.deps, persist: async (record: WaveRecord) => { await w.deps.persist(record); if (record.members.some((m) => m.phase === "verifying_merge") && !crashed) { crashed = true; throw new Error("process died"); } } };
+    await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, first)).finished;
+    const saved = w.persisted.findLast((r) => r.state === "running")!;
+    expect(saved.members[0]!.phase).toBe("verifying_merge");
+    expect(w.posts).toEqual([]);
+    const done = await (await resumeWave(structuredClone(saved), w.deps)).finished;
+    expect(w.merged).toEqual(["a"]);
+    expect(w.posts).toEqual([{ id: "a", post: { base: "t0", head: "t1" } }]);
+    expect(done.state).toBe("done");
+    expect(phases(done)).toEqual({ a: "merged" });
+  });
+
+  it("a resume in verifying_merge whose before-oid is missing halts with a reason and never calls it verified", async () => {
+    const w = world({ candidates: [[task("a")]] });
+    const member = { taskId: "a", title: "Task a", phase: "verifying_merge" as const, runId: "run-a", requestId: "req-a", cwd: "/wt/a", head: "h1", detail: "Merged a", startedAt: 1, mergeAfter: "t1" };
+    const record: WaveRecord = { v: 1, id: "w", repositoryId: "r", n: 1, batchesLeft: 0, batch: 1, state: "running", members: [member], attempted: ["a"], note: "", seq: 5 };
+    const done = await (await resumeWave(record, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(phases(done)).toEqual({ a: "held" });
+    expect(done.note).toMatch(/where the merge landed was not recorded/);
+    expect(w.verifies).toEqual([]);
+  });
+});
+
+describe("verifying members together", () => {
+  it("4 members at host limit 2 take about 2T, not 4T, and a ready member merges while others verify", async () => {
+    vi.useFakeTimers();
+    try {
+      const T = 60_000;
+      const w = world({ candidates: [[task("a"), task("b"), task("c"), task("d")]], scopes: { a: ["a"], b: ["b"], c: ["c"], d: ["d"] } });
+      const finishedAt = new Map<string, number>(), mergedAt = new Map<string, number>(), verifying: string[] = [];
+      const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+      w.deps.sleep = (ms, signal) => new Promise<void>((resolve) => { const timer = setTimeout(resolve, ms); signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true }); });
+      w.deps.pollMs = 1_000;
+      // Task a is quick; the others take T. Only the first verification takes time: the gate after a merge answers at once.
+      w.deps.verify = async (id, _signal, post) => {
+        if (post) return { state: "passed", stale: false, head: post.head };
+        verifying.push(id);
+        await wait(id === "a" ? T / 10 : T);
+        finishedAt.set(id, Date.now());
+        return passed();
+      };
+      const merge = w.deps.merge;
+      w.deps.merge = async (target) => { mergedAt.set(target.taskId, Date.now()); return merge(target); };
+      const start = Date.now();
+      const runner = await startWave({ repositoryId: "r", n: 4, waves: 1 }, w.deps);
+      let end = 0;
+      void runner.finished.then(() => { end = Date.now(); });
+      await vi.advanceTimersByTimeAsync(5 * T);
+      expect(runner.record().state).toBe("done");
+      expect(w.merged).toHaveLength(4);
+      // Never more than two verifications at once: the third starts only when a slot frees.
+      expect(verifying.slice(0, 2)).toEqual(["a", "b"]);
+      expect(end - start).toBeGreaterThanOrEqual(2 * T);
+      expect(end - start).toBeLessThan(3 * T);
+      // a merged while b, c and d were still verifying.
+      expect(mergedAt.get("a")!).toBeLessThan(finishedAt.get("b")!);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("persists verifying, so a reload finds the members mid-verification", async () => {
+    const w = world({ candidates: [[task("a"), task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    expect(w.persisted.length).toBe(0);
+    await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    const mid = w.persisted.find((r) => r.members.length === 2 && r.members.every((m) => m.phase === "verifying"));
+    expect(mid).toBeTruthy();
+    // Resumed from there, the verifications are started again and the wave finishes.
+    const again = world({ candidates: [[task("a"), task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    const done = await (await resumeWave(structuredClone(mid!), again.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(again.merged).toEqual(["a", "b"]);
+  });
+
+  it("writes the record one write at a time, though verifications settle together", async () => {
+    const w = world({ candidates: [[task("a"), task("b"), task("c")]], scopes: { a: ["a"], b: ["b"], c: ["c"] } });
+    let writing = 0, overlapped = false;
+    const persist = w.deps.persist;
+    w.deps.persist = async (record) => { writing += 1; if (writing > 1) overlapped = true; await new Promise((resolve) => setTimeout(resolve, 0)); await persist(record); writing -= 1; };
+    await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    expect(overlapped).toBe(false);
+  });
+});
+
+describe("stopping", () => {
+  it("says it is stopping while a merge is in flight, and the merge is not cut off", async () => {
+    const w = world({ candidates: [[task("a")]] });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let inMerge = false;
+    const merge = w.deps.merge;
+    w.deps.merge = async (target) => { inMerge = true; await held; return merge(target); };
+    const runner = await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps);
+    while (!inMerge) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runner.stopping()).toBe(false);
+    const stopping = runner.cancel();
+    expect(runner.stopping()).toBe(true);
+    release();
+    await stopping;
+    expect(runner.stopping()).toBe(false);
+    expect(w.merged).toEqual(["a"]);
+  });
+
+  it("a stop during the gate leaves the merged member held and says so", async () => {
+    const w = world({ candidates: [[task("a")]] });
+    let inGate = false;
+    const verify = w.deps.verify;
+    w.deps.verify = (id, signal, post) => { if (!post) return verify(id, signal, post); inGate = true; return untilAborted(signal); };
+    const runner = await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps);
+    while (!inGate) await new Promise((resolve) => setTimeout(resolve, 0));
+    await runner.cancel();
+    expect(runner.record().state).toBe("cancelled");
+    expect(phases(runner.record())).toEqual({ a: "held" });
+  });
+});
+
+describe("a scope entry that cannot be read overlaps everything", () => {
+  const ci = { caseInsensitive: false };
+  it("fails closed on an empty, outside-the-repository or unreadable entry, and reads . as the whole repository", () => {
+    for (const bad of ["", "   ", "../outside.ts", "..", "a\u0001b"]) {
+      expect(scopesOverlap([bad], ["src/a.ts"], ci), JSON.stringify(bad)).toBe(true);
+      expect(scopesOverlap(["src/a.ts"], ["docs/x.md", bad], ci), JSON.stringify(bad)).toBe(true);
+    }
+    expect(scopesOverlap(["."], ["src/a.ts"], ci)).toBe(true);
+    expect(scopesOverlap(["src/.."], ["src/a.ts"], ci)).toBe(true);
+    expect(scopesOverlap(["src/a.ts"], ["docs/x.md"], ci)).toBe(false);
+    expect(scopesOverlap([], ["src/a.ts"], ci)).toBe(false);
+  });
+
+  it("runs a task alone when one of its scope entries cannot be read, rather than dropping the entry", () => {
+    const scopes = new Map([["a", ["src/a.ts", ""]], ["b", ["docs/b.md"]]]);
+    expect(planBatch([task("a"), task("b")], scopes, 2, new Set(), ci).chosen.map((c) => c.id)).toEqual(["a"]);
+    expect(planBatch([task("b"), task("a")], scopes, 2, new Set(), ci).chosen.map((c) => c.id)).toEqual(["b"]);
+  });
+});
+
+describe("file scopes follow the filesystem's case rules", () => {
+  it("treats src/A.ts and src/a.ts as overlapping on a case-insensitive filesystem, and as distinct on a case-sensitive one", () => {
+    expect(scopesOverlap(["src/A.ts"], ["src/a.ts"], { caseInsensitive: true })).toBe(true);
+    expect(scopesOverlap(["src/A.ts"], ["src/a.ts"], { caseInsensitive: false })).toBe(false);
+    expect(scopesOverlap(["Src"], ["src/x.ts"], { caseInsensitive: true })).toBe(true);
+    expect(scopesOverlap(["Src"], ["src/x.ts"], { caseInsensitive: false })).toBe(false);
+    const scopes = new Map([["a", ["src/A.ts"]], ["b", ["src/a.ts"]]]);
+    expect(planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: true }).chosen.map((c) => c.id)).toEqual(["a"]);
+    expect(planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: false }).chosen.map((c) => c.id)).toEqual(["a", "b"]);
   });
 });

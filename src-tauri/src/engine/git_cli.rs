@@ -2039,8 +2039,33 @@ fn subcommand_index(args: &[&str]) -> Option<usize> {
 
 /// True when `err` is the gate declining to start a child under load. The
 /// command may succeed if asked again once load falls; it did not run.
+///
+/// Anchored to the one shape [`refusal_message`] writes, so text that merely
+/// quotes the phrase (a path inside "Not a Git repository: <path>", a worktree
+/// named in "does not belong") is not a deferral. The shape is, after an
+/// optional `[code] ` prefix the ledger adds: a label of plain words (the
+/// program and subcommand, never a path or a quote), [`DEFERRED_MARKER`], then
+/// the wait as `<seconds>s:`. The label ends at the FIRST marker, so a hostile
+/// path that carries a complete refusal later in the text cannot qualify.
 pub(crate) fn is_deferred_under_load(err: &str) -> bool {
-    err.contains(DEFERRED_MARKER)
+    let body = match err.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+        Some((code, rest)) if code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => rest,
+        _ => err,
+    };
+    let Some((label, after)) = body.split_once(DEFERRED_MARKER) else {
+        return false;
+    };
+    let plain_label = !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'));
+    let waited = after.split_once("s:").is_some_and(|(seconds, _)| {
+        let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
+        [whole, fraction]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    });
+    plain_label && waited
 }
 
 /// True when `err` is a child that never got a concurrency slot inside its
@@ -4135,6 +4160,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static FORCE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    /// Every spawn on this thread is refused as the gate sheds background work.
+    #[cfg(test)]
+    static FORCE_DEFERRAL: Cell<bool> = const { Cell::new(false) };
     /// Runs at every forced failure, so a test can tell when a computation
     /// is in progress, or stretch it, without timing guesses.
     #[cfg(test)]
@@ -4216,6 +4244,22 @@ pub(crate) fn with_forced_spawn_failure<T>(body: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(FORCE_SPAWN_FAILURE.replace(true));
+    body()
+}
+
+/// Every child spawned on this thread inside `body` is refused exactly as the
+/// gate refuses shed background work ([`Refusal::Shed`]): the error a
+/// `gitpulse-mcp` read gets when the spawn budget is low, independent of
+/// machine load.
+#[cfg(test)]
+pub(crate) fn with_forced_deferral<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_DEFERRAL.set(self.0);
+        }
+    }
+    let _restore = Restore(FORCE_DEFERRAL.replace(true));
     body()
 }
 
@@ -4337,6 +4381,10 @@ fn run_admitted(
 ) -> Result<BoundedRun, String> {
     #[cfg(test)]
     SPAWN_LABELS.with(|labels| labels.borrow_mut().push(label.to_string()));
+    #[cfg(test)]
+    if FORCE_DEFERRAL.get() {
+        return Err(refusal_message(label, Refusal::Shed));
+    }
     #[cfg(test)]
     if FORCE_SPAWN_FAILURE.get() || forced_failure_matches(cmd) {
         FORCED_FAILURE_HOOK.with(|slot| {
@@ -5284,6 +5332,52 @@ mod tests {
         assert_eq!(first, "action");
         refresh.join().unwrap();
         action.join().unwrap();
+    }
+
+    /// A deferral is recognized only in the shape the gate writes it, at the
+    /// start (after the ledger's optional `[code] `), for every label the
+    /// callers pass and every refusal wording. Text that quotes the phrase,
+    /// in a path or a verdict, is not one.
+    #[test]
+    fn a_deferral_is_recognized_only_where_the_gate_writes_it() {
+        use super::{is_deferred_under_load, refusal_message, Refusal};
+        let waited = std::time::Duration::from_millis(1_500);
+        for label in [
+            "git worktree",
+            "git status",
+            "git check-ignore",
+            "devmap",
+            "kingfisher",
+            "gh",
+            "npm",
+            "ps",
+        ] {
+            for refusal in [
+                Refusal::Shed,
+                Refusal::Refused { waited },
+                Refusal::Pressure { reactive: true },
+            ] {
+                let message = refusal_message(label, refusal);
+                assert!(is_deferred_under_load(&message), "{message}");
+                assert!(
+                    is_deferred_under_load(&format!("[deferred_worktree] {message}")),
+                    "{message}"
+                );
+            }
+        }
+        let path = "/tmp/x deferred under load after 1.000s: y";
+        for hostile in [
+            format!("Not a Git repository: {path}"),
+            format!("Worktree '{path}' does not belong to repository '/r'"),
+            format!("fatal: cannot chdir to '{path}': No such file"),
+            format!("[invalid_worktree] Not a Git repository: {path}"),
+            format!("git status failed: {path}"),
+            " deferred under load after 1s".to_string(),
+            "git status deferred under load after soon".to_string(),
+            "git status deferred under load after 1s'".to_string(),
+        ] {
+            assert!(!is_deferred_under_load(&hostile), "{hostile}");
+        }
     }
 
     /// Each refusal carries exactly one marker, and the classifiers that the

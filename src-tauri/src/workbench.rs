@@ -567,7 +567,17 @@ impl WorkbenchState {
             return if method == "verifications.status" {
                 verification_driver::status(&store, &backend, id)
             } else {
-                verification_driver::run_now(&store, &backend, id)
+                let base = match &parsed["base"] {
+                    Value::Null => None,
+                    Value::String(base) => Some(base.as_str()),
+                    _ => {
+                        return Err(WorkbenchError::new(
+                            "invalid_input",
+                            "A verification base must be a commit id.",
+                        ))
+                    }
+                };
+                verification_driver::run_now(&store, &backend, id, base)
             };
         }
         // Manvi proposes; these only start, read or stop a scan, and file or

@@ -493,6 +493,15 @@ fn main() {
         first.counters["recorded"], first.counters["transcripts"]
     ));
 
+    // Ownership sample sizes: every `cold` call takes the next one up from 20,
+    // and the primed `warm` size is the production default, which no cold call
+    // reaches. The ref cache does not keep an answer read inside its racy
+    // window of the repository's last write, so wait that out before priming.
+    const WARM_OWNERSHIP_SAMPLE: usize = 128;
+    let next_cold = std::cell::Cell::new(20usize);
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    GitReader::knowledge_report(&path, Some(WARM_OWNERSHIP_SAMPLE)).expect("prime ownership");
+
     let cases = vec![
         Case::new("insights snapshot", || {
             let (snap, facets_ok) = snapshot(&path);
@@ -544,6 +553,36 @@ fn main() {
         Case::new("catch_up steady", || {
             let (sample, elapsed) = catch_up_sample(&steady_root, &path);
             sample.elapsed(elapsed)
+        }),
+        // The ownership report on the 600-file fixture. `cold` asks for a
+        // sample size no earlier sample used, so no kept answer can serve it;
+        // `warm` repeats one size primed above, which a build with no memo
+        // measures again every time.
+        Case::new("ownership cold", || {
+            let size = next_cold.get();
+            next_cold.set(size + 1);
+            let started = std::time::Instant::now();
+            let report = GitReader::knowledge_report(&path, Some(size))
+                .unwrap_or_else(|error| panic!("ownership report failed: {error}"));
+            let elapsed = started.elapsed();
+            assert_eq!(
+                report.scanned_files, size,
+                "the sample was not fully blamed"
+            );
+            std::hint::black_box(&report);
+            Sample::default()
+                .metric("scanned_files", report.scanned_files as f64)
+                .elapsed(elapsed)
+        }),
+        Case::new("ownership warm", || {
+            let started = std::time::Instant::now();
+            let report = GitReader::knowledge_report(&path, Some(WARM_OWNERSHIP_SAMPLE))
+                .unwrap_or_else(|error| panic!("ownership report failed: {error}"));
+            let elapsed = started.elapsed();
+            std::hint::black_box(&report);
+            Sample::default()
+                .counter("scanned_files", report.scanned_files as u64)
+                .elapsed(elapsed)
         }),
         Case::new("commit details", || {
             let details = GitReader::get_commit_details(&path, &commit)
