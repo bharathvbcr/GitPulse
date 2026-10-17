@@ -13638,4 +13638,524 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         );
         assert_rename_pairs(path, &oid, "evil.txt", "old.txt", "evil merge");
     }
+
+    /// Adversarial review of the ownership sample (card 21, S4-09). Tests that
+    /// pass pin behaviour the implementation got right; `#[ignore = "break: ..."]`
+    /// tests are known breaks and fail when run with `--ignored`.
+    mod adversarial_ownership {
+        use super::*;
+        use std::io::Write as _;
+
+        fn commit_as(dir: &Path, message: &str, author: &str) {
+            git_in(dir, &["add", "-A"]);
+            git_in(dir, &["commit", "-m", message, "--author", author]);
+        }
+
+        fn write(dir: &Path, rel: &str, body: &str) {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn lines(n: usize, tag: &str) -> String {
+            (0..n).map(|l| format!("let {tag}_{l} = {l};\n")).collect()
+        }
+
+        /// One `git fast-import` stream of `commits` commits on main, each a
+        /// list of (path, body), so a 5,000-commit history costs one spawn.
+        fn fast_import(dir: &Path, commits: &[Vec<(String, String)>]) {
+            let mut stream = String::new();
+            for (n, files) in commits.iter().enumerate() {
+                let msg = format!("c{n}");
+                stream += &format!(
+                    "commit refs/heads/main\ncommitter T <t@example.com> {} +0000\ndata {}\n{msg}\n",
+                    1_700_000_000 + n,
+                    msg.len()
+                );
+                if n == 0 {
+                    stream += "from refs/heads/main^0\n";
+                }
+                for (path, body) in files {
+                    stream += &format!("M 644 inline {path}\ndata {}\n{body}\n", body.len());
+                }
+            }
+            let mut child = std::process::Command::new("git")
+                .args(["fast-import", "--quiet"])
+                .current_dir(dir)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fast-import");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stream.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success(), "fast-import failed");
+            git_in(dir, &["reset", "-q", "--hard"]);
+        }
+
+        fn primary_emails(report: &KnowledgeReport) -> Vec<&str> {
+            report
+                .primary_authors
+                .iter()
+                .map(|a| a.author_email.as_str())
+                .collect()
+        }
+
+        /// Paths with a newline, a tab, a space, a leading dash and non-ASCII
+        /// survive `numstat -z` parsing, `ls-tree -z` and `blame HEAD --`, so
+        /// the busiest of them make the sample and the report is complete.
+        #[test]
+        fn awkward_paths_are_ranked_blamed_and_kept() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                for n in 0..130 {
+                    write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
+                }
+                let hot = [
+                    "src/zz new\nline.rs",
+                    "src/zz\ttab.rs",
+                    "src/zz space name.rs",
+                    "src/-zz dash.rs",
+                    "src/zz \u{e9}.rs",
+                ];
+                for name in hot {
+                    write(dir.path(), name, "fn hot() {}\n");
+                }
+                commit_as(dir.path(), "feat: seed", "A <a@example.com>");
+                for round in 0..3 {
+                    for name in hot {
+                        write(dir.path(), name, &lines(60, &format!("r{round}")));
+                    }
+                    commit_as(dir.path(), "feat: churn", "A <a@example.com>");
+                }
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                let report = GitReader::knowledge_report(path, None).expect("report");
+                assert_eq!(report.candidate_files, 135);
+                assert_eq!(report.scanned_files, 128, "{report:?}");
+                assert_eq!(
+                    report.scanned_lines,
+                    hot.len() * 60 + (128 - hot.len()),
+                    "every awkward hot path is sampled: {report:?}"
+                );
+                let cold = blame_spawns(&root);
+                GitReader::knowledge_report(path, None).expect("second");
+                assert_eq!(blame_spawns(&root), cold, "a clean report is kept");
+            });
+        }
+
+        /// A file deleted at HEAD with the most churn in history is not in
+        /// `ls-tree`, so it is neither sampled nor blamed, and no blame fails.
+        #[test]
+        fn a_deleted_high_churn_file_is_not_sampled_and_does_not_fail_blame() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                for n in 0..130 {
+                    write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
+                }
+                write(dir.path(), "src/gone.rs", "fn gone() {}\n");
+                commit_as(dir.path(), "feat: seed", "A <a@example.com>");
+                for round in 0..4 {
+                    write(dir.path(), "src/gone.rs", &lines(200, &format!("r{round}")));
+                    commit_as(dir.path(), "feat: churn", "A <a@example.com>");
+                }
+                git_in(dir.path(), &["rm", "-q", "src/gone.rs"]);
+                commit_as(dir.path(), "chore: delete", "A <a@example.com>");
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                let report = GitReader::knowledge_report(path, None).expect("report");
+                assert_eq!(report.candidate_files, 130);
+                assert_eq!(report.scanned_files, 128);
+                assert_eq!(report.scanned_lines, 128);
+                let cold = blame_spawns(&root);
+                assert_eq!(cold, 128);
+                GitReader::knowledge_report(path, None).expect("second");
+                assert_eq!(blame_spawns(&root), cold);
+            });
+        }
+
+        /// Editing the uncommitted `.mailmap`, the content or the target of
+        /// `mailmap.file`, or the blob `mailmap.blob` names is never answered
+        /// from the report measured under the old map. Git itself reads the
+        /// worktree `.mailmap` when blaming at an explicit revision.
+        #[test]
+        fn every_mailmap_input_invalidates_the_memo() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                write(dir.path(), "code.rs", "fn a() {}\n");
+                commit_as(dir.path(), "feat: code", "Old <old@example.com>");
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                let email = || {
+                    let report = GitReader::knowledge_report(path, None).expect("report");
+                    primary_emails(&report)[0].to_string()
+                };
+                let map = |to: &str| format!("N <{to}> <old@example.com>\n");
+
+                assert_eq!(email(), "old@example.com");
+                write(&root, ".mailmap", &map("tree1@example.com"));
+                assert_eq!(email(), "tree1@example.com", "uncommitted .mailmap");
+                write(&root, ".mailmap", &map("tree2@example.com"));
+                assert_eq!(email(), "tree2@example.com", "edited .mailmap");
+                std::fs::remove_file(root.join(".mailmap")).unwrap();
+                assert_eq!(email(), "old@example.com", "deleted .mailmap");
+
+                write(&root, "../f1.mailmap", &map("f1a@example.com"));
+                write(&root, "../f2.mailmap", &map("f2@example.com"));
+                let (f1, f2) = (
+                    root.parent().unwrap().join("f1.mailmap"),
+                    root.parent().unwrap().join("f2.mailmap"),
+                );
+                git_in(&root, &["config", "mailmap.file", f1.to_str().unwrap()]);
+                assert_eq!(email(), "f1a@example.com", "mailmap.file");
+                std::fs::write(&f1, map("f1b@example.com")).unwrap();
+                assert_eq!(email(), "f1b@example.com", "mailmap.file content");
+                git_in(&root, &["config", "mailmap.file", f2.to_str().unwrap()]);
+                assert_eq!(email(), "f2@example.com", "mailmap.file retargeted");
+                git_in(&root, &["config", "--unset", "mailmap.file"]);
+
+                let blob = |to: &str| {
+                    git_stdout_in_with_stdin(&root, &["hash-object", "-w", "--stdin"], &map(to))
+                        .trim()
+                        .to_string()
+                };
+                let (b1, b2) = (blob("b1@example.com"), blob("b2@example.com"));
+                git_in(&root, &["update-ref", "refs/mm/blob", &b1]);
+                git_in(&root, &["config", "mailmap.blob", "refs/mm/blob"]);
+                assert_eq!(email(), "b1@example.com", "mailmap.blob");
+                git_in(&root, &["update-ref", "refs/mm/blob", &b2]);
+                assert_eq!(email(), "b2@example.com", "mailmap.blob ref moved");
+            });
+        }
+
+        fn git_stdout_in_with_stdin(dir: &Path, args: &[&str], stdin: &str) -> String {
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn git");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        /// Two worktrees of one repository at the same HEAD with different
+        /// uncommitted `.mailmap` files must not read each other's answer.
+        #[test]
+        fn two_worktrees_at_one_head_do_not_share_a_memo() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                write(dir.path(), "code.rs", "fn a() {}\n");
+                commit_as(dir.path(), "feat: code", "Old <old@example.com>");
+                let main = dir.path().canonicalize().unwrap();
+                let linked = main.parent().unwrap().join(format!(
+                    "adv-wt-{}",
+                    main.file_name().unwrap().to_string_lossy()
+                ));
+                git_in(
+                    &main,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        linked.to_str().unwrap(),
+                        "-b",
+                        "wt",
+                    ],
+                );
+                crate::test_support::trust_repo(&linked);
+                write(
+                    &main,
+                    ".mailmap",
+                    "M <main@example.com> <old@example.com>\n",
+                );
+                write(
+                    &linked,
+                    ".mailmap",
+                    "L <linked@example.com> <old@example.com>\n",
+                );
+                for _ in 0..2 {
+                    let m = GitReader::knowledge_report(main.to_str().unwrap(), None).unwrap();
+                    let l = GitReader::knowledge_report(linked.to_str().unwrap(), None).unwrap();
+                    assert_eq!(primary_emails(&m), ["main@example.com"]);
+                    assert_eq!(primary_emails(&l), ["linked@example.com"]);
+                }
+                git_in(
+                    &main,
+                    &["worktree", "remove", "--force", linked.to_str().unwrap()],
+                );
+            });
+        }
+
+        /// An unborn HEAD is an empty answer, and a shallow clone is blamed at
+        /// its boundary without a failure.
+        #[test]
+        fn an_unborn_head_and_a_shallow_clone_are_answers() {
+            let empty = tempfile::TempDir::new().unwrap();
+            git_in(empty.path(), &["init", "-b", "main"]);
+            let report =
+                GitReader::knowledge_report(empty.path().to_str().unwrap(), None).expect("unborn");
+            assert_eq!((report.candidate_files, report.areas_total), (0, 0));
+            assert!(report.areas.is_empty() && !report.truncated);
+
+            let src = init_repo_with_remotes(&[], "main");
+            for n in 0..3 {
+                write(src.path(), &format!("src/f{n}.rs"), &lines(n + 1, "x"));
+                commit_as(src.path(), "feat: f", "A <a@example.com>");
+            }
+            let parent = tempfile::TempDir::new().unwrap();
+            let url = format!("file://{}", src.path().canonicalize().unwrap().display());
+            git_in(
+                parent.path(),
+                &["clone", "-q", "--depth", "1", &url, "shallow"],
+            );
+            let shallow = parent.path().join("shallow");
+            crate::test_support::trust_repo(&shallow);
+            let report =
+                GitReader::knowledge_report(shallow.to_str().unwrap(), None).expect("shallow");
+            assert_eq!(report.scanned_files, report.candidate_files, "{report:?}");
+            assert_eq!(report.scanned_lines, 1 + 2 + 3);
+        }
+
+        /// A directory literally named `(root)` is a different area from the
+        /// top-level files, which are labelled `(root)`.
+        #[test]
+        #[ignore = "break: a top-level directory named `(root)` merges with the root-file area label"]
+        fn a_directory_named_root_is_not_the_root_area() {
+            let sample = select_ownership_sample(
+                vec!["(root)/a.rs".to_string(), "top.rs".to_string()],
+                &HashMap::new(),
+                8,
+            );
+            assert_eq!(sample.areas_total, 2, "{:?}", sample.areas);
+        }
+
+        /// More areas than the report carries rows for: the sample still takes
+        /// one file per busiest area, and `areas_total` carries the real count.
+        #[test]
+        fn more_areas_than_rows_and_than_slots_stay_honest() {
+            let mut churn = HashMap::new();
+            let mut files = Vec::new();
+            for n in 0..300 {
+                let path = format!("a{n:03}/f.rs");
+                churn.insert(path.clone(), 300 - n);
+                files.push(path);
+            }
+            let sample = select_ownership_sample(files.clone(), &churn, 128);
+            assert_eq!(sample.files.len(), 128);
+            assert_eq!(sample.areas_total, 300);
+            assert_eq!(sample.areas.len(), MAX_REPORTED_AREAS);
+            assert_eq!(
+                sample.areas.iter().filter(|a| a.sampled_files > 0).count(),
+                128
+            );
+            // 10,000 files in one area and nine singletons: every area is seen.
+            let mut big: Vec<String> = (0..10_000).map(|n| format!("big/f{n}.rs")).collect();
+            big.extend((0..9).map(|n| format!("s{n}/one.rs")));
+            let sample = select_ownership_sample(big, &HashMap::new(), 128);
+            assert_eq!(sample.areas_total, 10);
+            assert!(sample.areas.iter().all(|a| a.sampled_files >= 1));
+            // Case-only differing names are two areas, as they are in the tree.
+            let sample = select_ownership_sample(
+                vec!["Docs/a.md".to_string(), "docs/a.md".to_string()],
+                &HashMap::new(),
+                8,
+            );
+            assert_eq!(sample.areas_total, 2);
+        }
+
+        /// A tab-bearing name that itself looks like a numstat header, as the
+        /// new path of a rename, must not be taken for the next record.
+        #[test]
+        #[ignore = "break: a rename whose new path looks like `1<TAB>2<TAB>x` is parsed as a plain change"]
+        fn a_rename_to_a_header_shaped_name_is_a_rename() {
+            let files = parse_numstat_files("0\t0\t\0old.txt\01\t2\tx.txt\0");
+            assert_eq!(files.len(), 1, "{files:?}");
+            assert_eq!(files[0].path, "1\t2\tx.txt");
+        }
+
+        /// `git log --numstat` follows a rename, but counts it only under the
+        /// new name for the rename commit, so a heavily churned file that was
+        /// moved ranks as untouched and falls out of the sample.
+        #[test]
+        #[ignore = "break: churn is not carried across a rename, so a moved hot file ranks last"]
+        fn a_renamed_hot_file_keeps_its_churn_rank() {
+            let dir = init_repo_with_remotes(&[], "main");
+            for n in 0..130 {
+                write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
+            }
+            write(dir.path(), "src/hot.rs", "fn hot() {}\n");
+            commit_as(dir.path(), "feat: seed", "A <a@example.com>");
+            for round in 0..5 {
+                write(dir.path(), "src/hot.rs", &lines(60, &format!("r{round}")));
+                commit_as(dir.path(), "feat: churn", "A <a@example.com>");
+            }
+            git_in(dir.path(), &["mv", "src/hot.rs", "src/zz_moved.rs"]);
+            commit_as(dir.path(), "refactor: move", "A <a@example.com>");
+            let report =
+                GitReader::knowledge_report(dir.path().to_str().unwrap(), None).expect("report");
+            assert_eq!(
+                report.scanned_lines,
+                60 + 127,
+                "the moved file is the busiest one: {report:?}"
+            );
+        }
+
+        /// A gitlink (submodule) is in `ls-tree` and cannot be blamed. That is
+        /// not a failure of the sample, and must not defeat the memo or make
+        /// every report permanently `truncated`.
+        #[test]
+        #[ignore = "break: one gitlink makes blame_failed true, so the report is never kept and always truncated"]
+        fn a_submodule_does_not_defeat_the_memo_or_truncate_the_report() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                write(dir.path(), "src/a.rs", "fn a() {}\n");
+                commit_as(dir.path(), "feat: a", "A <a@example.com>");
+                let head = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+                git_in(
+                    dir.path(),
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("160000,{},vendor/sub", head.trim()),
+                    ],
+                );
+                git_in(dir.path(), &["commit", "-m", "chore: gitlink"]);
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                let first = GitReader::knowledge_report(path, None).expect("first");
+                assert!(
+                    !first.truncated,
+                    "a gitlink is not a missed file: {first:?}"
+                );
+                let cold = blame_spawns(&root);
+                GitReader::knowledge_report(path, None).expect("second");
+                assert_eq!(blame_spawns(&root), cold, "the second call must be kept");
+            });
+        }
+
+        /// Two simultaneous cold calls each blame: nothing coalesces them, so
+        /// Pulse and an MCP caller activating together double the work.
+        #[test]
+        #[ignore = "break: no single-flight, two concurrent cold calls blame every file twice"]
+        fn concurrent_cold_calls_blame_once() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = churn_fixture(40, 2);
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap().to_string();
+                let gate = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    for _ in 0..2 {
+                        scope.spawn(|| {
+                            gate.wait();
+                            GitReader::knowledge_report(&path, None).expect("report");
+                        });
+                    }
+                });
+                assert_eq!(blame_spawns(&root), 42, "one blame per file, not two");
+            });
+        }
+
+        /// More than OWNERSHIP_CHURN_COMMITS commits: a file that was busy
+        /// only before the window ranks as untouched, and nothing in the
+        /// report says the ranking saw a capped history.
+        #[test]
+        #[ignore = "break: the 5,000-commit churn window is silent; a file busy before it is dropped and nothing is flagged"]
+        fn a_file_busy_before_the_churn_window_is_still_sampled() {
+            let dir = init_repo_with_remotes(&[], "main");
+            let mut commits: Vec<Vec<(String, String)>> = Vec::new();
+            let mut seed: Vec<(String, String)> = (0..200)
+                .map(|n| (format!("src/cold_{n:03}.rs"), "fn c() {}\n".to_string()))
+                .collect();
+            seed.push(("src/zzz_hot.rs".into(), "fn h() {}\n".into()));
+            commits.push(seed);
+            for round in 0..50 {
+                commits.push(vec![(
+                    "src/zzz_hot.rs".into(),
+                    lines(50, &format!("r{round}")),
+                )]);
+            }
+            for n in 0..(OWNERSHIP_CHURN_COMMITS + 10) {
+                // Spread over the cold files so no one blame walks 5,000 commits.
+                commits.push(vec![(
+                    format!("src/cold_{:03}.rs", n % 199 + 1),
+                    format!("fn c{n}() {{}}\n"),
+                )]);
+            }
+            fast_import(dir.path(), &commits);
+            let report =
+                GitReader::knowledge_report(dir.path().to_str().unwrap(), None).expect("report");
+            assert_eq!(report.candidate_files, 201);
+            assert!(
+                report.scanned_lines >= 50 + 127,
+                "the hot file (50 lines) is sampled: {report:?}"
+            );
+        }
+
+        /// Spawn budget for one cold call and one warm call on a 2,000-file
+        /// repository. Printed with `--nocapture`; the bounds keep it honest.
+        #[test]
+        fn spawn_budget_on_a_two_thousand_file_repository() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                let seed: Vec<(String, String)> = (0..2000)
+                    .map(|n| {
+                        (
+                            format!("d{:02}/f{n:04}.rs", n % 20),
+                            "fn f() {}\n".to_string(),
+                        )
+                    })
+                    .collect();
+                let hot: Vec<(String, String)> = (0..20)
+                    .map(|n| (format!("d{n:02}/f{n:04}.rs"), lines(40, "h")))
+                    .collect();
+                fast_import(dir.path(), &[seed, hot]);
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                let before = git_cli::spawn_log::spawns_in(&root).len();
+                let report = GitReader::knowledge_report(path, None).expect("cold");
+                let cold = git_cli::spawn_log::spawns_in(&root);
+                let cold_n = cold.len() - before;
+                GitReader::knowledge_report(path, None).expect("warm");
+                let warm = git_cli::spawn_log::spawns_in(&root);
+                let warm_n = warm.len() - before - cold_n;
+                let by = |log: &[Vec<String>], word: &str| {
+                    log.iter().filter(|a| a.iter().any(|x| x == word)).count()
+                };
+                eprintln!(
+                    "SPAWNS cold={cold_n} (blame={}, ls-tree={}, log={}, config={}) warm={warm_n} scanned={} candidates={}",
+                    by(&cold[before..], "blame"),
+                    by(&cold[before..], "ls-tree"),
+                    by(&cold[before..], "log"),
+                    by(&cold[before..], "config"),
+                    report.scanned_files,
+                    report.candidate_files
+                );
+                for argv in &warm[before + cold_n..] {
+                    eprintln!("WARM {argv:?}");
+                }
+                assert_eq!(report.candidate_files, 2000);
+                assert!(cold_n <= 136, "cold spawns {cold_n}");
+                assert!(warm_n <= 6, "warm spawns {warm_n}");
+            });
+        }
+    }
 }
