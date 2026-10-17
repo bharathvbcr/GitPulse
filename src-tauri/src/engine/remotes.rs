@@ -917,3 +917,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "remotes_adv_tests.rs"]
+mod adv_tests;
