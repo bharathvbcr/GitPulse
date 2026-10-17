@@ -631,6 +631,22 @@ mod tests {
         (dir, path)
     }
 
+    /// KNOWN BREAK (ft-9cfa5374 adversarial review, medium): the `does not
+    /// belong` verdict quotes the worktree path, and the deferral arm of
+    /// `classify` is tested before the unrelated arm with a bare substring
+    /// match, so a worktree whose path contains the gate's marker reads as a
+    /// deferral. Expected `unrelated_worktree`; actual `deferred_worktree`.
+    #[test]
+    #[should_panic(expected = "deferred_worktree")]
+    fn a_hostile_worktree_path_cannot_make_an_unrelated_verdict_read_as_deferred() {
+        let (_dir, path) = repo();
+        let message = format!(
+            "Worktree '{path}/x deferred under load after 1s' does not belong to repository '{path}'"
+        );
+        let error = classify(&path, &path, message);
+        assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+
     /// The messages the spawn gate produces when it declines to start Git, in
     /// every wording it has: shed at once (`0.000s`, background work) and
     /// refused after waiting out the rate budget (any duration).
