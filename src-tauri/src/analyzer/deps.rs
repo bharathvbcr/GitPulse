@@ -1248,7 +1248,7 @@ fn dispatch_bun_audit(
     match run_json_cli(cwd, bun_program(), &["audit", "--json"], env) {
         Ok(text) => match parse_bun_audit_json(&text) {
             Ok(mut vulns) => {
-                let sections = declared_sections_or_issue(repo, cwd, report, label);
+                let sections = declared_sections_or_issue(repo, cwd, report);
                 for vuln in &mut vulns {
                     vuln.is_direct = sections.contains_key(&vuln.name);
                 }
@@ -1271,7 +1271,7 @@ fn dispatch_npm_outdated(
     match run_npm_json(cwd, &["outdated", "--json"], env) {
         Ok(text) => match parse_npm_outdated_json(&text) {
             Ok(mut rows) => {
-                let sections = declared_sections_or_issue(repo, cwd, report, label);
+                let sections = declared_sections_or_issue(repo, cwd, report);
                 fill_dependency_types(&mut rows, &sections);
                 report.outdated.append(&mut rows);
             }
@@ -2989,7 +2989,7 @@ fn declares_workspaces(repo: &Path, dir: &str) -> bool {
             format!("{dir}/{name}")
         }
     };
-    if sandbox_join(repo, &join("pnpm-workspace.yaml")).is_ok_and(|p| p.is_file()) {
+    if regular_file_in_repo(repo, &join("pnpm-workspace.yaml")) {
         return true;
     }
     // A refused manifest (oversized, not regular, outside the repository)
@@ -3024,14 +3024,21 @@ fn detect_lockfile(repo: &Path, dir: &str) -> Option<String> {
         } else {
             format!("{dir}/{name}")
         };
-        let Ok(path) = sandbox_join(repo, &rel) else {
-            continue;
-        };
-        if path.is_file() {
+        if regular_file_in_repo(repo, &rel) {
             return Some((*name).to_string());
         }
     }
     None
+}
+
+/// True when `rel` resolves, inside the repository, to a regular file. The
+/// same resolution as [`read_manifest_bytes`] (`sandbox_join_canonical`, then a
+/// non-blocking no-follow open that classifies the descriptor), without
+/// reading: a link out of the repository, a FIFO or a socket never counts, so
+/// a file outside the repo cannot change what a scan concludes.
+fn regular_file_in_repo(repo: &Path, rel: &str) -> bool {
+    sandbox_join_canonical(repo, rel)
+        .is_ok_and(|canon| crate::fs_entry::open_regular_nofollow(&canon).is_ok())
 }
 
 fn lockfile_to_manager(name: &str) -> &'static str {
@@ -3660,19 +3667,25 @@ fn declared_dependency_sections(
 
 /// The declared-section map for the manifest in `cwd`, with a refused manifest
 /// reported as an issue (and the map left empty) instead of read.
+///
+/// The issue is the one `local_scan` reports for the same manifest: same code,
+/// same severity (`error`: a manifest was refused and what depends on it is
+/// unexamined, not merely blank), and the manifest's own repo-relative path,
+/// so `push_issue` collapses it with that report and across the two
+/// dispatchers instead of repeating it per call.
 fn declared_sections_or_issue(
     repo: &Path,
     cwd: &Path,
     report: &mut DepsHealthReport,
-    label: &str,
 ) -> BTreeMap<String, String> {
-    declared_dependency_sections(repo, &cwd.join("package.json")).unwrap_or_else(|message| {
+    let manifest = cwd.join("package.json");
+    declared_dependency_sections(repo, &manifest).unwrap_or_else(|message| {
         push_issue(
             &mut report.issues,
-            "warning",
+            "error",
             "manifest_unreadable",
             message,
-            Some(label.to_string()),
+            Some(repo_relative(repo, &manifest)),
         );
         BTreeMap::new()
     })
@@ -5166,7 +5179,6 @@ mod tests {
     /// supported on socket" instead of "not a regular file".
     #[cfg(unix)]
     #[test]
-    #[ignore = "break: a socket named package.json is refused with an I/O message, not 'not a regular file'"]
     fn adv_socket_refusal_names_the_file_kind() {
         let (_guard, repo) = canonical_repo();
         let _listener =
@@ -5220,7 +5232,7 @@ mod tests {
     /// even when its other name is outside the repository.
     #[cfg(unix)]
     #[test]
-    #[ignore = "break: a hardlink to a file outside the repository is read (not detectable by path; nlink > 1 is the only signal)"]
+    #[ignore = "accepted limitation: a hardlink is indistinguishable from a regular file by path; see ft-bdb253cf review"]
     fn adv_hardlink_to_an_outside_file_is_refused() {
         let (_guard, repo) = canonical_repo();
         let (_outside_guard, outside) = canonical_repo();
@@ -5244,9 +5256,11 @@ mod tests {
             .expect("lossy read")
             .is_some());
         assert!(!declares_workspaces(&repo, ""));
-        assert!(declared_dependency_sections(&repo, &repo.join("package.json"))
-            .expect("not an error")
-            .is_empty());
+        assert!(
+            declared_dependency_sections(&repo, &repo.join("package.json"))
+                .expect("not an error")
+                .is_empty()
+        );
     }
 
     /// APFS is case- and normalization-insensitive by default; the read must
@@ -5274,8 +5288,8 @@ mod tests {
         }
     }
 
-    /// The refusal reaches the report as `manifest_unreadable`, once per
-    /// dispatcher that needed the sections, and an unreadable manifest leaves
+    /// The refusal reaches the report as one `manifest_unreadable` error no
+    /// matter how many dispatchers asked, and an unreadable manifest leaves
     /// the map empty.
     #[cfg(unix)]
     #[test]
@@ -5290,13 +5304,23 @@ mod tests {
             home: None,
         });
         let (mut report, _) = local_scan(&root, &env).unwrap();
-        let before = report.issues.len();
-        let sections = declared_sections_or_issue(&root, &root, &mut report, "root");
-        assert!(sections.is_empty());
-        let added = &report.issues[before..];
-        assert_eq!(added.len(), 1, "{added:?}");
-        assert_eq!(added[0].code, "manifest_unreadable");
-        assert!(added[0].message.contains("exceeds"), "{}", added[0].message);
+        // Both dispatchers (and `local_scan`, if it saw the manifest) report
+        // the one refusal: a single issue, at one severity.
+        assert!(declared_sections_or_issue(&root, &root, &mut report).is_empty());
+        assert!(declared_sections_or_issue(&root, &root, &mut report).is_empty());
+        let refusals: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.code == "manifest_unreadable")
+            .collect();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].severity, "error");
+        assert_eq!(refusals[0].path.as_deref(), Some("package.json"));
+        assert!(
+            refusals[0].message.contains("exceeds"),
+            "{}",
+            refusals[0].message
+        );
     }
 
     /// Break (hypothesis under test): `pnpm-workspace.yaml` is still probed
@@ -5304,7 +5328,6 @@ mod tests {
     /// out of the repository, so an outside file decides workspace coverage.
     #[cfg(unix)]
     #[test]
-    #[ignore = "break: a pnpm-workspace.yaml symlink outside the repo still makes a member 'covered' by the root lockfile"]
     fn adv_pnpm_workspace_symlink_outside_the_repo_does_not_change_the_scan() {
         let (_guard, repo) = canonical_repo();
         let (_outside_guard, outside) = canonical_repo();
@@ -5313,13 +5336,44 @@ mod tests {
         fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: 9\n").expect("lock");
         fs::create_dir_all(repo.join("packages/a")).expect("mkdir");
         fs::write(repo.join("packages/a/package.json"), br#"{"name":"a"}"#).expect("member");
-        assert_eq!(resolve_lockfile(&repo, "packages/a"), None, "control: no workspace");
+        assert_eq!(
+            resolve_lockfile(&repo, "packages/a"),
+            None,
+            "control: no workspace"
+        );
         std::os::unix::fs::symlink(outside.join("ws.yaml"), repo.join("pnpm-workspace.yaml"))
             .expect("symlink");
         assert_eq!(
             resolve_lockfile(&repo, "packages/a"),
             None,
             "an out-of-repo pnpm-workspace.yaml must not be consulted"
+        );
+    }
+
+    /// `detect_lockfile` shares the existence check: a lockfile that is a link
+    /// out of the repository (or a FIFO) is not a lockfile, so it cannot cover
+    /// a package, while an in-repo link still counts.
+    #[cfg(unix)]
+    #[test]
+    fn a_lockfile_symlinked_outside_the_repo_is_not_detected() {
+        let (_guard, repo) = canonical_repo();
+        let (_outside_guard, outside) = canonical_repo();
+        fs::write(outside.join("yarn.lock"), "# outside\n").expect("outside");
+        std::os::unix::fs::symlink(outside.join("yarn.lock"), repo.join("yarn.lock"))
+            .expect("symlink");
+        assert_eq!(detect_lockfile(&repo, ""), None);
+        let status = Command::new("mkfifo")
+            .arg(repo.join("package-lock.json"))
+            .status_locked()
+            .expect("mkfifo");
+        assert!(status.success());
+        assert_eq!(detect_lockfile(&repo, ""), None, "a FIFO is not a lockfile");
+        // Control: an in-repo link to a regular file still counts.
+        fs::write(repo.join("real.lock"), "# real\n").expect("real");
+        std::os::unix::fs::symlink("real.lock", repo.join("pnpm-lock.yaml")).expect("link");
+        assert_eq!(
+            detect_lockfile(&repo, "").as_deref(),
+            Some("pnpm-lock.yaml")
         );
     }
 

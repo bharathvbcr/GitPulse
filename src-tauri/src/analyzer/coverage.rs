@@ -6961,11 +6961,45 @@ src/main.go:4.1,4.8 1 0
     #[test]
     fn decode_xml_entities_matches_reference_on_crafted_inputs() {
         for input in [
-            "&amp&lt;", "&#38;", "&#x26;", "&#X26;", "&&amp;", "&#;", "&;", "&&;", "&;&;",
-            "&#x;", "&#+65;", "&#x+41;", "&#-1;", "&#x-1;", "&amp;amp;", "&#38;amp;", "&#38;lt;",
-            "&#x26;#x26;", "&#x26;#38;", "&a&b;", "&&&amp;", "&amp;&", "&", "", ";", ";&",
-            "&\u{e9};", "&\u{1F600};", "&#\u{e9};", "&#0;", "&#x0;", "&#x00000041;", "& ;",
-            "&AMP;", "&Amp;", "&amp ;", "&#65 ;", "&#6\u{0035};", "x&#x41;y&#66;z&bogus;&lt",
+            "&amp&lt;",
+            "&#38;",
+            "&#x26;",
+            "&#X26;",
+            "&&amp;",
+            "&#;",
+            "&;",
+            "&&;",
+            "&;&;",
+            "&#x;",
+            "&#+65;",
+            "&#x+41;",
+            "&#-1;",
+            "&#x-1;",
+            "&amp;amp;",
+            "&#38;amp;",
+            "&#38;lt;",
+            "&#x26;#x26;",
+            "&#x26;#38;",
+            "&a&b;",
+            "&&&amp;",
+            "&amp;&",
+            "&",
+            "",
+            ";",
+            ";&",
+            "&\u{e9};",
+            "&\u{1F600};",
+            "&#\u{e9};",
+            "&#0;",
+            "&#x0;",
+            "&#x00000041;",
+            "& ;",
+            "&AMP;",
+            "&Amp;",
+            "&amp ;",
+            "&#65 ;",
+            "&#6\u{0035};",
+            "x&#x41;y&#66;z&bogus;&lt",
         ] {
             assert_eq!(
                 decode_xml_entities(input),
@@ -7007,8 +7041,24 @@ src/main.go:4.1,4.8 1 0
         }
         // Random strings built from entity pieces, so valid references occur.
         let pieces = [
-            "&amp;", "&lt;", "&gt;", "&quot;", "&apos;", "&#65;", "&#x42;", "&#X43;", "&", ";",
-            "&#", "&#x", "a", "\u{e9}", "&#x0000041;", "&#38;", "&#x26;", "&#+66;",
+            "&amp;",
+            "&lt;",
+            "&gt;",
+            "&quot;",
+            "&apos;",
+            "&#65;",
+            "&#x42;",
+            "&#X43;",
+            "&",
+            ";",
+            "&#",
+            "&#x",
+            "a",
+            "\u{e9}",
+            "&#x0000041;",
+            "&#38;",
+            "&#x26;",
+            "&#+66;",
         ];
         for _ in 0..60_000 {
             let n = (next() % 40) as usize;
@@ -7024,7 +7074,10 @@ src/main.go:4.1,4.8 1 0
             }
         }
         assert_eq!(cases, 120_000);
-        assert!(decoded_something > 20_000, "generator rarely decodes: {decoded_something}");
+        assert!(
+            decoded_something > 20_000,
+            "generator rarely decodes: {decoded_something}"
+        );
     }
 
     /// Detail payloads are capped per file; totals still reflect every line.
