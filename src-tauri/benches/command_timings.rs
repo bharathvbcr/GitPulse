@@ -565,7 +565,10 @@ fn main() {
             let report = GitReader::knowledge_report(&path, Some(size))
                 .unwrap_or_else(|error| panic!("ownership report failed: {error}"));
             let elapsed = started.elapsed();
-            assert_eq!(report.scanned_files, size, "the sample was not fully blamed");
+            assert_eq!(
+                report.scanned_files, size,
+                "the sample was not fully blamed"
+            );
             std::hint::black_box(&report);
             Sample::default()
                 .metric("scanned_files", report.scanned_files as f64)
