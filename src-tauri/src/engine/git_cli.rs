@@ -8399,14 +8399,8 @@ mod tests {
         for pidfile in pidfiles {
             let pid = std::fs::read_to_string(&pidfile).expect("pid");
             let pid = pid.trim();
-            let probe = Command::new("kill")
-                .args(["-0", pid])
-                .status_locked()
-                .expect("kill -0");
-            assert!(
-                !probe.success(),
-                "deadline left pid {pid} running ({pidfile:?})"
-            );
+            let alive = crate::test_support::process_alive(pid.parse().expect("pid"));
+            assert!(!alive, "deadline left pid {pid} running ({pidfile:?})");
         }
     }
 
