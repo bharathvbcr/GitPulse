@@ -11,6 +11,8 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-17
+
 ### Added
 
 - **GPU terminal rendering**, gated on the TUI-redraw A/B in
@@ -372,8 +374,6 @@ before that tag is pushed.
   repository's message.** The commit box wiped the draft and the amend flag of
   whichever repository was showing when the commit returned, not the one it ran
   in. It now leaves the repository you are looking at alone.
-
-## [1.4.0] - 2026-10-11
 
 Agents that start in the background with a pane showing every one at work,
 stacked worktree tabs, a model choice per agent, one agent guidance in every
