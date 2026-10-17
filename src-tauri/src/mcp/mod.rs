@@ -25,6 +25,8 @@
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
 #[cfg(test)]
+mod adversarial_deferral_tests;
+#[cfg(test)]
 mod adversarial_tests;
 mod budget;
 pub mod complete;
@@ -659,6 +661,43 @@ fn codeintel_output() -> Value {
     })
 }
 
+/// `deferred`: present and true only on a facet whose own Git read the spawn
+/// gate deferred (and that stayed deferred after one retry).
+fn deferred_property() -> Value {
+    json!({ "type": "boolean", "description": "Present and true only when a Git read was deferred under load (and stayed deferred after one retry); nothing was examined, so ask again after retry_after_ms." })
+}
+
+/// `retry_after_ms`: what accompanies [`deferred_property`].
+fn retry_after_property() -> Value {
+    json!({ "type": "integer", "minimum": 0, "description": "With deferred: the soonest worth asking again, one refill interval of the spawn rate budget." })
+}
+
+/// An open object facet that can carry the deferral fields.
+fn deferrable_object() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "deferred": deferred_property(),
+            "retry_after_ms": retry_after_property()
+        }
+    })
+}
+
+/// The `agents` facet: it states no cause of its own, so a deferral shows on
+/// it and on `live` and each `live.kinds` entry that carries the cause.
+fn agents_output() -> Value {
+    let mut agents = deferrable_object();
+    agents["properties"]["live"] = json!({
+        "type": "object",
+        "properties": {
+            "deferred": deferred_property(),
+            "retry_after_ms": retry_after_property(),
+            "kinds": { "type": "array", "items": deferrable_object() }
+        }
+    });
+    agents
+}
+
 /// The shape of a facet that reports its own scan failure.
 fn ok_error_output(extra: Value, required: &[&str]) -> Value {
     let mut properties = json!({
@@ -692,7 +731,9 @@ fn collision_risk_output() -> Value {
             "shared_worktree_files": { "type": "integer" },
             "shared_worktrees": { "type": "array" },
             "sessions_ok": { "type": "boolean" },
-            "sessions_error": { "type": "string" }
+            "sessions_error": { "type": "string" },
+            "deferred": deferred_property(),
+            "retry_after_ms": retry_after_property()
         }),
         &[
             "overlapping_files",
@@ -736,11 +777,11 @@ fn build_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
-                    "worktrees": { "type": "object" },
-                    "agents": { "type": "object" },
-                    "changes": { "type": "object" },
+                    "worktrees": deferrable_object(),
+                    "agents": agents_output(),
+                    "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
-                    "ledger": { "type": "object" },
+                    "ledger": deferrable_object(),
                     "codeintel": { "type": "object" }
                 },
                 "required": ["repo_path", "worktrees", "agents", "changes", "collisions", "ledger", "codeintel"]
@@ -776,7 +817,9 @@ fn build_tools() -> Vec<Value> {
                     "files": { "type": "array" },
                     "total": { "type": "integer" },
                     "shown": { "type": "integer" },
-                    "truncated": { "type": "boolean" }
+                    "truncated": { "type": "boolean" },
+                    "deferred": deferred_property(),
+                    "retry_after_ms": retry_after_property()
                 }),
                 &["repo_path", "files", "total", "shown", "truncated"],
             ),
@@ -799,17 +842,19 @@ fn build_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
-                    "worktree": { "type": "object" },
+                    "worktree": deferrable_object(),
                     "worktree_ok": { "type": "boolean" },
                     "worktree_error": { "type": "string" },
                     "task_id": { "type": "string" },
                     "task_ok": { "type": "boolean" },
                     "task_error": { "type": "string" },
-                    "changes": { "type": "object" },
+                    "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
                     "operation": { "type": ["object", "null"] },
                     "operation_ok": { "type": "boolean" },
-                    "operation_error": { "type": "string" }
+                    "operation_error": { "type": "string" },
+                    "deferred": deferred_property(),
+                    "retry_after_ms": retry_after_property()
                 },
                 "required": ["repo_path", "worktree", "worktree_ok", "task_id", "task_ok", "changes", "collisions", "operation", "operation_ok"]
             }),
@@ -1251,6 +1296,111 @@ fn workbench_message(error: crate::workbench::WorkbenchError) -> String {
     format!("{}: {}", error.code, error.message)
 }
 
+/// How a read that the spawn gate deferred is asked once more.
+///
+/// `gitpulse-mcp` runs every spawn as background work, which the gate sheds
+/// the moment the shared rate budget is low, so a deferral is routine here and
+/// usually gone a token's refill later. One retry, after a delay of one refill
+/// interval plus jitter of up to the same again, so concurrent readers shed in
+/// the same instant do not come back in the same instant. The delay is
+/// therefore under two refill intervals (125 ms each at the production
+/// 8 tokens a second): under 250 ms added to a call that is otherwise bounded
+/// in seconds, and no retry is attempted that would end past `deadline`.
+/// Time, sleeping and randomness are injected so a test is exact and instant.
+pub(crate) struct DeferralRetry<'a> {
+    pub sleep: &'a dyn Fn(std::time::Duration),
+    /// A value in `0..bound`.
+    pub jitter: &'a dyn Fn(u64) -> u64,
+    pub now: &'a dyn Fn() -> std::time::Instant,
+    /// The request's own deadline. A retry that could not finish before it is
+    /// not started.
+    pub deadline: std::time::Instant,
+}
+
+/// Longest a read may run, counted from the start of the request, and still be
+/// retried: a call that already spent this long has no budget for a second
+/// attempt. Well inside the transport's own per-call budget.
+const DEFERRAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A value in `0..bound` that differs between processes and between calls.
+/// Not a CSPRNG and not meant to be: it only spreads retries apart.
+fn process_jitter(bound: u64) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(CALLS.fetch_add(1, Ordering::Relaxed));
+    hasher.finish() % bound.max(1)
+}
+
+/// Runs `read`; when its answer was a deferral, waits and runs it once more
+/// and returns the second answer, whatever it was. Otherwise, or when the
+/// deadline leaves no room, the first answer.
+pub(crate) fn retry_once_on_deferral<T>(
+    mut read: impl FnMut() -> T,
+    deferred: impl Fn(&T) -> bool,
+    retry: &DeferralRetry<'_>,
+) -> T {
+    let first = read();
+    if !deferred(&first) {
+        return first;
+    }
+    let base = insights::deferral_retry_after_ms();
+    let delay = std::time::Duration::from_millis(base + (retry.jitter)(base));
+    if (retry.now)() + delay >= retry.deadline {
+        return first;
+    }
+    (retry.sleep)(delay);
+    read()
+}
+
+/// [`retry_once_on_deferral`] for an insights payload: marks every deferred
+/// facet (see [`insights::mark_deferrals`]) on whichever answer is returned,
+/// so the reader sees `deferred` and `retry_after_ms` only when the retry
+/// also deferred, and sees neither when it succeeded.
+pub(crate) fn read_insights(read: impl Fn() -> Value, retry: &DeferralRetry<'_>) -> Value {
+    retry_once_on_deferral(
+        || {
+            let mut value = read();
+            let deferred = insights::mark_deferrals(&mut value);
+            (value, deferred)
+        },
+        |(_, deferred)| *deferred,
+        retry,
+    )
+    .0
+}
+
+/// Calls `body` with the production retry: real clock, real sleep, a window
+/// counted from now.
+fn with_production_retry<T>(body: impl FnOnce(&DeferralRetry<'_>) -> T) -> T {
+    body(&DeferralRetry {
+        sleep: &std::thread::sleep,
+        jitter: &process_jitter,
+        now: &std::time::Instant::now,
+        deadline: std::time::Instant::now() + DEFERRAL_RETRY_WINDOW,
+    })
+}
+
+/// The repository address a read resolves, retried once if the spawn gate
+/// deferred the Git read behind it.
+fn read_address(
+    repo: &str,
+    retry: &DeferralRetry<'_>,
+) -> Result<crate::ledger::bindings::BindingAddress, String> {
+    retry_once_on_deferral(
+        || crate::ledger::bindings::repository_address_readonly(repo),
+        |result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.code == crate::ledger::bindings::DEFERRED_WORKTREE)
+        },
+        retry,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
     // The schema refuses what it can say (bounds, enums, unknown keys); `parse`
     // then reads the accepted call into the tool's struct, and refuses what the
@@ -1260,7 +1410,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
     match name {
         "gitpulse_insights" => {
             let a: RepoArgs = parse(name, arguments)?;
-            Ok(json!(insights::snapshot(&a.repo_path)))
+            Ok(with_production_retry(|retry| {
+                read_insights(|| json!(insights::snapshot(&a.repo_path)), retry)
+            }))
         }
         "gitpulse_status" => {
             let a: RepoArgs = parse(name, arguments)?;
@@ -1268,22 +1420,38 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_active_changes" => {
             let a: ActiveChangesArgs = parse(name, arguments)?;
-            Ok(json!(insights::active_changes(
-                &a.repo_path,
-                a.worktree_path.as_deref(),
-                a.limit
-            )))
+            Ok(with_production_retry(|retry| {
+                read_insights(
+                    || {
+                        json!(insights::active_changes(
+                            &a.repo_path,
+                            a.worktree_path.as_deref(),
+                            a.limit
+                        ))
+                    },
+                    retry,
+                )
+            }))
         }
         "gitpulse_collision_risk" => {
             let a: RepoArgs = parse(name, arguments)?;
-            Ok(json!(insights::collision_risk(&a.repo_path)))
+            Ok(with_production_retry(|retry| {
+                read_insights(|| json!(insights::collision_risk(&a.repo_path)), retry)
+            }))
         }
         "gitpulse_change_context" => {
             let a: ChangeContextArgs = parse(name, arguments)?;
-            Ok(json!(insights::change_context(
-                &a.repo_path,
-                a.worktree_path.as_deref()
-            )))
+            Ok(with_production_retry(|retry| {
+                read_insights(
+                    || {
+                        json!(insights::change_context(
+                            &a.repo_path,
+                            a.worktree_path.as_deref()
+                        ))
+                    },
+                    retry,
+                )
+            }))
         }
         "gitpulse_ledger_events" => ledger_events(parse(name, arguments)?),
         "gitpulse_task_view" => task_view(parse(name, arguments)?),
@@ -1481,8 +1649,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
 const NO_BOARD: &str = "GitPulse has no task board on this machine yet: nothing has been filed.";
 
 fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
-    let address = crate::ledger::bindings::repository_address_readonly(&a.repo_path)
-        .map_err(|error| error.to_string())?;
+    let address = with_production_retry(|retry| read_address(&a.repo_path, retry))?;
     // `tail` pages *forward* from a cursor — deliberately, so a
     // consumer holding the last id it saw gets the same answer whether
     // it has been listening for an hour or just opened. This tool
@@ -1500,8 +1667,7 @@ fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
 }
 
 fn task_view(a: TaskViewArgs) -> Result<Value, String> {
-    let address = crate::ledger::bindings::repository_address_readonly(&a.repo_path)
-        .map_err(|error| error.to_string())?;
+    let address = with_production_retry(|retry| read_address(&a.repo_path, retry))?;
     let mut view = crate::tasks::view_filtered(&address.anchor, a.task_id.as_deref());
     // The view is also what the desktop app reads whole, so the cap is here, at
     // the MCP boundary. Each row's stored JSON text is cut the way a ledger
@@ -6667,5 +6833,214 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deferral_retry_tests {
+    use super::*;
+
+    /// A retry harness with no real clock, sleep or randomness: `jitter` is
+    /// what the injected RNG returns, `deadline_in` how far away the request's
+    /// deadline is, and `sleeps` records every delay it was asked to wait.
+    struct Harness {
+        sleeps: std::cell::RefCell<Vec<std::time::Duration>>,
+        jitter: u64,
+        origin: std::time::Instant,
+        deadline_in: std::time::Duration,
+    }
+
+    impl Harness {
+        fn new(jitter: u64, deadline_in: std::time::Duration) -> Self {
+            Self {
+                sleeps: Default::default(),
+                jitter,
+                origin: std::time::Instant::now(),
+                deadline_in,
+            }
+        }
+
+        fn run<T>(&self, body: impl FnOnce(&DeferralRetry<'_>) -> T) -> T {
+            let sleep = |delay: std::time::Duration| self.sleeps.borrow_mut().push(delay);
+            let jitter = |bound: u64| self.jitter.min(bound - 1);
+            let now = || self.origin;
+            body(&DeferralRetry {
+                sleep: &sleep,
+                jitter: &jitter,
+                now: &now,
+                deadline: self.origin + self.deadline_in,
+            })
+        }
+    }
+
+    const ROOMY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn deferred_payload() -> Value {
+        json!({ "ok": false, "error": "git status deferred under load after 0.000s: background \
+                  work is shed while the git spawn rate budget is low" })
+    }
+
+    fn ran_payload() -> Value {
+        json!({ "ok": true, "error": "" })
+    }
+
+    /// A deferral is asked once more, after the refill interval plus the
+    /// injected jitter; when the second ask succeeds the caller sees success
+    /// and no trace of a deferral.
+    #[test]
+    fn a_deferred_read_is_retried_once_with_jitter_and_a_success_carries_no_deferral() {
+        let harness = Harness::new(7, ROOMY);
+        let reads = std::cell::Cell::new(0);
+        let answer = harness.run(|retry| {
+            read_insights(
+                || {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == 1 {
+                        deferred_payload()
+                    } else {
+                        ran_payload()
+                    }
+                },
+                retry,
+            )
+        });
+        assert_eq!(reads.get(), 2);
+        assert_eq!(answer, ran_payload(), "{answer}");
+        let base = insights::deferral_retry_after_ms();
+        assert_eq!(
+            *harness.sleeps.borrow(),
+            vec![std::time::Duration::from_millis(base + 7)]
+        );
+    }
+
+    /// A retry that is also deferred is reported as deferred, after exactly
+    /// one retry: never a loop.
+    #[test]
+    fn a_retry_that_also_defers_is_reported_deferred_after_exactly_one_retry() {
+        let harness = Harness::new(0, ROOMY);
+        let reads = std::cell::Cell::new(0);
+        let answer = harness.run(|retry| {
+            read_insights(
+                || {
+                    reads.set(reads.get() + 1);
+                    deferred_payload()
+                },
+                retry,
+            )
+        });
+        assert_eq!(reads.get(), 2, "one read and one retry");
+        assert_eq!(harness.sleeps.borrow().len(), 1);
+        assert_eq!(answer["deferred"], json!(true), "{answer}");
+        assert_eq!(
+            answer["retry_after_ms"],
+            json!(insights::deferral_retry_after_ms())
+        );
+    }
+
+    /// A read that ran, or failed for a real reason, is never retried.
+    #[test]
+    fn a_read_that_did_not_defer_is_never_retried() {
+        for payload in [
+            ran_payload(),
+            json!({ "ok": false, "error": "fatal: not a git repository" }),
+        ] {
+            let harness = Harness::new(0, ROOMY);
+            let reads = std::cell::Cell::new(0);
+            let answer = harness.run(|retry| {
+                read_insights(
+                    || {
+                        reads.set(reads.get() + 1);
+                        payload.clone()
+                    },
+                    retry,
+                )
+            });
+            assert_eq!(reads.get(), 1, "{payload}");
+            assert!(harness.sleeps.borrow().is_empty());
+            assert_eq!(answer, payload);
+        }
+    }
+
+    /// The retry is bounded: the delay stays under 250 ms at the largest
+    /// jitter, and a deadline that would pass before the retry could finish
+    /// (or already has) skips it and reports the first, deferred answer.
+    #[test]
+    fn the_retry_is_bounded_and_respects_the_deadline() {
+        let base = insights::deferral_retry_after_ms();
+        let widest = Harness::new(u64::MAX, ROOMY);
+        widest.run(|retry| {
+            read_insights(deferred_payload, retry);
+        });
+        let delay = widest.sleeps.borrow()[0];
+        assert!(delay < std::time::Duration::from_millis(250), "{delay:?}");
+        assert!(delay >= std::time::Duration::from_millis(base));
+
+        for deadline_in in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(base),
+        ] {
+            let harness = Harness::new(0, deadline_in);
+            let reads = std::cell::Cell::new(0);
+            let answer = harness.run(|retry| {
+                read_insights(
+                    || {
+                        reads.set(reads.get() + 1);
+                        deferred_payload()
+                    },
+                    retry,
+                )
+            });
+            assert_eq!(reads.get(), 1, "{deadline_in:?}");
+            assert!(harness.sleeps.borrow().is_empty(), "{deadline_in:?}");
+            assert_eq!(answer["deferred"], json!(true), "{answer}");
+        }
+    }
+
+    /// End to end through the real snapshot and the tool dispatcher: a spawn
+    /// gate that sheds every read answers with `deferred`/`retry_after_ms` on
+    /// each failed facet (after the one real retry, at most 250 ms) and says
+    /// invalid_worktree nowhere; a repository that is genuinely not one still
+    /// says so and carries no deferral.
+    #[test]
+    fn collision_risk_and_insights_under_a_shed_gate_report_deferral_not_invalid() {
+        let repo = crate::test_support::git_repo();
+        let path = repo.path().to_str().unwrap();
+        for tool in ["gitpulse_collision_risk", "gitpulse_insights"] {
+            let answer = crate::engine::git_cli::with_forced_deferral(|| {
+                handle_tool_call(tool, &json!({ "repo_path": path })).expect(tool)
+            });
+            assert!(!answer["ok"].as_bool().unwrap_or(false), "{tool}");
+            let text = answer.to_string();
+            assert!(!text.contains("invalid_worktree"), "{tool}: {text}");
+            let marked = if tool == "gitpulse_insights" {
+                &answer["worktrees"]
+            } else {
+                &answer
+            };
+            assert_eq!(marked["deferred"], json!(true), "{tool}: {text}");
+            assert!(marked["retry_after_ms"].as_u64().unwrap() > 0, "{tool}");
+        }
+
+        let plain = tempfile::tempdir().unwrap();
+        let answer = handle_tool_call(
+            "gitpulse_insights",
+            &json!({ "repo_path": plain.path().to_str().unwrap() }),
+        )
+        .unwrap();
+        assert!(answer["ledger"].get("deferred").is_none(), "{answer}");
+    }
+
+    /// The ledger read resolves its address through the same retry: a shed
+    /// read is asked again once, and its error says deferred, not invalid.
+    #[test]
+    fn a_ledger_read_that_stays_shed_names_the_deferral_after_one_retry() {
+        let repo = crate::test_support::git_repo();
+        let harness = Harness::new(0, ROOMY);
+        let error = crate::engine::git_cli::with_forced_deferral(|| {
+            harness.run(|retry| read_address(repo.path().to_str().unwrap(), retry))
+        })
+        .expect_err("a shed read cannot resolve");
+        assert!(error.contains("[deferred_worktree]"), "{error}");
+        assert_eq!(harness.sleeps.borrow().len(), 1);
     }
 }
