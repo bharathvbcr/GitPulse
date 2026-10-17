@@ -31,6 +31,31 @@ function board(statusOf: Record<string, TaskStatus> = {}) {
   return { api, tasks, add, saves };
 }
 
+describe("record codec: the merge gate", () => {
+  it("round-trips verifying_merge with where the merge landed, and the priority filter", () => {
+    const r = record({ maxPriority: 1, members: [{ ...member("a", "verifying_merge"), mergeBefore: "b".repeat(40), mergeAfter: "c".repeat(40) }] });
+    expect(decodeWave(encodeWave(r))).toEqual(r);
+  });
+
+  it("decodes a record written before the gate existed: no merge oids, no priority", () => {
+    const old = JSON.parse(encodeWave(record({ members: [member("a", "merged")] })).slice(WAVE_MARK.length));
+    expect(old.members[0]).not.toHaveProperty("mergeBefore");
+    expect(old).not.toHaveProperty("maxPriority");
+    const decoded = decodeWave(`${WAVE_MARK}${JSON.stringify(old)}`);
+    expect(decoded?.members[0]?.phase).toBe("merged");
+    expect(decoded?.members[0]?.mergeBefore).toBeUndefined();
+    expect(decoded?.maxPriority).toBeUndefined();
+  });
+
+  it("refuses a malformed oid or priority rather than guessing", () => {
+    const base = JSON.parse(encodeWave(record({ members: [member("a", "verifying_merge")] })).slice(WAVE_MARK.length));
+    const badOid = structuredClone(base); badOid.members[0].mergeBefore = 7;
+    expect(decodeWave(`${WAVE_MARK}${JSON.stringify(badOid)}`)).toBeNull();
+    const badPriority = { ...structuredClone(base), maxPriority: -1 };
+    expect(decodeWave(`${WAVE_MARK}${JSON.stringify(badPriority)}`)).toBeNull();
+  });
+});
+
 describe("record codec", () => {
   it("round-trips a record through a card's logs, beside other log text", () => {
     const r = record();
@@ -111,13 +136,18 @@ describe("finding the wave a restart should continue", () => {
     expect(found!.complete).toBe(true);
   });
 
-  it("ignores finished waves, undecodable lines and a label that disagrees with its record", async () => {
+  it("ignores finished waves and a label that disagrees with its record", async () => {
     const b = board();
     b.add("done", { labels: [waveLabel("w1")], logs: encodeWave(record({ state: "done" })) });
-    b.add("junk", { labels: [waveLabel("w2")], logs: `${WAVE_MARK}{oops` });
     b.add("liar", { labels: [waveLabel("w9")], logs: encodeWave(record({ id: "w1" })) });
     b.add("plain");
     expect(await findActiveWave(b.api)).toEqual({ record: null, complete: true });
+  });
+
+  it("never reads a labelled card whose record cannot be decoded as no wave: the look is incomplete", async () => {
+    const b = board();
+    b.add("junk", { labels: [waveLabel("w2")], logs: `${WAVE_MARK}{oops` });
+    expect(await findActiveWave(b.api)).toEqual({ record: null, complete: false });
   });
 
   it("says it looked at only part of the board when a status runs past its page cap", async () => {

@@ -14,7 +14,7 @@ import { repoStore } from "../stores/repoStore";
 import { loadTaskScopes } from "../tasks/scopes";
 import type { WorktreeInfo } from "../branches/types";
 import {
-  MAX_SUGGESTIONS, WorkbenchError, getRepository, getTask, getTaskRun, listTasks, newID, prepareTaskRun, putTask, suggestTasks, taskWrite, type TaskRun,
+  MAX_SUGGESTIONS, WorkbenchError, getRepository, getTask, getTaskRun, listTasks, newID, prepareTaskRun, putTask, request, suggestTasks, taskWrite, type SuggestParams, type TaskRun,
 } from "./client";
 import { mergeVerifiedAttempt } from "./attemptWorktree";
 import { WORKTREE_PREPARE_TIMEOUT_MS, bounded } from "./taskActions";
@@ -29,6 +29,20 @@ import type { TaskSuggestions } from "./client";
 /** `work.verify.task` can take minutes; a verdict still `running` after this is reported as such, never trusted. */
 const VERIFY_WAIT_MS = 20 * 60_000;
 const VERIFY_POLL_MS = 3_000;
+/** The host's own bound on verifications in flight (`verification_driver.rs` `MAX_ACTIVE`); a wave keeps to it. */
+export const HOST_VERIFY_LIMIT = 2;
+
+/** What a wave asks Manvi to rank: the board's repository and the same priority filter as the Suggest next panel (absent: any priority). */
+export function suggestParams(repositoryId: string, maxPriority?: number): SuggestParams {
+  return { limit: MAX_SUGGESTIONS, repository_id: repositoryId, ...(maxPriority === undefined ? {} : { max_priority: maxPriority }) };
+}
+
+/** Starts a verification; with `base` the checkout is judged over that range (a re-verify after a merge). */
+async function startVerification(taskId: string, base?: string): Promise<void> {
+  if (!base) { await runVerification(taskId); return; }
+  const raw = await request("verifications.run", { id: taskId, base });
+  if (typeof raw !== "object" || raw === null) throw new WorkbenchError("protocol_error", "Task storage returned an invalid verification.");
+}
 
 export const taskApi: WaveTaskApi = {
   getTask,
@@ -77,15 +91,16 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"]): Promise<WaveDeps> {
+export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"], maxPriority?: number): Promise<WaveDeps> {
   const checkout = await checkoutFor(repositoryId);
   return {
     pollMs: 2_500,
+    verifyLimit: HOST_VERIFY_LIMIT,
     now: () => Date.now(),
     id: newID,
     sleep,
     persist,
-    suggest: async (signal) => readSuggestion(await bounded(suggestTasks({ limit: MAX_SUGGESTIONS, repository_id: repositoryId }), undefined, undefined, signal)),
+    suggest: async (signal) => readSuggestion(await bounded(suggestTasks(suggestParams(repositoryId, maxPriority)), undefined, undefined, signal)),
     scopes: async (ids, signal) => {
       const found = await stoppable(loadTaskScopes(invoke, checkout, ids), signal);
       return new Map(Object.values(found).map((scope) => [scope.id, [...scope.planned_files, ...scope.agent_appended_files]]));
@@ -101,7 +116,8 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
         provider: supportsManaged(saved.provider) ? saved.provider : "claude",
         permission_mode: saved.permission === "bypass" ? "ask" : saved.permission, acknowledge_bypass: false,
       }), WORKTREE_PREPARE_TIMEOUT_MS, undefined, signal);
-      const started = await startPreparedAttempt(run);
+      // Ends the wait on a stop; the run it was starting is left to its agent, like any started run.
+      const started = await stoppable(startPreparedAttempt(run), signal);
       if (!started.ok) throw new Error(started.error);
       return readRun(started.run);
     },
@@ -109,12 +125,14 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       try { return readRun(await stoppable(getTaskRun(runId), signal)); }
       catch (cause) { if (cause instanceof WorkbenchError && cause.code === "not_found") return null; throw cause; }
     },
-    verify: async (taskId, signal) => {
-      await bounded(runVerification(taskId), undefined, undefined, signal);
+    verify: async (taskId, signal, post) => {
+      await bounded(startVerification(taskId, post?.base), undefined, undefined, signal);
       const until = Date.now() + VERIFY_WAIT_MS;
       for (;;) {
         const verdict = await bounded(getVerification(taskId), undefined, undefined, signal);
-        if (verdict.state !== "running" || Date.now() > until) return { state: verdict.state, stale: verdict.stale, head: verdict.record?.head || null };
+        // After a merge the task's newest record may still be the earlier one: a verdict is waited for only once it is for the tip asked about.
+        const settled = verdict.state !== "running" && (!post || verdict.record?.head === post.head);
+        if (settled || Date.now() > until) return { state: verdict.state, stale: verdict.stale, head: verdict.record?.head || null };
         await sleep(VERIFY_POLL_MS, signal);
         if (signal.aborted) throw new Error("The wave was stopped while waiting for verification.");
       }
@@ -127,7 +145,10 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       if (!own) throw new Error(`${cwd} is no longer a worktree of the repository.`);
       return own.head;
     },
-    merge: async ({ runId, cwd, head }) => (await mergeVerifiedAttempt({ id: runId, cwd, state: "exited", expires_at: 0 }, head)).message,
+    merge: async ({ runId, cwd, head }) => {
+      const merged = await mergeVerifiedAttempt({ id: runId, cwd, state: "exited", expires_at: 0 }, head);
+      return { message: merged.message, beforeOid: merged.beforeOid, afterOid: merged.afterOid };
+    },
     mainState: async (signal) => {
       // The count and the parked operation are the two things that make the main checkout not free to merge into.
       const listing = await stoppable(invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout, depth: "dirty" }), signal);
@@ -151,12 +172,12 @@ function adopt(runner: WaveRunner): WaveRunner {
   return runner;
 }
 
-export async function beginWave(input: { repositoryId: string; n: number; waves: number; acceptUnchecked?: boolean }): Promise<WaveRunner> {
+export async function beginWave(input: { repositoryId: string; n: number; waves: number; acceptUnchecked?: boolean; maxPriority?: number }): Promise<WaveRunner> {
   if (current?.record().state === "running") throw new Error("A wave is already running. Stop it before starting another.");
   const found = await findActiveWave(taskApi);
   if (found.record) throw new Error("A wave from before a restart is still marked running on the board. Resume or stop it before starting another.");
   if (!found.complete) throw new Error("The board could not be read far enough to be sure no other wave is running, so none was started.");
-  return adopt(await startWave(input, await waveDeps(input.repositoryId, createWavePersister(taskApi))));
+  return adopt(await startWave(input, await waveDeps(input.repositoryId, createWavePersister(taskApi), input.maxPriority)));
 }
 
 /** Continues the wave a restart left running. `complete` false means some cards could not be read, so no wave found is not proof of none. */
@@ -165,5 +186,5 @@ export async function resumeActiveWave(): Promise<{ runner: WaveRunner | null; c
   const found = await findActiveWave(taskApi);
   if (!found.record) return { runner: null, complete: found.complete };
   const persist = createWavePersister(taskApi, found.record.members.map((m) => m.taskId));
-  return { runner: adopt(await resumeWave(found.record, await waveDeps(found.record.repositoryId, persist))), complete: found.complete };
+  return { runner: adopt(await resumeWave(found.record, await waveDeps(found.record.repositoryId, persist, found.record.maxPriority))), complete: found.complete };
 }
