@@ -67,14 +67,30 @@
    */
   let prepared = $state(false);
   let form = $state<{ launch: () => Promise<void> }>();
+  /**
+   * Closing is refused only while a preparation is in flight. Once the store
+   * accepted it, its start belongs to `startPreparedAttempt`, which finishes
+   * whether or not this sheet is open, so there is nothing left to wait for.
+   */
+  const closable = $derived(!busy || prepared);
   let closeButton: HTMLButtonElement;
 
   onMount(() => { closeButton?.focus(); });
 
+  /**
+   * The one way this sheet launches, for the button and the shortcut alike.
+   * After a preparation the footer offers Done, not Launch, and the shortcut
+   * must agree: the form's own gate passes again once the attempt is accepted.
+   */
+  function launch() {
+    if (prepared || busy || !gate.ok) return;
+    void form?.launch();
+  }
+
   function onKey(event: KeyboardEvent) {
     event.stopPropagation();
-    if (event.key === "Escape" && !busy) { event.preventDefault(); onClose(); }
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); void form?.launch(); }
+    if (event.key === "Escape" && closable) { event.preventDefault(); onClose(); }
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); launch(); }
   }
 </script>
 
@@ -95,7 +111,7 @@
         <p class="title" title={card.title}>{card.title}</p>
         <p class="meta">Saved revision {card.revision} · {describeHandoff(settings)}</p>
       </div>
-      <button bind:this={closeButton} type="button" class="gp-icon-btn" aria-label="Close agent handoff" disabled={busy} onclick={onClose}><X size={14} /></button>
+      <button bind:this={closeButton} type="button" class="gp-icon-btn" aria-label="Close agent handoff" disabled={!closable} onclick={onClose}><X size={14} /></button>
     </header>
 
     <div class="body">
@@ -117,13 +133,13 @@
     </div>
 
     <footer>
-      {#if prepared && !busy}
-        <span class="meta gate">Attempt prepared. Resume or cancel it from this task's Agents tab.</span>
+      {#if prepared}
+        <span class="meta gate">{busy ? "Attempt prepared and starting. Closing this sheet does not stop it." : "Attempt prepared. Resume or cancel it from this task's Agents tab."}</span>
         <button type="button" class="gp-btn-primary" onclick={onClose}>Done</button>
       {:else}
         <span class="meta gate">{gate.ok ? `${shortcutTextLabel("⌘↩", $hostPlatform.os)} to launch` : gate.reason}</span>
         <button type="button" class="gp-btn" disabled={busy} onclick={onClose}>Cancel</button>
-        <button type="button" class="gp-btn-primary" disabled={!gate.ok} onclick={() => void form?.launch()}>
+        <button type="button" class="gp-btn-primary" disabled={!gate.ok} onclick={launch}>
           {busy ? "Preparing…" : pending ? "Retry preparation" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
         </button>
       {/if}

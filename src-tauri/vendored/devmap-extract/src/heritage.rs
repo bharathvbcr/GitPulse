@@ -169,6 +169,26 @@ fn names_under(node: Node, source: &str, out: &mut Vec<String>) {
         if is_modifier_node(node.kind()) || is_type_argument_node(node.kind()) {
             continue;
         }
+        // A JS/TS base is an expression, and `React.Component` arrives as one
+        // `member_expression`. Reduced to `Component` alone, it is the same
+        // reference as `import { Component } from 'some-lib'`, and which
+        // library's contract the class inherits is lost. So it is recorded the
+        // way Python's `attribute` base already is — one reference per segment
+        // over one span, innermost first — and the resolver, which reduces
+        // every heritage name to its last segment, reads the first as before.
+        if node.kind() == "member_expression" {
+            let written = text(node, source);
+            if written.split('.').all(|segment| {
+                let segment = segment.trim();
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            }) {
+                out.extend(written.rsplit('.').filter_map(supertype_name));
+                continue;
+            }
+        }
         if is_terminal_type_node(node.kind()) {
             if let Some(name) = supertype_name(text(node, source)) {
                 out.push(name);
@@ -217,7 +237,11 @@ fn declared_type_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
 /// Returns `None` when this node is not a type declaration in this language,
 /// which is the overwhelmingly common case — this runs on every node of every
 /// walk, so the miss has to be one `match` on a `&str`.
-fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Node<'a>)>> {
+fn heritage_clauses<'a>(
+    node: Node<'a>,
+    source: &str,
+    lang: &str,
+) -> Option<Vec<(Relation, Node<'a>)>> {
     let container = node.kind();
     let interesting = matches!(
         (lang, container),
@@ -234,7 +258,7 @@ fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Nod
                 "class_declaration" | "struct_declaration" | "interface_declaration"
             )
             | ("cpp" | "cuda", "class_specifier" | "struct_specifier")
-            | ("ruby", "class")
+            | ("ruby", "class" | "module")
             | ("php", "class_declaration" | "interface_declaration")
             | ("swift", "class_declaration" | "protocol_declaration")
             | ("kotlin", "class_declaration" | "object_declaration")
@@ -246,6 +270,7 @@ fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Nod
             | ("rust", "impl_item")
             | ("objc", "class_interface" | "class_implementation")
             | ("solidity", "contract_declaration" | "interface_declaration")
+            | ("go", "type_spec")
     );
     if !interesting {
         return None;
@@ -287,10 +312,132 @@ fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Nod
     if lang == "rust" {
         collect_rust_impl(node, &mut clauses);
     }
+    if lang == "ruby" {
+        collect_ruby_mixins(node, source, &mut clauses);
+    }
     if lang == "objc" {
         collect_objc_heritage(node, &mut clauses);
     }
+    if lang == "go" {
+        collect_go_heritage(node, &mut clauses);
+    }
     Some(clauses)
+}
+
+/// The type name an embedded Go field or interface names.
+///
+/// `*pkg.Reader` and `pkg.Reader[T]` are one type, `Reader`. Passing the whole
+/// `qualified_type` to `names_under` would also emit the package, which is not
+/// a supertype. A named field (`Name string`, `a, b int`) is not an embedding
+/// and never reaches here.
+fn go_embedded_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    for _ in 0..4 {
+        match current.kind() {
+            "pointer_type" | "parenthesized_type" => current = current.named_child(0)?,
+            "generic_type" => current = current.child_by_field_name("type")?,
+            "qualified_type" => return current.child_by_field_name("name"),
+            "type_identifier" => return Some(current),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Go states embedding by omitting the field name. A struct field with a name,
+/// and an interface element that is a method or a union, add no supertype.
+/// The grammar does not spell `implements`; an embedded interface is still
+/// `Extends` here, and the resolver rewrites it when the target is an indexed
+/// interface.
+fn collect_go_heritage<'a>(node: Node<'a>, clauses: &mut Vec<(Relation, Node<'a>)>) {
+    let Some(body) = node.child_by_field_name("type") else {
+        return;
+    };
+    match body.kind() {
+        "struct_type" => {
+            let mut cursor = body.walk();
+            let Some(list) = body
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "field_declaration_list")
+            else {
+                return;
+            };
+            let mut fields = list.walk();
+            for decl in list.named_children(&mut fields) {
+                if decl.kind() != "field_declaration" {
+                    continue;
+                }
+                let mut names = decl.walk();
+                if decl
+                    .children_by_field_name("name", &mut names)
+                    .next()
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(ty) = decl.child_by_field_name("type") else {
+                    continue;
+                };
+                if let Some(name) = go_embedded_name_node(ty) {
+                    clauses.push((Relation::Extends, name));
+                }
+            }
+        }
+        "interface_type" => {
+            let mut cursor = body.walk();
+            for child in body.named_children(&mut cursor) {
+                if child.kind() != "type_elem" || child.named_child_count() != 1 {
+                    continue;
+                }
+                let Some(only) = child.named_child(0).filter(|only| {
+                    matches!(
+                        only.kind(),
+                        "type_identifier" | "qualified_type" | "generic_type"
+                    )
+                }) else {
+                    continue;
+                };
+                if let Some(name) = go_embedded_name_node(only) {
+                    clauses.push((Relation::Extends, name));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `include Reader` / `prepend Reader` in a class or module body: the module is
+/// in the declarer's ancestor chain, so a bare send the declarer makes can reach
+/// the module's methods. `extend` puts the module on the *singleton* and is not
+/// an instance ancestor, so it is not a supertype here.
+///
+/// Only a receiverless send of constants directly in the body: `include` inside
+/// a method, a conditional or a block is a runtime decision this does not claim.
+fn collect_ruby_mixins<'a>(node: Node<'a>, source: &str, clauses: &mut Vec<(Relation, Node<'a>)>) {
+    let Some(body) = node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "body_statement");
+        found
+    }) else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for statement in body.named_children(&mut cursor) {
+        if statement.kind() != "call" || statement.child_by_field_name("receiver").is_some() {
+            continue;
+        }
+        let is_mixin = statement
+            .child_by_field_name("method")
+            .is_some_and(|method| matches!(text(method, source), "include" | "prepend"));
+        if !is_mixin {
+            continue;
+        }
+        if let Some(arguments) = statement.child_by_field_name("arguments") {
+            clauses.push((Relation::Implements, arguments));
+        }
+    }
 }
 
 /// TypeScript separates the two clauses; JavaScript has only the base.
@@ -361,7 +508,7 @@ pub(crate) fn push_heritage_references(
     file_symbol_name: &str,
     references: &mut Vec<ExtractedReference>,
 ) {
-    let Some(clauses) = heritage_clauses(node, lang) else {
+    let Some(clauses) = heritage_clauses(node, source, lang) else {
         return;
     };
     if clauses.is_empty() {

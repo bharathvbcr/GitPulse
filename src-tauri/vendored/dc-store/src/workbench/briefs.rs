@@ -102,7 +102,7 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     markdown.push_str(&format!(
         "Due (Unix seconds): {due}\nLabels: {}\nEnhancement field locks: {}\n\n## Repositories\n",
         task.strings("labels", 64, 128, true)?.join(", "),
-        task.strings("locked_fields", 2, 32, false)?.join(", ")
+        task.strings("locked_fields", 3, 32, false)?.join(", ")
     ));
     let mut repositories = Vec::with_capacity(ids.len());
     for repo_id in &ids {

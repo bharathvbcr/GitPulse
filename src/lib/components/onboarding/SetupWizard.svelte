@@ -28,8 +28,11 @@
     buildDevcouncilInstallCommand,
   } from "../../tools/devcouncilInstall";
   import { enqueueConsoleLaunch } from "../../terminal/consoleLaunches";
-  import { repoStore } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { copyText } from "../../desktop/clipboard";
+  import { t } from "../../i18n/translate";
+  import { trapFocus } from "../../ui/focusTrap";
+  import { isImeComposition } from "../../keyboard/imeGuard";
 
   const wizard = onboardingStore.wizard;
   const status = onboardingStore.status;
@@ -41,12 +44,12 @@
   const verify = onboardingStore.verify;
 
   const steps: { id: WizardStep; label: string }[] = [
-    { id: "explain", label: "Why" },
-    { id: "source", label: "Source" },
-    { id: "preflight", label: "Check" },
-    { id: "install", label: "Install" },
-    { id: "verify", label: "Verify" },
-    { id: "done", label: "Done" },
+    { id: "explain", label: t("setup.step.explain") },
+    { id: "source", label: t("setup.step.source") },
+    { id: "preflight", label: t("setup.step.preflight") },
+    { id: "install", label: t("setup.step.install") },
+    { id: "verify", label: t("setup.step.verify") },
+    { id: "done", label: t("setup.step.done") },
   ];
 
   let cloneParent = $state("");
@@ -56,7 +59,7 @@
   const toolStatus = $derived(
     $status ? ($wizard.tool === "devmap" ? $status.devmap : $status.manvi) : null,
   );
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   const installSpec = $derived(
     $wizard.tool === "devmap"
       ? buildDevcouncilInstallCommand({
@@ -114,6 +117,13 @@
     await runInstall($wizard.tool, preferred);
   }
 
+  function onDialogKeydown(event: KeyboardEvent) {
+    if (event.key !== "Escape" || isImeComposition(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeSetupWizard();
+  }
+
   async function finish() {
     await markOnboardingComplete();
     closeSetupWizard();
@@ -123,19 +133,25 @@
 {#if $wizard.open}
   <div
     class="gp-scrim fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Optional tools setup"
+    role="presentation"
   >
-    <div class="gp-card w-full max-w-lg rounded-2xl border border-border bg-surface shadow-float">
+    <div
+      class="gp-card w-full max-w-lg rounded-2xl border border-border bg-surface shadow-float"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("setup.dialogLabel")}
+      tabindex="-1"
+      onkeydown={onDialogKeydown}
+      use:trapFocus
+    >
       <div class="flex items-center justify-between border-b border-border/60 px-4 py-3">
         <div>
-          <h2 class="text-sm font-semibold text-textPrimary">Set up optional tools</h2>
+          <h2 class="text-sm font-semibold text-textPrimary">{t("setup.title")}</h2>
           <p class="text-[11px] text-textMuted">
-            <span class="font-mono">{$wizard.tool}</span> — Map and policy are optional
+            <span class="font-mono">{$wizard.tool}</span> — {t("setup.subtitle")}
           </p>
         </div>
-        <button type="button" class="p-1 text-textMuted hover:text-textPrimary" onclick={closeSetupWizard} aria-label="Close">
+        <button type="button" class="p-1 text-textMuted hover:text-textPrimary" onclick={closeSetupWizard} aria-label={t("setup.close")}>
           <X size={14} />
         </button>
       </div>
@@ -243,7 +259,7 @@
               {/each}
             </ul>
           {:else}
-            <p class="text-textMuted">Checking prerequisites…</p>
+            <p class="text-textMuted">{t("setup.checking")}</p>
           {/if}
           <button type="button" class="gp-btn text-[11px]" onclick={() => setWizardStep("install")}>
             Continue
@@ -329,7 +345,7 @@
                 <button
                   type="button"
                   class="gp-btn text-[11px] inline-flex items-center gap-1"
-                  disabled={toolStatus?.installed && $ladder?.selected === "already_on_path"}
+                  disabled={!$ladder || (toolStatus?.installed && $ladder.selected === "already_on_path")}
                   onclick={() => void installSelected()}
                 >
                   <Download size={12} />
@@ -372,7 +388,7 @@
         {:else}
           <div class="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
             <Check size={14} />
-            <span>Setup complete for this session.</span>
+            <span>{t("setup.complete")}</span>
           </div>
           <button type="button" class="gp-btn text-[11px]" onclick={() => void finish()}>Done</button>
         {/if}

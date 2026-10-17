@@ -118,10 +118,10 @@ describe("agentGlance", () => {
     // The session adopted after a reload has no terminal in view, which is
     // exactly when a question from it most needs to reach the pane. This
     // used to answer "adopted" and drop the question.
-    const adopted = running("adopted", "Running · not shown since the window reloaded");
+    const adopted = running("adopted", "Running · not shown in any tab");
     const busy = activity({ attention: { kind: "needs-you", label: "Needs your input", detail: "Which branch?", at: NOW - 2_000 } });
     expect(agentGlance(adopted, busy, NOW)).toMatchObject({
-      tone: "needs-you", headline: "Needs your input · 2s ago · not shown since the window reloaded", detail: "Which branch?",
+      tone: "needs-you", headline: "Needs your input · 2s ago · not shown in any tab", detail: "Which branch?",
     });
     expect(agentGlance(adopted, activity({ lastOutputAt: NOW }), NOW)).toMatchObject({ tone: "adopted", headline: adopted.label });
   });

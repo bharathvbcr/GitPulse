@@ -1,4 +1,5 @@
 import type { EnhancementField, Task, TaskCard, TaskStatus } from "./client";
+import { DEFAULT_PRIORITY, numericPriority } from "./taskPriority";
 export type { BoardLayout } from "../ui/taskView";
 
 export type DueFilter = "all" | "overdue" | "soon" | "none";
@@ -9,13 +10,20 @@ export interface TaskFacet {
   kind: string | "all";
   owner: string | "all";
   label: string | "all";
+  /** A severity as the cards spell it, compared case-insensitively; "" is "no severity". */
+  severity: string | "all";
   due: DueFilter;
+  /** A repository id the card links to, primary or not. */
+  repository: string | "all";
 }
 
 export interface FacetOptions {
   kinds: string[];
   owners: string[];
   labels: string[];
+  severities: string[];
+  /** Ids of every repository a loaded card links to; the board names them. */
+  repositories: string[];
 }
 
 export interface CardChrome {
@@ -29,11 +37,11 @@ export interface CardChrome {
 const SOON_SECONDS = 7 * 24 * 60 * 60;
 
 export function emptyFacet(): TaskFacet {
-  return { priority: "all", kind: "all", owner: "all", label: "all", due: "all" };
+  return { priority: "all", kind: "all", owner: "all", label: "all", severity: "all", due: "all", repository: "all" };
 }
 
 export function facetActive(facet: TaskFacet): boolean {
-  return normalizePriority(facet.priority) !== "all" || facet.kind !== "all" || facet.owner !== "all" || facet.label !== "all" || facet.due !== "all";
+  return normalizePriority(facet.priority) !== "all" || facet.kind !== "all" || facet.owner !== "all" || facet.label !== "all" || facet.severity !== "all" || facet.due !== "all" || facet.repository !== "all";
 }
 
 export function dueState(dueAt: number | null | undefined, nowSec: number): DueState {
@@ -46,8 +54,7 @@ export function dueState(dueAt: number | null | undefined, nowSec: number): DueS
 
 export function normalizePriority(value: unknown): number | "all" {
   if (value === "all" || value === "" || value == null) return "all";
-  const n = typeof value === "number" ? value : Number(value);
-  return n === 0 || n === 1 || n === 2 || n === 3 ? n : "all";
+  return numericPriority(value) ?? "all";
 }
 
 export function cardMatchesFacet(card: TaskCard, facet: TaskFacet, nowSec: number): boolean {
@@ -59,6 +66,8 @@ export function cardMatchesFacet(card: TaskCard, facet: TaskFacet, nowSec: numbe
     if (facet.owner === "" ? owner !== "" : owner !== facet.owner) return false;
   }
   if (facet.label !== "all" && !card.labels.includes(facet.label)) return false;
+  if (facet.severity !== "all" && (card.severity ?? "").trim().toLowerCase() !== facet.severity.trim().toLowerCase()) return false;
+  if (facet.repository !== "all" && !card.repository_ids.includes(facet.repository)) return false;
   if (facet.due !== "all") {
     const due = dueState(card.due_at, nowSec);
     if (facet.due === "none" && due !== "none") return false;
@@ -72,13 +81,18 @@ export function collectFacetOptions(cards: readonly TaskCard[]): FacetOptions {
   const kinds = new Set<string>();
   const owners = new Set<string>();
   const labels = new Set<string>();
+  const severities = new Map<string, string>();
+  const repositories = new Set<string>();
   for (const card of cards) {
     if (card.kind.trim()) kinds.add(card.kind);
     if (card.owner?.trim()) owners.add(card.owner.trim());
+    const severity = card.severity?.trim();
+    if (severity && !severities.has(severity.toLowerCase())) severities.set(severity.toLowerCase(), severity);
     for (const label of card.labels) if (label.trim()) labels.add(label);
+    for (const id of card.repository_ids) if (id.trim()) repositories.add(id);
   }
   const sort = (values: Iterable<string>) => [...values].sort((a, b) => a.localeCompare(b));
-  return { kinds: sort(kinds), owners: sort(owners), labels: sort(labels) };
+  return { kinds: sort(kinds), owners: sort(owners), labels: sort(labels), severities: sort(severities.values()), repositories: sort(repositories) };
 }
 
 export function allLoadedCards(
@@ -128,7 +142,7 @@ export function hiddenTaskDetails(
   repoName: (id: string) => string | undefined,
 ): HiddenDetail[] {
   const extraRepos = task.repository_ids.slice(1).map((id) => repoName(id) ?? id);
-  const locks = (task.locked_fields ?? []).map((field) => field === "title" ? "Title" : "Description");
+  const locks = (task.locked_fields ?? []).map((field) => field === "title" ? "Title" : field === "description" ? "Description" : "Acceptance criteria");
   const due = task.due_at && task.due_at > 0 ? new Date(task.due_at * 1000).toLocaleString() : "";
   const description = line(task.description);
   const criteria = task.acceptance_criteria.map((item) => item.trim()).filter(Boolean);
@@ -264,3 +278,17 @@ export function reorderPlan(
   cards.splice(Math.max(0, Math.min(cards.length, index)), 0, dragged);
   return { cards, positions: Object.fromEntries(cards.map((card, i) => [card.id, (i + 1) * 1_048_576])) };
 }
+
+/**
+ * The cards most worth starting first: urgent before low, the earlier due date
+ * first among equals, and the board's own order for the rest (the sort is
+ * stable). A view over the cards; it never writes a position.
+ */
+export function sortByPriority<T extends Pick<TaskCard, "priority" | "due_at">>(cards: readonly T[]): T[] {
+  const rank = (card: T) => (numericPriority(card.priority) ?? DEFAULT_PRIORITY);
+  const due = (card: T) => (card.due_at != null && Number.isFinite(card.due_at) && card.due_at > 0 ? card.due_at : Number.POSITIVE_INFINITY);
+  return cards.map((card, index) => ({ card, index })).sort((a, b) => rank(a.card) - rank(b.card) || (due(a.card) < due(b.card) ? -1 : due(a.card) > due(b.card) ? 1 : 0) || a.index - b.index).map((entry) => entry.card);
+}
+
+// The scale has one owner, `taskPriority.ts`; these stay importable from here.
+export { PRIORITY_LABELS, priorityLabel } from "./taskPriority";

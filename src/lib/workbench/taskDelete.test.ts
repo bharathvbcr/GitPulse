@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { WorkbenchError } from "./client";
+import { bounded } from "./taskActions";
 import {
   classifyDeleteError,
   deleteAlreadyGone,
@@ -18,7 +19,6 @@ import {
   restoreTasks,
   runBoundedSerial,
   uniqueDeletable,
-  withTimeout,
   type DeletableTask,
 } from "./taskDelete";
 import type { Page, TaskCard } from "./client";
@@ -167,7 +167,7 @@ describe("runBoundedSerial and deleteTasks", () => {
     expect(result.deleted).toEqual([]);
     expect(result.failed[0]?.retryable).toBe(true);
     expect(result.failed[0]?.code).toBe("transport_error");
-    await expect(withTimeout(new Promise(() => {}), 10)).rejects.toMatchObject({ code: "transport_error" });
+    await expect(bounded(new Promise(() => {}), 10, "Delete timed out. Retry to confirm its result.")).rejects.toMatchObject({ code: "transport_error" });
   });
 });
 

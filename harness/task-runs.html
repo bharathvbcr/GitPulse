@@ -2,7 +2,7 @@
 <html class="dark"><head><meta charset="utf-8" /><title>Task terminal handoff verification</title></head>
 <body style="margin:0"><div id="app"></div><button id="check" style="position:fixed;top:8px;right:8px;z-index:100">Run handoff checks</button><pre id="result" style="position:fixed;top:42px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:650px;white-space:pre-wrap"></pre>
 <script type="module">
-  import { mockIPCWithEvents } from "./tauriMocks";
+  import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
   import { emit } from "@tauri-apps/api/event";
   import "../src/app.css";
   import { describeForeground, focusChanges, holdForeground } from "./foreground";
@@ -52,6 +52,9 @@
         if(loseDecision){loseDecision=false;throw {code:"transport_error",message:"Decision committed; fixture reply lost"};}
         return receipt;
       }
+      // A fixture checkout is its own repository: its Git directory sits
+      // inside it, and nothing shares its common directory.
+      if (args.method === "runs.checkout_identity") return JSON.stringify({ok:true,cwd:input.repo_path,git_dir:`${input.repo_path}/.git`,git_common_dir:`${input.repo_path}/.git`});
       if (args.method === "items.get") return record(task);
       if (args.method === "repositories.get") return record(repository);
       if (args.method === "runs.list") {
@@ -112,7 +115,8 @@
       show();
       if (loseLaunch) { loseLaunch=false; throw new Error("Launch reply lost by fixture; reconnect the same attempt"); }
       const id=run.session_id;
-      setTimeout(() => emit("terminal-output",{id,data_b64:btoa("Task terminal ready. Same attempt, same repository.\r\n")}), 30);
+      adoptOutput(id,args);
+      setTimeout(() => pushOutput(id,"Task terminal ready. Same attempt, same repository.\r\n"), 30);
       return {id,cwd:run.cwd,shell:run.provider};
     }
     switch (cmd) {
@@ -132,9 +136,10 @@
       case "cmd_remove_worktree":worktreeCalls.push({cmd,...args});return {policy:null,output:null};
       case "cmd_delete_branch":worktreeCalls.push({cmd,...args});throw new Error("error: the branch 'gitpulse/fix-e42-wt0attem' is not fully merged");
       case "cmd_terminal_spawn":
-        if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); return {id:`resume-${report.resumes.length}`,cwd:args.repoPath,shell:"claude"}; }
-        report.shellSpawns++;show();return {id:`shell-${report.shellSpawns}`,cwd:args.repoPath,shell:"/bin/sh"};
+        if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); const resumed=`resume-${report.resumes.length}`; adoptOutput(resumed,args); return {id:resumed,cwd:args.repoPath,shell:"claude"}; }
+        report.shellSpawns++;show();{const shell=`shell-${report.shellSpawns}`;adoptOutput(shell,args);return {id:shell,cwd:args.repoPath,shell:"/bin/sh"};}
       case "cmd_terminal_kill":report.kills++;show();return null;
+      case "cmd_terminal_detach":report.detaches=(report.detaches??0)+1;show();return true;
       case "cmd_terminal_resize":report.resizes.push({id:args.sessionId,rows:args.rows,cols:args.cols});return null;
       case "cmd_terminal_write":report.writes.push({id:args.sessionId,data:typeof args.data==="string"?args.data:""});return null;
       case "cmd_terminal_ack":case "cmd_workspace_sync":return null;
@@ -190,7 +195,7 @@
   const set=(name,value)=>{const el=field(name);if(!el)throw new Error(`Missing ${name}`);el.value=value;el.dispatchEvent(new Event("change",{bubbles:true}));};
   const results=[];
   const check=(name,pass)=>{if(!pass){results.push({name,pass:false});throw new Error(name);}report.checks.push(name);results.push({name,pass:true});show();};
-  const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emit("terminal-exit",{id:run.session_id,exit_code:0,signal:"",error:null,reaped:true});}};
+  const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emitExit(run.session_id,{exit_code:0,signal:"",error:null,reaped:true,ended_by_gitpulse:false});}};
   const params=new URLSearchParams(location.search);
   const runChecks=async()=>{
     try {
@@ -236,7 +241,7 @@
         const watched=[...runs.values()].find(run=>run.session_id==="task-session-1"), sid=watched.session_id;
         const card=()=>pane().querySelector(`[data-run-id="${watched.id}"]`);
         const line=()=>card().querySelector('[data-testid="agent-session"]');
-        await emit("terminal-output",{id:sid,data_b64:btoa("\x1b]0;Fixing E42\x07reading src/reconnect.ts\r\n")});
+        pushOutput(sid,"\x1b]0;Fixing E42\x07reading src/reconnect.ts\r\n");
         await wait(()=>card().querySelector('[data-testid="agent-title"]')?.textContent.includes("Fixing E42"));
         check("The pane shows what the agent calls itself right now",true);
         await wait(()=>line().dataset.tone==="active");
@@ -250,7 +255,7 @@
           line().textContent.includes("Needs your permission")&&card().querySelector('[data-testid="agent-said"]').textContent==="Bash: cargo test");
         check("The summary and the tab badge count it as needing you",
           pane().querySelector('[data-testid="agents-summary"]').textContent.includes("1 needs you")&&document.querySelector('[data-testid="host-working"]').dataset.asking==="1");
-        await emit("terminal-output",{id:sid,data_b64:btoa("still printing\r\n")});await pause(1200);
+        pushOutput(sid,"still printing\r\n");await pause(1200);
         check("More output does not answer the agent's question",card().dataset.tone==="needs-you");
         const writesBefore=report.writes.length;
         const terminalInput=document.querySelector('textarea[aria-label="Terminal input"]');
@@ -260,7 +265,7 @@
         check("Typing into the agent's terminal answers it, and the pane stops asking",document.querySelector('[data-testid="host-working"]').dataset.asking==="0");
         await emit("gitpulse-session-attention",{session:sid,channel:"hook",event:"agent_completed"});
         await wait(()=>line().dataset.tone==="finished");
-        await emit("terminal-output",{id:sid,data_b64:btoa("> \r\n")});await pause(1200);
+        pushOutput(sid,"> \r\n");await pause(1200);
         check("A finished agent stays finished when it repaints its prompt",line().dataset.tone==="finished"&&line().textContent.includes("Finished its work"));
         // Malformed notices for this very session: no channel, a non-string
         // session, an array. Each must leave the line as it was.
@@ -371,12 +376,12 @@
       await openLaunchForm();
       const launchModel=()=>document.querySelector('[data-testid="handoff-model-override"] [aria-label="Model"]');
       check("The Agent pane offers a model for this launch",!!launchModel());
-      launchModel().value="opus";launchModel().dispatchEvent(new Event("input",{bubbles:true}));await pause(30);
+      launchModel().value="opus";launchModel().dispatchEvent(new Event("change",{bubbles:true}));await pause(30);
       const spawnsBeforeModel=report.taskSpawns;
       button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===spawnsBeforeModel+1);
-      check("The launch carries the typed model as this attempt's model_choice",JSON.parse(preparations.at(-1)).model_choice?.model==="opus");
+      check("The launch carries the chosen model as this attempt's model_choice",JSON.parse(preparations.at(-1)).model_choice?.model==="opus");
       await openLaunchForm();
-      check("The typed model is cleared once that launch is accepted",launchModel()?.value==="");
+      check("The chosen model is cleared once that launch is accepted",launchModel()?.value==="");
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();seg("Connection","Managed").click();await pause(30);
       button("Start managed Claude Code").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
@@ -633,7 +638,7 @@
         await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-run-message"]'));
         const mergeCall=worktreeCalls.find(c=>c.cmd==="cmd_worktree_merge_teardown");
         check("Merge runs against the repository's main checkout, and the host's refusal shows in the row",
-          mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"
+          mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"&&mergeCall.expectedTip==="def5678"
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("still working in this worktree")
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').dataset.tone==="error");
         row(attempt.id).querySelector('[data-testid="agent-discard"]').click();

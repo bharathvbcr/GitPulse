@@ -23,6 +23,7 @@ import {
 import { cappedSuffix, observedTotal } from "../scan/limits";
 import { missingCoveragePipelines, suggestedCoverageCommands } from "./scripts";
 import type { CoverageReport } from "./types";
+import { wallClockBudget } from "../testing/wallClock";
 
 /** Values a well-behaved backend never sends but a broken one can. */
 const HOSTILE_NUMBERS = [
@@ -392,7 +393,7 @@ describe("coverage rendering scales", () => {
     const started = performance.now();
     const text = formatCoverageReport(report, "/repo");
     const elapsed = performance.now() - started;
-    expect(elapsed).toBeLessThan(1_000);
+    expect(elapsed).toBeLessThan(wallClockBudget(1_000));
     // Bounded output regardless of input size: 30 files + 40 artifacts.
     expect(text.split("\n").filter((l) => l.startsWith("- src/"))).toHaveLength(30);
     expect(text).toContain("…and 8 more");

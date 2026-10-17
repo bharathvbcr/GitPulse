@@ -2,6 +2,7 @@
 // and its grammars; everything above it — the model types, language detection,
 // go.mod parsing, the ignore rules — does not, and is what a *query* consumer
 // actually uses.
+pub mod androidmanifest;
 pub mod cache;
 pub mod clonesig;
 #[cfg(feature = "parse")]
@@ -14,7 +15,9 @@ mod entry_names;
 pub mod embedded;
 pub mod fallback;
 pub mod frameworks;
+pub mod gofacts;
 pub mod gomod;
+pub mod gradle;
 #[cfg(feature = "parse")]
 pub mod heritage;
 #[cfg(feature = "parse")]
@@ -22,6 +25,7 @@ pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
 pub mod rustsig;
+pub mod swifttargets;
 // Takes a `tree_sitter::Node` for the same reason `langimports` does, and is
 // called from the same seam.
 #[cfg(feature = "parse")]
@@ -44,6 +48,7 @@ mod git_metadata;
 pub mod paths;
 pub mod progress;
 pub mod safe_fs;
+pub mod secret;
 /// The bounded subprocess runner, re-exported at the path its callers have
 /// always used by the kernel crates. The implementation lives in `dc-proc`
 /// because nothing in this crate uses it, and `dc-verify` and `dc-regress`
@@ -68,13 +73,20 @@ mod returns;
 // The type a Rust local has where its own binder states it. Walks a parse
 // tree; its one caller is `treesitter::collect_site_bindings`.
 #[cfg(feature = "parse")]
-mod rustlocal;
-#[cfg(feature = "parse")]
 mod literals;
+pub mod pyproject;
+#[cfg(feature = "parse")]
+mod rustlocal;
+// The names a Swift callable binds and the types it writes for them. Walks a
+// parse tree; its callers are `treesitter::collect_site_bindings` and
+// `treesitter::collect_scope_locals`.
+#[cfg(feature = "parse")]
+mod swiftscope;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;
 pub mod wiring;
+pub mod workspaces;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,7 +98,8 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
-    parse_go_mod, GoModule, ProjectManifests,
+    parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings, ProjectManifests,
+    RustCrateManifest,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
@@ -97,6 +110,7 @@ pub use paths::{
     code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,
     state_dir, store_path, workspace_path,
 };
+pub use swifttargets::SwiftTarget;
 #[cfg(feature = "parse")]
 pub use treesitter::{extract_treesitter, linked_grammar_count, linked_grammar_keys};
 
@@ -401,12 +415,53 @@ pub fn content_hash(source: &str) -> u64 {
         })
 }
 
-/// Evaluate Git ignore rules the same way `WalkBuilder` does for a cold build.
+/// The one configuration of the tree walk, and so the one statement of which
+/// rule files decide "is this path excluded".
 ///
-/// `WalkBuilder.git_ignore(true)` reads `.gitignore` from the git worktree
-/// root down, including parents of `root` when the build is rooted in a
-/// subdirectory. The watcher must use this same stack or incremental
-/// generations admit files the next cold build drops.
+/// Every walk of the tree builds from this — the cold walk and the status
+/// freshness walk ([`scan_tree`]) and the manifest walk
+/// ([`collect_project_manifests`]) — and [`is_gitignored`], which the watcher
+/// asks per event, evaluates exactly these sources with exactly this
+/// precedence. Spelled out rather than left at the crate's defaults, because
+/// the defaults were the problem: the walk honoured `.ignore` files and
+/// `core.excludesFile` by default while the watcher, written against a
+/// reading of "gitignore rules", honoured neither — so a file named in
+/// `.ignore` was dropped by every `devmap build` and re-added by the next
+/// watcher event, forever, and `status` never settled.
+///
+/// The decision is that **everyone honours all four**, in the walk's order:
+///
+/// 1. `.ignore` in the path's directory or any ancestor, deepest first — the
+///    ripgrep/fd convention, read whether or not the tree is a git repository;
+/// 2. `.gitignore` from the path's directory up to the git worktree root;
+/// 3. the repository's `info/exclude` (the common directory's, in a worktree);
+/// 4. git's global excludes file (`core.excludesFile`, honouring
+///    `GIT_CONFIG_GLOBAL`, else `$XDG_CONFIG_HOME/git/ignore`).
+///
+/// The first kind with any match decides, whitelist or ignore. 2–4 apply only
+/// inside a git repository, as git itself applies them. A directory a rule
+/// excludes takes everything under it along. `.rgignore` and other
+/// tool-specific files are honoured by no one.
+pub fn walk_builder(root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .require_git(true);
+    builder
+}
+
+/// Evaluate the ignore rules the same way [`walk_builder`]'s walk does.
+///
+/// The watcher must use this same stack or incremental generations admit files
+/// the next cold build drops — which is not hypothetical: it read only
+/// `info/exclude` and the `.gitignore` chain while the walk also read `.ignore`
+/// and the global excludes file, and a `.ignore`d `skipme.ts` flapped in and
+/// out of the graph on every edit.
 ///
 /// "The same way" includes **tolerating the same broken files**. A rule file
 /// is not all-or-nothing: `GitignoreBuilder::add` compiles every line it can
@@ -438,22 +493,52 @@ pub fn is_gitignored_reporting(
     is_dir: bool,
 ) -> anyhow::Result<(bool, Vec<String>)> {
     let path_abs = path_under_root(root, path)?;
-    let (matchers, problems) = ignore_matchers_for(root, &path_abs, is_dir)?;
-    Ok((
-        matches_ignore(&matchers, &path_abs, is_dir).unwrap_or(false),
-        problems,
-    ))
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut problems = Vec::new();
+    let mut matchers = Vec::new();
+    for rule in ignore_rule_sources(root, &path_abs, is_dir)? {
+        if let Some(matcher) = compile_ignore_rules(&mut problems, &rule)? {
+            matchers.push((rule, matcher));
+        }
+    }
+    // The walk never tests its root, and prunes every directory under it that
+    // a rule excludes — so a path is excluded when it, or any directory
+    // between the root and it, is.
+    let mut candidates: Vec<(PathBuf, bool)> = path_abs
+        .ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.starts_with(&root_abs) && *ancestor != root_abs)
+        .map(|ancestor| (ancestor.to_path_buf(), true))
+        .collect();
+    candidates.reverse();
+    candidates.push((path_abs.clone(), is_dir));
+    let ignored = candidates.iter().any(|(candidate, candidate_is_dir)| {
+        walk_verdict(&matchers, candidate, *candidate_is_dir).is_ignore()
+    });
+    Ok((ignored, problems))
 }
 
-/// Ignore-rule files that affect `path`, from the git worktree root (or `root`
-/// when there is no git metadata) down to the path. Watcher cache stamps use
-/// this list so a parent `.gitignore` edit invalidates verdicts.
+/// Every rule file [`is_gitignored`] reads for `path`, existing or not.
+///
+/// Watcher cache stamps use this list, so an edit to any of them — a parent
+/// `.gitignore`, a `.ignore`, `info/exclude`, the global excludes file that
+/// lives outside the watched tree — invalidates the verdicts it backed.
 pub fn ignore_rule_files(root: &Path, path: &Path, is_dir: bool) -> anyhow::Result<Vec<PathBuf>> {
     let path_abs = path_under_root(root, path)?;
-    Ok(ignore_rule_bases(root, &path_abs, is_dir)?
+    Ok(ignore_rule_sources(root, &path_abs, is_dir)?
         .into_iter()
-        .map(|(_, rules)| rules)
+        .map(|rule| rule.path)
         .collect())
+}
+
+/// Whether `path` names a rule file [`walk_builder`]'s walk reads: a
+/// `.gitignore` or `.ignore` anywhere, a repository's `info/exclude`, or the
+/// global excludes file. What the watcher clears its verdict cache on.
+pub fn is_ignore_rule_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == ".gitignore" || name == ".ignore")
+        || path.ends_with("info/exclude")
+        || ignore::gitignore::gitconfig_excludes_path().is_some_and(|global| global == path)
 }
 
 fn path_under_root(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
@@ -470,58 +555,79 @@ fn path_under_root(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path_abs)
 }
 
-fn ignore_rule_bases(
-    root: &Path,
-    path: &Path,
-    is_dir: bool,
-) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
-    let git_root = git_worktree_root(root)
-        .or_else(|| root.canonicalize().ok())
-        .unwrap_or_else(|| root.to_path_buf());
+/// The four kinds of rule file, in the order the walk lets them decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RuleKind {
+    Ignore,
+    GitIgnore,
+    GitExclude,
+    Global,
+}
+
+#[derive(Debug, Clone)]
+struct RuleSource {
+    kind: RuleKind,
+    /// The directory the file's patterns are relative to.
+    base: PathBuf,
+    path: PathBuf,
+}
+
+fn ignore_rule_sources(root: &Path, path: &Path, is_dir: bool) -> anyhow::Result<Vec<RuleSource>> {
     let path_abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         root.join(path)
     };
     let path_abs = path_abs.canonicalize().unwrap_or(path_abs);
-    let git_root = git_root.canonicalize().unwrap_or(git_root);
-    let rel = path_abs
-        .strip_prefix(&git_root)
-        .unwrap_or(path_abs.as_path());
-    let parent = if is_dir {
-        rel
+    let directory = if is_dir {
+        path_abs.as_path()
     } else {
-        rel.parent().unwrap_or_else(|| Path::new(""))
+        path_abs.parent().unwrap_or_else(|| Path::new("/"))
     };
+    // Shallowest first; `walk_verdict` reads them deepest first.
+    let mut directories: Vec<&Path> = directory.ancestors().collect();
+    directories.reverse();
 
+    let mut rules: Vec<RuleSource> = directories
+        .iter()
+        .map(|dir| RuleSource {
+            kind: RuleKind::Ignore,
+            base: dir.to_path_buf(),
+            path: dir.join(".ignore"),
+        })
+        .collect();
+    let Some(git_root) = git_worktree_root(root) else {
+        // `require_git`: outside a repository only `.ignore` applies.
+        return Ok(rules);
+    };
+    let git_root = git_root.canonicalize().unwrap_or(git_root);
+    rules.extend(
+        directories
+            .iter()
+            .filter(|dir| dir.starts_with(&git_root))
+            .map(|dir| RuleSource {
+                kind: RuleKind::GitIgnore,
+                base: dir.to_path_buf(),
+                path: dir.join(".gitignore"),
+            }),
+    );
     let exclude = git_metadata(&git_root)?.map_or_else(
         || git_root.join(".git/info/exclude"),
         |metadata| metadata.common_dir.join("info/exclude"),
     );
-    let mut rules = vec![
-        (git_root.clone(), exclude),
-        (git_root.clone(), git_root.join(".gitignore")),
-    ];
-    let mut current = git_root;
-    for component in parent.components() {
-        current.push(component.as_os_str());
-        rules.push((current.clone(), current.join(".gitignore")));
+    rules.push(RuleSource {
+        kind: RuleKind::GitExclude,
+        base: git_root.clone(),
+        path: exclude,
+    });
+    if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+        rules.push(RuleSource {
+            kind: RuleKind::Global,
+            base: git_root,
+            path: global,
+        });
     }
     Ok(rules)
-}
-
-fn ignore_matchers_for(
-    root: &Path,
-    path: &Path,
-    is_dir: bool,
-) -> anyhow::Result<(Vec<ignore::gitignore::Gitignore>, Vec<String>)> {
-    let bases = ignore_rule_bases(root, path, is_dir)?;
-    let mut matchers = Vec::new();
-    let mut problems = Vec::new();
-    for (base, rules) in &bases {
-        add_ignore_rules(&mut matchers, &mut problems, base, rules)?;
-    }
-    Ok((matchers, problems))
 }
 
 /// Compile one rule file into a matcher, keeping every line that is valid.
@@ -533,46 +639,89 @@ fn ignore_matchers_for(
 /// and no rule applies, which is again what the cold walker does. Neither case
 /// may abort the evaluation: an ignore verdict that fails is a verdict the
 /// watcher reads as "ignored", so one typo would freeze the whole index.
-fn add_ignore_rules(
-    matchers: &mut Vec<ignore::gitignore::Gitignore>,
+fn compile_ignore_rules(
     problems: &mut Vec<String>,
-    base: &Path,
-    rules: &Path,
-) -> anyhow::Result<()> {
-    if !rules.is_file() {
-        return Ok(());
+    rule: &RuleSource,
+) -> anyhow::Result<Option<ignore::gitignore::Gitignore>> {
+    if !rule.path.is_file() {
+        return Ok(None);
     }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(base);
-    if let Some(error) = builder.add(rules) {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(&rule.base);
+    if let Some(error) = builder.add(&rule.path) {
         problems.push(format!(
-            "ignore rules {rules:?} are partly unusable and those lines are not \
-             being applied: {error}"
+            "ignore rules {:?} are partly unusable and those lines are not \
+             being applied: {error}",
+            rule.path
         ));
     }
-    matchers.push(builder.build()?);
-    Ok(())
+    Ok(Some(builder.build()?))
 }
 
-fn matches_ignore(
-    matchers: &[ignore::gitignore::Gitignore],
+/// One entry's verdict under the walk's precedence: per kind, the deepest rule
+/// file with any match for the entry; across kinds, the first kind that has
+/// one. Mirrors `ignore::dir::Ignore::matched_ignore`, which is not public.
+fn walk_verdict(
+    matchers: &[(RuleSource, ignore::gitignore::Gitignore)],
     path: &Path,
     is_dir: bool,
-) -> Option<bool> {
-    let mut ignored = None;
-    for matcher in matchers {
-        let relative = path.strip_prefix(matcher.path()).unwrap_or(path);
-        let matched = matcher.matched_path_or_any_parents(relative, is_dir);
-        if matched.is_ignore() {
-            ignored = Some(true);
-        } else if matched.is_whitelist() {
-            ignored = Some(false);
+) -> ignore::Match<()> {
+    for kind in [
+        RuleKind::Ignore,
+        RuleKind::GitIgnore,
+        RuleKind::GitExclude,
+        RuleKind::Global,
+    ] {
+        // A directory's own rule file governs what is *inside* it, not the
+        // directory itself; the global and exclude files have no such scope.
+        let mut applicable: Vec<&(RuleSource, ignore::gitignore::Gitignore)> = matchers
+            .iter()
+            .filter(|(rule, _)| rule.kind == kind)
+            .filter(|(rule, _)| {
+                matches!(kind, RuleKind::GitExclude | RuleKind::Global)
+                    || (path.starts_with(&rule.base) && path != rule.base)
+            })
+            .collect();
+        applicable.sort_by_key(|(rule, _)| std::cmp::Reverse(rule.base.components().count()));
+        for (_, matcher) in applicable {
+            match matcher.matched(path, is_dir) {
+                ignore::Match::None => {}
+                ignore::Match::Ignore(_) => return ignore::Match::Ignore(()),
+                ignore::Match::Whitelist(_) => return ignore::Match::Whitelist(()),
+            }
         }
     }
-    ignored
+    ignore::Match::None
+}
+
+/// Extracts one file, with the values of a secret file withheld.
+///
+/// Every engine below — refusal, notebook, tree-sitter and its fallbacks —
+/// returns through here, so [`secret::withhold_secret_values`] runs once on
+/// whatever came back, before the extraction reaches the cache, the store or
+/// a query.
+#[cfg(feature = "parse")]
+pub fn extract_file(path: &str, source: &str) -> Extraction {
+    extract_file_with_budget(path, source, treesitter::DEFAULT_PARSE_BUDGET)
+}
+
+/// [`extract_file`] under an explicit per-file parse budget.
+///
+/// The one place the budget enters the whole-file path, so the parallel pass
+/// and the serial retry of [`retry_budget_refusals`] differ only in the value
+/// they pass here.
+#[cfg(feature = "parse")]
+pub fn extract_file_with_budget(
+    path: &str,
+    source: &str,
+    budget: std::time::Duration,
+) -> Extraction {
+    let mut extraction = extract_file_unfiltered(path, source, budget);
+    secret::withhold_secret_values(&mut extraction);
+    extraction
 }
 
 #[cfg(feature = "parse")]
-pub fn extract_file(path: &str, source: &str) -> Extraction {
+fn extract_file_unfiltered(path: &str, source: &str, budget: std::time::Duration) -> Extraction {
     if source.len() as u64 > MAX_SOURCE_BYTES {
         return treesitter::refused_extraction(
             path,
@@ -585,6 +734,27 @@ pub fn extract_file(path: &str, source: &str) -> Extraction {
             ),
         );
     }
+    // An Android manifest is data the framework reads, not source: the
+    // components it names are entry points, and a manifest the reader cannot
+    // read is a recorded failure, not "no components" (which would silently
+    // un-exempt every one of them).
+    if androidmanifest::is_android_manifest(path) {
+        return match androidmanifest::parse_components(source) {
+            Ok(_) => treesitter::skipped_extraction(
+                path,
+                "config",
+                source,
+                "not parsed as source: an Android manifest, read for the components it declares"
+                    .to_string(),
+            ),
+            Err(reason) => treesitter::refused_extraction(
+                path,
+                "config",
+                source,
+                format!("AndroidManifest.xml could not be read: {reason}"),
+            ),
+        };
+    }
     // Notebooks divert here rather than inside `extract_treesitter`, because
     // what they need is not a different grammar but a different *source*: the
     // code has to be reconstructed out of the JSON before any grammar sees it,
@@ -592,10 +762,10 @@ pub fn extract_file(path: &str, source: &str) -> Extraction {
     // reconstructed buffer straight to the extractor would produce symbols
     // whose spans index a string that exists only in memory.
     if notebook::is_notebook(path) {
-        return notebook::extract_notebook_bounded(path, source);
+        return notebook::extract_notebook_bounded(path, source, budget);
     }
     let lang = detect_language(Path::new(path));
-    extract_treesitter(path, lang, source)
+    treesitter::extract_treesitter_with_budget(path, lang, source, budget)
 }
 
 #[cfg(feature = "parse")]
@@ -608,19 +778,187 @@ pub fn extract_all_with_progress(
     files: &[FileRef],
     progress: Option<&progress::FileProgress>,
 ) -> Vec<Extraction> {
+    extract_all_with_budgets(files, progress, ParseBudgets::default(), None).0
+}
+
+/// The two per-file parse budgets of a build: the wall-clock bound each file
+/// gets in the parallel pass, and the larger one a budget-refused file gets
+/// when it is re-run serially.
+#[cfg(feature = "parse")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseBudgets {
+    pub first_pass: std::time::Duration,
+    pub retry: std::time::Duration,
+}
+
+#[cfg(feature = "parse")]
+impl Default for ParseBudgets {
+    fn default() -> Self {
+        let first_pass = treesitter::DEFAULT_PARSE_BUDGET;
+        Self {
+            first_pass,
+            retry: first_pass.saturating_mul(treesitter::RETRY_BUDGET_FACTOR),
+        }
+    }
+}
+
+/// Most refused paths a [`BudgetRetryReport`] names. The total is carried
+/// beside the list, so a capped list is never read as the whole set.
+#[cfg(feature = "parse")]
+pub const MAX_NAMED_BUDGET_REFUSALS: usize = 50;
+
+/// What the serial budget retry did.
+///
+/// Counts are of files, not of paths: two inputs with one path are two files.
+/// `devmap status` reaches the same files through the `parse_failed` gap
+/// inventory, whose reason for each still-refused file begins with
+/// [`model::BUDGET_REFUSAL_PREFIX`] and states the retry budget it overran.
+#[cfg(feature = "parse")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BudgetRetryReport {
+    /// Files the parallel pass refused for budget.
+    pub first_pass_refused: usize,
+    /// Of those, files the serial retry actually re-ran.
+    pub retried: usize,
+    /// Of those retried, files that parsed (cleanly or partially).
+    pub recovered: usize,
+    /// Refused files never re-run: past [`treesitter::MAX_BUDGET_RETRIES`], or
+    /// the retry was cancelled first. They stay refused.
+    pub not_retried: usize,
+    /// Files refused for budget in the final result: `first_pass_refused -
+    /// recovered`. The number to alarm on.
+    pub still_refused_total: usize,
+    /// At most [`MAX_NAMED_BUDGET_REFUSALS`] of their paths, in input order.
+    pub still_refused: Vec<String>,
+}
+
+#[cfg(feature = "parse")]
+impl BudgetRetryReport {
+    /// Whether `still_refused` names every still-refused file.
+    pub fn names_all(&self) -> bool {
+        self.still_refused.len() == self.still_refused_total
+    }
+}
+
+/// [`extract_all_with_progress`] with explicit budgets, a cancellation flag
+/// for the retry, and the retry's report.
+///
+/// Pass one is the parallel extraction under `budgets.first_pass`. Pass two,
+/// [`retry_budget_refusals`], re-runs serially every file pass one refused for
+/// budget. Output order is the input order, so the result is independent of
+/// scheduling.
+#[cfg(feature = "parse")]
+pub fn extract_all_with_budgets(
+    files: &[FileRef],
+    progress: Option<&progress::FileProgress>,
+    budgets: ParseBudgets,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> (Vec<Extraction>, BudgetRetryReport) {
     if let Some(progress) = progress {
         progress.start(files.len());
     }
-    files
+    let mut extractions: Vec<Extraction> = files
         .par_iter()
         .map(|f| {
-            let extraction = extract_file(f.path, f.source);
+            let extraction = extract_file_with_budget(f.path, f.source, budgets.first_pass);
+            // A budget refusal is not final yet; the retry reports it.
             if let Some(progress) = progress {
-                progress.finish_file(false, extraction.is_parse_failure());
+                if !extraction.is_budget_refusal() {
+                    progress.finish_file(false, extraction.is_parse_failure());
+                }
             }
             extraction
         })
-        .collect()
+        .collect();
+    let report = retry_budget_refusals(files, &mut extractions, progress, budgets, cancel);
+    (extractions, report)
+}
+
+/// Re-run, serially and under `budgets.retry`, every file whose extraction was
+/// refused for budget, replacing that extraction in place.
+///
+/// Serial because the refusal is usually self-inflicted: the parallel pass runs
+/// one file per core, and under machine load a legitimate large file's wall
+/// time stretches past the budget. Alone, it does not. At most
+/// [`treesitter::MAX_BUDGET_RETRIES`] files are retried; `cancel` is checked
+/// before each. Only budget refusals are retried: a grammar fault, a depth
+/// refusal or a malformed notebook fails the same way at any budget, and is
+/// left exactly as the first pass reported it.
+///
+/// `extractions[i]` must be the first-pass result for `files[i]`. When
+/// `progress` is given, every budget-refused file is counted here (the first
+/// pass withholds it), as failed only if it is still refused.
+#[cfg(feature = "parse")]
+pub fn retry_budget_refusals(
+    files: &[FileRef],
+    extractions: &mut [Extraction],
+    progress: Option<&progress::FileProgress>,
+    budgets: ParseBudgets,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> BudgetRetryReport {
+    debug_assert_eq!(files.len(), extractions.len());
+    let refused: Vec<usize> = extractions
+        .iter()
+        .enumerate()
+        .filter(|(_, extraction)| extraction.is_budget_refusal())
+        .map(|(index, _)| index)
+        .collect();
+    let mut report = BudgetRetryReport {
+        first_pass_refused: refused.len(),
+        ..BudgetRetryReport::default()
+    };
+    for index in refused {
+        let cancelled = cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        // What the final reason says happened after the first pass, so a
+        // reader of `parse_failed` can tell the three refusals apart.
+        let verdict = if cancelled {
+            report.not_retried += 1;
+            "; not retried: the build was cancelled before the serial retry reached this file"
+                .to_string()
+        } else if report.retried >= treesitter::MAX_BUDGET_RETRIES {
+            report.not_retried += 1;
+            format!(
+                "; not retried: more than {} files were refused for budget, the cap on serial retries",
+                treesitter::MAX_BUDGET_RETRIES
+            )
+        } else {
+            report.retried += 1;
+            let file = &files[index];
+            extractions[index] = extract_file_with_budget(file.path, file.source, budgets.retry);
+            if !extractions[index].is_budget_refusal() {
+                report.recovered += 1;
+            }
+            format!(
+                "; refused again by the serial retry at the {:?} budget",
+                budgets.retry
+            )
+        };
+        if extractions[index].is_budget_refusal() {
+            if let model::ParseOutcome::Failed { reason } = &mut extractions[index].parse_outcome {
+                reason.push_str(&verdict);
+            }
+        }
+        let still_refused = extractions[index].is_budget_refusal();
+        if still_refused {
+            report.still_refused_total += 1;
+            if report.still_refused.len() < MAX_NAMED_BUDGET_REFUSALS {
+                report.still_refused.push(files[index].path.to_string());
+            }
+        }
+        if let Some(progress) = progress {
+            progress.finish_file(false, extractions[index].is_parse_failure());
+        }
+    }
+    if let Some(progress) = progress {
+        progress.record_budget_retry(progress::BudgetRetryCounts {
+            refused: report.first_pass_refused,
+            retried: report.retried,
+            recovered: report.recovered,
+            not_retried: report.not_retried,
+            still_refused: report.still_refused_total,
+        });
+    }
+    report
 }
 
 #[cfg(test)]
@@ -636,6 +974,30 @@ mod content_hash_tests {
 
 /// Collect indexable source files under `root` as owned `(relative_path, source)` pairs.
 /// Skips non-source paths and unreadable / non-UTF8 files (fail-closed: omit, do not invent).
+/// The key a repo-relative path is stored under: `/`-separated, spelled the
+/// same on every host.
+///
+/// On Windows `\` is the separator and is folded to `/`. Everywhere else it is
+/// an ordinary byte of a file name, and folding it there made `src/a\b.py` and
+/// `src/a/b.py` one key: discovery yielded both, so whichever was written last
+/// owned the row and the other file silently vanished from the graph. A key
+/// cannot spell that name without colliding, so it is refused, with the reason
+/// — a hole a reader can see, as `NonUtf8Path` is for a name UTF-8 cannot
+/// spell.
+pub fn repo_relative_key(relative: &str) -> Result<String, DiscoverySkipReason> {
+    if cfg!(windows) {
+        return Ok(relative.replace('\\', "/"));
+    }
+    if relative.contains('\\') {
+        return Err(DiscoverySkipReason::Unreadable {
+            reason: "a backslash in a file name is a path separator on Windows, so this \
+                     name cannot be stored without colliding with a real path; refused"
+                .to_string(),
+        });
+    }
+    Ok(relative.to_string())
+}
+
 pub fn collect_sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let (sources, _) = collect_sources_with_report(root)?;
     Ok(sources)
@@ -866,7 +1228,8 @@ impl ScannedTree {
     }
 
     /// Like [`Self::file_delta`], and collect up to `sample_cap` differing paths
-    /// (added, then changed, then removed) so a status surface can name them.
+    /// (added, then changed, then removed or over the limit) so a status
+    /// surface can name them.
     pub fn file_delta_with_samples(
         &self,
         previous: &BTreeMap<String, u64>,
@@ -893,9 +1256,18 @@ impl ScannedTree {
                 }
             }
         }
+        let over_limit: std::collections::BTreeSet<&str> = self
+            .report
+            .over_limit()
+            .map(|(path, _, _)| path.as_str())
+            .collect();
         for path in previous.keys() {
             if !current.contains_key(path.as_str()) {
-                delta.removed += 1;
+                if over_limit.contains(path.as_str()) {
+                    delta.over_limit += 1;
+                } else {
+                    delta.removed += 1;
+                }
                 push(path);
             }
         }
@@ -1075,9 +1447,7 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
     let unreadable_writer = std::sync::Arc::clone(&unreadable);
     let walk_root = root.to_path_buf();
     let pruned_writer = std::sync::Arc::clone(&pruned);
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
+    let walker = walk_builder(root)
         .filter_entry(move |entry| {
             if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 return true;
@@ -1185,7 +1555,36 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
             ));
             continue;
         };
-        let rel_str = rel_str.replace('\\', "/");
+        let rel_str = match repo_relative_key(rel_str) {
+            Ok(key) => key,
+            // A hole only where a source file was lost: `notes\todo.txt` is
+            // passed over like any other non-source name, or every repository
+            // holding one would read as permanently degraded.
+            Err(reason) => {
+                let reason = if is_indexable_source(rel_str) {
+                    reason
+                } else {
+                    DiscoverySkipReason::NonSource
+                };
+                report.skipped_paths.push((rel_str.to_string(), reason));
+                continue;
+            }
+        };
+        // A symlinked *directory* that leaves the repository is refused before
+        // the source gate, not after it. The gate asks whether a path's name is
+        // a source file's, and `crates/dc-verify` is not — so a link to a whole
+        // crate outside the tree was filed `NonSource`, the ordinary skip, and
+        // every symbol under it was absent with `discovery_refused: 0` and
+        // `search` answering "Available, 0" for a function that exists. The
+        // walk never descends a link, so nothing else accounts for those
+        // files. A directory the index never walks anyway — `node_modules`,
+        // a build output — is still the ordinary case, by `is_ignored_path`.
+        if let Err(reason @ DiscoverySkipReason::EscapesRoot { .. }) = &candidate {
+            if !is_ignored_path(&rel_str) && fs::metadata(p).is_ok_and(|target| target.is_dir()) {
+                report.skipped_paths.push((rel_str, reason.clone()));
+                continue;
+            }
+        }
         if !is_indexable_source(&rel_str) {
             report
                 .skipped_paths

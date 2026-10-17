@@ -4,7 +4,7 @@
  * `setInterval` cannot change its delay, so a timer that must slow down when
  * the event loop is late and stop entirely while the window is hidden has to
  * re-arm itself. The re-arm is skipped after dispose, including when the tick
- * disposes the timer — the same leak `createVisibleInterval` already closes.
+ * disposes the timer.
  */
 
 import { addForegroundListener, readBackgroundDocument, removeForegroundListener } from "./foreground";

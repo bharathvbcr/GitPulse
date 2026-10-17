@@ -170,11 +170,67 @@ The rows are the only part of that panel that scrolls, and the actions a
 selection enables are pinned below them: ticking a row shows Restore and Delete
 without scrolling for them.
 
-Search uses the store's full-text query. **Filters** narrows loaded cards by
-priority, type, owner, label and due date. **Due soon** means from now through the
-next seven days; overdue tasks have their own filter. Facet choices and **Select
-all** use loaded cards. Column totals and **Load more** expose additional results;
-an empty filtered page does not establish that the whole profile has no matches.
+A search — words, filters, or a **Filters** choice — switches the board from
+per-column pages to one candidate set for the scope: its tasks in board order,
+200 at a time, plus one full-text read of the store for the search's most
+selective word, so descriptions are matched too. Words are ranked locally over
+title, labels, type, owner and repository, finding word forms, related software
+terms ("login" finds "sign-in"), parts of words and close spellings. This is
+lexical ranking, not embeddings. Every word must match; `login OR signin`
+accepts either, and `"sign in"` needs the phrase in the title or a label. When
+no task has every word, the ones with some are shown and the line under the
+search box says so. That line also says how many tasks were read; a partial
+answer offers **Load more tasks** and never reads as complete. Matches order by
+**Relevance** or **Board order**; cards cannot be dragged or moved with the
+keyboard under Relevance. Typing re-ranks what is loaded without a request; a
+single repository (`repo:` naming exactly one, or the Filters repository) on the
+global board is read from that repository alone. The box completes filter names
+and values as you type.
+
+The box also takes filters, which the board applies to every candidate and
+never sends to the store — the store would search for their words:
+
+| Filter | Matches |
+| --- | --- |
+| `is:bug` (also `type:`, `kind:`; `is:bugs` works) | Type |
+| `priority:high` (`urgent`, `high`, `normal`, `low`, `p0`–`p3`) | Priority |
+| `status:review`, `status:in-progress`, `status:open` | Column; `open` is anything not Done |
+| `is:open`, `is:closed`, `is:unassigned`, `is:overdue` | The status, owner and due filters above, as GitHub spells them |
+| `repo:gitpulse`, `repo:acme`, `repo:code/gitpulse` | A linked repository: part of its name, a whole folder, owner or host in its path or remote, or — with a `/` — any part of it |
+| `owner:pat`, `owner:none` | Owner, or unassigned |
+| `label:ci`, `label:"needs review"`, `label:none` | Label, or unlabelled |
+| `severity:high`, `severity:none` | Severity |
+| `due:overdue` (`soon`, `later`, `none`, `any`) | Due date |
+
+Several filters on one key match either (`is:bug is:feature`, or the comma list
+`is:bug,feature`); filters on different keys must all match. A leading `-` excludes (`-label:ci`), and `-word`
+hides cards whose title contains the word. Quote a filter (`"is:bug"`) to search
+for it as words. A filter the board cannot read — `priority:huge`, an unknown
+`todo:fix`, an `OR` with nothing to join — is reported under the search box and
+not applied. Each applied filter shows as a chip that removes it (a comma list
+is one chip), and the quick filters (**Bugs**, **Urgent**, **Overdue**,
+**Unassigned**, **Open** …) add or remove theirs. **?** beside the box lists the
+syntax. A saved view keeps the search, filters included. The archive's search
+uses the same parser: the store is sent its required words, and filters, `OR`
+alternatives and phrases are checked against its loaded rows. Changing any filter clears
+the selection, so a bulk action never reaches a card the filter has hidden.
+
+**Filters** also narrows the board by priority, type, owner, label, due date
+and, on the global and workspace boards, repository. **Due soon** means from now
+through the next seven days; overdue tasks have their own filter. Facet choices,
+search filters and **Select all** use the loaded candidates: while a search is
+on, column counts are matches, and the line under the search box says how many
+of the scope's tasks were read; **Load more tasks** reads the next 200 (up to
+2,000). An empty answer over a partial read says so rather than claiming the
+profile has no matches.
+
+The navigator's **Find workspace or repo** box narrows its rows by name, and a
+repository's by its path or remote as well, by the same rule as `repo:` — so
+`git` finds repositories named for it, not every repository whose path ends
+in `.git`. The open board's row stays listed
+while it is filtered, workspace reordering waits until the box is cleared, and
+Escape clears it. It searches the rows the navigator has loaded; **More** loads
+the rest.
 
 Click a card to edit it. Command/Ctrl-click toggles selection; Shift-click selects
 a visible range. Right-click a card, or press Shift+F10 on a focused card, for

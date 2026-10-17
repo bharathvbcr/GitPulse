@@ -25,6 +25,29 @@ describe("parseDepsHealthReport", () => {
     ).toThrow(/omitted manifests/);
   });
 
+  it("carries the audit census through, and refuses a corrupt one", () => {
+    const base = {
+      npm_cli_present: true,
+      cargo_audit_present: true,
+      manifests: [],
+      ecosystems: [],
+      issues: [],
+      vulnerabilities: [],
+      outdated: [],
+      audit: { total: 0 },
+      truncated: false,
+    };
+    const parsed = parseDepsHealthReport({
+      ...base,
+      audit_coverage: { found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] },
+    });
+    expect(parsed.audit_coverage).toEqual({ found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] });
+    expect(parseDepsHealthReport(base).audit_coverage).toBeUndefined();
+    expect(() => parseDepsHealthReport({ ...base, audit_coverage: { found: "2" } })).toThrow(
+      /audit_coverage was corrupt/,
+    );
+  });
+
   it("defaults a missing lifecycle_scripts list to empty instead of crashing render", () => {
     const parsed = parseDepsHealthReport({
       npm_cli_present: true,
@@ -81,5 +104,21 @@ describe("parseDependabotReport / parseCodeScanningReport", () => {
     expect(parsed.available).toBe(false);
     expect(parsed.alerts).toEqual([]);
     expect(parsed.unavailable_reason).toBe("product_disabled");
+  });
+
+  it("carries the severity tiers a partial result could not read", () => {
+    const base = { available: true, alerts: [], truncated: true };
+    expect(parseDependabotReport({ ...base, partial_tiers: ["high", "low"] }).partial_tiers).toEqual([
+      "high",
+      "low",
+    ]);
+    expect(parseCodeScanningReport({ ...base, partial_tiers: ["error"] }).partial_tiers).toEqual(["error"]);
+  });
+
+  it("reads an absent partial_tiers as none, and refuses a corrupt one", () => {
+    expect(parseDependabotReport({ available: true, alerts: [], truncated: false }).partial_tiers).toEqual([]);
+    expect(() =>
+      parseDependabotReport({ available: true, alerts: [], truncated: true, partial_tiers: "high" }),
+    ).toThrow(/partial_tiers/);
   });
 });

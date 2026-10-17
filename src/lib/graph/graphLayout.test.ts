@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_GRAPH_CONTENT_WIDTH,
   clampGraphScrollLeft,
+  graphClipNotice,
   graphContentBoxStyle,
   graphViewportBoxStyle,
   resolveGraphLayout,
@@ -147,5 +148,37 @@ describe("graph viewport overflow geometry", () => {
     expect(clampGraphScrollLeft(900, 440, 1_200)).toBe(760);
     expect(clampGraphScrollLeft(-12, 440, 1_200)).toBe(0);
     expect(clampGraphScrollLeft(Number.NaN, 440, 200)).toBe(0);
+  });
+});
+
+describe("lanes past the canvas ceiling", () => {
+  it("reports how much of the topology the canvas cannot draw", () => {
+    const wide = resolveGraphLayout({
+      measuredLaneWidth: MAX_GRAPH_CONTENT_WIDTH + 600,
+      avatarSlotWidth: 0,
+      availableWidth: 1_840,
+      widthMode: "full",
+    });
+    expect(wide.contentWidth).toBe(MAX_GRAPH_CONTENT_WIDTH);
+    expect(wide.clippedWidth).toBe(600);
+
+    const fits = resolveGraphLayout({
+      measuredLaneWidth: 300,
+      avatarSlotWidth: 28,
+      availableWidth: 1_840,
+      widthMode: "balanced",
+    });
+    expect(fits.clippedWidth).toBe(0);
+    expect(resolveGraphLayout({ measuredLaneWidth: 9_000, avatarSlotWidth: 0, availableWidth: 0, widthMode: "full" }).clippedWidth).toBe(
+      9_000 - MAX_GRAPH_CONTENT_WIDTH,
+    );
+  });
+
+  it("words the cut in lanes, and says nothing when nothing is cut", () => {
+    expect(graphClipNotice(0, 30)).toBeNull();
+    expect(graphClipNotice(Number.NaN, 30)).toBeNull();
+    expect(graphClipNotice(600, 30)).toContain("20 branch lanes extend past the 4,096 px");
+    expect(graphClipNotice(10, 30)).toContain("1 branch lane extends");
+    expect(graphClipNotice(600, 0)).toContain("Some branch lanes extend");
   });
 });

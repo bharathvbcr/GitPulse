@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import BranchList from "./BranchList.svelte";
 
@@ -38,87 +39,33 @@ describe("BranchList", () => {
   });
 });
 
-describe("BranchList tag rows", () => {
-  it("shows how far a tag is ahead of the base, but only when it was compared", () => {
-    // A tag holding unmerged work is on no branch, so this chip is the only
-    // place the sidebar can say so. Both halves of the guard matter: without
-    // `compared_to` the counts are zeros meaning "not asked", and a release
-    // tag sitting on the base has nothing to report.
-    expect(source).toContain(
-      "{#if row.tag.compared_to && row.tag.commits_ahead_of_base > 0}",
-    );
-    expect(source).toContain(
-      'title="{row.tag.commits_ahead_of_base} commits not in {row.tag.compared_to}"',
-    );
-  });
-});
-
-describe("BranchList delete escalation", () => {
-  it("attempts the safe non-forced delete first", () => {
-    const safeIdx = source.indexOf("repoStore.deleteBranch(branch.name, false)");
-    expect(safeIdx).toBeGreaterThan(-1);
-    const forceIdx = source.indexOf("repoStore.deleteBranch(branch.name, true)");
-    expect(forceIdx).toBeGreaterThan(safeIdx);
-  });
-
-  it("escalates to force only through an explicit confirm fed by the decision helper", () => {
-    const decisionIdx = source.indexOf("escalateDeleteDecision(outcome.error ?? \"\", branch)");
-    expect(decisionIdx).toBeGreaterThan(-1);
-    const confirmIdx = source.indexOf('title: "Force-delete branch"');
-    expect(confirmIdx).toBeGreaterThan(decisionIdx);
-    // The retry is gated on both a positive decision and an explicit confirm.
-    expect(source).toContain("!decision.canRetryForce || !decision.message");
-    expect(source.indexOf("if (!forceOk) return;")).toBeGreaterThan(confirmIdx);
-  });
-
-  it("no longer deletes with a bare unconditional force", () => {
-    // The only `force=true` call sits after the escalation confirm block.
-    const confirmIdx = source.indexOf('title: "Force-delete branch"');
-    const forceIdx = source.indexOf("repoStore.deleteBranch(branch.name, true)");
-    expect(forceIdx).toBeGreaterThan(confirmIdx);
-    expect(source.indexOf("if (!ok) return;")).toBeLessThan(
-      source.indexOf("repoStore.deleteBranch(branch.name, false)")
-    );
-  });
-});
-
+/**
+ * Rendered in harness/branches.html ("delete, tags and create"): delete asks
+ * first and declining writes nothing; a confirmed delete is the safe one;
+ * git's unmerged refusal opens a separate force prompt naming the commits
+ * lost, and declining it never forces; a refusal force cannot fix offers no
+ * force prompt; a failed create keeps the form and the typed name; the
+ * upstream arrows and base counter titles say what they count.
+ */
 describe("BranchList create-form safety", () => {
-  it("keeps the typed name when creation fails (F14)", () => {
-    const outcomeCheck = source.indexOf("if (!outcome.ok) return;");
-    const clear = source.indexOf("createName = \"\";", source.indexOf("async function submitCreate"));
-    expect(outcomeCheck).toBeGreaterThan(-1);
-    expect(clear).toBeGreaterThan(outcomeCheck);
-  });
-
   it("bails out of suggestName when the repo changed mid-flight (race)", () => {
     const fn = source.slice(source.indexOf("async function suggestName"), source.indexOf("function openBranchMenu"));
     expect(fn).toContain("const repo = $repoStore.currentPath");
-    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBeGreaterThanOrEqual(2);
+    // The guard counts switches rather than comparing the endpoints: a path
+    // comparison lets A -> B -> A through, and BranchList outlives the switch.
+    expect(fn).toContain("const epoch = tabScope.epoch");
+    expect(fn.match(/!tabScope\.isCurrent\(epoch\)/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(fn).not.toMatch(/\$repoStore\.currentPath !== repo/);
   });
 });
 
 describe("BranchList tags", () => {
-  it("says when the tag list failed or was capped, instead of looking complete", () => {
-    expect(source).toContain("$repoStore.tagsFailed");
-    expect(source).toContain("$repoStore.tagsTruncated");
-    expect(source).toContain("The tag list could not be read, so this may not be complete.");
-    expect(source).toContain("Older tags exist and are not listed.");
-  });
-
-  it("creates and deletes tags through the store, not a missing UI", () => {
+  // Rendered in harness/branches.html: the failed and capped tag-list notes,
+  // the ahead chip shown only for a compared tag, and the delete prompt
+  // answered no (nothing deleted) and yes (exactly that tag deleted).
+  it("offers tag creation from the sidebar", () => {
     expect(source).toContain("repoStore.createTag");
-    expect(source).toContain("repoStore.deleteTag");
     expect(source).toContain('aria-label="Create tag"');
-    expect(source).toContain("Checkout");
-    expect(source).toContain("Delete…");
-  });
-
-  it("confirms tag deletion before invoking it", () => {
-    const confirmIdx = source.indexOf('title: "Delete tag"');
-    const deleteIdx = source.indexOf("repoStore.deleteTag(tag.name)");
-    expect(confirmIdx).toBeGreaterThan(-1);
-    expect(deleteIdx).toBeGreaterThan(confirmIdx);
-    expect(source).toContain("if (!ok) return;");
   });
 });
 
@@ -369,7 +316,8 @@ describe("BranchList menu keyboard accessibility", () => {
     expect(tabBranch).toContain("focusAdjacentToMenuOpener(");
     expect(tabBranch).toContain("e.shiftKey");
     expect(tabBranch).not.toContain("restoreFocus");
-    expect(source).toContain("candidate.tabIndex >= 0");
+    expect(source).toMatch(/focusAdjacentToMenuOpener[^}]*\} from "[./]+\/ui\/focusTrap"/);
+    expect(source).not.toContain("function focusAdjacentToMenuOpener");
   });
 
   it("declares popup semantics on the kebab trigger", () => {
@@ -437,22 +385,62 @@ describe("BranchList chip strip scrollbar", () => {
   });
 });
 
-describe("BranchList at-a-glance tooltips", () => {
-  it("explains the commits-ahead-of-base counter", () => {
-    expect(source).toContain(
-      "title=\"{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}"
-    );
+/** The `$effect` block that encloses `needle`, from its opening line to its close. */
+function effectAround(text: string, needle: string): string {
+  const at = text.indexOf(needle);
+  expect(at, needle).toBeGreaterThan(-1);
+  const start = text.lastIndexOf("$effect(() => {", at);
+  const end = text.indexOf("\n  });", at);
+  expect(start).toBeGreaterThan(-1);
+  return text.slice(start, end);
+}
+
+describe("BranchList freshness badges", () => {
+  it("asks for a batch only when the repository, the tips or the base change", () => {
+    // Reading `$repoStore` inside an effect re-runs it on every store
+    // emission; each re-run here was a freshness batch (~54 in the first
+    // 30 s of one launch). The effects read the shared repository key and
+    // derived values instead, and the reset depends on the repository alone.
+    const load = effectAround(source, "freshness.load(");
+    expect(load).not.toContain("$repoStore");
+    expect(load).toContain("const path = $currentRepoPath;");
+    const repo = effectAround(source, "freshnessStore.forRepo(");
+    expect(repo).not.toContain("$repoStore");
+    expect(repo).toContain("freshnessStore.forRepo($currentRepoPath);");
+    expect(source).toContain('const freshness = freshnessStore.consumer("branches");');
+    expect(source).toContain("const branchInfos = $derived($repoStore.branches);");
   });
 
-  it("also reports how far behind the base the branch is, which no chip shows", () => {
-    // commits_behind_base rode on BranchInfo unread. A branch 2 ahead and 90
-    // behind reads identically to one 2 ahead and current without it.
-    expect(source).toContain("branch.commits_behind_base > 0");
-    expect(source).toContain("${branch.commits_behind_base} behind");
+  it("never resets the shared store unconditionally", () => {
+    // An unconditional reset dropped the pull-request list's loads too.
+    expect(source).not.toContain("freshnessStore.reset(");
+  });
+});
+
+describe("BranchList mutation contract", () => {
+  const firstPrompt = (body: string) => Math.min(...["await askConfirm(", "await askText("].map((p) => body.indexOf(p)).filter((i) => i >= 0));
+
+  it.each([
+    ["runCreateTag", "repoStore.createTag(trimmed, at?.commitId, undefined, target)"],
+    ["runDeleteTag", "repoStore.deleteTag(tag.name, target)"],
+    ["runRename", "repoStore.renameBranch(branch.name, trimmed, target)"],
+    ["runDelete", "repoStore.deleteBranch(branch.name, false, target)"],
+  ])("%s names its repository before the prompt and keeps the outcome", (name, call) => {
+    const body = functionBody(source, name);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeLessThan(firstPrompt(body));
+    expect(body).toContain(call);
+    expect(body).toContain("reportFailure(");
   });
 
-  it("gives upstream arrows descriptive titles", () => {
-    expect(source).toContain('"{branch.ahead_count} ahead of upstream"');
-    expect(source).toContain('"{branch.behind_count} behind upstream"');
+  it("force-deletes against the same repository", () => {
+    expect(functionBody(source, "runDelete")).toContain("repoStore.deleteBranch(branch.name, true, target)");
+  });
+
+  it("offers Undo through the one owner, bound to the repository it deleted from", () => {
+    const body = functionBody(source, "runDelete");
+    expect(body.match(/offerBranchUndo\(/g)).toHaveLength(2);
+    expect(body).not.toContain("repoStore.createBranch(");
+    expect(body).not.toContain('toastStore.success(`Restored');
   });
 });

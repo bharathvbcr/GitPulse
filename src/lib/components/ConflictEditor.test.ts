@@ -119,10 +119,14 @@ describe("ConflictEditor load-effect memo guard", () => {
   it("reloads only when the conflicted file or repo actually changes", () => {
     // repoStore republishes fresh objects every ~6s status poll; reloading
     // per emission would churn IPC and replace parsedDoc mid-edit.
-    expect(source).toContain("if (key === loadedKey && loadedRetry === retryRevision) return;");
-    expect(source).toContain("loadedKey = key;");
-    // The memo key derives only from repo path + conflicted file.
-    expect(source).toContain("`${repo}\\u0000${file}`");
+    // The load effect depends only on the repository key, the conflicted file
+    // and Retry, each compared by value, and runs the load untracked.
+    const start = source.indexOf("$effect(() => {\n    const repo = $currentRepoPath;\n    const file = selectedFile;");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("function loadConflict", start));
+    expect(effect).toContain("void retryRevision;");
+    expect(effect).toContain("untrack(() => loadConflict(repo, file));");
+    expect(source).not.toContain("loadedKey");
   });
 
   it("does not cancel an in-flight load via effect teardown on memo hits", () => {
@@ -139,6 +143,19 @@ describe("ConflictEditor load-effect memo guard", () => {
     expect(source).toContain("const next = conflictSessions.open(repo, snapshot);");
     expect(source).toContain("parsedDoc = materializeResolution(next);");
     expect(source).toContain("await editorFileSaveQueue.whenIdle(fileSaveKey(repo, file));");
+  });
+});
+
+describe("ConflictEditor wholesale-replaced state", () => {
+  it("keeps the session draft and staged review diff out of deep proxies", () => {
+    // Each is a fresh object (a defensive copy from conflictSessions, an IPC
+    // answer) and is only ever reassigned, so proxying it is pure overhead.
+    expect(source).toContain("let draft = $state.raw<ConflictDraft | null>(null);");
+    expect(source).toContain("let reviewDiff = $state.raw<DiffPayload | null>(null);");
+    // Nothing writes into them in place, which raw state would not notice.
+    expect(source).not.toMatch(/\bdraft\.[\w.]+\s*=[^=]/);
+    expect(source).not.toMatch(/\bdraft\.(?:state|undo|redo|recovery)(?:\.\w+)*\.(?:push|pop|shift|splice|unshift)\(/);
+    expect(source).not.toMatch(/\breviewDiff\.\w+\s*=[^=]/);
   });
 });
 

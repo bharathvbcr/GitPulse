@@ -5,7 +5,6 @@ import {
   computeWordDiff,
   createParseCache,
   emptyDiffCopy,
-  filterFilePatch,
   isImagePath,
   parseUnifiedDiff,
   replacementBlockBounds,
@@ -141,6 +140,79 @@ describe("parseUnifiedDiff", () => {
     const leading = parseUnifiedDiff("@@ -1 +1 @@\n\\ No newline at end of file\n+a\n");
     expect(leading[0].type).toBe("hdr");
     expect(leading[1].noNewline).toBeUndefined();
+  });
+
+  describe("noNewline flag follows whatever row the marker follows", () => {
+    const MARK = "\\ No newline at end of file";
+    const flags = (raw: string) =>
+      parseUnifiedDiff(raw)
+        .filter((l) => l.type === "add" || l.type === "del" || l.type === "ctx")
+        .map((l) => `${l.type}:${l.noNewline ? "nn" : "-"}`);
+
+    it("flags a context row the marker follows at the end of a hunk", () => {
+      expect(flags(["@@ -1,2 +1,2 @@", "-a", "+b", " tail", MARK].join("\n"))).toEqual([
+        "del:-",
+        "add:-",
+        "ctx:nn",
+      ]);
+    });
+
+    it("flags a context row mid-file and leaves the others alone", () => {
+      expect(flags(["@@ -1,3 +1,3 @@", " one", " two", MARK, " three"].join("\n"))).toEqual([
+        "ctx:-",
+        "ctx:nn",
+        "ctx:-",
+      ]);
+    });
+
+    it("still flags add and del rows, old side only and new side only", () => {
+      expect(flags(["@@ -1,2 +1,2 @@", " keep", "-old", MARK, "+new"].join("\n"))).toEqual([
+        "ctx:-",
+        "del:nn",
+        "add:-",
+      ]);
+      expect(flags(["@@ -1,2 +1,2 @@", " keep", "-old", "+new", MARK].join("\n"))).toEqual([
+        "ctx:-",
+        "del:-",
+        "add:nn",
+      ]);
+    });
+
+    it("flags nothing for a marker first in a hunk or right after a hunk header", () => {
+      expect(flags(["@@ -1 +1 @@", MARK, " a"].join("\n"))).toEqual(["ctx:-"]);
+      expect(flags(["@@ -1 +1 @@", " a", "@@ -5 +5 @@", MARK, "+b"].join("\n"))).toEqual([
+        "ctx:-",
+        "add:-",
+      ]);
+    });
+
+    it("a second marker in a row does not flag anything twice", () => {
+      const rows = parseUnifiedDiff(["@@ -1 +1 @@", " a", MARK, MARK].join("\n"));
+      expect(rows.map((r) => `${r.type}:${r.noNewline ? "nn" : "-"}`)).toEqual([
+        "hdr:-",
+        "ctx:nn",
+        "hdr:-",
+        "hdr:-",
+      ]);
+    });
+
+    it("keeps a CRLF row's carriage return as content while flagging it", () => {
+      const rows = parseUnifiedDiff(["@@ -1 +1 @@", " tail\r", MARK].join("\n"));
+      expect(rows[1]).toMatchObject({ type: "ctx", content: " tail\r", noNewline: true });
+    });
+
+    it("flags only the last hunk when the marker is in it", () => {
+      expect(
+        flags(
+          ["@@ -1,2 +1,2 @@", " a", "-b", "+c", "@@ -9,2 +9,2 @@", "-x", "+y", " z", MARK].join("\n")
+        )
+      ).toEqual(["ctx:-", "del:-", "add:-", "del:-", "add:-", "ctx:nn"]);
+    });
+
+    it("does not flag a marker outside a hunk body", () => {
+      const rows = parseUnifiedDiff(["diff --git a/f b/f", "--- a/f", "+++ b/f", MARK].join("\n"));
+      expect(rows.some((r) => r.noNewline)).toBe(false);
+    });
   });
 
   it("parses padded hunk headers via relaxed whitespace matching", () => {
@@ -453,98 +525,6 @@ describe("parseUnifiedDiff meta classification", () => {
     const lines = parseUnifiedDiff(twoFile);
     const five = lines.find((l) => l.type === "add" && l.content === "+five");
     expect(five?.newNo).toBe(5);
-  });
-});
-
-describe("filterFilePatch", () => {
-  const multiFile = [
-    "commit abcdef1234567890",
-    "Author: Ada <ada@example.com>",
-    "",
-    "    subject line",
-    "",
-    "diff --git a/src/a.rs b/src/a.rs",
-    "index aaa..bbb 100644",
-    "--- a/src/a.rs",
-    "+++ b/src/a.rs",
-    "@@ -1 +1 @@",
-    "-alpha",
-    "+ALPHA",
-    "diff --git a/src/b.ts b/src/b.ts",
-    "index ccc..ddd 100644",
-    "--- a/src/b.ts",
-    "+++ b/src/b.ts",
-    "@@ -1 +1 @@",
-    "-beta",
-    "+BETA",
-    "diff --git a/old_name.txt b/new_name.txt",
-    "similarity index 100%",
-    "rename from old_name.txt",
-    "rename to new_name.txt",
-  ].join("\n");
-
-  it("extracts exactly one file's patch with its metadata block", () => {
-    const patch = filterFilePatch(multiFile, "src/b.ts");
-    expect(patch).toContain("diff --git a/src/b.ts b/src/b.ts");
-    expect(patch).toContain("+BETA");
-    expect(patch).not.toContain("ALPHA");
-    expect(patch).not.toContain("rename from");
-    expect(patch.split("\n")[0]).toBe("diff --git a/src/b.ts b/src/b.ts");
-  });
-
-  it("matches pure renames by their new name", () => {
-    expect(filterFilePatch(multiFile, "new_name.txt")).toContain("rename to new_name.txt");
-    expect(filterFilePatch(multiFile, "old_name.txt")).toContain("rename from old_name.txt");
-  });
-
-  it("drops the git-show preamble before the first file header", () => {
-    const patch = filterFilePatch(multiFile, "src/a.rs");
-    expect(patch).not.toContain("Author:");
-    expect(patch).not.toContain("subject line");
-  });
-
-  it("returns empty for paths absent from the diff and for empty input", () => {
-    expect(filterFilePatch(multiFile, "src/missing.rs")).toBe("");
-    expect(filterFilePatch("", "src/a.rs")).toBe("");
-    expect(filterFilePatch(multiFile, "")).toBe("");
-  });
-
-  it("does not let one path shadow a longer sibling path", () => {
-    const tricky = [
-      "diff --git a/src/a.ts b/src/a.ts",
-      "--- a/src/a.ts",
-      "+++ b/src/a.ts",
-      "@@ -1 +1 @@",
-      "-x",
-      "diff --git a/src/a.ts.bak b/src/a.ts.bak",
-      "--- a/src/a.ts.bak",
-      "+++ b/src/a.ts.bak",
-      "@@ -1 +1 @@",
-      "-y",
-    ].join("\n");
-    expect(filterFilePatch(tricky, "src/a.ts")).not.toContain(".bak");
-    expect(filterFilePatch(tricky, "src/a.ts.bak")).toContain("-y");
-  });
-
-  it("handles quoted diff headers for paths with special characters", () => {
-    const quoted =
-      'diff --git "a/weird\tname" "b/weird\tname"\nindex aaa..bbb 100644\n--- "a/weird\tname"\n+++ "b/weird\tname"\n@@ -1 +1 @@\n-q\n+Q\n'.replace(
-        /\t/g,
-        " "
-      );
-    expect(filterFilePatch(quoted, "weird name")).toContain("+Q");
-  });
-
-  it("keeps timestamps after the path from breaking +++/--- matching", () => {
-    const stamped = [
-      "diff --git a/x.txt b/x.txt",
-      "--- a/x.txt\t2026-01-01 00:00:00.000000000 +0000",
-      "+++ b/x.txt\t2026-08-24 00:00:00.000000000 +0000",
-      "@@ -1 +1 @@",
-      "-t",
-      "+T",
-    ].join("\n");
-    expect(filterFilePatch(stamped, "x.txt")).toContain("+T");
   });
 });
 

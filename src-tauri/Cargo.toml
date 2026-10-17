@@ -1,11 +1,13 @@
 [package]
 name = "gitpulse"
-version = "1.4.0"
-description = "High-Performance Native Git Desktop Client"
+version = "1.5.0"
+description = "High-performance native Git desktop client, code intelligence engine, and task workspace"
 authors = ["GitPulse Team"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/bharathvbcr/GitPulse"
+keywords = ["git", "git-client", "tauri", "devtools", "local-first"]
+categories = ["development-tools", "gui"]
 default-run = "gitpulse"
 
 [lib]
@@ -43,6 +45,10 @@ path = "src/bin/gitpulse-mcp.rs"
 name = "gitpulse-hook"
 path = "src/bin/gitpulse-hook.rs"
 
+[[bin]]
+name = "gitpulse-ptyd"
+path = "src/bin/gitpulse-ptyd.rs"
+
 [dependencies]
 # `macos-private-api` is what makes the macOS glass appearance possible at all,
 # and the gate is deeper than the name suggests: it forwards `wry/transparent`,
@@ -75,6 +81,11 @@ tauri-plugin-opener = "2.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rayon = "1.12"
+# The async runtime `pools::install_async_runtime` builds and hands to tauri.
+# Pinned to the version already resolved in Cargo.lock (the framework's own
+# `tokio` dependency), so declaring it adds no package: `rt-multi-thread` is
+# the runtime builder, `sync` the semaphore that bounds background commands.
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "sync"] }
 notify = "8.2"
 regex = "1.13"
 rfd = "0.17"
@@ -183,8 +194,11 @@ libc = "0.2"
 # another devmap build, all on the same repositories. Repeat it and the copies
 # stack until the machine gives out.
 #
-# Deliberately absent on macOS, where LaunchServices already guarantees one
-# instance of a bundled app and the plugin's own guidance is not to add it.
+# Absent on macOS, which has its own guard (`desktop::instance`). LaunchServices
+# keeps one instance per bundle *path*, not per identifier: with two copies of
+# GitPulse.app on disk a banner click could start a second app. The plugin's
+# macOS mode (a socket in /tmp, claimed by unlink-and-bind) races between two
+# launches and cannot carry a banner response or an Apple-event open.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 tauri-plugin-single-instance = "2"
 
@@ -260,6 +274,12 @@ harness = false
 name = "native_event_unwind"
 harness = false
 
+# Each scenario re-executes this binary on its own main thread: an approved
+# AppKit `terminate:` ends the process, so one process cannot run two.
+[[test]]
+name = "native_quit_guard"
+harness = false
+
 # Wall-clock measurement, not a pass/fail gate. `test = false` keeps it out of
 # `cargo test`: a timing assertion fails on a loaded machine for reasons that
 # have nothing to do with the code, and a check that fails spuriously is worse
@@ -276,6 +296,76 @@ name = "process_spawn"
 harness = false
 test = false
 
+[[bench]]
+name = "host_load"
+harness = false
+test = false
+
+# The benches below run on the shared harness in `benches/common` (JSON report,
+# host-load snapshot, work counters; see docs/PERFORMANCE.md "Benchmark
+# harness"). `harness = false` is required: the default libtest harness would
+# refuse their `fn main`. `test = false` keeps them out of `cargo test` for the
+# same reason as above; the scheduled `benches.yml` workflow runs them.
+[[bench]]
+name = "graph_diff"
+harness = false
+test = false
+
+[[bench]]
+name = "watcher"
+harness = false
+test = false
+
+[[bench]]
+name = "repo_read"
+harness = false
+test = false
+
+[[bench]]
+name = "command_timings"
+harness = false
+test = false
+
+[[bench]]
+name = "terminal_pty"
+harness = false
+test = false
+
+[[bench]]
+name = "idle_wakeups"
+harness = false
+test = false
+
+[[bench]]
+name = "live_index"
+harness = false
+test = false
+
+[[bench]]
+name = "worktree_teardown"
+harness = false
+test = false
+
+[[bench]]
+name = "analyzer_scans"
+harness = false
+test = false
+
+[[bench]]
+name = "graph_spawns"
+harness = false
+test = false
+
+[[bench]]
+name = "churn_spawns"
+harness = false
+test = false
+
+[[bench]]
+name = "commit_graph_history"
+harness = false
+test = false
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"
@@ -284,6 +374,12 @@ lto = "thin"
 # names nothing is not a stack trace. "debuginfo" drops the bulk (the debug
 # info) and keeps the names the panic hook's capture is written to produce.
 strip = "debuginfo"
+# One codegen unit: LLVM sees each crate whole, so it inlines and drops dead
+# code across what were 16 partitions — a smaller, faster binary for the
+# shipped build. It costs release compile time, which the release job's
+# 90-minute budget absorbs (builds ran 13–17 minutes at 16 units). Not
+# `panic = "abort"`: workbench/managed_run.rs and in_flight.rs `catch_unwind`.
+codegen-units = 1
 
 # urlpattern 0.3 (unic-ucd-ident and friends, RUSTSEC-2025-0075/0080/0081/0098/0100)
 # is still what crates.io tauri-utils 2.9.3 declares. urlpattern 0.6 dropped those

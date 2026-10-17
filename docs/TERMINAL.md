@@ -46,7 +46,7 @@ and closes still in flight, is **Settings → Agents → Terminal sessions open 
 once**: 32 until you change it, up to 128. The toolbar's session count shows
 it (`12/32`). A change applies to the next session; lowering it closes
 nothing, and new sessions wait until enough close. The ceiling bounds each
-session's PTY pair, reader thread and 256 KiB output window, and stays well
+session's PTY pair, reader thread and 512 KiB output window, and stays well
 inside macOS's system-wide PTY allowance, which other terminals share.
 
 Use **Terminal tab options** to rename a tab, move it left or right, copy selected
@@ -61,7 +61,8 @@ sessions. Selecting a third tab replaces the second pane.
 
 **Find** searches the active session's retained output, including wrapped lines and
 Unicode text. It supports next/previous matches and case sensitivity. Search is
-literal, limited to 256 characters, and retains the existing 5,000-line scrollback.
+literal, limited to 256 characters, and searches whatever scrollback the session keeps
+(see **Scrollback** below).
 At 1,000 highlighted results the UI reports **1000+ matches**, not an exact total.
 
 Use **Latest output** to return from scrollback. **Clear scrollback** retains the
@@ -161,6 +162,24 @@ questions and approvals use the separate Manvi protocol. See
 [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for copying, permissions and
 verification limits.
 
+A plain Claude Code tab gets the same treatment. A fresh launch is given a
+session id GitPulse records; a tab that takes over a running session (after a
+reload, or from Sessions) keeps the record already made for it and never makes
+a new one. When a signal from outside ends the session, the tab — and, for a
+burst of them, the incident's **Resume N** — offers **Resume** only if Claude
+Code saved a transcript for it. If it saved none, nothing is offered; if the
+transcript could not be checked, the tab says so instead of guessing. A Close
+from GitPulse, from the tab or from Sessions, never offers Resume, and neither
+does the program ending on its own; a tab's view closing while the agent keeps
+running does not end its record. "Resume N" reports what each relaunch did:
+started, waiting for a free terminal slot, or failed.
+
+Not verified against the Claude Code CLI, and relied on only as stated: whether
+`/clear` or `/resume` inside a session moves it to another session id (the
+transcript GitPulse looks for would then be the old one), and whether a session
+killed before its first message ever has a transcript (if not, it is correctly
+not offered).
+
 If the window reloads, the terminal processes it started keep running: they are
 detached rather than stopped, so one that prints a lot is no longer killed for
 lack of a page to show it. The reloaded window lists them under **Sessions** as
@@ -193,10 +212,19 @@ message. Invalid Unicode is also refused before any portion is sent. Failed or
 timed-out writes are not retried, since part of a command may already have arrived;
 restart the session before entering more input.
 
-The native PTY pauses after 256 KiB of output awaiting renderer acknowledgements.
+Sessions live in the app unless Settings → Agents → "Keep terminals running when
+GitPulse quits" is on; then they live in `gitpulse-ptyd`, survive a quit or a crash,
+and a quit with sessions running asks whether to leave them or stop them. A session
+taken over by a new view — after a reload, a crash, or from Sessions — is first shown
+its newest 512 KiB of output, kept whether or not anything was showing it, and is told
+when output printed while it was detached is no longer kept. See
+[Terminal host](TERMINAL_HOST.md).
+
+The native PTY pauses after 512 KiB of output awaiting renderer acknowledgements.
 If the renderer stops acknowledging for 30 seconds, the session closes with a
-delivery error. This bounds output in transit; retained history is still limited
-to 5,000 scrollback lines. Copy/export includes that retained buffer, not output
+delivery error. This bounds output in transit; retained history is limited
+to the session's scrollback (5,000 lines for a shell and 1,000 for an agent by
+default). Copy/export includes that retained buffer, not output
 already evicted. Exports are limited to 16 MiB.
 
 Listener attachment, input, resize, and close requests have five-second frontend
@@ -239,6 +267,70 @@ opened for an unrelated reason.
 
 Hyperlinks a program embeds itself (OSC 8) obey the same allowlist, checked
 against the escape sequence's target rather than its display text.
+
+## Scrollback
+
+**Settings → Appearance → Terminal scrollback** sets how many rows of history a
+terminal keeps, separately for shells (default 5,000) and for agent CLIs and
+task runs (default 1,000). The value is read when a terminal starts, and changing
+it applies to terminals already open: lowering it trims their oldest rows at
+once. Accepted values are 100 to 50,000.
+
+xterm allocates twelve bytes per column for every row of history whether or not
+the row holds text, so a filled 5,000-row session 200 columns wide holds about
+11.6 MB (measured against the bundled xterm 6.0.0: 11.56 MB of cell storage plus
+about 2.4 MB of JavaScript objects). The terminals of every repository tab you
+have visited stay open, which is why agents, whose useful history is the
+transcript the CLI keeps itself, default lower.
+
+## Option as Meta (macOS)
+
+On macOS, Option is Meta in the terminal by default: Option+B and Option+F send
+`ESC b` and `ESC f` (word motion in readline and zle) rather than composing a
+glyph, and Option-click still selects text in a program that has mouse reporting
+on. The cost is that a layout which types a character with Option (for example
+`@` on a German keyboard) cannot type it inside a terminal.
+
+**Settings → Appearance → Option as Meta in terminals** turns it off, for that
+trade-off. The change applies to terminals already open. The setting is not
+shown, and does nothing, off macOS.
+
+## GPU rendering
+
+A terminal you can see draws through xterm's WebGL renderer
+(`@xterm/addon-webgl`). A hidden one draws through the DOM renderer and holds
+no WebGL context. That covers a background tab, a collapsed dock, and another
+repository's dock. The context is taken when the session comes on screen and
+given back when it leaves (`src/lib/terminal/gpuRenderer.ts`). At most
+`MAX_VISIBLE_SESSIONS` (8) contexts exist at once.
+
+If a context is lost, for example through a GPU reset or a driver fault, the
+session disposes the addon on the canvas's `webglcontextlost` event and xterm
+draws the same rows through the DOM again. It does not wait for the addon's own
+three-second restore window, which would leave the pane blank. That session is
+marked `lost` (`data-renderer` on its container) and stays on the DOM renderer
+for the rest of its life, so a faulty driver cannot cause a loss loop.
+
+**Settings → Appearance → GPU terminal rendering** turns WebGL off for every
+session at once, for hardware that draws terminal text wrongly. It is on by
+default. Whether the renderer ships at all is decided by the TUI-redraw A/B in
+`docs/PERFORMANCE.md`.
+
+### Frame probe (OSC 7700)
+
+A program in a session can ask for the page's frame pacing:
+
+* `ESC ] 7700 ; frames-start [; period=<ms>] BEL` starts recording the
+  interval between animation frames.
+* `ESC ] 7700 ; frames-stop BEL` stops it. The terminal answers through the
+  PTY, as it answers a cursor-position report:
+  `ESC ] 7700 ; frames ; n= ; dropped= ; fraction= ; period= ; p50= ; p95= ; ms= BEL`.
+
+A dropped frame is one longer than 1.5× `period`, or 1.5× the run's median
+when no period is given. `scripts/tui-redraw-bench.mjs` uses the probe. It
+reveals the page's frame timing only, stops itself after 120 s, and its
+sequences draw nothing. The answer is classed as a terminal reply, so it
+never counts as the reader answering an agent.
 
 ## Screen reader support
 

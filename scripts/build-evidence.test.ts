@@ -2,10 +2,11 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { build, type Plugin } from "vite";
 import { describe, expect, it } from "vitest";
-import { privateSourceMaps, pruneEvidence } from "./build-evidence.mjs";
+import { privateSourceMaps, pruneEvidence, shippedSourceMaps } from "./build-evidence.mjs";
 import { appBuild, releaseRevisions } from "./app-version.mjs";
 
 describe("exact build evidence", () => {
@@ -112,8 +113,71 @@ describe("build evidence retention", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  it("lists the commit a release tag points at, peeled through annotated tags", () => {
-    const tagged = execFileSync("git", ["rev-list", "-n", "1", "--tags"], { encoding: "utf8" }).trim();
-    expect(releaseRevisions()).toContain(tagged);
+  // Hermetic: a shallow or tag-less checkout of this repository (CI's default
+  // clone, a fresh cloud session) has no tags to read, so the fixture makes
+  // its own — one lightweight tag and one annotated tag on distinct commits.
+  it("lists the commit a release tag points at, peeled through annotated tags", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gitpulse-tags-"));
+    try {
+      const git = (...args: string[]) =>
+        execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", ...args], { cwd: root, encoding: "utf8" }).trim();
+      git("init", "-q");
+      git("commit", "-q", "--allow-empty", "-m", "one");
+      git("tag", "v1.0.0");
+      const light = git("rev-parse", "HEAD");
+      git("commit", "-q", "--allow-empty", "-m", "two");
+      git("tag", "-a", "v1.1.0", "-m", "release");
+      const annotated = git("rev-parse", "HEAD");
+      const revisions = releaseRevisions(root);
+      expect(revisions).toContain(light);
+      expect(revisions).toContain(annotated);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("source maps never ship in the frontend bundle", () => {
+  it("names every file that is, or points at, a source map", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gitpulse-leak-"));
+    try {
+      await mkdir(path.join(root, "assets", "deep"), { recursive: true });
+      await writeFile(path.join(root, "assets", "main.js"), "export {};\n//# sourceMappingURL=main.js.map\n");
+      await writeFile(path.join(root, "assets", "main.js.map"), "{}");
+      await writeFile(path.join(root, "assets", "deep", "style.css"), "a{}\n/*# sourceMappingURL=style.css.map */");
+      await writeFile(path.join(root, "assets", "old.mjs"), "x()\n//@ sourceMappingURL=old.mjs.map");
+      await writeFile(path.join(root, "assets", "deep", "orphan.css.map"), "{}");
+      expect(shippedSourceMaps(root)).toEqual([
+        "assets/deep/orphan.css.map", "assets/deep/style.css", "assets/main.js", "assets/main.js.map", "assets/old.mjs",
+      ]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("passes a bundle that only mentions the word, and an empty one", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gitpulse-leak-"));
+    try {
+      expect(shippedSourceMaps(root)).toEqual([]);
+      await writeFile(path.join(root, "vendor.js"), "const tag = \"sourceMappingURL=\"; export { tag };");
+      await writeFile(path.join(root, "index.html"), "<!-- //# sourceMappingURL=x.map -->");
+      await writeFile(path.join(root, "build-info.json"), "{}");
+      expect(shippedSourceMaps(root)).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("fails the build, and prunes nothing, when a map reaches the output directory", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gitpulse-leak-"));
+    try {
+      const evidence = path.join(root, "evidence");
+      await seedHistory(evidence);
+      const before = (await readdir(evidence)).sort();
+      const dist = path.join(root, "dist");
+      // Runs before privateSourceMaps, so its map is written after that plugin
+      // has already moved the bundler's own maps out of the way.
+      const leak: Plugin = { name: "leak", writeBundle() { writeFileSync(path.join(dist, "leak.js.map"), "{}"); } };
+      await expect(buildProbe(root, evidence, [leak])).rejects.toThrow(/would ship its source maps: leak\.js\.map/);
+      // Retention is skipped: every snapshot that existed is still there. The
+      // failed build's own snapshot was written before the check ran.
+      const after = (await readdir(evidence)).sort();
+      expect(after.filter((id) => before.includes(id))).toEqual(before);
+      expect(after.length).toBe(before.length + 1);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

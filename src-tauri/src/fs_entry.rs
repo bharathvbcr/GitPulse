@@ -131,7 +131,29 @@ pub(crate) fn pin_parent(path: &Path, create: bool) -> io::Result<std::fs::File>
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
-    open_dir_chain(parent, create).map(|pinned| pinned.dir)
+    open_dir_chain(parent, create, None).map(|pinned| pinned.dir)
+}
+
+/// [`pin_parent`] with creation, reporting the directories THIS call made (the
+/// ones its own `mkdirat` succeeded for, never one that was already there or
+/// that a concurrent creator won), outermost first. The list is filled even
+/// when the walk fails part-way, so a caller whose later step fails can remove
+/// exactly what it made.
+#[cfg(unix)]
+pub(crate) fn pin_parent_recording(
+    path: &Path,
+    created: &mut Vec<std::path::PathBuf>,
+) -> io::Result<std::fs::File> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected an absolute file path",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
+    open_dir_chain(parent, true, Some(created)).map(|pinned| pinned.dir)
 }
 
 /// A pinned directory, and whether its *name* is beyond another user's reach.
@@ -251,7 +273,7 @@ pub(crate) fn pin_dir_nofollow(dir: &Path) -> io::Result<PinnedDir> {
             "Expected an absolute directory path",
         ));
     }
-    open_dir_chain(dir, false)
+    open_dir_chain(dir, false, None)
 }
 
 #[cfg(unix)]
@@ -288,7 +310,11 @@ fn holder_keeps_entry_private(holder: &std::fs::Metadata, entry: &std::fs::Metad
 /// component of `dir` relative to the previous descriptor, never re-walking a
 /// path and never following a symlink.
 #[cfg(unix)]
-fn open_dir_chain(dir: &Path, create: bool) -> io::Result<PinnedDir> {
+fn open_dir_chain(
+    dir: &Path,
+    create: bool,
+    mut created: Option<&mut Vec<std::path::PathBuf>>,
+) -> io::Result<PinnedDir> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -336,9 +362,11 @@ fn open_dir_chain(dir: &Path, create: bool) -> io::Result<PinnedDir> {
         if fd < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
             // SAFETY: creates one name under the pinned parent. A raced entry
             // is inspected by the no-follow open below, never accepted blindly.
-            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) } != 0
-                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-            {
+            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+                if let Some(created) = created.as_deref_mut() {
+                    created.push(walked.join(part));
+                }
+            } else if io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
                 return Err(io::Error::last_os_error());
             }
             fd = open();
@@ -613,9 +641,12 @@ pub(crate) fn preserve_metadata(source: &std::fs::File, target: &std::fs::File) 
 /// Why [`read_bounded_nofollow`] refused a file.
 #[derive(Debug)]
 pub(crate) enum BoundedRead {
-    /// Opening or reading failed; a symlink in the final component lands here.
+    /// Opening or reading failed; on Unix a symlink in the final component
+    /// lands here.
     Io(io::Error),
-    /// A directory, FIFO, socket or device — never opened for a blocking read.
+    /// A directory, FIFO, socket or device — never opened for a blocking read
+    /// — or, on Windows, a link (a symlink or junction), which is opened itself
+    /// and never followed.
     NotRegular,
     /// Larger than the cap when opened.
     TooLarge,
@@ -630,19 +661,8 @@ pub(crate) enum BoundedRead {
 /// a path check that a rename could invalidate before the open.
 pub(crate) fn read_bounded_nofollow(path: &Path, cap: usize) -> Result<Vec<u8>, BoundedRead> {
     use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(BoundedRead::Io)?;
-    let meta = file.metadata().map_err(BoundedRead::Io)?;
-    if !meta.is_file() {
-        return Err(BoundedRead::NotRegular);
-    }
-    if meta.len() > cap as u64 {
+    let (file, len) = open_regular_nofollow(path)?;
+    if len > cap as u64 {
         return Err(BoundedRead::TooLarge);
     }
     let mut bytes = Vec::new();
@@ -653,6 +673,43 @@ pub(crate) fn read_bounded_nofollow(path: &Path, cap: usize) -> Result<Vec<u8>, 
         return Err(BoundedRead::Grew);
     }
     Ok(bytes)
+}
+
+/// Open a regular file for reading without following a symlink, returning the
+/// handle and the length it had when opened. The open is non-blocking and the
+/// descriptor's own metadata decides "regular file"; see
+/// [`read_bounded_nofollow`]. For a caller that reads a prefix of the file and
+/// must not pay for the rest.
+pub(crate) fn open_regular_nofollow(path: &Path) -> Result<(std::fs::File, u64), BoundedRead> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // OPEN_REPARSE_POINT opens a link itself instead of its target, and
+        // BACKUP_SEMANTICS lets a directory be opened at all (without it the
+        // open fails with access denied, which would hide "not a regular
+        // file" behind an I/O error). Both are classified from the handle.
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = options.open(path).map_err(BoundedRead::Io)?;
+    let meta = file.metadata().map_err(BoundedRead::Io)?;
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = false;
+    if is_link || !meta.is_file() {
+        return Err(BoundedRead::NotRegular);
+    }
+    Ok((file, meta.len()))
 }
 
 #[cfg(test)]
@@ -758,7 +815,10 @@ mod tests {
             },
             0
         );
-        crate::diff::write_regular(&path, b"new").unwrap();
+        crate::diff::write_regular_expecting(&path, crate::diff::Expect::Any, |_| {
+            Ok(b"new".to_vec())
+        })
+        .unwrap();
         let saved = std::fs::File::open(&path).unwrap();
         let after = saved.metadata().unwrap();
         let mut actual = [0u8; 64];
@@ -798,5 +858,93 @@ mod tests {
         std::fs::remove_dir(&target).unwrap();
         rename_noreplace(&source, &target).unwrap();
         assert!(!source.exists() && target.is_dir());
+    }
+}
+
+/// Opens (creating if absent, never truncating) a small per-user record that
+/// several GitPulse processes share — the spawn budget, the host-load
+/// snapshot and its writer lock — refusing one that is not a regular file
+/// this user alone owns and can read.
+///
+/// A symlink planted at the path would otherwise redirect the writes; with
+/// `O_NOFOLLOW` the open fails instead. The owner and mode are checked on the
+/// opened descriptor, not the path, so nothing can be swapped in between.
+pub(crate) fn open_private_record(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    verify_private_owner(&file, path)?;
+    Ok(file)
+}
+
+/// Opens an existing record [`open_private_record`] wrote, read-only, with the
+/// same refusals. `Ok(None)` when there is no record at `path`: a reader must
+/// never be what creates the file a writer is supposed to own.
+pub(crate) fn open_private_record_readonly(path: &Path) -> Result<Option<std::fs::File>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not open {}: {error}", path.display())),
+    };
+    verify_private_owner(&file, path)?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn verify_private_owner(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(format!(
+            "{} is owned by uid {}, not this user (uid {me})",
+            path.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is accessible to other users (mode {:o})",
+            path.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+/// The per-user `APPDATA` directory is already private to its owner.
+#[cfg(not(unix))]
+fn verify_private_owner(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
+    if meta.is_file() {
+        Ok(())
+    } else {
+        Err(format!("{} is not a regular file", path.display()))
     }
 }

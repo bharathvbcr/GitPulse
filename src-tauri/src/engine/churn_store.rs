@@ -29,6 +29,21 @@
 //! A git that rejects `--attr-source` as an unknown option is not pinned, and
 //! its answers stay in process memory as they always did.
 //!
+//! # When a base that moved leaves an answer standing
+//!
+//! A branch's churn is a function of its tip and of the merge base between the
+//! tip and the default branch, not of where the default branch is. A row is
+//! therefore keyed by `(repository, inputs, tip)` and records the base it was
+//! measured against. When the base has moved on to a descendant of that
+//! recorded base and the branch's ahead count against the new base is the one
+//! recorded, the branch's own commits are the same set (the ahead set can only
+//! shrink as the base grows, so an equal count is an equal set), so the merge
+//! base, the diff and the answer are the same: [`Kept::carried`] hands the
+//! recorded measurement back with the behind count read fresh. Anything else (a
+//! base that was rewound or replaced, a branch the base absorbed, counts git
+//! could not give) is measured again. The caller proves the descent; this file
+//! owns the rule for what follows from it.
+//!
 //! # What the file holds
 //!
 //! Commit ids, counts, and 64-bit hashes of the repository's location and of
@@ -66,10 +81,15 @@ pub(crate) const ZERO_CHURN: Churn = Churn {
     commits_behind: 0,
 };
 
-const FILE_NAME: &str = "churn.v1.sqlite";
-/// Bumped whenever a row's meaning changes; any other version is discarded.
-const SCHEMA_VERSION: i64 = 1;
-/// Rows kept on disk: 96 branches a repository, hundreds of base moves.
+/// The file is named for the schema, so two GitPulse builds of different
+/// schema versions sharing one cache directory each keep their own file; with
+/// one shared name, each start would drop and rebuild the other's table.
+const FILE_NAME: &str = "churn.v2.sqlite";
+/// Bumped whenever a row's meaning changes (and `FILE_NAME` with it); a file of
+/// any other version is discarded and rebuilt empty (this is a cache of derived data, so losing it costs one
+/// measurement per branch). Version 2 moved the base out of the key.
+const SCHEMA_VERSION: i64 = 2;
+/// Rows kept on disk: one per branch tip per repository and input state.
 const PERSISTED_ROWS: usize = 50_000;
 /// Rows kept in memory, the bound the process memo always had.
 const MEMORY_ROWS: usize = 8_192;
@@ -139,18 +159,41 @@ impl Inputs {
     }
 }
 
-/// Answers already measured for `tips` against `base`.
-pub(crate) fn lookup(inputs: &Inputs, base: &str, tips: &[String]) -> HashMap<String, Churn> {
+/// A stored answer and the base it was measured against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Kept {
+    /// The default branch's commit when `churn` was measured.
+    pub(crate) base: String,
+    pub(crate) churn: Churn,
+}
+
+impl Kept {
+    /// This answer for a base that is a descendant of [`Self::base`] (the
+    /// caller has established that) and gives the tip `now` = (ahead, behind).
+    /// `None` when the ahead count moved: the base absorbed some of the
+    /// branch's commits, so its merge base and diff may differ.
+    pub(crate) fn carried(&self, now: (usize, usize)) -> Option<Churn> {
+        (self.churn.commits_ahead == now.0).then_some(Churn {
+            commits_ahead: now.0,
+            commits_behind: now.1,
+            ..self.churn
+        })
+    }
+}
+
+/// Answers already measured for `tips`, each with the base it was measured
+/// against.
+pub(crate) fn lookup(inputs: &Inputs, tips: &[String]) -> HashMap<String, Kept> {
     let Some(fingerprint) = inputs.fingerprint else {
         return HashMap::new();
     };
     with_store(inputs.pinned, |store| {
-        store.lookup(inputs.repo, fingerprint, base, tips)
+        store.lookup(inputs.repo, fingerprint, tips)
     })
     .unwrap_or_default()
 }
 
-/// Keeps `measured`, provided the inputs read now are the ones read before
+/// Keeps `measured` against `base`, provided the inputs read now are the ones read before
 /// measuring: a config or attributes change in between would otherwise be
 /// stored under the key of the state before it.
 pub(crate) fn keep(repo: &Path, before: &Inputs, base: &str, measured: &HashMap<String, Churn>) {
@@ -244,6 +287,31 @@ fn default_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "no per-user cache directory (HOME / LOCALAPPDATA unset)".to_string())
 }
 
+/// Why an open failed, and whether the file itself is to blame.
+struct OpenFailure {
+    message: String,
+    /// The file is not a database, or is corrupt: only then is deleting it a
+    /// repair rather than an attack on whoever else has it open.
+    unreadable: bool,
+}
+
+impl OpenFailure {
+    fn new(message: String, error: &rusqlite::Error) -> Self {
+        let unreadable = matches!(
+            error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+                )
+        );
+        Self {
+            message,
+            unreadable,
+        }
+    }
+}
+
 pub(crate) struct Store {
     conn: Connection,
     cap: usize,
@@ -251,9 +319,13 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// Opens the file at `path`, creating it. A file this build cannot use —
-    /// another schema version, or not a database at all — is a cache, so it
-    /// is discarded and created again.
+    /// Opens the file at `path`, creating it. A file that is not a database,
+    /// or is corrupt, is a cache, so it is discarded and created again. A
+    /// schema from another version is rebuilt in place by `ensure_schema`.
+    ///
+    /// Anything else — above all `SQLITE_BUSY` from another process using the
+    /// file, or a permission error — says nothing about the file's contents, so
+    /// it fails this open and leaves the file alone for the process that has it.
     pub(crate) fn open(path: &Path, cap: usize) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -261,7 +333,9 @@ impl Store {
         }
         match Self::open_once(path, cap) {
             Ok(store) => Ok(store),
+            Err(first) if !first.unreadable => Err(first.message),
             Err(first) => {
+                let first = first.message;
                 for suffix in ["", "-wal", "-shm"] {
                     let mut doomed = path.as_os_str().to_owned();
                     doomed.push(suffix);
@@ -277,25 +351,26 @@ impl Store {
                     }
                 }
                 Self::open_once(path, cap)
-                    .map_err(|second| format!("{first}; recreated, and then {second}"))
+                    .map_err(|second| format!("{first}; recreated, and then {}", second.message))
             }
         }
     }
 
-    fn open_once(path: &Path, cap: usize) -> Result<Self, String> {
+    fn open_once(path: &Path, cap: usize) -> Result<Self, OpenFailure> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        conn.busy_timeout(BUSY_TIMEOUT)
-            .map_err(|e| format!("cannot configure {}: {e}", path.display()))?;
+        .map_err(|e| OpenFailure::new(format!("cannot open {}: {e}", path.display()), &e))?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
+            OpenFailure::new(format!("cannot configure {}: {e}", path.display()), &e)
+        })?;
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| format!("{} is not usable: {e}", path.display()))?;
+            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| format!("{} is not usable: {e}", path.display()))?;
+            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         let mut store = Self {
             conn,
             cap,
@@ -303,7 +378,7 @@ impl Store {
         };
         store
             .ensure_schema()
-            .map_err(|e| format!("{} is not usable: {e}", path.display()))?;
+            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         Ok(store)
     }
 
@@ -330,15 +405,15 @@ impl Store {
                  CREATE TABLE churn (
                      repo INTEGER NOT NULL,
                      inputs INTEGER NOT NULL,
-                     base TEXT NOT NULL,
                      tip TEXT NOT NULL,
+                     base TEXT NOT NULL,
                      additions INTEGER NOT NULL,
                      deletions INTEGER NOT NULL,
                      files INTEGER NOT NULL,
                      ahead INTEGER NOT NULL,
                      behind INTEGER NOT NULL,
                      stored INTEGER NOT NULL,
-                     PRIMARY KEY (repo, inputs, base, tip)
+                     PRIMARY KEY (repo, inputs, tip)
                  ) WITHOUT ROWID;
                  CREATE INDEX churn_stored ON churn (stored);",
             )?;
@@ -352,26 +427,28 @@ impl Store {
         &mut self,
         repo: u64,
         inputs: u64,
-        base: &str,
         tips: &[String],
-    ) -> Result<HashMap<String, Churn>, rusqlite::Error> {
+    ) -> Result<HashMap<String, Kept>, rusqlite::Error> {
         let mut found = HashMap::new();
         let mut query = self.conn.prepare_cached(
-            "SELECT additions, deletions, files, ahead, behind FROM churn
-             WHERE repo = ?1 AND inputs = ?2 AND base = ?3 AND tip = ?4",
+            "SELECT base, additions, deletions, files, ahead, behind FROM churn
+             WHERE repo = ?1 AND inputs = ?2 AND tip = ?3",
         )?;
         for tip in tips {
-            let row = query.query_row(params![repo as i64, inputs as i64, base, tip], |row| {
-                Ok([
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ])
+            let row = query.query_row(params![repo as i64, inputs as i64, tip], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    [
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ],
+                ))
             });
-            let counts = match row {
-                Ok(counts) => counts,
+            let (base, counts) = match row {
+                Ok(found) => found,
                 Err(rusqlite::Error::QueryReturnedNoRows) => continue,
                 Err(error) => return Err(error),
             };
@@ -385,12 +462,15 @@ impl Store {
             };
             found.insert(
                 tip.clone(),
-                Churn {
-                    additions,
-                    deletions,
-                    files_changed,
-                    commits_ahead,
-                    commits_behind,
+                Kept {
+                    base,
+                    churn: Churn {
+                        additions,
+                        deletions,
+                        files_changed,
+                        commits_ahead,
+                        commits_behind,
+                    },
                 },
             );
         }
@@ -412,7 +492,7 @@ impl Store {
         {
             let mut put = tx.prepare_cached(
                 "INSERT OR REPLACE INTO churn
-                 (repo, inputs, base, tip, additions, deletions, files, ahead, behind, stored)
+                 (repo, inputs, tip, base, additions, deletions, files, ahead, behind, stored)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             let mut rows: Vec<(&String, &Churn)> = measured.iter().collect();
@@ -422,8 +502,8 @@ impl Store {
                 put.execute(params![
                     repo as i64,
                     inputs as i64,
-                    base,
                     tip,
+                    base,
                     count(churn.additions),
                     count(churn.deletions),
                     count(churn.files_changed),
@@ -437,8 +517,8 @@ impl Store {
         let over = rows - i64::try_from(self.cap).unwrap_or(i64::MAX);
         if over > 0 {
             tx.execute(
-                "DELETE FROM churn WHERE (repo, inputs, base, tip) IN
-                 (SELECT repo, inputs, base, tip FROM churn ORDER BY stored LIMIT ?1)",
+                "DELETE FROM churn WHERE (repo, inputs, tip) IN
+                 (SELECT repo, inputs, tip FROM churn ORDER BY stored LIMIT ?1)",
                 params![over],
             )?;
         }
@@ -624,7 +704,9 @@ mod tests {
     /// covers: a rotated file (attributes), a rename (rename config).
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap();
+        // Not `canonicalize`: its `\\?\` spelling is not one git resolves
+        // `core.attributesFile` and the other paths below through.
+        let repo = git_cli::canonicalize_plain(dir.path()).unwrap();
         git_in(&repo, &["init", "-q", "-b", "main"]);
         git_in(&repo, &["config", "user.email", "t@example.invalid"]);
         git_in(&repo, &["config", "user.name", "t"]);
@@ -791,7 +873,7 @@ mod tests {
         std::fs::remove_file(repo.join(".git/shallow")).unwrap();
         measured("shallow removed", false);
 
-        let global = repo.join(".git/global-attributes");
+        let global = repo.join(".git").join("global-attributes");
         std::fs::write(&global, "").unwrap();
         git_in(
             &repo,
@@ -979,6 +1061,633 @@ mod tests {
         );
     }
 
+    /// One more commit on `main`, which `topic` has nothing to do with.
+    fn advance(repo: &Path, label: &str) {
+        git_in(repo, &["commit", "-q", "--allow-empty", "-m", label]);
+    }
+
+    /// Processes run in `repo` so far whose argv names `needle`.
+    fn spawns_named(repo: &Path, needle: &str) -> usize {
+        spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == needle))
+            .count()
+    }
+
+    /// The point of keying by tip: the default branch moving on for a reason
+    /// that has nothing to do with a branch leaves its measurement standing.
+    /// Ahead and behind are still read fresh (behind moved), nothing is
+    /// measured, and at most one process asks whether the old base lies behind
+    /// the new one.
+    #[test]
+    fn an_unrelated_base_advance_does_not_measure_the_branch_again() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let (first_report, first) = stats(&repo);
+        assert_eq!(first_report.computed, 1);
+        assert_eq!(first.commits_behind, 0);
+
+        let diffs_before = diffs(&repo);
+        let ancestry_before = spawns_named(&repo, "--is-ancestor");
+        advance(&repo, "unrelated");
+        advance(&repo, "unrelated again");
+        let (report, second) = stats(&repo);
+        assert_eq!(
+            diffs(&repo) - diffs_before,
+            0,
+            "an unrelated advance was measured"
+        );
+        assert_eq!(report.computed, 0);
+        assert_eq!(report.cached, 1);
+        assert_eq!(
+            (second.additions, second.deletions, second.files_changed),
+            (first.additions, first.deletions, first.files_changed)
+        );
+        assert_eq!(second.commits_ahead, first.commits_ahead);
+        assert_eq!(second.commits_behind, 2, "behind is read fresh");
+        assert!(spawns_named(&repo, "--is-ancestor") - ancestry_before <= 1);
+        assert_eq!(
+            store.lock().unwrap().rows(),
+            1,
+            "the row is replaced in place"
+        );
+
+        // The answer was kept against the new base: the next call neither
+        // measures nor asks about ancestry.
+        let (diffs_before, ancestry_before) = (diffs(&repo), spawns_named(&repo, "--is-ancestor"));
+        let (_, third) = stats(&repo);
+        assert_eq!(third, second);
+        assert_eq!(diffs(&repo) - diffs_before, 0);
+        assert_eq!(spawns_named(&repo, "--is-ancestor") - ancestry_before, 0);
+    }
+
+    /// An advance does not hide a change to the inputs: the carried answer is
+    /// only found under the inputs it was measured with.
+    #[test]
+    fn a_base_advance_does_not_carry_an_answer_across_a_changed_input() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let (_, baseline) = stats(&repo);
+        advance(&repo, "unrelated");
+        git_in(&repo, &["config", "diff.renames", "false"]);
+        let before = diffs(&repo);
+        let (_, unrenamed) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        assert_ne!(unrenamed.files_changed, baseline.files_changed);
+    }
+
+    /// A default branch put back (a force-push) is not a descendant of the
+    /// base the answer was measured against: measured again.
+    #[test]
+    fn a_base_that_moved_backwards_measures_the_branch_again() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        advance(&repo, "to be rewound");
+        let (_, first) = stats(&repo);
+        git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        let before = diffs(&repo);
+        let (report, second) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        assert_eq!(report.computed, 1);
+        assert_eq!(second.commits_behind, 0);
+        assert_eq!(
+            (second.additions, second.deletions, second.files_changed),
+            (first.additions, first.deletions, first.files_changed)
+        );
+    }
+
+    /// A branch the base absorbed has a smaller ahead set, so its merge base
+    /// moved: measured again, and it reads as merged.
+    #[test]
+    fn a_branch_merged_into_the_base_is_measured_again() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        stats(&repo);
+        git_in(
+            &repo,
+            &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
+        );
+        let before = diffs(&repo);
+        let (_, merged) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        // Behind by the merge commit itself.
+        assert_eq!((merged.commits_ahead, merged.commits_behind), (0, 1));
+        assert_eq!(
+            (merged.additions, merged.deletions, merged.files_changed),
+            (0, 0, 0)
+        );
+    }
+
+    /// Part of a branch absorbed (its first commit merged, a second kept):
+    /// the ahead count moved, so it is measured again, against the merge base
+    /// that moved with it.
+    #[test]
+    fn a_branch_partly_absorbed_by_the_base_is_measured_again() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        git_in(&repo, &["checkout", "-q", "topic"]);
+        std::fs::write(repo.join("second.txt"), "s\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-qm", "second"]);
+        git_in(&repo, &["checkout", "-q", "main"]);
+        let (_, before_merge) = stats(&repo);
+        assert_eq!(before_merge.commits_ahead, 2);
+        git_in(&repo, &["merge", "-q", "--ff-only", "topic~1"]);
+        let before = diffs(&repo);
+        let (_, after) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        assert_eq!(after.commits_ahead, 1);
+        assert_eq!(after.files_changed, 1, "only the second commit is left");
+    }
+
+    /// A rebase puts the branch on a new tip: a new key, measured.
+    #[test]
+    fn a_rebased_branch_is_measured_again() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        stats(&repo);
+        std::fs::write(repo.join("other.txt"), "o\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-qm", "main moves"]);
+        git_in(&repo, &["rebase", "-q", "main", "topic"]);
+        git_in(&repo, &["checkout", "-q", "main"]);
+        let before = diffs(&repo);
+        let (report, rebased) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        assert_eq!(report.computed, 1);
+        assert_eq!((rebased.commits_ahead, rebased.commits_behind), (1, 0));
+    }
+
+    /// Two branches on one tip are one measurement before and after an
+    /// advance.
+    #[test]
+    fn branches_sharing_a_tip_are_carried_together() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        git_in(&repo, &["branch", "twin", "topic"]);
+        let report = GitReader::branch_stats(repo.to_str().unwrap()).unwrap();
+        assert_eq!(report.updates.len(), 2);
+        let before = diffs(&repo);
+        advance(&repo, "unrelated");
+        let report = GitReader::branch_stats(repo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (report.updates.len(), report.cached, report.computed),
+            (2, 2, 0)
+        );
+        assert_eq!(diffs(&repo) - before, 0);
+        assert!(report.updates.iter().all(|u| u.commits_behind_base == 1));
+    }
+
+    /// Past the per-call cap: the branches already measured are carried over
+    /// an advance without a process each, however many there are.
+    #[test]
+    fn a_base_advance_carries_every_measured_branch_past_the_call_cap() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let tree = rev(&repo, "main^{tree}");
+        let main = rev(&repo, "main");
+        for i in 0..100 {
+            let commit = git_cli::git_text(
+                &repo,
+                &["commit-tree", &tree, "-p", &main, "-m", &format!("b{i}")],
+            )
+            .unwrap();
+            git_in(&repo, &["branch", &format!("many-{i:03}"), commit.trim()]);
+        }
+        let path = repo.to_str().unwrap();
+        let mut drained = GitReader::branch_stats(path).unwrap();
+        for _ in 0..5 {
+            if !drained.capped {
+                break;
+            }
+            drained = GitReader::branch_stats(path).unwrap();
+        }
+        assert!(!drained.capped, "the 101 branches were not all measured");
+        assert_eq!(drained.updates.len(), 101);
+
+        let before = diffs(&repo);
+        advance(&repo, "unrelated");
+        let after = GitReader::branch_stats(path).unwrap();
+        assert_eq!(
+            diffs(&repo) - before,
+            0,
+            "a measured branch was measured again"
+        );
+        assert_eq!(
+            (after.updates.len(), after.computed, after.capped),
+            (101, 0, false)
+        );
+        assert!(after.updates.iter().all(|u| u.commits_behind_base == 1));
+    }
+
+    /// A cache written before the base left the key is rebuilt empty, not
+    /// read with the old key's meaning.
+    #[test]
+    fn a_cache_from_before_the_base_left_the_key_is_rebuilt() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(FILE_NAME);
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE churn (
+                 repo INTEGER NOT NULL, inputs INTEGER NOT NULL,
+                 base TEXT NOT NULL, tip TEXT NOT NULL,
+                 additions INTEGER NOT NULL, deletions INTEGER NOT NULL,
+                 files INTEGER NOT NULL, ahead INTEGER NOT NULL,
+                 behind INTEGER NOT NULL, stored INTEGER NOT NULL,
+                 PRIMARY KEY (repo, inputs, base, tip)
+             ) WITHOUT ROWID;
+             INSERT INTO churn VALUES (1, 2, 'old-base', 'a', 3, 4, 5, 1, 0, 1);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(old);
+
+        let mut store = Store::open(&path, 10).unwrap();
+        assert_eq!(store.rows(), 0, "an old row was kept");
+        assert!(store.lookup(1, 2, &["a".to_string()]).unwrap().is_empty());
+        store.insert(1, 2, "new-base", &one("a", 7)).unwrap();
+        let found = store.lookup(1, 2, &["a".to_string()]).unwrap();
+        assert_eq!(found["a"].base, "new-base");
+    }
+
+    /// What the build before the base left the key does on open: the oracle for
+    /// a v1 binary sharing the cache directory.
+    fn v1_binary_opens(dir: &Path) {
+        let conn = Connection::open(dir.join("churn.v1.sqlite")).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        if version != 1 {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS churn;
+                 CREATE TABLE churn (
+                     repo INTEGER NOT NULL, inputs INTEGER NOT NULL,
+                     base TEXT NOT NULL, tip TEXT NOT NULL,
+                     additions INTEGER NOT NULL, deletions INTEGER NOT NULL,
+                     files INTEGER NOT NULL, ahead INTEGER NOT NULL,
+                     behind INTEGER NOT NULL, stored INTEGER NOT NULL,
+                     PRIMARY KEY (repo, inputs, base, tip)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+    }
+
+    /// An older and a newer build sharing one cache directory must not drop
+    /// each other's table on every start.
+    #[test]
+    fn builds_of_different_schema_versions_do_not_rebuild_each_others_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        for round in 0..3 {
+            v1_binary_opens(cache.path());
+            let mut store = Store::open(&cache.path().join(FILE_NAME), 10).unwrap();
+            if round > 0 {
+                let found = store.lookup(1, 2, &["a".to_string()]).unwrap();
+                assert_eq!(
+                    found["a"].base, "base",
+                    "round {round}: the older build's start emptied the newer cache"
+                );
+            }
+            store.insert(1, 2, "base", &one("a", 7)).unwrap();
+        }
+        assert_ne!(FILE_NAME, "churn.v1.sqlite");
+    }
+
+    /// A git process in `repo` for the random-history oracle; `false` when it
+    /// refused (a conflicting merge, an empty cherry-pick), which the caller
+    /// then backs out of.
+    fn try_git(repo: &Path, args: &[&str]) -> bool {
+        use crate::procguard::LockedSpawn;
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = command.spawn_locked().expect("spawn git");
+        child
+            .wait_with_output()
+            .expect("wait for git")
+            .status
+            .success()
+    }
+
+    /// What `git` says a branch's churn against `main` is, asked without the
+    /// cache: `--numstat` summed (a second route to what `--shortstat` counts)
+    /// and the left-right count.
+    fn fresh_churn(repo: &Path, name: &str) -> Churn {
+        let spec = format!("main...{name}");
+        let numstat = git_cli::git_text(repo, &["diff", "--numstat", &spec]).unwrap();
+        let (mut additions, mut deletions, mut files_changed) = (0, 0, 0);
+        for line in numstat.lines() {
+            let mut cols = line.split('\t');
+            additions += cols.next().unwrap().parse::<usize>().unwrap();
+            deletions += cols.next().unwrap().parse::<usize>().unwrap();
+            files_changed += 1;
+        }
+        let counts =
+            git_cli::git_text(repo, &["rev-list", "--left-right", "--count", &spec]).unwrap();
+        let (behind, ahead) = git_cli::parse_left_right_count(&counts);
+        Churn {
+            additions,
+            deletions,
+            files_changed,
+            commits_ahead: ahead,
+            commits_behind: behind,
+        }
+    }
+
+    /// The carried answer is what git measures. A carried answer rests on
+    /// "the ahead count is unchanged, so the commit set is" over a base that
+    /// descends from the old one; this throws seeded random histories (commits,
+    /// merges both ways, criss-cross merges, cherry-picks, rebases, rewinds,
+    /// fast-forwards, and many empty advances of `main`) at it and compares
+    /// every branch after every step with a fresh `diff` and `rev-list`.
+    #[test]
+    fn a_carried_answer_is_what_git_measures_over_random_histories() {
+        let (mut carried_answers, mut ancestry_checks) = (0, 0);
+        for seed in 1u64..=8 {
+            let (_dir, repo) = fixture();
+            let cache = tempfile::tempdir().unwrap();
+            let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move |n: usize| -> usize {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % n as u64) as usize
+            };
+            let mut branches = vec!["main".to_string(), "topic".to_string()];
+            for step in 0..22 {
+                let pick = branches[next(branches.len())].clone();
+                let other = branches[next(branches.len())].clone();
+                let what;
+                match next(12) {
+                    0..=2 => {
+                        what = "empty advance of main";
+                        try_git(&repo, &["checkout", "-q", "main"]);
+                        try_git(&repo, &["commit", "-q", "--allow-empty", "-m", "adv"]);
+                    }
+                    3..=4 => {
+                        what = "commit";
+                        try_git(&repo, &["checkout", "-q", &pick]);
+                        let file = format!("f{}.txt", next(3));
+                        let body: String = (0..6).map(|i| format!("{} {}\n", i, next(4))).collect();
+                        std::fs::write(repo.join(&file), body).unwrap();
+                        try_git(&repo, &["add", "."]);
+                        try_git(&repo, &["commit", "-q", "-m", "c"]);
+                    }
+                    5 => {
+                        what = "new branch";
+                        let name = format!("b{step}");
+                        let at = format!("{other}~{}", next(2));
+                        if try_git(&repo, &["branch", &name, &at])
+                            || try_git(&repo, &["branch", &name, &other])
+                        {
+                            branches.push(name);
+                        }
+                    }
+                    6..=7 => {
+                        what = "merge";
+                        try_git(&repo, &["checkout", "-q", &pick]);
+                        if !try_git(&repo, &["merge", "-q", "--no-ff", "-m", "m", &other]) {
+                            try_git(&repo, &["merge", "--abort"]);
+                        }
+                    }
+                    8 => {
+                        what = "cherry-pick";
+                        try_git(&repo, &["checkout", "-q", &pick]);
+                        if !try_git(&repo, &["cherry-pick", "-x", &other]) {
+                            try_git(&repo, &["cherry-pick", "--abort"]);
+                        }
+                    }
+                    9 => {
+                        what = "rebase";
+                        if pick != "main" && !try_git(&repo, &["rebase", "-q", "main", &pick]) {
+                            try_git(&repo, &["rebase", "--abort"]);
+                        }
+                    }
+                    10 => {
+                        what = "fast-forward main";
+                        try_git(&repo, &["checkout", "-q", "main"]);
+                        try_git(&repo, &["merge", "-q", "--ff-only", &other]);
+                    }
+                    _ => {
+                        what = "rewind main";
+                        try_git(&repo, &["checkout", "-q", "main"]);
+                        try_git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+                    }
+                }
+                try_git(&repo, &["checkout", "-q", "-f", "main"]);
+                let report = GitReader::branch_stats(repo.to_str().unwrap()).expect("stats");
+                carried_answers += report.cached;
+                for update in &report.updates {
+                    let reported = Churn {
+                        additions: update.additions,
+                        deletions: update.deletions,
+                        files_changed: update.files_changed,
+                        commits_ahead: update.commits_ahead_of_base,
+                        commits_behind: update.commits_behind_base,
+                    };
+                    assert_eq!(
+                        reported,
+                        fresh_churn(&repo, &update.name),
+                        "seed {seed} step {step} ({what}): {} differs from a fresh measurement",
+                        update.name
+                    );
+                }
+            }
+            ancestry_checks += spawns_named(&repo, "--is-ancestor");
+        }
+        assert!(carried_answers > 0, "the histories never reused an answer");
+        assert!(
+            ancestry_checks > 0,
+            "the histories never carried over a moved base"
+        );
+    }
+
+    /// Points every stored row of `tip` at `base`, as a row written by another
+    /// process (or kept before a failed write) would be.
+    fn restamp(store: &Arc<Mutex<Store>>, tip: &str, base: &str) {
+        store
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE churn SET base = ?1 WHERE tip = ?2",
+                params![base, tip],
+            )
+            .unwrap();
+    }
+
+    /// More distinct stored bases than the carry cap: the cap bounds the
+    /// ancestry processes, and the branches it leaves out are measured, not
+    /// carried on trust.
+    #[test]
+    fn stored_bases_past_the_carry_cap_are_measured_not_carried() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let tree = rev(&repo, "main^{tree}");
+        // The fixture's `topic` gets a base of its own (the commit it forked
+        // from), so every stored base names exactly one tip: 7 distinct bases,
+        // 4 carried, 3 measured, whichever 4 the call happens to ask about.
+        let mut old_bases = vec![("topic".to_string(), rev(&repo, "topic"), rev(&repo, "main"))];
+        for i in 0..6 {
+            advance(&repo, &format!("m{i}"));
+            let base = rev(&repo, "main");
+            let commit = git_cli::git_text(
+                &repo,
+                &["commit-tree", &tree, "-p", &base, "-m", &format!("b{i}")],
+            )
+            .unwrap();
+            git_in(&repo, &["branch", &format!("k{i}"), commit.trim()]);
+            old_bases.push((format!("k{i}"), commit.trim().to_string(), base));
+        }
+        let path = repo.to_str().unwrap();
+        GitReader::branch_stats(path).unwrap();
+        for (_, tip, base) in &old_bases {
+            restamp(&store, tip, base);
+        }
+        advance(&repo, "unrelated");
+        let (diffs_before, ancestry_before) = (diffs(&repo), spawns_named(&repo, "--is-ancestor"));
+        let report = GitReader::branch_stats(path).unwrap();
+        assert!(
+            spawns_named(&repo, "--is-ancestor") - ancestry_before <= 4,
+            "more ancestry processes than the cap"
+        );
+        assert_eq!(
+            diffs(&repo) - diffs_before,
+            3,
+            "the branches past the cap are measured, the others carried"
+        );
+        for update in &report.updates {
+            let fresh = fresh_churn(&repo, &update.name);
+            assert_eq!(
+                (update.additions, update.deletions, update.files_changed),
+                (fresh.additions, fresh.deletions, fresh.files_changed),
+                "{}",
+                update.name
+            );
+            assert_eq!(
+                update.commits_behind_base, fresh.commits_behind,
+                "{}",
+                update.name
+            );
+        }
+    }
+
+    /// A stored base git cannot place (a shallow clone without it, a pruned
+    /// commit) makes the ancestry question an error: measured, never carried.
+    #[test]
+    fn a_stored_base_git_cannot_place_is_measured_not_carried() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let (_, first) = stats(&repo);
+        restamp(&store, &rev(&repo, "topic"), &"a".repeat(40));
+        advance(&repo, "unrelated");
+        let before = diffs(&repo);
+        let (report, second) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1, "an unplaceable base was trusted");
+        assert_eq!(report.computed, 1);
+        assert_eq!(second.additions, first.additions);
+        assert_eq!(second.commits_behind, 1);
+    }
+
+    /// A carry is written once, in one transaction, and a call that finds
+    /// the carried rows current writes nothing.
+    #[test]
+    fn carried_answers_are_written_once_per_advance() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let tree = rev(&repo, "main^{tree}");
+        let main = rev(&repo, "main");
+        for i in 0..20 {
+            let commit = git_cli::git_text(
+                &repo,
+                &["commit-tree", &tree, "-p", &main, "-m", &format!("b{i}")],
+            )
+            .unwrap();
+            git_in(&repo, &["branch", &format!("many-{i:02}"), commit.trim()]);
+        }
+        let path = repo.to_str().unwrap();
+        GitReader::branch_stats(path).unwrap();
+        advance(&repo, "unrelated");
+        let changes = |store: &Arc<Mutex<Store>>| store.lock().unwrap().conn.total_changes();
+        let at_advance = changes(&store);
+        GitReader::branch_stats(path).unwrap();
+        let carried = changes(&store) - at_advance;
+        assert_eq!(carried, 21, "the carry rewrote more than its rows");
+        let settled = changes(&store);
+        GitReader::branch_stats(path).unwrap();
+        assert_eq!(changes(&store), settled, "a settled call wrote");
+    }
+
+    /// An input that moves after an answer was carried is still seen: the
+    /// carried row sits under the fingerprint it was read with.
+    #[test]
+    fn a_carried_answer_does_not_survive_a_later_input_change() {
+        let (_dir, repo) = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        let (_use, _store) = UseStore::file(&cache.path().join(FILE_NAME));
+        let (_, baseline) = stats(&repo);
+        advance(&repo, "unrelated");
+        let before = diffs(&repo);
+        stats(&repo);
+        assert_eq!(diffs(&repo) - before, 0, "the answer was carried");
+        git_in(&repo, &["config", "diff.renames", "false"]);
+        let before = diffs(&repo);
+        let (_, unrenamed) = stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1);
+        assert_ne!(unrenamed.files_changed, baseline.files_changed);
+        std::fs::write(repo.join(".git/info/attributes"), "a.txt -diff\n").unwrap();
+        let before = diffs(&repo);
+        stats(&repo);
+        assert_eq!(diffs(&repo) - before, 1, "an attributes change was missed");
+    }
+
+    #[test]
+    fn a_carried_answer_keeps_the_measurement_and_takes_fresh_counts() {
+        let kept = Kept {
+            base: "old".into(),
+            churn: Churn {
+                additions: 5,
+                deletions: 4,
+                files_changed: 3,
+                commits_ahead: 2,
+                commits_behind: 1,
+            },
+        };
+        assert_eq!(
+            kept.carried((2, 9)),
+            Some(Churn {
+                commits_behind: 9,
+                ..kept.churn
+            })
+        );
+        assert_eq!(kept.carried((1, 9)), None, "the ahead set changed");
+        assert_eq!(kept.carried((3, 9)), None);
+    }
+
     fn churn(n: usize) -> Churn {
         Churn {
             additions: n,
@@ -1001,14 +1710,22 @@ mod tests {
         store.insert(1, 2, "base", &one("d", 4)).unwrap();
         assert_eq!(store.rows(), 3);
         let tips: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
-        let found = store.lookup(1, 2, "base", &tips).unwrap();
-        assert_eq!(found.get("a"), Some(&churn(10)));
+        let found = store.lookup(1, 2, &tips).unwrap();
+        assert_eq!(found.get("a").map(|kept| kept.churn), Some(churn(10)));
+        assert_eq!(found["a"].base, "base");
         assert_eq!(found.get("b"), None, "the oldest row was not evicted");
         assert!(found.contains_key("c") && found.contains_key("d"));
         // Every part of the key separates rows.
-        assert!(store.lookup(9, 2, "base", &tips).unwrap().is_empty());
-        assert!(store.lookup(1, 9, "base", &tips).unwrap().is_empty());
-        assert!(store.lookup(1, 2, "other", &tips).unwrap().is_empty());
+        assert!(store.lookup(9, 2, &tips).unwrap().is_empty());
+        assert!(store.lookup(1, 9, &tips).unwrap().is_empty());
+        // A later base replaces the row for its tip rather than adding one.
+        store.insert(1, 2, "later", &one("a", 11)).unwrap();
+        let found = store.lookup(1, 2, &["a".to_string()]).unwrap();
+        assert_eq!(
+            (found["a"].base.as_str(), found["a"].churn),
+            ("later", churn(11))
+        );
+        assert_eq!(store.rows(), 3);
     }
 
     #[test]
@@ -1032,10 +1749,7 @@ mod tests {
             .conn
             .execute("UPDATE churn SET additions = -1", [])
             .unwrap();
-        assert!(store
-            .lookup(1, 2, "base", &["a".to_string()])
-            .unwrap()
-            .is_empty());
+        assert!(store.lookup(1, 2, &["a".to_string()]).unwrap().is_empty());
     }
 
     #[test]
@@ -1047,5 +1761,30 @@ mod tests {
             .err()
             .expect("cannot open");
         assert!(err.contains("cannot create"), "{err}");
+    }
+
+    /// A transient `SQLITE_BUSY` (another process holds the file) says nothing
+    /// about the file's contents: the open fails and the file, with its rows,
+    /// survives for whoever has it.
+    #[test]
+    fn a_busy_cache_is_kept_not_deleted() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(FILE_NAME);
+        let mut store = Store::open(&path, 10).unwrap();
+        store.insert(1, 2, "base", &one("a", 1)).unwrap();
+        drop(store);
+
+        // Another process using the cache exclusively for a while.
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let busy = Store::open(&path, 10).err().expect("the file is locked");
+        assert!(!busy.contains("recreated"), "{busy}");
+        assert!(path.exists(), "a busy cache was deleted");
+        drop(holder);
+
+        let store = Store::open(&path, 10).expect("the cache is usable again");
+        assert_eq!(store.rows(), 1, "the rows survived a busy open");
     }
 }

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../../stores/sourceScan";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "LivePulseDashboard.svelte"), "utf8");
@@ -49,7 +50,7 @@ describe("LivePulseDashboard", () => {
       source.lastIndexOf("$effect(() =>"),
       source.indexOf("</script>"),
     );
-    expect(selectionEffect).toContain("const repo = $repoStore.currentPath;");
+    expect(selectionEffect).toContain("const repo = $currentRepoPath;");
     expect(selectionEffect).toContain("commitGuard?.cancel()");
     expect(selectionEffect).toContain("isLoadingCommits = false");
   });
@@ -71,5 +72,57 @@ describe("LivePulseDashboard", () => {
 
   it("does not constrain the Active Changes list to a fixed small height window", () => {
     expect(source).not.toContain("max-h-64");
+  });
+
+
+  /**
+   * The selection effect reads `$repoStore`, which publishes on every draft
+   * keystroke and status poll; without a key each publish cancelled and
+   * re-issued the history read for the file already shown. A moved HEAD is in
+   * the key so a commit, pull, or checkout still refreshes the history.
+   */
+  it("reloads file details only when repository, selection, or HEAD changes", () => {
+    const selectionEffect = source.slice(
+      source.lastIndexOf("$effect(() =>"),
+      source.indexOf("</script>"),
+    );
+    // Keyed by value on the repository, the selection and HEAD, so the
+    // effect runs only when one of them changes; the load runs untracked.
+    expect(selectionEffect).toContain("const repo = $currentRepoPath;");
+    expect(selectionEffect).toContain("const file = selectedFile;");
+    expect(selectionEffect).toContain("void $currentHeadTip;");
+    expect(selectionEffect.indexOf("untrack(() => {")).toBeLessThan(selectionEffect.indexOf("loadFileDetails(repo, file)"));
+    expect(source).not.toContain("lastDetailsKey");
+    // No teardown: `loadFileDetails` cancels its own predecessor.
+    expect(selectionEffect).not.toMatch(/return \(\) =>/);
+  });
+
+  it("reloads file details on a checkout between commits with a detached HEAD", () => {
+    // No current branch means an empty branch tip; the graph store's HEAD
+    // (for the repository it shows) is the fallback. No new IPC is polled.
+    const selectionEffect = source.slice(
+      source.lastIndexOf("$effect(() =>"),
+      source.indexOf("</script>"),
+    );
+    // headTip.test.ts drives the fallback itself.
+    expect(source).toContain('import { currentHeadTip } from "../../stores/headTip";');
+    expect(selectionEffect).toContain("void $currentHeadTip;");
+    expect(source).not.toContain("cmd_get_head_id");
+  });
+
+  it("discards against the repository it asked about, and keeps every index outcome", () => {
+    const discard = functionBody(source, "discardFile");
+    expect(discard.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(discard.indexOf("repoStore.captureTarget()")).toBeLessThan(discard.indexOf("await askConfirm("));
+    expect(discard).toContain("repoStore.discardChanges(path, target)");
+    expect(discard).toContain("reportFailure(");
+    for (const [fn, call] of [
+      ["stageAll", "repoStore.stageAll()"],
+      ["unstageAll", "repoStore.unstageAll()"],
+      ["stageFile", "repoStore.stageFile(path)"],
+      ["unstageFile", "repoStore.unstageFile(path)"],
+    ]) {
+      expect(functionBody(source, fn)).toContain(`return await ${call};`);
+    }
   });
 });

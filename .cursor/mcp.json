@@ -13,6 +13,16 @@
       "args": [],
       "command": "gitpulse-mcp",
       "type": "stdio"
+    },
+    "devcouncil": {
+      "args": [
+        "mcp"
+      ],
+      "command": "/Users/bharath/.local/bin/devcouncil",
+      "env": {
+        "DEVCOUNCIL_PROJECT_ROOT": "/Users/bharath/Code/devtools/GitPulse"
+      },
+      "type": "stdio"
     }
   }
 }

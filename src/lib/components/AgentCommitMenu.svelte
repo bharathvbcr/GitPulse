@@ -21,12 +21,13 @@
     Terminal,
     X,
   } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { portal } from "../dom/portal";
   import { popover, restoreFocusTo, type DismissReason, type PopoverOptions } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { formatError } from "../ui/formatError";
+  import { repoScope } from "../repos/repoScope.svelte";
   import {
     formatCommitAgentPrompt,
     getAgentCommitCliCommand,
@@ -84,7 +85,7 @@
   let triggerEl = $state<HTMLButtonElement | null>(null);
   let noteEl = $state<HTMLInputElement | null>(null);
 
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   const statuses = $derived($repoStore.statuses);
   const dirtyCount = $derived(statuses.length);
   const stagedCount = $derived(statuses.filter((s) => s.is_staged).length);
@@ -202,6 +203,33 @@
     if (closeOpenMenu === closeThis) closeOpenMenu = null;
   });
 
+  /**
+   * Two of these stay mounted across a repository tab switch (the sidebar
+   * header and the collapsed rail), so the switch has to do what a remount
+   * did: the panel was opened over the previous repository's changes, the note
+   * was written about them, and a launch in flight was started for them.
+   * `launcher` is the person's preference, not the repository's, and stays.
+   */
+  const tabScope = repoScope(
+    () => $currentRepoPath,
+    () => {
+      clearTimeout(copyTimer);
+      clearTimeout(closeTimer);
+      launchController?.abort();
+      launchController = undefined;
+      if (closeOpenMenu === closeThis) closeOpenMenu = null;
+      open = false;
+      scopeChoice = null;
+      userNote = "";
+      previewTab = "prompt";
+      detailsOpen = false;
+      launching = false;
+      notice = null;
+      error = null;
+      copied = false;
+    },
+  );
+
   async function openMenu() {
     if (disabledReason) return;
     if (closeOpenMenu !== closeThis) closeOpenMenu?.();
@@ -246,6 +274,8 @@
     error = null;
     notice = null;
     clearTimeout(closeTimer);
+    const epoch = tabScope.epoch;
+    const stale = () => destroyed || !tabScope.isCurrent(epoch);
     launchController = new AbortController();
 
     try {
@@ -259,7 +289,7 @@
         (openState) => repoStore.setTerminalOpen(openState),
       );
 
-      if (destroyed) return;
+      if (stale()) return;
       if (res.ok) {
         notice = res.notice ?? "Agent session opened in the terminal.";
         if (open) closeTimer = setTimeout(() => close(), SUCCESS_CLOSE_MS);
@@ -267,17 +297,18 @@
         error = res.error ?? "Failed to launch agent session.";
       }
     } catch (err: unknown) {
-      if (!destroyed) error = formatError(err);
+      if (!stale()) error = formatError(err);
     } finally {
-      if (!destroyed) launching = false;
+      if (!stale()) launching = false;
     }
   }
 
   async function handleCopy(text: string) {
     if (!text) return;
     error = null;
+    const epoch = tabScope.epoch;
     const ok = await copyText(text);
-    if (destroyed) return;
+    if (destroyed || !tabScope.isCurrent(epoch)) return;
     if (ok) {
       copied = true;
       clearTimeout(copyTimer);

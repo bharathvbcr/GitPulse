@@ -7,13 +7,15 @@
 //! on every hook invocation — the second time the same tree had just been
 //! enumerated, because the build in front of it had already walked it.
 //!
-//! Computing them here is only useful if the answers are *identical*, so this
-//! module is a deliberate transcription of
+//! This module is a deliberate transcription of the Python
 //! `RepoMapper.get_git_files` / `_files_fingerprint` / `_content_fingerprint`
 //! and `indexing.graph.build.content_fingerprint`, down to the `\0` separator,
-//! the `c2:` scheme prefix and the `(size, mtime_ns, ctime_ns)` memo key.
-//! `tests/freshness_parity.rs` runs both implementations over a real tree and
-//! compares the strings; anything here that drifts from Python fails there.
+//! the `c2:` scheme prefix and the `(size, mtime_ns, ctime_ns)` memo key. The
+//! Python package is retired, so the kernel is the only producer and the only
+//! reader: `tests/freshness_parity.rs`, which compared the two over a real tree
+//! and printed SKIPPED (passing) once no interpreter could import `devcouncil`,
+//! was deleted rather than left to report ok without running. The scheme is
+//! pinned by `digest.rs`'s published test vectors and by the inventory tests.
 //!
 //! **Only the git path is implemented.** Python falls back to an `os.walk` when
 //! git cannot answer, and that fallback stays the Python side's: a second
@@ -207,8 +209,10 @@ pub const GIT_LS_FILES_OUTPUT_CAP: usize = 64 * 1024 * 1024;
 /// [`git_head`] with the program named, so a test can stand a script in for it.
 #[doc(hidden)]
 pub fn git_head_with_program(program: &OsStr, root: &Path) -> String {
-    let mut command = subprocess::git_with_program(program, root);
-    command.args(["rev-parse", "HEAD"]);
+    let Ok(mut command) = subprocess::git_with_program(program, root, ["rev-parse", "HEAD"]) else {
+        // No git this process may run against root: "cannot be answered".
+        return String::new();
+    };
     let bounds = Bounds {
         deadline: GIT_HEAD_DEADLINE,
         stdout_cap: 4096,
@@ -241,8 +245,17 @@ fn is_generated_dir_name(part: &str) -> bool {
     GENERATED_DIR_NAMES.contains(&part) || devmap_extract::paths::is_state_dir_name(part)
 }
 
+///
+/// A name discovery refuses to key is excluded too, through the same
+/// [`devmap_extract::repo_relative_key`] the walk uses: on Unix `src/a\b.py` is
+/// one file name that discovery refuses rather than fold onto the real
+/// `src/a/b.py`, so the map never covers it and the inventory must not count
+/// it. Folding it here instead kept it as indexable source under the real
+/// file's spelling.
 pub fn is_runtime_or_generated_file(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
+    let Ok(normalized) = devmap_extract::repo_relative_key(path) else {
+        return true;
+    };
     let name = normalized.rsplit('/').next().unwrap_or("");
     let lower_name = name.to_lowercase();
 
@@ -279,8 +292,9 @@ pub(crate) fn ls_files(
     root: &Path,
     flags: &[&str],
 ) -> Result<Vec<String>, String> {
-    let mut command = subprocess::git_with_program(program, root);
-    command.arg("ls-files").arg("-z").args(flags);
+    let args = ["ls-files", "-z"].iter().chain(flags);
+    let mut command = subprocess::git_with_program(program, root, args)
+        .map_err(|failure| format!("git ls-files {}: {failure}", flags.join(" ")))?;
     let bounds = Bounds {
         deadline: GIT_LS_FILES_DEADLINE,
         stdout_cap: GIT_LS_FILES_OUTPUT_CAP,
@@ -309,11 +323,17 @@ pub(crate) fn ls_files(
     // `-z` so non-ASCII paths arrive unquoted; lossy decoding matches the
     // Python reader's `errors="replace"`, so a path neither side can decode
     // still hashes to the same string on both.
+    //
+    // Entries are git's own spelling, which is `/`-separated on every host,
+    // and are passed through verbatim. Folding `\` here turned a Unix name
+    // `src/a\b.py` into the real `src/a/b.py`, so the inventory listed that
+    // path twice; whether such a name is keyable is decided once, by
+    // `devmap_extract::repo_relative_key` in `is_runtime_or_generated_file`.
     Ok(captured
         .stdout_lossy()
         .split('\0')
         .filter(|entry| !entry.is_empty())
-        .map(|entry| entry.replace('\\', "/"))
+        .map(str::to_string)
         .collect())
 }
 
@@ -667,6 +687,19 @@ mod tests {
         ] {
             assert!(!is_runtime_or_generated_file(path), "{path} must be kept");
         }
+    }
+
+    /// On Unix `\` is a byte of a name, so `src\a.py` is one file at the root
+    /// that discovery refuses (`devmap_extract::repo_relative_key`). Folded, it
+    /// read as `src/a.py` and was kept as indexable source.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_discovery_refuses_is_never_part_of_the_inventory() {
+        assert!(
+            is_runtime_or_generated_file("src\\a.py"),
+            "a backslash name is refused by discovery, so the inventory excludes it"
+        );
+        assert!(!is_runtime_or_generated_file("src/a.py"));
     }
 
     #[test]

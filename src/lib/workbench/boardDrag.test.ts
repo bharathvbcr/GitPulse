@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   cardFace,
   dragExceeded,
+  grabPoint,
   insertIndexFromY,
   insertionNeighbors,
   insertionPosition,
@@ -49,6 +50,17 @@ describe("insertionPosition", () => {
     expect(insertionPosition(null, null, now)).toBe(now);
     expect(insertionPosition(400, null, now)).toBe(401);
     expect(insertionPosition(null, 400, now)).toBe(200);
+  });
+
+  it("refuses to guess the bottom of a column that has more cards than are loaded", () => {
+    // before + 1 would sort after page one, and the card would vanish on reload.
+    expect(insertionPosition(400, null, 9_000, true)).toBeNull();
+    expect(insertionPosition(null, null, 9_000, true)).toBeNull();
+    // A slot with a card after it is decided by its neighbors whatever lies beyond.
+    expect(insertionPosition(400, 800, 9_000, true)).toBe(600);
+    expect(insertionPosition(null, 400, 9_000, true)).toBe(200);
+    // A complete column still appends.
+    expect(insertionPosition(400, null, 9_000, false)).toBe(401);
   });
 
   it("reads neighbors from the remaining cards at an insert index", () => {
@@ -101,6 +113,47 @@ describe("cardFace", () => {
       expect(face.pip).toBeNull();
       expect(JSON.stringify(face)).not.toMatch(/Normal|Low|Urgent|High/i);
       expect(face.repo).toBeNull();
+    }
+  });
+
+  it("keeps the point a card was grabbed by under the pointer", () => {
+    const box = { left: 300, top: 120, width: 240, height: 64 };
+    expect(grabPoint({ x: 492, y: 158 }, box)).toEqual({ dx: 192, dy: 38, width: 240, height: 64 });
+    expect(grabPoint({ x: 300, y: 120 }, box)).toEqual({ dx: 0, dy: 0, width: 240, height: 64 });
+    expect(grabPoint({ x: 540, y: 184 }, box)).toEqual({ dx: 240, dy: 64, width: 240, height: 64 });
+  });
+
+  it("clamps a press outside the measured box onto its edge", () => {
+    const box = { left: 300, top: 120, width: 240, height: 64 };
+    expect(grabPoint({ x: 10, y: 10 }, box)).toEqual({ dx: 0, dy: 0, width: 240, height: 64 });
+    expect(grabPoint({ x: 9_000, y: 9_000 }, box)).toEqual({ dx: 240, dy: 64, width: 240, height: 64 });
+  });
+
+  it("never produces a non-finite or negative preview from a degenerate measurement", () => {
+    const bad = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -5, 0];
+    for (const width of bad) for (const left of bad) for (const x of bad) {
+      const grab = grabPoint({ x, y: x }, { left, top: left, width, height: width });
+      for (const value of Object.values(grab)) {
+        expect(Number.isFinite(value)).toBe(true);
+        expect(value).toBeGreaterThanOrEqual(0);
+      }
+      expect(grab.dx).toBeLessThanOrEqual(grab.width);
+      expect(grab.dy).toBeLessThanOrEqual(grab.height);
+    }
+  });
+
+  it("puts the pointer inside the preview for any press and any pointer position", () => {
+    let seed = 7;
+    const rand = () => ((seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31) / 2 ** 31);
+    for (let i = 0; i < 5_000; i++) {
+      const box = { left: rand() * 2_000 - 500, top: rand() * 2_000 - 500, width: rand() * 600, height: rand() * 300 };
+      const grab = grabPoint({ x: box.left + rand() * box.width, y: box.top + rand() * box.height }, box);
+      const pointer = { x: rand() * 4_000 - 1_000, y: rand() * 4_000 - 1_000 };
+      const left = pointer.x - grab.dx, top = pointer.y - grab.dy;
+      expect(pointer.x).toBeGreaterThanOrEqual(left - 1e-9);
+      expect(pointer.x).toBeLessThanOrEqual(left + grab.width + 1e-9);
+      expect(pointer.y).toBeGreaterThanOrEqual(top - 1e-9);
+      expect(pointer.y).toBeLessThanOrEqual(top + grab.height + 1e-9);
     }
   });
 });

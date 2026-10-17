@@ -139,4 +139,22 @@ describe("countdowns pause while the user is on the stack", () => {
     vi.advanceTimersByTime(10_000);
     expect(get(toastStore)).toHaveLength(0);
   });
+
+  it("restart gives an action toast its full duration again, from now", () => {
+    const id = toastStore.action("Deleted", "Undo", () => {});
+    vi.advanceTimersByTime(11_900);
+    toastStore.restart(id);
+    vi.advanceTimersByTime(11_000);
+    expect(get(toastStore)).toHaveLength(1);
+    vi.advanceTimersByTime(1_100);
+    expect(get(toastStore)).toHaveLength(0);
+  });
+
+  it("restart of a toast that is gone does nothing", () => {
+    const id = toastStore.success("saved");
+    toastStore.dismiss(id);
+    toastStore.restart(id);
+    vi.advanceTimersByTime(10_000);
+    expect(get(toastStore)).toHaveLength(0);
+  });
 });

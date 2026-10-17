@@ -3,6 +3,8 @@ use gitpulse_lib::diff::{
     ConflictResolutionChoice,
 };
 use gitpulse_lib::engine::git_cli::{git, git_with_stdin};
+// Only the macOS extended-attribute test spawns.
+#[cfg(target_os = "macos")]
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use tempfile::TempDir;
@@ -704,7 +706,7 @@ fn special_files_are_rejected_without_blocking() {
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     let started = std::time::Instant::now();
     assert!(conflict_session::snapshot(dir.path().to_str().unwrap(), "file").is_err());
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(started.elapsed() < common::env::coverage_relaxed(std::time::Duration::from_secs(10)));
 }
 
 #[test]

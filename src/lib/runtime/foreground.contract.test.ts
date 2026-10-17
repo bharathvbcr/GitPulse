@@ -6,7 +6,6 @@ const GATES = [
   "stores/repoStore.ts",
   "workbench/client.ts",
   "runtime/adaptiveTimer.ts",
-  "dom/visibleInterval.ts",
   "async/backgroundScope.ts",
   "components/TaskAgentPanel.svelte",
   "components/TaskManviAssist.svelte",
@@ -35,13 +34,11 @@ describe("background work shares one foreground rule", () => {
     expect(probe).not.toContain("readBackgroundDocument");
   });
 
-  it("routes both browser hosts through the same listener", () => {
-    for (const path of ["runtime/adaptiveTimer.ts", "dom/visibleInterval.ts"]) {
-      const source = read(path);
-      expect(source).toContain("addForegroundListener");
-      expect(source).toContain('addEventListener("focus"');
-      expect(source).toContain('addEventListener("blur"');
-    }
+  it("routes the browser host through the shared listener", () => {
+    const source = read("runtime/adaptiveTimer.ts");
+    expect(source).toContain("addForegroundListener");
+    expect(source).toContain('addEventListener("focus"');
+    expect(source).toContain('addEventListener("blur"');
   });
 
   it("polls a live task run through the shared delay", () => {
@@ -51,16 +48,20 @@ describe("background work shares one foreground rule", () => {
   });
 
   it("drops a debounced workbench refresh while the window is in the background", () => {
+    // The board refreshes through the shared live loader, which asks `canRun`
+    // both when a refresh is scheduled and when it fires (liveLoader.test.ts).
     const board = read("components/TaskBoard.svelte");
-    const schedule = board.slice(board.indexOf("function scheduleRefresh()"), board.indexOf("async function initialize"));
-    expect(schedule.match(/readBackgroundDocument\(\)/g)?.length).toBeGreaterThanOrEqual(2);
+    const loader = board.slice(board.indexOf("const background = createLiveLoader("), board.indexOf("function scheduleRefresh()"));
+    expect(loader).toMatch(/canRun: \(\) => [^\n]*!readBackgroundDocument\(\)/);
+    expect(board).toMatch(/function scheduleRefresh\(\) \{ background\.schedule\(\); \}/);
     expect(board).toContain("bindForegroundChanges");
     expect(board).not.toContain('window.addEventListener("focus", scheduleRefresh)');
 
     const ops = read("components/ManviOpsPanel.svelte");
-    const tasks = ops.slice(ops.indexOf("function scheduleRefreshRepoTasks()"), ops.indexOf("async function loadRepoTasks"));
-    expect(tasks.match(/readBackgroundDocument\(\)/g)?.length).toBeGreaterThanOrEqual(2);
+    const tasks = ops.slice(ops.indexOf("const repoTaskLoader = createLiveLoader("), ops.indexOf("async function loadRepoTasks"));
+    expect(tasks).toMatch(/canRun: \(\) => !readBackgroundDocument\(\)/);
+    expect(tasks).toMatch(/function scheduleRefreshRepoTasks\(\) \{ repoTaskLoader\.schedule\(\); \}/);
     expect(ops).toContain("bindForegroundChanges");
-    expect(ops).toContain('listen("workbench-changed", scheduleRefreshRepoTasks)');
+    expect(ops).toContain("changed: scheduleRefreshRepoTasks");
   });
 });

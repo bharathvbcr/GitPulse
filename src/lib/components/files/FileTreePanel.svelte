@@ -2,7 +2,8 @@
   import { untrack } from "svelte";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
-  import { repoStore, type FileStatus } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore, type FileStatus } from "../../stores/repoStore";
+  import { currentHeadTip } from "../../stores/headTip";
   import { invoke } from "../../ipc/invoke";
   import {
     ChevronDown,
@@ -53,14 +54,15 @@
   import { copyText } from "../../desktop/clipboard";
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
   import { askConfirm, askText } from "../../stores/modalStore";
-  import { harnessStore, type Guarded } from "../../stores/harnessStore";
-  import type { DeleteOutcome } from "../../files/types";
+  import { reportFailure } from "../../stores/mutationOutcome";
+  import type { MutationTarget } from "../../repos/storeTypes";
   import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
+  import { newPathProblem, readFileWriteError, withAncestors } from "../../files/fileWrite";
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
   import { popover, restoreFocusTo } from "../../ui/popover";
-  import { enumerateFocusables } from "../../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import EmptyState from "../EmptyState.svelte";
@@ -98,7 +100,9 @@
   type StatusFilter = "all" | "modified" | "staged" | "untracked" | "conflicted";
   type SortOrder = "name-asc" | "name-desc" | "status" | "churn";
 
-  let files = $state<string[]>([]);
+  // Replaced wholesale by each listing, never edited in place — a deep proxy
+  // over tens of thousands of paths would buy nothing.
+  let files = $state.raw<string[]>([]);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
   let inflight: AsyncGuard | null = null;
@@ -191,29 +195,36 @@
     return () => inflight?.cancel();
   });
 
-  let lastRepo = "";
+  // `$repoStore.x` inside an effect tracks the whole store, and the store
+  // publishes a fresh object on every change — every status poll, loading
+  // flag and error. The repository key, this membership string and HEAD
+  // (see `currentHeadTip`) compare by value, so the listing below reloads only
+  // when the repository, the set of dirty paths, or HEAD changes.
+  const statusMembership = $derived(statusPathKey($repoStore.statuses));
+
+  // A new repository starts with every folder expanded again.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const membership = statusPathKey($repoStore.statuses);
-    void membership;
-    if (!repo) {
-      inflight?.cancel();
-      files = [];
-      errorMsg = null;
-      isLoading = false;
-      selectedIndex = -1;
-      lastRepo = "";
-      return;
-    }
-    if (repo !== lastRepo) {
-      collapsed = {};
-      lastRepo = repo;
-    }
-    void loadFiles(repo);
-    const started = inflight;
-    return () => {
-      if (inflight === started) started?.cancel();
-    };
+    void $currentRepoPath;
+    untrack(() => (collapsed = {}));
+  });
+
+  // No teardown: `loadFiles` cancels its predecessor itself, and unmount is
+  // the effect above.
+  $effect(() => {
+    const repo = $currentRepoPath;
+    void statusMembership;
+    void $currentHeadTip;
+    untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        files = [];
+        errorMsg = null;
+        isLoading = false;
+        selectedIndex = -1;
+        return;
+      }
+      void loadFiles(repo);
+    });
   });
 
   let listedPaths = $derived.by(() =>
@@ -294,8 +305,11 @@
 
 
   // Flattened rows
+  // The tree depends only on the listing; a folder toggle re-flattens it
+  // without rebuilding it. `flattenFileTree` reads the tree, never mutates it.
+  let tree = $derived(buildFileTree(filteredPaths));
   let rows = $derived.by<FileRow[]>(() => {
-    const flattened = flattenFileTree(buildFileTree(filteredPaths), (dirPath) =>
+    const flattened = flattenFileTree(tree, (dirPath) =>
       isFiltering ? false : collapsed[dirPath] === true,
     );
     if (sortOrder === "name-asc") return flattened;
@@ -441,34 +455,6 @@
     return () => window.clearTimeout(timer);
   });
 
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
-  }
-
   function handleMenuKeydown(e: KeyboardEvent) {
     if (e.key === "Tab") {
       e.preventDefault();
@@ -517,57 +503,90 @@
   }
 
   // File operations
+  /**
+   * Asks for a name and creates the empty file `toPath(name)` through the
+   * create-only command, which never replaces anything. A name the listing
+   * already holds is refused in the dialog; one the listing has not shown but
+   * the disk has comes back `already_exists`, and the dialog reopens on the
+   * name that was typed with that refusal under it. Resolves the created
+   * path, or null when cancelled or failed.
+   */
+  async function promptAndCreate(
+    repo: string,
+    target: MutationTarget,
+    parentDir: string,
+    prompt: { title: string; message: string; placeholder: string; confirmLabel: string },
+    toPath: (name: string) => string,
+  ): Promise<string | null> {
+    let typed = "";
+    let refusal: string | undefined;
+    for (;;) {
+      const name = await askText({
+        ...prompt,
+        initialValue: typed,
+        error: refusal,
+        validate: (value) => newPathProblem(value, parentDir, withAncestors(listedPaths)),
+      });
+      if (!name?.trim()) return null;
+      if (repo !== $repoStore.currentPath) return null;
+      const path = toPath(name.trim());
+      const outcome = await repoStore.createFile(path, target);
+      if (outcome.ok) return path;
+      const typedError = readFileWriteError(outcome.cause);
+      // `surfaced` false: the store judged it the expected refusal for this path.
+      if (typedError?.code === "already_exists" && !outcome.surfaced) {
+        typed = name;
+        refusal = typedError.message;
+        continue;
+      }
+      reportFailure(outcome, "Could not create the file");
+      return null;
+    }
+  }
+
   async function createNewFile(parentDir: string = "") {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const name = await askText({
-      title: "New File",
-      message: parentDir ? `Create file in ${parentDir}/` : "Create file in repository root",
-      placeholder: "example.ts",
-      confirmLabel: "Create",
-    });
-    if (!name?.trim()) return;
-    const fullRelative = parentDir ? `${parentDir}/${name.trim()}` : name.trim();
-    try {
-      await invoke("cmd_write_file_content", {
-        repoPath: repo,
-        filePath: fullRelative,
-        content: "",
-      });
-      await loadFiles(repo);
-      await repoStore.refresh();
-      chooseFile(fullRelative);
-    } catch (err: unknown) {
-      repoStore.setError(formatError(err));
-    }
+    // The repository the prompt is raised for, held across it.
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
+    const created = await promptAndCreate(
+      repo,
+      target,
+      parentDir,
+      {
+        title: "New File",
+        message: parentDir ? `Create file in ${parentDir}/` : "Create file in repository root",
+        placeholder: "example.ts",
+        confirmLabel: "Create",
+      },
+      (name) => (parentDir ? `${parentDir}/${name}` : name),
+    );
+    if (!created) return;
+    await loadFiles(repo);
+    chooseFile(created);
   }
 
   async function createNewFolder(parentDir: string = "") {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const folderName = await askText({
-      title: "New Folder",
-      message: parentDir ? `Create folder in ${parentDir}/` : "Create folder in repository root",
-      placeholder: "components",
-      confirmLabel: "Create Folder",
-    });
-    if (!folderName?.trim()) return;
-    const dummyPath = parentDir
-      ? `${parentDir}/${folderName.trim()}/.gitkeep`
-      : `${folderName.trim()}/.gitkeep`;
-    try {
-      await invoke("cmd_write_file_content", {
-        repoPath: repo,
-        filePath: dummyPath,
-        content: "",
-      });
-      await loadFiles(repo);
-      await repoStore.refresh();
-    } catch (err: unknown) {
-      repoStore.setError(formatError(err));
-    }
+    // The repository the prompt is raised for, held across it.
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
+    const created = await promptAndCreate(
+      repo,
+      target,
+      parentDir,
+      {
+        title: "New Folder",
+        message: parentDir ? `Create folder in ${parentDir}/` : "Create folder in repository root",
+        placeholder: "components",
+        confirmLabel: "Create Folder",
+      },
+      (name) => (parentDir ? `${parentDir}/${name}/.gitkeep` : `${name}/.gitkeep`),
+    );
+    if (!created) return;
+    await loadFiles(repo);
   }
 
   /**
@@ -578,7 +597,8 @@
   async function movePath(row: FileRow) {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const answer = await askText({
       title: row.kind === "dir" ? "Rename or Move Folder" : "Rename or Move File",
       message: `New repository-relative path for ${row.path}`,
@@ -587,18 +607,13 @@
     });
     const to = answer?.trim().replace(/\/+$/, "");
     if (!to || to === row.path) return;
-    try {
-      const result = await invoke<Guarded<null>>("cmd_move_path", { repoPath: repo, from: row.path, to });
-      harnessStore.recordVerdict(result.policy, repo);
-      harnessStore.recordAction({ repoPath: repo, kind: "move", label: `${row.path} → ${to}`, ok: true });
-    } catch (err: unknown) {
-      harnessStore.recordAction({ repoPath: repo, kind: "move", label: `${row.path} → ${to}`, ok: false });
-      repoStore.setError(formatError(err));
-      return;
-    }
+    const moved = await repoStore.movePath(row.path, to, target);
+    if (!reportFailure(moved, "Could not move it")) return;
+    // The mutation ran in the repository asked about; what follows reads the
+    // one in front.
+    if (repo !== $repoStore.currentPath) return;
     const selected = $repoStore.selectedFilePath;
     await loadFiles(repo);
-    await repoStore.refresh();
     if (row.kind === "file") chooseFile(to);
     else if (selected && isAtOrUnder(selected, row.path)) chooseFile(remapPath(selected, row.path, to));
   }
@@ -611,7 +626,8 @@
   async function deletePath(row: FileRow) {
     closeContextMenu();
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    const target = repoStore.captureTarget();
+    if (!repo || !target) return;
     const untracked = new Set(
       $repoStore.statuses.filter((s) => isUntrackedStatusCode(s.status_code)).map((s) => s.path),
     );
@@ -622,47 +638,42 @@
       destructive: true,
     });
     if (!confirmed || repo !== $repoStore.currentPath) return;
-    let outcome: DeleteOutcome;
-    try {
-      const result = await invoke<Guarded<DeleteOutcome>>("cmd_delete_path", { repoPath: repo, path: row.path });
-      harnessStore.recordVerdict(result.policy, repo);
-      harnessStore.recordAction({ repoPath: repo, kind: "delete", label: row.path, ok: true });
-      outcome = result.output;
-    } catch (err: unknown) {
-      harnessStore.recordAction({ repoPath: repo, kind: "delete", label: row.path, ok: false });
-      repoStore.setError(formatError(err));
-      return;
-    }
+    const deleted = await repoStore.deletePath(row.path, target);
+    if (!reportFailure(deleted, "Could not delete it")) return;
+    if (repo !== $repoStore.currentPath) return;
+    const outcome = deleted.output;
     const selected = $repoStore.selectedFilePath;
     if (selected && isAtOrUnder(selected, row.path) && typeof onSelectFile !== "function") {
       repoStore.selectFilePath(null);
     }
     await loadFiles(repo);
-    await repoStore.refresh();
-    if (outcome.left_behind) {
+    if (outcome?.left_behind) {
       repoStore.setError(`${row.path} still holds ignored files, which GitPulse does not delete.`);
     }
   }
 
   async function stageFile(path: string) {
     closeContextMenu();
-    await repoStore.stageFile(path);
+    return await repoStore.stageFile(path);
   }
 
   async function unstageFile(path: string) {
     closeContextMenu();
-    await repoStore.unstageFile(path);
+    return await repoStore.unstageFile(path);
   }
 
   async function discardFile(path: string) {
     closeContextMenu();
+    // The repository this file belongs to, held across the confirm.
+    const target = repoStore.captureTarget();
     const confirmed = await askConfirm({
       title: "Discard Changes",
       message: `Are you sure you want to discard all uncommitted changes to ${path}? This cannot be undone.`,
       confirmLabel: "Discard Changes",
     });
     if (!confirmed) return;
-    await repoStore.discardChanges(path);
+    const outcome = await repoStore.discardChanges(path, target);
+    reportFailure(outcome, "Could not discard the changes");
   }
 
   async function openInSystem(filePath: string) {

@@ -49,7 +49,7 @@ export function validateWorkResponse(command: string, value: unknown): void {
         const v = record(value); flag(v.available); nullableText(v.error);
         list(v.leases, entry => {
           const l = fields(entry, ["task_id", "owner", "status"]);
-          nullableText(l.agent); nullableText(l.expires_at);
+          nullableText(l.agent); nullableText(l.expires_at); nullableText(l.expiry_error);
         });
         break;
       }
@@ -76,7 +76,7 @@ export function validateWorkResponse(command: string, value: unknown): void {
       case "cmd_repo_operation": {
         if (value === null) break;
         const op = fields(value, ["kind"]);
-        if (!["Merge", "Rebase", "RebaseApply", "ApplyMailbox", "CherryPick", "Revert", "Bisect"].includes(String(op.kind))) throw new Error("unknown operation kind");
+        if (!["Merge", "SquashMerge", "Rebase", "RebaseApply", "ApplyMailbox", "CherryPick", "Revert", "Bisect"].includes(String(op.kind))) throw new Error("unknown operation kind");
         count(op.conflicted_total);
         for (const key of ["current_step", "total_steps"]) if (op[key] != null) count(op[key]);
         break;

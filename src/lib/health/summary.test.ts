@@ -109,6 +109,7 @@ describe("summarizeHealth — the all-clear is earned, never assumed", () => {
     ["the audit was partial", { report: report({ audit_complete: false }) }],
     ["Dependabot was never fetched", { dependabot: null }],
     ["Dependabot could not be reached", { dependabot: dependabot({ available: false, error: "gh exited 1" }) }],
+    ["Dependabot came back missing a severity tier", { dependabot: dependabot({ truncated: true, partial_tiers: ["critical"] }) }],
     ["code scanning was never fetched", { codeScanning: null }],
     ["code scanning could not be reached", { codeScanning: codeScanning({ available: false, error: "no access" }) }],
     ["npm is missing so nothing could be checked for updates", { report: report({ npm_cli_present: false }) }],
@@ -201,6 +202,31 @@ describe("summarizeHealth — GitHub alert states are all distinguishable", () =
     expect(f.caveat).toContain("more remain");
   });
 
+  it("names the severity tiers a partial list could not read", () => {
+    const f = facet(
+      cleanInput({
+        dependabot: dependabot({
+          truncated: true,
+          partial_tiers: ["critical", "high"],
+          alerts: [{ severity: "low" } as never],
+        }),
+      }),
+      "dependabot",
+    );
+    expect(f.value).toBe("1+ open");
+    expect(f.caveat).toContain("critical, high");
+    expect(f.caveat).toContain("more may be open");
+  });
+
+  it("does not report an empty partial list as '0 open'", () => {
+    const f = facet(
+      cleanInput({ dependabot: dependabot({ truncated: true, partial_tiers: ["critical"], alerts: [] }) }),
+      "dependabot",
+    );
+    expect(f.value).toBe("incomplete");
+    expect(f.tone).toBe("unknown");
+  });
+
   it("reads GitHub severities whatever case they arrive in", () => {
     // `github/mod.rs` stores `security_vulnerability.severity` verbatim, so
     // "HIGH" and "Critical" are both live inputs.
@@ -223,6 +249,26 @@ describe("summarizeHealth — the local audit", () => {
     expect(f.value).toBe("did not run");
     expect(f.tone).toBe("unknown");
     expect(f.caveat).toContain("no finding count exists");
+  });
+
+  it("names the audit census on a partial audit and on one that never ran", () => {
+    const audit_coverage = { found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] };
+    const partial = facet(
+      cleanInput({ report: report({ audit_complete: false, audit_coverage }) }),
+      "vulnerabilities",
+    );
+    expect(partial.caveat).toContain("1 of 2 audited; not audited: cargo:Cargo.lock.");
+    const none = facet(
+      cleanInput({
+        report: report({
+          scanners_ran: [],
+          audit_complete: false,
+          audit_coverage: { found: 2, audited: 0, unaudited: ["npm:package-lock.json", "cargo:Cargo.lock"] },
+        }),
+      }),
+      "vulnerabilities",
+    );
+    expect(none.caveat).toContain("0 of 2 audited; not audited: npm:package-lock.json, cargo:Cargo.lock.");
   });
 
   it("marks a partial audit's counts as a floor even when it found things", () => {

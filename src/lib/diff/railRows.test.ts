@@ -8,6 +8,7 @@ import {
   type RailFileRow,
 } from "./railRows";
 import type { RailEntry } from "./fileRail";
+import { wallClockBudget } from "../testing/wallClock";
 
 const entry = (path: string, over: Partial<RailEntry> = {}): RailEntry => ({
   path,
@@ -86,7 +87,7 @@ describe("disambiguatePaths", () => {
     const paths = Array.from({ length: 1_000 }, (_, i) => `pkg/p${i}/index.ts`);
     const started = Date.now();
     const map = disambiguatePaths(paths);
-    expect(Date.now() - started).toBeLessThan(500);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(500));
     expect(map.get("pkg/p0/index.ts")).toBe("p0");
     expect(map.get("pkg/p999/index.ts")).toBe("p999");
   });

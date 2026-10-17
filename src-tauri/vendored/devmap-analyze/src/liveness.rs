@@ -25,10 +25,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// The consequence is stated rather than hidden: DevMap does not report unused
 /// CSS. Svelte's own compiler does, from inside the compilation that knows the
 /// answer, and that is the tool for it.
+///
+/// `Macro` is here for the same reason: a `macro_rules!` macro is linked only to
+/// its invocations in the file that defines it. One invoked from another file
+/// through `#[macro_use]`, a `use` of the macro or `$crate::name!` leaves no
+/// edge, so an unreferenced macro is not evidence of a dead one.
 fn is_never_dead_candidate(kind: SymbolKind) -> bool {
     matches!(
         kind,
-        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule
+        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule | SymbolKind::Macro
     )
 }
 
@@ -221,6 +226,29 @@ fn go_value_mentioned_names(
     mentions
 }
 
+/// Exported interface method specs anywhere in the corpus, by `(method, arity)`.
+///
+/// The corpus-wide counterpart of [`go_interface_specs_by_package`]. An
+/// exported method name is not qualified by its package, so a type in one
+/// package satisfies an interface declared in any other. Read only for
+/// exported Go methods; see the arm in [`symbol_exemption_index`].
+fn go_exported_interface_specs(extractions: &[Extraction]) -> HashMap<(&str, usize), &str> {
+    let mut specs: HashMap<(&str, usize), &str> = HashMap::new();
+    for ext in extractions {
+        if ext.language != "go" {
+            continue;
+        }
+        for spec in &ext.go_interface_methods {
+            if spec.method.starts_with(|c: char| c.is_uppercase()) {
+                specs
+                    .entry((spec.method.as_str(), spec.param_count))
+                    .or_insert(spec.interface_name.as_str());
+            }
+        }
+    }
+    specs
+}
+
 /// Symbol identities that exist in a Go package only as mutually exclusive
 /// build variants, keyed by `(package, identity)`.
 ///
@@ -385,6 +413,29 @@ pub struct ExtractionCoverage {
     /// Files whose calls were extracted, keyed by language — the per-language
     /// half of [`Self::files_with_call_extraction`].
     pub covered_by_language: BTreeMap<String, usize>,
+    /// Source files discovery skipped for exceeding the size ceiling whose
+    /// language extracts calls and which are not vendored.
+    ///
+    /// The ones that can hold a caller, and so the only ones charged: a
+    /// 30 MB vendored `parser.c` cannot call this repository's code, and a
+    /// `.json` blob has no calls to miss, so neither demotes a finding — which
+    /// is the "permanently partial" trap that made `Oversized` an ordinary skip
+    /// in the first place. A 1.7 MB generated `gen.py` calling `helper` forty
+    /// thousand times is exactly a caller, and was invisible.
+    ///
+    /// Also entered in [`Self::blind_by_language`] under its language, so the
+    /// language-scoped cap sees it; counted here for the aggregate fallback
+    /// and for `degraded_reason`'s sentence.
+    pub over_limit_files: usize,
+    /// Files a grammar read with `ERROR`/`MISSING` nodes in the tree that are
+    /// charged: in a call-extracting language and not vendored.
+    ///
+    /// Entered in [`Self::blind_by_language`] and kept out of
+    /// [`Self::covered_by_language`]. A hole in a file whose calls were never
+    /// looked for is already charged as `call_blind`, and a vendored file
+    /// cannot hold a caller; both are still *listed* in the `partial_parse`
+    /// inventory, which `extraction_gaps` derives without this filter.
+    pub partial_parse_files: usize,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -392,7 +443,7 @@ pub struct ExtractionCoverage {
 /// A separate type rather than a bare `usize` so a caller cannot pass the wrong
 /// count positionally, and so the one place that means "no discovery step ran"
 /// is spelled [`DiscoveryCoverage::none`] rather than `0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryCoverage {
     /// `None` means no discovery result is being reported — which is **not**
     /// the same as a discovery step that ran and refused nothing. Keeping the
@@ -400,6 +451,10 @@ pub struct DiscoveryCoverage {
     /// summary that records `0` for the first case tells a later reader the
     /// tree was fully walked when nobody walked it.
     refused_files: Option<usize>,
+    /// Source files skipped for exceeding the size ceiling, sorted by path.
+    /// Meaningful only beside a measured `refused_files`: the same walk
+    /// produces both.
+    over_limit: Vec<crate::model::OverLimitFile>,
 }
 
 impl DiscoveryCoverage {
@@ -411,6 +466,7 @@ impl DiscoveryCoverage {
     pub fn none() -> Self {
         Self {
             refused_files: None,
+            over_limit: Vec::new(),
         }
     }
 
@@ -419,7 +475,42 @@ impl DiscoveryCoverage {
     pub fn refused(refused_files: usize) -> Self {
         Self {
             refused_files: Some(refused_files),
+            over_limit: Vec::new(),
         }
+    }
+
+    /// The same measurement, with the files the walk skipped for size.
+    ///
+    /// Sorted and de-duplicated by path here, so two callers handing the same
+    /// facts in different orders persist the same summary.
+    pub fn with_over_limit(mut self, mut files: Vec<crate::model::OverLimitFile>) -> Self {
+        files.sort();
+        files.dedup_by(|left, right| left.path == right.path);
+        self.over_limit = files;
+        self
+    }
+
+    /// The over-limit files as persisted: `None` when discovery was not
+    /// measured, for the reason [`Self::refused_files`] gives.
+    pub fn over_limit_files(&self) -> Option<Vec<crate::model::OverLimitFile>> {
+        self.refused_files.map(|_| self.over_limit.clone())
+    }
+
+    /// The over-limit files that can hide a caller, with their language.
+    ///
+    /// A call-extracting language — by the same capability bit
+    /// `extraction_coverage` counts covered files from, so the two sides of
+    /// the share describe one partition — and not vendored, by
+    /// `devmap_extract::wiring::is_vendored_path`, the predicate liveness
+    /// already exempts vendored symbols by.
+    pub fn charged_over_limit(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.over_limit.iter().filter_map(|file| {
+            let language = devmap_extract::detect_language(std::path::Path::new(&file.path));
+            let calls = devmap_extract::languages::capabilities_for_language(language)
+                .contains(Capability::Calls);
+            (calls && !devmap_extract::wiring::is_vendored_path(&file.path))
+                .then_some((file.path.as_str(), language))
+        })
     }
 
     /// The measurement, or `None` when none was taken. Persisted verbatim so a
@@ -523,6 +614,22 @@ impl ExtractionCoverage {
                 self.call_blind_files
             ));
         }
+        // Its own clause for the same reason: the fix is to split or shrink
+        // the file (or accept the hole), not to re-run anything.
+        if self.partial_parse_files > 0 {
+            reason.push_str(&format!(
+                "; {} file(s) parsed with ERROR/MISSING regions, so declarations and calls \
+                 inside those regions are absent",
+                self.partial_parse_files
+            ));
+        }
+        if self.over_limit_files > 0 {
+            reason.push_str(&format!(
+                "; {} source file(s) that can hold calls were skipped for exceeding the \
+                 source size limit, so any caller in them is absent from the graph",
+                self.over_limit_files
+            ));
+        }
         Some(reason)
     }
 
@@ -547,7 +654,8 @@ impl ExtractionCoverage {
             .parse_failed_files
             .saturating_add(self.pattern_recovered_files)
             .saturating_add(self.call_blind_files)
-            .saturating_add(self.discovery_refused_files);
+            .saturating_add(self.discovery_refused_files)
+            .saturating_add(self.over_limit_files);
         if self.blind_by_language.is_empty() && self.covered_by_language.is_empty() {
             return aggregate;
         }
@@ -968,6 +1076,491 @@ pub const COVERAGE_LOSS_CONFIDENCE_CAP: f32 = 0.35;
 pub const COVERAGE_LOSS_REASON: &str =
     "no inbound call edges, but call extraction did not cover every file — not evidence of death";
 
+/// Languages whose confident (0.9) dead tier has been earned by measurement.
+///
+/// **Set by a check, not by assignment.** `devmap-cli/tests/dead_tier_eligibility.rs`
+/// builds every labelled fixture under `testdata/accuracy/` and fails if a
+/// language is listed here while any of its confident-branch rows is not
+/// labelled `truly_dead`, and fails if a language whose fixture is clean — at
+/// least one confident row, no false one, every truly-dead marker in the
+/// confident branch — and whose corpus record (`record.json`) has labelled
+/// rows, at most 5% false on every corpus, is *not* listed. A language the
+/// record never measured, or measured with no row, is unproven: a missing or
+/// unreadable record fails the test. So the table cannot rot in either direction: a
+/// regression that puts one false row in a listed language's confident tier
+/// fails CI, and a fix that earns a language the tier fails CI until it is
+/// listed.
+///
+/// Labels are [`Extraction::code_language`] values, so `typescript` and `tsx`
+/// are earned separately — they are separate grammars with separate extractors.
+///
+/// A language not listed here never publishes a row at 0.9. Its confident
+/// rows are capped at [`UNPROVEN_TIER_CONFIDENCE`] carrying
+/// [`confident_tier_unproven_reason`], which names the language. The audit of
+/// 2026-10-09 measured the confident tier wrong in every language but Python
+/// (Go 2/2, TypeScript 13/28, Rust 1/1, Swift 1/1, Kotlin 2/11), each through a
+/// silent miss that bypassed the namesake veto — and `CLAUDE.md` tells agents
+/// that tier is the one to act on.
+///
+/// **What listing rests on today, stated so nobody reads more into it.**
+/// (2026-10-10.) Each listed language has zero confident-tier false positives
+/// on its committed fixture, every fixture `truly_dead` marker in the confident
+/// branch, at least one labelled row in the corpus record, and at most 5% false
+/// on every corpus of it (`testdata/accuracy/record.json`: 20 local
+/// repositories, every language each holds listed — `rows: 0` where its
+/// confident branch was empty). Measured there: Go 0/17 (all from one corpus),
+/// TypeScript 0/29, TSX 0/14, Rust 0/3.
+///
+/// Off the list: **Kotlin**, whose only corpus proof was nine ChronosFlow rows
+/// (0/9, all coverage-capped at 0.66) scored on 2026-10-15 (26c5139b). Their
+/// dead labels are lost, so the rows are carried and unverified in
+/// `record.json` (`carried_dead_evidence`) and no longer count; re-labelling
+/// is tracked by ft-8ed75897. **Swift**, measured on ten corpora with no confident-branch
+/// row on any — its examined population is `private` members something
+/// reaches — so nothing beyond one fixture row has ever tested it; **Python**,
+/// 17 of 58 corpus rows false (string dispatch, an aliased import, module
+/// constants read from other files, calls through a Protocol), causes the
+/// L-Python and interface-dispatch cards own. Each comes back when the record
+/// says so.
+pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &["go", "rust", "tsx", "typescript"];
+
+/// Whether `language` may publish dead rows in the confident tier.
+pub fn confident_tier_eligible(language: &str) -> bool {
+    CONFIDENT_TIER_ELIGIBLE.contains(&language)
+}
+
+/// The machine token every row capped by [`CONFIDENT_TIER_ELIGIBLE`] starts with.
+pub const CONFIDENT_TIER_UNPROVEN: &str = "confident_tier_unproven";
+
+/// Where a confident row of an unlisted language lands: the unconfirmed tier,
+/// beside `only_ambiguous_callers`, so it stays visible and is never acted on.
+pub const UNPROVEN_TIER_CONFIDENCE: f32 = 0.4;
+
+/// Reason carried by a confident row whose language has not earned the tier.
+///
+/// Same shape as [`CALL_BLIND_REASON`] and the coverage cap: the evidence for
+/// death is the same "no inbound edge" it always was, and the reason says why
+/// that evidence is not yet trusted for this language.
+pub fn confident_tier_unproven_reason(language: &str) -> String {
+    format!(
+        "{CONFIDENT_TIER_UNPROVEN}: no inbound edge names this symbol, but the {language} \
+         confident tier has not been proven against its labelled fixture and the corpus \
+         record — capped below the act-on tier until CONFIDENT_TIER_ELIGIBLE lists {language}"
+    )
+}
+
+/// Whether a dead row's evidence earned the confident tier: it was published
+/// there, or it carries [`CONFIDENT_TIER_UNPROVEN`] because its language has not
+/// earned the tier yet.
+///
+/// The one question a caller asking "did the analysis call this confidently
+/// dead?" means. Reading `confidence >= 0.9` alone answers a different one —
+/// "is this language listed?" — and a check that a C function *reached* the
+/// confident branch would start failing, or worse passing, for that reason.
+pub fn earned_confident_tier(report: &DeadSymbolReport) -> bool {
+    !report.is_exempt
+        && (report.confidence > HIGHEST_DEGRADED_CONFIDENCE
+            || report
+                .exemption_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(CONFIDENT_TIER_UNPROVEN)))
+}
+
+/// The machine token an `exported_unreferenced` row starts with.
+pub const EXPORTED_UNREFERENCED: &str = "exported_unreferenced";
+
+/// Reason carried by an exported symbol the manifest proves module-private.
+fn exported_unreferenced_reason(proof: &str) -> String {
+    format!(
+        "{EXPORTED_UNREFERENCED}: exported, but {proof}, and nothing in the corpus reaches it — \
+         unconfirmed until this language's entry-point model is proven"
+    )
+}
+
+/// The machine token a row starts with when its class inherits from a type the
+/// corpus does not declare.
+pub const EXTERNAL_SUPERTYPE: &str = "external_supertype";
+
+/// The machine token a row starts with when it is a member of an object literal.
+pub const OBJECT_LITERAL_MEMBER: &str = "object_literal_member";
+
+/// Languages where a subclass overrides a base method with no keyword saying so.
+///
+/// Kotlin, Java, Swift, C# and Scala require `override` (or `@Override`), and
+/// the extractor already exempts what carries it; a method there without one
+/// cannot be what a base class calls. Python and TypeScript/JavaScript say
+/// nothing at the override, so an uncalled method on a subclass of a library
+/// type may be exactly what the library calls — CodeMirror's `WidgetType.toDOM`,
+/// `HTMLParser.handle_starttag`, watchdog's `on_any_event`. The 2026-10-10
+/// corpus record measured those as confident false positives in both languages.
+fn overrides_without_keyword(language: &str) -> bool {
+    matches!(language, "python" | "typescript" | "tsx" | "javascript")
+}
+
+/// Supertypes that call no subclass method by name, so inheriting from one is
+/// no evidence that an uncalled method is reached.
+///
+/// `object`, the abstract-base and generic markers, enums and record shapes
+/// (pydantic's `BaseModel` among them: it calls decorated validators and
+/// named hooks, never a plain method a model adds), and exception types (by name, including a library's `HTTPException` or a
+/// `ValidationError`): none of them dispatches to a method a subclass adds.
+/// Dunder hooks are already outside the population (leading underscore).
+///
+/// For Swift, the value-semantics and marker protocols whose requirements are
+/// operators or compiler-synthesised members (`Equatable`, `Hashable`,
+/// `Codable`, `Sendable`, `Identifiable`, …) and `NSObject` itself: conforming
+/// to one says nothing about who calls the type's other members.
+fn supertype_dispatches_nothing(name: &str) -> bool {
+    matches!(
+        name,
+        "object"
+            | "ABC"
+            | "Generic"
+            | "Enum"
+            | "IntEnum"
+            | "StrEnum"
+            | "Flag"
+            | "NamedTuple"
+            | "TypedDict"
+            | "BaseModel"
+            | "NSObject"
+            | "Equatable"
+            | "Hashable"
+            | "Comparable"
+            | "Codable"
+            | "Encodable"
+            | "Decodable"
+            | "Sendable"
+            | "Identifiable"
+            | "CaseIterable"
+            | "RawRepresentable"
+            | "ObservableObject"
+            | "AnyObject"
+    ) || name.ends_with("Error")
+        || name.ends_with("Exception")
+}
+
+/// `(file, declaring type)` → the first supertype it names that the corpus does
+/// not declare, for the languages [`overrides_without_keyword`] covers.
+///
+/// A supertype is in the corpus when a resolved `Extends` edge from the type
+/// names it ([`supertypes_by_type`]); a heritage reference with no such edge
+/// is a library type, or one this build could not find — either way something
+/// outside the graph may call the type's methods. A base whose contract the
+/// wiring registry knows (`known_dispatch_contract`: `torch.autograd.Function`,
+/// `torch.nn.Module`, `HTMLElement`, React class components), matched on the
+/// base as [`import_qualified`] names it, is not counted: its dispatched
+/// methods are exempt by name and the rest stay ordinary candidates.
+fn external_supertypes<'e>(
+    extractions: &'e [Extraction],
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> HashMap<(&'e str, &'e str), &'e str> {
+    let mut out = HashMap::new();
+    for ext in extractions {
+        // Swift is tracked for the conformance half: a framework calls a
+        // protocol requirement's witness by name (`swift_member_may_witness`).
+        if !overrides_without_keyword(ext.code_language()) && ext.code_language() != "swift" {
+            continue;
+        }
+        // A dotted base arrives as one `Heritage` reference per segment over
+        // one span, innermost first (`Function`, `autograd`, `torch`), so the
+        // written base is the segments reversed; the bare name is the first.
+        let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
+        for reference in &ext.references {
+            // `implements` names an interface, which has no code to call with.
+            if reference.kind != ReferenceKind::Heritage {
+                continue;
+            }
+            let Some(declarer) = reference
+                .enclosing_symbol
+                .as_deref()
+                .and_then(|owner| owner.rsplit("::").next())
+            else {
+                continue;
+            };
+            let start = reference.span.start_byte;
+            match bases
+                .iter_mut()
+                .find(|(owner, at, _)| *owner == declarer && *at == start)
+            {
+                Some((_, _, segments)) => segments.push(reference.name.as_str()),
+                None => bases.push((declarer, start, vec![reference.name.as_str()])),
+            }
+        }
+        for (declarer, _, segments) in bases {
+            let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
+            if base.is_empty() || supertype_dispatches_nothing(base) {
+                continue;
+            }
+            let written: Vec<&str> = segments.iter().rev().copied().collect();
+            if devmap_extract::wiring::known_dispatch_contract(&import_qualified(ext, &written)) {
+                continue;
+            }
+            let in_corpus = supertypes
+                .get(&(ext.file_path.as_str(), declarer))
+                .is_some_and(|supers| supers.iter().any(|(_, name)| *name == base));
+            if !in_corpus {
+                out.entry((ext.file_path.as_str(), declarer))
+                    .or_insert(segments[0]);
+            }
+        }
+    }
+    out
+}
+
+/// A written base (`["nn", "Module"]`) with its root segment replaced by what
+/// the file's imports bind it to (`torch.nn.Module` under `import torch.nn as
+/// nn`), so the dispatch registry matches the library and not a spelling.
+///
+/// * `from M import X as L` / `import { X as L } from 'M'` binds `L` to `M.X`.
+/// * `import M as L` / `import L from 'M'` / `import * as L from 'M'` binds `L`
+///   to `M` (a JS default import is the module's own export).
+/// * `import torch.nn` binds `torch`, the module's first segment, to itself.
+///
+/// A root no import binds is returned as written: a global (`HTMLElement`) or
+/// a name declared in the file.
+fn import_qualified(ext: &Extraction, written: &[&str]) -> String {
+    let Some((root, rest)) = written.split_first() else {
+        return String::new();
+    };
+    let bound = ext.imports.iter().find_map(|import| {
+        let spec = import.module_specifier.as_str();
+        let named = import
+            .local_names
+            .iter()
+            .zip(&import.imported_names)
+            .find(|(local, _)| local.as_str() == *root)
+            .map(|(_, imported)| {
+                if imported == "*" {
+                    spec.to_string()
+                } else {
+                    format!("{spec}.{imported}")
+                }
+            });
+        named
+            .or_else(|| (import.alias.as_deref() == Some(*root)).then(|| spec.to_string()))
+            .or_else(|| {
+                (import.alias.is_none()
+                    && import.imported_names.is_empty()
+                    && spec.split('.').next() == Some(*root))
+                .then(|| root.to_string())
+            })
+    });
+    let mut qualified = bound.unwrap_or_else(|| root.to_string());
+    for segment in rest {
+        qualified.push('.');
+        qualified.push_str(segment);
+    }
+    qualified
+}
+
+/// The external supertype `declaring_type` inherits from, directly or through
+/// in-corpus ancestors, walked as [`reached_through_a_supertype`] walks them.
+fn external_supertype_of<'e>(
+    file: &str,
+    declaring_type: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    external: &HashMap<(&'e str, &'e str), &'e str>,
+) -> Option<&'e str> {
+    let mut frontier = vec![(file, declaring_type)];
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for _ in 0..HERITAGE_WALK_MAX_DEPTH {
+        let mut next = Vec::new();
+        for key in frontier {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(base) = external.get(&key) {
+                return Some(base);
+            }
+            next.extend(supertypes.get(&key).into_iter().flatten().copied());
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Why an uncalled method that would otherwise be confident is unconfirmed:
+/// something outside the call graph dispatches to it by name.
+///
+/// * **`object_literal_member`** — a TypeScript/JavaScript method declared in
+///   an object literal (`{ startState() {…}, token() {…} }`,
+///   `components={{ pre() {…} }}`) is reached through the object, by key, by
+///   whatever the object is handed to. The extractor parents it on the file,
+///   or on the module-level `const` that holds the object (`parser.startState`),
+///   never on a class, which is how it is told from a class method.
+/// * **`external_supertype`** — a method on a class whose supertype chain
+///   reaches a type the corpus does not declare, in a language where an
+///   override is not marked.
+///
+/// Visible at 0.4 with the reason, never exempt: either can also be dead, and
+/// the reader is told which check to make.
+fn unconfirmed_dispatch_reason(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    identity: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    external: &HashMap<(&str, &str), &str>,
+) -> Option<String> {
+    let language = ext.code_language();
+    if sym.kind != SymbolKind::Method || !overrides_without_keyword(language) {
+        return None;
+    }
+    if matches!(language, "typescript" | "tsx" | "javascript")
+        && sym.parent_symbol.as_deref().is_none_or(|parent| {
+            parent == ext.file_path
+                || ext.symbols.iter().any(|owner| {
+                    owner.qualified_name == parent && owner.kind == SymbolKind::Variable
+                })
+        })
+    {
+        return Some(format!(
+            "{OBJECT_LITERAL_MEMBER}: a method of an object literal, reached through the object \
+             by key wherever the object is passed — no call names it, which is not evidence \
+             nothing calls it"
+        ));
+    }
+    let (declaring_type, _) = identity.rsplit_once('.')?;
+    let base = external_supertype_of(&ext.file_path, declaring_type, supertypes, external)?;
+    Some(format!(
+        "{EXTERNAL_SUPERTYPE}: its class inherits from `{base}`, which the corpus does not \
+         declare, and a base class calls a subclass's methods by name — no call names it, \
+         which is not evidence nothing calls it"
+    ))
+}
+
+/// Why an uncalled symbol was not examined at all: it is exported.
+///
+/// The visibility, not any evidence, keeps it off the list. Counted per
+/// language in the `excluded` disclosure, because a `dead` answer of zero over
+/// a corpus whose every uncalled symbol is exported is not a finding.
+pub const EXPORTED_NOT_EXAMINED_REASON: &str =
+    "exported — not examined: its visibility, not any evidence, keeps it off the dead list";
+
+/// Why an uncalled, unexported symbol was exempted with its file when the file
+/// carried no more specific reason.
+pub const FILE_EXEMPT_REASON: &str =
+    "exempt with its file — the file is outside the dead-code population";
+
+/// The stable token for a stored exemption reason, for counting.
+///
+/// Reasons are sentences, and several embed a name (`implements interface
+/// \`Reader\``), so counting by the raw string would split one cause across as
+/// many rows as it has names. This is the one owner of the mapping, read by the
+/// `excluded` disclosure; a reason this does not recognise is a wiring
+/// annotation's details — a runtime entry point, a framework hook, a test or
+/// generated file — and is counted as `wiring`.
+pub fn exemption_token(reason: &str) -> &'static str {
+    // The second spelling is the fallback generations before 2026-10-09
+    // stored for the same case, so an old store still counts it.
+    if reason == EXPORTED_NOT_EXAMINED_REASON || reason == "Exported or exempt" {
+        "exported"
+    } else if reason == "Member of an exported type — public interface" {
+        "exported_owner"
+    } else if reason.starts_with("Overrides a method reached through") {
+        "heritage_override"
+    } else if reason.starts_with("implements interface `") {
+        "interface_implementation"
+    } else if reason == GO_STD_INTERFACE_REASON {
+        "std_interface_implementation"
+    } else if reason == "Declared in a C-family header — public interface" {
+        "c_header"
+    } else if reason == GO_BUILD_VARIANT_REASON {
+        "go_build_variant"
+    } else if reason == GO_VALUE_MENTION_REASON {
+        "go_value_mention"
+    } else if reason == "Symbol overlaps a tree-sitter parse error" {
+        "parse_error_overlap"
+    } else if reason == FILE_EXEMPT_REASON {
+        "file_exempt"
+    } else if reason.ends_with("excluded from dead code candidates") {
+        "not_parsed"
+    } else {
+        "wiring"
+    }
+}
+
+/// Exempt-reason tokens that are visibility rather than evidence.
+///
+/// What the `excluded` disclosure sums as "not examined": nothing reached these
+/// symbols; a keyword or a language default kept them off the list.
+pub const VISIBILITY_TOKENS: &[&str] = &["exported", "exported_owner"];
+
+/// Why an exported Go method is exempt when a standard-library interface could
+/// dispatch to it.
+pub const GO_STD_INTERFACE_REASON: &str =
+    "satisfies a standard-library interface by name and arity (fmt.Stringer, error, io.Reader, \
+     http.Handler, json.Marshaler, sort.Interface, …); calls reach it through the interface";
+
+/// `(method, parameter count)` of the standard-library interfaces a type in a
+/// module-private package most often satisfies without a single in-corpus call.
+///
+/// Only consulted when widening exported Go symbols into the unconfirmed tier,
+/// where it errs toward withholding: a `String()` on an `internal/` type is
+/// called by `fmt`, never by the corpus.
+const GO_STD_INTERFACE_METHODS: &[(&str, usize)] = &[
+    ("String", 0),
+    ("GoString", 0),
+    ("Error", 0),
+    ("Unwrap", 0),
+    ("Is", 1),
+    ("As", 1),
+    ("Format", 2),
+    ("Read", 1),
+    ("Write", 1),
+    ("Close", 0),
+    ("Seek", 2),
+    ("ReadFrom", 1),
+    ("WriteTo", 1),
+    ("ServeHTTP", 2),
+    ("RoundTrip", 1),
+    ("MarshalJSON", 0),
+    ("UnmarshalJSON", 1),
+    ("MarshalText", 0),
+    ("UnmarshalText", 1),
+    ("MarshalYAML", 0),
+    ("UnmarshalYAML", 1),
+    ("MarshalBinary", 0),
+    ("UnmarshalBinary", 1),
+    ("Scan", 1),
+    ("Value", 0),
+    ("Len", 0),
+    ("Less", 2),
+    ("Swap", 2),
+    ("Lock", 0),
+    ("Unlock", 0),
+];
+
+/// Whether a Go file's package is provably private to its module.
+///
+/// Go's own rules, nothing inferred: an `internal/` directory is importable
+/// only from the tree rooted at its parent, and nothing can import `package
+/// main`. Either way an exported name proves nothing about callers outside the
+/// corpus, so an uncalled one is a candidate — at the unconfirmed tier, until
+/// Go's interface dispatch is modelled.
+fn go_module_private_proof(ext: &Extraction) -> Option<&'static str> {
+    if ext.language != "go" {
+        return None;
+    }
+    if ext.go_package.as_deref() == Some("main") {
+        return Some("nothing can import Go `package main`");
+    }
+    let dir = parent_dir(&ext.file_path);
+    if dir == "internal"
+        || dir.starts_with("internal/")
+        || dir.contains("/internal/")
+        || dir.ends_with("/internal")
+    {
+        return Some(
+            "Go permits importing an `internal/` package only from inside its parent tree",
+        );
+    }
+    None
+}
+
 /// Which kind of hole one file leaves in call coverage.
 ///
 /// The two are not interchangeable and are never folded into one number: a
@@ -1004,6 +1597,17 @@ pub enum ExtractionGap {
     /// exists because that exact silence, for a file discovery dropped, cost a
     /// `helper()` a confident delete verdict.
     NotParsed,
+    /// A grammar read the file and its tree holds `ERROR` or `MISSING` nodes.
+    ///
+    /// Not `ParseFailed` — the file contributed a `File` node and whatever was
+    /// declared outside the damage — and not clean either: tree-sitter's error
+    /// recovery can swallow everything after the fault. A `.tsx` holding
+    /// `type R<T> = import('m').Ref<T>;` loses every later declaration
+    /// (ScholarLM's `AuthContext.tsx` lost `AuthProvider` and `useAuth`), and a
+    /// Kotlin `suspend { … }` lambda opens an error region that swallows the
+    /// rest of the file. None of that appeared in any coverage inventory, so a
+    /// caller inside the damage was a caller nobody could know was missing.
+    PartialParse,
 }
 
 impl ExtractionGap {
@@ -1021,6 +1625,7 @@ impl ExtractionGap {
         ExtractionGap::CallBlind,
         ExtractionGap::ImportBlind,
         ExtractionGap::NotParsed,
+        ExtractionGap::PartialParse,
     ];
 
     /// The stored spelling, and the one a consumer reads back. One owner, so a
@@ -1033,6 +1638,7 @@ impl ExtractionGap {
             ExtractionGap::CallBlind => "call_blind",
             ExtractionGap::ImportBlind => "import_blind",
             ExtractionGap::NotParsed => "not_parsed",
+            ExtractionGap::PartialParse => "partial_parse",
         }
     }
 }
@@ -1189,11 +1795,25 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// act on" — is the unattributed tier silently manufacturing confident
 /// findings.
 ///
-/// **Only two classes qualify for the veto, not every non-builtin.** Classes
+/// **Three classes qualify for the veto, not every non-builtin.** Classes
 /// with affirmative evidence that the site meant something else — `Builtin`,
-/// `HostGlobal`, `LocalBinding`, `External`, `NoNamesake`, `ModulePath` — must
-/// not veto. What is left is the two tiers where the resolver admits it does
-/// not know: `UninferredReceiver` and `Unresolved`.
+/// `HostGlobal`, `External`, `NoNamesake`, `ModulePath` — must not veto. What is
+/// left is the three the ledger itself calls unattributed
+/// ([`UNATTRIBUTED_LABELS`]): `UninferredReceiver`, `UnresolvedMember`, `Unresolved`, and
+/// `LocalBinding`.
+///
+/// `LocalBinding` joined on 2026-10-09. It was excluded on the theory that a
+/// call to a name the enclosing scope binds is a callback, never a symbol —
+/// and the audit measured the theory wrong in exactly the shapes where it
+/// mattered: `let (n, shadow_b) = (1, opt.and_then(|p| shadow_b(p)))` (Rust
+/// C48) calls the *function* inside the initializer of the pattern that binds
+/// the name, `{ cwd = repoRoot() }` (a TypeScript destructured default) calls
+/// it while binding `cwd`, and a Go function-local `type entry` shadowed by a
+/// later `for _, entry := range` loses its only reference the same way. Each
+/// was published at 0.9 and each was live. The classifier is right that the
+/// scope binds the name; it cannot see *which* of the name's bindings a given
+/// site reached, so the honest reading is the one the other two classes get:
+/// "the resolver could not prove which", not "nothing calls this".
 ///
 /// `Route` joins `Call` and `Reference` as an admitted kind because a route
 /// handler that failed to bind is the strongest version of this case: the
@@ -1205,23 +1825,419 @@ pub(crate) fn unresolved_namesake_names(resolution: &ResolutionResult) -> HashSe
     resolution
         .unresolved
         .iter()
-        .filter(|row| {
-            matches!(
-                row.kind,
-                UnresolvedKind::Call | UnresolvedKind::Reference | UnresolvedKind::Route
-            ) && matches!(
-                row.class,
-                UnresolvedClass::UninferredReceiver | UnresolvedClass::Unresolved
-            ) && match &row.resolution {
-                Resolution::Unresolved { reason } => {
-                    reason != "implicit receiver method is overridden by an indexed subtype"
-                }
-                _ => true,
-            }
-        })
+        .filter(|row| is_namesake_veto_row(row))
         .map(|row| row.callee_name.as_str())
         .filter(|name| !name.is_empty())
         .collect()
+}
+
+/// The one predicate for "this ledger row may be a call to a symbol of its
+/// name", shared by the veto and by the site evidence an unconfirmed row
+/// carries — so the count a reader sees is the count that demoted the row.
+fn is_namesake_veto_row(row: &UnresolvedReference) -> bool {
+    matches!(
+        row.kind,
+        UnresolvedKind::Call | UnresolvedKind::Reference | UnresolvedKind::Route
+    ) && matches!(
+        row.class,
+        UnresolvedClass::UninferredReceiver
+            | UnresolvedClass::UnresolvedMember
+            | UnresolvedClass::Unresolved
+            | UnresolvedClass::LocalBinding
+    ) && match &row.resolution {
+        Resolution::Unresolved { reason } => {
+            reason != "implicit receiver method is overridden by an indexed subtype"
+        }
+        _ => true,
+    }
+}
+
+/// Whether a resolved edge is one candidate of several rather than a binding.
+///
+/// Shared by the liveness join and the site evidence, so an edge counted as an
+/// ambiguous caller is exactly an edge that made the row `only_ambiguous_callers`.
+fn is_ambiguous_edge(edge: &ResolvedEdge) -> bool {
+    !matches!(
+        edge.edge_kind,
+        EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
+    ) && edge
+        .resolution
+        .as_deref()
+        .is_some_and(Resolution::is_unproven_candidate_set)
+}
+
+/// The reason a symbol reached only through interface dispatch carries.
+pub const REACHED_BY_DISPATCH: &str = "reached_by_dispatch";
+
+/// Targets whose only unproven callers are interface dispatch edges.
+///
+/// A dispatch candidate and an ambiguous name match both leave a symbol at
+/// 0.4, but they are different evidence — the first is a type-system claim that
+/// the symbol *implements* what was called — and the reason says which. Keyed
+/// the way [`called_and_ambiguous_symbols`] keys its sets (qualified, short and
+/// member spellings), so the join cannot miss on spelling.
+fn dispatch_only_symbols(resolution: &ResolutionResult) -> HashSet<(String, String)> {
+    let spellings = |edge: &ResolvedEdge| -> Vec<(String, String)> {
+        let short = edge
+            .target_symbol
+            .rsplit("::")
+            .next()
+            .unwrap_or(edge.target_symbol.as_str());
+        let member = short.rsplit('.').next().unwrap_or(short);
+        [edge.target_symbol.as_str(), short, member]
+            .into_iter()
+            .map(|form| (edge.target_file.clone(), form.to_string()))
+            .collect()
+    };
+    let mut dispatched: HashSet<(String, String)> = HashSet::new();
+    let mut other: HashSet<(String, String)> = HashSet::new();
+    for edge in resolution
+        .edges
+        .iter()
+        .filter(|edge| is_ambiguous_edge(edge))
+    {
+        let bucket = if matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::Dispatch { .. })
+        ) {
+            &mut dispatched
+        } else {
+            &mut other
+        };
+        bucket.extend(spellings(edge));
+    }
+    dispatched.retain(|key| !other.contains(key));
+    dispatched
+}
+
+/// The manifests that scope module privacy, keyed by manifest family, each as
+/// `(directory, proof)` — `proof` is `None` for a manifest that publishes its
+/// package (a library), which is what stops a library nested in an application
+/// from inheriting the application's verdict.
+type ManifestScopes<'a> = HashMap<&'static str, Vec<(&'a str, Option<&'a str>)>>;
+
+/// Every module manifest in the corpus, by family. See
+/// [`devmap_extract::wiring::module_manifest_family`].
+fn manifest_scopes(extractions: &[Extraction]) -> ManifestScopes<'_> {
+    let mut scopes: ManifestScopes<'_> = HashMap::new();
+    let indexed: HashSet<&str> = extractions
+        .iter()
+        .map(|ext| ext.file_path.as_str())
+        .collect();
+    for ext in extractions {
+        let Some(family) = devmap_extract::wiring::module_manifest_family(&ext.file_path) else {
+            continue;
+        };
+        // A Swift package proves privacy per executable target: the package
+        // directory itself is a scope that proves nothing (so a library target
+        // beside the executable is not widened), and each executable target's
+        // directory, deeper and so nearer, carries the proof.
+        if family == "swiftpm" {
+            let entry = scopes.entry(family).or_default();
+            entry.push((parent_dir(&ext.file_path), None));
+            for annotation in &ext.wiring {
+                if annotation.kind == WiringKind::ModulePrivateScope {
+                    entry.push((
+                        annotation.target_symbol.as_str(),
+                        Some(annotation.details.as_str()),
+                    ));
+                }
+            }
+            continue;
+        }
+        let mut proof = ext
+            .wiring
+            .iter()
+            .find(|annotation| annotation.kind == WiringKind::ModulePrivateScope)
+            .map(|annotation| annotation.details.as_str());
+        // A `Cargo.toml` with no `[lib]` still gets one when `src/lib.rs`
+        // exists — Cargo discovers it — and the manifest cannot see that file.
+        if family == "cargo" {
+            let dir = parent_dir(&ext.file_path);
+            let lib = if dir.is_empty() {
+                "src/lib.rs".to_string()
+            } else {
+                format!("{dir}/src/lib.rs")
+            };
+            if indexed.contains(lib.as_str()) {
+                proof = None;
+            }
+        }
+        // `App.xcodeproj/project.pbxproj` scopes the directory holding the
+        // project bundle, not the bundle itself.
+        let dir = if family == "xcode" {
+            parent_dir(parent_dir(&ext.file_path))
+        } else {
+            parent_dir(&ext.file_path)
+        };
+        scopes.entry(family).or_default().push((dir, proof));
+    }
+    scopes
+}
+
+/// The proof the nearest manifest of `family` above `path` gives, if it gives
+/// one. The nearest wins, by directory depth.
+fn nearest_manifest_proof<'a>(
+    scopes: &ManifestScopes<'a>,
+    family: &str,
+    path: &str,
+) -> Option<&'a str> {
+    nearest_manifest(scopes, family, path).flatten()
+}
+
+/// The nearest manifest of `family` above `path`: `None` when there is none,
+/// `Some(proof)` — itself possibly `None` — when there is.
+fn nearest_manifest<'a>(
+    scopes: &ManifestScopes<'a>,
+    family: &str,
+    path: &str,
+) -> Option<Option<&'a str>> {
+    scopes
+        .get(family)?
+        .iter()
+        .filter(|(dir, _)| dir.is_empty() || path.starts_with(&format!("{dir}/")))
+        .max_by_key(|(dir, _)| dir.len())
+        .map(|(_, proof)| *proof)
+}
+
+/// Why an exported symbol is nonetheless private to its module, or `None` when
+/// nothing in the manifest or the language proves it.
+///
+/// The one owner of the widening. A language enters here only once its
+/// entry-point model is in place, because before that the population this
+/// opens is mostly framework callbacks (measured on Swift: about 15 of 26
+/// hidden internal-uncalled symbols):
+///
+/// * **Go** — `internal/` and `package main`, by the language's own import rule.
+/// * **TypeScript / JavaScript** — a package whose `package.json` publishes no
+///   entry point; framework lifecycle methods and JSX uses are already edges or
+///   exemptions.
+/// * **Kotlin / Java** — a Gradle module applying `com.android.application`,
+///   once Android components (by supertype), DI and serialization annotations,
+///   `override`s and `@Preview` are entry points.
+///
+/// * **Rust** — an item written `pub(crate)`, `pub(super)`, `pub(self)` or
+///   `pub(in path)`, which the language confines to its crate (a per-symbol
+///   annotation from the extractor); and every `pub` item of a package whose
+///   `Cargo.toml` declares no library target and which has no `src/lib.rs`.
+///   Trait-impl methods, `#[no_mangle]`/`extern "C"`, `#[tauri::command]` and
+///   the binary entry points are exempt before this point.
+///
+/// * **Swift** — an internal symbol of an `executableTarget` in `Package.swift`,
+///   or of an Xcode project whose every product is an application, extension
+///   or test bundle; a file inside a Swift package is judged by the package
+///   alone. Withheld — left not examined — when its type conforms to a
+///   protocol the corpus does not declare ([`swift_member_may_witness`]): a
+///   framework calls a requirement's witness by name, and an internal member
+///   can be one. `@objc`, `@IBAction`, `override`, `@main` and the runtime
+///   supertypes are exempt before this point.
+fn module_private_proof<'a>(
+    ext: &'a Extraction,
+    sym: &ExtractedSymbol,
+    scopes: &ManifestScopes<'a>,
+    external_bases: &HashMap<(&str, &str), &str>,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> Option<&'a str> {
+    if let Some(proof) = go_module_private_proof(ext) {
+        return Some(proof);
+    }
+    let family = match ext.code_language() {
+        "typescript" | "tsx" | "javascript" => "js",
+        "kotlin" | "java" => "gradle",
+        "rust" => {
+            if let Some(annotation) = ext.wiring.iter().find(|annotation| {
+                annotation.kind == WiringKind::ModulePrivateScope
+                    && annotation.target_symbol == sym.qualified_name
+            }) {
+                return Some(annotation.details.as_str());
+            }
+            "cargo"
+        }
+        "swift" => {
+            if swift_member_may_witness(ext, sym, external_bases, supertypes) {
+                return None;
+            }
+            if let Some(proof) = nearest_manifest(scopes, "swiftpm", &ext.file_path) {
+                return proof;
+            }
+            "xcode"
+        }
+        _ => return None,
+    };
+    nearest_manifest_proof(scopes, family, &ext.file_path)
+}
+
+/// How many ambiguous call sites reach a slot, and the smallest
+/// `(path, enclosing symbol, callee)` among them.
+type NamesakeSites<'a> = (u32, Option<(&'a str, &'a str, &'a str)>);
+
+/// Counts one call site against a slot and keeps the smallest site, so the
+/// reported example does not depend on edge order.
+fn record_namesake_site<'a>(entry: &mut NamesakeSites<'a>, site: (&'a str, &'a str, &'a str)) {
+    entry.0 = entry.0.saturating_add(1);
+    if entry
+        .1
+        .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
+    {
+        entry.1 = Some(site);
+    }
+}
+
+/// Whether a Swift member may be the witness of a requirement of a protocol the
+/// corpus does not declare.
+///
+/// `extension Controller: NSTableViewDelegate { func tableViewSelectionDidChange… }`
+/// and `struct Badge: ViewModifier { func body… }` are called by AppKit and
+/// SwiftUI by requirement name. Which members are requirements is in the SDK,
+/// not the corpus, so every member of a conforming type is withheld; the
+/// marker protocols [`supertype_dispatches_nothing`] lists do not count.
+fn swift_member_may_witness(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    external_bases: &HashMap<(&str, &str), &str>,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> bool {
+    let Some(owner) = sym
+        .parent_symbol
+        .as_deref()
+        .filter(|parent| *parent != ext.file_path)
+        .and_then(|parent| parent.rsplit("::").next())
+    else {
+        return false;
+    };
+    external_supertype_of(&ext.file_path, owner, supertypes, external_bases).is_some()
+}
+
+/// Fill in the site evidence of every unconfirmed row in one pass.
+///
+/// `sites` counts the ambiguous edges into the symbol and the unattributed
+/// ledger rows naming it — the two kinds of evidence that put a row below the
+/// confident tier. The first site is the lexically smallest `(path, enclosing
+/// symbol)`, located to a byte by the call or reference that produced it, so a
+/// reader can jump straight to it and the choice is stable across builds.
+fn attach_site_evidence(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+    reports: &mut [DeadSymbolReport],
+    pending: &[(usize, &str, &ExtractedSymbol)],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut by_target: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (slot, (_, file, sym)) in pending.iter().enumerate() {
+        by_target
+            .entry((file, sym.qualified_name.as_str()))
+            .or_default()
+            .push(slot);
+        by_target
+            .entry((file, sym.name.as_str()))
+            .or_default()
+            .push(slot);
+        by_name.entry(sym.name.as_str()).or_default().push(slot);
+    }
+
+    // Per slot: how many sites, and the smallest `(path, enclosing, callee)`.
+    let mut found: Vec<NamesakeSites> = vec![(0, None); pending.len()];
+
+    for edge in resolution
+        .edges
+        .iter()
+        .filter(|edge| is_ambiguous_edge(edge))
+    {
+        let short = edge
+            .target_symbol
+            .rsplit("::")
+            .next()
+            .unwrap_or(edge.target_symbol.as_str());
+        let member = short.rsplit('.').next().unwrap_or(short);
+        let mut slots: Vec<usize> = Vec::new();
+        for form in [edge.target_symbol.as_str(), short, member] {
+            if let Some(hit) = by_target.get(&(edge.target_file.as_str(), form)) {
+                slots.extend(hit.iter().copied());
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            let site = (
+                edge.source_file.as_str(),
+                edge.source_symbol.as_str(),
+                member,
+            );
+            record_namesake_site(&mut found[slot], site);
+        }
+    }
+    for row in resolution
+        .unresolved
+        .iter()
+        .filter(|row| is_namesake_veto_row(row))
+    {
+        let Some(slots) = by_name.get(row.callee_name.as_str()) else {
+            continue;
+        };
+        for &slot in slots {
+            let site = (
+                row.source_file.as_str(),
+                row.source_symbol.as_str(),
+                row.callee_name.as_str(),
+            );
+            record_namesake_site(&mut found[slot], site);
+        }
+    }
+
+    let by_path: HashMap<&str, &Extraction> = extractions
+        .iter()
+        .map(|ext| (ext.file_path.as_str(), ext))
+        .collect();
+    for (slot, (index, _, _)) in pending.iter().enumerate() {
+        let (sites, first) = found[slot];
+        let Some(report) = reports.get_mut(*index) else {
+            continue;
+        };
+        let first_byte = first.and_then(|(path, enclosing, callee)| {
+            site_byte(by_path.get(path).copied()?, enclosing, callee)
+        });
+        report.evidence = Some(DeadEvidence {
+            sites,
+            first_path: first.map(|(path, _, _)| path.to_string()),
+            first_byte,
+            first_line: None,
+        });
+    }
+}
+
+/// The byte offset of the first site in `enclosing` that names `callee`: a
+/// call, else a reference, else the enclosing symbol's own start.
+fn site_byte(ext: &Extraction, enclosing: &str, callee: &str) -> Option<u32> {
+    let call = ext
+        .calls
+        .iter()
+        .filter(|call| {
+            call.callee_name == callee && call.caller_symbol.as_deref() == Some(enclosing)
+        })
+        .map(|call| call.span.start_byte)
+        .min();
+    let reference = || {
+        ext.references
+            .iter()
+            .filter(|reference| {
+                reference.name == callee && reference.enclosing_symbol.as_deref() == Some(enclosing)
+            })
+            .map(|reference| reference.span.start_byte)
+            .min()
+    };
+    let declaration = || {
+        ext.symbols
+            .iter()
+            .filter(|sym| sym.qualified_name == enclosing)
+            .map(|sym| sym.span.start_byte)
+            .min()
+    };
+    call.or_else(reference)
+        .or_else(declaration)
+        .and_then(|byte| u32::try_from(byte).ok())
 }
 
 /// Reason carried by a finding the call-blind cap demoted.
@@ -1298,6 +2314,13 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // whose declarations nobody looked for.
             (ExtractionGap::NotParsed, reason.clone())
         } else if a_grammar_read_this_file(ext) {
+            if let ParseOutcome::Partial { .. } = &ext.parse_outcome {
+                gaps.push(ExtractionGapEntry {
+                    path: ext.file_path.clone(),
+                    gap: ExtractionGap::PartialParse,
+                    reason: partial_parse_reason(ext),
+                });
+            }
             // A clean parse in a language this build has no extractor for.
             // Both bits are asked independently: HCL is call-blind *and*
             // import-blind, Java only the second, and collapsing them would
@@ -1330,6 +2353,280 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
     gaps
 }
 
+/// Whether a partial parse can have erased a declaration, and with it the
+/// calls inside it: some error region of nonzero width that holds a name lies
+/// outside every declaration the extractor still found.
+///
+/// **A policy line, stated as one.** Every partial file is *listed* in the
+/// `partial_parse` inventory; this decides which are *charged* against the
+/// dead-code ceiling. The shapes it separates, measured:
+///
+/// * A `.tsx` holding `type R<T> = import('m').Ref<T>;` — the region runs from
+///   the alias past where `AuthProvider` and `useAuth` should start. Outside
+///   every surviving declaration: charged.
+/// * Kotlin `suspend { … }` — the region swallows the rest of the file and no
+///   declaration survives: charged.
+/// * `&raw` in valid Rust — tree-sitter-rust 0.23.3 reads a variable named
+///   `raw` after `&` as raw-borrow syntax and marks four bytes inside a
+///   function body that was otherwise parsed. Inside a surviving declaration,
+///   which the dead pass already exempts when a range overlaps it: listed, not
+///   charged. Most of this repository's partial files were this shape, and
+///   charging them took every Rust finding out of the confident tier.
+/// * A zero-width `MISSING` token: nothing was consumed: not charged.
+/// * A region holding no identifier character, which the extractor lists as
+///   `nameless_ranges` — the `>()` tree-sitter-typescript strands after
+///   `importOriginal<typeof import('m')>()`, or the lone `}` the CUDA
+///   preprocessor scanner leaves behind a macro whose body line ends in a
+///   comment. A declaration and a callee both need a name, so neither can be
+///   inside: listed, not charged. Charging that `>()` took every TypeScript
+///   finding of a 27-file fixture out of the confident tier.
+///
+/// The `File` symbol is not a declaration here — its span is the whole file,
+/// which would contain every region.
+fn partial_parse_erased_source(ext: &Extraction) -> bool {
+    partial_region_verdicts(ext)
+        .iter()
+        .any(|(_, verdict)| *verdict == PartialRegionVerdict::Charged)
+}
+
+/// Why one error region of a partial parse is, or is not, charged.
+///
+/// The one owner of the per-region line [`partial_parse_erased_source`]
+/// documents. The charge and the `partial_parse` reason both read it, so the
+/// listing cannot tell a reader a region was lost from the graph while the
+/// ceiling treated it as harmless, which is what one sentence for every
+/// partial file used to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialRegionVerdict<'a> {
+    /// Holds a name and lies outside every surviving declaration.
+    Charged,
+    /// Lies inside this surviving declaration (its name relative to the file).
+    InsideDeclaration(&'a str),
+    /// Of nonzero width, but the extractor found no identifier character in it.
+    Nameless,
+    /// A zero-width `MISSING` token: nothing was consumed.
+    ZeroWidth,
+}
+
+/// Every error region of `ext`'s partial parse with its verdict, in the order
+/// the extractor reported them, duplicates removed. Empty for any other
+/// outcome.
+///
+/// Inside a declaration, the innermost one is named: a method is more use to
+/// a reader than the `impl` around it.
+fn partial_region_verdicts(ext: &Extraction) -> Vec<(TextRange, PartialRegionVerdict<'_>)> {
+    let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &ext.parse_outcome
+    else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    error_ranges
+        .iter()
+        .filter(|range| seen.insert((range.start_byte, range.end_byte)))
+        .map(|range| {
+            let verdict = if range.end_byte <= range.start_byte {
+                PartialRegionVerdict::ZeroWidth
+            } else if nameless_ranges.contains(range) {
+                PartialRegionVerdict::Nameless
+            } else {
+                ext.symbols
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.kind != SymbolKind::File
+                            && symbol.span.start_byte <= range.start_byte
+                            && range.end_byte <= symbol.span.end_byte
+                    })
+                    .min_by_key(|symbol| symbol.span.end_byte - symbol.span.start_byte)
+                    .map_or(PartialRegionVerdict::Charged, |symbol| {
+                        PartialRegionVerdict::InsideDeclaration(
+                            symbol
+                                .qualified_name
+                                .strip_prefix(ext.file_path.as_str())
+                                .and_then(|rest| rest.strip_prefix("::"))
+                                .unwrap_or(symbol.name.as_str()),
+                        )
+                    })
+            };
+            (range.clone(), verdict)
+        })
+        .collect()
+}
+
+/// Whether a partially parsed file is charged against the dead-code ceiling.
+///
+/// File-level gates first — a grammar read it, its language extracts calls,
+/// it is not vendored — then the per-region verdict. One predicate, read by
+/// the count in [`extraction_coverage`] and the sentence in
+/// [`partial_parse_reason`].
+fn partial_parse_charged(ext: &Extraction) -> bool {
+    partial_parse_file_exemption(ext).is_none() && partial_parse_erased_source(ext)
+}
+
+/// Why a partially parsed file is not charged whatever its regions hold, or
+/// `None` when its regions decide.
+///
+/// A vendored file is excluded by the rule over-limit files are charged by: a
+/// vendored grammar's `parser.c` cannot call this repository's code. A file in
+/// a language with no call extractor is already charged as `call_blind`, and
+/// charging it again would double its weight in the share.
+fn partial_parse_file_exemption(ext: &Extraction) -> Option<String> {
+    if !a_grammar_read_this_file(ext) {
+        return Some("no grammar read this file".to_string());
+    }
+    if !ext.capabilities().contains(Capability::Calls) {
+        return Some(format!(
+            "`{}` has no call extractor in this build, so the file is charged as call_blind instead",
+            ext.language
+        ));
+    }
+    if devmap_extract::wiring::is_vendored_path(&ext.file_path) {
+        return Some(
+            "the file is vendored, and a vendored file cannot call this repository's code"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Most merged error regions a `partial_parse` reason spells out.
+const PARTIAL_PARSE_RANGE_SAMPLE: usize = 8;
+
+/// `ranges` as `a..b` items, at most [`PARTIAL_PARSE_RANGE_SAMPLE`] of them and
+/// how many more when cut — both numbers, never a sample read as the whole.
+fn partial_parse_range_list(ranges: &[String]) -> String {
+    let shown = ranges.len().min(PARTIAL_PARSE_RANGE_SAMPLE);
+    let more = ranges.len() - shown;
+    format!(
+        "{}{}",
+        ranges[..shown].join(", "),
+        if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// What a partial parse lost, and which of it is charged, stated.
+///
+/// Every region is named with its verdict from [`partial_region_verdicts`]:
+/// the charged ones, then each exemption with its reason. An exempt region is
+/// listed, never dropped, so the listing still says where the tree was
+/// damaged even where the damage is judged harmless.
+fn partial_parse_reason(ext: &Extraction) -> String {
+    let error_ranges: &[TextRange] = match &ext.parse_outcome {
+        ParseOutcome::Partial { error_ranges, .. } => error_ranges,
+        _ => &[],
+    };
+    let lost = partial_parse_lost(error_ranges);
+    let verdicts = partial_region_verdicts(ext);
+    let named = |pick: &dyn Fn(&PartialRegionVerdict<'_>) -> Option<String>| -> Vec<String> {
+        verdicts
+            .iter()
+            .filter_map(|(range, verdict)| {
+                pick(verdict)
+                    .map(|suffix| format!("{}..{}{suffix}", range.start_byte, range.end_byte))
+            })
+            .collect()
+    };
+    let charged = named(&|verdict| (*verdict == PartialRegionVerdict::Charged).then(String::new));
+    let inside = named(&|verdict| match verdict {
+        PartialRegionVerdict::InsideDeclaration(name) => Some(format!(" in `{name}`")),
+        _ => None,
+    });
+    let nameless = named(&|verdict| (*verdict == PartialRegionVerdict::Nameless).then(String::new));
+    let zero_width =
+        named(&|verdict| (*verdict == PartialRegionVerdict::ZeroWidth).then(String::new));
+
+    let mut sentence = lost;
+    if !charged.is_empty() {
+        let file_exemption = partial_parse_file_exemption(ext);
+        sentence.push_str(&format!(
+            "; {}: {} region(s) outside every surviving declaration ({}){}",
+            if file_exemption.is_some() {
+                "would be charged"
+            } else {
+                "charged"
+            },
+            charged.len(),
+            partial_parse_range_list(&charged),
+            match file_exemption {
+                Some(why) => format!(", but the file is not charged: {why}"),
+                None => " — declarations and calls inside them may be absent from the graph"
+                    .to_string(),
+            }
+        ));
+    }
+    let mut exempt: Vec<String> = Vec::new();
+    if !inside.is_empty() {
+        exempt.push(format!(
+            "{} region(s) inside a surviving declaration ({})",
+            inside.len(),
+            partial_parse_range_list(&inside)
+        ));
+    }
+    if !nameless.is_empty() {
+        exempt.push(format!(
+            "{} region(s) that hold no name ({})",
+            nameless.len(),
+            partial_parse_range_list(&nameless)
+        ));
+    }
+    if !zero_width.is_empty() {
+        exempt.push(format!(
+            "{} zero-width MISSING token(s) ({})",
+            zero_width.len(),
+            partial_parse_range_list(&zero_width)
+        ));
+    }
+    if !exempt.is_empty() {
+        sentence.push_str(&format!("; not charged: {}", exempt.join(", ")));
+    }
+    sentence
+}
+
+/// The byte ranges a partial parse lost, merged and stated.
+///
+/// Merged first because tree-sitter reports nested and overlapping regions —
+/// an `ERROR` spanning the file and a `MISSING` token inside it — and summing
+/// those would claim more bytes lost than the file holds. Both numbers are
+/// given when the list is cut: a sample presented as the whole is how a hole
+/// comes to look smaller than it is.
+fn partial_parse_lost(error_ranges: &[TextRange]) -> String {
+    let mut ranges: Vec<(usize, usize)> = error_ranges
+        .iter()
+        .map(|range| (range.start_byte, range.end_byte.max(range.start_byte)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let lost: usize = merged.iter().map(|(start, end)| end - start).sum();
+    let shown: Vec<String> = merged
+        .iter()
+        .take(PARTIAL_PARSE_RANGE_SAMPLE)
+        .map(|(start, end)| format!("{start}..{end}"))
+        .collect();
+    let more = merged.len().saturating_sub(shown.len());
+    format!(
+        "the tree holds ERROR/MISSING nodes over {} region(s), {lost} byte(s) lost: {}{}",
+        merged.len(),
+        shown.join(", "),
+        if more > 0 {
+            format!(", and {more} more region(s)")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// Count the files whose calls were never extracted.
 ///
 /// One owner for the question, shared with `code_graph.rs`, which needs the
@@ -1341,7 +2638,16 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     let mut coverage = ExtractionCoverage::default();
     let path_language: HashMap<&str, &str> = extractions
         .iter()
-        .map(|ext| (ext.file_path.as_str(), ext.language.as_str()))
+        .map(|ext| (ext.file_path.as_str(), ext.code_language()))
+        .collect();
+    // Partially parsed files whose language extracts calls: charged as blind,
+    // and so not counted as covered below — one side of the partition each.
+    // Which ones is `partial_parse_charged`'s call, the same predicate the
+    // `partial_parse` reason states its verdict from.
+    let partial_with_calls: HashSet<&str> = extractions
+        .iter()
+        .filter(|ext| partial_parse_charged(ext))
+        .map(|ext| ext.file_path.as_str())
         .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
@@ -1350,14 +2656,28 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             ExtractionGap::CallBlind => coverage.call_blind_files += 1,
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
             ExtractionGap::NotParsed => coverage.not_parsed_files += 1,
+            ExtractionGap::PartialParse => {
+                if partial_with_calls.contains(entry.path.as_str()) {
+                    coverage.partial_parse_files += 1;
+                }
+            }
         }
         // ImportBlind and NotParsed stay out of the capping numerator — same
         // policy as `blind_files` before language scoping. The rest feed the
         // per-language map that `cap_for` reads.
-        if matches!(
-            entry.gap,
-            ExtractionGap::ParseFailed | ExtractionGap::PatternRecovered | ExtractionGap::CallBlind
-        ) {
+        // A partial parse is charged where its language extracts calls: a
+        // call-blind language is already charged as `CallBlind`, and charging
+        // the same file twice would double its weight in the share.
+        let charged_partial = entry.gap == ExtractionGap::PartialParse
+            && partial_with_calls.contains(entry.path.as_str());
+        if charged_partial
+            || matches!(
+                entry.gap,
+                ExtractionGap::ParseFailed
+                    | ExtractionGap::PatternRecovered
+                    | ExtractionGap::CallBlind
+            )
+        {
             let lang = path_language
                 .get(entry.path.as_str())
                 .copied()
@@ -1374,11 +2694,14 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     // fold every `.md` and `.json` into the covered side and flatter the share
     // — the denominator is files whose calls were *looked for*, not files seen.
     for ext in extractions {
-        if a_grammar_read_this_file(ext) && ext.capabilities().contains(Capability::Calls) {
+        if a_grammar_read_this_file(ext)
+            && ext.capabilities().contains(Capability::Calls)
+            && !partial_with_calls.contains(ext.file_path.as_str())
+        {
             coverage.files_with_call_extraction += 1;
             *coverage
                 .covered_by_language
-                .entry(ext.language.clone())
+                .entry(ext.code_language().to_string())
                 .or_default() += 1;
         }
     }
@@ -1400,6 +2723,52 @@ pub struct LivenessOutcome {
 /// resolutions count as reaching.
 type CallIndex = (HashSet<(String, String)>, HashSet<(String, String)>);
 
+/// Record `symbol` of `file` as something an ambiguous site might name, under
+/// the three spellings a declaration is looked up by: its identity, its short
+/// name, and the member name with its owner stripped.
+///
+/// `ExtractedSymbol::name` is the bare `toJson`, while a site names
+/// `File::RemoteTaskEntity.toJson`, so without the stripped form the two never
+/// meet and the ambiguity is recorded against nothing. This became load-bearing
+/// when Kotlin extension functions gained their receiver: one Android file
+/// declares seven `private fun <T>.toJson()` on seven different types and calls
+/// every one of them as `it.toJson()` inside a `map { }`. The receiver `it`
+/// cannot be typed, so the site is ambiguous — and the other six candidates,
+/// each genuinely called, were reported dead at 0.9 confidence.
+///
+/// Bounded to the ambiguous set on purpose: this can only move a finding from
+/// 0.9 to 0.4 `only_ambiguous_callers`, never exempt it, so it cannot hide a
+/// symbol nothing calls. Doing the same for `called_symbols` would silently
+/// exempt every same-named method in the file, which is a different and much
+/// worse trade.
+fn record_ambiguous(set: &mut HashSet<(String, String)>, file: &str, symbol: &str) {
+    set.insert((file.to_string(), symbol.to_string()));
+    if let Some(short_name) = symbol.rsplit("::").next() {
+        set.insert((file.to_string(), short_name.to_string()));
+        if let Some(member) = short_name.rsplit('.').next() {
+            set.insert((file.to_string(), member.to_string()));
+        }
+    }
+}
+
+/// The ambiguous *sites*: every call that named several candidates and bound
+/// none of them (S2). A bare-name site with in-repo namesakes is carried by its
+/// ledger row — `Resolution::AmbiguousGlobal` with the complete candidate list
+/// — and never by edges, so liveness reads the ambiguity from the ledger.
+fn ambiguous_ledger_rows(
+    resolution: &ResolutionResult,
+) -> impl Iterator<Item = (&UnresolvedReference, &[(String, String)])> {
+    resolution.unresolved.iter().filter_map(|row| {
+        if row.kind != UnresolvedKind::Call {
+            return None;
+        }
+        match &row.resolution {
+            Resolution::AmbiguousGlobal { candidates, .. } => Some((row, &candidates[..])),
+            _ => None,
+        }
+    })
+}
+
 fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
     // File-scoped called symbols: (target_file, symbol_name_or_qualified_name)
     let mut called_symbols: HashSet<(String, String)> = HashSet::new();
@@ -1419,39 +2788,12 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         // An ambiguous or explicitly unresolved edge is evidence that a
         // symbol may be called, not proof that any one candidate is called.
         // Do not turn speculative resolution into a false liveness negative.
-        if matches!(
-            edge.resolution.as_deref(),
-            Some(Resolution::AmbiguousGlobal { .. })
-                | Some(Resolution::LanguageServerDispatch { .. })
-        ) {
-            ambiguous_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
-            if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
-                ambiguous_symbols.insert((edge.target_file.clone(), short_name.to_string()));
-                // …and the member name with its owner stripped.
-                //
-                // `ExtractedSymbol::name` is the bare `toJson`, while an edge
-                // names `File::RemoteTaskEntity.toJson`, so without this the two
-                // never meet and the ambiguity is recorded against nothing.
-                //
-                // This became load-bearing when Kotlin extension functions
-                // gained their receiver: one Android file declares seven
-                // `private fun <T>.toJson()` on seven different types and calls
-                // every one of them as `it.toJson()` inside a `map { }`. The
-                // receiver `it` cannot be typed, so the resolver emits an
-                // *ambiguous* edge naming one candidate — and the other six,
-                // each genuinely called, were reported dead at 0.9 confidence.
-                // Before the receiver fix all seven collapsed into one symbol
-                // and the question could not arise.
-                //
-                // Bounded to the ambiguous set on purpose: this can only move a
-                // finding from 0.9 to 0.4 `only_ambiguous_callers`, never exempt
-                // it, so it cannot hide a symbol nothing calls. Doing the same
-                // for `called_symbols` would silently exempt every same-named
-                // method in the file, which is a different and much worse trade.
-                if let Some(member) = short_name.rsplit('.').next() {
-                    ambiguous_symbols.insert((edge.target_file.clone(), member.to_string()));
-                }
-            }
+        if is_ambiguous_edge(edge) {
+            record_ambiguous(
+                &mut ambiguous_symbols,
+                &edge.target_file,
+                &edge.target_symbol,
+            );
             continue;
         }
         if matches!(
@@ -1463,6 +2805,12 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         called_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
         if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
             called_symbols.insert((edge.target_file.clone(), short_name.to_string()));
+        }
+    }
+
+    for (_, candidates) in ambiguous_ledger_rows(resolution) {
+        for (file, symbol) in candidates {
+            record_ambiguous(&mut ambiguous_symbols, file, symbol);
         }
     }
 
@@ -1509,6 +2857,49 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
 /// The `.or_else` precedence of the original chain is preserved exactly, because
 /// the reason string is a machine token in three tests: symbol wiring, heritage
 /// override, Go interface, C header, exported owner, Go build variant.
+/// Why a Kotlin or Java class is live: an Android manifest declares it as a
+/// component. Matched on the class's package-qualified name, inside the module
+/// directory the manifest governs; a name written `.Name`, or bare as `Name`,
+/// is relative to the module's namespace, which only the build script knows,
+/// so it matches on its suffix.
+fn android_component_reason(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    components: &[(&str, &str, &str)],
+) -> Option<String> {
+    if components.is_empty()
+        || !matches!(ext.language.as_str(), "kotlin" | "java")
+        || sym.kind != SymbolKind::Class
+        || sym
+            .parent_symbol
+            .as_deref()
+            .is_some_and(|parent| parent != ext.file_path)
+    {
+        return None;
+    }
+    let package = ext.jvm_package.as_deref()?;
+    let qualified = format!("{package}.{}", sym.name);
+    components.iter().find_map(|(module, name, details)| {
+        let in_module = module.is_empty()
+            || ext
+                .file_path
+                .strip_prefix(module)
+                .is_some_and(|rest| rest.starts_with('/'));
+        // `.Sync` and a bare `Sync` are both relative to the namespace; only a
+        // dotted name is written out in full.
+        let names_it = if name.starts_with('.') {
+            qualified.ends_with(name)
+        } else if !name.contains('.') {
+            qualified
+                .strip_suffix(name)
+                .is_some_and(|head| head.ends_with('.'))
+        } else {
+            qualified == *name
+        };
+        (in_module && names_it).then(|| (*details).to_string())
+    })
+}
+
 fn symbol_exemption_index(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
@@ -1516,10 +2907,15 @@ fn symbol_exemption_index(
     ambiguous: &HashSet<(String, String)>,
 ) -> HashMap<(String, String), String> {
     let supertypes = supertypes_by_type(resolution);
+    // Dispatch candidates are not proven reached. The direct edge to the
+    // interface method is a call, so the heritage exemption would spare every
+    // conformer and the `reached_by_dispatch` verdict would never run.
+    let dispatch_only = dispatch_only_symbols(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
     let go_value_mentions = go_value_mentioned_names(extractions);
+    let go_exported_specs = go_exported_interface_specs(extractions);
 
     // The one annotation kind whose target lives in a *different* file from the
     // one that carries it: `[project.scripts] cli = "pkg.mod:func"` is written
@@ -1537,6 +2933,19 @@ fn symbol_exemption_index(
         .flat_map(|ext| ext.wiring.iter())
         .filter(|w| w.kind == WiringKind::ConfigEntryPoint)
         .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
+        .collect();
+
+    // The Android half of the same declaration: a manifest names a class by
+    // package-qualified name, so the join is made here, where each class's own
+    // `package` header is known. `(module dir, name as written, why)`.
+    let android_components: Vec<(&str, &str, &str)> = config_entry_points
+        .iter()
+        .filter_map(|(target, details)| {
+            let (module, name) = target
+                .strip_prefix(devmap_extract::wiring::ANDROID_COMPONENT_TARGET_PREFIX)?
+                .split_once('|')?;
+            Some((module, name, *details))
+        })
         .collect();
 
     let mut index: HashMap<(String, String), String> = HashMap::new();
@@ -1557,14 +2966,21 @@ fn symbol_exemption_index(
             .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
             .collect();
 
+        // Read by the corpus-wide exported-interface arm below; empty for
+        // every other language, which never reaches it.
+        let go_param_counts = if ext.language == "go" {
+            ext.go_method_param_counts()
+        } else {
+            BTreeMap::new()
+        };
+
         // Cross-file half of the Go interface exemption. Extraction closes the
         // same-file case as a wiring annotation; the package-wide join can only
         // happen here, where every file is in scope.
         let go_interface_exemptions: HashMap<&str, String> = go_package_key(ext)
             .and_then(|key| go_interface_specs.get(&key))
             .map(|specs| {
-                let param_counts = ext.go_method_param_counts();
-                go_interface_method_matches(&ext.symbols, &param_counts, specs.iter().copied())
+                go_interface_method_matches(&ext.symbols, &go_param_counts, specs.iter().copied())
                     .into_iter()
                     .map(|(symbol, interface_name)| {
                         (
@@ -1606,8 +3022,14 @@ fn symbol_exemption_index(
                 .contains(&(ext.file_path.clone(), sym.name.clone()))
                 || ambiguous.contains(&(ext.file_path.clone(), sym.qualified_name.clone()));
 
-            let heritage =
-                reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called);
+            let reached_only_by_dispatch = dispatch_only
+                .contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()));
+            let heritage = (!reached_only_by_dispatch)
+                .then(|| {
+                    reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called)
+                })
+                .flatten();
 
             let reason: Option<String> = wired
                 .get(sym.qualified_name.as_str())
@@ -1621,6 +3043,7 @@ fn symbol_exemption_index(
                         .get(sym.qualified_name.as_str())
                         .map(|details| (*details).to_string())
                 })
+                .or_else(|| android_component_reason(ext, sym, &android_components))
                 .or(heritage)
                 .or_else(|| {
                     go_interface_exemptions
@@ -1697,6 +3120,38 @@ fn symbol_exemption_index(
                                 files.iter().any(|file| *file != ext.file_path.as_str())
                             }))
                     .then(|| GO_VALUE_MENTION_REASON.to_string())
+                })
+                // An exported Go method whose shape some interface declares.
+                //
+                // Exported methods never needed this while every exported Go
+                // name was exempt for being exported. Widening a module-private
+                // package into the unconfirmed tier makes them candidates, and
+                // an exported method is satisfiable from *any* package — so the
+                // join is corpus-wide, unlike the package-scoped one above,
+                // which exists for unexported names only. The standard-library
+                // interfaces are listed by name and arity because `fmt` calls
+                // `String()` and the corpus never does.
+                // Only where the package is module-private: in any other
+                // package an exported method is spared for being exported, and
+                // filing it under an interface would shrink the `excluded`
+                // count of symbols never examined for their visibility.
+                .or_else(|| {
+                    if ext.language != "go"
+                        || sym.kind != SymbolKind::Method
+                        || !sym.is_exported
+                        || go_module_private_proof(ext).is_none()
+                    {
+                        return None;
+                    }
+                    let params = *go_param_counts.get(sym.qualified_name.as_str())?;
+                    go_exported_specs
+                        .get(&(sym.name.as_str(), params))
+                        .map(|interface_name| go_interface_exemption_reason(interface_name))
+                        .or_else(|| {
+                            GO_STD_INTERFACE_METHODS
+                                .contains(&(sym.name.as_str(), params))
+                                .then(|| GO_STD_INTERFACE_REASON.to_string())
+                        })
                 });
 
             if let Some(reason) = reason {
@@ -1751,6 +3206,16 @@ pub fn analyze_liveness_with_coverage(
     // file discovery never read may hold the only call to a symbol here, so a
     // refusal has to reach `coverage.cap()` the same way a parse failure does.
     coverage.discovery_refused_files = discovery.charged();
+    // An over-limit file is charged by language, like a parse failure: it has
+    // a path, so it has a language, and a 2 MB generated Go client must not
+    // demote a Python finding.
+    for (_, language) in discovery.charged_over_limit() {
+        coverage.over_limit_files += 1;
+        *coverage
+            .blind_by_language
+            .entry(language.to_string())
+            .or_default() += 1;
+    }
     // Computed once for the whole corpus: the join is name-only, so it has no
     // per-file component to recompute.
     let unresolved_names = unresolved_namesake_names(resolution);
@@ -1765,7 +3230,15 @@ pub fn analyze_liveness_with_coverage(
     let exemptions =
         symbol_exemption_index(extractions, resolution, &called_symbols, &ambiguous_symbols);
 
+    let dispatch_only = dispatch_only_symbols(resolution);
     let mut reports = Vec::new();
+    // Unconfirmed rows awaiting their site evidence, by report index. Filled
+    // in one pass over the edges and the ledger after the loop, so the cost is
+    // proportional to the rows that need it rather than to the corpus.
+    let mut pending: Vec<(usize, &str, &ExtractedSymbol)> = Vec::new();
+    let scopes = manifest_scopes(extractions);
+    let supertypes = supertypes_by_type(resolution);
+    let external_bases = external_supertypes(extractions, &supertypes);
 
     for ext in extractions {
         // X6: Parse-failed files must NEVER be reported as confirmed dead code
@@ -1814,9 +3287,9 @@ pub fn analyze_liveness_with_coverage(
         // percent transient. The reason and the number now agree.
         let cap = |confidence: f32| {
             if file_is_call_blind {
-                coverage.cap_call_blind_file_for(&ext.language, confidence)
+                coverage.cap_call_blind_file_for(ext.code_language(), confidence)
             } else {
-                coverage.cap_for(&ext.language, confidence)
+                coverage.cap_for(ext.code_language(), confidence)
             }
         };
 
@@ -1852,10 +3325,19 @@ pub fn analyze_liveness_with_coverage(
         // population is outside every liveness verdict", and leaving one
         // surface to rediscover that the day a YAML grammar is linked is how
         // the three surfaces disagreed in the first place.
-        let is_file_exempt = is_parse_failed
-            || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
-            || file_wiring.iter().any(|w| {
-                matches!(
+        let exempting_wiring = file_wiring.iter().copied().find(|w| {
+            // A Go `main.go` or a Rust `main.rs` is a binary's entry *file*,
+            // and the language's entry *function* is already exempt by
+            // name at symbol level (`go_runtime_entry_reason`, the Rust
+            // `main` attribute rule). Exempting the whole file on top of
+            // that spared every other function in it: an uncalled helper
+            // in `main.go` was never reported while the same helper in the
+            // package's next file was. The rule this list states — a
+            // file-level claim is not a claim about the symbols in it —
+            // applies, so for these two the annotation stays a claim about
+            // the file.
+            (w.kind == WiringKind::ScriptEntry && !matches!(ext.language.as_str(), "go" | "rust"))
+                || matches!(
                     w.kind,
                     WiringKind::Vendored
                         | WiringKind::TestFile
@@ -1866,7 +3348,6 @@ pub fn analyze_liveness_with_coverage(
                         // the file and its symbols.
                         | WiringKind::Fixture
                         | WiringKind::GeneratedFile
-                        | WiringKind::ScriptEntry
                         | WiringKind::StructuralExempt
                         | WiringKind::FrameworkDecorator
                         | WiringKind::Launcher
@@ -1877,7 +3358,10 @@ pub fn analyze_liveness_with_coverage(
                         // the question was reported as dead on every build.
                         | WiringKind::AllowUnwired
                 )
-            });
+        });
+        let is_file_exempt = is_parse_failed
+            || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
+            || exempting_wiring.is_some();
 
         // Per-symbol exemptions: a runtime, framework, or harness reaches the
         // symbol without an explicit call site, or the language forbids the
@@ -1898,7 +3382,11 @@ pub fn analyze_liveness_with_coverage(
         } else if is_parse_failed {
             Some("Parse failed — excluded from dead code candidates".to_string())
         } else {
-            file_wiring.first().map(|w| w.details.clone())
+            // From the annotation that exempted the file, never merely the
+            // first one it carries: a Go `main.go`'s `ScriptEntry` no longer
+            // exempts its symbols, and naming it as their reason would say it
+            // did.
+            exempting_wiring.map(|w| w.details.clone())
         };
 
         // One report per graph identity. Two `#[cfg]` variants of one method —
@@ -1912,7 +3400,7 @@ pub fn analyze_liveness_with_coverage(
         let mut overlaps_by_identity: HashMap<&str, bool> = HashMap::new();
         for sym in &ext.symbols {
             let overlaps = match &ext.parse_outcome {
-                ParseOutcome::Partial { error_ranges } => error_ranges.iter().any(|range| {
+                ParseOutcome::Partial { error_ranges, .. } => error_ranges.iter().any(|range| {
                     sym.span.start_byte < range.end_byte && range.start_byte < sym.span.end_byte
                 }),
                 ParseOutcome::Clean
@@ -1960,25 +3448,41 @@ pub fn analyze_liveness_with_coverage(
                 .get(&(ext.file_path.clone(), sym.qualified_name.clone()))
                 .map(String::as_str);
 
-            if !is_called
-                && is_ambiguously_called
-                && !is_exported
-                && !is_file_exempt
-                && symbol_exemption.is_none()
-                && !overlaps_parse_error
-            {
+            // Nothing else spares it: not its file, not a recorded exemption,
+            // not a parse error over its span. Every report branch below
+            // requires this; the exempt branch is what is left.
+            let unspared = !is_file_exempt && symbol_exemption.is_none() && !overlaps_parse_error;
+            let identity = dead_symbol_identity(sym, &ext.file_path);
+            let language = ext.code_language();
+            let dispatch_reason = (!is_called && !is_exported && unspared)
+                .then(|| {
+                    unconfirmed_dispatch_reason(ext, sym, &identity, &supertypes, &external_bases)
+                })
+                .flatten();
+
+            if !is_called && is_ambiguously_called && !is_exported && unspared {
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
                     confidence: cap(0.4),
                     is_exempt: false,
-                    exemption_reason: Some("only_ambiguous_callers".to_string()),
+                    exemption_reason: Some(
+                        if dispatch_only
+                            .contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                            || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()))
+                        {
+                            REACHED_BY_DISPATCH
+                        } else {
+                            "only_ambiguous_callers"
+                        }
+                        .to_string(),
+                    ),
+                    evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called
                 && !is_exported
-                && !is_file_exempt
-                && symbol_exemption.is_none()
-                && !overlaps_parse_error
+                && unspared
                 && unresolved_names.contains(sym.name.as_str())
             {
                 // The defect ledger, read at last. Same tier as
@@ -1991,47 +3495,92 @@ pub fn analyze_liveness_with_coverage(
                 // Placed after the ambiguity branch so a symbol with both keeps
                 // the older, more specific token rather than silently changing
                 // what those tests observe.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
                     confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some(UNRESOLVED_NAMESAKE_REASON.to_string()),
+                    evidence: Some(DeadEvidence::none()),
                 });
-            } else if !is_called
-                && !is_exported
-                && !is_file_exempt
-                && symbol_exemption.is_none()
-                && !overlaps_parse_error
-            {
+            } else if let Some(reason) = dispatch_reason {
+                // Something outside the graph dispatches to it by name — a
+                // library base class, or whatever an object literal is handed
+                // to. Same tier as the namesake veto, its own reason.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
+                reports.push(DeadSymbolReport {
+                    symbol_name: identity,
+                    file_path: ext.file_path.clone(),
+                    confidence: cap(0.4),
+                    is_exempt: false,
+                    exemption_reason: Some(reason),
+                    evidence: Some(DeadEvidence::none()),
+                });
+            } else if !is_called && !is_exported && unspared {
                 // The corpus-level half of X6. A confident finding here means
                 // "no edge in the whole generation names this symbol" — which
                 // is only evidence when every file got to contribute its edges.
                 // While it did not, the finding stays visible (hiding it would
                 // be its own lie) but must not reach the tier `CLAUDE.md` tells
                 // agents to act on.
+                let confidence = cap(0.9);
+                if confidence > HIGHEST_DEGRADED_CONFIDENCE && !confident_tier_eligible(language) {
+                    // The evidence earned the confident tier and the language
+                    // has not. Only a row that would otherwise publish there is
+                    // touched: a coverage-capped row already says why it is
+                    // unconfirmed, and its graded confidence is the ranking
+                    // the coverage curve exists to keep.
+                    reports.push(DeadSymbolReport {
+                        symbol_name: identity,
+                        file_path: ext.file_path.clone(),
+                        confidence: UNPROVEN_TIER_CONFIDENCE,
+                        is_exempt: false,
+                        exemption_reason: Some(confident_tier_unproven_reason(language)),
+                        evidence: Some(DeadEvidence::none()),
+                    });
+                } else {
+                    reports.push(DeadSymbolReport {
+                        symbol_name: identity,
+                        file_path: ext.file_path.clone(),
+                        confidence,
+                        is_exempt: false,
+                        // Most specific reason wins, matching the exempt branch
+                        // below. A symbol in a call-blind file is not merely
+                        // downstream of somebody else's coverage hole — its own
+                        // file is the hole, and the reader's next move differs:
+                        // corpus loss invites a re-index, a missing extractor
+                        // does not.
+                        exemption_reason: if file_is_call_blind {
+                            Some(CALL_BLIND_REASON.to_string())
+                        } else if coverage.is_complete_for(language) {
+                            None
+                        } else {
+                            Some(COVERAGE_LOSS_REASON.to_string())
+                        },
+                        evidence: None,
+                    });
+                }
+            } else if let Some(proof) = (!is_called && is_exported && unspared)
+                .then(|| module_private_proof(ext, sym, &scopes, &external_bases, &supertypes))
+                .flatten()
+            {
+                // An export the manifest proves module-private. The keyword
+                // that kept it off the list is not evidence of a caller, but
+                // the language's entry-point model is not proven either, so it
+                // enters at the unconfirmed tier and never above it.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
-                    confidence: cap(0.9),
+                    confidence: cap(UNPROVEN_TIER_CONFIDENCE),
                     is_exempt: false,
-                    // Most specific reason wins, matching the exempt branch
-                    // below. A symbol in a call-blind file is not merely
-                    // downstream of somebody else's coverage hole — its own
-                    // file is the hole, and the reader's next move differs:
-                    // corpus loss invites a re-index, a missing extractor does
-                    // not.
-                    exemption_reason: if file_is_call_blind {
-                        Some(CALL_BLIND_REASON.to_string())
-                    } else if coverage.is_complete_for(&ext.language) {
-                        None
-                    } else {
-                        Some(COVERAGE_LOSS_REASON.to_string())
-                    },
+                    exemption_reason: Some(exported_unreferenced_reason(proof)),
+                    evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called {
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
                     confidence: 0.3,
                     is_exempt: true,
@@ -2043,12 +3592,21 @@ pub fn analyze_liveness_with_coverage(
                         symbol_exemption
                             .map(str::to_string)
                             .or_else(|| file_reason.clone())
-                            .or_else(|| Some("Exported or exempt".to_string()))
+                            .or_else(|| {
+                                Some(if is_exported {
+                                    EXPORTED_NOT_EXAMINED_REASON.to_string()
+                                } else {
+                                    FILE_EXEMPT_REASON.to_string()
+                                })
+                            })
                     },
+                    evidence: None,
                 });
             }
         }
     }
+
+    attach_site_evidence(extractions, resolution, &mut reports, &pending);
 
     LivenessOutcome { reports, coverage }
 }
@@ -2093,6 +3651,152 @@ mod tests {
         }
     }
 
+    /// A partial parse is listed wherever it is, and charged only where it can
+    /// hide a caller: a call-extracting language, outside a vendored tree, a
+    /// region that holds a name. The reason names the merged byte ranges lost,
+    /// overlap counted once.
+    #[test]
+    fn partial_parses_are_listed_everywhere_and_charged_where_they_can_hide_a_caller() {
+        let ranges = |ranges: &[(usize, usize)]| -> Vec<TextRange> {
+            ranges
+                .iter()
+                .map(|(start_byte, end_byte)| TextRange {
+                    start_byte: *start_byte,
+                    end_byte: *end_byte,
+                })
+                .collect()
+        };
+        let partial = |path: &str, errors: &[(usize, usize)], nameless: &[(usize, usize)]| {
+            let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
+            ext.file_path = path.to_string();
+            ext.parse_outcome = ParseOutcome::Partial {
+                error_ranges: ranges(errors),
+                nameless_ranges: ranges(nameless),
+            };
+            ext
+        };
+        // `def x(): pass` spans bytes 0..13: a region inside it is the `&raw`
+        // shape — the declaration survived — and a zero-width one consumed
+        // nothing. Both are listed and neither is charged. Nor is a region
+        // outside it that the extractor found holds no name (a stray `}`); a
+        // second region beside it that does hold one is charged.
+        let corpus = vec![
+            partial("src/app.py", &[(10, 50), (20, 30), (60, 64)], &[]),
+            partial("src/inner.py", &[(4, 8), (11, 11)], &[]),
+            partial("vendor/lib/x.py", &[(20, 40)], &[]),
+            partial("src/stray.py", &[(20, 21)], &[(20, 21)]),
+            partial("src/both.py", &[(20, 21), (30, 40)], &[(20, 21)]),
+        ];
+        let listed: Vec<(String, String)> = extraction_gaps(&corpus)
+            .into_iter()
+            .filter(|entry| entry.gap == ExtractionGap::PartialParse)
+            .map(|entry| (entry.path, entry.reason))
+            .collect();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "src/app.py",
+                "src/inner.py",
+                "vendor/lib/x.py",
+                "src/stray.py",
+                "src/both.py"
+            ],
+            "every partial file is listed"
+        );
+        assert!(
+            listed[0]
+                .1
+                .contains("2 region(s), 44 byte(s) lost: 10..50, 60..64"),
+            "nested ranges are merged before they are summed: {}",
+            listed[0].1
+        );
+        let coverage = extraction_coverage(&corpus);
+        assert_eq!(
+            coverage.partial_parse_files, 2,
+            "only the files with a region that holds a name and lies outside every \
+             surviving declaration, outside a vendored tree, are charged"
+        );
+        assert_eq!(coverage.blind_by_language.get("python"), Some(&2));
+        assert!(!coverage.is_complete());
+    }
+
+    /// The listing says which regions were charged and which were not, and
+    /// why — the same verdict the charge was decided by. Before, every
+    /// partial file read "declarations and calls inside them are absent from
+    /// the graph", including the `&raw` shape whose declaration survived and
+    /// which was never charged: an exemption the reader could not see.
+    #[test]
+    fn a_partial_parse_reason_names_each_exempt_region_and_why() {
+        let region = |start_byte: usize, end_byte: usize| TextRange {
+            start_byte,
+            end_byte,
+        };
+        let partial = |path: &str, errors: Vec<TextRange>, nameless: Vec<TextRange>| {
+            let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
+            ext.file_path = path.to_string();
+            ext.parse_outcome = ParseOutcome::Partial {
+                error_ranges: errors,
+                nameless_ranges: nameless,
+            };
+            ext
+        };
+        let reason_for = |ext: &Extraction| -> String {
+            extraction_gaps(std::slice::from_ref(ext))
+                .into_iter()
+                .find(|entry| entry.gap == ExtractionGap::PartialParse)
+                .map(|entry| entry.reason)
+                .expect("a partial file is listed")
+        };
+
+        // `def x(): pass` spans 0..13. Inside it, a stray nameless `}`
+        // outside it, a zero-width MISSING token, and one charged region.
+        let mixed = partial(
+            "src/mixed.py",
+            vec![region(4, 8), region(20, 21), region(11, 11), region(30, 40)],
+            vec![region(20, 21)],
+        );
+        let reason = reason_for(&mixed);
+        assert!(reason.contains("byte(s) lost"), "{reason}");
+        assert!(
+            reason.contains("charged: 1 region(s) outside every surviving declaration (30..40)"),
+            "{reason}"
+        );
+        assert!(
+            reason
+                .contains("not charged: 1 region(s) inside a surviving declaration (4..8 in `x`)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("1 region(s) that hold no name (20..21)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("1 zero-width MISSING token(s) (11..11)"),
+            "{reason}"
+        );
+
+        // Nothing charged: the reason must not claim anything was lost from
+        // the graph.
+        let exempt = partial("src/raw.py", vec![region(4, 8)], Vec::new());
+        let reason = reason_for(&exempt);
+        assert!(reason.contains("not charged"), "{reason}");
+        assert!(
+            !reason.contains("outside every surviving declaration"),
+            "{reason}"
+        );
+        assert!(!reason.contains("absent from the graph"), "{reason}");
+
+        // A vendored file's charged-shape region is named, and so is the
+        // reason the file as a whole is not charged.
+        let vendored = partial("vendor/lib/x.py", vec![region(30, 40)], Vec::new());
+        let reason = reason_for(&vendored);
+        assert!(reason.contains("vendored"), "{reason}");
+        assert_eq!(extraction_coverage(&[vendored]).partial_parse_files, 0);
+    }
+
     fn extraction(symbols: Vec<ExtractedSymbol>, error: Option<(usize, usize)>) -> Extraction {
         let mut ext = devmap_extract::extract_file("f.py", "def x(): pass\n");
         ext.symbols = symbols;
@@ -2103,6 +3807,7 @@ mod tests {
                     start_byte,
                     end_byte,
                 }],
+                nameless_ranges: Vec::new(),
             },
             None => ParseOutcome::Clean,
         };

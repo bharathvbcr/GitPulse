@@ -14,6 +14,8 @@ import { autoInit } from "../../codeintel/autoInit";
 import * as workspaceSync from "../../codeintel/workspaceSync";
 import { withDeferralRetry } from "../../ipc/invoke";
 import { jitteredRetryDelayMs } from "../../async/deferral";
+import { harnessStore } from "../harnessStore";
+import { gitActionCount } from "../../desktop/exitGuard";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -572,12 +574,17 @@ describe("repository content revisions", () => {
       return snapshotFor("/r/content").statuses as never;
     } }));
     await store.openRepo("/r/content");
+    const opened = get(store.contentRevisions)["/r/content"];
+    // The second refresh waits for the slow first one and reads once more
+    // (hydrateFlight.ts), so both snapshots land and each advances the revision.
     const pending = store.refresh();
-    await store.refresh();
-    const current = get(store.contentRevisions)["/r/content"];
+    const queued = store.refresh();
     slow.resolve(snapshotFor("/r/content").statuses);
     await pending;
-    expect(get(store.contentRevisions)["/r/content"]).toBe(current);
+    await queued;
+    const current = get(store.contentRevisions)["/r/content"];
+    expect(current).not.toBe(opened);
+    // A snapshot that fails (call 4) publishes nothing as fresh content.
     await store.refresh();
     expect(get(store.contentRevisions)["/r/content"]).toBe(current);
   });
@@ -883,10 +890,10 @@ describe("repoStore tabs", () => {
       expect(get(store).activeTabId).toBe(id);
     });
 
-    it("says when some of what it ends are agents hosted from other checkouts of the repository", async () => {
+    it("says when some sessions are agents hosted from other checkouts of the repository", async () => {
       // An agent in a worktree with no tab of its own runs in its repository's
-      // tab (taskLaunches.hostTabFor). Closing that tab ends it, and "the
-      // shells running in it" did not say that some were not in it at all.
+      // tab (taskLaunches.hostTabFor). Closing that tab used to end it; it now
+      // keeps running under Sessions, and the question says so.
       const graph = makeGraph();
       const store = createRepoStore({
         invoke: makeInvoke(), storage: memoryStorage(), caseInsensitive: true, graph: graph.api, filter: makeFilter(),
@@ -895,7 +902,7 @@ describe("repoStore tabs", () => {
       await store.openRepo("/r/alpha");
       const closing = store.closeTab(get(store).activeTabId!);
       await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End 3 terminal sessions?"));
-      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another checkout of this repository, hosted here; closing ends them too.");
+      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another checkout of this repository, hosted here; they keep running.");
       cancelPrompt();
       await closing;
       expect(get(store).openTabs).toHaveLength(1);
@@ -1312,6 +1319,107 @@ describe("repoStore tabs", () => {
     expect(get(store).generation).toBeGreaterThan(genA2);
   });
 
+  it("writes a pending workspace change when the page is hidden or closed", async () => {
+    // The quit flush listened for `pagehide` on `document`, but the browser
+    // fires it at `window` and window events never reach document listeners,
+    // so a change inside the debounce window was lost on close.
+    const listeners = new Map<string, Set<() => void>>();
+    const win = {
+      addEventListener: (type: string, fn: () => void) => {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type)!.add(fn);
+      },
+      removeEventListener: (type: string, fn: () => void) => void listeners.get(type)?.delete(fn),
+    };
+    vi.stubGlobal("window", win);
+    try {
+      const storage = memoryStorage();
+      const filter = makeFilter();
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage,
+        caseInsensitive: true,
+        graph: makeGraph().api,
+        filter,
+      });
+      await store.openRepo("/r/quit-a");
+      store.flushPersistedWorkspace();
+      // The search box is debounced state: it waits for the persist timer.
+      filter.setSearch("needle");
+      const read = () => (JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
+        tabs?: Array<{ searchQuery?: string }>;
+      }).tabs?.[0]?.searchQuery ?? "";
+      expect(read()).toBe("");
+      for (const fn of listeners.get("pagehide") ?? []) fn();
+      expect(read()).toBe("needle");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("types a commit message without republishing the repository state", async () => {
+    // ft-0ff882a6: the draft lived on the session, so each keystroke replaced
+    // the session, rebuilt the active tab's row and notified every subscriber.
+    const { store } = makeStore();
+    await store.openRepo("/r/draft-a");
+    let published = 0;
+    const unsubscribe = store.subscribe(() => (published += 1));
+    const rowBefore = get(store).openTabs[0];
+    published = 0;
+    let drafts = 0;
+    const unsubscribeDraft = store.commitDraft.subscribe(() => (drafts += 1));
+    drafts = 0;
+    const message = "fix: keep the draft out of the repository state";
+    for (let i = 1; i <= message.length; i += 1) store.commitDraft.set(message.slice(0, i));
+    expect(published).toBe(0);
+    expect(drafts).toBe(message.length);
+    expect(get(store.commitDraft)).toBe(message);
+    expect(get(store).openTabs[0]).toBe(rowBefore);
+    unsubscribe();
+    unsubscribeDraft();
+  });
+
+  it("notifies currentPath subscribers only when the active repository changes", async () => {
+    // Effects key on this instead of `$repoStore.currentPath`, which re-runs
+    // them on every publish: a status poll, a loading flag, an error.
+    const { store } = makeStore();
+    await store.openRepo("/r/path-a");
+    const seen: (string | null)[] = [];
+    let published = 0;
+    const unsubscribe = store.subscribe(() => (published += 1));
+    const unsubscribePath = store.currentPath.subscribe((path) => seen.push(path));
+    published = 0;
+    store.setError("unrelated");
+    store.setError(null);
+    expect(published).toBe(2);
+    expect(seen).toEqual(["/r/path-a"]);
+    await store.openRepo("/r/path-b");
+    expect(seen.at(-1)).toBe("/r/path-b");
+    const switched = seen.length;
+    store.setError("unrelated again");
+    expect(seen).toHaveLength(switched);
+    unsubscribe();
+    unsubscribePath();
+  });
+
+  it("keeps one draft per tab and drops a closed tab's draft", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/draft-a");
+    const a = get(store).activeTabId!;
+    store.commitDraft.set("draft for a");
+    await store.openRepo("/r/draft-b");
+    const b = get(store).activeTabId!;
+    expect(get(store.commitDraft)).toBe("");
+    store.commitDraft.set("draft for b");
+    await store.activateTab(a);
+    expect(get(store.commitDraft)).toBe("draft for a");
+    await store.closeTab(b);
+    expect(store.commitDraft.read(b)).toBe("");
+    // Reopening the closed repository starts a fresh message, as before.
+    await store.openRepo("/r/draft-b");
+    expect(get(store.commitDraft)).toBe("");
+  });
+
   it("skips storage writes and recent-menu IPC while only unpersisted state changes", async () => {
     const counts = { setItem: 0, menu: 0 };
     const storage = memoryStorage();
@@ -1339,8 +1447,8 @@ describe("repoStore tabs", () => {
     counts.setItem = 0;
     counts.menu = 0;
 
-    await store.setCommitDraft("fix: handle");
-    await store.setCommitDraft("fix: handle edge");
+    store.commitDraft.set("fix: handle");
+    store.commitDraft.set("fix: handle edge");
     await store.setAmending(true);
 
     expect(counts.setItem).toBe(0);
@@ -1532,7 +1640,7 @@ describe("repoStore canonical identity", () => {
     await store.openRepo("/r/ghost", { allowBroken: true });
     expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/ghost"]);
     expect(get(store).error ?? "").toMatch(/unavailable|Cannot access/i);
-    await store.setCommitDraft("wip notes");
+    store.commitDraft.set("wip notes");
 
     // The volume comes back; retrying the alias adopts the canonical identity.
     ghostResolves = true;
@@ -1542,7 +1650,7 @@ describe("repoStore canonical identity", () => {
     expect(state.currentPath).toBe("/r/real");
     expect(state.error).toBeNull();
     // Draft state travels from the alias tab to its canonical successor.
-    expect(state.commitDraft).toBe("wip notes");
+    expect(get(store.commitDraft)).toBe("wip notes");
     // No stale alias entry lingers to resurrect a duplicate tab later.
     expect(state.lastClosed).not.toContain("/r/ghost");
 
@@ -1567,12 +1675,12 @@ describe("repoStore canonical identity", () => {
     const { store } = makeStore(invoke);
     // Canonical tab first, with its own draft.
     await store.openRepo("/r/real");
-    await store.setCommitDraft("canonical draft");
+    store.commitDraft.set("canonical draft");
     const realId = get(store).activeTabId!;
 
     // Broken alias opened afterwards stays a separate tab until healed.
     await store.openRepo("/r/ghost", { allowBroken: true });
-    await store.setCommitDraft("alias draft");
+    store.commitDraft.set("alias draft");
     expect(get(store).openTabs).toHaveLength(2);
 
     ghostResolves = true;
@@ -1580,7 +1688,7 @@ describe("repoStore canonical identity", () => {
     const state = get(store);
     expect(state.openTabs).toHaveLength(1);
     expect(state.openTabs[0].id).toBe(realId);
-    expect(state.commitDraft).toBe("canonical draft");
+    expect(get(store.commitDraft)).toBe("canonical draft");
   });
 });
 
@@ -1952,6 +2060,26 @@ describe("repoStore status poll lifecycle", () => {
 
     await store.openRepo("/r/poll-c");
     expect(arms()).toHaveLength(2);
+  });
+
+  it("tells subscribers what a poll found moved, since the watcher cannot see nested edits", async () => {
+    vi.useFakeTimers();
+    let edited = false;
+    const row = { path: "docs/guide.md", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 };
+    const invoke = makeInvoke({
+      cmd_get_status: async (_cmd, args) =>
+        (edited ? [row] : snapshotFor(String(args?.repoPath)).statuses) as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/poll-nested");
+    const heard: { path: string; kinds: string[]; paths: string[] }[] = [];
+    const stop = store.onPolledChange((path, change) => heard.push({ path, kinds: change.kinds, paths: change.paths }));
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 100);
+    expect(heard, "a quiet poll announces nothing").toEqual([]);
+    edited = true;
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 100);
+    expect(heard).toEqual([{ path: "/r/poll-nested", kinds: ["worktree", "documents"], paths: ["docs/guide.md", "README.md"] }]);
+    stop();
   });
 
   it("restarts polling when a tab closes and another remains", async () => {
@@ -2339,7 +2467,9 @@ describe("repoStore diff selection", () => {
     await store.openRepo("/r/commit-file-err");
 
     await store.selectCommitFileDiff("cX", "src/b.ts");
-    expect(get(store).error).toMatch(/bad object/);
+    // The diff's own error: the repository status error stays untouched (ft-038e6ba5).
+    expect(get(store).selectedDiffError).toMatch(/bad object/);
+    expect(get(store).error).toBeNull();
   });
 
   it("applies rapid same-tab selections in click order, not resolve order", async () => {
@@ -2643,10 +2773,12 @@ describe("repoStore snapshot hydration ordering", () => {
     }));
   }
 
-  it("lets the latest-started snapshot win when two loads share one generation", async () => {
-    // activateTab starts a hydrate at generation N; refresh() starts more at
-    // the SAME N. The older fetch must not overwrite fresher data when it
-    // resolves last (F2).
+  it("reads once behind a running snapshot instead of beside it, and the later read wins", async () => {
+    // activateTab starts a hydrate at generation N; refresh() asks for more at
+    // the SAME N. They used to run side by side and the older answer, landing
+    // last, had to be discarded by a run token (F2). They no longer overlap:
+    // the second waits for the first and reads once more, so the answer that
+    // lands last is also the one read last (hydrateFlight.ts).
     const staleStatus = deferred<unknown>();
     let call = 0;
     let armedAt = Number.POSITIVE_INFINITY;
@@ -2663,15 +2795,18 @@ describe("repoStore snapshot hydration ordering", () => {
     armedAt = call + 1; // the NEXT status fetch hangs
     const staleLoad = store.refresh();
     const freshLoad = store.refresh();
-    await freshLoad;
-    // Calls so far: 1 = initial hydration, 2 = the hung stale load, 3 = fresh.
-    expect(get(store).statuses[0]?.path).toBe("probe-3");
+    await flushMicro();
+    // Calls so far: 1 = initial hydration, 2 = the hung load. The second
+    // refresh has not started a read beside it.
+    expect(call).toBe(armedAt);
 
-    // The first load settles LAST; its result must be discarded.
     staleStatus.resolve(statusProbe([{ path: "probe-stale" }]));
     await staleLoad;
+    await freshLoad;
     await flushMicro();
 
+    // 3 = the read owed behind the first; it landed last and is what shows.
+    expect(call).toBe(armedAt + 1);
     const state = get(store);
     expect(state.statuses[0]?.path).toBe("probe-3");
     expect(state.error).toBeNull();
@@ -2903,6 +3038,29 @@ describe("repoStore post-mutation selection refetch", () => {
     await store.checkoutBranch("feature");
     await flushMicro();
     expect(diffPaths).toEqual(["a.ts"]);
+  });
+
+  it("detaching goes through its own command, never cmd_checkout_branch", async () => {
+    const seen: Array<[string, unknown]> = [];
+    const invoke = makeInvoke({
+      cmd_checkout_branch: async (cmd, args) => {
+        seen.push([cmd, args?.branchName]);
+        return undefined as never;
+      },
+      cmd_checkout_detached: async (cmd, args) => {
+        seen.push([cmd, args?.revision]);
+        return undefined as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/detach");
+    const outcome = await store.checkoutDetached("v1.0");
+    expect(outcome.ok).toBe(true);
+    await store.checkoutBranch("feature");
+    expect(seen).toEqual([
+      ["cmd_checkout_detached", "v1.0"],
+      ["cmd_checkout_branch", "feature"],
+    ]);
   });
 });
 
@@ -4168,7 +4326,7 @@ describe("uncommitted previews", () => {
     await store.openRepo("/r");
     await store.selectCommitDiff("old");
     await store.previewUncommitted();
-    expect(get(store)).toMatchObject({ error: "file disappeared", selectedDiff: null, selectedCommitId: null, selectedDiffPending: false, selectedFilePath: "README.md" });
+    expect(get(store)).toMatchObject({ error: null, selectedDiffError: "file disappeared", selectedDiff: null, selectedCommitId: null, selectedDiffPending: false, selectedFilePath: "README.md" });
   });
 
   it("resolves another worktree and fetches its files, never the previous repository's", async () => {
@@ -4379,3 +4537,822 @@ describe("repoStore tab grouping", () => {
   });
 });
 
+
+describe("repoStore mutation targets", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    cancelPrompt();
+  });
+
+  type Call = { cmd: string; repoPath: string };
+
+  function recording(extra: Partial<Record<string, InvokeFn>> = {}) {
+    const calls: Call[] = [];
+    const track =
+      (cmd: string): InvokeFn =>
+      async (_c, args) => {
+        calls.push({ cmd, repoPath: String(args?.repoPath) });
+        return undefined as never;
+      };
+    const invoke = makeInvoke({
+      cmd_discard_changes: track("cmd_discard_changes"),
+      cmd_reset: track("cmd_reset"),
+      cmd_delete_branch: track("cmd_delete_branch"),
+      cmd_create_branch: track("cmd_create_branch"),
+      cmd_rename_branch: track("cmd_rename_branch"),
+      cmd_create_tag: track("cmd_create_tag"),
+      cmd_delete_tag: track("cmd_delete_tag"),
+      ...extra,
+    });
+    return { calls, ...makeStore(invoke) };
+  }
+
+  async function openAB(store: ReturnType<typeof makeStore>["store"]) {
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    return { a, b: store.captureTarget()! };
+  }
+
+  it("captureTarget names the active tab and is null with none open", async () => {
+    const { store } = recording();
+    expect(store.captureTarget()).toBeNull();
+    await store.openRepo("/r/a");
+    expect(store.captureTarget()).toMatchObject({ path: "/r/a" });
+  });
+
+  it("runs a captured target against its own repository after another tab became active", async () => {
+    const { store, calls } = recording();
+    const { a } = await openAB(store);
+    const outcome = await store.discardChanges("f.txt", a);
+    expect(outcome.ok).toBe(true);
+    expect(calls).toEqual([{ cmd: "cmd_discard_changes", repoPath: "/r/a" }]);
+  });
+
+  it("refuses a target whose tab was closed, running nothing", async () => {
+    const { store, calls } = recording();
+    const { a } = await openAB(store);
+    await store.closeTab(a.tabId);
+    const outcome = await store.discardChanges("f.txt", a);
+    expect(outcome).toMatchObject({ ok: false, refused: true });
+    expect(outcome.error).toMatch(/repository changed/);
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses a repo-gone target, running nothing", async () => {
+    const { store, calls } = recording();
+    const { a } = await openAB(store);
+    store.markRepoGone("/r/a");
+    const gone = await store.deleteBranch("x", false, a);
+    expect(gone).toMatchObject({ ok: false, refused: true });
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses an explicit null target rather than falling back to whichever tab is active", async () => {
+    const { store, calls } = recording();
+    await store.openRepo("/r/a");
+    const outcome = await store.discardChanges("f.txt", null);
+    expect(outcome).toMatchObject({ ok: false, refused: true });
+    expect(calls).toEqual([]);
+  });
+
+  it("a same-path reopen keeps the target valid", async () => {
+    const { store, calls } = recording();
+    const { a } = await openAB(store);
+    await store.openRepo("/r/a");
+    await store.createBranch("n", "abc", a);
+    expect(calls).toEqual([{ cmd: "cmd_create_branch", repoPath: "/r/a" }]);
+  });
+
+  type Mutating = ReturnType<typeof makeStore>["store"];
+  it.each([
+    ["discardChanges", (s: Mutating, t: never) => s.discardChanges("f", t), "cmd_discard_changes"],
+    ["resetTo", (s: Mutating, t: never) => s.resetTo("keep", "abc", t), "cmd_reset"],
+    ["deleteBranch", (s: Mutating, t: never) => s.deleteBranch("x", false, t), "cmd_delete_branch"],
+    ["renameBranch", (s: Mutating, t: never) => s.renameBranch("x", "y", t), "cmd_rename_branch"],
+    ["createTag", (s: Mutating, t: never) => s.createTag("v1", undefined, undefined, t), "cmd_create_tag"],
+    ["deleteTag", (s: Mutating, t: never) => s.deleteTag("v1", t), "cmd_delete_tag"],
+  ])("%s after a pending prompt and a tab switch hits the captured repo", async (_n, run, cmd) => {
+    const { store, calls } = recording();
+    await store.openRepo("/r/a");
+    const target = store.captureTarget()!;
+    const { askConfirm } = await import("../modalStore");
+    const pending = askConfirm({ title: "t", message: "m" } as never);
+    await store.openRepo("/r/b");
+    completePrompt(true);
+    expect(await pending).toBe(true);
+    await run(store, target as never);
+    expect(calls).toEqual([{ cmd, repoPath: "/r/a" }]);
+  });
+
+  it("an Undo created after a delete restores into the originating repository", async () => {
+    const { store, calls } = recording();
+    const { a } = await openAB(store);
+    await store.deleteBranch("x", false, a);
+    await store.createBranch("x", "sha", a);
+    expect(calls.map((c) => c.repoPath)).toEqual(["/r/a", "/r/a"]);
+  });
+
+  it("flags a failure as surfaced only when its repository is the active one", async () => {
+    const { store } = recording({
+      cmd_create_branch: async () => {
+        throw new Error("exists");
+      },
+    });
+    const { a, b } = await openAB(store);
+    const background = await store.createBranch("x", "abc", a);
+    expect(background).toMatchObject({ ok: false, surfaced: false });
+    const active = await store.createBranch("x", "abc", b);
+    expect(active).toMatchObject({ ok: false, surfaced: true });
+  });
+
+  it("a refusal is not surfaced", async () => {
+    const { store } = recording();
+    const { a } = await openAB(store);
+    await store.closeTab(a.tabId);
+    const outcome = await store.createBranch("x", "abc", a);
+    expect(outcome.surfaced).toBe(false);
+  });
+
+  it("drops the watcher echo of a held mutation", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = recording({
+      cmd_commit: async () => hold.promise as never,
+      cmd_list_branches: async () => {
+        loads.n += 1;
+        return [] as never;
+      },
+    });
+    await store.openRepo("/r/a");
+    loads.n = 0;
+    const running = store.commit("m");
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(loads.n).toBe(0);
+    hold.resolve(undefined);
+    await running;
+  });
+});
+
+describe("repoStore bulk operations go through runMutating", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("holds mutation activity for each repo and between queued repos", async () => {
+    const holds: Record<string, ReturnType<typeof deferred<unknown>>> = {
+      "/r/a": deferred(),
+      "/r/b": deferred(),
+    };
+    const { store } = makeStore(
+      makeInvoke({ cmd_pull: async (_c, args) => holds[String(args?.repoPath)].promise as never }),
+    );
+    await store.openRepo("/r/a");
+    await store.openRepo("/r/b");
+    const seen: Record<string, string[]>[] = [];
+    const stop = store.mutationActivity.subscribe((v) => seen.push(v));
+    const run = store.runAcrossOpenRepos("pull", { concurrency: 1 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(get(store.mutationActivity)["/r/a"]).toContain("pull");
+    holds["/r/a"].resolve({ policy: null, output: "ok" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(get(store.mutationActivity)["/r/b"]).toContain("pull");
+    holds["/r/b"].resolve({ policy: null, output: "ok" });
+    await run;
+    stop();
+    const busy = seen.map((v) => gitActionCount(v) > 0);
+    const firstBusy = busy.indexOf(true);
+    expect(firstBusy).toBeGreaterThanOrEqual(0);
+    expect(busy.slice(firstBusy, busy.lastIndexOf(true) + 1).every(Boolean)).toBe(true);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+  });
+
+  it("records a verdict and an action per repo, ok:false for the failing one", async () => {
+    const verdict = vi.spyOn(harnessStore, "recordVerdict");
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_pull: async (_c, args) => {
+          if (String(args?.repoPath) === "/r/b") throw new Error("diverged");
+          return { policy: { status: "allow" }, output: "ok" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    await store.openRepo("/r/b");
+    verdict.mockClear();
+    action.mockClear();
+    const report = await store.runAcrossOpenRepos("pull");
+    expect(report.failed).toBe(1);
+    expect(report.succeeded).toBe(1);
+    const byRepo = Object.fromEntries(action.mock.calls.map(([a]) => [a.repoPath, a]));
+    expect(byRepo["/r/a"]).toMatchObject({ kind: "pull", ok: true });
+    expect(byRepo["/r/b"]).toMatchObject({ kind: "pull", ok: false });
+    expect(verdict.mock.calls.some(([, p]) => p === "/r/a")).toBe(true);
+  });
+
+  it("arms the echo window before the pull is invoked", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_pull: async () => hold.promise as never,
+        cmd_list_branches: async () => {
+          loads.n += 1;
+          return [] as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    loads.n = 0;
+    const run = store.runAcrossOpenRepos("pull");
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(loads.n).toBe(0);
+    hold.resolve({ policy: null, output: "ok" });
+    await run;
+  });
+
+  it("skips a tab that closed before its turn", async () => {
+    const pulled: string[] = [];
+    const hold = deferred<unknown>();
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_pull: async (_c, args) => {
+          pulled.push(String(args?.repoPath));
+          if (String(args?.repoPath) === "/r/a") await hold.promise;
+          return { policy: null, output: "ok" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    await store.openRepo("/r/b");
+    const b = store.captureTarget()!;
+    const run = store.runAcrossOpenRepos("pull", { concurrency: 1 });
+    await new Promise((r) => setTimeout(r, 0));
+    await store.closeTab(b.tabId);
+    hold.resolve({ policy: null, output: "ok" });
+    const report = await run;
+    expect(pulled).toEqual(["/r/a"]);
+    expect(report.results.find((r) => r.path === "/r/b")?.status).toBe("skipped");
+  });
+});
+
+describe("repoStore per-path mutation queue", () => {
+  it("runs two mutations on one repository one after the other and counts the queued one", async () => {
+    const order: string[] = [];
+    const first = deferred<unknown>();
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => {
+          order.push("commit:start");
+          await first.promise;
+          order.push("commit:end");
+          return undefined as never;
+        },
+        cmd_push: async () => {
+          order.push("push:start");
+          return undefined as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const commit = store.commit("m");
+    const push = store.push();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(order).toEqual(["commit:start"]);
+    expect(get(store.mutationActivity)["/r/a"]).toEqual(["commit", "push"]);
+    first.resolve(undefined);
+    await Promise.all([commit, push]);
+    expect(order).toEqual(["commit:start", "commit:end", "push:start"]);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+  });
+
+  it("a hung mutation holds up its own repository only", async () => {
+    const hang = deferred<unknown>();
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => hang.promise as never,
+        cmd_create_branch: async () => undefined as never,
+      }),
+    );
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    const hung = store.commit("m");
+    await new Promise((r) => setTimeout(r, 0));
+    expect((await store.createBranch("n", "abc", a)).ok).toBe(true);
+    hang.resolve(undefined);
+    await hung;
+  });
+
+  it("refuses a queued mutation whose tab closed while it waited", async () => {
+    const first = deferred<unknown>();
+    const calls: string[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_commit: async () => first.promise as never,
+        cmd_delete_branch: async (_c, args) => void calls.push(String(args?.repoPath)) as never,
+      }),
+    );
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    const running = store.commit("m");
+    const queued = store.deleteBranch("x", false, a);
+    await store.openRepo("/r/b");
+    await store.closeTab(a.tabId);
+    first.resolve(undefined);
+    await running;
+    expect(await queued).toMatchObject({ ok: false, refused: true });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("repoStore echo replay and queue release", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function reloading(pull: InvokeFn, loads: { n: number }) {
+    return makeStore(
+      makeInvoke({
+        cmd_pull: pull,
+        cmd_list_branches: async () => {
+          loads.n += 1;
+          return [] as never;
+        },
+      }),
+    );
+  }
+
+  it("replays a change made during a held pull that then fails", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = reloading(async () => {
+      await hold.promise;
+      throw new Error("conflict");
+    }, loads);
+    await store.openRepo("/r/a");
+    loads.n = 0;
+    const running = store.pull();
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBe(0);
+    hold.resolve(undefined);
+    await running;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBeGreaterThan(0);
+  });
+
+  it("replays a change dropped during a bulk pull, which skips its own refresh", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = reloading(async () => {
+      await hold.promise;
+      return { policy: null, output: "ok" } as never;
+    }, loads);
+    await store.openRepo("/r/a");
+    const run = store.runAcrossOpenRepos("pull", { only: ["/r/a"] });
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    hold.resolve(undefined);
+    await run;
+    loads.n = 0;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBeGreaterThan(0);
+  });
+
+  it("does not replay when the mutation refreshed itself", async () => {
+    vi.useFakeTimers();
+    const loads = { n: 0 };
+    const hold = deferred<unknown>();
+    const { store } = reloading(async () => {
+      await hold.promise;
+      return { policy: null, output: "ok" } as never;
+    }, loads);
+    await store.openRepo("/r/a");
+    const running = store.pull();
+    await vi.advanceTimersByTimeAsync(0);
+    await store.handleRepoChanged("/r/a");
+    hold.resolve(undefined);
+    await running;
+    loads.n = 0;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(loads.n).toBe(0);
+  });
+});
+
+describe("file, worktree and branch-cleanup mutations (ft-d61584de)", () => {
+  const guarded = (output: unknown) => ({ policy: null, output }) as never;
+  const sent: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+  const record = (cmd: string, output: unknown = null) =>
+    async (_c: string, args?: Record<string, unknown>) => {
+      sent.push({ cmd, args: args ?? {} });
+      return guarded(output);
+    };
+  afterEach(() => {
+    sent.length = 0;
+    vi.restoreAllMocks();
+  });
+
+  it("each is counted by the quit guard while it is pending, and journalled once it settles", async () => {
+    const hold = deferred<unknown>();
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({ cmd_prune_worktree: async () => hold.promise as never }));
+    await store.openRepo("/r/a");
+    const target = store.captureTarget();
+    const pending = store.pruneWorktrees(target);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(gitActionCount(get(store.mutationActivity))).toBe(1);
+    expect(get(store.mutationActivity)["/r/a"]).toEqual(["worktree-prune"]);
+    hold.resolve({ policy: null, output: null });
+    expect((await pending).ok).toBe(true);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ repoPath: "/r/a", kind: "worktree-prune", ok: true }));
+  });
+
+  it("queue behind one another per repository", async () => {
+    const holds = [deferred<unknown>(), deferred<unknown>()];
+    let started = 0;
+    const { store } = makeStore(makeInvoke({ cmd_prune_worktree: async () => holds[started++].promise as never }));
+    await store.openRepo("/r/a");
+    const target = store.captureTarget();
+    const first = store.pruneWorktrees(target);
+    const second = store.pruneWorktrees(target);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(started).toBe(1);
+    expect(gitActionCount(get(store.mutationActivity))).toBe(2);
+    holds[0].resolve(guarded(null));
+    await first;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(started).toBe(2);
+    holds[1].resolve(guarded(null));
+    await second;
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+  });
+
+  it("a worktree cache sync that fails is journalled as failed and returns the failure", async () => {
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({ cmd_worktree_cow_sync: async () => { throw new Error("cow refused"); } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.worktreeCowSync("/r/a/.claude/worktrees/x", store.captureTarget());
+    expect(outcome).toMatchObject({ ok: false, error: expect.stringContaining("cow refused") });
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ kind: "worktree-cow-sync", ok: false }));
+  });
+
+  it("move, delete and create send their arguments to the target's repository and return the delete outcome", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_move_path: record("cmd_move_path"),
+      cmd_delete_path: record("cmd_delete_path", { left_behind: true }),
+      cmd_create_file: record("cmd_create_file"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    expect((await store.movePath("x.ts", "y.ts", a)).ok).toBe(true);
+    const deleted = await store.deletePath("old.ts", a);
+    expect(deleted).toMatchObject({ ok: true, output: { left_behind: true } });
+    expect((await store.createFile("new.ts", a)).ok).toBe(true);
+    expect(sent).toEqual([
+      { cmd: "cmd_move_path", args: { repoPath: "/r/a", from: "x.ts", to: "y.ts" } },
+      { cmd: "cmd_delete_path", args: { repoPath: "/r/a", path: "old.ts" } },
+      { cmd: "cmd_create_file", args: { repoPath: "/r/a", filePath: "new.ts" } },
+    ]);
+  });
+
+  it("add, remove, lock, unlock, merge-teardown and branch delete send to the target's repository, journalled by kind", async () => {
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({
+      cmd_add_worktree: record("cmd_add_worktree", { path: "/w" }),
+      cmd_remove_worktree: record("cmd_remove_worktree", {}),
+      cmd_lock_worktree: record("cmd_lock_worktree"),
+      cmd_unlock_worktree: record("cmd_unlock_worktree"),
+      cmd_worktree_merge_teardown: record("cmd_worktree_merge_teardown", { merged: true }),
+      cmd_delete_branch: record("cmd_delete_branch"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    const request = { targetPath: "/w", newBranch: "feat", startPoint: null, detach: false, cowCaches: true, runHooks: false };
+    expect(await store.addWorktree(request, a)).toMatchObject({ ok: true, output: { path: "/w" } });
+    expect((await store.removeWorktree("/w", true, a)).ok).toBe(true);
+    expect((await store.lockWorktree("/w", a)).ok).toBe(true);
+    expect((await store.unlockWorktree("/w", a)).ok).toBe(true);
+    const merge = { worktreePath: "/w", targetBranch: null, squash: false, expectedTip: "abc" };
+    expect(await store.worktreeMergeTeardown(merge, a)).toMatchObject({ ok: true, output: { merged: true } });
+    expect((await store.deleteBranch("feat", false, a, true)).ok).toBe(true);
+    expect(sent).toEqual([
+      { cmd: "cmd_add_worktree", args: { repoPath: "/r/a", ...request } },
+      { cmd: "cmd_remove_worktree", args: { repoPath: "/r/a", targetPath: "/w", force: true } },
+      { cmd: "cmd_lock_worktree", args: { repoPath: "/r/a", targetPath: "/w", reason: null } },
+      { cmd: "cmd_unlock_worktree", args: { repoPath: "/r/a", targetPath: "/w" } },
+      { cmd: "cmd_worktree_merge_teardown", args: { repoPath: "/r/a", ...merge } },
+      { cmd: "cmd_delete_branch", args: { repoPath: "/r/a", branchName: "feat", force: false } },
+    ]);
+    const kinds = action.mock.calls.map(([entry]) => entry.kind);
+    expect(kinds).toEqual(expect.arrayContaining(["worktree", "worktree-remove", "worktree-lock", "worktree-unlock", "worktree-merge", "branch-delete"]));
+    expect(action.mock.calls.every(([entry]) => entry.repoPath === "/r/a" && entry.ok === true)).toBe(true);
+  });
+
+  it("a worktree command for a repository whose tab is gone is refused and nothing is sent", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_remove_worktree: record("cmd_remove_worktree"),
+      cmd_worktree_merge_teardown: record("cmd_worktree_merge_teardown"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    await store.closeTab(a.tabId);
+    expect(await store.removeWorktree("/w", false, a)).toMatchObject({ ok: false, refused: true });
+    expect(await store.worktreeMergeTeardown({ worktreePath: "/w", targetBranch: null, squash: false, expectedTip: "x" }, a)).toMatchObject({ ok: false, refused: true });
+    expect(await store.removeWorktree("/w", false, null)).toMatchObject({ ok: false, refused: true });
+    expect(sent).toEqual([]);
+  });
+
+  it("handled keeps a failure off the session's error banner, while it is still returned and journalled as failed", async () => {
+    const action = vi.spyOn(harnessStore, "recordAction");
+    const { store } = makeStore(makeInvoke({ cmd_add_worktree: async () => { throw new Error("add refused"); } }));
+    await store.openRepo("/r/a");
+    const request = { targetPath: "/w", newBranch: null, startPoint: null, detach: true, cowCaches: true, runHooks: false };
+    const handled = await store.addWorktree(request, store.captureTarget(), true);
+    expect(handled).toMatchObject({ ok: false, error: expect.stringContaining("add refused"), surfaced: false });
+    expect(get(store).error).toBeNull();
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ kind: "worktree", ok: false }));
+    const unhandled = await store.addWorktree(request, store.captureTarget());
+    expect(unhandled.ok).toBe(false);
+    expect(get(store).error).toContain("add refused");
+  });
+
+  it("targetForPath names an open tab, opens a missing one without taking the screen, and is null when it cannot open", async () => {
+    const { store } = makeStore(makeInvoke({}));
+    await store.openRepo("/r/a");
+    await store.openRepo("/r/b");
+    const front = store.captureTarget()!;
+    expect(await store.targetForPath("/r/b")).toEqual(front);
+    const opened = await store.targetForPath("/r/c");
+    expect(opened).toMatchObject({ path: "/r/c" });
+    expect(store.captureTarget()).toEqual(front);
+    expect(store.targetIsActive(opened)).toBe(false);
+    expect(await store.targetForPath("")).toBeNull();
+  });
+
+  describe("targetForPath adversarial", () => {
+    const resolving = (aliases: Record<string, string>) => makeInvoke({
+      cmd_resolve_repo: async (_cmd, args) => {
+        const raw = String(args?.repoPath ?? "");
+        const path = aliases[raw] ?? raw;
+        return { path, name: path.split("/").pop(), is_bare: false } as never;
+      },
+    });
+
+    it("names the tab a symlinked or aliased spelling resolves to, opening it once and keeping the screen", async () => {
+      const { store } = makeStore(resolving({ "/link/main": "/real/main" }));
+      await store.openRepo("/r/front");
+      const front = store.captureTarget()!;
+      const target = await store.targetForPath("/link/main");
+      expect(target).toMatchObject({ path: "/real/main" });
+      expect(store.captureTarget()).toEqual(front);
+      expect(get(store).openTabs.filter((tab) => tab.path === "/real/main")).toHaveLength(1);
+      // Asked again, by either spelling, it names the same tab and opens no second one.
+      expect(await store.targetForPath("/link/main")).toEqual(target);
+      expect(await store.targetForPath("/real/main")).toEqual(target);
+      expect(get(store).openTabs).toHaveLength(2);
+    });
+
+    it("a trailing slash names the open tab and opens nothing new", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/a");
+      const a = store.captureTarget()!;
+      await store.openRepo("/r/b");
+      expect(await store.targetForPath("/r/a/")).toEqual(a);
+      expect(get(store).openTabs).toHaveLength(2);
+    });
+
+    it("a linked worktree and its main checkout are two repositories: each path names its own tab", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/main");
+      const main = store.captureTarget()!;
+      await store.openRepo("/r/main/.claude/worktrees/lane");
+      const lane = store.captureTarget()!;
+      expect(await store.targetForPath("/r/main")).toEqual(main);
+      expect(await store.targetForPath("/r/main/.claude/worktrees/lane")).toEqual(lane);
+      expect(main.tabId).not.toBe(lane.tabId);
+    });
+
+    it("two asks for the same unopened checkout at once share one tab", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/front");
+      const [one, two] = await Promise.all([store.targetForPath("/r/new"), store.targetForPath("/r/new")]);
+      expect(one).not.toBeNull();
+      expect(two).toEqual(one);
+      expect(get(store).openTabs.filter((tab) => tab.path === "/r/new")).toHaveLength(1);
+    });
+
+    it("is null, not a target that will only be refused later, for a checkout that is gone", async () => {
+      let gone = false;
+      const { store } = makeStore(makeInvoke({ cmd_resolve_repo: async (_cmd, args) => {
+        if (gone) throw new Error("not a git repository");
+        return { path: String(args?.repoPath ?? ""), name: "r", is_bare: false } as never;
+      } }));
+      await store.openRepo("/r/a");
+      await store.openRepo("/r/b");
+      gone = true;
+      store.markRepoGone("/r/a");
+      expect(await store.targetForPath("/r/a")).toBeNull();
+    });
+
+    it("a path that cannot be opened is null and leaves no tab behind", async () => {
+      const { store } = makeStore(makeInvoke({ cmd_resolve_repo: async () => { throw new Error("not a git repository"); } }));
+      expect(await store.targetForPath("/nowhere")).toBeNull();
+      expect(get(store).openTabs).toEqual([]);
+    });
+
+    it("looks an open tab up without opening one when asked not to", async () => {
+      const { store } = makeStore(makeInvoke({}));
+      await store.openRepo("/r/a");
+      const a = store.captureTarget()!;
+      await store.openRepo("/r/b");
+      expect(await store.targetForPath("/r/a", { open: false })).toEqual(a);
+      expect(await store.targetForPath("/r/never-opened", { open: false })).toBeNull();
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/a", "/r/b"]);
+    });
+
+    it("a merge-teardown armed on a tab that was closed and reopened at the same path runs there; one whose tab stayed closed is refused", async () => {
+      // The rule: a target names a repository by its path (the tab id is the path's identity),
+      // not a session instance. A same-path reopen is the same repository, so the run is not refused;
+      // a repository whose tab is closed is, and nothing is sent.
+      const sent: string[] = [];
+      const { store } = makeStore(makeInvoke({ cmd_worktree_merge_teardown: async (cmd) => { sent.push(cmd); return { policy: null, output: { merged: true } } as never; } }));
+      await store.openRepo("/r/a");
+      const a = store.captureTarget()!;
+      await store.openRepo("/r/b");
+      await store.closeTab(a.tabId);
+      const merge = { worktreePath: "/w", targetBranch: null, squash: false, expectedTip: "abc" };
+      expect(await store.worktreeMergeTeardown(merge, a, true)).toMatchObject({ ok: false, refused: true });
+      await store.openRepo("/r/a", { activate: false });
+      expect(await store.worktreeMergeTeardown(merge, a, true)).toMatchObject({ ok: true });
+      expect(sent).toEqual(["cmd_worktree_merge_teardown"]);
+    });
+  });
+
+  it("an already-existing file comes back on cause and is not filed as the session's error", async () => {
+    const refusal = { code: "already_exists", message: "'a.ts' already exists", path: "a.ts" };
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome).toMatchObject({ ok: false, cause: refusal, surfaced: false });
+    expect(get(store).error).toBeNull();
+  });
+
+  it("an already_exists for a different path than the one created is not expected: it is filed", async () => {
+    const refusal = { code: "already_exists", message: "'other.ts' already exists", path: "other.ts" };
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome.ok).toBe(false);
+    expect(get(store).error).toContain("other.ts");
+  });
+
+  it("a refused or changed_on_disk create is filed, not treated as the name prompt's retry", async () => {
+    for (const refusal of [
+      { code: "refused", message: "outside the repository" },
+      { code: "changed_on_disk", message: "changed", path: "a.ts", expected: "x", actual: "y" },
+    ]) {
+      const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw refusal; } }));
+      await store.openRepo("/r/a");
+      await store.createFile("a.ts", store.captureTarget());
+      expect(get(store).error, refusal.code).toContain(refusal.message);
+    }
+  });
+
+  it("an exception thrown synchronously by the wrapped call, and a failed delete, release the quit guard", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_delete_path: () => { throw new Error("sync boom"); },
+      cmd_move_path: async () => { throw new Error("async boom"); },
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget();
+    expect(await store.deletePath("x", a)).toMatchObject({ ok: false });
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    expect(await store.movePath("x", "y", a)).toMatchObject({ ok: false });
+    expect(gitActionCount(get(store.mutationActivity))).toBe(0);
+    // A later mutation on the same repository is not stranded behind the failed one.
+    expect(await store.deletePath("z", a)).toMatchObject({ ok: false });
+  });
+
+  it("fetch, pull and push with no target pin the repository in front when they are CALLED, not when they finish", async () => {
+    for (const run of [
+      (s: ReturnType<typeof makeStore>["store"]) => s.fetch(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.pull(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.push(),
+      (s: ReturnType<typeof makeStore>["store"]) => s.stashSave(),
+    ]) {
+      const hold = deferred<unknown>();
+      const paths: unknown[] = [];
+      const gate = async (_c: string, args?: Record<string, unknown>) => {
+        paths.push(args?.repoPath);
+        return hold.promise as never;
+      };
+      const { store } = makeStore(makeInvoke({ cmd_fetch: gate, cmd_pull: gate, cmd_push: gate, cmd_stash_save: gate }));
+      await store.openRepo("/r/a");
+      const pending = run(store);
+      await store.openRepo("/r/b");
+      hold.resolve(guarded(null));
+      await pending;
+      expect(paths).toEqual(["/r/a"]);
+    }
+  });
+
+  it("any other create failure is filed as an error", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_create_file: async () => { throw new Error("disk full"); } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.createFile("a.ts", store.captureTarget());
+    expect(outcome.ok).toBe(false);
+    expect(get(store).error).toContain("disk full");
+  });
+
+  it("deadbranch clean and restore send what the dialog had and unwrap the guarded result", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_deadbranch_clean: record("cmd_deadbranch_clean", { deleted: ["a"], failed: [], backup_path: null, message: "ok" }),
+      cmd_deadbranch_restore: record("cmd_deadbranch_restore", { restored: ["a"], failed: [], message: "ok" }),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    const cleaned = await store.deadbranchClean(["a"], true, false, a);
+    expect(cleaned.output?.deleted).toEqual(["a"]);
+    const restored = await store.deadbranchRestore("/b/1.json", a);
+    expect(restored.output?.restored).toEqual(["a"]);
+    expect(sent).toEqual([
+      { cmd: "cmd_deadbranch_clean", args: { repoPath: "/r/a", branches: ["a"], force: true, createBackup: false } },
+      { cmd: "cmd_deadbranch_restore", args: { repoPath: "/r/a", backupPath: "/b/1.json", branches: null } },
+    ]);
+  });
+
+  it("a failed deadbranch clean is not an empty success", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_deadbranch_clean: async () => { throw new Error("guard refused"); } }));
+    await store.openRepo("/r/a");
+    const outcome = await store.deadbranchClean(["a"], false, true, store.captureTarget());
+    expect(outcome).toMatchObject({ ok: false, error: expect.stringContaining("guard refused") });
+    expect(outcome.output).toBeUndefined();
+  });
+
+  it("a restore after the tab closed is refused in the repository left behind and runs nothing", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_deadbranch_restore: record("cmd_deadbranch_restore") }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    await store.closeTab(a.tabId);
+    const outcome = await store.deadbranchRestore("/b/1.json", a);
+    expect(outcome).toMatchObject({ ok: false, refused: true });
+    expect(sent).toEqual([]);
+  });
+
+  it("targetIsActive is true only for the tab in front", async () => {
+    const { store } = makeStore();
+    expect(store.targetIsActive(null)).toBe(false);
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    expect(store.targetIsActive(a)).toBe(true);
+    await store.openRepo("/r/b");
+    expect(store.targetIsActive(a)).toBe(false);
+    expect(store.targetIsActive(store.captureTarget())).toBe(true);
+    await store.closeTab(a.tabId);
+    expect(store.targetIsActive(a)).toBe(false);
+  });
+
+  it("the palette's commands run in the target's repository after another tab became active, or are refused", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_fetch: record("cmd_fetch"),
+      cmd_pull: record("cmd_pull"),
+      cmd_push: record("cmd_push"),
+      cmd_stash_save: record("cmd_stash_save"),
+    }));
+    await store.openRepo("/r/a");
+    const a = store.captureTarget()!;
+    await store.openRepo("/r/b");
+    await store.fetch(undefined, a);
+    await store.pull(undefined, undefined, undefined, a);
+    await store.push(undefined, undefined, false, a);
+    await store.stashSave(undefined, undefined, a);
+    expect(sent.map((s) => s.args.repoPath)).toEqual(["/r/a", "/r/a", "/r/a", "/r/a"]);
+    await store.closeTab(a.tabId);
+    sent.length = 0;
+    for (const outcome of [
+      await store.fetch(undefined, a),
+      await store.push(undefined, undefined, false, a),
+      await store.stashPop(a),
+    ]) {
+      expect(outcome).toMatchObject({ ok: false, refused: true });
+    }
+    expect(sent).toEqual([]);
+  });
+});

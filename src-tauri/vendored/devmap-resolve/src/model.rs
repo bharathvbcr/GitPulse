@@ -158,6 +158,16 @@ pub enum ResolutionKind {
     /// Confidence is [`Confidence::SPECULATIVE`], excluded from default walks
     /// the same way [`Self::AmbiguousGlobal`] is.
     LanguageServerDispatch,
+    /// A call through an interface (or protocol, or trait) bound to every
+    /// in-repo type that implements the method it names.
+    ///
+    /// Each candidate is a possible runtime target — evidence from the type
+    /// system, unlike a name collision — so it earns an edge where an
+    /// [`Self::AmbiguousGlobal`] candidate does, at [`Confidence::LOW`]: inside
+    /// the default walk, below `min_rung: high`. The edge carries the interface
+    /// method as `via`. The number of candidates bounds its precision, not its
+    /// correctness: with one implementer it is a call in fact.
+    Dispatch,
     Unresolved,
     Structural,
 }
@@ -165,7 +175,7 @@ pub enum ResolutionKind {
 impl ResolutionKind {
     /// Every kind, in declaration order. What [`Self::from_label`] searches and
     /// what a table generated from the enum (the store's SQL check) iterates.
-    pub const ALL: [ResolutionKind; 10] = [
+    pub const ALL: [ResolutionKind; 11] = [
         ResolutionKind::SameFile,
         ResolutionKind::SamePackage,
         ResolutionKind::ImportScoped,
@@ -174,6 +184,7 @@ impl ResolutionKind {
         ResolutionKind::UniqueGlobal,
         ResolutionKind::AmbiguousGlobal,
         ResolutionKind::LanguageServerDispatch,
+        ResolutionKind::Dispatch,
         ResolutionKind::Unresolved,
         ResolutionKind::Structural,
     ];
@@ -186,7 +197,8 @@ impl ResolutionKind {
     /// - `LanguageServer` — one target a language server named
     ///   ([`Confidence::HIGH`], below every deterministic parse rung).
     /// - `UniqueGlobal` — exactly one declaration of that name in the family.
-    /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
+    /// - `AmbiguousGlobal` — several matches and no way to choose (G5). Carried
+    ///   only by a ledger row, never by an edge (S2).
     /// - `LanguageServerDispatch` — a language-server candidate set, scored
     ///   like `AmbiguousGlobal` so default walks exclude it.
     /// - `Unresolved` — no edge is ever built from this variant. It scores at
@@ -203,6 +215,7 @@ impl ResolutionKind {
             | ResolutionKind::ReceiverType
             | ResolutionKind::Structural => Confidence::DETERMINISTIC,
             ResolutionKind::LanguageServer | ResolutionKind::UniqueGlobal => Confidence::HIGH,
+            ResolutionKind::Dispatch => Confidence::LOW,
             ResolutionKind::AmbiguousGlobal
             | ResolutionKind::LanguageServerDispatch
             | ResolutionKind::Unresolved => Confidence::SPECULATIVE,
@@ -221,6 +234,7 @@ impl ResolutionKind {
             ResolutionKind::UniqueGlobal => "UniqueGlobal",
             ResolutionKind::AmbiguousGlobal => "AmbiguousGlobal",
             ResolutionKind::LanguageServerDispatch => "LanguageServerDispatch",
+            ResolutionKind::Dispatch => "Dispatch",
             ResolutionKind::Unresolved => "Unresolved",
             ResolutionKind::Structural => "Structural",
         }
@@ -329,6 +343,9 @@ pub enum Resolution {
         target_file: String,
         family: LangFamily,
     },
+    /// Several in-repo namesakes of a bare name and no evidence that picks one.
+    /// Recorded on the site's ledger row with the complete candidate list; no
+    /// edge is ever built from it (S2).
     AmbiguousGlobal {
         candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
         family: LangFamily,
@@ -340,6 +357,14 @@ pub enum Resolution {
         candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
         server: String,
         server_version: String,
+    },
+    /// See [`ResolutionKind::Dispatch`]. `via_*` name the interface method the
+    /// call was written against; `candidates` are the implementing methods, one
+    /// edge each.
+    Dispatch {
+        candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
+        via_file: String,
+        via_symbol: String,
     },
     Unresolved {
         reason: String,
@@ -399,6 +424,7 @@ impl Resolution {
             Resolution::UniqueGlobal { .. } => ResolutionKind::UniqueGlobal,
             Resolution::AmbiguousGlobal { .. } => ResolutionKind::AmbiguousGlobal,
             Resolution::LanguageServerDispatch { .. } => ResolutionKind::LanguageServerDispatch,
+            Resolution::Dispatch { .. } => ResolutionKind::Dispatch,
             Resolution::Unresolved { .. } => ResolutionKind::Unresolved,
             Resolution::Structural { .. } => ResolutionKind::Structural,
             // The same rung as UniqueGlobal: one declaration of the name in the
@@ -414,6 +440,21 @@ impl Resolution {
     /// the payload.
     pub fn confidence(&self) -> Confidence {
         self.kind().confidence()
+    }
+
+    /// Whether this resolution is one candidate of several rather than a
+    /// binding: an ambiguous name match, a language server's candidate set, or
+    /// an interface call with more than one implementer.
+    ///
+    /// The one owner of the question liveness and cluster passes ask before
+    /// letting an edge count as *reaching* its target. A dispatch with exactly
+    /// one implementer is a call in fact, so it is not in this set.
+    pub fn is_unproven_candidate_set(&self) -> bool {
+        match self {
+            Resolution::AmbiguousGlobal { .. } | Resolution::LanguageServerDispatch { .. } => true,
+            Resolution::Dispatch { candidates, .. } => candidates.len() > 1,
+            _ => false,
+        }
     }
 
     /// The single `(file, symbol)` this resolution names, or `None` for the two
@@ -465,24 +506,11 @@ impl Resolution {
             // Several targets, or none: neither can answer "which one".
             Resolution::AmbiguousGlobal { .. }
             | Resolution::LanguageServerDispatch { .. }
+            | Resolution::Dispatch { .. }
             | Resolution::Unresolved { .. } => None,
         }
     }
 }
-
-/// Most candidates one ambiguous *bare-name* call site may fan out into as
-/// edges.
-///
-/// At or below this ceiling every candidate becomes a `Calls` edge (SC4: do
-/// not collapse the ambiguity). Above it the site emits **no** edges and one
-/// ledger row whose `Resolution::AmbiguousGlobal` still carries the complete
-/// candidate list — a capped sample of a 241-candidate site was still 16
-/// wrong edges per call, and GitPulse measured 71% of all edges as
-/// `AmbiguousGlobal` before receiver calls were barred from this rung.
-///
-/// Receiver calls never reach this rung at all: they resolve only through
-/// receiver evidence, or land in the ledger as External / UninferredReceiver.
-pub const AMBIGUOUS_FANOUT_CAP: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedEdge {
@@ -626,6 +654,17 @@ pub enum UnresolvedClass {
     /// or resolution bug. A member no symbol of the family declares is
     /// [`NoNamesake`] instead: there is no owner for inference to find.
     UninferredReceiver,
+    /// A method call whose receiver **was** typed — an indexed type, with every
+    /// package it embeds from read in full — and that type declares, embeds and
+    /// is promoted no member of that name.
+    ///
+    /// Not [`UninferredReceiver`]: that class says the receiver's type is the
+    /// unknown, which sends a reader after type inference. Here the type is
+    /// known, so the miss is about the *member* — generated code, a method added
+    /// by a build-tagged file the index did not hold, or a call the program
+    /// does not compile. Unexplained, like the three classes that may hide an
+    /// edge.
+    UnresolvedMember,
     /// A call or reference that failed every ladder rung, and **no indexed
     /// symbol that could be its target carries that name**: for a bare name,
     /// no symbol anywhere; for a member on a receiver, no symbol of the
@@ -674,6 +713,7 @@ impl UnresolvedClass {
             UnresolvedClass::LocalBinding => "local_binding",
             UnresolvedClass::External { .. } => "external",
             UnresolvedClass::UninferredReceiver => "uninferred_receiver",
+            UnresolvedClass::UnresolvedMember => "unresolved_member",
             UnresolvedClass::NoNamesake => "no_namesake",
             UnresolvedClass::ModulePath => "module_path",
             UnresolvedClass::Unresolved => "unresolved",
@@ -702,7 +742,12 @@ impl UnresolvedClass {
 
 /// The persisted [`UnresolvedClass::label`]s of the classes that are not
 /// [`UnresolvedClass::is_explained`] — the sites that may hide an edge.
-pub const UNATTRIBUTED_LABELS: &[&str] = &["local_binding", "uninferred_receiver", "unresolved"];
+pub const UNATTRIBUTED_LABELS: &[&str] = &[
+    "local_binding",
+    "uninferred_receiver",
+    "unresolved_member",
+    "unresolved",
+];
 
 #[cfg(test)]
 mod unattributed_label_tests {
@@ -720,6 +765,7 @@ mod unattributed_label_tests {
                 module: "react".into(),
             },
             UnresolvedClass::UninferredReceiver,
+            UnresolvedClass::UnresolvedMember,
             UnresolvedClass::NoNamesake,
             UnresolvedClass::ModulePath,
             UnresolvedClass::Unresolved,
@@ -733,6 +779,7 @@ mod unattributed_label_tests {
                 | UnresolvedClass::LocalBinding
                 | UnresolvedClass::External { .. }
                 | UnresolvedClass::UninferredReceiver
+                | UnresolvedClass::UnresolvedMember
                 | UnresolvedClass::NoNamesake
                 | UnresolvedClass::ModulePath
                 | UnresolvedClass::Unresolved => {}
@@ -829,6 +876,52 @@ pub struct UnresolvedReference {
     /// what makes "is the `unresolved` tier really only bare names" a query
     /// instead of an instrumented rebuild.
     pub receiver: Option<String>,
+    /// Where in `source_file` the use was written, for a call or reference
+    /// the resolver read from an extraction; `None` for a route, an import, or
+    /// a row built by hand.
+    ///
+    /// The opt-in language-server pass asks a server about *this* site. It
+    /// used to find the site again by `(source_symbol, callee_name)` and take
+    /// the first match, so in `a.run(); b.run();` both rows were asked about
+    /// `a.run` and `b`'s row was given `a`'s target. Not persisted and not
+    /// serialised: a locator for the build that produced the row, not part of
+    /// the ledger's identity on disk.
+    #[serde(skip)]
+    pub site: Option<SiteBytes>,
+}
+
+/// A byte range in a source file: the in-memory locator an
+/// [`UnresolvedReference`] carries back to the site it records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SiteBytes {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl SiteBytes {
+    pub fn of(span: &Span) -> Self {
+        Self {
+            start: span.start_byte,
+            end: span.end_byte,
+        }
+    }
+}
+
+/// The glob re-export expansion stopped at its hop cap, so
+/// [`ResolutionResult::reexport_chains`] is a partial map.
+///
+/// A chain the expansion never built is absent, not wrong — the answer the map
+/// gave before globs were expanded at all — but absent from a *complete* walk
+/// and absent from a *truncated* one are different statements, and the caller
+/// must be able to tell them apart. Read with `Resolver::reexport_glob_cutoff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReexportGlobCutoff {
+    /// The most hops the expansion may hold.
+    pub limit: usize,
+    /// Hops the round that hit the cap proposed and could not insert. A lower
+    /// bound: the rounds after it never ran, so what they would have added is
+    /// not counted.
+    pub dropped_at_least: usize,
 }
 
 /// Aggregate limits for global-candidate lookup and repeated ambiguity evidence.

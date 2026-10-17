@@ -1,13 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import { previewDevmapEdits } from "./client";
+import { cancelCodeintelQuery, previewDevmapEdits } from "./client";
 import { CODEINTEL_FANOUT_CAP } from "./fanout";
 import { previewStore } from "./previewStore";
 import type { DevmapPreviewOutcome } from "./types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("./client", () => ({ previewDevmapEdits: vi.fn() }));
+vi.mock("./client", () => ({
+  previewDevmapEdits: vi.fn(),
+  cancelCodeintelQuery: vi.fn(async () => true),
+  newCodeintelCancelToken: vi.fn(() => `token-${++mintedTokens}`),
+}));
+let mintedTokens = 0;
 
 function emptyOutcome(overrides: Partial<DevmapPreviewOutcome> = {}): DevmapPreviewOutcome {
   return {
@@ -68,5 +73,83 @@ describe("previewStore.refresh", () => {
     const omitted = state.files.filter((file) => !file.available);
     expect(omitted).toHaveLength(4);
     expect(omitted.every((file) => (file.reason ?? "").includes("fan-out capped"))).toBe(true);
+  });
+
+  it("reads the staged files together, keeps their order, and reports each unreadable file on its own", async () => {
+    const releases = new Map<string, () => void>();
+    vi.mocked(invoke).mockImplementation((_cmd, args) => {
+      const filePath = (args as { filePath: string }).filePath;
+      return new Promise((resolve, reject) => {
+        releases.set(filePath, () => (filePath === "src/b.ts" ? reject("permission denied") : resolve(`// ${filePath}\n`)));
+      });
+    });
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"];
+    const done = previewStore.refresh("/repo", paths);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(invoke, "every read is in flight before the first answers").toHaveBeenCalledTimes(paths.length);
+    // Answer out of order: the pairs still follow the caller's order.
+    for (const path of ["src/d.ts", "src/b.ts", "src/a.ts", "src/c.ts"]) releases.get(path)!();
+    await done;
+    expect(previewDevmapEdits).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(previewDevmapEdits).mock.calls[0][1]).toEqual([
+      ["src/a.ts", "// src/a.ts\n"],
+      ["src/c.ts", "// src/c.ts\n"],
+      ["src/d.ts", "// src/d.ts\n"],
+    ]);
+    const unread = get(previewStore).files.filter((file) => !file.available);
+    expect(unread).toEqual([{ file_path: "src/b.ts", available: false, reason: "permission denied", report: null }]);
+  });
+
+  // D8: the backend's cancel flag was the constant `false`, so a superseded
+  // batch ran its remaining files to the end with only the answer ignored.
+  describe("abandoned previews", () => {
+    beforeEach(() => {
+      vi.mocked(cancelCodeintelQuery).mockClear();
+    });
+
+    function holdPreview() {
+      const calls: Array<{ token: string | undefined; release: () => void }> = [];
+      vi.mocked(previewDevmapEdits).mockImplementation(
+        (_repo, _pairs, token) =>
+          new Promise((resolve) => {
+            calls.push({ token, release: () => resolve(emptyOutcome()) });
+          }),
+      );
+      return calls;
+    }
+
+    it("sends a cancel token with the batch", async () => {
+      const calls = holdPreview();
+      const done = previewStore.refresh("/repo", ["src/a.ts"]);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      expect(calls[0].token).toMatch(/^token-/);
+      calls[0].release();
+      await done;
+      expect(cancelCodeintelQuery).not.toHaveBeenCalled();
+    });
+
+    it("cancels the batch in flight when a different request supersedes it", async () => {
+      const calls = holdPreview();
+      const first = previewStore.refresh("/repo", ["src/a.ts"]);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      const second = previewStore.refresh("/repo", ["src/b.ts"]);
+      expect(cancelCodeintelQuery).toHaveBeenCalledWith(calls[0].token);
+      await vi.waitFor(() => expect(calls).toHaveLength(2));
+      expect(calls[1].token).not.toBe(calls[0].token);
+      calls[1].release();
+      calls[0].release();
+      await Promise.all([first, second]);
+    });
+
+    it("cancels the batch in flight on reset", async () => {
+      const calls = holdPreview();
+      const done = previewStore.refresh("/repo", ["src/a.ts"]);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      previewStore.reset();
+      expect(cancelCodeintelQuery).toHaveBeenCalledWith(calls[0].token);
+      calls[0].release();
+      await done;
+    });
   });
 });

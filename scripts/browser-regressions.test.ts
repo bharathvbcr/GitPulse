@@ -57,6 +57,30 @@ describe("failure reporting a CI reader can see", () => {
   });
 });
 
+describe("the watchdog only ever signals the Chrome it launched", () => {
+  const profile = "/tmp/gitpulse-browser-abc123";
+  const own = (pid: number) => ({ pgid: pid, command: `Chrome --user-data-dir=${profile} about:blank` });
+  it("names Chrome's group when the pid is still its group leader", async () => {
+    const { chromeVictim } = await import("./browser-regressions.mjs");
+    expect(chromeVictim(4242, profile, "darwin", 7, own)).toBe(-4242);
+    expect(chromeVictim(4242, profile, "win32", 7, own)).toBe(4242);
+  });
+  it("refuses every id that would reach more than Chrome", async () => {
+    const { chromeVictim } = await import("./browser-regressions.mjs");
+    // process.kill(-0) is kill(0): the watchdog's own group. -1 is everything.
+    for (const id of [0, -0, 1, -1, -2, NaN, Infinity, 1.5, 7]) {
+      expect(chromeVictim(id, profile, "darwin", 7, own), `pid ${id}`).toBeNull();
+    }
+  });
+  it("refuses a recycled pid: gone, not a group leader, or not this run's Chrome", async () => {
+    const { chromeVictim } = await import("./browser-regressions.mjs");
+    expect(chromeVictim(4242, profile, "darwin", 7, () => null)).toBeNull();
+    expect(chromeVictim(4242, profile, "darwin", 7, () => ({ pgid: 900, command: `Chrome --user-data-dir=${profile}` }))).toBeNull();
+    expect(chromeVictim(4242, profile, "darwin", 7, () => ({ pgid: 4242, command: "/usr/bin/vim notes.txt" }))).toBeNull();
+    expect(chromeVictim(4242, "", "darwin", 7, own)).toBeNull();
+  });
+});
+
 describe("a browser cannot outlive its runner", () => {
   const chrome = chromeBinary();
   // Reported as skipped where there is no Chrome, never as passed.
@@ -66,10 +90,8 @@ describe("a browser cannot outlive its runner", () => {
     // A stand-in runner: launches Chrome exactly as a harness run does, then
     // is SIGKILLed, so no `finally`, handler or `exit` hook can run.
     const parent = spawn(process.execPath, ["--input-type=module", "-e", `
-      import { spawn } from "node:child_process";
-      const { chromeLaunch } = await import(${JSON.stringify(pathToFileURL(runner).href)});
-      const launch = chromeLaunch(${JSON.stringify(chrome)}, ${JSON.stringify(profile)}, "about:blank");
-      const child = spawn(launch.file, launch.args, { stdio: launch.stdio });
+      const { startChrome } = await import(${JSON.stringify(pathToFileURL(runner).href)});
+      const child = startChrome(${JSON.stringify(chrome)}, ${JSON.stringify(profile)}, "about:blank");
       console.log(String(child.pid));
       setInterval(() => {}, 1000);
     `], { stdio: ["ignore", "pipe", "inherit"] });
@@ -81,7 +103,7 @@ describe("a browser cannot outlive its runner", () => {
         parent.once("exit", code => reject(new Error(`stand-in runner exited (${code})`)));
       });
       expect(pid).toBeGreaterThan(0);
-      // Chrome is up and waiting on its control pipe before the runner dies.
+      // Chrome is up before the runner dies.
       await new Promise(r => setTimeout(r, 1500));
       expect(alive()).toBe(true);
       parent.kill("SIGKILL");

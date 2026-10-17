@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>File tree checks</title>
+<style>body{margin:0}#host{display:flex;height:480px;width:340px}#result{position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100;white-space:pre}</style></head>
+<body><div id="host"></div><pre id="result"></pre>
+<script type="module">
+/**
+ * The file explorer, rendered.
+ *
+ * What the tree does for a keyboard and for a filter is what these checks
+ * settle against fixture IPC: the single-select tree keys, the active item a
+ * screen reader follows, the context menu's keys and focus return, the filter
+ * a query narrows the listing with, the confirmation a delete or discard waits
+ * for, what create, rename and move send, which index action a file is offered,
+ * how an unverified line count and a long name are drawn, and what a filter
+ * that ran out of time says.
+ * Nothing here executes git.
+ */
+import "../src/app.css";
+import { mockIPCWithEvents } from "./tauriMocks";
+import { createChecks } from "./checks.ts";
+
+const errors = [];
+addEventListener("error", event => errors.push(event.message));
+addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+const root = "/fixture/GitPulse";
+let listing = ["README.md", "docs/guide.md", "src/app.ts", "src/lib/a.ts", "src/lib/b.ts"];
+const unexpected = [], deletes = [], indexCalls = [], discards = [], writes = [], moves = [];
+let moveFails = false;
+// A command parked here answers only when `release` is called, so a check can
+// look at the store while the host is still working.
+const parked = {};
+const park = cmd => new Promise(resolve => { (parked[cmd] ??= []).push(resolve); });
+const release = cmd => { (parked[cmd] ?? []).splice(0).forEach(resolve => resolve()); };
+let holding = new Set();
+const status = (path, code, extra = {}) => ({ path, is_staged: false, status_code: code, is_conflicted: false, additions: 1, deletions: 0, ...extra });
+// README is staged only; a.ts is changed on both sides of the index; b.ts
+// carries a churn count the backend could not verify.
+let statuses = [
+  status("docs/guide.md", "??"), status("src/app.ts", "M"),
+  status("README.md", "M", { is_staged: true }),
+  status("src/lib/a.ts", "MM", { is_staged: true, additions: 3, deletions: 1 }),
+  status("src/lib/b.ts", "M", { additions: 5, deletions: 2, warnings: ["numstat record unreadable"] }),
+];
+const guarded = { policy: null, output: null };
+mockIPCWithEvents((cmd, args) => {
+  switch (cmd) {
+    case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
+    case "cmd_list_repo_files": return listing;
+    case "cmd_get_status": return statuses;
+    case "cmd_stage_file": case "cmd_unstage_file": indexCalls.push({ cmd, ...args }); return guarded;
+    case "cmd_discard_changes": discards.push(args); return guarded;
+    case "cmd_create_file": writes.push(args); if (holding.has(cmd)) return park(cmd).then(() => guarded); if (args.filePath === "hidden-on-disk.ts") throw { code: "already_exists", message: "'hidden-on-disk.ts' already exists", path: args.filePath }; return guarded;
+    case "cmd_move_path": moves.push(args); if (holding.has(cmd)) return park(cmd).then(() => guarded); if (moveFails) throw new Error("move refused by fixture"); return guarded;
+    case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: "a".repeat(40), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
+    case "cmd_list_remotes": case "cmd_list_submodules": return [];
+    case "cmd_stash_list": return { entries: [], truncated: false };
+    case "cmd_list_tags": return { tags: [], truncated: false };
+    case "cmd_branch_stats": return {};
+    case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_watch_repo": case "cmd_unwatch_repo": case "cmd_note_tab_activated": case "cmd_last_fetch_at": case "cmd_set_recent_menu": return null;
+    case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
+    case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
+    case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
+    case "cmd_delete_path": deletes.push(args); if (holding.has(cmd)) return park(cmd).then(() => ({ policy: null, output: { left_behind: false } })); return { policy: null, output: { left_behind: false } };
+    default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
+  }
+});
+const { mount, tick } = await import("svelte");
+const { get } = await import("svelte/store");
+const { repoStore } = await import("../src/lib/stores/repoStore");
+const { promptState, promptError, completePrompt } = await import("../src/lib/stores/modalStore");
+const { harnessStore } = await import("../src/lib/stores/harnessStore");
+const { gitActionCount } = await import("../src/lib/desktop/exitGuard");
+const Panel = (await import("../src/lib/components/files/FileTreePanel.svelte")).default;
+const { results, check, stopped } = createChecks();
+const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
+const until = async (test, label) => { const end = Date.now() + 8000; while (!test() && Date.now() < end) await wait(); if (!test()) throw new Error("Timed out: " + label); };
+const host = document.getElementById("host");
+const tree = () => host.querySelector('[role="tree"]');
+const items = () => [...host.querySelectorAll('[role="treeitem"]')];
+const nameOf = el => el.textContent.trim().replace(/\s+/g, " ");
+const active = () => { const id = tree().getAttribute("aria-activedescendant"); return id ? document.getElementById(id) : null; };
+const activeName = () => active() ? nameOf(active()) : "";
+const press = async (target, key, init = {}) => { target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init })); await tick(); await wait(80); };
+
+(async () => { try {
+  await repoStore.openRepo(root);
+  mount(Panel, { target: host });
+  await until(() => items().some(el => nameOf(el).includes("README.md")), "tree rows");
+  // The first rows are redrawn once shortly after mount; wait for the
+  // settled tree rather than the one it replaces.
+  await wait(400);
+  await until(() => items().some(el => nameOf(el).includes("README.md")), "tree rows after the status read");
+
+  // --- structure ----------------------------------------------------------
+  check("the listing is drawn as a tree with the folders and the root file", () =>
+    Boolean(tree()) && items().some(el => nameOf(el).includes("src")) && items().some(el => nameOf(el).includes("README.md")));
+  check("a folder says whether it is expanded and every item says its depth", () =>
+    items().every(el => el.getAttribute("aria-level")) && items().some(el => el.hasAttribute("aria-expanded")));
+
+  // --- keys ---------------------------------------------------------------
+  tree().focus(); await press(tree(), "Home");
+  const first = activeName();
+  check("Home selects the first item and the tree names it as the active descendant", () => first !== "" && nameOf(items()[0]) === first);
+  await press(tree(), "End");
+  check("End selects the last item", () => activeName() === nameOf(items().at(-1)) && activeName() !== first);
+  await press(tree(), "ArrowUp");
+  const upper = activeName();
+  await press(tree(), "ArrowDown");
+  check("ArrowUp and ArrowDown move one item each way", () => upper !== "" && upper !== activeName() && activeName() === nameOf(items().at(-1)));
+  // Folders start open. `docs` is the first row and holds one file.
+  await press(tree(), "Home");
+  const docsRow = () => items().find(el => nameOf(el).startsWith("docs"));
+  const openCount = items().length;
+  check("the first item is the docs folder, open", () => activeName().startsWith("docs") && docsRow().getAttribute("aria-expanded") === "true");
+  await press(tree(), "ArrowLeft");
+  check("ArrowLeft on an open folder collapses it and hides its children", () => docsRow().getAttribute("aria-expanded") === "false" && items().length === openCount - 1);
+  await press(tree(), "ArrowRight");
+  check("ArrowRight on a collapsed folder opens it again", () => docsRow().getAttribute("aria-expanded") === "true" && items().length === openCount);
+  await press(tree(), "ArrowRight");
+  check("ArrowRight on an open folder steps into its first child, one level deeper", () => activeName().includes("guide.md") && Number(active().getAttribute("aria-level")) === Number(docsRow().getAttribute("aria-level")) + 1);
+  await press(tree(), "ArrowLeft");
+  check("ArrowLeft on a child goes back to its parent folder", () => activeName().startsWith("docs"));
+
+  // --- opening ------------------------------------------------------------
+  await press(tree(), "Home");
+  while (!activeName().includes("README.md")) await press(tree(), "ArrowDown");
+  await press(tree(), "Enter");
+  check("Enter on a file opens it", () => get(repoStore).selectedFilePath === "README.md");
+
+  // --- narrowing -----------------------------------------------------------
+  const filterBox = () => host.querySelector('input[placeholder="Filter files"]');
+  const typed = async text => { filterBox().value = text; filterBox().dispatchEvent(new Event("input", { bubbles: true })); await tick(); await wait(250); };
+  const leaves = () => items().filter(el => !el.hasAttribute("aria-expanded")).map(nameOf);
+  await typed("*.md");
+  check("a glob query keeps only the files it matches, with their folders", () => leaves().length === 2 && leaves().every(name => name.includes(".md")) && items().some(el => nameOf(el).startsWith("docs")));
+  check("and the count says how many of the files it kept", () => /2 of 5 files shown/.test(host.innerHTML));
+  await typed("");
+  const untracked = () => host.querySelector('[aria-label^="Untracked ("]');
+  untracked().click(); await tick(); await wait(200);
+  check("the Untracked scope shows only the untracked file, and says it is pressed", () => leaves().length === 1 && leaves()[0].includes("guide.md") && untracked().getAttribute("aria-pressed") === "true");
+  untracked().click(); await tick(); await wait(200);
+  check("pressing it again shows every file", () => leaves().length === 5 && untracked().getAttribute("aria-pressed") === "false");
+
+  // --- following the open file ---------------------------------------------
+  tree().focus(); await press(tree(), "Home");
+  while (!activeName().startsWith("src")) await press(tree(), "ArrowDown");
+  await press(tree(), "ArrowLeft");
+  check("the src folder is collapsed, hiding the file under it", () => !items().some(el => nameOf(el).includes("a.ts")));
+  repoStore.selectFilePath("src/lib/a.ts"); await tick(); await wait(300);
+  check("opening a file from elsewhere unfolds the folders down to it and selects it", () => items().some(el => nameOf(el).includes("a.ts")) && activeName().includes("a.ts"));
+  tree().focus();
+  await press(tree(), "ArrowLeft"); await press(tree(), "ArrowLeft");
+  await wait(300);
+  check("collapsing its folder afterwards is not undone by the open file", () => !items().some(el => nameOf(el).includes("a.ts")) && activeName().startsWith("lib"));
+
+  // --- the context menu ---------------------------------------------------
+  const menu = () => document.querySelector('[role="menu"]');
+  tree().focus(); await press(tree(), "Home"); await press(tree(), "ArrowDown");
+  await press(tree(), "ContextMenu");
+  check("the Menu key opens the actions for the selected item", () => Boolean(menu()));
+  const menuItems = () => [...menu().querySelectorAll('[role="menuitem"]')];
+  await press(menu(), "End");
+  const atEnd = document.activeElement === menuItems().at(-1);
+  await press(menu(), "Home");
+  check("End and Home move focus to the last and first action", () => menuItems().length > 1 && atEnd && document.activeElement === menuItems()[0]);
+  await press(menu(), "ArrowDown");
+  check("ArrowDown moves to the next action", () => document.activeElement === menuItems()[1]);
+  await press(menu(), "Escape");
+  check("Escape closes it and puts focus back on the tree", () => !menu() && (document.activeElement === tree() || tree().contains(document.activeElement)));
+  await press(tree(), "F10", { shiftKey: true });
+  check("Shift+F10 opens it too", () => Boolean(menu()));
+  await press(menu(), "Escape");
+
+  // --- delete asks first, and says what cannot be undone -------------------
+  await press(tree(), "Home");
+  await press(tree(), "ArrowDown");
+  check("the untracked file is selected", () => activeName().includes("guide.md"));
+  await press(tree(), "ContextMenu");
+  const deleteItem = [...menu().querySelectorAll("button,[role='menuitem']")].find(el => /Delete File/.test(el.textContent));
+  deleteItem.click(); await until(() => get(promptState), "delete confirmation");
+  const asked = get(promptState).options;
+  check("Delete File asks first, as a destructive confirmation that names the path and that git holds no copy",
+    () => asked.title === "Delete File" && asked.destructive === true && asked.message.includes("docs/guide.md") && /cannot be undone/.test(asked.message));
+  check("and nothing has been deleted while it waits", () => deletes.length === 0);
+  completePrompt(false); await wait(150);
+  check("cancelling deletes nothing", () => deletes.length === 0);
+  await press(tree(), "ContextMenu");
+  [...menu().querySelectorAll("button,[role='menuitem']")].find(el => /Delete File/.test(el.textContent)).click();
+  await until(() => get(promptState), "second confirmation"); completePrompt(true);
+  await until(() => deletes.length === 1, "delete sent");
+  check("confirming deletes that path, once", () => deletes[0].path === "docs/guide.md" && deletes[0].repoPath === root);
+
+  // --- which index action each file is offered -----------------------------
+  const rowFor = path => items().find(el => el.getAttribute("title") === path || el.querySelector(`[title="${path}"]`));
+  const reveal = async path => { repoStore.selectFilePath(path); await tick(); await wait(300); };
+  const openMenuFor = async path => {
+    await reveal(path);
+    host.querySelector(`[aria-label="Actions for ${path}"]`).click(); await tick(); await wait(120);
+  };
+  const menuLabels = () => [...menu().querySelectorAll('[role="menuitem"]')].map(el => el.textContent.trim());
+  const menuItem = label => [...menu().querySelectorAll('[role="menuitem"]')].find(el => el.textContent.trim() === label);
+  const closeMenu = async () => { if (menu()) await press(menu(), "Escape"); };
+  await openMenuFor("README.md");
+  check("a staged file is offered Unstage Changes, and neither Stage File nor Discard", () => menuLabels().includes("Unstage Changes") && !menuLabels().includes("Stage File") && !menuLabels().includes("Discard Changes…"));
+  menuItem("Unstage Changes").click();
+  await until(() => indexCalls.length === 1, "unstage sent");
+  check("and Unstage Changes unstages that file", () => indexCalls[0].cmd === "cmd_unstage_file" && indexCalls[0].filePath === "README.md" && indexCalls[0].repoPath === root);
+  await openMenuFor("src/app.ts");
+  check("an unstaged file is offered Stage File and Discard, and not Unstage Changes", () => menuLabels().includes("Stage File") && menuLabels().includes("Discard Changes…") && !menuLabels().includes("Unstage Changes"));
+  menuItem("Stage File").click();
+  await until(() => indexCalls.length === 2, "stage sent");
+  check("and Stage File stages that file", () => indexCalls[1].cmd === "cmd_stage_file" && indexCalls[1].filePath === "src/app.ts");
+  await openMenuFor("src/lib/a.ts");
+  check("a file changed on both sides of the index is offered both actions", () => menuLabels().includes("Unstage Changes") && menuLabels().includes("Stage File"));
+  await closeMenu();
+
+  // --- discard asks first ---------------------------------------------------
+  await openMenuFor("src/app.ts");
+  menuItem("Discard Changes…").click();
+  await until(() => get(promptState), "discard confirmation");
+  const discardAsk = get(promptState).options;
+  check("Discard Changes asks first, naming the file and that it cannot be undone", () => discardAsk.title === "Discard Changes" && discardAsk.message.includes("src/app.ts") && /cannot be undone/.test(discardAsk.message));
+  check("and nothing is discarded while it waits", () => discards.length === 0);
+  completePrompt(false); await wait(150);
+  check("cancelling discards nothing", () => discards.length === 0);
+  await openMenuFor("src/app.ts");
+  menuItem("Discard Changes…").click();
+  await until(() => get(promptState), "second discard confirmation"); completePrompt(true);
+  await until(() => discards.length === 1, "discard sent");
+  check("confirming discards that file, once", () => discards[0].filePath === "src/app.ts" && discards[0].repoPath === root);
+
+  // --- creating files and folders ------------------------------------------
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "new file prompt");
+  check("New File asks for a name in the repository root", () => get(promptState).options.title === "New File" && get(promptState).options.message === "Create file in repository root");
+  completePrompt("   "); await wait(150);
+  check("a blank name creates nothing", () => writes.length === 0);
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "new file prompt again"); completePrompt("  notes.ts ");
+  await until(() => writes.length === 1, "file written");
+  await wait(200);
+  check("a name creates that empty file at the root, trimmed, and opens it", () => writes[0].filePath === "notes.ts" && !("content" in writes[0]) && get(repoStore).selectedFilePath === "notes.ts");
+  await openMenuFor("docs/guide.md");
+  await press(tree(), "Home");
+  await closeMenu();
+  host.querySelector('[aria-label="Actions for docs"]').click(); await tick(); await wait(120);
+  menuItem("New Folder in folder…").click();
+  await until(() => get(promptState), "new folder prompt");
+  check("New Folder from a folder's menu asks for a folder inside it", () => get(promptState).options.title === "New Folder" && get(promptState).options.message === "Create folder in docs/");
+  completePrompt("assets");
+  await until(() => writes.length === 2, "folder written");
+  check("and creates it by writing a .gitkeep inside it", () => writes[1].filePath === "docs/assets/.gitkeep");
+  host.querySelector('[aria-label="Actions for docs"]').click(); await tick(); await wait(120);
+  menuItem("New File in folder…").click();
+  await until(() => get(promptState), "new file in folder prompt"); completePrompt("intro.md");
+  await until(() => writes.length === 3, "file in folder written");
+  check("New File from a folder's menu creates the file inside that folder", () => writes[2].filePath === "docs/intro.md");
+
+  // --- an existing name is refused and nothing is written ------------------------
+  const created = writes.length;
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "new file prompt for an existing name");
+  completePrompt("README.md"); await wait(150);
+  check("a name the listing holds is refused in the dialog, which stays open with the reason", () => get(promptState) !== null && /already exists/.test(get(promptError) ?? ""));
+  check("and nothing was sent to the host", () => writes.length === created);
+  completePrompt(null); await wait(100);
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "new file prompt for a file only the disk has");
+  completePrompt("hidden-on-disk.ts");
+  await until(() => writes.length === created + 1 && get(promptState), "host refusal reopens the prompt");
+  check("a file the listing has not shown is refused by the host and the prompt reopens on the typed name", () => writes.at(-1).filePath === "hidden-on-disk.ts" && get(promptState).options.initialValue === "hidden-on-disk.ts" && /already exists/.test(get(promptState).options.error ?? ""));
+  check("and it is not opened", () => get(repoStore).selectedFilePath !== "hidden-on-disk.ts");
+  completePrompt(null); await wait(100);
+  check("cancelling that prompt creates nothing more", () => writes.length === created + 1);
+
+  // --- rename and move --------------------------------------------------------
+  await openMenuFor("src/lib/b.ts");
+  menuItem("Rename or Move…").click();
+  await until(() => get(promptState), "move prompt");
+  const moveAsk = get(promptState).options;
+  check("Rename or Move starts from the file's current path", () => moveAsk.title === "Rename or Move File" && moveAsk.initialValue === "src/lib/b.ts");
+  completePrompt("src/lib/b.ts"); await wait(150);
+  check("answering with the same path moves nothing", () => moves.length === 0);
+  await openMenuFor("src/lib/b.ts");
+  menuItem("Rename or Move…").click();
+  await until(() => get(promptState), "move prompt again"); completePrompt("src/core/b.ts");
+  await until(() => moves.length === 1, "move sent"); await wait(200);
+  check("a new path moves the file there and the open file follows it", () => moves[0].from === "src/lib/b.ts" && moves[0].to === "src/core/b.ts" && get(repoStore).selectedFilePath === "src/core/b.ts");
+  await reveal("docs/guide.md");
+  host.querySelector('[aria-label="Actions for docs"]').click(); await tick(); await wait(120);
+  menuItem("Rename or Move Folder…").click();
+  await until(() => get(promptState), "folder move prompt"); completePrompt("guides/");
+  await until(() => moves.length === 2, "folder move sent"); await wait(200);
+  check("moving a folder drops a trailing slash and the open file inside it follows", () => moves[1].from === "docs" && moves[1].to === "guides" && get(repoStore).selectedFilePath === "guides/guide.md");
+  moveFails = true;
+  await openMenuFor("src/app.ts");
+  menuItem("Rename or Move…").click();
+  await until(() => get(promptState), "refused move prompt"); completePrompt("src/main.ts");
+  await until(() => moves.length === 3, "refused move sent"); await wait(200);
+  check("a move the backend refuses says why and leaves the open file where it was", () => get(repoStore).error?.includes("refused by fixture") && get(repoStore).selectedFilePath === "src/app.ts");
+  moveFails = false;
+  repoStore.setError(null);
+
+  // --- every file mutation goes through the store's wrapper --------------------
+  // Counted by the quit guard while it is queued or running, one at a time per
+  // repository, and journalled; a confirm raised in one repository is not
+  // answered in another.
+  harnessStore.activateRepository(root);
+  const busy = () => gitActionCount(get(repoStore.mutationActivity));
+  const journal = () => get(harnessStore).actions;
+  const settled = async () => { await until(() => busy() === 0, "mutations settled"); await wait(80); };
+  await settled();
+  const deletesBefore = deletes.length, movesBefore = moves.length, writesBefore = writes.length;
+  holding = new Set(["cmd_delete_path", "cmd_move_path", "cmd_create_file"]);
+  await openMenuFor("README.md");
+  menuItem("Delete File…").click();
+  await until(() => get(promptState), "wrapped delete confirmation"); completePrompt(true);
+  await until(() => deletes.length === deletesBefore + 1, "wrapped delete sent");
+  check("a pending delete is counted by the quit guard", () => busy() === 1);
+  await openMenuFor("src/lib/a.ts");
+  menuItem("Rename or Move…").click();
+  await until(() => get(promptState), "wrapped move prompt"); completePrompt("src/lib/z.ts");
+  await wait(250);
+  check("a move asked for behind it is counted too, and waits its turn instead of running beside it", () => busy() === 2 && moves.length === movesBefore);
+  release("cmd_delete_path");
+  await until(() => moves.length === movesBefore + 1, "queued move runs after the delete");
+  release("cmd_move_path");
+  await settled();
+  check("both ran, in order, and the quit guard is idle again", () => busy() === 0 && deletes.length === deletesBefore + 1 && moves.length === movesBefore + 1);
+  check("the delete and the move are each journalled, once, as done", () => journal().filter(a => a.kind === "delete" && a.label === "README.md" && a.ok).length === 1 && journal().filter(a => a.kind === "move" && a.label === "src/lib/a.ts → src/lib/z.ts" && a.ok).length === 1);
+  host.querySelector('[aria-label="New file in repository root"]').click();
+  await until(() => get(promptState), "wrapped create prompt"); completePrompt("wrapped.ts");
+  await until(() => writes.length === writesBefore + 1, "wrapped create sent");
+  check("a pending create is counted by the quit guard", () => busy() === 1);
+  release("cmd_create_file");
+  await settled();
+  check("and journalled as done", () => journal().some(a => a.kind === "create" && a.label === "wrapped.ts" && a.ok));
+  holding = new Set();
+
+  const otherRepo = "/fixture/Other";
+  const deletesAtSwitch = deletes.length;
+  await openMenuFor("docs/guide.md");
+  menuItem("Delete File…").click();
+  await until(() => get(promptState), "delete confirmation before a switch");
+  await repoStore.openRepo(otherRepo);
+  await wait(200);
+  completePrompt(true);
+  await wait(300);
+  check("a delete confirmed after the repository changed is not sent to the one now in front", () => !deletes.slice(deletesAtSwitch).some(args => args.repoPath === otherRepo));
+  await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === root).id);
+  harnessStore.activateRepository(root);
+  await wait(300);
+
+  // --- churn the backend could not verify --------------------------------------
+  await reveal("src/lib/a.ts");
+  const churnOf = path => [...rowFor(path).querySelectorAll("span.font-mono")].filter(el => /^~?[+-]\d+$/.test(el.textContent.trim()));
+  const warned = churnOf("src/lib/b.ts"), verified = churnOf("src/lib/a.ts");
+  check("a line count the backend flagged reads as a floor: a tilde, in amber", () => warned.length === 2 && warned[0].textContent.trim() === "~+5" && warned.every(el => /amber/.test(el.className)));
+  check("and its tooltip gives the backend's reason", () => /may understate/.test(warned[0].title) && warned[0].title.includes("numstat record unreadable"));
+  check("a verified count has no tilde and keeps the add/delete colours", () => verified.length === 2 && verified[0].textContent.trim() === "+3" && /emerald/.test(verified[0].className) && /rose/.test(verified[1].className) && !verified[0].title);
+
+  // --- long names scroll instead of being painted through ---------------------
+  const longName = "src/verdict.schema.with-a-name-much-longer-than-the-rail-can-hold.json";
+  listing = [...listing, longName];
+  statuses = [...statuses, status(longName, "M")];
+  await repoStore.refresh(root); await until(() => rowFor(longName), "long row");
+  await reveal(longName);
+  const longRow = rowFor(longName);
+  const nameEl = [...longRow.querySelectorAll("span")].find(el => el.textContent.includes("much-longer"));
+  const badge = [...longRow.querySelectorAll("span")].find(el => /font-bold/.test(el.className) && el.textContent.trim().length <= 2 && el !== nameEl);
+  const scroller = (() => { let node = longRow.parentElement; while (node && node !== host) { if (["auto", "scroll"].includes(getComputedStyle(node).overflowX)) return node; node = node.parentElement; } return null; })();
+  check("a long name is drawn whole, on one line", () => nameEl.scrollWidth <= nameEl.clientWidth + 1 && nameEl.getBoundingClientRect().height < 30 && nameEl.textContent.trim() === longName.split("/").pop());
+  check("its status mark sits after the name, inside the row, instead of over the name or clipped off its end", () => Boolean(badge) && badge.getBoundingClientRect().left >= nameEl.getBoundingClientRect().right - 1 && badge.getBoundingClientRect().right <= longRow.getBoundingClientRect().right + 1 && longRow.scrollWidth <= longRow.clientWidth + 1);
+  check("and the tree scrolls sideways to reach it", () => Boolean(scroller) && scroller.scrollWidth > scroller.clientWidth);
+  check("and every row is as wide as the widest, so a short row's highlight still spans the scrolled width", () => { const short = rowFor("README.md"); return Boolean(short) && Math.abs(short.getBoundingClientRect().width - longRow.getBoundingClientRect().width) <= 1; });
+
+  // --- a filter that ran out of time says so --------------------------------
+  listing = [...listing, ...Array.from({ length: 1000 }, (_, i) => `gen/file-${i}.ts`)];
+  statuses = [...statuses, status("gen/file-0.ts", "M")];
+  await repoStore.refresh(root); await until(() => items().some(el => nameOf(el).startsWith("gen")), "big listing");
+  const realNow = Date.now; let clock = realNow.call(Date);
+  // Every clock read is a second later, so the scan's budget runs out at its
+  // first check, 256 paths in: the deterministic form of a slow filter.
+  Date.now = () => (clock += 1000);
+  await typed("file-");
+  Date.now = realNow;
+  const counter = () => [...host.querySelectorAll("span")].find(el => /files match — the filter stopped|files shown$/.test(el.title));
+  check("a filter stopped at its time budget says so in a caption under the box", () => /Filter stopped at its time budget/.test(host.textContent));
+  check("and its count is a floor, not a total", () => counter().textContent.trim().startsWith("≥") && /^At least \d+ of \d+ files match/.test(counter().title));
+  await typed("");
+  check("a complete filter has neither the caption nor the floor", () => !/Filter stopped at its time budget/.test(host.textContent) && !counter().textContent.includes("≥"));
+
+  check("No unexpected commands", () => unexpected.length === 0);
+  check("No unhandled runtime errors", () => errors.length === 0);
+} catch (error) { stopped(error); }
+  document.getElementById("result").textContent = results.map(r => (r.pass ? "ok   " : "FAIL ") + r.name).join("\n");
+  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected }));
+  const reportPath = new URLSearchParams(location.search).get("report");
+  if (reportPath?.startsWith("/__gp_result/")) await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+})();
+</script></body></html>

@@ -267,6 +267,14 @@ flowchart TD
   native launch validation alone does not prove the provider's effective policy.
   See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the verification limits.
 - Model-assisted remediation actions (`cmd_manvi_run_action`) are restricted to a strict command allowlist and require explicit user confirmation.
+- With "Keep terminals running when GitPulse quits" on (off by default), the PTYs live in a
+  separate process, `gitpulse-ptyd`, reached over a unix socket that only the same user can
+  connect to (`0700` directory, `0600` socket, peer uid checked on every connection). Repository
+  validation, trust and `require_unsubstitutable_dir` run in that process, where the fork
+  happens; a session-only trust grant never reaches it. What this widens and why it grants a
+  same-user process nothing it did not already have is the security-impact statement in
+  [Terminal host](TERMINAL_HOST.md#security-impact-statement), which awaits the owner's sign-off
+  before the host becomes the default.
 
 ### GitHub Alert Scans
 - Opening a repository fetches Dependabot and code scanning alerts through the
@@ -399,3 +407,17 @@ On 2026-09-12, the pinned revision `ac84b24` passed `cargo audit --deny warnings
 for 550 Rust dependencies and `npm audit` for 175 npm dependencies, with no
 reported advisories. These are dated advisory-database checks, not exhaustive
 source or runtime security verification. Re-run both checks for a release.
+
+## Posting verification results to GitHub
+
+GitPulse writes to GitHub in one new way: a commit status (`devcouncil/verify`) and an
+optional pull-request comment carrying a task's verification verdict, through the user's
+own `gh` login (owner-approved option A). The boundaries are enforced in
+`src-tauri/src/workbench/verify_status.rs` and pinned by its tests. It is off per
+repository until the person opts in (`verify_status` in `tools.json`; an unreadable block
+is off). It runs only from the desktop commands `cmd_verify_status_post` and
+`cmd_verify_status_save`; no MCP tool calls it. `success` needs a settled `passed` record
+for the commit it names and a clean worktree at that commit; anything not established posts
+`error`, and a verdict that cannot be tied to the commit posts nothing. The content is a
+fixed vocabulary, counts and criterion numbers: no command output, environment, diff hunks
+or free text. The request is `gh api`; GitPulse never reads, stores or logs the token.

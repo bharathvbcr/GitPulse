@@ -55,7 +55,12 @@ const preflight = writable<PreflightReport | null>(null);
 const ladder = writable<LadderAssessment | null>(null);
 const verify = writable<VerifyReport | null>(null);
 
-let progressUnlisten: UnlistenFn | null = null;
+// Single in-flight/settled registration: concurrent callers share one
+// listen() so a second open before the first await resolves cannot leak.
+let progressListener: Promise<UnlistenFn> | null = null;
+// Bumped on every ladder/preflight load so a reply for a tool the user has
+// since switched away from is dropped instead of installed against.
+let ladderTicket = 0;
 
 export const onboardingStore = {
   wizard,
@@ -109,7 +114,7 @@ export function openSetupWizard(tool: ExternalTool = "devmap", step: WizardStep 
     focusToolOnly: tool !== "devmap" || step !== "explain",
     preset: "devmap",
   });
-  void ensureProgressListener();
+  void ensureProgressListener().catch(() => {});
   void refreshToolsStatus();
   void refreshToolConfig();
   void loadLadderAndPreflight(tool);
@@ -133,22 +138,32 @@ export function setWizardPreset(preset: DevcouncilPreset) {
 }
 
 async function loadLadderAndPreflight(tool: ExternalTool) {
+  const ticket = ++ladderTicket;
+  ladder.set(null);
+  preflight.set(null);
   try {
-    ladder.set(await getToolLadder(tool));
-    preflight.set(await getToolPreflight(tool));
+    const nextLadder = await getToolLadder(tool);
+    if (ticket !== ladderTicket) return;
+    ladder.set(nextLadder);
+    const nextPreflight = await getToolPreflight(tool);
+    if (ticket !== ladderTicket) return;
+    preflight.set(nextPreflight);
   } catch (e) {
-    loadError.set(String(e));
+    if (ticket === ladderTicket) loadError.set(String(e));
   }
 }
 
-async function ensureProgressListener() {
-  if (progressUnlisten) return;
-  progressUnlisten = await listen<ToolInstallProgress>(
-    "tool-install-progress",
-    (event) => {
+function ensureProgressListener(): Promise<UnlistenFn> {
+  if (!progressListener) {
+    progressListener = listen<ToolInstallProgress>("tool-install-progress", (event) => {
       progressLine.set(event.payload.line);
-    },
-  );
+    }).catch((e) => {
+      // A failed registration must be retryable, not cached forever.
+      progressListener = null;
+      throw e;
+    });
+  }
+  return progressListener;
 }
 
 export async function runInstall(tool: ExternalTool, rung?: InstallRung | null) {
@@ -156,7 +171,7 @@ export async function runInstall(tool: ExternalTool, rung?: InstallRung | null) 
   installing.set(tool);
   lastOutcome.set(null);
   progressLine.set(null);
-  await ensureProgressListener();
+  await ensureProgressListener().catch(() => {});
   try {
     const outcome = await installExternalTool(tool, rung);
     lastOutcome.set(outcome);
@@ -227,3 +242,10 @@ export async function runVerify(tool: ExternalTool) {
 }
 
 export type { DevcouncilPreset };
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    void progressListener?.then((unlisten) => unlisten()).catch(() => {});
+    progressListener = null;
+  });
+}

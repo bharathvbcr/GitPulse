@@ -2,6 +2,7 @@ use gitpulse_lib::analyzer::CoverageScanner;
 use gitpulse_lib::diff::PatchBuilder;
 use gitpulse_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLine};
 use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
+use gitpulse_lib::engine::git_reader::FirstParentChain;
 use gitpulse_lib::engine::git_writer::MergeMode;
 use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
 use gitpulse_lib::github::parse_github_remote_url;
@@ -296,7 +297,7 @@ fn release_batch_checks_every_path_and_policy_before_mutating() {
 }
 
 #[test]
-fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
+fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
     use gitpulse_lib::engine::git_writer::IndexAction;
     let repo = TestRepo::init();
     repo.write("valid", "work\n");
@@ -316,14 +317,21 @@ fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
     let error =
         GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |_| Ok(()))
             .unwrap_err();
-    assert!(error.contains("after 128 of 129"), "{error}");
+    // One git process applies the whole selection under one lock, so a path
+    // git refuses fails the batch and none of the 128 valid ones is staged
+    // (the chunked form stopped partway and left 128 of them behind).
+    assert!(
+        error.contains("Index update failed for the 129 selected paths"),
+        "{error}"
+    );
     assert_eq!(
         GitReader::get_status(&repo.path_str())
             .unwrap()
             .iter()
             .filter(|s| s.is_staged)
             .count(),
-        129
+        1,
+        "only the earlier, successful `valid` is staged"
     );
     let lock = repo.dir.path().join(".git/index.lock");
     fs::write(&lock, "another writer").unwrap();
@@ -334,7 +342,10 @@ fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
         |_| Ok(()),
     )
     .unwrap_err();
-    assert!(error.contains("after 0 of 1"), "{error}");
+    assert!(
+        error.contains("Index update failed for the 1 selected paths"),
+        "{error}"
+    );
     assert_eq!(fs::read_to_string(lock).unwrap(), "another writer");
 }
 
@@ -745,7 +756,14 @@ fn test_open_repo_history_status_and_details() {
 
     let details = GitReader::get_commit_details(&path, &history[0].id).expect("details");
     assert_eq!(details.summary, history[0].summary);
-    assert_eq!(details.gpg_status, "N");
+    let verdict =
+        gitpulse_lib::engine::commit_signature::verify_commit_signature(&path, &history[0].id)
+            .expect("verify an unsigned commit");
+    assert_eq!(
+        verdict.signature,
+        gitpulse_lib::engine::CommitSignature::None
+    );
+    assert_eq!(verdict.status, gitpulse_lib::engine::SignatureStatus::None);
 
     let stats = GitReader::get_repo_language_stats(&path)
         .expect("stats")
@@ -1200,7 +1218,8 @@ fn test_rebase_failed_step_restores_original_branch() {
 #[test]
 fn test_coverage_scan_of_rust_lcov_in_opened_repo() {
     let repo = TestRepo::init();
-    repo.write("src/lib.rs", "pub fn x() {}\n");
+    // Two lines on disk: the scanner drops hits past the end of the file.
+    repo.write("src/lib.rs", "pub fn x() {}\npub fn y() {}\n");
     repo.write(
         "lcov.info",
         "SF:src/lib.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
@@ -1617,17 +1636,26 @@ fn reset_preview_names_what_a_rewind_leaves_behind() {
 /// parent's path is the old name.
 #[test]
 fn blame_at_revision_steps_to_the_parent_across_a_rename() {
+    // The quotes make git C-quote the name in its porcelain output, which the
+    // parser must undo. `"` is not a legal Windows filename (`git mv` fails
+    // with "Invalid argument"), so there the rename target is a plain name
+    // with a space, and the quoted-name parse is exercised off Windows only.
+    let new_name = if cfg!(windows) {
+        "new q.txt"
+    } else {
+        "new \"q\".txt"
+    };
     let repo = TestRepo::init();
     repo.write("old name.txt", "one\ntwo\n");
     repo.commit_all("c1");
-    run_git(repo.dir.path(), &["mv", "old name.txt", "new \"q\".txt"]);
-    repo.write("new \"q\".txt", "one\nTWO\n");
+    run_git(repo.dir.path(), &["mv", "old name.txt", new_name]);
+    repo.write(new_name, "one\nTWO\n");
     repo.commit_all("c2");
     // The working tree moves on; a revision blame must not see it.
-    repo.write("new \"q\".txt", "one\nTWO\nthree\n");
+    repo.write(new_name, "one\nTWO\nthree\n");
 
     let at_head =
-        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", Some("HEAD")).expect("blame");
+        GitReader::get_file_blame(&repo.path_str(), new_name, Some("HEAD")).expect("blame");
     assert_eq!(at_head.len(), 2, "HEAD has two lines, the worktree three");
     assert_eq!(at_head[1].content, "TWO");
     let parent = at_head[1].previous_commit.clone().expect("c2 has a parent");
@@ -1648,7 +1676,7 @@ fn blame_at_revision_steps_to_the_parent_across_a_rename() {
 
     // The working-tree form is unchanged by the new argument.
     assert_eq!(
-        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", None)
+        GitReader::get_file_blame(&repo.path_str(), new_name, None)
             .expect("worktree")
             .len(),
         3
@@ -2437,19 +2465,47 @@ fn first_parent_chain_stops_at_known_tip_oldest_first() {
     repo.commit_all("top");
     let tip = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
 
+    let pass = GitReader::first_parent_pass(
+        &repo.path_str(),
+        std::slice::from_ref(&tip),
+        100,
+        std::time::Duration::from_secs(30),
+    )
+    .expect("pass succeeds");
     let stop: std::collections::HashSet<String> = [root.clone()].into_iter().collect();
-    let chain = GitReader::first_parent_chain(&repo.path_str(), &tip, &stop, 100)
-        .expect("walk succeeds")
-        .expect("stop id is reachable");
     // Oldest-first: root (the stop id) -> mid -> tip.
     let mid = git_out(repo.dir.path(), &["rev-parse", "HEAD~"]);
-    assert_eq!(chain, vec![root.clone(), mid, tip.clone()]);
+    assert_eq!(
+        pass.chain(&tip, &stop),
+        FirstParentChain::Reached(vec![root.clone(), mid, tip.clone()])
+    );
 
-    // A stop set that never matches exhausts the cap and reports None —
-    // "no discoverable base", never a fabricated root.
+    // A stop set that never matches reaches the root and reports it as such —
+    // "no discoverable base", never a fabricated one.
     let miss: std::collections::HashSet<String> = ["deadbeef".to_string()].into_iter().collect();
-    let unresolved = GitReader::first_parent_chain(&repo.path_str(), &tip, &miss, 100).unwrap();
-    assert!(unresolved.is_none());
+    assert_eq!(pass.chain(&tip, &miss), FirstParentChain::Rooted);
+    assert!(!pass.truncated());
+
+    // A pass cut by its commit cap says so, and a chain it did not finish is
+    // unknown, not rooted.
+    let cut = GitReader::first_parent_pass(
+        &repo.path_str(),
+        std::slice::from_ref(&tip),
+        1,
+        std::time::Duration::from_secs(30),
+    )
+    .expect("capped pass succeeds");
+    assert!(cut.truncated());
+    assert_eq!(cut.chain(&tip, &stop), FirstParentChain::Unfinished);
+
+    // An argument that is not a commit id never reaches git.
+    let hostile = GitReader::first_parent_pass(
+        &repo.path_str(),
+        &["--all".to_string()],
+        100,
+        std::time::Duration::from_secs(30),
+    );
+    assert!(hostile.is_err());
 }
 
 /// Regression (audit dirty-tree): restacking with uncommitted changes used to
@@ -2674,15 +2730,15 @@ fn run_git_with_identities(cwd: &Path, args: &[&str]) {
     );
 }
 
-/// `get_commit_details` reads eleven NUL-separated fields out of one
-/// `--format` string by position: %H %P %an %ae %ad %cn %ce %cd %G? %s %b.
+/// `get_commit_details` reads ten NUL-separated fields out of one
+/// `--format` string by position: %H %P %an %ae %ad %cn %ce %cd %s %b.
 /// The format string and the indices that read it sit in different places, so
 /// reordering two placeholders assigns one field's value to another — no
 /// error, no panic, just an author's email rendered as their commit date.
 ///
 /// Every other test in this suite commits with the same name and address for
 /// author and committer, which makes exactly that swap invisible. This one
-/// gives all eleven fields distinguishable values.
+/// gives all ten fields distinguishable values.
 #[test]
 fn commit_details_assigns_every_format_field_to_its_own_slot() {
     let repo = TestRepo::init();
@@ -2728,7 +2784,6 @@ fn commit_details_assigns_every_format_field_to_its_own_slot() {
         details.committer_date
     );
 
-    assert_eq!(details.gpg_status, "N", "%G? with no signature");
     assert_eq!(details.summary, "subject stays on its own line", "%s");
     assert!(
         details.body.contains("body first paragraph")
@@ -2744,9 +2799,10 @@ fn commit_details_assigns_every_format_field_to_its_own_slot() {
     );
 }
 
-/// The reflog reader splits four positional fields out of one `--format`
-/// string: %H %gd %gs %ct. The only existing coverage asserted the list was
-/// non-empty, so every one of those four could have swapped places without a
+/// The reflog reader splits three positional fields out of one `--format`
+/// string, `%H %gd %gs`, and reads the move's time out of `%gd` rendered with
+/// `--date=unix`. The only existing coverage asserted the list was
+/// non-empty, so every one of those three could have swapped places without a
 /// test noticing — a selector rendered as a commit id, a timestamp parsed out
 /// of hex and silently falling back to 0.
 ///
@@ -2777,12 +2833,10 @@ fn reflog_assigns_every_format_field_to_its_own_slot() {
         "commit_id is not hex: {}",
         newest.commit_id
     );
-    // %gd: the selector, which is the only field shaped like HEAD@{n}.
-    assert!(
-        newest.selector.starts_with("HEAD@{"),
-        "selector: {}",
-        newest.selector
-    );
+    // %gd: the selector, which is the only field shaped like HEAD@{n}. It is
+    // read under `--date=unix` for its time, and stays positional: the pane
+    // hands it back to git as a revision.
+    assert_eq!(newest.selector, "HEAD@{0}", "selector");
     // %gs: the subject, split at its first colon into action and message.
     assert!(
         newest.action.starts_with("commit"),
@@ -2790,11 +2844,12 @@ fn reflog_assigns_every_format_field_to_its_own_slot() {
         newest.action
     );
     assert_eq!(newest.message, "feat: second", "message");
-    // %ct: seconds since the epoch. A hex object id parsed here yields 0, and
-    // any real commit made after 2001 is well past this floor.
+    // The reflog's own time, in seconds since the epoch, read out of the
+    // dated selector. A hex object id parsed here yields 0, and any real move
+    // made after 2001 is well past this floor.
     assert!(
         newest.timestamp > 1_000_000_000,
-        "timestamp did not come from %ct: {}",
+        "timestamp did not come from the dated selector: {}",
         newest.timestamp
     );
 }

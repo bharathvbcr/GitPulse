@@ -30,13 +30,36 @@ use gitpulse_lib::hooks::{self, IDENTITY_FLAGS, SUBCOMMANDS};
 fn main() {
     // A hook runs git for the user's own agent, so it spends the per-user
     // spawn budget the app and the agent servers spend. First, before any
-    // spawn builds the gate.
+    // spawn builds the gate; this only records the choice and blocks on nothing.
     gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
-    decide();
+    // The one deadline for the whole process starts here, before anything that
+    // can block, so every later wait is cut to what the host's timeout leaves.
+    hooks::start_deadline();
+    let code = run_guarded(decide);
+    // The decision is already on stdout. Anything a check abandoned at its
+    // deadline is still running: a `git status` or the harness sidecar, in its
+    // own process group, able to hold `.git/index.lock` after the hook is gone.
+    // `process::exit` runs no destructor, so they are taken down here, as the
+    // servers do. Free when nothing is registered; otherwise one `CHILD_GRACE`.
+    let sweep = gitpulse_lib::procguard::reap_all(gitpulse_lib::procguard::CHILD_GRACE);
+    if !sweep.is_complete() {
+        log::warn!(target: "hook", "{}", sweep.describe());
+    }
     // Not a bare return: a hook that finished while a caught signal was still
     // being swept would exit out from under it, leaving the git or harness
     // subprocess the sweep was killing.
-    gitpulse_lib::procguard::exit(0);
+    gitpulse_lib::procguard::exit(code);
+}
+
+/// Runs the hook and returns its exit code, which is 0 even when it panicked.
+/// A panic otherwise exits 101: not the blocking 2, but not the promised 0
+/// either, and a host is free to treat any non-zero hook as a failure the user
+/// has to look at. The installed panic hook has already logged the fault.
+fn run_guarded(decide: impl FnOnce() + std::panic::UnwindSafe) -> i32 {
+    if std::panic::catch_unwind(decide).is_err() {
+        log::error!(target: "hook", "gitpulse-hook panicked; no decision");
+    }
+    0
 }
 
 fn decide() {
@@ -91,6 +114,14 @@ fn decide() {
     let argument = std::env::args().nth(2);
     match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
         Ok(output) => {
+            // GitPulse injects the PreToolUse gates into every session it
+            // launches, so a session that also enables the plugin runs them
+            // twice. Decisions are left alone; an identical warning is said once.
+            let output = if hooks::INJECTED_SUBCOMMANDS.contains(&subcommand.as_str()) {
+                hooks::advisory_once::dedupe(&subcommand, &input, output)
+            } else {
+                output
+            };
             if let Some(json) = output.render_for_host(input.is_cursor) {
                 emit(format!("{json}\n"));
             }
@@ -117,5 +148,16 @@ fn emit(payload: String) {
     .and_then(|output| output.write(payload.as_bytes()));
     if let Err(error) = result {
         log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_hook_still_exits_zero_with_no_decision() {
+        assert_eq!(run_guarded(|| panic!("hook fault")), 0);
+        assert_eq!(run_guarded(|| {}), 0);
     }
 }

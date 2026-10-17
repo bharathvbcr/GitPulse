@@ -1,4 +1,3 @@
-import { gitHeaderSides, stripSidePrefix } from "./gitPaths";
 
 export type DiffChunkKind = "Equal" | "Added" | "Removed";
 
@@ -120,7 +119,8 @@ export interface AnnotatedDiffLine {
   segments?: DiffSegment[];
   /**
    * True when git's `\ No newline at end of file` marker followed this
-   * add/del row: the file side this row belongs to lacks a trailing newline.
+   * add/del/context row: the file side(s) this row belongs to lack a trailing
+   * newline (both, for a context row).
    * The patch builder turns this back into the marker text so EOF-hunk
    * staging produces byte-exact blobs.
    */
@@ -249,7 +249,12 @@ export function parseUnifiedDiff(raw: string | null | undefined): AnnotatedDiffL
       // missing trailing newline exactly.
       if (inHunk) {
         const prev = out[out.length - 1];
-        if (prev && (prev.type === "add" || prev.type === "del")) prev.noNewline = true;
+        // Any body row can carry it: a context row is "no newline" on both
+        // sides, and dropping the flag there makes `git apply` reject the
+        // hunk or write the newline back.
+        if (prev && (prev.type === "add" || prev.type === "del" || prev.type === "ctx")) {
+          prev.noNewline = true;
+        }
       }
       out.push({ type: "hdr", content: line });
     } else if (inHunk) {
@@ -310,15 +315,96 @@ export function replacementBlockBounds(
   lines: AnnotatedDiffLine[],
   index: number
 ): [number, number] | null {
+  const block = replacementBlock(lines, index);
+  return block ? [block.start, block.end] : null;
+}
+
+/** A replacement block: dels in `[start, addStart)`, adds in `[addStart, end)`. */
+export interface ReplacementBlock {
+  start: number;
+  addStart: number;
+  end: number;
+}
+
+/** [`replacementBlockBounds`] plus where the del run ends and the add run begins. */
+export function replacementBlock(
+  lines: AnnotatedDiffLine[],
+  index: number
+): ReplacementBlock | null {
   const line = lines[index];
   if (!line || (line.type !== "del" && line.type !== "add")) return null;
   let start = index;
-  while (start > 0 && lines[start - 1].type === "add") start -= 1;
+  // Only an add row can sit inside the add run of its own block. A del row
+  // starts (or continues) a del run, so an add run before it ends the previous
+  // block rather than belonging to this one.
+  if (line.type === "add") {
+    while (start > 0 && lines[start - 1].type === "add") start -= 1;
+  }
   while (start > 0 && lines[start - 1].type === "del") start -= 1;
-  let end = index + 1;
-  while (end < lines.length && lines[end].type === "del") end += 1;
+  let addStart = start;
+  while (addStart < lines.length && lines[addStart].type === "del") addStart += 1;
+  let end = addStart;
   while (end < lines.length && lines[end].type === "add") end += 1;
-  return [start, end];
+  return { start, addStart, end };
+}
+
+/** Pairs annotated on each side of the requested row by [`annotateAround`]. */
+export const WORD_DIFF_PAIR_HALO = 24;
+
+/**
+ * LCS table cells one [`annotateAround`] call may spend on neighbours once the
+ * requested row's own pair (always done) is counted. Per-line caps bound one pair at ~252k cells (500 tokens a
+ * side); this bounds a call to a handful of those, however many pairs the
+ * halo names.
+ */
+export const WORD_DIFF_CELL_BUDGET = 1_000_000;
+
+/** Upper bound on the LCS table `computeWordDiff` builds for two lines. */
+function pairCellCost(oldLen: number, newLen: number): number {
+  return (Math.min(oldLen, MAX_TOKENS + 1) + 1) * (Math.min(newLen, MAX_TOKENS + 1) + 1);
+}
+
+/**
+ * Word-diffs the pair holding row `index` and its neighbours, not the whole
+ * replacement block.
+ *
+ * `annotateRange` over a block costs one LCS per pair, so a block of
+ * thousands of long lines stalled the first row paint. Here the row's own
+ * pair is always annotated; then up to [`WORD_DIFF_PAIR_HALO`] pairs on each
+ * side, nearest first, while the call stays within [`WORD_DIFF_CELL_BUDGET`].
+ * Pairs left over simply stay plain until their own row is rendered (each
+ * rendered row calls this for itself), and the pairing is the same
+ * `del[k]`/`add[k]` one `annotateRange` makes. Pass the block back in to skip
+ * the scan for rows of the same block.
+ */
+export function annotateAround(
+  lines: AnnotatedDiffLine[],
+  index: number,
+  block: ReplacementBlock | null = replacementBlock(lines, index),
+  halo: number = WORD_DIFF_PAIR_HALO
+): void {
+  if (!block) return;
+  const pairCount = Math.min(block.addStart - block.start, block.end - block.addStart);
+  const k = index < block.addStart ? index - block.start : index - block.addStart;
+  if (k < 0 || k >= pairCount) return;
+  let spent = 0;
+  const annotatePair = (offset: number, force: boolean): void => {
+    if (offset < 0 || offset >= pairCount) return;
+    const delLine = lines[block.start + offset];
+    const addLine = lines[block.addStart + offset];
+    if (delLine.segments || addLine.segments) return;
+    const cost = pairCellCost(delLine.content.length - 1, addLine.content.length - 1);
+    if (!force && spent + cost > WORD_DIFF_CELL_BUDGET) return;
+    spent += cost;
+    const diff = computeWordDiff(delLine.content.slice(1), addLine.content.slice(1));
+    delLine.segments = diff.original_segments;
+    addLine.segments = diff.modified_segments;
+  };
+  annotatePair(k, true);
+  for (let d = 1; d <= halo; d += 1) {
+    annotatePair(k - d, false);
+    annotatePair(k + d, false);
+  }
 }
 
 /**
@@ -378,65 +464,6 @@ export function isImagePath(path: string | null | undefined): boolean {
 export function annotateUnifiedDiff(raw: string): AnnotatedDiffLine[] {
   const parsed = parseUnifiedDiff(raw);
   return annotateRange(parsed, 0, parsed.length);
-}
-
-/** True when the line is a per-file section opener: `diff --git a/X b/Y`. */
-function isFileHeader(line: string): boolean {
-  return line.startsWith("diff --git ");
-}
-
-function sectionMentionsPath(section: string[], path: string): boolean {
-  const header = section.find(isFileHeader);
-  if (!header) return false;
-  const sides = gitHeaderSides(header);
-  const headerMatch =
-    !!sides &&
-    (sides[0] === path ||
-      sides[1] === path ||
-      stripSidePrefix(sides[0]) === path ||
-      stripSidePrefix(sides[1]) === path);
-  if (headerMatch) return true;
-  // Timestamps ride after a tab: "+++ b/src/main.rs<TAB>2024-01-01 ...".
-  const marked = (marker: string): boolean =>
-    section.some((line) => {
-      if (!line.startsWith(marker)) return false;
-      const rest = line.slice(marker.length);
-      return rest === path || rest.startsWith(`${path}\t`);
-    });
-  // Rename/copy targets run to end of line: no timestamp suffix.
-  const exact = (marker: string): boolean =>
-    section.some((line) => line === `${marker}${path}`);
-  return (
-    marked("--- a/") || marked("+++ b/") || exact("rename to ") || exact("copy to ")
-  );
-}
-
-/**
- * Reduces a multi-file diff (as produced by `cmd_get_commit_diff`) to the
- * patch of a single file, keeping each file's metadata block attached to its
- * hunks. The backend command takes no path filter, so commit-file selection
- * filters here; sections are matched by their `diff --git` header sides plus
- * +++/--- fallbacks so renames resolve too. Returns "" when the path is not
- * part of the diff.
- */
-export function filterFilePatch(raw: string, path: string): string {
-  if (!raw || !path) return "";
-  const lines = raw.split("\n");
-  const sections: string[][] = [];
-  let preamble: string[] | null = null;
-  for (const line of lines) {
-    if (isFileHeader(line)) {
-      sections.push([line]);
-    } else if (sections.length > 0) {
-      sections[sections.length - 1].push(line);
-    } else {
-      (preamble ??= []).push(line);
-    }
-  }
-  return sections
-    .filter((section) => sectionMentionsPath(section, path))
-    .map((section) => section.join("\n"))
-    .join("\n");
 }
 
 /** Empty-state copy for the diff pane, distinguishing clean merges. */

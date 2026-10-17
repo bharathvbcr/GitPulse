@@ -1,8 +1,8 @@
 use crate::engine::git_cli::{
     git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
-    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, resolve_git_common_dir,
-    sandbox_join, validate_repo, with_background_processes, BoundedRun, OutputStream,
-    ProcessObserver, NETWORK_TIMEOUT,
+    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, is_transient_git_lock_error,
+    resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
+    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +37,21 @@ const MAX_INDEX_PATH_BYTES: usize = 4 * 1024 * 1024;
 /// Leave room for Git's executable and quoting within Windows' command limit.
 const MAX_INDEX_ARGV_BYTES: usize = 12 * 1024;
 const MAX_INDEX_CHUNK_PATHS: usize = 128;
+/// ASCII files staged by one `git add` in [`GitWriter::stage_files_attributed`];
+/// the bound on its stdin (about 150 KiB at typical note paths). Non-ASCII
+/// names in a batch cost further processes, in chunks of
+/// [`MAX_INDEX_CHUNK_PATHS`].
+const STAGE_BATCH_PATHS: usize = 2_500;
+/// Extra `git add` runs one call may spend halving failed batches to find the
+/// file at fault. Bounds the cost of many bad files to a constant.
+const STAGE_SPLIT_BUDGET: usize = 64;
+
+/// What a checkout left behind. `detached` is read from HEAD after the switch,
+/// not assumed from which entry point ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutOutcome {
+    pub detached: bool,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -304,8 +319,13 @@ pub const AUTO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// caller: before the commit nothing is staged; after it, the squash is.
 #[derive(Debug)]
 pub(crate) enum SquashFailure {
-    /// The merge or the gate refused; the index is as it was.
+    /// The gate or an identity guard refused before git ran; nothing was
+    /// started and the index is as it was.
     Merge(String),
+    /// `git merge --squash` itself failed, so it was started: a conflict
+    /// leaves unmerged entries and `SQUASH_MSG` behind. The caller that owns
+    /// the checkout restores it with [`GitWriter::rollback_failed_merge_gated`].
+    Conflict(String),
     /// The changes are staged but the commit failed (a refusing hook, an
     /// identity problem). The message says how to finish or undo it.
     Commit(String),
@@ -314,7 +334,9 @@ pub(crate) enum SquashFailure {
 impl SquashFailure {
     pub(crate) fn into_message(self) -> String {
         match self {
-            SquashFailure::Merge(message) | SquashFailure::Commit(message) => message,
+            SquashFailure::Merge(message)
+            | SquashFailure::Conflict(message)
+            | SquashFailure::Commit(message) => message,
         }
     }
 }
@@ -328,6 +350,31 @@ impl IndexAction {
             Self::Unstage => vec!["git".into(), "reset".into(), "--quiet".into(), "--".into()],
         }
     }
+}
+
+/// `paths` split into argv lines that each begin with `prefix` and stay inside
+/// the command-length and path-count bounds. Always at least one line, so an
+/// empty `paths` yields the bare `prefix`.
+fn index_chunks(prefix: &[String], paths: &[String]) -> Vec<Vec<String>> {
+    let mut chunks = Vec::new();
+    let mut argv = prefix.to_vec();
+    let mut bytes = 128usize;
+    for path in paths {
+        // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
+        let cost = path.len() * 2 + 4;
+        if argv.len() > prefix.len()
+            && (bytes + cost > MAX_INDEX_ARGV_BYTES
+                || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
+        {
+            chunks.push(argv);
+            argv = prefix.to_vec();
+            bytes = 128;
+        }
+        bytes += cost;
+        argv.push(path.clone());
+    }
+    chunks.push(argv);
+    chunks
 }
 
 fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, String> {
@@ -476,6 +523,127 @@ impl GitWriter {
         .map(|_| ())
     }
 
+    /// Stages many files in a bounded number of git processes and reports each
+    /// file's own outcome, in the order given.
+    ///
+    /// One `git add` (paths on stdin, literal pathspecs) per
+    /// [`STAGE_BATCH_PATHS`] files (plus one per 128 files whose names are not
+    /// ASCII, see [`Self::change_index_with`]), so a 5,000-file rewrite costs two
+    /// processes where [`Self::stage_file`] in a loop cost 5,000.
+    ///
+    /// Contract of one ASCII stdin batch: `git add` is all-or-nothing over its
+    /// pathspec set (a vanished path is fatal before anything is staged), with
+    /// one exception: an ignored path makes it exit 1 *after* staging every
+    /// other path. A failed group is therefore attributed in two steps. Ignored
+    /// paths are named exactly (`git check-ignore`) and the rest re-staged,
+    /// outside any budget. What remains is halved: a vanished file is isolated
+    /// in about `log2(batch)` extra processes and every other file in the batch
+    /// is still staged. The halving is bounded by [`STAGE_SPLIT_BUDGET`]; past
+    /// it, the files still ungrouped each carry the batch's error, which is true
+    /// of them (a vanished path staged none of the group) but does not say which
+    /// file caused it.
+    ///
+    /// A selection that mixes ASCII and non-ASCII names runs more than one git
+    /// process (stdin first, then argument chunks), so it can be partly
+    /// applied when a later one fails; the error says so. A lock held by
+    /// someone else is not a per-file fault, so it is never halved: the whole
+    /// group reports it after one bounded retry.
+    pub fn stage_files_attributed(repo_path: &str, files: &[String]) -> Vec<Result<(), String>> {
+        let mut outcomes: Vec<Result<(), String>> = vec![Ok(()); files.len()];
+        let mut split_budget = STAGE_SPLIT_BUDGET;
+        for (batch, slots) in files
+            .chunks(STAGE_BATCH_PATHS)
+            .zip(outcomes.chunks_mut(STAGE_BATCH_PATHS))
+        {
+            Self::stage_group(repo_path, batch, slots, &mut split_budget);
+        }
+        outcomes
+    }
+
+    /// Which of `files` git would refuse to add because a `.gitignore` rule
+    /// ignores them (tracked paths never are). Empty when none is, or when
+    /// git could not answer: the caller then falls back to halving.
+    fn ignored_among(repo_path: &str, files: &[String]) -> HashSet<String> {
+        let Ok(repo) = validate_repo(repo_path) else {
+            return HashSet::new();
+        };
+        let mut input = Vec::new();
+        for file in files {
+            input.extend_from_slice(file.as_bytes());
+            input.push(0);
+        }
+        match git_with_stdin(&repo, &["check-ignore", "-z", "--stdin"], &input) {
+            Ok(out) => String::from_utf8_lossy(&out)
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(String::from)
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    fn stage_group(
+        repo_path: &str,
+        files: &[String],
+        outcomes: &mut [Result<(), String>],
+        split_budget: &mut usize,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let error = match Self::change_index_with(repo_path, files, IndexAction::Stage, |_| Ok(()))
+        {
+            Ok(_) => return,
+            Err(error) => error,
+        };
+        // `git add` exits 1 for an ignored path yet stages every other path in
+        // the set, so a batch that failed is not always untouched. Ignored
+        // paths are named exactly, outside the halving budget, and the rest are
+        // staged again (a no-op for what git already took).
+        if files.len() > 1 && !is_transient_git_lock_error(&error) {
+            let ignored = Self::ignored_among(repo_path, files);
+            if !ignored.is_empty() && ignored.len() < files.len() {
+                let mut rest = Vec::new();
+                let mut rest_slots = Vec::new();
+                for (index, file) in files.iter().enumerate() {
+                    if ignored.contains(file) {
+                        outcomes[index] = Err(format!(
+                            "Index update failed for the 1 selected paths: {file} is ignored by a .gitignore file; stage it with force to track it."
+                        ));
+                    } else {
+                        rest.push(file.clone());
+                        rest_slots.push(index);
+                    }
+                }
+                let mut rest_outcomes = vec![Ok(()); rest.len()];
+                Self::stage_group(repo_path, &rest, &mut rest_outcomes, split_budget);
+                for (slot, outcome) in rest_slots.into_iter().zip(rest_outcomes) {
+                    outcomes[slot] = outcome;
+                }
+                return;
+            }
+        }
+        if files.len() > 1 && !is_transient_git_lock_error(&error) && *split_budget > 0 {
+            *split_budget -= 1;
+            let (left_files, right_files) = files.split_at(files.len() / 2);
+            let (left, right) = outcomes.split_at_mut(left_files.len());
+            Self::stage_group(repo_path, left_files, left, split_budget);
+            Self::stage_group(repo_path, right_files, right, split_budget);
+            return;
+        }
+        let error = if files.len() > 1 {
+            format!(
+                "{error} (one batch of {} paths; not attributed to a single path)",
+                files.len()
+            )
+        } else {
+            error
+        };
+        for outcome in outcomes {
+            *outcome = Err(error.clone());
+        }
+    }
+
     pub fn unstage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
         Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Unstage, |_| {
             Ok(())
@@ -484,9 +652,12 @@ impl GitWriter {
     }
 
     /// One native request and lock for a selection. All paths and all policy
-    /// verdicts are checked before the first write. Bounded argv chunks avoid
-    /// platform command-length limits. A later Git failure names the completed
-    /// prefix; it is never presented as an atomic rollback or as success.
+    /// verdicts are checked before the write, then one git process applies the
+    /// whole selection (paths on stdin, so no command-length limit applies).
+    /// Paths with a non-ASCII character are the exception: they go as
+    /// arguments, in chunks, because git does not precompose a pathspec it
+    /// reads from stdin (see the comment at the write). A Git failure is
+    /// reported, never presented as success.
     pub fn change_index_with<J, V>(
         repo_path: &str,
         files: &[String],
@@ -503,37 +674,65 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefix = action.argv();
-        let mut plans = Vec::new();
-        let mut argv = prefix.clone();
-        let mut bytes = 128usize;
-        for path in &paths {
-            // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
-            let cost = path.len() * 2 + 4;
-            if argv.len() > prefix.len()
-                && (bytes + cost > MAX_INDEX_ARGV_BYTES
-                    || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
-            {
-                plans.push(argv);
-                argv = prefix.clone();
-                bytes = 128;
-            }
-            bytes += cost;
-            argv.push(path.clone());
-        }
-        plans.push(argv);
+        let plans = index_chunks(&prefix, &paths);
         let mut verdicts = Vec::with_capacity(plans.len());
         for plan in &plans {
             let args: Vec<&str> = plan.iter().map(String::as_str).collect();
             verdicts.push(judge(&args)?);
         }
-        let mut completed = 0;
-        for plan in &plans {
-            let args: Vec<&str> = plan.iter().skip(1).map(String::as_str).collect();
-            git_text(&repo, &args).map_err(|error| format!(
-                "Index update stopped after {completed} of {} selected paths: {error}. Refresh to review the current index.", paths.len()
-            ))?;
-            completed += plan.len() - prefix.len();
+        // One process for every ASCII path, paths on stdin NUL-separated: git
+        // applies the pathspec set to the index under one lock, so a failure
+        // leaves nothing half-applied, except that an ignored path exits 1
+        // after the other paths were staged (the chunked form ran a process per
+        // 128 paths and could stop partway). The non-ASCII paths below run
+        // after it in further processes, so a selection mixing both can be
+        // partly applied. The judged lines above name the same pathspecs; only
+        // the transport differs.
+        //
+        // A path with a non-ASCII character does not go this way. On macOS git
+        // precomposes a pathspec it is handed as an argument but not one it
+        // reads from a file, so a decomposed (NFD) spelling given on stdin
+        // matches nothing and `git add` still exits 0: a silent no-op that
+        // would read as staged. Those paths take the argument form, in the
+        // bounded chunks the judge was shown.
+        let (plain, accented): (Vec<&String>, Vec<&String>) =
+            paths.iter().partition(|path| path.is_ascii());
+        // The ASCII paths are applied before the others, and each argument
+        // chunk before the next, so a failure after a first process succeeded
+        // leaves that part applied; the message says so rather than reading
+        // as all-or-nothing.
+        let applied = std::cell::Cell::new(false);
+        let failed = |error: String| {
+            let partly = if applied.get() {
+                " The selection was partly applied before this failure."
+            } else {
+                ""
+            };
+            format!("Index update failed for the {} selected paths: {error}.{partly} Refresh to review the current index.", paths.len())
+        };
+        if !plain.is_empty() {
+            let mut input = Vec::new();
+            for path in &plain {
+                input.extend_from_slice(path.as_bytes());
+                input.push(0);
+            }
+            let mut args: Vec<&str> = prefix[1..prefix.len() - 1]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+            git_with_stdin(&repo, &args, &input).map_err(failed)?;
+            applied.set(true);
         }
+        let accented: Vec<String> = accented.into_iter().cloned().collect();
+        for chunk in index_chunks(&prefix, &accented) {
+            if chunk.len() > prefix.len() {
+                let args: Vec<&str> = chunk.iter().skip(1).map(String::as_str).collect();
+                git_text(&repo, &args).map_err(failed)?;
+                applied.set(true);
+            }
+        }
+        let completed = paths.len();
         Ok((verdicts, completed))
     }
 
@@ -571,8 +770,8 @@ impl GitWriter {
         if to.starts_with(&format!("{from}/")) {
             return Err(format!("Cannot move {from} into itself"));
         }
-        let from_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, from)?;
-        let to_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, to)?;
+        let from_abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, from)?;
+        let to_abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, to)?;
         if std::fs::symlink_metadata(&from_abs).is_err() {
             return Err(format!("{from} does not exist"));
         }
@@ -628,10 +827,10 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = path.trim_end_matches('/');
-        if path.is_empty() || path == "." {
-            return Err("Refusing to delete the repository root".into());
-        }
-        let abs = crate::engine::git_cli::sandbox_join_canonical(&repo, path)?;
+        // The repository root, in any spelling, is refused by the same check
+        // that resolves the target (`./.` and `.//` used to slip past a
+        // comparison with `.` and reach `git rm -r`).
+        let abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, path)?;
         if std::fs::symlink_metadata(&abs).is_err() {
             return Err(format!("{path} does not exist"));
         }
@@ -702,22 +901,32 @@ impl GitWriter {
     }
 
     /// True when `email` is an address that exists so a fixture can commit in a
-    /// throwaway repository. Reserved DNS names (`.test`, `.invalid`,
-    /// `example.com`) and the local fixture addresses this repo actually uses.
+    /// throwaway repository — reserved DNS names (`.test`, `.invalid`,
+    /// `example.com`) and the local fixture addresses this repo actually uses —
+    /// or is not an address at all: empty, without an `@`, with nothing on
+    /// either side of its last `@`, or longer than the 254 characters an SMTP
+    /// path allows (in bytes). Neither kind is a person, so both are refused rather than
+    /// recorded. Case and surrounding space are ignored.
     ///
-    /// Keep the rule in lockstep with `.githooks/pre-commit`. A checkout of
-    /// this project refuses these on commit; a fixture repository does not,
-    /// because it has no `.githooks/pre-commit`.
+    /// `is_fixture_email` in `.githooks/lib/fixture-identity.sh` is the same
+    /// rule for the commit, merge and push hooks; both are tested against
+    /// `.githooks/lib/fixture-identity.cases`. A checkout of this project
+    /// refuses these on commit; a fixture repository does not, because it has
+    /// no `.githooks/pre-commit`.
     pub(crate) fn is_fixture_author_email(email: &str) -> bool {
-        let email = email.trim().to_ascii_lowercase();
-        if email.is_empty() || email.len() > 320 {
-            return false;
+        // Bytes and ASCII case, as the shell rule counts and folds them: the
+        // reserved names are ASCII, and an SMTP path's limit is in octets.
+        let email = email
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .to_ascii_lowercase();
+        if email.len() > 254 {
+            return true;
         }
         let Some((local, domain)) = email.rsplit_once('@') else {
-            return false;
+            return true;
         };
         if local.is_empty() || domain.is_empty() {
-            return false;
+            return true;
         }
         domain == "test"
             || domain.ends_with(".test")
@@ -812,9 +1021,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
     }
 
-    /// The identity a commit in `repo` would be recorded under. The
-    /// environment counts only when it covers author and committer both,
-    /// which is what git needs to record a commit without configuration.
+    /// The identity a commit in `repo` would be recorded under, resolved in
+    /// git's own order: the `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment
+    /// first, then `user.*` config, then `EMAIL`. The environment counts only
+    /// when it covers author and committer both, which is what git needs to
+    /// record a commit without configuration.
     pub fn identity(repo_path: &str) -> Result<GitIdentity, String> {
         let repo = validate_repo(repo_path)?;
         Self::identity_in(&repo)
@@ -826,6 +1037,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// [`Self::identity_in`] with the environment passed in: git's child
     /// inherits this process's `GIT_AUTHOR_*` / `GIT_COMMITTER_*` / `EMAIL`.
+    ///
+    /// The environment outranks config, as it does in git (`git var
+    /// GIT_AUTHOR_IDENT` prints `GIT_AUTHOR_NAME` even when `user.name` is
+    /// set). This used to read config first, so the identity shown and
+    /// refused-on was not the one a commit would record.
     fn identity_with(
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
@@ -833,13 +1049,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let env = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
         let env_pair =
             |author: &str, committer: &str| env(author).filter(|_| env(committer).is_some());
-        let name = match Self::config_value(repo, "user.name")? {
+        let name = match env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME") {
             Some(name) => Some(name),
-            None => env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"),
+            None => Self::config_value(repo, "user.name")?,
         };
-        let email = match Self::config_value(repo, "user.email")? {
+        let email = match env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL") {
             Some(email) => Some(email),
-            None => env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL").or_else(|| env("EMAIL")),
+            None => Self::config_value(repo, "user.email")?.or_else(|| env("EMAIL")),
         };
         Ok(GitIdentity { name, email })
     }
@@ -865,6 +1081,136 @@ Unset the local override with `git config --local --unset-all user.name` and \
             missing.join(" and "),
             if missing.len() == 1 { "is" } else { "are" }
         ))
+    }
+
+    /// Both identity guards every path that records a commit runs first: an
+    /// identity must be configured, and it must not be the test fixture's.
+    pub(crate) fn require_commit_identity(repo: &Path) -> Result<(), String> {
+        Self::require_identity(repo)?;
+        Self::refuse_fixture_identity(repo, false)
+    }
+
+    /// Restores the checkout at `repo` after a merge this call started failed
+    /// part-way (a conflict, a timeout), so the next merge does not find it
+    /// parked. It undoes only state this call created: the caller has proved,
+    /// under the lock and before merging, that the checkout had no operation
+    /// and no unmerged entry, and `merged_tip` is the commit it merged, so a
+    /// `MERGE_HEAD` that names anything else is somebody else's merge and is
+    /// never aborted. `merge --abort` for a merge, falling back to
+    /// `reset --merge`; `reset --merge` for a squash, which has no
+    /// `MERGE_HEAD`. Unmerged entries with no marker are not this merge's (git
+    /// writes a marker before it leaves any), so they are left alone and
+    /// reported, never reset away. Other local changes survive either command.
+    ///
+    /// Each command is put to `gate` first, and a refusal is honoured: it is
+    /// not run, and the refusal is the error, so what the audit trail records
+    /// as blocked did not run. The checkout is then left parked for a person.
+    /// Returns `Ok` only after re-reading the repository and finding no
+    /// operation and no unmerged entry. Caller MUST hold the repository
+    /// mutation lock.
+    pub(crate) fn rollback_failed_merge_gated(
+        repo: &Path,
+        merged_tip: &str,
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        Self::rollback_inner(repo, Some(merged_tip), gate)
+    }
+
+    /// [`Self::rollback_failed_merge_gated`] with every command allowed and
+    /// whatever `MERGE_HEAD` is there taken as this merge's.
+    #[cfg(test)]
+    pub(crate) fn rollback_failed_merge_locked(repo: &Path) -> Result<(), String> {
+        Self::rollback_inner(repo, None, &mut |_| Ok(()))
+    }
+
+    fn rollback_inner(
+        repo: &Path,
+        merged_tip: Option<&str>,
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        use crate::engine::repo_op::{detect_kind, OperationKind};
+        let mut run = |args: &[&str]| -> Result<String, String> {
+            gate(args).map_err(|reason| {
+                format!(
+                    "the gate refused `git {}`, so it was not run: {reason}",
+                    args.join(" ")
+                )
+            })?;
+            git_text(repo, args)
+        };
+        // A refusal by the gate is final; any other failure may fall back.
+        let refused = |e: &str| e.starts_with("the gate refused");
+        match detect_kind(repo)? {
+            Some(OperationKind::Merge) => {
+                if let Some(tip) = merged_tip {
+                    let head = std::fs::read_to_string(
+                        crate::engine::git_cli::resolve_git_dir(repo)?.join("MERGE_HEAD"),
+                    )
+                    .map_err(|e| format!("could not read MERGE_HEAD: {e}"))?;
+                    if !head.trim().eq_ignore_ascii_case(tip) {
+                        return Err(format!(
+                            "the merge parked in the checkout is of {}, not of the {tip} this call merged, so it is not this call's and was left alone",
+                            head.trim()
+                        ));
+                    }
+                }
+                if let Err(abort) = run(&["merge", "--abort"]) {
+                    if refused(&abort) {
+                        return Err(abort);
+                    }
+                    run(&["reset", "--merge"]).map_err(|reset| {
+                        if refused(&reset) {
+                            reset
+                        } else {
+                            format!(
+                                "`git merge --abort` failed ({abort}) and so did `git reset --merge` ({reset})"
+                            )
+                        }
+                    })?;
+                }
+            }
+            Some(OperationKind::SquashMerge) => {
+                run(&["reset", "--merge"]).map_err(|e| {
+                    if refused(&e) {
+                        e
+                    } else {
+                        format!("`git reset --merge` failed: {e}")
+                    }
+                })?;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "a {} is parked in the checkout, which this merge did not start; it was left alone",
+                    other.label()
+                ));
+            }
+            None => {
+                if !git_text(repo, &["ls-files", "--unmerged"])?
+                    .trim()
+                    .is_empty()
+                {
+                    return Err("unmerged entries are in the index with no merge in progress, so they are not from this merge; they were left alone".into());
+                }
+            }
+        }
+        let mut left = Vec::new();
+        if let Some(kind) = detect_kind(repo)? {
+            left.push(format!("a {} is still in progress", kind.label()));
+        }
+        if !git_text(repo, &["ls-files", "--unmerged"])?
+            .trim()
+            .is_empty()
+        {
+            left.push("unmerged entries remain in the index".to_string());
+        }
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the checkout was not restored: {}",
+                left.join("; ")
+            ))
+        }
     }
 
     /// The argv pair [`Self::set_identity`] runs, program included. Shared
@@ -981,8 +1327,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, String> {
-        Self::require_identity(repo)?;
-        Self::refuse_fixture_identity(repo, false)?;
+        Self::require_commit_identity(repo)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
             return Err("Resolve merge conflicts before committing.".into());
@@ -1010,8 +1355,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err("Commit message must not be empty".into());
         }
         let paths = literal_paths(&repo, files)?;
-        Self::require_identity(&repo)?;
-        Self::refuse_fixture_identity(&repo, false)?;
+        Self::require_commit_identity(&repo)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
@@ -1042,33 +1386,159 @@ Unset the local override with `git config --local --unset-all user.name` and \
         .map(|output| String::from_utf8_lossy(&output).into_owned())
     }
 
-    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
+    /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the
+    /// program name first, so the write gate judges exactly the line that runs.
+    ///
+    /// `switch` only ever lands on a branch, so no spelling here can detach
+    /// HEAD. A local branch is switched to by name. A remote-tracking name such
+    /// as `origin/feature` (what a remote row in the UI carries) is mapped to
+    /// its local tracking branch: switched to when it exists, created with
+    /// `--track` when it does not. Anything else goes through `--guess`, which
+    /// creates a local branch from a single remote twin. A tag or an object id
+    /// is not a branch and is refused; [`Self::checkout_detached`] is the
+    /// explicit way to land on one.
+    ///
+    /// The answer is a snapshot of the refs and config. A caller that gets it
+    /// approved must run it through [`Self::checkout_branch_judged`], which
+    /// re-derives it under the repository lock and refuses if it changed.
+    pub fn checkout_branch_argv(repo_path: &str, branch_name: &str) -> Result<Vec<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::checkout_branch_argv_in(&repo, branch_name)
+    }
+
+    fn checkout_branch_argv_in(repo: &Path, branch_name: &str) -> Result<Vec<String>, String> {
+        validate_ref_name(branch_name)?;
+        let ref_exists = |full: &str| -> Result<bool, String> {
+            Ok(git_captured(repo, &["show-ref", "--verify", "--quiet", full])?.success)
+        };
+        let argv = |rest: &[&str]| -> Vec<String> {
+            std::iter::once("git")
+                .chain(rest.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        if ref_exists(&format!("refs/heads/{branch_name}"))? {
+            return Ok(argv(&["switch", branch_name]));
+        }
+        if ref_exists(&format!("refs/remotes/{branch_name}"))? {
+            // Read fresh: a branch is created or chosen on this answer.
+            let remotes = crate::engine::git_reader::configured_remote_names_fresh(repo)?;
+            let mut owners = remotes.iter().filter(|remote| {
+                branch_name.len() > remote.len()
+                    && branch_name.starts_with(remote.as_str())
+                    && branch_name.as_bytes()[remote.len()] == b'/'
+            });
+            let (Some(remote), None) = (owners.next(), owners.next()) else {
+                return Err(format!(
+                    "'{branch_name}' does not name exactly one configured remote's branch; \
+                     check it out by its local name"
+                ));
+            };
+            let local = &branch_name[remote.len() + 1..];
+            validate_ref_name(local)?;
+            if local == "HEAD" {
+                return Err(format!(
+                    "'{branch_name}' is the remote's HEAD pointer, not a branch"
+                ));
+            }
+            if ref_exists(&format!("refs/heads/{local}"))? {
+                let upstream = git_text(
+                    repo,
+                    &[
+                        "for-each-ref",
+                        "--format=%(upstream)",
+                        &format!("refs/heads/{local}"),
+                    ],
+                )?;
+                let upstream = upstream.trim();
+                if !upstream.is_empty() && upstream != format!("refs/remotes/{branch_name}") {
+                    return Err(format!(
+                        "local branch '{local}' tracks {upstream}, not '{branch_name}'; \
+                         switch to '{local}' by name, or rename it first"
+                    ));
+                }
+                return Ok(argv(&["switch", local]));
+            }
+            // `--track` alone names the new branch by dropping everything up to
+            // the first slash, which is wrong for a remote called `a/b`; name it.
+            return Ok(argv(&["switch", "--track", "-c", local, branch_name]));
+        }
+        Ok(argv(&["switch", "--guess", branch_name]))
+    }
+
+    /// Switches to a branch, creating the local tracking branch for a remote
+    /// one, and reports whether HEAD ended up detached. There is no fallback
+    /// to `checkout <name>`: it detaches HEAD for a remote-tracking ref, a tag
+    /// or an object id and reported that as a branch checkout. A refused
+    /// `switch` (dirty tree, ambiguous or missing name) is the error.
+    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<CheckoutOutcome, String> {
+        Self::checkout_branch_locked(repo_path, branch_name, None)
+    }
+
+    /// [`Self::checkout_branch`] for a caller whose policy gate approved
+    /// `judged` (from [`Self::checkout_branch_argv`]). The argv is derived again
+    /// under the repository lock; if refs or config moved in between and it is
+    /// no longer the approved line, nothing runs.
+    pub fn checkout_branch_judged(
+        repo_path: &str,
+        branch_name: &str,
+        judged: &[String],
+    ) -> Result<CheckoutOutcome, String> {
+        Self::checkout_branch_locked(repo_path, branch_name, Some(judged))
+    }
+
+    fn checkout_branch_locked(
+        repo_path: &str,
+        branch_name: &str,
+        judged: Option<&[String]>,
+    ) -> Result<CheckoutOutcome, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_ref_name(branch_name)?;
-        // Two strategies: `switch --guess` covers creating a local
-        // branch from a remote twin (git >= 2.23), revision-only `checkout` covers
-        // everything older. The former middle attempt (`checkout --guess`)
-        // added a third executable spelling without covering any state the
-        // other two miss — and every extra strategy is another argv the
-        // policy gate must judge identically.
-        let attempts: [&[&str]; 2] = [
-            &["switch", "--guess", branch_name],
-            &["checkout", branch_name, "--"],
-        ];
-        let mut first_err = None;
-        for attempt in attempts {
-            match git_text(&repo, attempt) {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                }
+        let argv = Self::checkout_branch_argv_in(&repo, branch_name)?;
+        if let Some(judged) = judged {
+            if judged != argv.as_slice() {
+                return Err(format!(
+                    "'{branch_name}' now resolves to `{}`, not the approved `{}`; \
+                     the repository changed, try again",
+                    argv.join(" "),
+                    judged.join(" ")
+                ));
             }
         }
-        Err(first_err.expect("at least one attempt recorded"))
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
+    }
+
+    /// Checks out a commit, tag or other revision with HEAD detached. This is
+    /// the named way to detach: [`Self::checkout_branch`] never does.
+    pub fn checkout_detached_argv(revision: &str) -> Result<Vec<String>, String> {
+        validate_oid_or_revision(revision)?;
+        Ok(["git", "switch", "--detach", revision]
+            .into_iter()
+            .map(String::from)
+            .collect())
+    }
+
+    pub fn checkout_detached(repo_path: &str, revision: &str) -> Result<CheckoutOutcome, String> {
+        let argv = Self::checkout_detached_argv(revision)?;
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        git_text(&repo, &args)?;
+        Self::checkout_outcome(&repo)
+    }
+
+    fn checkout_outcome(repo: &Path) -> Result<CheckoutOutcome, String> {
+        Ok(CheckoutOutcome {
+            detached: crate::engine::git_reader::head_branch(repo)?.is_none(),
+        })
     }
 
     pub fn create_branch(
@@ -1114,7 +1584,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if force {
             // `-d` leaves these to git's own safety nets; `-D` bypasses them,
             // so the checks must be re-done server side.
-            if is_default_branch(&repo, branch_name) {
+            if is_default_branch(&repo, branch_name).map_err(|error| {
+                format!(
+                    "refusing to force-delete '{branch_name}': could not tell whether it is the default branch: {error}"
+                )
+            })? {
                 return Err(format!(
                     "refusing to force-delete '{branch_name}': it resolves to the repository's default branch"
                 ));
@@ -1179,22 +1653,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if steps.is_empty() {
             return Err("Rebase sequence is empty".into());
         }
-        if let Some(first) = steps.first() {
-            if matches!(
-                first.action,
-                RebaseActionKind::Squash | RebaseActionKind::Fixup
-            ) {
-                return Err(format!(
-                    "Cannot '{}' commit {} without a previous commit to combine into",
-                    match first.action {
-                        RebaseActionKind::Squash => "squash",
-                        RebaseActionKind::Fixup => "fixup",
-                        _ => unreachable!(),
-                    },
-                    first.commit_id
-                ));
-            }
-        }
+        Self::refuse_fixture_identity(&repo, false)?;
+        validate_rebase_plan(steps)?;
         for step in steps {
             validate_oid_or_revision(&step.commit_id)?;
         }
@@ -1227,10 +1687,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 ));
             }
         }
-        let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // A refused read is an error: taking it for "detached" would skip the
+        // final `branch -f` and report success with HEAD left detached.
+        let original_branch = crate::engine::git_reader::head_branch(&repo)?;
 
         // Recovery must never swallow its own failure: the checkout outcome is
         // captured so a locked index or full disk cannot hide that HEAD was
@@ -1426,6 +1885,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A pull that does not fast-forward records a merge or replays local
+        // commits, and either one writes the configured identity.
+        Self::refuse_fixture_identity(&repo, false)?;
         git_text_network(&repo, &Self::pull_argv(remote, branch, rebase))
     }
 
@@ -1543,6 +2005,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 })
                 .map_err(SquashFailure::into_message);
         }
+        // Only a fast-forward-only merge is guaranteed to write no commit.
+        if mode != MergeMode::FfOnly {
+            Self::refuse_fixture_identity(&repo, false)?;
+        }
         let argv = Self::merge_argv(branch_name, mode);
         gate(&argv)?;
         git_text(&repo, &argv)
@@ -1559,25 +2025,40 @@ Unset the local override with `git config --local --unset-all user.name` and \
     ) -> Result<bool, SquashFailure> {
         // Checked first: once the merge has staged the squash, a missing
         // identity would leave it stranded in the index.
-        Self::require_identity(repo).map_err(SquashFailure::Merge)?;
+        Self::require_commit_identity(repo).map_err(SquashFailure::Merge)?;
         let merge = Self::merge_argv(branch, MergeMode::Squash);
         gate(&merge).map_err(SquashFailure::Merge)?;
-        git_text(repo, &merge).map_err(SquashFailure::Merge)?;
-        // `git merge` refuses to start over staged changes, so whatever is
-        // staged now is the squash.
-        let staged =
-            git_text(repo, &["diff", "--cached", "--name-only"]).map_err(SquashFailure::Merge)?;
-        if staged.trim().is_empty() {
-            return Ok(false);
-        }
-        let commit = Self::squash_commit_argv(branch);
-        let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
+        git_text(repo, &merge).map_err(SquashFailure::Conflict)?;
         let staged_note = |e: String| {
             SquashFailure::Commit(format!(
                 "The squashed changes of {branch} are staged but could not be committed: {e}. \
                  Commit the staged changes, or undo them with `git reset --merge`."
             ))
         };
+        // `git merge` refuses to start over staged changes, so whatever is
+        // staged now is the squash.
+        let staged = git_text(repo, &["diff", "--cached", "--name-only"]).map_err(staged_note)?;
+        if staged.trim().is_empty() {
+            // Nothing to commit, so nothing is parked: `merge --squash` left
+            // its message file behind, and with it a repository that reads as
+            // mid-squash for good. It is this call's, so it goes.
+            let message = crate::engine::git_cli::resolve_git_dir(repo)
+                .map_err(SquashFailure::Commit)?
+                .join("SQUASH_MSG");
+            match std::fs::remove_file(&message) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(SquashFailure::Commit(format!(
+                        "The squash of {branch} staged nothing, but {} could not be removed: {e}",
+                        message.display()
+                    )))
+                }
+            }
+            return Ok(false);
+        }
+        let commit = Self::squash_commit_argv(branch);
+        let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
         gate(&commit).map_err(staged_note)?;
         git_text(repo, &commit).map_err(staged_note)?;
         Ok(true)
@@ -1689,17 +2170,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 "Working tree has uncommitted changes; commit or stash before restacking".into(),
             );
         }
+        // A rebase re-commits every replayed commit as the configured committer.
+        Self::refuse_fixture_identity(repo_canon, false)?;
 
         // symbolic-ref fails on detached HEAD; then there is no branch to restore.
-        let original_head = git_text(repo_canon, &["symbolic-ref", "--quiet", "HEAD"])
-            .ok()
-            .map(|s| {
-                s.trim()
-                    .trim_start_matches("refs/heads/")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty());
+        // A refused read is an error, never "detached": the restore below
+        // would then be skipped and the repository left on the wrong branch.
+        let original_head = crate::engine::git_reader::head_branch(repo_canon)?;
 
         let restore_checkout = |repo_canon: &Path, target: &str| -> Result<(), String> {
             if git_text(repo_canon, &["checkout", target]).is_ok() {
@@ -1732,7 +2209,23 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 // their original branch (--abort lands on `branch`, not where
                 // the user was). Neither cleanup failure hides the primary
                 // error; the message names the true end-state instead.
-                let _ = git_text(repo_canon, &["rebase", "--abort"]);
+                let abort = git_text(repo_canon, &["rebase", "--abort"]);
+                // An abort with no rebase to abort (the rebase never started)
+                // fails harmlessly; one that failed with a rebase still parked
+                // is not a rollback, and an undecidable state is treated the
+                // same way.
+                let still_parked = !matches!(crate::engine::repo_op::detect(repo_canon), Ok(None));
+                if let (Err(abort_err), true) = (&abort, still_parked) {
+                    // Nothing was rolled back, and checking out another
+                    // branch now would fail or compound it.
+                    return Err(format!(
+                        "Restack of '{branch}' onto '{onto}' failed and could not be rolled back \
+                         (git rebase --abort failed: {}); the repository is still mid-rebase. \
+                         Original failure: {}",
+                        summarize_git_failure(abort_err),
+                        summarize_git_failure(&rebase_err)
+                    ));
+                }
                 let end_state = match &original_head {
                     Some(orig) if orig != branch => {
                         if restore_checkout(repo_canon, orig).is_err() {
@@ -1778,6 +2271,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(tag_name)?;
+        // An annotated tag records the configured identity as its tagger.
+        if message.is_some() {
+            Self::refuse_fixture_identity(&repo, false)?;
+        }
         let mut args = vec!["tag"];
         if let Some(msg) = message {
             args.push("-a");
@@ -1972,6 +2469,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::refuse_if_parked(&repo, subcommand)?;
+        // A replayed commit keeps its author but records the configured
+        // committer; `--no-commit` records nothing.
+        if !no_commit {
+            Self::refuse_fixture_identity(&repo, false)?;
+        }
         let argv = Self::replay_argv(subcommand, commits, no_commit);
         git_text(&repo, &argv[1..])
     }
@@ -2015,6 +2517,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     ) -> Result<String, String> {
         validate_clone_url(url)?;
         options.validate()?;
+        super::git_cli::require_git_for_clone(options.recurse_submodules)?;
         // Global Git runs from a neutral directory. Resolve local relative
         // sources first so that isolation does not reinterpret the user's URL.
         // Keep URL schemes and scp-like host:path syntax intact.
@@ -2152,6 +2655,35 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
+/// Refuses a plan in which a squash or fixup has no kept commit before it, as
+/// git does ("cannot 'squash' without a previous commit"). A dropped step is
+/// not a commit to fold into: with only drops ahead of it the fold would amend
+/// the onto commit itself and `branch -f` would then move the branch onto that
+/// rewritten copy of the base. Pick and reword keep a commit; drop does not.
+fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
+    let mut has_kept_commit = false;
+    for step in steps {
+        let folds_into_previous = match step.action {
+            RebaseActionKind::Squash => Some("squash"),
+            RebaseActionKind::Fixup => Some("fixup"),
+            RebaseActionKind::Pick | RebaseActionKind::Reword(_) => {
+                has_kept_commit = true;
+                None
+            }
+            RebaseActionKind::Drop => None,
+        };
+        if let Some(verb) = folds_into_previous {
+            if !has_kept_commit {
+                return Err(format!(
+                    "Cannot '{verb}' commit {} without a previous commit to combine into",
+                    step.commit_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Composes the user-facing error for a failed rebase step together with any
 /// recovery failures that occurred while rolling back.
 ///
@@ -2255,53 +2787,84 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Journals the tip SHA of a branch about to be deleted.
+/// Journals the tip SHA of a branch [`GitWriter::delete_branch`] just deleted.
 ///
 /// Gate rows authorise the request; this row is the restore record. `before_ref`
 /// holds the tip so `create_branch(name, tip)` can put the ref back after the
-/// in-memory Undo toast is gone. Uses [`crate::ledger::record`] so a ledger
-/// outage never blocks the delete itself.
+/// in-memory Undo toast is gone.
 pub(crate) fn record_deleted_branch_tip(
     repo_path: &str,
     branch_name: &str,
     tip: &str,
     force: bool,
 ) {
-    use crate::ledger::{ActorKind, Draft, Outcome};
-
     let flag = if force { "-D" } else { "-d" };
-    let argv = ["git", "branch", flag, branch_name];
-    let address = crate::ledger::bindings::repository_address(repo_path).ok();
-    let ledger_repo = address
-        .as_ref()
-        .map(|address| address.anchor.clone())
-        .unwrap_or_else(|| repo_path.to_string());
-    let worktree_path = address
-        .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+    BranchDeleteJournal::resolve(repo_path).record(
+        &["git", "branch", flag, branch_name],
+        branch_name,
+        tip,
+        crate::ledger::Outcome::Ok,
+    );
+}
 
-    let _ = crate::ledger::record(Draft {
-        repo_path: ledger_repo,
-        worktree_path,
-        actor_kind: Some(ActorKind::Human),
-        action: crate::ledger::action_for_argv(&argv),
-        object: Some(branch_name.to_string()),
-        argv_json: serde_json::to_string(&argv).ok(),
-        outcome: Some(Outcome::Ok),
-        before_ref: Some(tip.to_string()),
-        detail_json: Some(r#"{"phase":"mutate","kind":"branch.delete"}"#.to_string()),
-        ..Default::default()
-    });
+/// Where a repository's branch-delete rows go, resolved once so a batch of
+/// deletes does not re-resolve the ledger address per branch.
+///
+/// Writes through [`crate::ledger::record`] so a ledger outage never blocks
+/// the delete itself.
+pub(crate) struct BranchDeleteJournal {
+    repo: String,
+    worktree: Option<String>,
+}
+
+impl BranchDeleteJournal {
+    pub(crate) fn resolve(repo_path: &str) -> Self {
+        let address = crate::ledger::bindings::repository_address(repo_path).ok();
+        let repo = address
+            .as_ref()
+            .map(|address| address.anchor.clone())
+            .unwrap_or_else(|| repo_path.to_string());
+        let worktree = address
+            .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+        Self { repo, worktree }
+    }
+
+    /// One row for one delete that ran: `argv` is what ran, `outcome` what
+    /// git reported, `tip` the commit the branch pointed at beforehand.
+    pub(crate) fn record(
+        &self,
+        argv: &[&str],
+        branch_name: &str,
+        tip: &str,
+        outcome: crate::ledger::Outcome,
+    ) {
+        let _ = crate::ledger::record(crate::ledger::Draft {
+            repo_path: self.repo.clone(),
+            worktree_path: self.worktree.clone(),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            action: crate::ledger::action_for_argv(argv),
+            object: Some(branch_name.to_string()),
+            argv_json: serde_json::to_string(argv).ok(),
+            outcome: Some(outcome),
+            before_ref: Some(tip.to_string()),
+            detail_json: Some(r#"{"phase":"mutate","kind":"branch.delete"}"#.to_string()),
+            ..Default::default()
+        });
+    }
 }
 
 /// True when `branch_name` is the branch the repository's HEAD resolves to by
 /// default: the primary remote's HEAD branch first, then conventional
 /// main/master/trunk/develop — the same resolution `list_branches` uses.
-pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
-    let remote = crate::engine::git_reader::resolve_default_remote(repo);
-    let head_ref = crate::engine::git_reader::remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    crate::engine::git_reader::resolve_default_base_on(repo, &remote, remote_head.as_deref())
-        .is_some_and(|(short, _)| short == branch_name)
+///
+/// `Err` when a read the answer depends on produced none (a refused spawn, a
+/// deadline, an unreadable `origin/HEAD`): an unknown is never "not the
+/// default", so a destructive caller refuses. Reads the repository afresh
+/// rather than through the memoized default base, which would answer from
+/// before the read started failing.
+pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> Result<bool, String> {
+    let base = crate::engine::git_reader::compute_default_base(repo).checked()?;
+    Ok(base.base.is_some_and(|(short, _)| short == branch_name))
 }
 
 /// True when any worktree of `repo` (including the main one) has
@@ -2310,11 +2873,16 @@ pub(crate) fn is_checked_out_in_any_worktree(
     repo: &Path,
     branch_name: &str,
 ) -> Result<bool, String> {
-    let stdout = git_text(repo, &["worktree", "list", "--porcelain"])?;
-    let target = format!("refs/heads/{branch_name}");
-    Ok(stdout
-        .lines()
-        .any(|line| line.strip_prefix("branch ").map(str::trim) == Some(target.as_str())))
+    Ok(checked_out_branches(repo)?.contains(branch_name))
+}
+
+/// Short names of every local branch checked out in any worktree of `repo`
+/// (including the main one), from a single `git worktree list`.
+pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, String> {
+    Ok(crate::engine::worktree::read_worktree_entries(repo)?
+        .into_iter()
+        .filter_map(|entry| entry.branch)
+        .collect())
 }
 
 /// Rewrites only the subject line of a commit message, keeping the body —
@@ -2408,27 +2976,7 @@ fn branch_has_upstream(repo: &Path) -> bool {
 }
 
 fn current_branch_name(repo: &Path) -> Result<String, String> {
-    match git_text(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        Ok(name) => {
-            let name = name.trim();
-            if name.is_empty() {
-                Err(PUSH_DETACHED.into())
-            } else {
-                Ok(name.to_string())
-            }
-        }
-        Err(_) => Err(PUSH_DETACHED.into()),
-    }
-}
-
-fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
-    let text = git_text(repo, &["remote"])?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect())
+    crate::engine::git_reader::head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())
 }
 
 /// Remote to publish an unpublished branch to when the caller did not name one.
@@ -2438,7 +2986,7 @@ fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
 /// Never invents `origin` — `git push -u origin …` against a missing remote is
 /// the same class of raw fatal this path exists to replace.
 fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
-    let remotes = configured_remotes(repo)?;
+    let remotes = crate::engine::remotes::list_names(repo)?;
     if remotes.is_empty() {
         return Err(PUSH_NO_REMOTES.into());
     }
@@ -2500,60 +3048,64 @@ fn plan_push_argv(
     Ok(args)
 }
 
+/// The one validator for a branch, tag, remote or revision name that reaches a
+/// git argv: git's own `check-ref-format` rules (rules 1 and 3-10 of
+/// `git help check-ref-format`; rule 2 is not enforced, so one-level names such
+/// as `main` and `HEAD` pass), reimplemented here so it never spawns git — it
+/// runs in loops on read paths.
+///
+/// There is no shell in the way: every caller hands the name to git as one argv
+/// element, so a character git allows (`&`, `(`, `=`, `;`, `$`, `]`, ...) needs
+/// no refusal here. Anything that renders a name into text a human might paste
+/// into a shell must quote it (see `deadbranch`'s backup file).
+///
+/// Two rules are stricter than git, on purpose:
+/// - a leading `-` is refused on every path, so a name can never be read as an
+///   option;
+/// - the C1 control code points U+0080-U+009F are refused. Git sees them as
+///   ordinary bytes and accepts them, but branch names are rendered into
+///   xterm.js terminals, which act on them (U+009B is CSI), so accepting one
+///   would be a terminal escape-injection path.
+///
+/// The tests check this function against `git check-ref-format` over a table and
+/// a sweep of short names, and name the C1 rows as the expected divergence.
 pub fn validate_ref_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Invalid ref name".into());
     }
+    // Rule 3.
     if name.contains("..") {
         return Err("Invalid ref name: contains traversal '..'".into());
     }
-    if name.starts_with('.') || name.ends_with('.') || name.ends_with('/') {
-        return Err("Invalid ref name: invalid prefix or suffix".into());
+    // Rule 6: no leading or trailing '/', no '//' — every component has a body.
+    if name.split('/').any(str::is_empty) {
+        return Err("Invalid ref name: empty path component".into());
     }
-    // A ".lock" suffix on ANY component collides with git's lock files under
-    // .git/refs/ — not just when the whole ref ends in .lock. The split also
-    // covers the single-component case.
+    // Rule 1: a ".lock" suffix on ANY component collides with git's lock files
+    // under .git/refs/, and a leading '.' on any component hides it.
     for component in name.split('/') {
         if component.starts_with('.') || component.ends_with(".lock") {
             return Err("Invalid ref name: invalid path component".into());
         }
     }
+    // Rule 7.
+    if name.ends_with('.') {
+        return Err("Invalid ref name: invalid suffix".into());
+    }
+    // Rules 8 and 9.
     if name == "@" || name.contains("@{") {
         return Err("Invalid ref name: invalid '@' sequence".into());
     }
-    if name.contains("//") {
-        return Err("Invalid ref name: contains '//'".into());
-    }
+    // Rules 4, 5 and 10: ASCII control characters (DEL included), space, and
+    // `~ ^ : ? * [ \`. A lone `]` is legal; only `[` opens a glob. DEL and the
+    // C1 range U+0080-U+009F are refused together (the C1 half is stricter than
+    // git; see above).
     if name.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                ' ' | '~'
-                    | '^'
-                    | ':'
-                    | '?'
-                    | '*'
-                    | '['
-                    | ']'
-                    | '\\'
-                    | ';'
-                    | '`'
-                    | '$'
-                    | '|'
-                    | '&'
-                    | '<'
-                    | '>'
-                    | '!'
-                    | '('
-                    | ')'
-                    | '{'
-                    | '}'
-                    | '='
-                    | '"'
-                    | '\''
-            )
+        c < ' '
+            || ('\u{7f}'..='\u{9f}').contains(&c)
+            || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
     }) {
-        return Err("Invalid ref name: contains forbidden characters".into());
+        return Err("Invalid ref name: contains a character git forbids in ref names".into());
     }
     Ok(())
 }
@@ -2563,6 +3115,13 @@ pub fn validate_oid(oid: &str) -> Result<(), String> {
         return Err("Invalid commit id".into());
     }
     Ok(())
+}
+
+/// True for a full-length object id: exactly 40 (SHA-1) or 64 (SHA-256) hex
+/// digits, the only form that names one commit for good. [`validate_oid`]
+/// accepts any 1 to 64 hex digits, abbreviations included; this does not.
+pub fn is_full_oid(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Validates a single revision argument supplied by the UI.
@@ -2615,33 +3174,42 @@ mod tests {
 
     #[test]
     fn fixture_email_matches_the_hook_denylist() {
-        for email in [
-            "contract@gitpulse.test",
-            "GitPulse@test.local",
-            "person@example.invalid",
-            "person@example.com",
-            "t@t",
-            "t@e.com",
-            "a@test",
-            "a@invalid",
-            "test@test.com",
-            "test@gitpulse.local",
-        ] {
-            assert!(
+        // The table the shell hooks are tested against too, so the two
+        // implementations cannot drift apart.
+        let table = include_str!("../../../.githooks/lib/fixture-identity.cases");
+        let mut checked = (0, 0);
+        for (number, line) in table.lines().enumerate() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let (label, email) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("fixture-identity.cases:{}: no tab", number + 1));
+            let email = email
+                .strip_prefix('"')
+                .and_then(|quoted| quoted.strip_suffix('"'))
+                .unwrap_or(email);
+            let expected = match label {
+                "fixture" => true,
+                "person" => false,
+                other => panic!("fixture-identity.cases:{}: label {other:?}", number + 1),
+            };
+            assert_eq!(
                 GitWriter::is_fixture_author_email(email),
-                "{email} must be a fixture address"
+                expected,
+                "fixture-identity.cases:{}: {email:?} must be a {label}",
+                number + 1
             );
+            if expected {
+                checked.0 += 1;
+            } else {
+                checked.1 += 1;
+            }
         }
-        for email in [
-            "ada@gitpulse.dev",
-            "bharath.vbcr@gmail.com",
-            "dev@github.com",
-        ] {
-            assert!(
-                !GitWriter::is_fixture_author_email(email),
-                "{email} must be committable"
-            );
-        }
+        assert!(
+            checked.0 >= 20 && checked.1 >= 10,
+            "the table must exercise both classes, read {checked:?}"
+        );
     }
 
     fn git_ok(dir: &std::path::Path, args: &[&str]) {
@@ -2755,6 +3323,399 @@ mod tests {
         );
     }
 
+    /// A guarded checkout whose history was written by a real identity, with a
+    /// `side` branch diverged from `main` by one commit each, and whose local
+    /// config now names the contract fixture. Returns the checkout and the
+    /// `side` tip.
+    fn guarded_checkout_with_a_fixture_identity() -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=Ada", "-c", "user.email=ada@gitpulse.dev"];
+            full.extend_from_slice(args);
+            git_ok(dir.path(), &full);
+        };
+        git_ok(dir.path(), &["init", "-q", "-b", "main"]);
+        git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git_ok(dir.path(), &["config", "tag.gpgsign", "false"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        real(&["add", "--", "base.txt"]);
+        real(&["commit", "-q", "-m", "base"]);
+        real(&["switch", "-q", "-c", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "side\n").unwrap();
+        real(&["add", "--", "side.txt"]);
+        real(&["commit", "-q", "-m", "side"]);
+        real(&["switch", "-q", "main"]);
+        std::fs::write(dir.path().join("main.txt"), "main\n").unwrap();
+        real(&["add", "--", "main.txt"]);
+        real(&["commit", "-q", "-m", "main"]);
+        // Ignored, so the guard marker leaves the tree clean for a rebase.
+        std::fs::write(dir.path().join(".git/info/exclude"), ".githooks/\n").unwrap();
+        mark_guarded(dir.path());
+        git_ok(dir.path(), &["config", "user.name", "GitPulse Contract"]);
+        git_ok(
+            dir.path(),
+            &["config", "user.email", "contract@gitpulse.test"],
+        );
+        crate::test_support::trust_repo(dir.path());
+        let side = git_stdout(dir.path(), &["rev-parse", "side"]);
+        (dir, side)
+    }
+
+    /// A trusted checkout on `main` where merging `side` conflicts in `f.txt`.
+    fn conflicting_checkout() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=Ada", "-c", "user.email=ada@gitpulse.dev"];
+            full.extend_from_slice(args);
+            git_ok(dir.path(), &full);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "side"]);
+        std::fs::write(dir.path().join("f.txt"), "side\n").unwrap();
+        git(&["commit", "-qam", "side"]);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(dir.path().join("f.txt"), "main\n").unwrap();
+        git(&["commit", "-qam", "main"]);
+        crate::test_support::trust_repo(dir.path());
+        dir
+    }
+
+    fn checkout_is_clean(repo: &std::path::Path) {
+        assert_eq!(git_stdout(repo, &["status", "--porcelain"]), "");
+        assert_eq!(crate::engine::repo_op::detect_kind(repo).unwrap(), None);
+    }
+
+    #[test]
+    fn rollback_restores_a_conflicted_merge_and_a_conflicted_squash() {
+        for flavour in ["merge", "squash"] {
+            let dir = conflicting_checkout();
+            let repo = dir.path();
+            let args: &[&str] = if flavour == "squash" {
+                &["merge", "--squash", "side"]
+            } else {
+                &["merge", "--no-edit", "side"]
+            };
+            assert!(
+                !git_captured(repo, args).unwrap().success,
+                "{flavour}: the fixture merge should conflict"
+            );
+            GitWriter::rollback_failed_merge_locked(repo)
+                .unwrap_or_else(|e| panic!("{flavour}: {e}"));
+            checkout_is_clean(repo);
+            assert!(
+                !repo.join(".git/SQUASH_MSG").exists(),
+                "{flavour}: SQUASH_MSG"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+                "main\n"
+            );
+        }
+    }
+
+    /// Unmerged entries with no `MERGE_HEAD` or `SQUASH_MSG` are not this
+    /// merge's (a conflicted stash pop the user is resolving). They are left
+    /// exactly as they are, and said.
+    #[test]
+    fn rollback_leaves_unmerged_entries_with_no_marker_alone() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["merge", "--no-edit", "side"])
+                .unwrap()
+                .success
+        );
+        std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
+        let before = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+        let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
+        assert!(refused.contains("left alone"), "{refused}");
+        assert_eq!(std::fs::read_to_string(repo.join("f.txt")).unwrap(), before);
+        assert!(!git_stdout(repo, &["ls-files", "--unmerged"]).is_empty());
+    }
+
+    /// A gate that refuses the rollback is honoured: asked once, the command
+    /// never runs (no fallback to `reset --merge` either), and the refusal is
+    /// the error. The conflict stays in the checkout.
+    #[test]
+    fn rollback_is_not_run_when_the_gate_refuses_it() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["merge", "--no-edit", "side"])
+                .unwrap()
+                .success
+        );
+        let mut asked = Vec::new();
+        let refused = GitWriter::rollback_failed_merge_gated(
+            repo,
+            &git_stdout(repo, &["rev-parse", "side"]),
+            &mut |argv: &[&str]| {
+                asked.push(argv.join(" "));
+                Err("policy: no resets".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(asked, ["merge --abort"]);
+        assert!(
+            refused.contains("merge --abort")
+                && refused.contains("not run")
+                && refused.contains("no resets"),
+            "{refused}"
+        );
+        assert!(repo.join(".git/MERGE_HEAD").exists());
+        assert!(!git_stdout(repo, &["ls-files", "--unmerged"]).is_empty());
+    }
+
+    /// A `MERGE_HEAD` that is not the commit this call merged is somebody
+    /// else's merge (it landed between our merge and the rollback). It is
+    /// named, and never aborted.
+    #[test]
+    fn rollback_never_aborts_a_merge_it_did_not_start() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["merge", "--no-edit", "side"])
+                .unwrap()
+                .success
+        );
+        let foreign = "b".repeat(40);
+        let mut asked = Vec::new();
+        let refused =
+            GitWriter::rollback_failed_merge_gated(repo, &foreign, &mut |argv: &[&str]| {
+                asked.push(argv.join(" "));
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            refused.contains("not of the") && refused.contains(&foreign),
+            "{refused}"
+        );
+        assert!(
+            asked.is_empty(),
+            "a foreign merge was put to the gate: {asked:?}"
+        );
+        assert!(repo.join(".git/MERGE_HEAD").exists());
+        // The tip it did merge is aborted.
+        let side = git_stdout(repo, &["rev-parse", "side"]);
+        GitWriter::rollback_failed_merge_gated(repo, &side, &mut |_| Ok(())).unwrap();
+        checkout_is_clean(repo);
+    }
+
+    #[test]
+    fn rollback_with_nothing_to_undo_is_ok() {
+        let dir = conflicting_checkout();
+        GitWriter::rollback_failed_merge_locked(dir.path()).unwrap();
+        checkout_is_clean(dir.path());
+    }
+
+    /// Both `merge --abort` and the `reset --merge` it falls back to need the
+    /// index lock. A rollback that could not run must say so, not report a
+    /// checkout it left parked as restored.
+    #[test]
+    fn rollback_that_cannot_restore_the_checkout_says_so() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["merge", "--no-edit", "side"])
+                .unwrap()
+                .success
+        );
+        let lock = repo.join(".git/index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let failed = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
+        assert!(
+            failed.contains("merge --abort") && failed.contains("reset --merge"),
+            "{failed}"
+        );
+        assert!(repo.join(".git/MERGE_HEAD").exists());
+        std::fs::remove_file(&lock).unwrap();
+        GitWriter::rollback_failed_merge_locked(repo).unwrap();
+        checkout_is_clean(repo);
+    }
+
+    /// A cherry-pick the user parked is not this merge's to undo.
+    #[test]
+    fn rollback_leaves_another_operation_alone() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["cherry-pick", "side"])
+                .unwrap()
+                .success
+        );
+        let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
+        assert!(refused.contains("cherry-pick"), "{refused}");
+        assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
+    }
+
+    /// Between the steps of a multi-commit cherry-pick or revert the
+    /// `*_HEAD` file is gone but the sequencer is not; reset and stash must
+    /// still refuse rather than walk away from it.
+    #[test]
+    fn refuse_if_parked_refuses_between_the_steps_of_a_sequence() {
+        for revert in [false, true] {
+            let dir = crate::test_support::repo_parked_in_a_sequence(revert);
+            let canon = dir.path().canonicalize().unwrap();
+            let refused = GitWriter::refuse_if_parked(&canon, "reset")
+                .expect_err("a parked sequence must refuse a reset");
+            assert!(
+                refused.contains(if revert { "revert" } else { "cherry-pick" }),
+                "{refused}"
+            );
+            assert!(GitWriter::refuse_if_parked(&canon, "stash").is_err());
+        }
+        let idle = crate::test_support::git_repo();
+        crate::test_support::git_in(idle.path(), &["commit", "--allow-empty", "-q", "-m", "x"]);
+        let canon = idle.path().canonicalize().unwrap();
+        GitWriter::refuse_if_parked(&canon, "reset").expect("an idle repository is not parked");
+    }
+
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .unwrap_or_else(|err| panic!("spawn git {}: {err}", args.join(" ")));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Every ref and HEAD, so a refused operation can be shown to have written
+    /// nothing.
+    fn refs_snapshot(dir: &std::path::Path) -> String {
+        format!(
+            "{}\n{}",
+            git_stdout(dir, &["rev-parse", "HEAD"]),
+            git_stdout(dir, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        )
+    }
+
+    fn assert_refused(dir: &std::path::Path, what: &str, result: Result<String, String>) {
+        let err = result.expect_err(&format!("{what} must refuse the fixture identity"));
+        assert!(
+            err.contains("contract@gitpulse.test"),
+            "{what}: refusal must name the address, got {err}"
+        );
+        assert!(
+            git_stdout(dir, &["status", "--porcelain"]).is_empty(),
+            "{what}: a refused operation must leave the tree clean"
+        );
+    }
+
+    /// `git commit` is not the only command that records an identity. Each of
+    /// these writes the configured committer (or tagger) into a new object,
+    /// and before the guard reached them a fixture identity in this checkout's
+    /// config passed every one.
+    #[test]
+    fn every_writer_that_records_an_identity_refuses_a_fixture() {
+        let pass = &mut |_: &[&str]| Ok(());
+        for mode in [MergeMode::Default, MergeMode::NoFf, MergeMode::Squash] {
+            let (dir, _) = guarded_checkout_with_a_fixture_identity();
+            let before = refs_snapshot(dir.path());
+            let result = GitWriter::merge_branch(dir.path().to_str().unwrap(), "side", mode, pass);
+            assert_refused(dir.path(), &format!("merge {mode:?}"), result);
+            assert_eq!(
+                refs_snapshot(dir.path()),
+                before,
+                "merge {mode:?} wrote a ref"
+            );
+        }
+
+        let (dir, side) = guarded_checkout_with_a_fixture_identity();
+        let repo = dir.path().to_str().unwrap();
+        let before = refs_snapshot(dir.path());
+        assert_refused(
+            dir.path(),
+            "cherry-pick",
+            GitWriter::cherry_pick(repo, std::slice::from_ref(&side), false),
+        );
+        assert_refused(
+            dir.path(),
+            "revert",
+            GitWriter::revert(
+                repo,
+                &[git_stdout(dir.path(), &["rev-parse", "HEAD"])],
+                false,
+            ),
+        );
+        assert_refused(
+            dir.path(),
+            "annotated tag",
+            GitWriter::create_tag(repo, "v9.9.9", None, Some("release")).map(|()| String::new()),
+        );
+        assert_refused(
+            dir.path(),
+            "restack",
+            GitWriter::restack(repo, "side", "main"),
+        );
+        let base = git_stdout(dir.path(), &["rev-parse", "main~1"]);
+        let head = git_stdout(dir.path(), &["rev-parse", "main"]);
+        assert_refused(
+            dir.path(),
+            "interactive rebase",
+            GitWriter::execute_rebase_sequence(
+                repo,
+                &base,
+                // A plain pick: a reword would be caught by the commit it runs,
+                // and the pick alone is what re-commits as the configured
+                // committer.
+                &[RebaseStep {
+                    commit_id: head,
+                    action: RebaseActionKind::Pick,
+                }],
+            )
+            .map(|()| String::new()),
+        );
+        assert_eq!(
+            refs_snapshot(dir.path()),
+            before,
+            "a refused writer wrote a ref"
+        );
+    }
+
+    /// The guard refuses what records an identity, not every command near one:
+    /// a fast-forward, a lightweight tag and a `--no-commit` replay write no
+    /// identity and still work under the same config.
+    #[test]
+    fn writers_that_record_no_identity_still_run_under_a_fixture_config() {
+        let (dir, side) = guarded_checkout_with_a_fixture_identity();
+        let repo = dir.path().to_str().unwrap();
+        GitWriter::create_tag(repo, "light", None, None).expect("a lightweight tag has no tagger");
+        GitWriter::cherry_pick(repo, std::slice::from_ref(&side), true)
+            .expect("--no-commit records nothing");
+        git_ok(dir.path(), &["reset", "-q", "--hard"]);
+        git_ok(dir.path(), &["switch", "-q", "-c", "behind", "main~1"]);
+        let pass = &mut |_: &[&str]| Ok(());
+        GitWriter::merge_branch(repo, "main", MergeMode::FfOnly, pass)
+            .expect("a fast-forward records nothing");
+        assert_eq!(
+            git_stdout(dir.path(), &["rev-parse", "HEAD"]),
+            git_stdout(dir.path(), &["rev-parse", "main"])
+        );
+    }
+
+    #[test]
+    fn pull_refuses_a_fixture_identity_before_reaching_the_remote() {
+        let (dir, _) = guarded_checkout_with_a_fixture_identity();
+        // A remote that does not exist: a refusal must come before any fetch.
+        git_ok(
+            dir.path(),
+            &["remote", "add", "origin", "/nonexistent/gitpulse-remote"],
+        );
+        let before = refs_snapshot(dir.path());
+        let err = GitWriter::pull(
+            dir.path().to_str().unwrap(),
+            Some("origin"),
+            Some("main"),
+            None,
+        )
+        .expect_err("pull must refuse the fixture identity");
+        assert!(err.contains("contract@gitpulse.test"), "{err}");
+        assert_eq!(refs_snapshot(dir.path()), before);
+    }
+
     #[test]
     fn test_validate_ref_name() {
         assert!(validate_ref_name("feat/auth").is_ok());
@@ -2787,6 +3748,333 @@ mod tests {
         assert!(validate_ref_name(".hidden/inner").is_err());
         assert!(validate_ref_name("feat/dot.file").is_ok());
         assert!(validate_ref_name("feat/auth").is_ok());
+    }
+
+    /// Every row is `(name, git accepts it)`. A name is refused here when git
+    /// refuses it (check-ref-format rules 1, 3-10; one-level names allowed),
+    /// plus a leading `-`, which git's `--branch` mode also refuses and which
+    /// is the argv option-injection guard on every path.
+    const REF_NAME_TABLE: &[(&str, bool)] = &[
+        // Ordinary names.
+        ("main", true),
+        ("feat/auth", true),
+        ("v1.0.0", true),
+        ("a/b/c", true),
+        ("refs/heads/x", true),
+        // Characters the old shell-metacharacter list refused, which git allows.
+        ("a&b", true),
+        ("fix/a&b", true),
+        ("x(y)", true),
+        ("feat(ui)", true),
+        ("feat(ui)=x", true),
+        ("k=v", true),
+        ("a]b", true),
+        ("{a}", true),
+        ("a{b", true),
+        ("a}b", true),
+        ("a'b", true),
+        ("a\"b", true),
+        ("a`b", true),
+        ("a;b", true),
+        ("a$b", true),
+        ("a${IFS}b", true),
+        ("a|b", true),
+        ("a<b", true),
+        ("a>b", true),
+        ("a!b", true),
+        ("a#b", true),
+        ("a%b", true),
+        ("a+b", true),
+        ("a,b", true),
+        // `@`, `.`, `-` and `.lock` are only special in some positions.
+        ("a@b", true),
+        ("a@", true),
+        ("@a", true),
+        ("@@", true),
+        ("a/@", true),
+        ("a-", true),
+        ("a/-b", true),
+        ("a.b", true),
+        ("a.lock.x", true),
+        ("a/lockfile", true),
+        ("foo.lockdown", true),
+        // Other non-ASCII text is ordinary.
+        ("ü", true),
+        ("日本語/ブランチ", true),
+        ("a\u{a0}b", true),
+        // Rule 1: a component may not start with `.` or end with `.lock`.
+        (".a", false),
+        ("a/.b", false),
+        (".lock", false),
+        ("a.lock", false),
+        ("a/b.lock", false),
+        ("a.lock/b", false),
+        // Rule 3.
+        ("a..b", false),
+        ("...", false),
+        ("..", false),
+        (".", false),
+        ("a..", false),
+        // Rule 4: control characters (DEL included), space, `~ ^ :`.
+        ("a b", false),
+        ("a\tb", false),
+        ("a\nb", false),
+        ("a\u{1}b", false),
+        ("a\u{7f}b", false),
+        ("a~b", false),
+        ("a^b", false),
+        ("a:b", false),
+        // Rule 5: `? * [`. A lone `]` is fine.
+        ("a?b", false),
+        ("a*b", false),
+        ("a[b", false),
+        // Rule 6: no leading or trailing `/`, no `//`.
+        ("/a", false),
+        ("a/", false),
+        ("a//b", false),
+        // Rule 7.
+        ("a.", false),
+        ("a/.", false),
+        // Rule 8.
+        ("x@{1}", false),
+        ("a@{b", false),
+        ("a/@{u}", false),
+        ("@{-1}", false),
+        // Rule 9 (also covered below against `--branch`, which differs).
+        ("@", false),
+        // Rule 10.
+        ("a\\b", false),
+        // The extras.
+        ("", false),
+        ("-x", false),
+        ("--force", false),
+        ("-", false),
+        ("a\0b", false),
+        // Stricter than git: C1 control code points (see `REF_NAME_C1_ROWS`).
+        ("a\u{80}b", false),
+        ("a\u{85}b", false),
+        ("a\u{9b}b", false),
+        ("a\u{9f}b", false),
+    ];
+
+    /// The rows of [`REF_NAME_TABLE`] where `validate_ref_name` is deliberately
+    /// stricter than git: C1 control code points, which git accepts and which
+    /// xterm.js interprets (U+009B is CSI). The git comparison expects git to
+    /// ACCEPT each of these and the validator to refuse it; it never skips them.
+    const REF_NAME_C1_ROWS: &[&str] = &["a\u{80}b", "a\u{85}b", "a\u{9b}b", "a\u{9f}b"];
+
+    /// Rows `git check-ref-format --branch` answers about something other than
+    /// the name: `HEAD` is refused as a branch name, and `@` / `@{-N}` are
+    /// expanded to a previously checked-out branch. `validate_ref_name` guards
+    /// remote, tag and revision arguments as well, where `HEAD` is a legal
+    /// value, so these rows are checked against plain
+    /// `check-ref-format --allow-onelevel` (rules 1-10, which is the rule list
+    /// the validator implements) instead.
+    const REF_NAME_PLAIN_MODE_ROWS: &[&str] = &["HEAD", "@", "@{-1}"];
+
+    /// What git says about `name`: `Some(true)` accepted, `Some(false)` refused
+    /// (exit 1 or 128), `None` when git cannot be run at all. Any other exit status
+    /// is a usage error, not a verdict, and fails the test.
+    ///
+    /// `check-ref-format` takes no `--` terminator (exit 129), so a leading
+    /// `-` can only be asked of `--branch`, which reads it as a name.
+    fn git_ref_verdict(flags: &[&str], name: &str, cwd: &std::path::Path) -> Option<bool> {
+        let output = std::process::Command::new("git")
+            .arg("check-ref-format")
+            .args(flags)
+            .arg(name)
+            .current_dir(cwd)
+            .output_locked()
+            .ok()?;
+        match output.status.code() {
+            Some(0) => Some(true),
+            // Plain mode exits 1 on a bad name; `--branch` dies with 128.
+            Some(1 | 128) => Some(false),
+            other => panic!(
+                "git check-ref-format {flags:?} {name:?} exited {other:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    #[test]
+    fn ref_name_table_is_decided_by_git_rules_not_a_shell_reject_list() {
+        for &(name, accepted) in REF_NAME_TABLE {
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                accepted,
+                "validate_ref_name({name:?}) should {}",
+                if accepted { "accept" } else { "refuse" }
+            );
+        }
+        for name in REF_NAME_PLAIN_MODE_ROWS {
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                *name == "HEAD",
+                "validate_ref_name({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_name_table_agrees_with_git_check_ref_format() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        if git_ref_verdict(&["--allow-onelevel"], "main", cwd.path()).is_none() {
+            eprintln!("SKIPPED: git is not runnable here, so there is no oracle to compare to");
+            return;
+        }
+        for &(name, accepted) in REF_NAME_TABLE {
+            // argv cannot carry a NUL byte, so git cannot be asked.
+            if name.contains('\0') {
+                continue;
+            }
+            let git = git_ref_verdict(&["--branch"], name, cwd.path()).expect("git runs");
+            // `--branch` on a plain name is the whole of what a branch needs;
+            // the table's `@` and `@{-1}` rows are asked of plain mode below.
+            if REF_NAME_PLAIN_MODE_ROWS.contains(&name) {
+                continue;
+            }
+            if REF_NAME_C1_ROWS.contains(&name) {
+                // The one intended divergence: git accepts, the validator refuses.
+                assert!(
+                    git && !accepted && validate_ref_name(name).is_err(),
+                    "{name:?} must be accepted by git and refused by validate_ref_name"
+                );
+                continue;
+            }
+            assert_eq!(
+                git, accepted,
+                "the table says {name:?} is {accepted}, but git check-ref-format --branch disagrees"
+            );
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                git,
+                "validate_ref_name({name:?}) disagrees with git check-ref-format --branch"
+            );
+        }
+        for name in REF_NAME_PLAIN_MODE_ROWS {
+            let git = git_ref_verdict(&["--allow-onelevel"], name, cwd.path()).expect("git runs");
+            assert_eq!(
+                validate_ref_name(name).is_ok(),
+                git,
+                "validate_ref_name({name:?}) disagrees with git check-ref-format --allow-onelevel"
+            );
+        }
+    }
+
+    /// The table is hand-picked; this sweeps every short sequence of the
+    /// tokens the rules turn on, so a rule that only bites in combination
+    /// (`a/.lock`, `@/{`, `a./b`) cannot hide between rows.
+    #[test]
+    fn ref_name_sweep_agrees_with_git_check_ref_format() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        if git_ref_verdict(&["--allow-onelevel"], "main", cwd.path()).is_none() {
+            eprintln!("SKIPPED: git is not runnable here, so there is no oracle to compare to");
+            return;
+        }
+        const TOKENS: [&str; 6] = ["a", ".", "/", "@", "{", ".lock"];
+        let mut names: Vec<String> = Vec::new();
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for token in TOKENS {
+                    next.push(format!("{prefix}{token}"));
+                }
+            }
+            names.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut disagreements = Vec::new();
+        for name in &names {
+            let git = git_ref_verdict(&["--allow-onelevel"], name, cwd.path()).expect("git runs");
+            if validate_ref_name(name).is_ok() != git {
+                disagreements.push(format!("{name:?}: git {git}"));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "{} of {} names disagree with git: {disagreements:?}",
+            disagreements.len(),
+            names.len()
+        );
+    }
+
+    #[test]
+    fn a_leading_dash_is_refused_by_every_branch_taking_entry_point() {
+        let repo = init_repo_with_commit();
+        let path = repo_path(&repo);
+        for name in ["-x", "--force", "-", "--orphan"] {
+            let refused = |what: &str, result: Result<(), String>| {
+                let err = result.expect_err(&format!("{what} must refuse {name:?}"));
+                assert!(
+                    err.starts_with("Invalid ref name"),
+                    "{what}({name:?}) was refused for the wrong reason: {err}"
+                );
+            };
+            refused(
+                "checkout_branch",
+                GitWriter::checkout_branch(&path, name).map(|_| ()),
+            );
+            GitWriter::checkout_detached(&path, name)
+                .expect_err("checkout_detached must refuse a leading dash");
+            refused("create_branch", GitWriter::create_branch(&path, name, None));
+            refused(
+                "delete_branch",
+                GitWriter::delete_branch(&path, name, false).map(|_| ()),
+            );
+            refused(
+                "rename_branch (old)",
+                GitWriter::rename_branch(&path, name, "ok"),
+            );
+            refused(
+                "rename_branch (new)",
+                GitWriter::rename_branch(&path, "main", name),
+            );
+            refused(
+                "get_range_diff (from)",
+                crate::engine::git_reader::GitReader::get_range_diff(&path, name, "main")
+                    .map(|_| ()),
+            );
+            refused(
+                "get_range_diff (to)",
+                crate::engine::git_reader::GitReader::get_range_diff(&path, "main", name)
+                    .map(|_| ()),
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_with_shell_punctuation_can_be_made_checked_out_diffed_and_deleted() {
+        let repo = init_repo_with_commit();
+        let path = repo_path(&repo);
+        for name in ["fix/a&b", "feat(ui)=x", "k;l$m"] {
+            GitWriter::create_branch(&path, name, None).expect("create");
+            GitWriter::checkout_branch(&path, name).expect("checkout");
+            let file = "touched.txt";
+            std::fs::write(repo.path().join(file), format!("on {name}\n")).unwrap();
+            git_ok(repo.path(), &["add", "--", file]);
+            git_ok(
+                repo.path(),
+                &["commit", "-q", "-m", "work on the odd branch"],
+            );
+            let diff = crate::engine::git_reader::GitReader::get_range_diff(&path, "main", name)
+                .expect("diff")
+                .text;
+            assert!(diff.contains(file), "{name}: {diff}");
+            GitWriter::checkout_branch(&path, "main").expect("back to main");
+            // Force: the branch carries a commit main does not have.
+            GitWriter::delete_branch(&path, name, true).expect("delete");
+            let listed = git_text(
+                &validate_repo(&path).unwrap(),
+                &["branch", "--list", "--format=%(refname:short)"],
+            )
+            .unwrap();
+            assert!(
+                !listed.lines().any(|line| line == name),
+                "{name} should be gone: {listed}"
+            );
+        }
     }
 
     /// The destination resolver mirrors sandbox_join_canonical: an existing
@@ -3204,6 +4492,181 @@ mod tests {
         );
     }
 
+    /// A clone of a repository that has `main` and `feature`, left on `main`.
+    /// Its remote-tracking branches are `origin/main` and `origin/feature`.
+    fn clone_with_remote_feature() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let origin = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            origin.path(),
+            &["commit", "--allow-empty", "-q", "-m", "base"],
+        );
+        crate::test_support::git_in(origin.path(), &["switch", "-q", "-c", "feature"]);
+        crate::test_support::git_in(
+            origin.path(),
+            &["commit", "--allow-empty", "-q", "-m", "on feature"],
+        );
+        crate::test_support::git_in(origin.path(), &["switch", "-q", "main"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(
+            parent.path(),
+            &["clone", "-q", origin.path().to_str().unwrap(), "work"],
+        );
+        let work = parent.path().join("work").canonicalize().unwrap();
+        crate::test_support::trust_repo(&work);
+        (origin, parent, work)
+    }
+
+    /// The branch HEAD is on, or `None` when it is detached.
+    fn attached_branch(repo: &std::path::Path) -> Option<String> {
+        git_text(repo, &["symbolic-ref", "-q", "HEAD"])
+            .ok()
+            .and_then(|name| name.trim().strip_prefix("refs/heads/").map(String::from))
+    }
+
+    /// The command palette hands the remote row's name, `origin/feature`. It
+    /// is a remote-tracking ref, so the old `checkout origin/feature --`
+    /// fallback detached HEAD at it and reported success.
+    #[test]
+    fn checkout_of_a_remote_tracking_name_lands_on_a_local_tracking_branch() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        let _ = GitWriter::checkout_branch(path, "origin/feature");
+        assert_eq!(
+            attached_branch(&work).as_deref(),
+            Some("feature"),
+            "HEAD must be on the local tracking branch, not detached"
+        );
+        assert_eq!(
+            git_text(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .unwrap()
+                .trim(),
+            "origin/feature"
+        );
+    }
+
+    #[test]
+    fn checkout_of_a_remote_tracking_name_reuses_an_existing_local_branch() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["branch", "feature", "origin/feature"]);
+        GitWriter::checkout_branch(path, "origin/feature").expect("switch to the local twin");
+        assert_eq!(attached_branch(&work).as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn checkout_of_a_tag_or_an_oid_never_detaches_head() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "v-only"]);
+        let oid = git_text(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        for name in ["v-only", oid.as_str()] {
+            let _ = GitWriter::checkout_branch(path, name);
+            assert_eq!(
+                attached_branch(&work).as_deref(),
+                Some("main"),
+                "checkout_branch({name}) must not leave HEAD detached"
+            );
+            assert!(GitWriter::checkout_branch(path, name).is_err(), "{name}");
+        }
+    }
+
+    /// A tag sharing its name with a branch: a local branch wins, because it is
+    /// what a branch checkout means; with only a remote twin the name is
+    /// ambiguous and is refused rather than resolved onto the tag.
+    #[test]
+    fn checkout_never_resolves_a_branch_name_onto_a_tag() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "feature"]);
+        let ambiguous = GitWriter::checkout_branch(path, "feature");
+        assert_eq!(
+            attached_branch(&work).as_deref(),
+            ambiguous.is_ok().then_some("feature").or(Some("main")),
+            "HEAD is on the new branch or untouched, never detached on the tag"
+        );
+        crate::test_support::git_in(&work, &["switch", "-q", "-c", "local-and-tag"]);
+        crate::test_support::git_in(&work, &["tag", "local-and-tag"]);
+        crate::test_support::git_in(&work, &["switch", "-q", "main"]);
+        let outcome = GitWriter::checkout_branch(path, "local-and-tag").expect("the branch");
+        assert!(!outcome.detached);
+        assert_eq!(attached_branch(&work).as_deref(), Some("local-and-tag"));
+    }
+
+    #[test]
+    fn checkout_detached_is_the_named_way_to_detach_and_says_so() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["tag", "v-only"]);
+        let attached = GitWriter::checkout_branch(path, "origin/feature").unwrap();
+        assert!(!attached.detached);
+        let detached = GitWriter::checkout_detached(path, "v-only").unwrap();
+        assert!(detached.detached);
+        assert_eq!(attached_branch(&work), None);
+        let back = GitWriter::checkout_branch(path, "main").unwrap();
+        assert!(!back.detached);
+    }
+
+    /// Two remotes carrying the same branch: a bare `feature` is ambiguous and
+    /// must not be guessed into a detached checkout, while the qualified name
+    /// is exact.
+    #[test]
+    fn checkout_with_two_remotes_never_detaches() {
+        let (origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(
+            &work,
+            &["remote", "add", "upstream", origin.path().to_str().unwrap()],
+        );
+        crate::test_support::git_in(&work, &["fetch", "-q", "upstream"]);
+        let _ = GitWriter::checkout_branch(path, "feature");
+        assert_eq!(attached_branch(&work).as_deref(), Some("main"));
+        let _ = GitWriter::checkout_branch(path, "upstream/feature");
+        assert_eq!(attached_branch(&work).as_deref(), Some("feature"));
+        assert_eq!(
+            git_text(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .unwrap()
+                .trim(),
+            "upstream/feature"
+        );
+    }
+
+    /// An unborn HEAD (no commit yet) with a fetched remote branch.
+    #[test]
+    fn checkout_of_a_remote_branch_works_from_an_unborn_head() {
+        let (origin, _parent, _work) = clone_with_remote_feature();
+        let fresh = crate::test_support::git_repo();
+        let canon = fresh.path().canonicalize().unwrap();
+        crate::test_support::git_in(
+            &canon,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        crate::test_support::git_in(&canon, &["fetch", "-q", "origin"]);
+        let _ = GitWriter::checkout_branch(canon.to_str().unwrap(), "origin/feature");
+        assert_eq!(attached_branch(&canon).as_deref(), Some("feature"));
+        assert!(GitWriter::checkout_branch(canon.to_str().unwrap(), "origin/missing").is_err());
+    }
+
+    #[test]
+    fn a_refused_checkout_on_a_dirty_tree_changes_nothing() {
+        let (_origin, _parent, work) = clone_with_remote_feature();
+        let path = work.to_str().unwrap();
+        crate::test_support::git_in(&work, &["switch", "-q", "feature"]);
+        std::fs::write(work.join("clash.txt"), "feature\n").unwrap();
+        crate::test_support::git_in(&work, &["add", "clash.txt"]);
+        crate::test_support::git_in(&work, &["commit", "-q", "-m", "clash on feature"]);
+        crate::test_support::git_in(&work, &["switch", "-q", "main"]);
+        std::fs::write(work.join("clash.txt"), "uncommitted\n").unwrap();
+        GitWriter::checkout_branch(path, "feature").expect_err("the dirty file would be lost");
+        assert_eq!(attached_branch(&work).as_deref(), Some("main"));
+        assert_eq!(
+            std::fs::read_to_string(work.join("clash.txt")).unwrap(),
+            "uncommitted\n"
+        );
+    }
+
     /// Regression (audit A7): when every checkout strategy fails, the first
     /// (most meaningful) error must surface, not the last retry's.
     #[test]
@@ -3540,6 +5003,90 @@ mod tests {
             "error must name fixup, got: {fixup_err}"
         );
         assert_eq!(head_message(&dir), "commit A", "HEAD must be untouched");
+    }
+
+    /// A squash/fixup folds into the nearest kept commit before it. Dropping
+    /// every commit ahead of it leaves only the onto commit, which git refuses
+    /// to squash into ("cannot 'squash' without a previous commit") and which
+    /// this engine would otherwise amend, rewriting the base's tip.
+    #[test]
+    fn rebase_refuses_squash_or_fixup_with_no_kept_commit_before_it() {
+        for (leading, action_name) in [
+            (vec![RebaseActionKind::Drop], "squash"),
+            (vec![RebaseActionKind::Drop], "fixup"),
+            (
+                vec![RebaseActionKind::Drop, RebaseActionKind::Drop],
+                "squash",
+            ),
+        ] {
+            let dir = init_repo_with_commit();
+            let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+            let mut steps = Vec::new();
+            for (i, action) in leading.iter().enumerate() {
+                let id = write_commit(&dir, &format!("d{i}.txt"), "d\n", &format!("dropped {i}"));
+                steps.push(RebaseStep {
+                    commit_id: id,
+                    action: match action {
+                        RebaseActionKind::Drop => RebaseActionKind::Drop,
+                        _ => unreachable!("only Drop leads these plans"),
+                    },
+                });
+            }
+            let last = write_commit(&dir, "z.txt", "z\n", "folded");
+            steps.push(RebaseStep {
+                commit_id: last,
+                action: if action_name == "squash" {
+                    RebaseActionKind::Squash
+                } else {
+                    RebaseActionKind::Fixup
+                },
+            });
+            let head_before = head_oid(&dir);
+            let err =
+                GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+                    .expect_err("a squash with every earlier step dropped must be refused");
+            assert!(
+                err.to_lowercase().contains(action_name),
+                "error must name {action_name}, got: {err}"
+            );
+            assert_eq!(head_oid(&dir), head_before, "HEAD must not move");
+            let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+            assert_eq!(branch.trim(), "main", "HEAD must stay on its branch");
+        }
+    }
+
+    #[test]
+    fn rebase_still_squashes_into_a_pick_across_a_drop() {
+        let dir = init_repo_with_commit();
+        let base = write_commit(&dir, "a.txt", "a\n", "base commit");
+        let c_a = write_commit(&dir, "b.txt", "b\n", "kept A");
+        let c_b = write_commit(&dir, "d.txt", "d\n", "dropped B");
+        let c_c = write_commit(&dir, "c.txt", "c\n", "folded C");
+        let steps = vec![
+            RebaseStep {
+                commit_id: c_a,
+                action: RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: c_b,
+                action: RebaseActionKind::Drop,
+            },
+            RebaseStep {
+                commit_id: c_c,
+                action: RebaseActionKind::Squash,
+            },
+        ];
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect("pick, drop, squash folds into the pick");
+        assert_eq!(head_message(&dir), "kept A");
+        let count = git_text(
+            dir.path(),
+            &["rev-list", "--count", &format!("{base}..HEAD")],
+        )
+        .unwrap();
+        assert_eq!(count.trim(), "1", "one commit above the base");
+        assert!(dir.path().join("c.txt").exists());
+        assert!(!dir.path().join("d.txt").exists());
     }
 
     /// Pure-message tests for rebase recovery reporting: the step error always
@@ -3910,7 +5457,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
             "{err}"
         );
         assert!(err.contains("git commit timed out after "), "{err}");
@@ -3950,7 +5498,8 @@ mod tests {
         let err = GitWriter::commit(&repo_path(&dir), "never lands", false).unwrap_err();
         assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
             "{err}"
         );
         assert!(
@@ -3961,6 +5510,129 @@ mod tests {
         assert_eq!(head_oid(&dir), before);
     }
 
+    /// A cancel or a deadline asks git to stop before it insists: git removes
+    /// its own `.git/index.lock` on SIGTERM, and loses the ability to on
+    /// SIGKILL. The next commit must not trip over the dead one's lock.
+    #[cfg(unix)]
+    fn assert_no_stale_index_lock_and_next_commit_lands(dir: &tempfile::TempDir) {
+        let lock = dir.path().join(".git/index.lock");
+        assert!(!lock.exists(), "the stopped commit left {}", lock.display());
+        std::fs::remove_file(dir.path().join(".git/hooks/pre-commit")).unwrap();
+        let before = head_oid(dir);
+        GitWriter::commit_files(&repo_path(dir), "after the stop", &["tracked.txt".into()])
+            .expect("the next commit succeeds first try");
+        assert_ne!(head_oid(dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_commit_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        let marker = dir.path().join(".git/hook-started");
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            &format!("touch '{}'\nsleep 30", marker.display()),
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let canonical = dir.path().canonicalize().unwrap();
+        let canceller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline, "hook never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::engine::git_cli::cancel_hooked_git(&canonical)
+        });
+        // `--only` keeps `.git/index.lock` held while the hook runs.
+        let err = GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()])
+            .unwrap_err();
+        assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
+        assert!(
+            crate::engine::git_cli::is_hooked_git_cancelled(&err),
+            "{err}"
+        );
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_stopped_at_its_deadline_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        install_hook(dir.path(), "pre-commit", "sleep 30");
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let err = crate::engine::git_cli::hooks::with_hook_timeout(
+            std::time::Duration::from_secs(2),
+            || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
+    /// R2-02 adversarial: a hook that has written far more than a pipe holds
+    /// (git relays hook output to stderr) and is cancelled mid-sleep leaves no
+    /// lock behind, and the next commit lands first try.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_commit_whose_hook_flooded_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        let marker = dir.path().join(".git/hook-started");
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            &format!(
+                "touch '{}'\nhead -c 100000 /dev/zero | tr '\\0' x >&2\nsleep 30",
+                marker.display()
+            ),
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let canonical = dir.path().canonicalize().unwrap();
+        let canceller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline, "hook never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Let the hook fill its pipe and block before the cancel lands.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::engine::git_cli::cancel_hooked_git(&canonical)
+        });
+        let err = GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()])
+            .unwrap_err();
+        assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
+        assert!(
+            crate::engine::git_cli::is_hooked_git_cancelled(&err),
+            "{err}"
+        );
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
+    /// R2-02 adversarial: the same flood, stopped by the hook deadline, with a
+    /// hook that traps the ask and keeps writing.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_commit_whose_hook_traps_term_and_floods_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            "trap '' TERM\nwhile :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx >&2; done",
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let err = crate::engine::git_cli::hooks::with_hook_timeout(
+            std::time::Duration::from_secs(2),
+            || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
     /// Overrides any global identity with an empty one, which git refuses
     /// to commit under, so the repository has no usable identity at all.
     fn blank_identity(dir: &std::path::Path) {
@@ -3969,7 +5641,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_reads_config_then_an_environment_covering_author_and_committer() {
+    fn identity_reads_an_environment_covering_author_and_committer_then_config() {
         let dir = init_repo_with_commit();
         blank_identity(dir.path());
         let none = |_: &str| None;
@@ -4001,8 +5673,17 @@ mod tests {
                 .unwrap()
                 .name
                 .as_deref(),
+            Some("Ada"),
+            "the environment wins over configuration, as `git var GIT_AUTHOR_IDENT` has it"
+        );
+        let env_name_absent = |_: &str| None;
+        assert_eq!(
+            GitWriter::identity_with(dir.path(), &env_name_absent)
+                .unwrap()
+                .name
+                .as_deref(),
             Some("Grace"),
-            "configuration wins over the environment"
+            "without the environment, configuration answers"
         );
     }
 
@@ -4220,9 +5901,18 @@ mod tests {
     #[test]
     fn pull_with_rebase_replays_local_commits_without_a_merge() {
         let (local, _origin) = diverged_clone();
+        // Unset in the repository, so whatever answers comes from outside it:
+        // Git for Windows' installer writes `pull.rebase=false` to the system
+        // config, which a fresh clone there inherits.
+        let inherited = git_text(
+            local.path(),
+            &["config", "--system", "--get", "pull.rebase"],
+        )
+        .ok()
+        .map(|value| value.trim().to_owned());
         assert_eq!(
             GitWriter::pull_rebase_config(&repo_path(&local)).unwrap(),
-            None
+            inherited
         );
         GitWriter::pull(&repo_path(&local), None, None, Some(true)).unwrap();
         assert_eq!(parents_of_head(&local), 1, "rebased, not merged");
@@ -4243,9 +5933,12 @@ mod tests {
         write_commit(&dir, "other.txt", "base\n", "other");
         std::fs::write(dir.path().join("tracked.txt"), "stash me\n").unwrap();
         std::fs::write(dir.path().join("other.txt"), "keep me\n").unwrap();
-        std::fs::write(dir.path().join("*"), "literal star\n").unwrap();
+        // A file whose name is a glob. `*` is not a legal Windows filename
+        // (creating it is OS error 123), but a character class is.
+        let glob = if cfg!(windows) { "[tk]" } else { "*" };
+        std::fs::write(dir.path().join(glob), "literal glob\n").unwrap();
         let options = StashSaveOptions {
-            paths: vec!["tracked.txt".into(), "*".into(), "tracked.txt".into()],
+            paths: vec!["tracked.txt".into(), glob.into(), "tracked.txt".into()],
             ..StashSaveOptions::default()
         };
         assert_eq!(
@@ -4259,7 +5952,7 @@ mod tests {
                 "part",
                 "--",
                 ":(literal)tracked.txt",
-                ":(literal)*"
+                format!(":(literal){glob}").as_str()
             ]
         );
         GitWriter::stash_save_with(&repo_path(&dir), Some("part"), options).unwrap();
@@ -4272,8 +5965,8 @@ mod tests {
             "keep me\n"
         );
         assert!(
-            !dir.path().join("*").exists(),
-            "the literal `*` file was stashed"
+            !dir.path().join(glob).exists(),
+            "the literal `{glob}` file was stashed"
         );
 
         let escape = StashSaveOptions {
@@ -4436,4 +6129,584 @@ mod tests {
             .expect("a slow hook is not a hung git");
         assert_eq!(head_message(&dir).trim(), "slow hook");
     }
+
+    /// A selection of 300 paths used to be three `git add` processes (one per
+    /// 128 paths) that could stop partway. It is one, and stages everything.
+    #[test]
+    fn staging_and_unstaging_a_selection_is_one_process_each() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..300).map(|i| format!("dir/f {i}.txt")).collect();
+        std::fs::create_dir_all(dir.path().join("dir")).unwrap();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let staged = |dir: &tempfile::TempDir| {
+            let out = std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only", "-z"])
+                .current_dir(dir.path())
+                .output_locked()
+                .expect("git diff --cached");
+            String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .count()
+        };
+
+        let (staged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()))
+        });
+        assert_eq!(staged_result.expect("stage").1, 300);
+        assert_eq!(
+            labels.iter().filter(|l| l.as_str() == "git add").count(),
+            1,
+            "{labels:?}"
+        );
+        assert_eq!(staged(&dir), 300);
+
+        let (unstaged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::change_index_with(&path, &files, IndexAction::Unstage, |_| Ok(()))
+        });
+        assert_eq!(unstaged_result.expect("unstage").1, 300);
+        assert_eq!(
+            labels.iter().filter(|l| l.as_str() == "git reset").count(),
+            1,
+            "{labels:?}"
+        );
+        assert_eq!(staged(&dir), 0);
+    }
+
+    fn staged_names(dir: &tempfile::TempDir) -> std::collections::BTreeSet<String> {
+        let out = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only", "-z"])
+            .current_dir(dir.path())
+            .output_locked()
+            .expect("git diff --cached");
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    fn adds(labels: &[String]) -> usize {
+        labels.iter().filter(|l| l.as_str() == "git add").count()
+    }
+
+    /// The hub-rename cost: the number of `git add` processes depends on the
+    /// batch size, never on how many files there are beyond it.
+    #[test]
+    fn staging_many_files_attributed_costs_one_process_per_batch() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::create_dir_all(dir.path().join("n")).unwrap();
+        for (count, expected) in [(0, 0), (1, 1), (10, 1), (2 * STAGE_BATCH_PATHS + 1, 3)] {
+            let files: Vec<String> = (0..count).map(|i| format!("n/{count}-{i}.md")).collect();
+            for file in &files {
+                std::fs::write(dir.path().join(file), "x\n").unwrap();
+            }
+            let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                GitWriter::stage_files_attributed(&path, &files)
+            });
+            assert_eq!(outcomes.len(), count);
+            assert!(outcomes.iter().all(Result::is_ok), "{count}: {outcomes:?}");
+            assert_eq!(adds(&labels), expected, "{count} files: {labels:?}");
+        }
+        assert_eq!(staged_names(&dir).len(), 1 + 10 + 2 * STAGE_BATCH_PATHS + 1);
+    }
+
+    /// One vanished file fails the whole `git add`; it must be named, and the
+    /// files beside it must still be staged.
+    #[test]
+    fn a_failed_batch_reports_each_files_own_outcome() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..40).map(|i| format!("f{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        for gone in [3usize, 17, 39] {
+            std::fs::remove_file(dir.path().join(&files[gone])).unwrap();
+        }
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(
+                outcome.is_err(),
+                [3, 17, 39].contains(&index),
+                "{index}: {outcome:?}"
+            );
+        }
+        let expected: std::collections::BTreeSet<String> = files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| ![3, 17, 39].contains(i))
+            .map(|(_, f)| f.clone())
+            .collect();
+        assert_eq!(staged_names(&dir), expected);
+        assert!(
+            adds(&labels) < files.len(),
+            "attribution is not per-file spawns: {labels:?}"
+        );
+    }
+
+    /// Many bad files cost a constant number of processes, and the files the
+    /// halving never reached say so rather than being reported staged.
+    #[test]
+    fn halving_a_failed_batch_is_bounded() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..400).map(|i| format!("never-written-{i}.md")).collect();
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        assert!(outcomes.iter().all(Result::is_err));
+        assert!(
+            adds(&labels) <= 1 + 2 * STAGE_SPLIT_BUDGET,
+            "{}",
+            adds(&labels)
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.as_ref().unwrap_err().contains("not attributed")),
+            "an unattributed batch is labelled as one"
+        );
+        assert!(staged_names(&dir).is_empty());
+    }
+
+    /// Names git or the shell would read as something else stage as themselves.
+    #[test]
+    fn staging_attributed_treats_exotic_names_literally() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let names = [
+            "-leading-dash.md",
+            ":(top)magic.md",
+            ":(glob)**.md",
+            "star*.md",
+            "two  spaces and 'quote'.md",
+            "line\nbreak.md",
+            "tab\there.md",
+            "caf\u{e9}-nfc.md",
+            "cafe\u{301}-decomposed.md",
+            "#hash?query%41.md",
+        ];
+        let files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        for name in &names {
+            std::fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        // A file that exists but must not be swept in by `*` or `**`.
+        std::fs::write(dir.path().join("bystander.md"), "x\n").unwrap();
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let staged = staged_names(&dir);
+        assert!(!staged.contains("bystander.md"), "{staged:?}");
+        for name in &names {
+            // git on macOS may record a decomposed name precomposed.
+            let precomposed = name.replace("e\u{301}", "\u{e9}");
+            assert!(
+                staged.iter().any(|s| s == name || *s == precomposed),
+                "{name:?} not in {staged:?}"
+            );
+        }
+    }
+
+    /// `git add --pathspec-from-file` exits 0 and stages nothing for a
+    /// decomposed spelling on macOS. Such names must still be staged, in a
+    /// bounded number of processes, never reported staged while absent.
+    #[test]
+    fn decomposed_names_are_staged_not_silently_skipped() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..300).map(|i| format!("cafe\u{301}-{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        assert_eq!(staged_names(&dir).len(), files.len());
+        assert!(
+            adds(&labels) <= 300usize.div_ceil(MAX_INDEX_CHUNK_PATHS),
+            "{labels:?}"
+        );
+    }
+
+    /// A lock someone else holds is not one file's fault: it is reported for
+    /// the group after the bounded retry, not halved into more waiting.
+    #[test]
+    fn a_held_index_lock_is_reported_for_the_group_without_halving() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..8).map(|i| format!("l{i}.md")).collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let lock = dir.path().join(".git/index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::stage_files_attributed(&path, &files)
+        });
+        std::fs::remove_file(&lock).unwrap();
+        assert!(outcomes.iter().all(Result::is_err), "{outcomes:?}");
+        assert!(staged_names(&dir).is_empty());
+        // The retry loop re-spawns the same one batch; halving would show as
+        // a second, smaller group's worth of spawns.
+        assert!(adds(&labels) <= 4, "{labels:?}");
+    }
+
+    /// The invariant under every attribution: a file reported staged is in the
+    /// index, and a file reported failed is not (git's own list is the judge).
+    fn assert_outcomes_match_index(
+        dir: &tempfile::TempDir,
+        files: &[String],
+        outcomes: &[Result<(), String>],
+    ) {
+        let staged = staged_names(dir);
+        for (file, outcome) in files.iter().zip(outcomes) {
+            let precomposed = file.replace("e\u{301}", "\u{e9}");
+            let in_index = staged.contains(file) || staged.contains(&precomposed);
+            assert_eq!(
+                outcome.is_ok(),
+                in_index,
+                "{file:?}: reported {outcome:?}, index has it: {in_index}"
+            );
+        }
+    }
+
+    /// `git add` exits 1 for an ignored path yet stages the rest of its
+    /// pathspec set, so a failed batch is not always an untouched index.
+    #[test]
+    fn an_ignored_file_in_a_batch_is_named_and_the_rest_staged() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join(".gitignore"), "skip-*\n").unwrap();
+        let files: Vec<String> = ["a.md", "skip-me.md", "b.md", "skip-too.md", "c.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes[1].is_err() && outcomes[3].is_err());
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok() && outcomes[4].is_ok());
+    }
+
+    /// Past the halving budget no file may read as failed while git staged it,
+    /// nor staged while it is absent from the index.
+    #[test]
+    fn an_exhausted_halving_budget_never_misreports_a_staged_file() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join(".gitignore"), "skip-*\n").unwrap();
+        let files: Vec<String> = (0..600)
+            .map(|i| {
+                if i % 7 == 3 {
+                    format!("skip-{i}.md")
+                } else {
+                    format!("ok-{i}.md")
+                }
+            })
+            .collect();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+    }
+
+    /// A directory, a symlink and a dangling symlink are paths git can stage;
+    /// each is reported as the index shows it.
+    #[test]
+    fn directories_and_symlinks_are_reported_as_the_index_shows_them() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::create_dir_all(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d/in.md"), "x\n").unwrap();
+        std::fs::write(dir.path().join("t.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink("t.md", dir.path().join("link.md")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.path().join("dangling.md")).unwrap();
+        let files: Vec<String> = ["t.md", "link.md", "dangling.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let dirs = vec!["d".to_string()];
+        let outcomes = GitWriter::stage_files_attributed(&path, &dirs);
+        assert!(outcomes[0].is_ok());
+        assert!(staged_names(&dir).contains("d/in.md"));
+    }
+
+    /// A set mixing ASCII and non-ASCII names with vanished files of each kind:
+    /// the two transports run in sequence, so a failure in the second leaves
+    /// the first applied, and the per-file outcomes must still be exact.
+    #[test]
+    fn a_mixed_batch_with_vanished_files_of_both_kinds_is_attributed_exactly() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = [
+            "a1.md",
+            "cafe\u{301}-1.md",
+            "gone-ascii.md",
+            "a2.md",
+            "cafe\u{301}-gone.md",
+            "cafe\u{301}-2.md",
+            "a3.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for file in &files {
+            if !file.contains("gone") {
+                std::fs::write(dir.path().join(file), "x\n").unwrap();
+            }
+        }
+        let outcomes = GitWriter::stage_files_attributed(&path, &files);
+        assert_outcomes_match_index(&dir, &files, &outcomes);
+        assert!(outcomes[2].is_err() && outcomes[4].is_err(), "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 5);
+    }
+
+    /// An error from a mixed selection says what was applied: the plain paths
+    /// went in before the accented ones failed.
+    #[test]
+    fn a_failed_mixed_selection_does_not_claim_nothing_was_applied() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        std::fs::write(dir.path().join("plain.md"), "x\n").unwrap();
+        let files = vec!["plain.md".to_string(), "cafe\u{301}-gone.md".to_string()];
+        let result = GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()));
+        let error = result.expect_err("one path is missing");
+        let staged = staged_names(&dir);
+        assert!(
+            !staged.contains("plain.md") || error.contains("partly"),
+            "plain.md is staged but the error reads as all-or-nothing: {error}"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_decomposed_name_unstages_it() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let name = "cafe\u{301}-unstage.md".to_string();
+        std::fs::write(dir.path().join(&name), "x\n").unwrap();
+        GitWriter::stage_file(&path, &name).unwrap();
+        assert_eq!(staged_names(&dir).len(), 1);
+        GitWriter::unstage_file(&path, &name).unwrap();
+        assert!(staged_names(&dir).is_empty(), "{:?}", staged_names(&dir));
+    }
+
+    /// Every argv a chunk becomes stays far from the OS command-length limit,
+    /// whatever the path lengths, and keeps to the path-count bound.
+    #[test]
+    fn index_chunks_bound_both_the_argv_bytes_and_the_path_count() {
+        let prefix: Vec<String> = ["git", "add", "--"].iter().map(|s| s.to_string()).collect();
+        for len in [1usize, 40, 1000, 4000] {
+            let paths: Vec<String> = (0..500)
+                .map(|i| format!(":(literal){}{i}", "\u{e9}".repeat(len / 2)))
+                .collect();
+            let chunks = index_chunks(&prefix, &paths);
+            assert_eq!(
+                chunks.iter().map(|c| c.len() - prefix.len()).sum::<usize>(),
+                paths.len()
+            );
+            for chunk in &chunks {
+                let bytes: usize = chunk.iter().map(|a| a.len() + 1).sum();
+                assert!(chunk.len() - prefix.len() <= MAX_INDEX_CHUNK_PATHS);
+                // One path can exceed the byte budget alone (it is at most
+                // 4096 bytes); several never do.
+                assert!(
+                    bytes <= MAX_INDEX_ARGV_BYTES || chunk.len() - prefix.len() == 1,
+                    "{len}: {bytes}"
+                );
+            }
+        }
+    }
 }
+
+/// Destructive actions are bound to a read that happened: a git read that
+/// produced no answer is never taken as "not the default branch" or "HEAD is
+/// detached".
+#[cfg(all(test, unix))]
+mod bound_to_checked_state {
+    use super::*;
+    use crate::procguard::LockedSpawn;
+    use crate::test_support::git_in;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn rev(dir: &Path, rev: &str) -> String {
+        git_text(dir, &["rev-parse", rev])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn commit_file(dir: &Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).unwrap();
+        git_in(dir, &["add", "--", name]);
+        git_in(dir, &["commit", "-q", "-m", name]);
+        rev(dir, "HEAD")
+    }
+
+    fn repo_on(branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", branch]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    fn branch_exists(dir: &Path, name: &str) -> bool {
+        git_text(
+            dir,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ],
+        )
+        .is_ok()
+    }
+
+    /// The default branch is `trunk2`, named only by origin/HEAD. When that
+    /// read fails, a force delete must refuse rather than assume "not default".
+    #[test]
+    fn a_force_delete_refuses_when_the_default_branch_read_fails() {
+        let dir = repo_on("trunk2");
+        let p = dir.path();
+        git_in(p, &["remote", "add", "origin", "/nonexistent/origin.git"]);
+        git_in(p, &["update-ref", "refs/remotes/origin/trunk2", "HEAD"]);
+        git_in(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk2",
+            ],
+        );
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+
+        let head = p.join(".git/refs/remotes/origin/HEAD");
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let read_fails =
+            git_text(p, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).is_err();
+        let result = GitWriter::delete_branch(p.to_str().unwrap(), "trunk2", true);
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(read_fails, "precondition: the remote-HEAD read must fail");
+        assert!(
+            result.is_err() && branch_exists(p, "trunk2"),
+            "force-deleted the default branch after a failed remote-HEAD read: {result:?}"
+        );
+    }
+
+    /// A refused `symbolic-ref HEAD` read is not "HEAD is detached": the
+    /// rebase would skip `branch -f` and report success with HEAD detached.
+    #[test]
+    fn a_rebase_does_not_treat_a_failed_head_read_as_detached() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        let c1 = commit_file(p, "a.txt");
+        commit_file(p, "b.txt");
+        let c3 = commit_file(p, "c.txt");
+
+        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            GitWriter::execute_rebase_sequence(
+                p.to_str().unwrap(),
+                &c1,
+                &[RebaseStep {
+                    commit_id: c3.clone(),
+                    action: RebaseActionKind::Pick,
+                }],
+            )
+        });
+
+        let on_branch = git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok();
+        assert!(
+            result.is_err(),
+            "a failed HEAD read let the rebase report {result:?}"
+        );
+        assert!(on_branch, "HEAD was left detached");
+        assert_eq!(rev(p, "refs/heads/main"), c3, "main must not have moved");
+    }
+
+    /// Same class for restack: a refused HEAD read must stop it before the
+    /// rebase starts, not be read as "no branch to restore".
+    #[test]
+    fn a_restack_does_not_treat_a_failed_head_read_as_detached() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+        let tip = commit_file(p, "f.txt");
+        git_in(p, &["checkout", "-q", "main"]);
+        commit_file(p, "m.txt");
+        let main_tip = rev(p, "main");
+
+        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            GitWriter::execute_restack(p, "feature", "main", &main_tip)
+        });
+
+        assert!(
+            result.is_err(),
+            "a failed HEAD read let the restack report {result:?}"
+        );
+        assert_eq!(
+            rev(p, "refs/heads/feature"),
+            tip,
+            "feature must not have moved"
+        );
+        assert!(
+            git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok(),
+            "HEAD was left detached"
+        );
+    }
+
+    /// The identity shown (and checked) is the one a commit records: git
+    /// prefers `GIT_AUTHOR_*` to `user.*`, so the environment wins here too.
+    #[test]
+    fn the_environment_outranks_config_for_the_identity_as_it_does_in_git() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Config Name"]);
+        git_in(p, &["config", "user.email", "config@example.test"]);
+        let env = |name: &str| match name {
+            "GIT_AUTHOR_NAME" | "GIT_COMMITTER_NAME" => Some("Env Name".to_string()),
+            "GIT_AUTHOR_EMAIL" | "GIT_COMMITTER_EMAIL" => Some("env@example.test".to_string()),
+            _ => None,
+        };
+        let ours = GitWriter::identity_with(p, &env).unwrap();
+
+        let git_var = std::process::Command::new("git")
+            .args(["var", "GIT_AUTHOR_IDENT"])
+            .current_dir(p)
+            .env("GIT_AUTHOR_NAME", "Env Name")
+            .env("GIT_AUTHOR_EMAIL", "env@example.test")
+            .env("GIT_COMMITTER_NAME", "Env Name")
+            .env("GIT_COMMITTER_EMAIL", "env@example.test")
+            .output_locked()
+            .unwrap();
+        let ident = String::from_utf8_lossy(&git_var.stdout).to_string();
+        assert!(
+            ident.starts_with(&format!(
+                "{} <{}>",
+                ours.name.as_deref().unwrap(),
+                ours.email.as_deref().unwrap()
+            )),
+            "identity {ours:?} is not what git records: {ident}"
+        );
+        assert_eq!(ours.name.as_deref(), Some("Env Name"));
+        assert_eq!(ours.email.as_deref(), Some("env@example.test"));
+    }
+}
+
+#[cfg(test)]
+#[path = "git_writer_adv_tests.rs"]
+mod adv_tests;

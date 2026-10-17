@@ -13,6 +13,20 @@ use rusqlite::{params, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// The coverage-gap label a budget refusal is stored under: it is a
+/// `ParseOutcome::Failed`, so it lands in `parse_failed` beside grammar faults.
+/// The label has one owner, `ExtractionGap`, which the write side stores and
+/// `CoverageGaps::slot` reads, so a rename cannot split the readers.
+fn parse_failed_gap() -> &'static str {
+    devmap_analyze::ExtractionGap::ParseFailed.label()
+}
+
+/// `?1` generation, `?2` gap label, `?3` prefix length, `?4` prefix. `substr`
+/// rather than `LIKE`: the prefix is compared literally and case-sensitively,
+/// as `starts_with` does.
+const BUDGET_GAP_FILTER: &str = "generation_id = ?1 AND gap = ?2
+               AND substr(reason, 1, ?3) = ?4";
+
 impl Store {
     /// Most recent builds, newest first. `limit` is clamped to the retention cap.
     pub fn build_history(&self, limit: usize) -> Result<Vec<BuildHistoryRow>> {
@@ -389,7 +403,8 @@ impl Store {
 
     /// Whether the latest generation still describes the working tree.
     ///
-    /// Payload identity, per-file content hashes, and discovery refusals.
+    /// Payload identity, per-file content hashes, and the refusal inventory
+    /// (discovery and the project manifests, through `refusal_inventory`).
     /// Git HEAD is not consulted: it is provenance, restamped by the caller
     /// once this returns true. `false` means a full rebuild (or a drain that
     /// re-reads the tree) is required; an error means the question could not
@@ -403,7 +418,7 @@ impl Store {
             return Ok(false);
         };
         let hashes = self.latest_file_hashes()?;
-        let refusals = self.latest_discovery_refusals()?;
+        let stored = self.latest_discovery_inventory()?;
         let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
             Ok(scanned) => scanned,
             Err(error) => {
@@ -412,8 +427,16 @@ impl Store {
                 )))
             }
         };
-        Ok(scanned.matches_file_hashes(&hashes)
-            && crate::discovery_refusals(&scanned.report) == refusals)
+        if !scanned.matches_file_hashes(&hashes) {
+            return Ok(false);
+        }
+        let manifests =
+            devmap_extract::collect_project_manifests(Path::new(&root)).map_err(|error| {
+                refusal(format!(
+                    "project manifests could not be compared to the indexed generation: {error}"
+                ))
+            })?;
+        Ok(crate::DiscoveryInventory::of(&scanned.report, &manifests) == stored)
     }
 
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
@@ -940,7 +963,7 @@ generation {latest}; run `devmap status` to re-verify",
             ));
         };
         let hashes = self.latest_file_hashes()?;
-        let refusals = self.latest_discovery_refusals()?;
+        let stored = self.latest_discovery_inventory()?;
         let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
             Ok(scanned) => scanned,
             Err(error) => {
@@ -964,11 +987,29 @@ generation {latest}; run `devmap status` to re-verify",
                     added: delta.added,
                     changed: delta.changed,
                     removed: delta.removed,
+                    over_limit: delta.over_limit,
                     sample_paths,
                 }),
             ));
         }
-        if crate::discovery_refusals(&scanned.report) != refusals {
+        // The manifests too: the stored inventory holds the ones the resolver
+        // could not read, so a comparison against discovery alone would call
+        // every such generation stale, and miss a manifest that broke or was
+        // repaired while no source moved.
+        let manifests = match devmap_extract::collect_project_manifests(Path::new(&root)) {
+            Ok(manifests) => manifests,
+            Err(error) => {
+                return Ok((
+                    None,
+                    Some(format!(
+                        "source freshness unverified: project manifests could not be read ({error})"
+                    )),
+                    None,
+                ))
+            }
+        };
+        let current = crate::DiscoveryInventory::of(&scanned.report, &manifests);
+        if current.refusals != stored.refusals {
             return Ok((
                 Some(false),
                 Some(
@@ -976,6 +1017,43 @@ generation {latest}; run `devmap status` to re-verify",
                         .to_string(),
                 ),
                 None,
+            ));
+        }
+        // A file over the limit that the generation never held — created
+        // that size, or grown past it and since rebuilt around — leaves the
+        // hashes equal, so only this comparison sees it. Reported as the
+        // over-limit delta it is, with the paths, rather than as a refusal.
+        if current.over_limit != stored.over_limit {
+            let differing: std::collections::BTreeSet<&str> = current
+                .over_limit
+                .iter()
+                .filter(|row| !stored.over_limit.contains(row))
+                .chain(
+                    stored
+                        .over_limit
+                        .iter()
+                        .filter(|row| !current.over_limit.contains(row)),
+                )
+                .map(|row| row.path.as_str())
+                .collect();
+            return Ok((
+                Some(false),
+                Some(
+                    "source files over the size limit differ from the indexed generation; \
+                     rebuild or drain watcher edits"
+                        .to_string(),
+                ),
+                Some(SourceTreeDelta {
+                    added: 0,
+                    changed: 0,
+                    removed: 0,
+                    over_limit: differing.len(),
+                    sample_paths: differing
+                        .into_iter()
+                        .take(SourceTreeDelta::SAMPLE)
+                        .map(str::to_string)
+                        .collect(),
+                }),
             ));
         }
         // HEAD is provenance: an identical tree remains current after an empty
@@ -1147,26 +1225,41 @@ generation {latest}; run `devmap status` to re-verify",
     /// minus the paths this batch re-decided, and a capped read would silently
     /// drop verdicts on every drain until the corpus looked clean.
     pub fn latest_discovery_refusals(&self) -> Result<Vec<DiscoveryRefusal>> {
+        Ok(self.latest_discovery_inventory()?.refusals)
+    }
+
+    /// The latest generation's whole [`crate::DiscoveryInventory`] — refusals
+    /// and over-limit files — read from one snapshot.
+    ///
+    /// Uncapped, for the reason [`Self::latest_discovery_refusals`] gives, and
+    /// one read for both halves so a writer landing between two reads cannot
+    /// pair one generation's refusals with another's over-limit rows.
+    pub fn latest_discovery_inventory(&self) -> Result<crate::DiscoveryInventory> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
-            return Ok(Vec::new());
+            return Ok(crate::DiscoveryInventory::default());
         };
         let mut stmt = snapshot.prepare(
             "SELECT path, reason FROM generation_coverage_gaps
              WHERE generation_id = ?1 AND gap = ?2
              ORDER BY path ASC",
         )?;
-        let refusals = stmt
-            .query_map(params![generation, crate::GAP_DISCOVERY_REFUSED], |row| {
+        let mut read = |gap: &str| {
+            stmt.query_map(params![generation, gap], |row| {
                 Ok(DiscoveryRefusal {
                     path: row.get(0)?,
                     reason: row.get(1)?,
                 })
             })?
-            .collect::<Result<Vec<_>>>();
+            .collect::<Result<Vec<_>>>()
+        };
+        let inventory = crate::DiscoveryInventory {
+            refusals: read(crate::GAP_DISCOVERY_REFUSED)?,
+            over_limit: read(crate::GAP_OVER_LIMIT)?,
+        };
         drop(stmt);
         drop(snapshot);
-        refusals
+        Ok(inventory)
     }
 
     /// Whether the latest generation's edges carry the resolution the resolver
@@ -1235,6 +1328,96 @@ generation {latest}; run `devmap status` to re-verify",
                     "stored generation resolution_rate is invalid: {error}"
                 ))
             })
+    }
+
+    /// Files of the latest generation that were refused for the wall-clock
+    /// parse budget, after the build's serial retry.
+    ///
+    /// The parse budget is a fact about the machine's load as much as about the
+    /// file, and `ParseOutcome::Failed` is the only place it is recorded (a new
+    /// variant would be a schema change), so `coverage_gaps.parse_failed` lists
+    /// these beside grammar faults even though only these are cured by building
+    /// again. Read from the generation's `parse_failed` coverage-gap rows by the
+    /// reason's [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`] — the same test
+    /// `Extraction::is_budget_refusal` applies. Those rows are a per-generation
+    /// snapshot of the live extraction, **not** `generation_files`, which is a
+    /// view over `file_payloads` rows shared by every generation naming the same
+    /// file, content and extractor: reading the payload would report whatever the
+    /// last writer left there rather than what this generation was built from.
+    /// One snapshot with the generation id, so a file deleted or re-parsed since
+    /// is simply absent.
+    /// The listing is capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its
+    /// total. `None` when the store holds no generation: nothing was measured.
+    pub fn latest_budget_refusals(&self) -> Result<Option<CoverageGapSample>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let prefix = devmap_extract::model::BUDGET_REFUSAL_PREFIX;
+        let total: i64 = snapshot.query_row(
+            &format!("SELECT COUNT(*) FROM generation_coverage_gaps WHERE {BUDGET_GAP_FILTER}"),
+            params![
+                generation,
+                parse_failed_gap(),
+                prefix.chars().count() as i64,
+                prefix
+            ],
+            |row| row.get(0),
+        )?;
+        let mut page = snapshot.prepare(&format!(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE {BUDGET_GAP_FILTER}
+             ORDER BY path ASC
+             LIMIT ?5"
+        ))?;
+        let shown = page
+            .query_map(
+                params![
+                    generation,
+                    parse_failed_gap(),
+                    prefix.chars().count() as i64,
+                    prefix,
+                    crate::COVERAGE_GAP_SAMPLE as i64
+                ],
+                |row| {
+                    Ok(CoverageGapRow {
+                        path: row.get(0)?,
+                        reason: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(CoverageGapSample {
+            total: total.max(0) as usize,
+            shown,
+        }))
+    }
+
+    /// Every path [`Self::latest_budget_refusals`] counts, uncapped.
+    ///
+    /// For the build, which must re-extract all of them: a capped read would
+    /// leave the files past fifty refused for good. Bounded by the corpus.
+    pub fn latest_budget_refused_paths(&self) -> Result<Vec<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let prefix = devmap_extract::model::BUDGET_REFUSAL_PREFIX;
+        let mut stmt = snapshot.prepare(&format!(
+            "SELECT path FROM generation_coverage_gaps
+             WHERE {BUDGET_GAP_FILTER}
+             ORDER BY path ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                generation,
+                parse_failed_gap(),
+                prefix.chars().count() as i64,
+                prefix
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect()
     }
 
     /// Stored edges of the latest generation whose confidence contradicts the

@@ -142,7 +142,7 @@ pub(crate) fn test_endpoint_resolves() -> usize {
 pub(crate) struct TestEndpointBinding(
     /// Held, never read: the serial's whole job is to be released on drop.
     #[allow(dead_code)]
-    std::sync::MutexGuard<'static, ()>,
+    crate::test_support::env::EnvGuard,
 );
 
 #[cfg(all(test, unix))]
@@ -159,7 +159,7 @@ impl Drop for TestEndpointBinding {
 /// until the returned binding is dropped.
 #[cfg(all(test, unix))]
 pub(crate) fn bind_test_endpoint(endpoint: impl Into<String>) -> TestEndpointBinding {
-    let serial = super::cli::test_serial();
+    let serial = crate::test_support::env::env_serial();
     TEST_ENDPOINT_RESOLVES.store(0, std::sync::atomic::Ordering::Relaxed);
     *TEST_ENDPOINT
         .lock()
@@ -240,6 +240,7 @@ fn resolve_socket_path_uncached(repo: &Path) -> Result<String, String> {
 /// never has a daemon, which is a different claim.
 #[cfg(unix)]
 fn probe_socket(socket: &str) -> DaemonState {
+    use crate::deadline::DeadlineStream;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -250,18 +251,16 @@ fn probe_socket(socket: &str) -> DaemonState {
             "no daemon is listening on this repository's endpoint",
         );
     }
-    let mut stream = match UnixStream::connect(socket) {
+    let stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         // A socket file with nothing behind it is the normal residue of a
         // daemon that exited; it is an absence, not a fault.
         Err(e) => return DaemonState::absent(owned, format!("cannot connect: {e}")),
     };
-    if let Err(e) = stream
-        .set_read_timeout(Some(PROBE_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(PROBE_TIMEOUT)))
-    {
-        return DaemonState::absent(owned, format!("cannot bound the probe: {e}"));
-    }
+    // One deadline for the whole probe: the read loop below stops only on a
+    // newline, EOF or the reply cap, so a per-read timeout lets a daemon that
+    // answers a byte at a time keep this thread for as long as it likes.
+    let mut stream = DeadlineStream::new(stream, std::time::Instant::now() + PROBE_TIMEOUT);
     if let Err(e) = stream.write_all(STATUS_FRAME.as_bytes()) {
         return DaemonState::absent(owned, format!("cannot send a status request: {e}"));
     }
@@ -487,6 +486,41 @@ mod tests {
         assert_eq!(
             parsed.get("cmd").and_then(serde_json::Value::as_str),
             Some("status")
+        );
+    }
+
+    /// The probe reads until a newline, EOF or the reply cap. With a timeout
+    /// per read, a daemon that answers one byte inside each timeout is never
+    /// cut off, so the probe — and the thread running it — outlived
+    /// `PROBE_TIMEOUT` by as long as the peer cared to keep going.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_dripping_its_reply_cannot_hold_the_probe_past_its_deadline() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("ipc.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let daemon = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 256];
+            let _ = peer.read(&mut request);
+            // One byte, no newline, well inside the timeout, for twice the
+            // deadline. A write error means the probe hung up.
+            for _ in 0..(2 * PROBE_TIMEOUT.as_millis() / 400) {
+                if peer.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+        let started = std::time::Instant::now();
+        let state = probe_socket(&socket.to_string_lossy());
+        let held = started.elapsed();
+        daemon.join().expect("daemon thread");
+        assert!(!state.serving);
+        assert!(
+            held < PROBE_TIMEOUT + Duration::from_secs(2),
+            "the probe ran {held:?} against a {PROBE_TIMEOUT:?} deadline"
         );
     }
 }

@@ -100,6 +100,30 @@ export function labelFor(event: LedgerEvent): string {
 }
 
 /**
+ * When the event happened, in epoch milliseconds.
+ *
+ * `ts_utc` is the append clock: a transcript or reflog row is written when a
+ * catch-up pass reads it, which can be days after the call. The source's own
+ * time rides in `detail_json.occurred_at` (the event contract has no field for
+ * it). A row without one, from an older writer or a source with no clock of
+ * its own, or with one that does not parse, is shown at `ts_utc`.
+ */
+export function eventTimeMs(event: LedgerEvent): number {
+  if (event.detail_json) {
+    try {
+      const detail = JSON.parse(event.detail_json) as { occurred_at?: unknown };
+      if (typeof detail.occurred_at === "string") {
+        const occurred = Date.parse(detail.occurred_at);
+        if (Number.isFinite(occurred)) return occurred;
+      }
+    } catch {
+      // An unreadable detail says nothing about time; fall through.
+    }
+  }
+  return Date.parse(event.ts_utc);
+}
+
+/**
  * Projects one durable event into a journal entry.
  *
  * `ok` is false for anything the gate blocked or that ran and failed — the two
@@ -113,7 +137,7 @@ export function eventToAction(event: LedgerEvent): AgentActionEntry {
     // the identity; the numeric id remains the paging/sort cursor.
     identity: JSON.stringify(["ledger", event.repo_path, event.ulid, event.id]),
     id: event.id,
-    ts: Date.parse(event.ts_utc),
+    ts: eventTimeMs(event),
     kind: kindForAction(event.action),
     label: labelFor(event),
     ok: event.outcome === "ok",

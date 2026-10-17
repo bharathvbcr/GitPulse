@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   findFragmentTarget,
   handleMarkdownClick,
+  handleMarkdownKeydown,
   MARKDOWN_ID_PREFIX,
   resolveMarkdownLink,
   type MarkdownClickContext,
@@ -106,6 +110,8 @@ function element(attrs: Record<string, string>, matches: string[] = []) {
   return {
     id: attrs.id ?? "",
     getAttribute: (name: string) => attrs[name] ?? null,
+    setAttribute: (name: string, value: string) => void (attrs[name] = value),
+    removeAttribute: (name: string) => void delete attrs[name],
     closest(selector: string) {
       return matches.includes(selector) ? this : null;
     },
@@ -134,6 +140,44 @@ function context(overrides: Partial<MarkdownClickContext> = {}): MarkdownClickCo
 }
 
 describe("handleMarkdownClick", () => {
+  it("loads a withheld remote picture only when it is clicked, and only for network addresses", () => {
+    const attrs = { src: "#", "data-withheld-src": "https://tracker.example/p.png?u=1" };
+    const picture = element(attrs, ["img[data-withheld-src]"]);
+    const click = event(picture);
+    handleMarkdownClick(click, context());
+    expect(click.preventDefault).toHaveBeenCalled();
+    expect(attrs.src).toBe("https://tracker.example/p.png?u=1");
+    expect("data-withheld-src" in attrs).toBe(false);
+    expect((attrs as Record<string, string>).referrerpolicy).toBe("no-referrer");
+
+    // Scheme-relative would resolve against the app's own scheme: read as https.
+    const relative = { src: "#", "data-withheld-src": "//cdn.example/p.png" };
+    handleMarkdownClick(event(element(relative, ["img[data-withheld-src]"])), context());
+    expect(relative.src).toBe("https://cdn.example/p.png");
+
+    for (const bad of ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "", "http://plain.example/p.png", "https://", "///x"]) {
+      const held = { src: "#", "data-withheld-src": bad };
+      handleMarkdownClick(event(element(held, ["img[data-withheld-src]"])), context());
+      expect(held.src, bad).toBe("#");
+    }
+  });
+
+  it("loads a withheld picture from the keyboard with Enter or Space, and ignores other keys", () => {
+    for (const key of ["Enter", " "]) {
+      const attrs = { src: "#", "data-withheld-src": "https://cdn.example/p.png", role: "button", tabindex: "0" };
+      const press = { key, target: element(attrs, ["img[data-withheld-src]"]), preventDefault: vi.fn() };
+      handleMarkdownKeydown(press as unknown as KeyboardEvent);
+      expect(press.preventDefault, key).toHaveBeenCalled();
+      expect(attrs.src, key).toBe("https://cdn.example/p.png");
+      expect("tabindex" in attrs, key).toBe(false);
+    }
+    const attrs = { src: "#", "data-withheld-src": "https://cdn.example/p.png" };
+    const press = { key: "a", target: element(attrs, ["img[data-withheld-src]"]), preventDefault: vi.fn() };
+    handleMarkdownKeydown(press as unknown as KeyboardEvent);
+    expect(press.preventDefault).not.toHaveBeenCalled();
+    expect(attrs.src).toBe("#");
+  });
+
   it("never lets the webview follow a link, whatever the link is", () => {
     for (const href of ["https://example.com", "#x", "a.md", "javascript:x", "#", "../../../x"]) {
       const click = event(element({ href }, ["a[href]"]));
@@ -190,5 +234,19 @@ describe("findFragmentTarget", () => {
     expect(findFragmentTarget(root, "1")).toBe(footnote);
     expect(findFragmentTarget(root, 'a"b]c')).toBe(odd);
     expect(findFragmentTarget(root, "a")).toBeNull();
+  });
+});
+
+describe("footnote ids", () => {
+  // The DOM pass runs in a browser, not under this node runner: harness/markdown.html
+  // checks the real page (a heading "Note" beside `[^note]` shares no id and the
+  // footnote link lands on its definition). Here: the pass exists and runs
+  // before the document-wide id prefix, which would otherwise hide the clash.
+  it("namespaces footnote definitions ahead of the id prefix", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "markdownLinks.ts"), "utf8");
+    expect(source.indexOf("namespaceFootnotes(root);")).toBeGreaterThan(-1);
+    expect(source.indexOf("namespaceFootnotes(root);")).toBeLessThan(
+      source.indexOf("element.id = `${MARKDOWN_ID_PREFIX}${element.id}`"),
+    );
   });
 });

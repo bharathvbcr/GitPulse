@@ -8,7 +8,7 @@ GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 own
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
         direction TB
-        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 18 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU Canvas Graph"]
         Dock["Terminal Dock (portable-pty)"]
         Stores["Domain Stores & SWR Cache"]
@@ -84,7 +84,7 @@ There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/rep
 
 ## Why Fleet is not a view
 
-A `ViewTab` is stored on the **active repository's** session and its pane lives inside `{#key currentPath}`. Fleet answers a question about the **workspace**. If it were a view it would be scoped wrong and destroyed on every repo switch — taking the live terminal PTY with it.
+A `ViewTab` is stored on the **active repository's** session and its panel content is keyed on `currentPath` (in `ViewSectionPanel`). Fleet answers a question about the **workspace**. If it were a view it would be scoped wrong and destroyed on every repo switch — taking the live terminal PTY with it.
 
 Fleet is swapped by **hiding, never unmounting**. Open state is a UI preference, not part of the persisted workspace blob.
 

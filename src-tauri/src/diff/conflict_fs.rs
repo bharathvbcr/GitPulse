@@ -5,6 +5,27 @@ use std::path::Path;
 #[cfg(not(windows))]
 use std::path::PathBuf;
 
+/// The three ways an entry transaction reports that another writer got there
+/// first. [`concurrent_change`] recognises them so a save can answer with a
+/// typed conflict rather than a string a caller would have to parse.
+const CHANGED_BEFORE_PUBLISH: &str =
+    "The working file or its directory changed; reload before saving";
+const NEW_ENTRY_APPEARED: &str = "Cannot create the resolution without replacing a new entry";
+const RACED_AFTER_PUBLISH: &str = "An external edit raced the save";
+/// The Windows transaction's own wording for the same condition.
+const WINDOWS_SOURCE_CHANGED: &str = "Conflict source changed";
+
+fn concurrent_change(message: &str) -> bool {
+    [
+        CHANGED_BEFORE_PUBLISH,
+        NEW_ENTRY_APPEARED,
+        RACED_AFTER_PUBLISH,
+        WINDOWS_SOURCE_CHANGED,
+    ]
+    .iter()
+    .any(|known| message.starts_with(known))
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -177,6 +198,22 @@ mod unix {
             return Err("Only regular files can be saved".into());
         }
         read_at_with_limit(&directory, &target, cap)
+    }
+
+    /// What stands at `path` for a create: the entry itself in whatever form
+    /// (file, directory, link), never its target. Unlike [`read_for_save`] a
+    /// directory is an answer here, not an error. The parent is created, which
+    /// is what New Folder needs for its `.gitkeep`.
+    ///
+    /// `created` receives the directories this call made, so a create that
+    /// then fails can take them away again.
+    pub(super) fn read_for_create(
+        path: &Path,
+        created: &mut Vec<PathBuf>,
+    ) -> Result<Worktree, String> {
+        let directory =
+            crate::fs_entry::pin_parent_recording(path, created).map_err(|e| e.to_string())?;
+        read_at(&directory, &name(path)?)
     }
 
     pub struct Recovery {
@@ -398,7 +435,7 @@ mod unix {
         if (still_here.dev(), still_here.ino()) != (anchored.dev(), anchored.ino())
             || read_at_with_limit(&directory, &target, cap)? != *source
         {
-            return Err("The working file or its directory changed; reload before saving".into());
+            return Err(CHANGED_BEFORE_PUBLISH.into());
         }
         if source.mode == "missing" {
             // SAFETY: linkat without AT_SYMLINK_FOLLOW links the entry itself;
@@ -413,10 +450,7 @@ mod unix {
                 )
             } != 0
             {
-                return Err(format!(
-                    "Cannot create the resolution without replacing a new entry: {}",
-                    error()
-                ));
+                return Err(format!("{NEW_ENTRY_APPEARED}: {}", error()));
             }
             directory.sync_all().map_err(|e| e.to_string())?;
             return Ok(None);
@@ -433,7 +467,7 @@ mod unix {
         }
         recovery.keep = true;
         if read_at_with_limit(&directory, &recovery.name, cap)? != *source {
-            return Err(format!("An external edit raced the save. Review the working file and the displaced content retained at {} before staging", recovery.path.display()));
+            return Err(format!("{RACED_AFTER_PUBLISH}. Review the working file and the displaced content retained at {} before staging", recovery.path.display()));
         }
         directory.sync_all().map_err(|e| {
             format!(
@@ -508,28 +542,269 @@ pub(super) fn replace(
     }
 }
 
+/// A version of a file's content, small enough to carry in an editor draft and
+/// compare on save: `"<len>:<digest hex>"` of the raw bytes, or `"absent"`
+/// for a path with no file.
+///
+/// Content rather than mtime and size on purpose. The editor's textarea hands
+/// back LF text while the save re-adds CRLF, so only the backend can say what
+/// the bytes on disk are; and a timestamp misses a same-size rewrite inside
+/// one tick while reporting a conflict for a bare `touch`. The digest is not a
+/// security boundary: this guards against a lost update, and a 2^-64 collision
+/// is the same risk as the write racing in just after the check.
+pub(crate) fn content_token(bytes: Option<&[u8]>) -> String {
+    match bytes {
+        None => "absent".into(),
+        Some(bytes) => format!("{}:{:016x}", bytes.len(), digest(bytes)),
+    }
+}
+
+/// A 64-bit digest of `bytes`, fast enough to run over every file the editor
+/// opens or saves (8 MiB at most).
+///
+/// This is an accidental-change detector, not a hash that holds against a
+/// crafted input. Each block is absorbed by an invertible step, so someone who
+/// knows the function can build two different files with one token. That is
+/// acceptable here because the other writer is the user's own external editor,
+/// an agent or `git`, none of which is trying to forge a token; the digest only
+/// has to tell the edits they actually make from no edit at all. A
+/// collision-resistant hash would need a dependency or a much slower pass. A
+/// crafted multi-lane collision (two lanes edited in one block and repaired in
+/// the next) remains possible; the tests cover the accidental shapes, not that.
+///
+/// FNV-1a was the first choice and cost more than reading the file: its one
+/// multiply per byte is a serial dependency chain, so an 8 MiB open took
+/// about 2.3x as long. This takes a word at a time on four lanes so the
+/// multiplies overlap. The lanes are not independent: after every block each
+/// absorbs a mix of all four, so a change confined to one lane at one offset
+/// cannot be undone by a change to the same lane later. The tail bytes and the
+/// length are folded in at the end. Tokens are compared within one running app
+/// against bytes it just read, never stored, so the function may change.
+fn digest(bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
+    const FOLD: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    let mut lanes: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x8422_2325_cbf2_9ce4,
+        0x1000_0000_01b3_0001,
+        0x0001_0000_0000_01b3,
+    ];
+    let (blocks, tail) = bytes.as_chunks::<32>();
+    for block in blocks {
+        for (lane, word) in lanes.iter_mut().zip(block.as_chunks::<8>().0) {
+            let word = u64::from_le_bytes(*word);
+            *lane = (*lane ^ word).wrapping_mul(PRIME).rotate_left(29);
+        }
+        let mix = (lanes[0]
+            ^ lanes[1].rotate_left(16)
+            ^ lanes[2].rotate_left(32)
+            ^ lanes[3].rotate_left(48))
+        .wrapping_mul(FOLD);
+        for lane in &mut lanes {
+            *lane = lane.wrapping_add(mix ^ (mix >> 29));
+        }
+    }
+    let mut hash = bytes.len() as u64;
+    for lane in lanes {
+        hash = (hash ^ lane).wrapping_mul(PRIME).rotate_left(31);
+    }
+    for byte in tail {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
+    }
+    hash ^ (hash >> 32)
+}
+
+/// What a write requires of the entry it replaces.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Expect<'a> {
+    /// Replace whatever regular file is there, or create it.
+    Any,
+    /// Replace only a regular file holding exactly these bytes.
+    Bytes(&'a [u8]),
+    /// Replace only the entry whose [`content_token`] is this.
+    Token(&'a str),
+    /// Create only: nothing may stand at the path, in any form.
+    Absent,
+}
+
+/// Why a write did not happen, or failed part-way.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// An [`Expect::Absent`] write found an entry, including one that
+    /// appeared between the check and the publish.
+    AlreadyExists,
+    /// The entry is not what the caller expected; `actual` is its token now.
+    Changed {
+        actual: String,
+    },
+    Other(String),
+}
+
+impl From<String> for WriteFailure {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists => f.write_str("File already exists"),
+            Self::Changed { .. } => f.write_str("The file changed on disk"),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+/// The token of what is at `path` now, for a conflict report.
+fn current_token(path: &Path) -> String {
+    #[cfg(unix)]
+    let now = unix::read(path);
+    #[cfg(windows)]
+    let now = windows::read(path);
+    #[cfg(not(any(unix, windows)))]
+    let now: Result<Worktree, String> = Err(String::new());
+    match now {
+        Ok(entry) if matches!(entry.mode.as_str(), "missing" | "100644" | "100755") => {
+            content_token(entry.bytes.as_deref())
+        }
+        Ok(_) => "other".into(),
+        Err(_) => "unreadable".into(),
+    }
+}
+
+/// Reads `path` for a write: a create needs the entry in whatever form it has
+/// (and its parent made), a save needs a regular file it may write.
+#[cfg(unix)]
+fn read_source(
+    path: &Path,
+    expected: Expect<'_>,
+    cap: usize,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<Worktree, String> {
+    if matches!(expected, Expect::Absent) {
+        unix::read_for_create(path, created)
+    } else {
+        unix::read_for_save(path, cap)
+    }
+}
+
+/// Windows does not report the directories its pin made, so a failed create
+/// there leaves them (unlike unix, where they are removed again).
+#[cfg(windows)]
+fn read_source(
+    path: &Path,
+    expected: Expect<'_>,
+    cap: usize,
+    _created: &mut Vec<std::path::PathBuf>,
+) -> Result<Worktree, String> {
+    if matches!(expected, Expect::Absent) && std::fs::symlink_metadata(path).is_ok() {
+        // Any entry at all refuses a create; its form does not matter.
+        return Ok(Worktree {
+            bytes: None,
+            mode: "160000".into(),
+        });
+    }
+    windows::read_for_save(path, cap)
+}
+
+/// Maps a failed publish to the typed failure when another writer caused it.
+fn settled(path: &Path, expected: Expect<'_>, message: String) -> WriteFailure {
+    if !concurrent_change(&message) {
+        WriteFailure::Other(message)
+    } else if matches!(expected, Expect::Absent) {
+        WriteFailure::AlreadyExists
+    } else {
+        WriteFailure::Changed {
+            actual: current_token(path),
+        }
+    }
+}
+
+/// The one write owner: replaces or creates the regular file at `path` with
+/// what `encode` returns, provided the entry is what `expected` says.
+///
 /// Ordinary saves share the anchored entry transaction used by conflict saves.
 /// They retain the editor's file-size budget and retain displaced content when
 /// an external edit races publication.
-pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
-    let cap = crate::engine::budget::MAX_FILE_BYTES as usize;
-    if content.len() > cap {
-        return Err(format!(
-            "File exceeds the {} MiB save limit",
-            cap / (1024 * 1024)
-        ));
+///
+/// `encode` is handed the bytes read under the same anchored directory the
+/// replacement then re-checks, so the bytes a caller plans from, the bytes the
+/// expectation is judged against and the bytes the swap displaces are one
+/// read, with no window between them. Returns the [`content_token`] of the
+/// bytes now on disk. Nothing is written when the expectation fails.
+pub(crate) fn write_regular_expecting(
+    path: &Path,
+    expected: Expect<'_>,
+    encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
+) -> Result<String, WriteFailure> {
+    write_regular_after_check(path, expected, encode, || {})
+}
+
+/// [`write_regular_expecting`] with a seam that runs once the expectation has
+/// held and before the publish, so a test can be the other writer.
+fn write_regular_after_check(
+    path: &Path,
+    expected: Expect<'_>,
+    encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
+    after_check: impl FnOnce(),
+) -> Result<String, WriteFailure> {
+    let mut created = Vec::new();
+    let result = write_regular_recording(path, expected, encode, after_check, &mut created);
+    if result.is_err() {
+        // A create that did not happen leaves the tree as it found it:
+        // innermost first, `remove_dir` only (it refuses a directory that has
+        // anything in it, so another creator's file is never lost), and only
+        // the directories this call made, so one a concurrent creator got to
+        // first is not touched.
+        for directory in created.iter().rev() {
+            let _ = std::fs::remove_dir(directory);
+        }
     }
-    #[cfg(unix)]
-    let source = unix::read_for_save(path, cap)?;
-    #[cfg(windows)]
-    let source = windows::read_for_save(path, cap)?;
+    result
+}
+
+fn write_regular_recording(
+    path: &Path,
+    expected: Expect<'_>,
+    encode: impl FnOnce(Option<&[u8]>) -> Result<Vec<u8>, String>,
+    after_check: impl FnOnce(),
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<String, WriteFailure> {
+    let cap = crate::engine::budget::MAX_FILE_BYTES as usize;
     #[cfg(any(unix, windows))]
     {
-        if !matches!(source.mode.as_str(), "missing" | "100644" | "100755") {
-            return Err("Only regular files can be saved".into());
+        let source = read_source(path, expected, cap, created)?;
+        if matches!(expected, Expect::Absent) {
+            if source.mode != "missing" {
+                return Err(WriteFailure::AlreadyExists);
+            }
+        } else if !matches!(source.mode.as_str(), "missing" | "100644" | "100755") {
+            return Err(WriteFailure::Other(
+                "Only regular files can be saved".into(),
+            ));
         }
+        let existing = source.bytes.as_deref();
+        let changed = match expected {
+            Expect::Bytes(want) => existing != Some(want),
+            Expect::Token(want) => content_token(existing) != want,
+            Expect::Any | Expect::Absent => false,
+        };
+        if changed {
+            return Err(WriteFailure::Changed {
+                actual: content_token(existing),
+            });
+        }
+        let content = encode(existing)?;
+        if content.len() > cap {
+            return Err(WriteFailure::Other(format!(
+                "File exceeds the {} MiB save limit",
+                cap / (1024 * 1024)
+            )));
+        }
+        let token = content_token(Some(&content));
         let next = Worktree {
-            bytes: Some(content.to_vec()),
+            bytes: Some(content),
             mode: if source.mode == "100755" {
                 "100755"
             } else {
@@ -537,18 +812,264 @@ pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
             }
             .into(),
         };
+        after_check();
         #[cfg(unix)]
-        let saved = unix::replace_with_limit(path, &source, &next, cap)?;
+        let saved = unix::replace_with_limit(path, &source, &next, cap);
         #[cfg(windows)]
-        let saved = windows::replace_with_limit(path, &source, &next, cap as u64)?;
+        let saved = windows::replace_with_limit(path, &source, &next, cap as u64);
+        let saved = saved.map_err(|message| settled(path, expected, message))?;
         if let Some(mut original) = saved {
             original.keep = false;
         }
-        Ok(())
+        Ok(token)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = path;
-        Err("Atomic file saves are unavailable on this platform".into())
+        let _ = (path, expected, encode, after_check, cap, created);
+        Err(WriteFailure::Other(
+            "Atomic file saves are unavailable on this platform".into(),
+        ))
     }
 }
+
+#[cfg(all(test, unix))]
+mod write_tests {
+    use super::*;
+
+    fn dir() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        (root, canonical)
+    }
+
+    #[test]
+    fn create_does_not_replace_file_created_after_check() {
+        let (_root, root) = dir();
+        let target = root.join("new.txt");
+        let planted = target.clone();
+        let result = write_regular_after_check(
+            &target,
+            Expect::Absent,
+            |_| Ok(Vec::new()),
+            || std::fs::write(&planted, b"someone else's work").unwrap(),
+        );
+        assert_eq!(result, Err(WriteFailure::AlreadyExists));
+        assert_eq!(std::fs::read(&target).unwrap(), b"someone else's work");
+    }
+
+    #[test]
+    fn create_makes_a_missing_parent_and_a_zero_byte_file() {
+        let (_root, root) = dir();
+        let target = root.join("a/b/.gitkeep");
+        let token = write_regular_expecting(&target, Expect::Absent, |_| Ok(Vec::new())).unwrap();
+        assert_eq!(token, content_token(Some(b"")));
+        assert_ne!(token, "absent");
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    #[test]
+    fn create_refuses_a_file_a_directory_and_a_link_without_touching_them() {
+        let (_root, root) = dir();
+        std::fs::write(root.join("f"), b"keep").unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(root.join("f"), root.join("l")).unwrap();
+        for name in ["f", "d", "l"] {
+            let result =
+                write_regular_expecting(&root.join(name), Expect::Absent, |_| Ok(Vec::new()));
+            assert_eq!(result, Err(WriteFailure::AlreadyExists), "{name}");
+        }
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"keep");
+        assert!(root.join("d").is_dir());
+        assert!(root.join("l").is_symlink());
+    }
+
+    #[test]
+    fn a_token_save_is_refused_when_the_bytes_moved_and_succeeds_when_they_did_not() {
+        let (_root, root) = dir();
+        let target = root.join("t.txt");
+        std::fs::write(&target, b"one\n").unwrap();
+        let base = content_token(Some(b"one\n"));
+        std::fs::write(&target, b"two\n").unwrap();
+        let refused =
+            write_regular_expecting(&target, Expect::Token(&base), |_| Ok(b"mine\n".to_vec()));
+        assert_eq!(
+            refused,
+            Err(WriteFailure::Changed {
+                actual: content_token(Some(b"two\n"))
+            })
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"two\n");
+        let current = content_token(Some(b"two\n"));
+        let saved =
+            write_regular_expecting(&target, Expect::Token(&current), |_| Ok(b"mine\n".to_vec()))
+                .unwrap();
+        assert_eq!(saved, content_token(Some(b"mine\n")));
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine\n");
+    }
+
+    #[test]
+    fn a_save_that_loses_the_race_is_a_typed_conflict_and_keeps_the_other_writers_bytes() {
+        let (_root, root) = dir();
+        let target = root.join("t.txt");
+        std::fs::write(&target, b"one\n").unwrap();
+        let base = content_token(Some(b"one\n"));
+        let rival = target.clone();
+        let result = write_regular_after_check(
+            &target,
+            Expect::Token(&base),
+            |_| Ok(b"mine\n".to_vec()),
+            || std::fs::write(&rival, b"theirs, longer\n").unwrap(),
+        );
+        assert_eq!(
+            result,
+            Err(WriteFailure::Changed {
+                actual: content_token(Some(b"theirs, longer\n"))
+            })
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs, longer\n");
+    }
+
+    #[test]
+    fn the_token_tells_apart_every_single_byte_edit_swap_and_length() {
+        // Sizes straddle the 32-byte block and the tail, so each path of the
+        // digest is exercised; a base is only worth sending if one changed
+        // byte, a swapped pair or a changed length always changes it.
+        for size in [0usize, 1, 7, 31, 32, 33, 64, 100, 4096] {
+            let base: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+            let token = content_token(Some(&base));
+            assert_eq!(
+                token,
+                content_token(Some(&base.clone())),
+                "stable at {size}"
+            );
+            for at in 0..size {
+                let mut flipped = base.clone();
+                flipped[at] ^= 1;
+                assert_ne!(token, content_token(Some(&flipped)), "flip {at} of {size}");
+            }
+            let mut longer = base.clone();
+            longer.push(0);
+            assert_ne!(token, content_token(Some(&longer)), "length at {size}");
+        }
+        let (a, b) = (b"AAAAAAAABBBBBBBB".to_vec(), b"BBBBBBBBAAAAAAAA".to_vec());
+        assert_ne!(
+            content_token(Some(&a)),
+            content_token(Some(&b)),
+            "swapped words"
+        );
+        let (a, b) = (
+            [&[0u8; 32][..], &[1u8; 32][..]].concat(),
+            [&[1u8; 32][..], &[0u8; 32][..]].concat(),
+        );
+        assert_ne!(
+            content_token(Some(&a)),
+            content_token(Some(&b)),
+            "swapped blocks"
+        );
+    }
+
+    /// The digest's lane step and seeds as they were when the lanes were
+    /// independent: the model a same-lane compensating edit is built on.
+    const SEEDS: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x8422_2325_cbf2_9ce4,
+        0x1000_0000_01b3_0001,
+        0x0001_0000_0000_01b3,
+    ];
+    fn step(lane: u64, word: u64) -> u64 {
+        (lane ^ word)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(29)
+    }
+
+    #[test]
+    fn a_compensating_edit_to_one_lane_at_two_offsets_changes_the_token() {
+        // 4 blocks of 32 bytes. For every lane and every pair of blocks, edit
+        // that lane's word in the earlier block and solve the later block's
+        // word in the same lane so that, were the lanes independent, the lane
+        // would return to its original state. The token must still differ.
+        for (lane, seed) in SEEDS.iter().copied().enumerate() {
+            for first in 0..4 {
+                for second in first + 1..4 {
+                    for edit in [1u64, 0xdead_beef_cafe_f00d, u64::MAX] {
+                        let base = vec![0u8; 128];
+                        let (mut u, mut v) = (step(seed, edit), step(seed, 0));
+                        for _ in first + 1..second {
+                            u = step(u, 0);
+                            v = step(v, 0);
+                        }
+                        let mut changed = base.clone();
+                        let at = |block: usize| block * 32 + lane * 8;
+                        changed[at(first)..at(first) + 8].copy_from_slice(&edit.to_le_bytes());
+                        changed[at(second)..at(second) + 8].copy_from_slice(&(u ^ v).to_le_bytes());
+                        assert_ne!(
+                            content_token(Some(&base)),
+                            content_token(Some(&changed)),
+                            "lane {lane} blocks {first}/{second} edit {edit:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edits_that_cross_lanes_never_cancel() {
+        // Two words, anywhere in 16 positions, each set to a spread of values:
+        // every pair of distinct two-word edits of a zero file gets its own
+        // token, so no pair of positions cancels another.
+        let mut seen = std::collections::HashMap::new();
+        let values = [1u64, 2, 0xff, 0x0100, 0x8000_0000_0000_0000, u64::MAX];
+        for p in 0..16usize {
+            for q in p + 1..16 {
+                for x in values {
+                    for y in values {
+                        let mut bytes = vec![0u8; 128];
+                        bytes[p * 8..p * 8 + 8].copy_from_slice(&x.to_le_bytes());
+                        bytes[q * 8..q * 8 + 8].copy_from_slice(&y.to_le_bytes());
+                        let token = content_token(Some(&bytes));
+                        assert!(
+                            seen.insert(token, (p, q, x, y)).is_none(),
+                            "{p} {q} {x:x} {y:x}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(!seen.contains_key(&content_token(Some(&[0u8; 128]))));
+    }
+
+    #[test]
+    fn every_two_byte_tail_has_its_own_token() {
+        // 32 bytes of block, then a 2-byte tail: all 65536 tails distinct, so
+        // no pair of tail bytes cancels another.
+        let mut seen = std::collections::HashSet::new();
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let mut bytes = vec![7u8; 32];
+                bytes.extend([a, b]);
+                assert!(seen.insert(content_token(Some(&bytes))), "tail {a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_absent_token_means_the_file_was_not_there() {
+        assert_eq!(content_token(None), "absent");
+        assert_ne!(content_token(Some(b"")), "absent");
+        let (_root, root) = dir();
+        let target = root.join("gone.txt");
+        let refused = write_regular_expecting(&target, Expect::Token("1:00"), |_| Ok(Vec::new()));
+        assert_eq!(
+            refused,
+            Err(WriteFailure::Changed {
+                actual: "absent".into()
+            })
+        );
+        assert!(!target.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "adversarial_tests.rs"]
+mod adversarial_tests;

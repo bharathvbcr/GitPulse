@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
-const source = readFileSync(new URL("../src-tauri/src/commands/mod.rs", import.meta.url), "utf8");
+const source = readCommandsSource();
 
 function functionSource(name: string): string {
   const start = source.indexOf(`pub async fn ${name}(`);
@@ -41,7 +41,22 @@ describe("native mutation policy contract", () => {
 
   it("routes every policy-carrying command through the write gate", () => {
     for (const name of guardedCommands()) {
-      const body = functionSource(name);
+      let body = functionSource(name);
+      // A command that hands its body to a named sync delegate (so the gate
+      // is testable without the async runtime) is judged by that delegate's
+      // body, which must itself call the gate: `docs_rename_guarded` judges
+      // the move and every path the rename writes.
+      const delegate = /\b(docs_rename_guarded)\(/.exec(body)?.[1];
+      if (delegate) {
+        const start = source.indexOf(`fn ${delegate}(`);
+        expect(start, `${name} delegates to ${delegate}, which must exist`).toBeGreaterThanOrEqual(0);
+        body = source.slice(start, source.indexOf("\n}\n", start));
+        // Each rewritten path is judged on its own path: one at a time, or as
+        // one batch of per-path verdicts (`guard_files`), every one recorded.
+        const perPath = body.includes('guard_file(repo_path, path, "modify")')
+          || (body.includes('guard_files(repo_path, &rewrites, "modify")') && /for verdict in guard_files\([^)]*\)\?\s*\{\s*fold\.record\(verdict\)/.test(body));
+        expect(perPath, `${delegate} must judge each path it rewrites`).toBe(true);
+      }
       // `guard` judges a rendered command line; `guard_file` judges a path.
       // Both are the canonical harness entry points; anything else is a
       // command that reports a verdict it never actually obtained.

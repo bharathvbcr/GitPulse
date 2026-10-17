@@ -2,8 +2,8 @@
 //!
 //! This module answers one question — "is there a newer published GitPulse
 //! than the one running?" — and it answers it without adding a dependency and
-//! without an HTTP client. The transport is `git ls-remote --tags` against the
-//! project's own public repository, which works for three reasons:
+//! without an HTTP client. Candidates come from `git ls-remote --tags` against
+//! the project's own public repository, which works for three reasons:
 //!
 //!   * `git` is already a hard requirement of the application, so there is no
 //!     new tool to install and no new attack surface;
@@ -13,6 +13,11 @@
 //!     (terminal prompts disabled, credential helpers non-interactive,
 //!     ambient `GIT_*` configuration stripped, output and wall-clock bounded),
 //!     so this check inherits that instead of re-earning it.
+//!
+//! A tag is only a candidate. It is announced once its release is *published*,
+//! confirmed by one bounded `HEAD` of the release's checksum asset
+//! ([`release_marker_asset`]), because the release workflow runs for many
+//! minutes after a tag is pushed and may never finish.
 //!
 //! It is deliberately *opt-in*: nothing here runs until the user turns the
 //! preference on or presses "Check now". The frontend owns that gate; this
@@ -75,7 +80,7 @@ pub struct UpdateCheck {
 }
 
 impl UpdateCheck {
-    fn failed(error: String) -> Self {
+    pub(crate) fn failed(error: String) -> Self {
         Self {
             current_version: CURRENT_VERSION.to_string(),
             latest_version: String::new(),
@@ -157,8 +162,8 @@ pub fn parse_release_tag(tag: &str) -> Option<Version> {
     parse_version(bare)
 }
 
-/// Extracts the highest stable version from `git ls-remote --tags --refs`
-/// output.
+/// Extracts every stable version from `git ls-remote --tags --refs` output,
+/// highest first.
 ///
 /// Each line is `<sha>\trefs/tags/<name>`. Lines that do not match that shape,
 /// and tags that are not stable `MAJOR.MINOR.PATCH` releases, are skipped:
@@ -166,8 +171,8 @@ pub fn parse_release_tag(tag: &str) -> Option<Version> {
 ///
 /// Returns the tag text alongside the version, so the caller links to the tag
 /// the remote actually published rather than a reconstructed guess.
-pub fn latest_stable_tag(ls_remote_output: &str) -> Result<Option<(String, Version)>, String> {
-    let mut best: Option<(String, Version)> = None;
+pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, String> {
+    let mut found: Vec<(String, Version)> = Vec::new();
     let mut seen = 0usize;
     for line in ls_remote_output.lines() {
         let line = line.trim();
@@ -192,20 +197,71 @@ pub fn latest_stable_tag(ls_remote_output: &str) -> Result<Option<(String, Versi
         let Some(version) = parse_release_tag(tag) else {
             continue;
         };
-        match &best {
-            Some((_, current)) if *current >= version => {}
-            _ => best = Some((tag.to_string(), version)),
+        if !found.iter().any(|(_, known)| *known == version) {
+            found.push((tag.to_string(), version));
         }
     }
-    Ok(best)
+    found.sort_by_key(|(_, version)| std::cmp::Reverse(*version));
+    Ok(found)
+}
+
+/// The highest stable tag in a listing, published or not. See [`stable_tags`].
+pub fn latest_stable_tag(ls_remote_output: &str) -> Result<Option<(String, Version)>, String> {
+    Ok(stable_tags(ls_remote_output)?.into_iter().next())
+}
+
+/// How many tags newer than the running build are probed for a published
+/// release before the check gives up and reports nothing to announce. A tag
+/// with no release is the exception, not a queue; the bound keeps a repository
+/// with many such tags from turning one check into many network round trips.
+const MAX_RELEASE_PROBES: usize = 5;
+
+/// Name of the asset a *finished* release carries and a draft does not expose.
+///
+/// `scripts/check-release-assets.mjs` names it (`checksums`) and
+/// `release-state.mjs` uploads it last, after every installer and before the
+/// draft is published, so it is public exactly when users can install the
+/// release. A test pins this format to that script.
+pub fn release_marker_asset(version: Version) -> String {
+    format!(
+        "GitPulse_{}.{}.{}_SHA256SUMS.txt",
+        version.major, version.minor, version.patch
+    )
+}
+
+/// Whether the release for `tag` is published: its checksum asset answers an
+/// anonymous request, which a draft's assets do not.
+///
+/// A pushed tag says nothing about that. The release workflow runs for many
+/// minutes after the tag lands, may fail, and publishes only when green, so
+/// announcing every tag told every user about builds nobody could install (and
+/// a mistaken `v9.0.0` stayed announced until someone deleted it).
+fn release_is_published(tag: &str, version: Version) -> Result<bool, String> {
+    let url = format!(
+        "{}/releases/download/{}/{}",
+        REPOSITORY_URL.trim_end_matches(".git"),
+        crate::github::percent_encode_tag(tag),
+        release_marker_asset(version)
+    );
+    crate::tool_install::release::http_head_ok(&url)
 }
 
 /// Builds the [`UpdateCheck`] for a known-good tag listing.
 ///
+/// `published` answers whether the release behind a tag is installable. It is
+/// asked only about tags newer than `current_version`, newest first, at most
+/// [`MAX_RELEASE_PROBES`] of them; the first one it confirms is the update. If
+/// it cannot answer, the whole check fails rather than guessing in either
+/// direction: an unverifiable tag is neither announced nor ruled out.
+///
 /// Split from [`check_for_update`] so the whole decision — including the
 /// "remote has no stable tag at all" and "remote is behind us" branches — is
 /// testable without touching the network.
-pub fn evaluate(current_version: &str, ls_remote_output: &str) -> UpdateCheck {
+pub fn evaluate(
+    current_version: &str,
+    ls_remote_output: &str,
+    published: &dyn Fn(&str, Version) -> Result<bool, String>,
+) -> UpdateCheck {
     let Some(current) = parse_version(current_version) else {
         // Unreachable via CURRENT_VERSION (Cargo would reject a non-semver
         // package version), but this function is also the tested entry point.
@@ -213,27 +269,56 @@ pub fn evaluate(current_version: &str, ls_remote_output: &str) -> UpdateCheck {
             "the running version '{current_version}' is not a MAJOR.MINOR.PATCH version"
         ));
     };
-    let latest = match latest_stable_tag(ls_remote_output) {
+    let tags = match stable_tags(ls_remote_output) {
         Ok(found) => found,
         Err(error) => return UpdateCheck::failed(error),
     };
-    let Some((tag, version)) = latest else {
+    let Some((_, newest)) = tags.first() else {
         return UpdateCheck::failed(
             "the repository published no stable release tag to compare against".into(),
         );
     };
-    UpdateCheck {
+    let up_to_date = |latest: Version| UpdateCheck {
         current_version: current_version.to_string(),
-        latest_version: format!("{}.{}.{}", version.major, version.minor, version.patch),
-        update_available: version > current,
-        release_url: if version > current {
-            release_tag_url(&tag)
-        } else {
-            releases_url()
-        },
+        latest_version: format!("{}.{}.{}", latest.major, latest.minor, latest.patch),
+        update_available: false,
+        release_url: releases_url(),
         checked: true,
         error: None,
+    };
+    if *newest <= current {
+        return up_to_date(*newest);
     }
+    for (tag, version) in tags
+        .iter()
+        .filter(|(_, version)| *version > current)
+        .take(MAX_RELEASE_PROBES)
+    {
+        match published(tag, *version) {
+            Ok(true) => {
+                return UpdateCheck {
+                    current_version: current_version.to_string(),
+                    latest_version: format!(
+                        "{}.{}.{}",
+                        version.major, version.minor, version.patch
+                    ),
+                    update_available: true,
+                    release_url: release_tag_url(tag),
+                    checked: true,
+                    error: None,
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return UpdateCheck::failed(format!(
+                    "could not confirm that {tag} is a published release: {error}"
+                ))
+            }
+        }
+    }
+    // Tags newer than this build exist, and none of them has a published
+    // release: nothing is installable, so there is nothing to announce.
+    up_to_date(current)
 }
 
 /// Runs the check against the upstream repository.
@@ -244,7 +329,11 @@ pub fn evaluate(current_version: &str, ls_remote_output: &str) -> UpdateCheck {
 pub fn check_for_update() -> UpdateCheck {
     let args = ["ls-remote", "--tags", "--refs", REPOSITORY_URL];
     match git_global_with_timeout(&args, CHECK_TIMEOUT) {
-        Ok(bytes) => evaluate(CURRENT_VERSION, &String::from_utf8_lossy(&bytes)),
+        Ok(bytes) => evaluate(
+            CURRENT_VERSION,
+            &String::from_utf8_lossy(&bytes),
+            &release_is_published,
+        ),
         Err(error) => UpdateCheck::failed(error),
     }
 }
@@ -402,7 +491,7 @@ mod tests {
 
     #[test]
     fn reports_an_available_update() {
-        let result = evaluate("0.0.3", &line("v1.2.3"));
+        let result = evaluate("0.0.3", &line("v1.2.3"), &|_, _| Ok(true));
         assert!(result.checked);
         assert!(result.update_available);
         assert_eq!(result.latest_version, "1.2.3");
@@ -412,7 +501,7 @@ mod tests {
 
     #[test]
     fn reports_up_to_date_on_an_exact_match() {
-        let result = evaluate("0.0.3", &line("v0.0.3"));
+        let result = evaluate("0.0.3", &line("v0.0.3"), &|_, _| Ok(true));
         assert!(result.checked);
         assert!(!result.update_available);
         assert_eq!(result.latest_version, "0.0.3");
@@ -422,7 +511,7 @@ mod tests {
     #[test]
     fn a_remote_behind_us_is_not_an_update() {
         // Running a locally-built newer version than anything published.
-        let result = evaluate("2.0.0", &line("v1.2.3"));
+        let result = evaluate("2.0.0", &line("v1.2.3"), &|_, _| Ok(true));
         assert!(result.checked);
         assert!(!result.update_available);
     }
@@ -437,14 +526,110 @@ mod tests {
         assert_eq!(failed.error.as_deref(), Some("network unreachable"));
         assert!(failed.release_url.ends_with("/releases"));
 
-        let no_tags = evaluate("0.0.3", "");
+        let no_tags = evaluate("0.0.3", "", &|_, _| Ok(true));
         assert!(!no_tags.checked);
         assert!(no_tags.error.is_some());
     }
 
+    /// Regression (any pushed tag announced an update): `v1.3.0` is tagged and
+    /// its release workflow has not published, or failed. The old check
+    /// announced it to every user on the next poll.
+    #[test]
+    fn a_tag_with_no_published_release_is_not_announced() {
+        let result = evaluate("1.2.0", &line("v1.3.0"), &|_, _| Ok(false));
+        assert!(result.checked, "{result:?}");
+        assert!(!result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "1.2.0");
+        assert!(result.release_url.ends_with("/releases"));
+    }
+
+    #[test]
+    fn the_newest_published_release_wins_over_a_newer_unpublished_tag() {
+        let listing = format!("{}{}{}", line("v1.2.1"), line("v1.5.0"), line("v1.3.0"));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let result = evaluate("1.2.0", &listing, &|tag, _| {
+            asked.borrow_mut().push(tag.to_string());
+            Ok(tag == "v1.3.0")
+        });
+        assert!(result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "1.3.0");
+        assert!(result.release_url.ends_with("/releases/tag/v1.3.0"));
+        assert_eq!(
+            *asked.borrow(),
+            ["v1.5.0", "v1.3.0"],
+            "newest first, stopping at the first published"
+        );
+    }
+
+    #[test]
+    fn a_release_that_cannot_be_checked_fails_the_check_both_ways() {
+        let result = evaluate("1.2.0", &line("v1.3.0"), &|_, _| {
+            Err("curl is not installed".into())
+        });
+        assert!(
+            !result.checked,
+            "an unverifiable tag must not look like up to date"
+        );
+        assert!(
+            !result.update_available,
+            "an unverifiable tag must not be announced"
+        );
+        assert!(result.error.unwrap().contains("curl is not installed"));
+    }
+
+    #[test]
+    fn release_probes_are_bounded_and_skip_tags_not_newer_than_us() {
+        let listing: String = (0..40)
+            .map(|patch| line(&format!("v1.3.{patch}")))
+            .collect::<String>()
+            + &line("v1.0.0");
+        let probes = std::cell::Cell::new(0usize);
+        let result = evaluate("1.2.0", &listing, &|_, _| {
+            probes.set(probes.get() + 1);
+            Ok(false)
+        });
+        assert!(result.checked && !result.update_available);
+        assert_eq!(probes.get(), MAX_RELEASE_PROBES);
+
+        let probes = std::cell::Cell::new(0usize);
+        let behind = evaluate("2.0.0", &line("v1.9.9"), &|_, _| {
+            probes.set(probes.get() + 1);
+            Ok(true)
+        });
+        assert!(behind.checked && !behind.update_available);
+        assert_eq!(
+            probes.get(),
+            0,
+            "a tag not newer than this build is never probed"
+        );
+    }
+
+    /// The marker is the file `scripts/release-state.mjs` uploads; a rename
+    /// there that missed this would make every real release look unpublished.
+    #[test]
+    fn the_release_marker_asset_is_the_one_the_release_scripts_publish() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../scripts/check-release-assets.mjs"),
+        )
+        .expect("read check-release-assets.mjs");
+        assert!(
+            script.contains("checksums: `GitPulse_${version}_SHA256SUMS.txt`"),
+            "scripts/check-release-assets.mjs no longer names the checksum asset this way"
+        );
+        assert_eq!(
+            release_marker_asset(Version {
+                major: 1,
+                minor: 4,
+                patch: 0
+            }),
+            "GitPulse_1.4.0_SHA256SUMS.txt"
+        );
+    }
+
     #[test]
     fn a_bad_running_version_fails_the_check() {
-        let result = evaluate("not-a-version", &line("v1.0.0"));
+        let result = evaluate("not-a-version", &line("v1.0.0"), &|_, _| Ok(true));
         assert!(!result.checked);
         assert!(result.error.unwrap().contains("MAJOR.MINOR.PATCH"));
     }

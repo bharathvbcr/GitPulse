@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import { compile } from "svelte/compiler";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
@@ -200,5 +201,16 @@ describe("tag chips carry the tag's standing against the base", () => {
     expect(body).toContain("unmeasured");
     expect(body).not.toContain("already in");
     expect(body).not.toMatch(/\+\d/);
+  });
+});
+
+describe("CommitRow branch creation contract", () => {
+  it("names its repository before the prompt, and toasts success only after an ok outcome", () => {
+    const body = functionBody(source, "createBranchHere");
+    expect(body.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeLessThan(body.indexOf("await askText("));
+    expect(body).toContain("const outcome = await repoStore.createBranch(name.trim(), row.id, target);");
+    expect(body).toContain("reportFailure(outcome,");
+    expect(body.indexOf("toastStore.success(")).toBeGreaterThan(body.indexOf("reportFailure(outcome,"));
   });
 });

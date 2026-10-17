@@ -1,0 +1,81 @@
+name: Deep checks
+
+# Opt-in tests that are too heavy or too environment-bound for the per-push
+# gate in ci.yml, run on a schedule so they cannot rot unseen:
+#   - the lane-solver deep fuzz (an order of magnitude more seeds and larger
+#     DAGs than the always-on suites);
+#   - the repository-hygiene test that drives a real, installed Go toolchain
+#     against a disposable cache (Go is not a build dependency, so the test is
+#     #[ignore]d everywhere else).
+# A separate workflow so a red result here is its own check and never blocks
+# the deterministic gate.
+on:
+  schedule:
+    # Weekly, Tuesday, off the hour and off the nightly parallel run.
+    - cron: "41 4 * * 2"
+  # Run by hand on a branch, so a fix is verified before its PR exists.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Fail closed: this job only checks out, builds and tests.
+permissions:
+  contents: read
+
+jobs:
+  deep:
+    name: Deep fuzz and Go hygiene (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install System Dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+
+      # The hygiene test pins GOTOOLCHAIN=local, so the Go on PATH is the Go
+      # that runs; this makes that a known version rather than the image's.
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      # --ignored selects ONLY the opt-in tests. `--exact` keeps each run to
+      # the one named test, so a renamed test fails loudly with "0 tests"
+      # instead of quietly running nothing (checked below).
+      - name: Lane-solver deep fuzz
+        shell: bash
+        env:
+          DEEP_FUZZ_SCALE: "2"
+        run: |
+          set -euo pipefail
+          out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --release --test lane_solver_fuzz -- --ignored --exact deep_fuzz_many_seeds_and_large_dags 2>&1 | tee /dev/stderr)"
+          grep -q "test result: ok. 1 passed" <<<"$out"
+
+      - name: Repository hygiene against installed Go
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact storage::hygiene::tests::installed_go_cleans_only_the_reviewed_temporary_cache 2>&1 | tee /dev/stderr)"
+          grep -q "test result: ok. 1 passed" <<<"$out"

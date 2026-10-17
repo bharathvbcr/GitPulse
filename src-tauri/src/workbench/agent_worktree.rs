@@ -48,7 +48,7 @@
 //! keeps a branch with commits, and a tree something still has open is kept.
 
 use super::WorkbenchError;
-use crate::engine::git_cli::{git_captured, resolve_git_common_dir, resolve_git_dir};
+use crate::engine::git_cli::{git_text, resolve_git_common_dir, resolve_git_dir};
 use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -130,24 +130,16 @@ fn main_checkout(selected: &Path) -> Result<PathBuf, WorkbenchError> {
 
 /// Whether `path` is already a worktree of this repository on `branch`.
 fn existing(selected: &Path, path: &Path, branch: &str) -> Result<bool, WorkbenchError> {
-    let run = git_captured(selected, &["worktree", "list", "--porcelain"])
-        .and_then(|r| r.require_complete("Worktree listing"))
-        .map_err(refused)?;
-    if run.status_code != 0 {
-        return Err(refused("Could not list this repository's worktrees."));
-    }
-    let text = String::from_utf8_lossy(&run.stdout);
+    let entries = crate::engine::worktree::read_worktree_entries(selected).map_err(refused)?;
     let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut here = false;
-    for line in text.lines() {
-        if let Some(entry) = line.strip_prefix("worktree ") {
-            let entry = Path::new(entry);
-            here = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf()) == wanted;
-        } else if here && line == format!("branch refs/heads/{branch}") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(entries.iter().any(|entry| {
+        let listed = Path::new(&entry.path);
+        listed
+            .canonicalize()
+            .unwrap_or_else(|_| listed.to_path_buf())
+            == wanted
+            && entry.branch.as_deref() == Some(branch)
+    }))
 }
 
 /// The one naming rule: an attempt's worktree directory name, from the task
@@ -232,6 +224,8 @@ pub(super) fn provision(
         None,
         false,
         true,
+        // Approved hooks only: an unapproved file is reported, not run.
+        true,
     )
     .map_err(refused)?;
     let provisioned = Provisioned {
@@ -243,6 +237,9 @@ pub(super) fn provision(
     if let Some(cache) = created.cache_error {
         // Caches only save a rebuild; the agent can work without them.
         log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
+    }
+    if let Some(notice) = created.hook_notice {
+        log::warn!(target: "workbench", "agent worktree {}: {notice}", provisioned.path);
     }
     if let Some(hook) = created.hook_error {
         // The repository's own setup did not finish (dependencies, seeds), so
@@ -262,6 +259,43 @@ pub(super) fn provision(
             "The repository's post_create hook failed in the new worktree, so the agent was not started: {hook}.{cleanup}"
         )));
     }
+    // Where the lane was cut from, for the merge to hold the target to. A
+    // checkout on a detached HEAD, or on a branch name the writers will not
+    // pass to git, has no branch to record; the merge then skips that check
+    // and reports no base, rather than guessing one.
+    match crate::engine::git_reader::head_branch(source) {
+        Ok(Some(base_branch)) => {
+            let recorded = git_text(
+                Path::new(&provisioned.path),
+                &["rev-parse", "--verify", "HEAD"],
+            )
+            .and_then(|oid| {
+                crate::engine::worktree::write_base_record(
+                    Path::new(&provisioned.path),
+                    &base_branch,
+                    oid.trim(),
+                )
+            });
+            if let Err(error) = recorded {
+                let cleanup = discard(&provisioned)
+                    .err()
+                    .map(|e| {
+                        format!(
+                            " The worktree could not be removed and is still at {} on branch {}: {e}",
+                            provisioned.path, provisioned.branch
+                        )
+                    })
+                    .unwrap_or_default();
+                return Err(refused(format!(
+                    "GitPulse could not record which branch the new worktree was cut from, so the agent was not started: {error}.{cleanup}"
+                )));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log::warn!(target: "workbench", "agent worktree {} has no recorded base branch: {error}", provisioned.path);
+        }
+    }
     // Without the record, a later retry of this same attempt rebuilds the
     // tree instead of trusting it: slower, never wrong.
     if let Err(error) = resolve_git_dir(Path::new(&provisioned.path))
@@ -272,6 +306,24 @@ pub(super) fn provision(
     Ok(provisioned)
 }
 
+/// What a removal left to say beyond "removed": the files that could not be
+/// deleted and the leftovers of earlier removals the sweep could not clear.
+/// Logged, and returned for a caller that reports it. `None` when nothing.
+fn removal_notice(
+    path: &str,
+    removal: &crate::engine::worktree::WorktreeRemoval,
+) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    parts.extend(removal.cleanup_error.as_deref());
+    parts.extend(removal.sweep_problems.iter().map(String::as_str));
+    if parts.is_empty() {
+        return None;
+    }
+    let notice = parts.join("; ");
+    log::warn!(target: "workbench", "agent worktree {path} was removed, but: {notice}");
+    Some(notice)
+}
+
 /// What [`reclaim`] did with an unclaimed attempt's worktree.
 pub(super) struct Reclaimed {
     path: String,
@@ -279,6 +331,10 @@ pub(super) struct Reclaimed {
     removed: bool,
     branch_deleted: bool,
     kept_because: Option<String>,
+    /// The worktree is removed but its files could not all be deleted, or a
+    /// leftover of an earlier removal could not be cleared; see
+    /// [`removal_notice`].
+    cleanup_error: Option<String>,
 }
 
 impl Reclaimed {
@@ -289,6 +345,7 @@ impl Reclaimed {
             removed: false,
             branch_deleted: false,
             kept_because: Some(why),
+            cleanup_error: None,
         }
     }
 
@@ -300,6 +357,7 @@ impl Reclaimed {
             "removed": self.removed,
             "branch_deleted": self.branch_deleted,
             "kept_because": self.kept_because,
+            "cleanup_error": self.cleanup_error,
         })
     }
 
@@ -352,6 +410,18 @@ pub(super) fn reclaim(
     run: &Value,
     open_files: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Option<Reclaimed> {
+    // Cancel and release give a tree back; under memory pressure that is the
+    // last work to defer, so its git children run as the user action they
+    // are, never shed with the refreshes (`sysload::governor`).
+    crate::engine::git_cli::with_admission(crate::engine::git_cli::Admission::Interactive, || {
+        reclaim_unshed(run, open_files)
+    })
+}
+
+fn reclaim_unshed(
+    run: &Value,
+    open_files: &dyn Fn(&Path) -> Result<(), String>,
+) -> Option<Reclaimed> {
     if !run["owner_id"].is_null() {
         return None;
     }
@@ -388,11 +458,13 @@ pub(super) fn reclaim(
     }
     let remove = crate::engine::worktree::remove_worktree_argv(&path, false);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
-    if let Err(why) = crate::harness::guard_command(&source, &refs)
+    let removal = match crate::harness::guard_command(&source, &refs)
         .and_then(|_| crate::engine::worktree::remove_worktree(&source, &path, false))
     {
-        return Some(Reclaimed::kept(&path, &branch, why));
-    }
+        Ok(removal) => removal,
+        Err(why) => return Some(Reclaimed::kept(&path, &branch, why)),
+    };
+    let cleanup_error = removal_notice(&path, &removal);
     let delete = ["git", "branch", "-d", branch.as_str()];
     let deleted = crate::harness::guard_command(&source, &delete).and_then(|_| {
         crate::engine::git_writer::GitWriter::delete_branch(&source, &branch, false).map(|_| ())
@@ -406,6 +478,7 @@ pub(super) fn reclaim(
         path,
         branch,
         removed: true,
+        cleanup_error,
     })
 }
 
@@ -418,7 +491,11 @@ pub(super) fn discard(provisioned: &Provisioned) -> Result<(), String> {
     let remove = crate::engine::worktree::remove_worktree_argv(&provisioned.path, true);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
     crate::harness::guard_command(&provisioned.source, &refs)?;
-    crate::engine::worktree::remove_worktree(&provisioned.source, &provisioned.path, true)?;
+    let removal =
+        crate::engine::worktree::remove_worktree(&provisioned.source, &provisioned.path, true)?;
+    // The worktree is gone; files left to delete are not a failed discard, but
+    // they are not silent either.
+    removal_notice(&provisioned.path, &removal);
     let delete = ["git", "branch", "-d", provisioned.branch.as_str()];
     crate::harness::guard_command(&provisioned.source, &delete)?;
     crate::engine::git_writer::GitWriter::delete_branch(
@@ -446,11 +523,9 @@ mod tests {
         git_global(&["init", "-b", "main", root.to_str().unwrap()]).unwrap();
         crate::test_support::trust_repo(&root);
         std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
-        std::fs::write(
-            root.join(".gitpulse/hooks.json"),
-            r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#,
-        )
-        .unwrap();
+        let hooks = r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#;
+        std::fs::write(root.join(".gitpulse/hooks.json"), hooks).unwrap();
+        crate::engine::approve_worktree_hooks(&root, hooks).unwrap();
         git_text(&root, &["add", "."]).unwrap();
         git_text(
             &root,
@@ -524,6 +599,16 @@ mod tests {
         )
         .unwrap();
         assert!(std::path::Path::new(&made.path).is_dir(), "{}", made.path);
+        // The branch and commit the lane was cut from are recorded in its
+        // private Git directory, where the merge reads them.
+        let base = std::fs::read_to_string(
+            crate::engine::git_cli::resolve_git_dir(std::path::Path::new(&made.path))
+                .unwrap()
+                .join(crate::engine::worktree::BASE_RECORD),
+        )
+        .expect("no base record was written");
+        let head = git_text(&root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(base, format!("main\n{}\n", head.trim()));
         let status = git_text(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
         // The command gate's ledger also writes into the repository; only the
         // worktree container is this test's concern. Unexcluded, it reads

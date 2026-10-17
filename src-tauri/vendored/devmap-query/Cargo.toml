@@ -2,12 +2,39 @@
 name = "devmap-query"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Query engine and code-graph artifact writers for the DevCouncil kernel"
+autotests = false
+
+[[test]]
+name = "it"
+
+[[test]]
+name = "artifact_writer_security"
+
+[[test]]
+name = "a_cold_query_pays_for_its_answer_not_the_generation"
+required-features = ["parse"]
+
+[[test]]
+name = "a_delete_this_list_reads_for_its_answer"
+required-features = ["parse"]
+
+[[test]]
+name = "a_fan_out_pays_for_its_index_once_per_direction"
+required-features = ["parse"]
+
+[[test]]
+name = "query_work_is_bounded_by_the_answer"
+required-features = ["parse"]
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }
+# The one is_test_path; a path dependency inside this workspace, already
+# linked through devmap-extract.
+dc-glob = { path = "../dc-glob" }
 devmap-resolve = { path = "../devmap-resolve", default-features = false }
 devmap-analyze = { path = "../devmap-analyze", default-features = false }
 devmap-store = { path = "../devmap-store", default-features = false }
@@ -35,88 +62,18 @@ parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse",
 # error instead of results. A build error reads as "not meant to be tested",
 # which is how it survived — no test had ever run in that configuration.
 #
-# `required-features` skips these when `parse` is off rather than failing the
-# build. Nothing changes with default features on, where `parse` is enabled.
+# The integration tests are one target, `tests/it.rs`, whose modules are the
+# files under `tests/`. A file that needs a grammar is declared
+# `#[cfg(feature = "parse")]` there, which skips it when `parse` is off rather
+# than failing the build; `every_test_target_declares_its_grammar_need` reads
+# those lines.
 #
-# `workspace_registry_concurrency` and `freshness_parity` are deliberately
-# absent — they exercise the workspace registry and the freshness stamp, neither
-# of which needs a parser, and they must keep being compiled and run in the
-# no-parse configuration. See the note below the list for the examples.
-
-[[test]]
-name = "a_cold_query_pays_for_its_answer_not_the_generation"
-required-features = ["parse"]
-
-[[test]]
-name = "coverage_loss_artifacts"
-required-features = ["parse"]
-
-[[test]]
-name = "edge_index_under_writes"
-required-features = ["parse"]
+# `workspace_registry_concurrency` is deliberately absent — it exercises the
+# workspace registry, which needs no parser, and it must keep being compiled
+# and run in the no-parse configuration. See the note below the list for the examples.
 
 [[example]]
 name = "answer_snapshot"
-required-features = ["parse"]
-
-[[test]]
-name = "explore_and_affected"
-required-features = ["parse"]
-
-[[test]]
-name = "incomplete_answers_say_so"
-required-features = ["parse"]
-
-[[test]]
-name = "manifest_truncation_counts"
-required-features = ["parse"]
-
-[[test]]
-name = "neighbors_adversarial"
-required-features = ["parse"]
-
-[[test]]
-name = "neighbors_composition"
-required-features = ["parse"]
-
-[[test]]
-name = "persisted_engine_answers"
-required-features = ["parse"]
-
-[[test]]
-name = "preview_containment"
-required-features = ["parse"]
-
-[[test]]
-name = "preview_unreadable_file"
-required-features = ["parse"]
-
-[[test]]
-name = "query_cancellation"
-required-features = ["parse"]
-
-[[test]]
-name = "search_counts_under_concurrent_writes"
-required-features = ["parse"]
-
-[[test]]
-name = "search_ranks_before_paging"
-required-features = ["parse"]
-
-[[test]]
-name = "snapshot_budget"
-required-features = ["parse"]
-
-[[test]]
-name = "workspace_search_totals"
-required-features = ["parse"]
-
-[[test]]
-name = "paired_reads_are_one_generation"
-required-features = ["parse"]
-
-[[test]]
-name = "query_work_is_bounded_by_the_answer"
 required-features = ["parse"]
 
 # Examples are targets too, and `--all-targets` builds them. `query_bench`
@@ -129,163 +86,4 @@ required-features = ["parse"]
 name = "query_bench"
 required-features = ["parse"]
 
-[[test]]
-name = "a_fan_out_pays_for_its_index_once_per_direction"
-required-features = ["parse"]
-
-[[test]]
-name = "a_delete_this_list_reads_for_its_answer"
-required-features = ["parse"]
-
-[[test]]
-name = "a_bare_ruby_send_has_a_caller"
-required-features = ["parse"]
-
-[[test]]
-name = "a_traversal_over_a_hole_says_so"
-required-features = ["parse"]
-
-[[test]]
-name = "a_call_blind_target_is_unavailable_not_empty"
-required-features = ["parse"]
-
-[[test]]
-name = "answers_agree_with_each_other"
-required-features = ["parse"]
-
-[[test]]
-name = "subsystem_neighbours_are_computed"
-required-features = ["parse"]
-
-[[test]]
-name = "stored_edges_keep_the_confidence_their_evidence_earned"
-required-features = ["parse"]
-
-[[test]]
-name = "dynamic_references_clear_unwired"
-required-features = ["parse"]
-
-[[test]]
-name = "rung_filter"
-required-features = ["parse"]
-
-[[test]]
-name = "rung_filter_under_stress"
-required-features = ["parse"]
-
-[[test]]
-name = "stored_edge_resolution_is_read_not_guessed"
-required-features = ["parse"]
-
-[[test]]
-name = "unwired_excludes_prose_on_its_own_grounds"
-required-features = ["parse"]
-
-[[test]]
-name = "unwired_is_not_import_blind"
-required-features = ["parse"]
-
-[[test]]
-name = "routes_under_hostile_input"
-required-features = ["parse"]
-
-[[test]]
-name = "coupling_spans_inheritance"
-required-features = ["parse"]
-
-[[test]]
-name = "every_emitted_field_says_whether_it_ran"
-required-features = ["parse"]
-
-[[test]]
-name = "graph_intel_is_emitted"
-required-features = ["parse"]
-
-[[test]]
-name = "the_core_graph_is_the_artifacts_nodes_and_edges"
-required-features = ["parse"]
-
-[[test]]
-name = "dead_clusters_reach_a_query"
-required-features = ["parse"]
-
-[[test]]
-name = "impact_layers_come_from_the_kernel"
-required-features = ["parse"]
-
-[[test]]
-name = "file_liveness_characterization"
-required-features = ["parse"]
-
-[[test]]
-name = "unwired_never_names_a_non_code_file"
-required-features = ["parse"]
-
-[[test]]
-name = "source_read_security"
-required-features = ["parse"]
-
-[[test]]
-name = "search_zero_is_not_absence"
-required-features = ["parse"]
-
-[[test]]
-name = "search_hostile_queries"
-required-features = ["parse"]
-
-[[test]]
-name = "skeleton_envelopes"
-required-features = ["parse"]
-
-[[test]]
-name = "ask_ranking"
-required-features = ["parse"]
-
-[[test]]
-name = "ask_evidence"
-required-features = ["parse"]
-
-[[test]]
-name = "ask_scope"
-required-features = ["parse"]
-
-[[test]]
-name = "affected_counts_inline_tests"
-required-features = ["parse"]
-
-[[test]]
-name = "ambiguous_impact_seeds"
-required-features = ["parse"]
-
-
-[[test]]
-name = "impact_names_its_unresolved_callers"
-required-features = ["parse"]
-
-[[test]]
-name = "a_rendered_component_has_a_caller"
-required-features = ["parse"]
-
-[[test]]
-name = "a_wrapped_callback_is_a_function"
-required-features = ["parse"]
-
-[[test]]
-name = "a_kernel_is_reached_from_its_host_by_name"
-required-features = ["parse"]
-
-[[test]]
-name = "a_walk_names_only_the_gaps_it_touches"
-required-features = ["parse"]
-
-[[test]]
-name = "retired_python_claims_have_kernel_tests"
-required-features = ["parse"]
-
-[[test]]
-name = "name_query_filters"
-required-features = ["parse"]
-
-[[test]]
-name = "literal_sites"
-required-features = ["parse"]
+# Builds its generations from extracted source.

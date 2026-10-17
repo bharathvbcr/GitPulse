@@ -10,6 +10,12 @@ export interface DocsStatus {
   truncated: boolean;
   skippedOversized: number;
   skippedUnreadable: number;
+  /**
+   * Markdown files the scan did not cover. From status/refresh: tracked files
+   * the vault does not hold (capped, oversized, unreadable, not UTF-8). In a
+   * rename's `scan` it also counts untracked, non-ignored markdown files.
+   */
+  notScanned: number;
 }
 
 export interface DocsSearchHit {
@@ -55,11 +61,37 @@ export interface DocGraph {
   truncated: boolean;
 }
 
+export interface DocRenameFailure {
+  path: string;
+  error: string;
+}
+
 export interface DocRenameOutcome {
   from: string;
   to: string;
+  /** Written and staged; includes `to` when the moved note's own links changed. */
   rewrittenPaths: string[];
   linksRewritten: number;
+  /** Every planned rewrite was written and staged. */
+  complete: boolean;
+  /** Changed after the plan was made, so left as they were. */
+  skippedConflict: string[];
+  /** Could not be written or staged. */
+  failed: DocRenameFailure[];
+  /**
+   * Links that resolved before the rename and do not after it, as the
+   * rewritten vault reads them: reference-style definitions, which are not
+   * rewritten. Residual: a destination whose name holds `#`, `?` or `%` is
+   * written escaped, but the vault does not index such a link, so a rename
+   * onto one is neither reported here nor checked.
+   */
+  leftBroken: BrokenLink[];
+  /**
+   * What the rename was planned from covered: the vault plus the untracked
+   * markdown files around it. A note it did not scan was neither searched for
+   * links nor rewritten.
+   */
+  scan: DocsStatus;
 }
 
 export function docsRefresh(repoPath: string, options?: { background?: boolean }): Promise<DocsStatus> {

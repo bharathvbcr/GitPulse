@@ -247,6 +247,7 @@ pub fn view(repo_path: &str) -> GrantView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     #[cfg(unix)]
@@ -420,6 +421,13 @@ mod tests {
                 "hard rule",
                 r#"{"id":"G-5","grantor":{"authority":"human","id":"operator"},"reason":"r","scope":{"rules":["path.secret"]}}"#,
                 "hard rule",
+            ),
+            (
+                // Added to the contract at DevCouncil e79c2610. Hard there, so
+                // it must read as a known hard rule here, not as an unknown one.
+                "hard command rule",
+                r#"{"id":"G-5B","grantor":{"authority":"human","id":"operator"},"reason":"r","scope":{"rules":["command.git_read_argument"]}}"#,
+                "carries hard rule command.git_read_argument",
             ),
             (
                 "unknown rule",

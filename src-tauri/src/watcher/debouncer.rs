@@ -1,15 +1,56 @@
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Events the native callback may have queued for the debounce loop. A burst
+/// past this is not buffered further: the callback records an overflow, and
+/// the loop answers it with one full refresh (see [`RepoFileWatcher::take_overflow`]).
+/// The queue used to be unbounded, so a stalled consumer grew it without limit.
+pub(crate) const EVENT_QUEUE_CAPACITY: usize = 4096;
 
 pub struct RepoFileWatcher {
     watcher: Option<RecommendedWatcher>,
     retired: Receiver<()>,
     pub receiver: Receiver<Result<Event, notify::Error>>,
+    overflow: Arc<AtomicBool>,
+    /// A second sender on `receiver`, kept so that something other than the
+    /// native callback can wake whoever is blocked on it (see
+    /// [`Self::waker`]). It also means the receiver no longer disconnects when
+    /// the backend dies; [`Self::backend_alive`] is how that is noticed.
+    wake: SyncSender<Result<Event, notify::Error>>,
 }
 
 impl RepoFileWatcher {
+    /// A sender onto this watcher's event channel, for waking its reader.
+    pub(crate) fn waker(&self) -> SyncSender<Result<Event, notify::Error>> {
+        self.wake.clone()
+    }
+
+    /// False once the native backend has released its callback, which is what
+    /// the channel's disconnecting used to say before it had a second sender.
+    /// A watcher whose backend was shut down on purpose is not alive either.
+    pub(crate) fn backend_alive(&self) -> bool {
+        !matches!(
+            self.retired.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_overflow(&self) {
+        self.overflow.store(true, Ordering::Release);
+    }
+
+    /// True once if events were dropped because the queue was full since the
+    /// last call. Dropped events are unknowable, so the caller refreshes
+    /// everything — the same answer a `Rescan` event gets.
+    pub(crate) fn take_overflow(&self) -> bool {
+        self.overflow.swap(false, Ordering::AcqRel)
+    }
+
     /// Wait for the backend to release its callback and outstanding native
     /// reads. notify's Windows Drop only queues Stop; dropping its Rust handle
     /// alone does not mean ReadDirectoryChangesW has relinquished the tree.
@@ -83,7 +124,10 @@ impl RepoFileWatcher {
             ));
         }
 
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(EVENT_QUEUE_CAPACITY);
+        let wake = tx.clone();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let callback_overflow = overflow.clone();
         let (lifetime, retired) = channel::<()>();
 
         let mut watcher = RecommendedWatcher::new(
@@ -91,7 +135,7 @@ impl RepoFileWatcher {
                 // The sender's lifetime follows every native callback owner.
                 // It is never sent to: disconnect is the shutdown receipt.
                 std::hint::black_box(&lifetime);
-                let _ = tx.send(res);
+                forward_event(&tx, &callback_overflow, res);
             },
             Config::default().with_poll_interval(Duration::from_millis(150)),
         )
@@ -146,7 +190,23 @@ impl RepoFileWatcher {
             watcher: Some(watcher),
             retired,
             receiver: rx,
+            overflow,
+            wake,
         })
+    }
+}
+
+/// Hands one native event to the debounce loop without ever blocking the
+/// backend's callback thread: a full queue records an overflow instead.
+fn forward_event(
+    tx: &SyncSender<Result<Event, notify::Error>>,
+    overflow: &AtomicBool,
+    res: Result<Event, notify::Error>,
+) {
+    match tx.try_send(res) {
+        Err(TrySendError::Full(_)) => overflow.store(true, Ordering::Release),
+        // The consumer is gone; the loop's own disconnect handling reports it.
+        Err(TrySendError::Disconnected(_)) | Ok(()) => {}
     }
 }
 
@@ -155,5 +215,25 @@ impl Drop for RepoFileWatcher {
         if let Err(error) = self.shutdown() {
             log::warn!(target: "watcher", "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_queue_records_one_overflow_instead_of_growing() {
+        let (tx, rx) = sync_channel(2);
+        let overflow = AtomicBool::new(false);
+        for _ in 0..5 {
+            forward_event(&tx, &overflow, Ok(Event::new(notify::EventKind::Any)));
+        }
+        assert_eq!(rx.try_iter().count(), 2, "the queue is bounded");
+        assert!(
+            overflow.swap(false, Ordering::AcqRel),
+            "the drop is recorded"
+        );
+        assert!(!overflow.load(Ordering::Acquire));
     }
 }

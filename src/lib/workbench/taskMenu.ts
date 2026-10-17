@@ -1,5 +1,5 @@
-import { PRIORITY_LABELS } from "./boardDrag";
-import { archiveState } from "./taskArchive";
+import { PRIORITY_LABELS } from "./taskPriority";
+import { ALREADY_ARCHIVED, archiveState } from "./taskArchive";
 import { STATUSES, STATUS_LABELS, type TaskCard, type TaskStatus } from "./client";
 import { displayTitle, isRevision, isTaskId } from "./taskDelete";
 import { linkedIssueNumber } from "./issueTask";
@@ -561,7 +561,7 @@ export function taskMenuItems(options: {
     action: { kind: "archive" },
     icon: "archive",
     separatorBefore: true,
-    hint: archived === "all" ? "Already archived" : "Keeps status",
+    hint: archived === "all" ? ALREADY_ARCHIVED : "Keeps status",
     // Every task in the selection is already archived, so every write would
     // spend a revision storing the value that is already there — the same
     // reason a Move row showing the current status is disabled rather than

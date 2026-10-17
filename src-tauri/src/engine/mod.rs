@@ -1,5 +1,6 @@
 pub mod budget;
 pub mod churn_store;
+pub mod commit_signature;
 pub mod content_search;
 pub mod cow_clone;
 pub mod deadbranch;
@@ -20,9 +21,11 @@ pub mod worktree_hooks;
 pub use cow_clone::{reflink_copy_dir, reflink_ignored_caches, ReflinkResult};
 pub use portless::{detect_worktree_routes, hash_port, read_portless_routes, WorktreeRouteInfo};
 pub use worktree_hooks::{
-    execute_worktree_hooks, load_worktree_hooks, HookExecutionResult, WorktreeHooksConfig,
+    approve_worktree_hooks, preview_worktree_hooks, run_repo_hooks, HookExecutionResult,
+    HookOutcome, WorktreeHooksConfig, WorktreeHooksPreview,
 };
 
+pub use commit_signature::{CommitSignature, CommitSignatureCheck, SignatureStatus};
 pub use deadbranch::{
     DeadbranchBackupInfo, DeadbranchCleanResult, DeadbranchConfig, DeadbranchRestoreResult,
     DeadbranchScanResult, StaleBranchInfo,
@@ -45,5 +48,6 @@ pub use stash::{StashAction, StashEntry};
 pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleList, SubmoduleState};
 pub use worktree::{
     add_worktree_extended, agent_kind, agent_session_slug, merge_and_teardown_worktree,
-    merge_teardown_argv, MergeTeardownResult, WorktreeDiffStat, WorktreeDivergence, WorktreeInfo,
+    merge_teardown_argv, MergeTeardownError, MergeTeardownResult, WorktreeDiffStat,
+    WorktreeDivergence, WorktreeInfo,
 };

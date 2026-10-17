@@ -30,6 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod commit_graph;
 pub mod hygiene;
 
 #[cfg(unix)]
@@ -282,6 +283,10 @@ pub struct StorageReport {
     pub reclaim: Vec<ReclaimItem>,
     #[serde(default)]
     pub reclaim_summary: ReclaimSummary,
+    /// Read-only commit-graph census (zero git spawns). Old payloads without
+    /// it deserialize to `Unknown`, never to a claim that the graph is fine.
+    #[serde(default)]
+    pub commit_graph: commit_graph::CommitGraphReport,
     pub scan: ScanStats,
 }
 
@@ -1620,6 +1625,13 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         branches,
         reclaim,
         reclaim_summary,
+        commit_graph: match crate::engine::git_cli::resolve_git_dir(&repo) {
+            Ok(private_dir) => commit_graph::inspect(&repo, &private_dir, &git_dir),
+            Err(reason) => commit_graph::CommitGraphReport {
+                note: Some(format!("the git directory could not be resolved: {reason}")),
+                ..commit_graph::CommitGraphReport::default()
+            },
+        },
         scan: ScanStats {
             elapsed_ms: started.elapsed().as_millis(),
             files_visited: total_files,

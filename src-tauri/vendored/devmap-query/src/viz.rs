@@ -546,12 +546,6 @@ label.row {{ display:flex; align-items:center; gap:7px; margin:9px 0 0; color:va
 .tag.dead {{ background:rgba(227,93,106,.18); color:var(--dead); }}
 .tag.entry {{ background:rgba(52,211,153,.18); color:var(--entry); }}
 .tag.unwired {{ background:rgba(240,173,78,.18); color:var(--unwired); }}
-#notes {{ padding:0 16px; font-size:12px; color:var(--muted); }}
-#notes:not(:empty) {{ padding:12px 16px; border-bottom:1px solid var(--line); }}
-#notes details {{ margin-top:6px; }}
-#notes summary {{ cursor:pointer; color:var(--unwired); }}
-#notes ul {{ margin:6px 0 0; padding-left:16px; max-height:180px; overflow:auto; }}
-#notes li {{ word-break:break-all; margin-bottom:3px; }}
 #graph {{ flex:1; position:relative; min-width:0; }}
 #empty {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
   color:var(--muted); text-align:center; padding:32px; pointer-events:none; }}
@@ -573,7 +567,6 @@ label.row {{ display:flex; align-items:center; gap:7px; margin:9px 0 0; color:va
     <div class="sub" id="filterCount" role="status"></div>
   </div>
   <div id="legend"></div>
-  <div id="notes"></div>
   <div id="detail"><span class="sub">Click a node for detail.</span></div>
 </div>
 <div id="graph"></div>
@@ -611,21 +604,6 @@ document.getElementById('legend').innerHTML = (VIEW.legend || [])
   .map(([color, label]) =>
     '<div><span class="key" style="background:' + esc(color) + '"></span>' + esc(label) + '</div>')
   .join('');
-
-// Crossings the view could not place onto a subsystem. Dropping them silently
-// would make "nothing crosses here" and "we could not tell" look identical,
-// which is the one thing this page must never do.
-(function notes() {{
-  const total = DATA.unresolved_handoffs_total || 0;
-  if (!total) return;
-  const listed = DATA.unresolved_handoffs || [];
-  const more = total > listed.length ? ' (' + listed.length + ' of ' + total + ' listed)' : '';
-  document.getElementById('notes').innerHTML =
-    '<details><summary>' + total + ' handoff' + (total === 1 ? '' : 's') +
-    ' not drawn' + more + '</summary><ul>' +
-    listed.map(u => '<li>' + esc(u.from) + ': ' + esc(u.text) + '</li>').join('') +
-    '</ul></details>';
-}})();
 
 const el = document.getElementById('graph');
 if (!DATA.nodes.length) {{
@@ -673,7 +651,6 @@ if (!DATA.nodes.length) {{
   el.appendChild(noMatch);
 
   const detail = document.getElementById('detail');
-  const byId = new Map((DATA.subsystems || []).map(s => [s.id, s]));
   function showDetail(n) {{
     const tags = flagsOf(n).map(f => '<span class="tag ' + f + '">' + f + '</span>').join('');
     let html = '<h2>' + esc(n.name) + '</h2>' + tags + '<dl>';
@@ -683,31 +660,9 @@ if (!DATA.nodes.length) {{
       html += row(label, v);
     }}
     html += row('Degree', String(n.degree)) + '</dl>';
-    const sub = byId.get(n.id);
-    if (sub) {{
-      html += section('Summary', sub.summary ? [sub.summary] : [], 'no summary recorded');
-      html += section('Entry points', sub.entry_points, 'none');
-      html += section('Critical files', sub.critical_files, 'none');
-      html += section('Neighbours', sub.neighbors, 'none');
-      // "computed" vs "empty" is the distinction the whole tool exists to keep.
-      // An un-derived field printed as "none" is a claim the producer never made.
-      html += section('Handoff paths', sub.handoff_paths,
-        DATA.meta && DATA.meta.handoff_paths_computed ? 'none' : 'not computed for this map');
-      for (const [role, files] of Object.entries(sub.role_files || {{}})) {{
-        html += section('Role · ' + role, files, 'none');
-      }}
-      if (!DATA.meta || !DATA.meta.role_files_computed) {{
-        html += '<dt>Role files</dt><dd class="sub">not computed for this map</dd>';
-      }}
-    }}
     detail.innerHTML = html;
   }}
   const row = (k, v) => v ? '<dt>' + k + '</dt><dd>' + esc(String(v)) + '</dd>' : '';
-  function section(label, items, empty) {{
-    if (!items || !items.length) return '<dt>' + label + '</dt><dd class="sub">' + empty + '</dd>';
-    return '<dt>' + label + '</dt><dd><ul>' +
-      items.map(i => '<li>' + esc(String(i)) + '</li>').join('') + '</ul></dd>';
-  }}
   function fitFiltered(nodes) {{
     const placed = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y));
     if (!placed.length) return;
@@ -808,9 +763,103 @@ if (!DATA.nodes.length) {{
     )
 }
 
+/// What a page's script reads off its payload that the payload does not carry.
+///
+/// A page that reads a key no producer emits renders nothing for it, and
+/// "nothing to report" is indistinguishable from "never computed" — the dead
+/// `unresolved_handoffs_total` note was exactly that. Each `(name, value)` root
+/// is a script variable bound to a JSON value (`DATA`, or `META` for
+/// `DATA.meta`); every `name.a.b` chain is walked through the value, and a
+/// step that names a key an object lacks is reported as `name.a.b`. A step
+/// into a non-object (an array's `.length`, a string's method) ends the walk.
+#[cfg(test)]
+pub(crate) fn page_reads_missing_from(
+    page: &str,
+    roots: &[(&str, &Value)],
+) -> std::collections::BTreeSet<String> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut missing = std::collections::BTreeSet::new();
+    for (name, root) in roots {
+        let needle = format!("{name}.");
+        let mut from = 0;
+        while let Some(found) = page[from..].find(&needle) {
+            let start = from + found;
+            from = start + needle.len();
+            if page[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_ident(c) || c == '.')
+            {
+                continue;
+            }
+            let mut path = (*name).to_string();
+            let mut current = *root;
+            let mut rest = &page[from..];
+            loop {
+                let len = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
+                if len == 0 {
+                    break;
+                }
+                let key = &rest[..len];
+                path.push('.');
+                path.push_str(key);
+                let Some(object) = current.as_object() else {
+                    break;
+                };
+                let Some(next) = object.get(key) else {
+                    missing.insert(path);
+                    break;
+                };
+                current = next;
+                rest = &rest[len..];
+                match rest.strip_prefix('.') {
+                    Some(after) => rest = after,
+                    None => break,
+                }
+            }
+        }
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page reads only what `render_html` puts in its payload. The
+    /// retired subsystem view left a note reading `unresolved_handoffs_total`
+    /// and a detail pane reading `subsystems` here, neither of which the code
+    /// graph payload has ever carried.
+    #[test]
+    fn every_key_the_page_reads_is_one_the_payload_carries() {
+        for symbols in [false, true] {
+            let options = VizOptions {
+                symbols,
+                ..Default::default()
+            };
+            let html = render_html(&graph(), &options);
+            let script = html
+                .split("const DATA = JSON.parse(")
+                .nth(1)
+                .expect("the page script");
+            let mut payload = build_payload(&graph(), &options);
+            payload["view"] = json!({});
+            let missing = page_reads_missing_from(script, &[("DATA", &payload)]);
+            assert!(missing.is_empty(), "the page reads {missing:?}");
+        }
+    }
+
+    #[test]
+    fn the_contract_check_reports_a_key_no_producer_emits() {
+        let payload = json!({"nodes": [], "meta": {"a": 1}});
+        let page = "DATA.nodes.length; DATA.meta.a; DATA.meta.b; DATA.gone; xDATA.no; META.c";
+        let missing =
+            page_reads_missing_from(page, &[("DATA", &payload), ("META", &payload["meta"])]);
+        assert_eq!(
+            missing.into_iter().collect::<Vec<_>>(),
+            vec!["DATA.gone", "DATA.meta.b", "META.c"]
+        );
+    }
 
     fn graph() -> Value {
         json!({

@@ -90,6 +90,42 @@ it("supports hosted runners without an external devmap CLI and reports that abse
   expect(result.stdout).toContain("CLI unavailable");
 });
 
+it("pins third-party actions to the commit their tag resolved to", () => {
+  const uses = [...workflow.matchAll(/^\s*uses:\s+(\S+)/gm)].map((match) => match[1]);
+  const floating = uses.filter((use) => !/@[0-9a-f]{40}$/.test(use));
+  expect(floating).toEqual([]);
+  for (const pin of [
+    // The stable branch's head. That branch's action.yml defaults `toolchain`
+    // to stable, so the pin freezes the action's code and keeps its behaviour.
+    "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable",
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+    "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7",
+    "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2",
+    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
+    "tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1",
+    "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+    "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0",
+  ]) {
+    expect(workflow).toContain(`uses: ${pin}`);
+  }
+});
+
+it("does not persist credentials from any checkout", () => {
+  const steps = workflow.split(/\n(?= {6}- )/);
+  const checkouts = steps.filter((step) => step.includes("uses: actions/checkout@"));
+  expect(checkouts).toHaveLength(5);
+  for (const step of checkouts) {
+    expect(step).toContain("persist-credentials: false");
+  }
+});
+
+it("does not run dependency scripts while the release job holds the GitHub token", () => {
+  const release = workflow.slice(workflow.indexOf("\n  release:"), workflow.indexOf("\n  attest:"));
+  expect(release).toContain("contents: write");
+  expect(release).toContain("run: bun install --frozen-lockfile --ignore-scripts");
+  expect(release).not.toContain("run: bun install --frozen-lockfile\n");
+});
+
 it("fails the release when any platform leg fails rather than publishing a partial draft", () => {
   const verify = workflow.slice(workflow.indexOf("\n  verify:"));
   expect(verify).toContain("if: always()");
@@ -109,7 +145,9 @@ it("attaches checksums and SBOMs after every installer and before finalize", () 
   const attest = workflow.slice(workflow.indexOf("\n  attest:"), workflow.indexOf("\n  verify:"));
   expect(attest).toContain("needs: [preflight, prepare, release]");
   expect(attest).toContain("ref: ${{ needs.preflight.outputs.commit }}");
-  expect(attest).toContain("uses: anchore/sbom-action@v0");
+  expect(attest).toContain(
+    "uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0",
+  );
   expect(attest).toContain("upload-release-assets: false");
   expect(attest).toContain("cargo cyclonedx --manifest-path src-tauri/Cargo.toml");
   expect(attest).toContain("run: node scripts/release-state.mjs attest");

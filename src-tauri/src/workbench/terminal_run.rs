@@ -1,5 +1,5 @@
 use super::{
-    announce, process_birth, query, receipts, terminal_command, terminal_launch, WorkbenchError,
+    announce, claude_hook, query, receipts, terminal_command, terminal_launch, WorkbenchError,
     WorkbenchState,
 };
 use crate::terminal::{
@@ -37,12 +37,7 @@ pub(super) fn parse(input: &str) -> Result<Launch, WorkbenchError> {
     }
     let launch: Launch = serde_json::from_str(input)
         .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
-    if launch.id.is_empty()
-        || launch.id.len() > 128
-        || !launch
-            .id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if !super::is_record_id(&launch.id)
         || launch.expected_revision != terminal_launch::PREPARED_REVISION
         || launch.rows == 0
         || launch.rows > 1000
@@ -78,6 +73,7 @@ pub(super) fn spawn<R: tauri::Runtime>(
     terminals: &TerminalSessions,
     state: &WorkbenchState,
     launch: Launch,
+    output: terminal::OutputSink,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     // One launch of this attempt at a time, and a second one waits for the
     // first rather than failing. The claim below is single-use and the
@@ -100,9 +96,13 @@ pub(super) fn spawn<R: tauri::Runtime>(
         state.with_store(|store| query(store, "runs.get", &json!({"id":launch.id}).to_string()))?;
     let source: Source = serde_json::from_value(response["item"].clone())
         .map_err(|e| WorkbenchError::new("protocol_error", e.to_string()))?;
-    if let Some(session) =
-        terminal::attach_tracked_session(terminals, &source.id, launch.rows, launch.cols)
-    {
+    if let Some(session) = terminal::attach_tracked_session(
+        terminals,
+        &source.id,
+        launch.rows,
+        launch.cols,
+        output.clone(),
+    ) {
         return Ok(session);
     }
     if source.state != "prepared" || source.revision != launch.expected_revision {
@@ -121,10 +121,13 @@ pub(super) fn spawn<R: tauri::Runtime>(
             .map_err(|message| WorkbenchError::new("protocol_error", message))?,
         None => defaults.model_for(&source.provider).cloned(),
     };
+    // Decided once, here, so the build is checked for the flags it is given.
+    let hook = claude_hook::for_launch(&source.provider);
     let options = terminal_command::LaunchOptions {
         notify: crate::tool_config::session_alerts().configure_agents,
         setting_sources: sources.as_deref(),
         model: recorded.as_ref(),
+        hook: hook.binary(),
     };
     terminal_command::check(
         &program,
@@ -136,7 +139,9 @@ pub(super) fn spawn<R: tauri::Runtime>(
     .inspect_err(|e| log::warn!(target: "workbench", "launch {}: refused by the CLI check after {}ms: {}", source.id, began.elapsed().as_millis(), e.code))?;
     log::info!(target: "workbench", "launch {}: checked after {}ms", source.id, began.elapsed().as_millis());
     let id = source.id.clone();
-    let outcome = start(app, terminals, state, launch, source, program, options);
+    let outcome = start(
+        app, terminals, state, launch, source, program, options, output,
+    );
     match &outcome {
         Ok(_) => {
             log::info!(target: "workbench", "launch {id}: started after {}ms", began.elapsed().as_millis())
@@ -148,6 +153,7 @@ pub(super) fn spawn<R: tauri::Runtime>(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start<R: tauri::Runtime>(
     app: &AppHandle<R>,
     terminals: &TerminalSessions,
@@ -156,6 +162,7 @@ fn start<R: tauri::Runtime>(
     source: Source,
     program: String,
     options: terminal_command::LaunchOptions<'_>,
+    output: terminal::OutputSink,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     let brief = terminal_command::BriefFile::create(&source.brief.markdown)?;
     let args = terminal_command::arguments(
@@ -192,7 +199,7 @@ fn start<R: tauri::Runtime>(
         }),
         run_id: source.id,
         owner,
-        _brief: brief,
+        _brief: Some(brief),
     });
     terminal::spawn_tracked_session(
         app,
@@ -202,6 +209,7 @@ fn start<R: tauri::Runtime>(
         launch.cols,
         program,
         args,
+        output,
         observer,
     )
     .map_err(|e| WorkbenchError::new("launch_error", e))
@@ -216,7 +224,54 @@ struct RunObserver<R: tauri::Runtime> {
     /// `receipts::apply`, shared with the replay of a receipt that storage
     /// refused.
     observed: Mutex<receipts::Observed>,
-    _brief: terminal_command::BriefFile,
+    /// The launch's brief, removed when the observer is. `None` for a run
+    /// adopted from an earlier app, whose brief went with that app.
+    _brief: Option<terminal_command::BriefFile>,
+}
+
+/// The observer for a task run whose terminal outlived the app that launched
+/// it: a terminal host kept it running, or recorded its exit while no app was
+/// there. What that app's observer had seen is read back from the run itself
+/// — its owner, its session and its process identity — so the exit goes
+/// through the same `receipts::apply` decision, under the same owner and
+/// the same request ids, as it would have.
+///
+/// `None` for a run the store cannot read or that has no owner: nothing can
+/// be recorded for it, and reconciliation decides it instead.
+pub(crate) fn adopted_observer<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    host: &WorkbenchState,
+    run_id: &str,
+) -> Option<Arc<dyn SessionObserver>> {
+    let response = host
+        .with_store(|store| query(store, "runs.get", &json!({"id": run_id}).to_string()))
+        .inspect_err(|e| log::warn!(target: "workbench", "run {run_id}: its terminal outlived its app, but the run could not be read: {}: {}", e.code, e.message))
+        .ok()?;
+    let item = &response["item"];
+    let owner = item["owner_id"]
+        .as_str()
+        .filter(|o| !o.is_empty())?
+        .to_owned();
+    let session = item["session_id"].as_str().unwrap_or_default().to_owned();
+    let start = match (item["process_id"].as_u64(), item["process_start"].as_str()) {
+        (Some(pid), Some(birth)) => u32::try_from(pid).ok().map(|pid| (pid, birth.to_owned())),
+        _ => None,
+    };
+    Some(Arc::new(RunObserver {
+        app: app.clone(),
+        host: host.clone(),
+        observed: Mutex::new(receipts::Observed {
+            run_id: run_id.to_owned(),
+            owner: owner.clone(),
+            session,
+            start,
+            exit: None,
+            spawn_failure: None,
+        }),
+        run_id: run_id.to_owned(),
+        owner,
+        _brief: None,
+    }))
 }
 
 impl<R: tauri::Runtime> RunObserver<R> {
@@ -268,11 +323,8 @@ impl<R: tauri::Runtime> SessionObserver for RunObserver<R> {
         announce(&self.app, &result);
         Ok(())
     }
-    fn started(&self, session: &str, pid: Option<u32>) -> Result<(), String> {
-        let pid = pid
-            .filter(|pid| *pid > 0)
-            .ok_or("PTY did not report a process ID")?;
-        let birth = process_birth::read(pid)?;
+    fn started(&self, session: &str, process: Result<(u32, String), String>) -> Result<(), String> {
+        let (pid, birth) = process?;
         self.observe(|observed| {
             observed.session = session.to_owned();
             observed.start = Some((pid, birth));
@@ -414,6 +466,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap_or_else(|e| {
             panic!(
@@ -425,7 +478,7 @@ mod tests {
         let waited = Instant::now();
         while !output.lock().unwrap().contains(&expected) {
             assert!(
-                waited.elapsed() < Duration::from_secs(30),
+                waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
                 "the agent did not start in {}: {}",
                 canonical.display(),
                 output.lock().unwrap()
@@ -464,11 +517,20 @@ mod tests {
         let first = state.0.terminal_launches.try_enter("run").unwrap();
         let (first_session, second) = std::thread::scope(|scope| {
             let handle = app.handle();
-            let waiter = scope.spawn(|| spawn(handle, &terminals, &state, launch()));
+            let waiter = scope.spawn(|| {
+                spawn(
+                    handle,
+                    &terminals,
+                    &state,
+                    launch(),
+                    crate::terminal::OutputSink::events(handle),
+                )
+            });
             let parked = Instant::now();
             while state.0.terminal_launches.waiting() == 0 {
                 assert!(
-                    parked.elapsed() < Duration::from_secs(10),
+                    parked.elapsed()
+                        < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
                     "the second launch never waited"
                 );
                 std::thread::sleep(Duration::from_millis(5));
@@ -481,6 +543,7 @@ mod tests {
                 source(&state),
                 program,
                 super::terminal_command::LaunchOptions::default(),
+                crate::terminal::OutputSink::events(app.handle()),
             )
             .unwrap();
             drop(first);
@@ -542,6 +605,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         let running = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -551,7 +615,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(':'));
-        let replay = spawn(app.handle(), &terminals, &state, launch()).unwrap();
+        let replay = spawn(
+            app.handle(),
+            &terminals,
+            &state,
+            launch(),
+            crate::terminal::OutputSink::events(app.handle()),
+        )
+        .unwrap();
         assert_eq!(replay.id, started.id);
         assert_eq!(
             state.request("runs.get", r#"{"id":"run"}"#).unwrap(),
@@ -574,7 +645,7 @@ mod tests {
                 break std::fs::read_to_string(path).unwrap();
             }
             assert!(
-                waited.elapsed() < Duration::from_secs(30),
+                waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
                 "the launch prompt never named the brief"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -605,7 +676,7 @@ mod tests {
         // nothing. The pid came from this test's own child moments ago.
         while unsafe { libc::kill(pid, 0) } == 0 {
             assert!(
-                waited.elapsed() < Duration::from_secs(120),
+                waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(120)),
                 "the pty child never exited after being told to finish"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -625,9 +696,15 @@ mod tests {
             "inbox"
         );
         assert_eq!(
-            spawn(app.handle(), &terminals, &state, launch())
-                .unwrap_err()
-                .code,
+            spawn(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                crate::terminal::OutputSink::events(app.handle()),
+            )
+            .unwrap_err()
+            .code,
             "launch_consumed"
         );
         let output = output.lock().unwrap().clone();
@@ -670,6 +747,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         state.shutdown();
@@ -715,15 +793,22 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .is_err());
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
         assert_eq!(saved["item"]["state"], "failed");
         assert!(saved["item"]["process_id"].is_null());
         assert_eq!(
-            spawn(app.handle(), &terminals, &state, launch())
-                .unwrap_err()
-                .code,
+            spawn(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                crate::terminal::OutputSink::events(app.handle()),
+            )
+            .unwrap_err()
+            .code,
             "launch_consumed"
         );
     }
@@ -749,6 +834,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .is_err());
         received.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -783,6 +869,7 @@ mod tests {
             source(&state),
             program,
             super::terminal_command::LaunchOptions::default(),
+            crate::terminal::OutputSink::events(app.handle()),
         )
         .unwrap();
         write_to_session(&terminals, &session.id, "finish\n").unwrap();
@@ -844,5 +931,130 @@ mod tests {
         assert_eq!(after["item"]["exit_code"], 7);
         assert_eq!(after["item"]["revision"], revision);
         assert!(!journal.exists());
+    }
+
+    /// AC: an agent that exits while no app is connected to its terminal host
+    /// gets its real exit status recorded in its run when the next app
+    /// connects. The first app goes away with the agent running; the agent
+    /// exits with 7 while nothing is connected; the host keeps the receipt;
+    /// the next app adopts the run and records the 7.
+    ///
+    /// The host is the real server (`host::server::serve`), on a thread of this
+    /// process rather than as `gitpulse-ptyd`: a unit test has no path to the
+    /// binary. `tests/terminal_host.rs` runs the binary itself.
+    #[test]
+    fn a_task_agent_that_exits_while_no_app_is_connected_gets_its_real_exit_recorded() {
+        use crate::terminal::host::{client::HostConfig, server};
+        let root = tempfile::tempdir().unwrap();
+        let state = fixture(root.path());
+        let dir = tempfile::Builder::new()
+            .prefix("ph")
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
+        let serving = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                server::serve(server::ServeConfig {
+                    dir,
+                    idle_exit: Duration::from_secs(2),
+                })
+            })
+        };
+        let socket = dir.path().join(crate::terminal::host::socket_name(
+            crate::terminal::host::PROTOCOL,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "the host never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Never started by these apps: the host above is already listening.
+        let config = HostConfig {
+            dir: dir.path().to_path_buf(),
+            binary: Some("/nonexistent/gitpulse-ptyd".into()),
+            idle_exit: None,
+            log_dir: None,
+        };
+        let release = root.path().join("release");
+        let program = script(
+            root.path(),
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done\nexit 7",
+                release.display()
+            ),
+        );
+        let run = |state: &WorkbenchState| state.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        {
+            let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+            let terminals = TerminalSessions::with_host(config.clone());
+            terminals.bind_app(app.handle());
+            start(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                source(&state),
+                program,
+                super::terminal_command::LaunchOptions::default(),
+                crate::terminal::OutputSink::events(app.handle()),
+            )
+            .unwrap();
+            assert_eq!(run(&state)["item"]["state"], "running");
+        } // This app is gone: its connection closes, its observer with it.
+        std::fs::write(&release, b"").unwrap();
+        let receipts = dir.path().join("receipts");
+        let exited = || {
+            std::fs::read_dir(&receipts)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    std::fs::read_to_string(e.path())
+                        .unwrap_or_default()
+                        .contains("{\"exit\"")
+                })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !exited() {
+            assert!(
+                Instant::now() < deadline,
+                "the host never recorded the exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            run(&state)["item"]["state"],
+            "running",
+            "nobody has recorded it yet"
+        );
+
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let terminals = TerminalSessions::with_host(config);
+        terminals.bind_app(app.handle());
+        {
+            let (handle, runs) = (app.handle().clone(), state.clone());
+            terminals.set_adopter(Arc::new(move |run_id: &str| {
+                super::adopted_observer(&handle, &runs, run_id)
+            }));
+        }
+        terminals.connect_host().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while run(&state)["item"]["state"] != "exited" {
+            assert!(
+                Instant::now() < deadline,
+                "the exit was never recorded: {}",
+                run(&state)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(run(&state)["item"]["exit_code"], 7);
+        // Recorded, so the host forgets it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while exited() {
+            assert!(Instant::now() < deadline, "the receipt was never forgotten");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(terminals);
+        assert_eq!(serving.join().unwrap(), server::exit_code::IDLE);
     }
 }

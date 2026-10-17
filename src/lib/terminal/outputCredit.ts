@@ -2,8 +2,8 @@
  * Frontend half of the PTY output window.
  *
  * Rust `OutputFlow.reserve` counts every emitted chunk until
- * `cmd_terminal_ack` subtracts it. The reader blocks, then kills the child,
- * when that debt sits for 30 seconds. Credit therefore has to be released
+ * `cmd_terminal_ack` subtracts it. The reader blocks when that debt sits
+ * for 30 seconds, then skips output (never the process) until it is repaid. Credit therefore has to be released
  * once for every chunk the view accepted, including a chunk the emulator
  * never paints: the view was already gone, or it was not open yet and the
  * hold reached the window. Releasing early, before an emulator exists, would
@@ -11,29 +11,20 @@
  *
  * The window size is the Rust constant. `outputCredit.test.ts` reads it.
  */
-export const OUTPUT_CREDIT_WINDOW = 256 * 1024;
-
-/** One native read. A reserved length outside this range is not a length. */
-export const MAX_TERMINAL_OUTPUT_CHUNK = 4096;
+export const OUTPUT_CREDIT_WINDOW = 512 * 1024;
 
 /**
- * The byte count the reader reserved, or null when the event cannot name one.
- * Zero, fractions, and anything above one read are refused: acknowledging them
- * would either be rejected or would shrink the window by the wrong amount.
+ * One output message on a session's channel. The reader coalesces what a
+ * program wrote in a burst into one message (up to this many bytes) because
+ * every message costs the webview a script and a fetch. The credit Rust
+ * reserved for a message is exactly its length, so no length travels beside
+ * the bytes; one longer than this is not a message the host sends and is
+ * repaid without being painted (`planTerminalOutput`). Pinned to Rust's
+ * `OUTPUT_CHUNK_BYTES` by `outputCredit.test.ts`.
  */
-export function reservedTerminalBytes(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isInteger(value)) return null;
-  if (value < 1 || value > MAX_TERMINAL_OUTPUT_CHUNK) return null;
-  return value;
-}
+export const MAX_TERMINAL_OUTPUT_CHUNK = 64 * 1024;
 
-export function decodeTerminalOutput(b64: string): Uint8Array {
-  if (typeof b64 !== "string") throw new Error("Terminal output was not base64");
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
-  return bytes;
-}
+const OVERSIZE = "Terminal output chunk exceeded its limit";
 
 export interface OutputView {
   /** An emulator exists and has not been disposed. */
@@ -155,44 +146,108 @@ export type OutputPlan =
   | { action: "paint"; token: PaintToken }
   | { action: "ack"; bytes: number; failure: string | null }
   | { action: "held" }
-  | { action: "overflow"; owed: OutputAck[]; failure: string }
-  | { action: "stop"; failure: string };
+  | { action: "overflow"; owed: OutputAck[]; failure: string };
 
 /**
- * Decide what one output event does to the credit window.
+ * Decide what one output message does to the credit window.
  *
- * A chunk the emulator cannot decode still occupied `reserved` bytes in
- * `OutputFlow`. Acknowledging that count is what keeps one bad frame from
- * stalling the reader. When the event does not name a usable length, the
- * caller has to stop the session: `flow.stop` is what wakes `reserve`.
- * Guessing the count from the base64 text would acknowledge the wrong number.
+ * Rust reserved exactly `bytes.length` for this message, so that is what is
+ * owed whatever becomes of it. A message longer than a read can make is not
+ * painted: it is repaid in full and reported. Repaying is what keeps one bad
+ * message from holding the reader's window shut until its stall timeout; it
+ * was previously dropped with its credit still outstanding.
  */
 export function planTerminalOutput(
   credit: ReturnType<typeof createOutputCredit>,
-  b64: string,
+  bytes: Uint8Array,
   sessionId: string,
-  reserved: unknown,
   view: OutputView,
 ): OutputPlan {
-  const reservedBytes = reservedTerminalBytes(reserved);
-  let decoded: Uint8Array;
-  try {
-    decoded = decodeTerminalOutput(b64);
-  } catch (err) {
-    const failure = `Invalid terminal output: ${err instanceof Error ? err.message : String(err)}`;
-    if (reservedBytes !== null) return { action: "ack", bytes: reservedBytes, failure };
-    return { action: "stop", failure };
+  if (bytes.length > MAX_TERMINAL_OUTPUT_CHUNK) {
+    return { action: "ack", bytes: bytes.length, failure: OVERSIZE };
   }
-  if (reservedBytes !== null && reservedBytes !== decoded.length) {
-    return {
-      action: "ack",
-      bytes: reservedBytes,
-      failure: "Terminal output length did not match its reserved credit",
-    };
-  }
-  const decision = credit.accept(decoded, sessionId, view);
+  const decision = credit.accept(bytes, sessionId, view);
   if (decision.action === "paint") return { action: "paint", token: decision.token };
   if (decision.action === "ack") return { action: "ack", bytes: decision.bytes, failure: null };
   if (decision.action === "held") return { action: "held" };
   return { action: "overflow", owed: decision.owed, failure: "Terminal output was dropped: the view was not open" };
+}
+
+/**
+ * Owed bytes at which acknowledgements are sent at once rather than at the
+ * next frame. A quarter of the window: whatever is being coalesced is never
+ * more than this, so the reader always has at least three quarters of
+ * `OutputFlow`'s window free and never waits on a frame that has not come.
+ */
+export const ACK_FLUSH_THRESHOLD = OUTPUT_CREDIT_WINDOW / 4;
+
+/**
+ * Upper bound on how long owed credit waits when no frame comes: a hidden
+ * window does not run animation frames, and a backgrounded terminal still
+ * paints (xterm's write callbacks are not frame-driven).
+ */
+export const ACK_FLUSH_BACKSTOP_MS = 50;
+
+/** Runs `flush` later; returns a cancel. */
+export type AckScheduler = (flush: () => void) => () => void;
+
+/** The next animation frame, or the backstop timer, whichever comes first. */
+export const frameAckScheduler: AckScheduler = (flush) => {
+  const raf = typeof globalThis.requestAnimationFrame === "function" ? globalThis.requestAnimationFrame : null;
+  const frame = raf ? raf(flush) : null;
+  const timer = setTimeout(flush, ACK_FLUSH_BACKSTOP_MS);
+  return () => {
+    if (frame !== null) globalThis.cancelAnimationFrame?.(frame);
+    clearTimeout(timer);
+  };
+};
+
+/**
+ * Coalesces `cmd_terminal_ack` calls.
+ *
+ * Every painted chunk (at most `MAX_TERMINAL_OUTPUT_CHUNK`) used to be
+ * acknowledged with its own IPC call. `OutputFlow::acknowledge` accepts any total up to what it
+ * has reserved, and the sum of released credit is by construction never more
+ * than that, so one call per session per frame carries the same credit.
+ * Owed credit is sent at once when any session reaches
+ * `ACK_FLUSH_THRESHOLD`, and `flush()` sends everything synchronously — the
+ * view's teardown calls it so no credit is left behind with the view.
+ */
+export function createAckCoalescer(
+  send: (sessionId: string, bytes: number) => void,
+  schedule: AckScheduler = frameAckScheduler,
+) {
+  const owed = new Map<string, number>();
+  let cancel: (() => void) | null = null;
+
+  function flush() {
+    if (cancel) {
+      const stop = cancel;
+      cancel = null;
+      stop();
+    }
+    if (owed.size === 0) return;
+    const rows = [...owed];
+    owed.clear();
+    for (const [sessionId, bytes] of rows) send(sessionId, bytes);
+  }
+
+  return {
+    /** Owe `bytes` to `sessionId`. Zero and negative counts are ignored. */
+    add(sessionId: string, bytes: number) {
+      if (!(bytes > 0)) return;
+      const total = (owed.get(sessionId) ?? 0) + bytes;
+      owed.set(sessionId, total);
+      if (total >= ACK_FLUSH_THRESHOLD) flush();
+      else if (!cancel) cancel = schedule(flush);
+    },
+    /** Send everything owed now. */
+    flush,
+    /** Bytes owed and not yet sent. */
+    owed(): number {
+      let total = 0;
+      for (const bytes of owed.values()) total += bytes;
+      return total;
+    },
+  };
 }

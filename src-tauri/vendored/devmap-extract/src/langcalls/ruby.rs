@@ -418,12 +418,26 @@ const METHOD_DEFINING_MACROS: &[&str] = &[
 fn methods_defined_without_def(scope: Node, source: &str) -> Option<HashSet<String>> {
     let mut names = HashSet::new();
     let mut gate = Some(scope);
+    // The nearest class or module declares its own `attr_*` / `define_method`
+    // names as methods (`langdecl::ruby::attribute_symbols`), so a send of one
+    // binds to that declaration and is no longer refused. A *farther* gate's
+    // macros stay refused: those methods belong to an outer class, which an
+    // inner one does not inherit from.
+    let mut nearest = true;
     while let Some(node) = gate {
         if matches!(node.kind(), "class" | "module" | "singleton_class") {
+            let declares_attributes = nearest && node.kind() != "singleton_class";
+            nearest = false;
             let completed = walk_scope(node, false, |child, _| match child.kind() {
                 "call" if is_method_defining_macro(child, source) => {
-                    if let Some(arguments) = child.child_by_field_name("arguments") {
-                        names.extend(literal_names(arguments, source));
+                    let declared = declares_attributes
+                        && !crate::langdecl::ruby::attribute_names(child, source).is_empty()
+                        && crate::treesitter::generic_enclosing_type(child, source)
+                            == get_child_text(node, "name", source);
+                    if !declared {
+                        if let Some(arguments) = child.child_by_field_name("arguments") {
+                            names.extend(literal_names(arguments, source));
+                        }
                     }
                 }
                 "alias" => {

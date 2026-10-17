@@ -16,15 +16,26 @@
 
 use serde_json::{json, Value};
 
+use super::budget;
 use super::uri::{self, Target, UriError};
 
-/// Ceiling on one resource document, in bytes of serialized JSON.
+/// Ceiling on one resource document, in bytes of the text as it is carried on
+/// the wire: after JSON escaping, which grows a quote or a control character
+/// two to six times.
 ///
 /// stdio has no backpressure: a 200 MB `insights` payload for a monorepo is
 /// written to the pipe in one `writeln!` and the client has to buffer all of
 /// it. Truncation here is always *reported* — never a silently shortened
 /// document that reads as complete.
-pub const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+///
+/// Below the frame by a quarter megabyte, which is what the response around the
+/// document (the envelope, the `uri`, the notice) may take. A cap equal to the
+/// frame could never fit it: any document near the cap overflowed, and the
+/// transport could only answer that with an error.
+pub const MAX_DOCUMENT_BYTES: usize = super::MAX_FRAME_BYTES - 256 * 1024;
+
+/// Room the notice appended to a cut document may take on the wire.
+const NOTICE_RESERVE_BYTES: usize = 512;
 
 /// A repository facet: one `gitpulse://<facet>{+repo_path}` template.
 struct Facet {
@@ -181,16 +192,20 @@ fn text_content(target_uri: &str, payload: Value) -> Value {
         json!({ "ok": false, "error": format!("result could not be serialized: {error}") })
             .to_string()
     });
-    let (text, truncated) = if text.len() > MAX_DOCUMENT_BYTES {
-        let mut cut = MAX_DOCUMENT_BYTES;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
+    // A character costs at most six bytes escaped, so a document under a sixth
+    // of the cap cannot overflow it and is not measured (the manifest is read
+    // on every `resources/read`, and counting its characters showed in the
+    // bench).
+    let (text, truncated) = if text.len() > MAX_DOCUMENT_BYTES / 6
+        && budget::escaped_len(&text) - 2 > MAX_DOCUMENT_BYTES
+    {
+        // Cut where the *escaped* prefix fits, leaving room for the notice.
+        let prefix = budget::escaped_prefix(&text, MAX_DOCUMENT_BYTES - NOTICE_RESERVE_BYTES);
         (
             format!(
-                "{}\n\n… truncated: document is {} bytes, capped at {}. \
-                 Use the equivalent tool with a narrower argument to read it in full.",
-                &text[..cut],
+                "{prefix}\n\n… truncated: document is {} bytes, capped at {} bytes as carried \
+                 on the wire. Use the equivalent tool with a narrower argument to read it \
+                 in full.",
                 text.len(),
                 MAX_DOCUMENT_BYTES
             ),
@@ -214,6 +229,11 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             "name": super::SERVER_NAME,
             "version": super::server_version(),
             "storeSchemaVersion": crate::codeintel::SUPPORTED_STORE_SCHEMA,
+            // The two dc-store schemas this build embeds, so a cross-app check
+            // can ask an installed binary rather than trust the source it
+            // might not have been built from (scripts/check-schema-parity.mjs).
+            "dcStoreSchemaVersion": dc_store::SCHEMA_VERSION,
+            "workbenchSchemaVersion": dc_store::workbench::WORKBENCH_SCHEMA,
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
             // Derived from the tool annotations, so it cannot claim "read-only"
@@ -261,6 +281,57 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
     }
 }
 
+/// One page of the ledger from `cursor`, shared by `gitpulse_ledger_events` and
+/// the `ledger` resource so the two cannot drift.
+///
+/// `tail` pages *forward* from a cursor — deliberately, so a consumer holding
+/// the last id it saw gets the same answer whether it has been listening for
+/// an hour or just opened. `returned` says how many came back, `truncated` is
+/// true only when more events really follow (an exactly-full final page is not
+/// truncated), and `next_cursor` is what to pass to get them.
+///
+/// A page is bounded in bytes as well as rows: each row is cut field by field
+/// ([`crate::ledger::LedgerEvent::bounded`]) and the page ends at the last row
+/// that fits [`crate::ledger::PAGE_MAX_BYTES`], so a thousand heavy rows come
+/// back as several pages whose `next_cursor` continues without a gap.
+pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, String> {
+    match crate::ledger::tail_readonly_page(anchor, cursor, limit, crate::ledger::PAGE_MAX_BYTES)
+        .map_err(|e| e.to_string())?
+    {
+        Some((events, byte_capped)) => {
+            let next_cursor = events.last().map(|event| event.id);
+            // A page cut for its size always has more behind it. Otherwise a
+            // full page might be the last one: one more row of lookahead
+            // settles it, and only a full page pays for it.
+            let truncated = byte_capped
+                || match next_cursor {
+                    Some(last) if events.len() as u32 >= limit => {
+                        !crate::ledger::tail_readonly(anchor, last, 1)
+                            .map_err(|e| e.to_string())?
+                            .unwrap_or_default()
+                            .is_empty()
+                    }
+                    _ => false,
+                };
+            Ok(json!({
+                "ok": true,
+                "returned": events.len(),
+                "truncated": truncated,
+                "next_cursor": next_cursor,
+                "events": events,
+            }))
+        }
+        // No ledger is not an empty ledger, and must not read as one.
+        None => Ok(json!({
+            "ok": false,
+            "error": "no ledger in this repository yet; nothing has been recorded",
+            "returned": 0,
+            "truncated": false,
+            "events": [],
+        })),
+    }
+}
+
 /// The composed repository status document.
 ///
 /// The tool dispatch calls this too — it is the one shape that genuinely had
@@ -270,6 +341,10 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     // The read-only variant: the creating one opens the database (which makes
     // it) and runs the legacy consolidation (which migrates rows), neither of
     // which a tool annotated `readOnlyHint: true` may do to someone's repo.
+    // `?` is the repository boundary: an untrusted, missing or unrelated path
+    // is refused whole. A ledger that exists but cannot be read is not that —
+    // `status_readonly` reports it inside the ledger facet (`recording: false`
+    // plus `error`), so the worktree and code-graph facets still answer.
     let ledger_status = crate::ledger::bindings::repository_status_readonly(repo)
         .map_err(|error| error.to_string())?;
     let codeintel_status = crate::codeintel::status(repo);
@@ -326,25 +401,13 @@ fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
         "changes" => Ok(json!(crate::insights::active_changes(repo, None, None))),
         "context" => Ok(json!(crate::insights::change_context(repo, None))),
         "ledger" => {
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| ReadError::Internal(error.to_string()))?;
-            match crate::ledger::tail_readonly(&address.anchor, 0, super::LEDGER_DEFAULT_LIMIT)
-                .map_err(|error| ReadError::Internal(error.to_string()))?
-            {
-                Some(events) => Ok(json!({
-                    "ok": true, "returned": events.len(), "events": events
-                })),
-                // No ledger is not an empty ledger, and must not read as one.
-                None => Ok(json!({
-                    "ok": false,
-                    "error": "no ledger in this repository yet; nothing has been recorded",
-                    "returned": 0,
-                    "events": [],
-                })),
-            }
+            ledger_page(&address.anchor, 0, super::LEDGER_DEFAULT_LIMIT)
+                .map_err(ReadError::Internal)
         }
         "tasks" => {
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| ReadError::Internal(error.to_string()))?;
             Ok(json!(crate::tasks::view(&address.anchor)))
         }
@@ -477,6 +540,93 @@ mod tests {
         assert!(text.len() < MAX_DOCUMENT_BYTES + 4096);
     }
 
+    /// The frame is measured on the wire, where JSON escaping grows a quote or
+    /// a control character 2-6x. A document capped on its raw length always
+    /// overflowed the frame once escaped, which ended the session.
+    #[test]
+    fn a_document_that_escapes_to_more_than_the_frame_is_delivered_truncated() {
+        const FRAME: usize = 4 * 1024 * 1024;
+        for payload in [
+            "\"".repeat(3 * 1024 * 1024),
+            "\u{1}".repeat(3 * 1024 * 1024),
+            "é".repeat(3 * 1024 * 1024),
+            "😀".repeat(1024 * 1024 + 7),
+        ] {
+            let contents = vec![text_content(
+                "gitpulse://insights/tmp/x",
+                json!({ "blob": payload }),
+            )];
+            let response = super::super::JsonRpcResponse {
+                jsonrpc: "2.0",
+                id: json!(1),
+                result: Some(json!({ "resultType": "complete", "contents": contents })),
+                error: None,
+            };
+            let wire = serde_json::to_string(&response).unwrap().len() + 1;
+            assert!(
+                wire <= FRAME,
+                "a truncated document is {wire} bytes on the wire"
+            );
+            assert!(
+                contents[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("… truncated"),
+                "the truncation is not announced"
+            );
+        }
+        // The manifest is far below the cap and stays whole JSON.
+        let manifest = read("gitpulse://server/manifest").expect("manifest reads");
+        assert_eq!(manifest[0]["mimeType"], "application/json");
+    }
+
+    /// A row written before the append cap existed can hold a megabyte in one
+    /// field. The page that carries it is bounded per row, not per page.
+    #[test]
+    fn a_ledger_row_stored_before_the_cap_comes_back_capped() {
+        use crate::ledger::{self, ActorKind, Draft, Outcome};
+        use crate::procguard::LockedSpawn;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", &repo])
+            .output_locked()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        crate::test_support::trust_repo(dir.path());
+        let anchor = ledger::bindings::repository_address(&repo)
+            .expect("address")
+            .anchor;
+        let heavy = json!({ "note": "n".repeat(1024 * 1024), "keep": "small" }).to_string();
+        ledger::record(Draft {
+            repo_path: anchor.clone(),
+            action: "session.command".into(),
+            actor_kind: Some(ActorKind::Agent),
+            outcome: Some(Outcome::Ok),
+            argv_json: Some(json!(["echo", "a".repeat(512 * 1024)]).to_string()),
+            detail_json: Some(heavy),
+            ..Default::default()
+        })
+        .expect("recorded");
+
+        let page = ledger_page(&anchor, 0, 10).expect("page");
+        let size = page.to_string().len();
+        assert!(size < 128 * 1024, "one heavy row made a {size} byte page");
+        let event = &page["events"][0];
+        let argv: Value = serde_json::from_str(event["argv_json"].as_str().unwrap())
+            .expect("argv_json stays JSON");
+        assert!(argv.is_array(), "argv_json stays an array: {argv}");
+        let detail: Value = serde_json::from_str(event["detail_json"].as_str().unwrap())
+            .expect("detail_json stays JSON");
+        assert_eq!(detail["keep"], "small");
+        assert!(
+            detail["gitpulse_truncated"]["keys"]
+                .as_array()
+                .is_some_and(|keys| keys.iter().any(|key| key == "note")),
+            "the cut names what it removed: {detail:.200}"
+        );
+    }
+
     #[test]
     fn a_document_under_the_cap_is_untouched_json() {
         let content = text_content("gitpulse://server/health", json!({ "a": 1 }));
@@ -518,6 +668,11 @@ mod tests {
             parsed["storeSchemaVersion"],
             crate::codeintel::SUPPORTED_STORE_SCHEMA
         );
+        assert_eq!(parsed["dcStoreSchemaVersion"], dc_store::SCHEMA_VERSION);
+        assert_eq!(
+            parsed["workbenchSchemaVersion"],
+            dc_store::workbench::WORKBENCH_SCHEMA
+        );
     }
 
     #[test]
@@ -538,5 +693,92 @@ mod tests {
         // `gitpulse://server/...` is parsed by the `server` authority, so a facet
         // called `server` would be unreachable.
         assert!(!facet_names().contains(&"server"));
+    }
+
+    fn trusted_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::test_support::git_in(dir.path(), &["init", "-q"]);
+        crate::test_support::trust_repo(dir.path());
+        let repo = dir.path().canonicalize().expect("canonical");
+        let repo = repo.to_string_lossy().into_owned();
+        (dir, repo)
+    }
+
+    fn record_events(repo: &str, count: usize) {
+        for _ in 0..count {
+            crate::ledger::append(crate::ledger::Draft {
+                repo_path: repo.to_string(),
+                action: "git.commit".to_string(),
+                actor_kind: Some(crate::ledger::ActorKind::Human),
+                outcome: Some(crate::ledger::Outcome::Ok),
+                ..Default::default()
+            })
+            .expect("append");
+        }
+    }
+
+    #[test]
+    fn the_ledger_resource_pages_like_the_tool() {
+        let (_dir, repo) = trusted_repo();
+        record_events(&repo, 60);
+        let page = repo_facet("ledger", &repo).expect("ledger facet");
+        assert_eq!(page["returned"], 50, "{page}");
+        assert_eq!(page["truncated"], true, "{page}");
+        let next = page["next_cursor"].as_i64().expect("next_cursor");
+        assert_eq!(next, 50);
+        let rest = ledger_page(&repo, next, 50).expect("second page");
+        assert_eq!(rest["returned"], 10);
+        assert_eq!(rest["truncated"], false);
+    }
+
+    #[test]
+    fn an_exactly_full_final_page_is_not_truncated() {
+        let (_dir, repo) = trusted_repo();
+        record_events(&repo, 3);
+        let full = ledger_page(&repo, 0, 3).expect("page");
+        assert_eq!(full["returned"], 3);
+        assert_eq!(full["truncated"], false, "{full}");
+        let short = ledger_page(&repo, 0, 2).expect("page");
+        assert_eq!(short["truncated"], true, "{short}");
+        assert_eq!(short["next_cursor"], 2);
+    }
+
+    #[test]
+    fn reading_the_ledger_resource_creates_nothing() {
+        let (dir, repo) = trusted_repo();
+        let page = repo_facet("ledger", &repo).expect("ledger facet");
+        assert_eq!(page["ok"], false, "{page}");
+        assert!(
+            !dir.path().join(".devcouncil").exists(),
+            "a resource read created the ledger"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_that_cannot_be_read_degrades_one_facet_not_the_status() {
+        let (dir, repo) = trusted_repo();
+        let state = dir.path().join(".devcouncil");
+        std::fs::create_dir(&state).expect("state dir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(
+            state.join("ledger.sqlite"),
+            b"this is not a sqlite database at all",
+        )
+        .expect("corrupt ledger");
+        let status = status_document(&repo).expect("the status call must not fail whole");
+        assert_eq!(status["ledger"]["recording"], false, "{status}");
+        assert!(
+            !status["ledger"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "{status}"
+        );
+        assert!(status["worktrees"].is_object(), "{status}");
+        assert!(status["codeintel"].is_object(), "{status}");
     }
 }

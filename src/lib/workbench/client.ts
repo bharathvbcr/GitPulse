@@ -1,12 +1,27 @@
+import { listen } from "@tauri-apps/api/event";
+import { isTauri } from "../platform";
 import { invoke } from "../ipc/invoke";
+import { createWorkbenchChanges, type WorkbenchSubscriber } from "./changes";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";
+import type { ProposalMethod } from "./proposals";
 import { isSessionId } from "../terminal/tabs";
 import type { ModelChoice as LaunchModelChoice } from "../terminal/agentDefaults";
 import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
+export type { WorkbenchChange, WorkbenchSubscriber } from "./changes";
+
+const workbenchChanges = createWorkbenchChanges({ listen, explain: (cause) => explainError(cause) });
+/**
+ * Follow the host's `workbench-changed` events through the one shared
+ * subscription (`changes.ts`): each write reaches a subscriber once. Outside
+ * the desktop host there is no event, and nothing is subscribed.
+ */
+export function subscribeWorkbenchChanges(subscriber: WorkbenchSubscriber): () => void {
+  return isTauri() ? workbenchChanges.subscribe(subscriber) : () => {};
+}
 
 export { STATUSES, STATUS_LABELS, asTaskStatus, PERMISSION_MODES, AGENT_PROVIDERS, asAgentProvider } from "./vocabulary";
 export type { TaskStatus, PermissionMode, RunKind, AgentProvider } from "./vocabulary";
@@ -31,6 +46,11 @@ export interface ChecklistEntry { text: string; done: boolean }
 /** The store's caps (dc-store `workbench/items.rs`). */
 export const MAX_CHECKLIST = 128, MAX_CHECKLIST_TEXT = 4096, MAX_TASK_LINKS = 64;
 export type EnhancementField = "title" | "description";
+/** What a refinement proposal (dc-store schema 12) may propose; accepting selects among them. */
+export const REFINE_PARTS = ["acceptance_criteria", "split_into", "duplicate_of"] as const;
+export type RefinePart = (typeof REFINE_PARTS)[number];
+/** A task field a person can lock against Manvi: `acceptance_criteria` joined the text fields in schema 12. */
+export type LockableField = EnhancementField | "acceptance_criteria";
 export const ENHANCEMENT_STATES = ["pending", "running", "cancel_requested", "ready", "failed", "cancelled", "interrupted", "dismissed", "accepted", "undone"] as const;
 export type EnhancementState = (typeof ENHANCEMENT_STATES)[number];
 export interface EnhancementSummary extends RecordVersion {
@@ -46,7 +66,7 @@ export interface AutomationSettings extends RecordVersion { enabled: boolean; pr
 export const AUTOMATIC_STATES = ["not_started", "checking", "idle", "disabled", "waiting", "generating", "stopping", "paused", "stopped"] as const;
 export interface AutomaticStatus { state: typeof AUTOMATIC_STATES[number]; reason: string; task_id: string; proposal_id: string; next_check_at: number }
 export type EnhancementMutation = "enhancements.create" | "enhancements.generate" | "enhancements.accept" | "enhancements.dismiss" | "enhancements.undo" | "enhancements.recover" | "enhancements.revise";
-export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; checklist: ChecklistEntry[]; links: TaskLink[]; locked_fields?: EnhancementField[]; logs?: string }
+export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; checklist: ChecklistEntry[]; links: TaskLink[]; locked_fields?: LockableField[]; logs?: string }
 export interface BriefReference extends RecordVersion { name: string }
 export interface TaskBrief extends RecordVersion { format_version: 1; task: Task; repositories: BriefReference[]; workspace: BriefReference | null; markdown: string }
 export const RUN_STATES = ["prepared", "starting", "running", "exited", "failed", "cancelled", "unresolved"] as const;
@@ -59,6 +79,8 @@ export interface TaskRun extends RecordVersion {
   provider: AgentProvider; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
   cwd: string; created_at: number; expires_at: number; session_id: string | null;
   exit_code: number | null; reason: string; outcome_uncertain: boolean;
+  /** The checkout's Git directories as preparation observed them; the store's key for "this checkout is taken". */
+  git_dir?: string; git_common_dir?: string;
   /** The model fields this attempt was launched with; null when it used the launcher's own default. */
   model_choice?: RecordedModelChoice | null;
 }
@@ -82,7 +104,7 @@ export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at">;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -361,19 +383,34 @@ function links(value: unknown): TaskLink[] {
     return { kind, item_id: id };
   });
 }
-function lockFields(value: unknown): EnhancementField[] {
+function distinct(value: unknown, max: number): string[] {
   const fields = strings(value);
-  if (fields.length > 2 || new Set(fields).size !== fields.length) return invalid();
-  return fields.map((field) => field === "title" || field === "description" ? field : invalid());
+  if (fields.length > max || new Set(fields).size !== fields.length) return invalid();
+  return fields;
+}
+function lockFields(value: unknown): EnhancementField[] {
+  return distinct(value, 2).map((field) => field === "title" || field === "description" ? field : invalid());
+}
+function taskLocks(value: unknown): LockableField[] {
+  return distinct(value, 3).map((field) => field === "title" || field === "description" || field === "acceptance_criteria" ? field : invalid());
+}
+function refineParts(value: unknown): RefinePart[] {
+  return distinct(value, REFINE_PARTS.length).map((part) => REFINE_PARTS.find((known) => known === part) ?? invalid());
 }
 export function task(value: unknown): Task {
   const raw = object(value);
   const logs = raw.logs === undefined ? undefined : text(raw.logs);
   if (logs !== undefined && (logs.includes("\0") || new TextEncoder().encode(logs).length > 1024 * 1024)) return invalid();
-  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), checklist: checklist(raw.checklist), links: links(raw.links), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: lockFields(raw.locked_fields) }) };
+  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), checklist: checklist(raw.checklist), links: links(raw.links), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: taskLocks(raw.locked_fields) }) };
+}
+/** Stored proposals are text (title/description) or, from schema 12, refinements; a body written before it has no kind. */
+export function enhancementKind(value: unknown): "text" | "refine" {
+  const kind = object(value).kind;
+  return kind === undefined || kind === "text" ? "text" : kind === "refine" ? "refine" : invalid();
 }
 export function enhancementSummary(value: unknown): EnhancementSummary {
   const raw = object(value);
+  if (enhancementKind(raw) !== "text") return invalid();
   const state = ENHANCEMENT_STATES.find((state) => state === raw.state);
   const fields = lockFields(raw.fields);
   const taskID = text(raw.task_id), sourceRevision = integer(raw.source_revision);
@@ -418,6 +455,32 @@ export function enhancement(value: unknown): Enhancement {
   if ((summary.edited_fields.length && original === null) || (original && summary.fields.some((field) => (original[field] !== proposed[field]) !== summary.edited_fields.includes(field)))) return invalid();
   return { ...summary, source, proposed, original_proposed: original, rationale: raw.rationale === undefined ? "" : text(raw.rationale) };
 }
+/** A stored refinement proposal, as the review of it needs it. */
+export interface StoredRefinement extends RecordVersion {
+  task_id: string; source_revision: number; state: EnhancementState; fields: RefinePart[]; accepted_fields: RefinePart[];
+  created_item_ids: string[]; applied_task_revision: number | null;
+  proposed: { acceptance_criteria: string[]; split_into: { title: string; description: string }[]; duplicate_of: { id: string; reason: string }[] };
+}
+export function storedRefinement(value: unknown): StoredRefinement {
+  const raw = object(value);
+  if (enhancementKind(raw) !== "refine") return invalid();
+  const state = ENHANCEMENT_STATES.find((state) => state === raw.state);
+  const taskID = text(raw.task_id), sourceRevision = integer(raw.source_revision), fields = refineParts(raw.fields);
+  const proposed = raw.proposed === undefined ? {} : object(raw.proposed);
+  const list = (value: unknown): unknown[] => value === undefined ? [] : Array.isArray(value) && value.length <= 64 ? value : invalid();
+  const ids = list(raw.created_item_ids).map(text);
+  if (!state || !fields.length || !sourceRevision || !/^[A-Za-z0-9_-]{1,128}$/.test(taskID) || ids.some((id) => !/^[A-Za-z0-9_-]{1,128}$/.test(id))) return invalid();
+  return {
+    ...version(raw), task_id: taskID, source_revision: sourceRevision, state, fields,
+    accepted_fields: raw.accepted_fields === undefined ? [] : refineParts(raw.accepted_fields),
+    created_item_ids: ids, applied_task_revision: raw.applied_task_revision === undefined ? null : integer(raw.applied_task_revision),
+    proposed: {
+      acceptance_criteria: list(proposed.acceptance_criteria).map(text),
+      split_into: list(proposed.split_into).map((entry) => { const row = object(entry); return { title: text(row.title), description: row.description === undefined ? "" : text(row.description) }; }),
+      duplicate_of: list(proposed.duplicate_of).map((entry) => { const row = object(entry); return { id: text(row.id), reason: row.reason === undefined ? "" : text(row.reason) }; }),
+    },
+  };
+}
 export function page<T>(value: unknown, decode: (raw: unknown) => T): Page<T> {
   const raw = object(value);
   if (raw.ok !== true || !Array.isArray(raw.items) || raw.items.length > 200) return invalid();
@@ -431,7 +494,7 @@ export function explainError(error: unknown): string {
   return typeof error === "string" ? error : "Task storage is unavailable. Try again.";
 }
 export function newID(): string { return crypto.randomUUID(); }
-export async function request(method: WorkbenchMethod, input: Record<string, unknown>): Promise<unknown> {
+export async function request(method: WorkbenchMethod | ProposalMethod, input: Record<string, unknown>): Promise<unknown> {
   try { return decodeJSON(await invoke<unknown>("cmd_workbench_request", { method, input: JSON.stringify(input) })); }
   catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : "transport_error";
@@ -470,7 +533,9 @@ export function taskRun(value: unknown): TaskRun {
     task_id: text(raw.task_id), source_revision: source, task_title: text(raw.task_title), repository_id: text(raw.repository_id), provider: named, permission_mode: permission, state,
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
     exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain),
-    ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }) };
+    ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }),
+    ...(raw.git_dir === undefined ? {} : { git_dir: text(raw.git_dir) }),
+    ...(raw.git_common_dir === undefined ? {} : { git_common_dir: text(raw.git_common_dir) }) };
 }
 /** A run's recorded model fields. Absent on attempts stored before schema 11. */
 function modelChoice(value: unknown): RecordedModelChoice | null {
@@ -496,6 +561,20 @@ export async function launchManagedRun(id: string): Promise<TaskRun> {
 export async function stopManagedRun(id: string): Promise<void> {
   const result = object(await request("runs.stop_managed", {id}));
   if (result.ok !== true) invalid();
+}
+/** The Git identity of the checkout holding a directory, by the probe a preparation records. */
+export interface CheckoutIdentity { cwd: string; git_dir: string; git_common_dir: string }
+/**
+ * Asks the host which checkout holds `path`, so "is it taken" can be asked by
+ * the key the store refuses on (`git_dir`) — not by the directory, which may
+ * be a subfolder of the checkout another attempt is working in.
+ */
+export async function checkoutIdentity(path: string): Promise<CheckoutIdentity> {
+  const raw = object(await request("runs.checkout_identity", { repo_path: path }));
+  if (raw.ok !== true) return invalid();
+  const cwd = text(raw.cwd), gitDir = text(raw.git_dir), commonDir = text(raw.git_common_dir);
+  if (!cwd || !gitDir || !commonDir) return invalid();
+  return { cwd, git_dir: gitDir, git_common_dir: commonDir };
 }
 export async function getTaskRun(id: string): Promise<TaskRun> {
   const run = record(await request("runs.get", { id }), taskRun);
@@ -598,8 +677,10 @@ export async function relinkRepository(repo: Repository, path: string, requestId
   const saved = repository(raw.repository);
   return saved.id === repo.id && saved.revision === repo.revision + 1 ? saved : invalid();
 }
-export async function listRepositories(cursor?: string): Promise<Page<Repository>> { return page(await request("repositories.list", { limit: 200, ...(cursor ? { cursor } : {}) }), repository); }
-export async function listWorkspaces(cursor?: string): Promise<Page<WorkspaceCard>> { return page(await request("workspaces.list", { limit: 200, include_archived: true, ...(cursor ? { cursor } : {}) }), workspaceCard); }
+/** Rows per `repositories.list` / `workspaces.list` page: the store's maximum. */
+export const NAVIGATOR_PAGE_SIZE = 200;
+export async function listRepositories(cursor?: string): Promise<Page<Repository>> { return page(await request("repositories.list", { limit: NAVIGATOR_PAGE_SIZE, ...(cursor ? { cursor } : {}) }), repository); }
+export async function listWorkspaces(cursor?: string): Promise<Page<WorkspaceCard>> { return page(await request("workspaces.list", { limit: NAVIGATOR_PAGE_SIZE, include_archived: true, ...(cursor ? { cursor } : {}) }), workspaceCard); }
 export async function getWorkspace(id: string): Promise<Workspace> { return record(await request("workspaces.get", { id }), workspace); }
 export async function getTask(id: string): Promise<Task> { return record(await request("items.get", { id }), task); }
 export async function getTaskBrief(id: string, expectedRevision: number): Promise<TaskBrief> {
@@ -608,8 +689,15 @@ export async function getTaskBrief(id: string, expectedRevision: number): Promis
   return brief;
 }
 export async function getEnhancement(id: string): Promise<Enhancement> { return record(await request("enhancements.get", { id }), enhancement); }
+/** The stored refinement a Manvi refine reply named (`enhancement_id`): its revision is what accepting it is conditional on. */
+export async function getRefinement(id: string): Promise<StoredRefinement> { return record(await request("enhancements.get", { id }), storedRefinement); }
+/** A page of summaries with refinement proposals left out: those are reviewed in the refine panel, not as text suggestions. */
+function textPage(value: unknown): Page<EnhancementSummary> {
+  const rows = page(value, (raw) => enhancementKind(raw) === "text" ? enhancementSummary(raw) : null);
+  return { ...rows, items: rows.items.filter((row): row is EnhancementSummary => row !== null) };
+}
 export async function listEnhancements(taskID: string, cursor?: string): Promise<Page<EnhancementSummary>> {
-  return page(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, ...(cursor ? { cursor } : {}) }), enhancementSummary);
+  return textPage(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, ...(cursor ? { cursor } : {}) }));
 }
 /** States in which a proposal still has a worker on it. */
 export const LIVE_ENHANCEMENT_STATES = ["pending", "running", "cancel_requested"] as const satisfies readonly EnhancementState[];
@@ -625,7 +713,7 @@ export const ACTIVE_ENHANCEMENT_STATES = [...LIVE_ENHANCEMENT_STATES, "ready"] a
  * generation start beside it.
  */
 export async function latestEnhancement(taskID: string, states: readonly EnhancementState[]): Promise<EnhancementSummary | null> {
-  const result = page(await request("enhancements.list", { task_id: taskID, newest: true, limit: 1, states: [...states] }), enhancementSummary);
+  const result = textPage(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, states: [...states] }));
   return result.items[0] ?? null;
 }
 export async function changeEnhancement(method: EnhancementMutation, input: Record<string, unknown>): Promise<Enhancement> {
@@ -654,13 +742,6 @@ export async function completeEnhancement(input: {
   failure?: string;
 }): Promise<Enhancement> {
   return record(await request("enhancements.complete", input), enhancement);
-}
-/** Start generation for a pending enhancement; optional model selects the sidecar env. */
-export async function generateEnhancement(
-  input: { id: string; request_id: string; expected_revision: number },
-  selection?: ModelSelection | null,
-): Promise<Enhancement> {
-  return changeEnhancement("enhancements.generate", { ...input, ...selectionWire(selection) });
 }
 export async function enhancementConfiguration(selection?: ModelSelection | null): Promise<EnhancementConfiguration> {
   const raw = object(await request("enhancements.configuration", selectionWire(selection)));
@@ -821,7 +902,16 @@ export async function automaticQueueCount(): Promise<number> {
     return { id: text(raw.id), not_before_ms: integer(raw.not_before_ms) };
   }).total;
 }
-type AutomaticUpdate = { status: AutomaticStatus | null; error: string };
+export type AutomaticUpdate = { status: AutomaticStatus | null; error: string };
+/**
+ * Whether two published updates say the same thing to a reader: the state,
+ * which task and proposal it is on, and the error. The status poll republishes
+ * every 2 s while enhancement is busy; a countdown or a reworded reason is not
+ * a change a list of attention should be re-read for.
+ */
+export function sameAutomaticUpdate(a: AutomaticUpdate, b: AutomaticUpdate): boolean {
+  return a.error === b.error && a.status?.state === b.status?.state && a.status?.task_id === b.status?.task_id && a.status?.proposal_id === b.status?.proposal_id;
+}
 let automaticUpdate: AutomaticUpdate = { status: null, error: "" };
 const automaticListeners = new Set<(value: AutomaticUpdate) => void>();
 const AUTOMATIC_REFRESH_MS = 2_000;
@@ -920,4 +1010,57 @@ export function taskBrief(value: unknown): TaskBrief {
   const workspace = raw.workspace === null ? null : briefReference(raw.workspace);
   if ((workspace?.id ?? null) !== full.home_workspace_id) return invalid();
   return { ...saved, format_version: 1, task: full, repositories, workspace, markdown };
+}
+
+/** Manvi's `work.tasks.suggest`: which open tasks to start next, ranked, with the reason for each. */
+export interface TaskSuggestionSignal { name: string; points: number; detail: string }
+export interface TaskSuggestion { rank: number; id: string; title: string; status: TaskStatus; priority: number; score: number; reason: string; signals: TaskSuggestionSignal[] }
+export interface TaskSuggestions {
+  generated_at: number;
+  suggestions: TaskSuggestion[];
+  blocked: { id: string; title: string; blocked_by: string[] }[];
+  /**
+   * `blocked` is tasks an open task is known to block. `unread` is tasks left out because their links were
+   * never read; Manvi builds before the unread count existed fold them into `blocked`, so it is 0 there.
+   */
+  excluded: { in_progress: number; review: number; duplicate: number; blocked: number; unread: number; filtered: number };
+  /**
+   * False when a bound cut the read or any open task's links were not read: the list is then a ranking of
+   * what was read. `unhydrated` counts open tasks, in any column, whose links were not read.
+   */
+  board: { scanned: number; complete: boolean; unhydrated: number };
+  verification: { checked: number; unchecked: number; failed: number };
+  candidates: number;
+}
+export interface SuggestParams { limit?: number; max_priority?: number; repository_id?: string }
+export const MAX_SUGGESTIONS = 20;
+function suggestion(value: unknown): TaskSuggestion {
+  const raw = object(value);
+  const priority = integer(raw.priority), status = text(raw.status);
+  // Manvi builds before the fix sent `null` for a task that earned no points; that is no signals, not a bad answer.
+  const signals = raw.signals === null ? [] : raw.signals;
+  if (priority > 3 || !(STATUSES as readonly string[]).includes(status) || !Array.isArray(signals) || signals.length > 32) return invalid();
+  return {
+    rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status: status as TaskStatus, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
+    reason: text(raw.reason),
+    signals: signals.map((entry) => { const signal = object(entry); return { name: text(signal.name), points: Number.isFinite(signal.points) ? (signal.points as number) : invalid(), detail: text(signal.detail) }; }),
+  };
+}
+export async function suggestTasks(params: SuggestParams = {}): Promise<TaskSuggestions> {
+  return taskSuggestions(await request("tasks.suggest", { ...params }));
+}
+/** The decoder `suggestTasks` applies: a reply that is not exactly this shape is a protocol error, never a partial list. */
+export function taskSuggestions(value: unknown): TaskSuggestions {
+  const raw = object(value);
+  if (raw.ok !== true || !Array.isArray(raw.suggestions) || raw.suggestions.length > MAX_SUGGESTIONS || !Array.isArray(raw.blocked) || raw.blocked.length > 100) return invalid();
+  const excluded = object(raw.excluded), board = object(raw.board), verification = object(raw.verification);
+  return {
+    generated_at: integer(raw.generated_at),
+    suggestions: raw.suggestions.map(suggestion),
+    blocked: raw.blocked.map((entry) => { const item = object(entry); return { id: text(item.id), title: text(item.title), blocked_by: strings(item.blocked_by) }; }),
+    excluded: { in_progress: integer(excluded.in_progress), review: integer(excluded.review), duplicate: integer(excluded.duplicate), blocked: integer(excluded.blocked), unread: excluded.unread === undefined ? 0 : integer(excluded.unread), filtered: integer(excluded.filtered) },
+    board: { scanned: integer(board.scanned), complete: boolean(board.complete), unhydrated: integer(board.unhydrated) },
+    verification: { checked: integer(verification.checked), unchecked: integer(verification.unchecked), failed: integer(verification.failed) },
+    candidates: integer(raw.candidates),
+  };
 }

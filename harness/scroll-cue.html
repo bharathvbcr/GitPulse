@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Scroll cue stress checks</title>
+    <style>
+      body { margin: 0; padding: 12px; background: rgb(11 14 23); }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      // Every ResizeObserver keeps the elements it observes alive until it
+      // unobserves or disconnects them. Count what each one still holds, so a
+      // strip that churns its children can be asked whether it lets go.
+      const observed = new Set();
+      const NativeRO = window.ResizeObserver;
+      window.ResizeObserver = class extends NativeRO {
+        #held = new Set();
+        constructor(cb) { super(cb); observed.add(this.#held); }
+        observe(el, opts) { this.#held.add(el); return super.observe(el, opts); }
+        unobserve(el) { this.#held.delete(el); return super.unobserve(el); }
+        disconnect() { this.#held.clear(); return super.disconnect(); }
+      };
+      const detachedHeld = () => [...observed].reduce((n, held) => n + [...held].filter((el) => !el.isConnected).length, 0);
+
+      const { mount, tick, flushSync } = await import("svelte");
+      const { createChecks } = await import("./checks.ts");
+      const {
+        bindHorizontalWheel, overflowFadeToken, EMPTY_OVERFLOW_HINT,
+      } = await import("../src/lib/dom/overflowHint.ts");
+      const Host = (await import("./ScrollCueHost.svelte")).default;
+
+      const { results, check, stopped } = createChecks();
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const frames = (n = 2) => new Promise((resolve) => {
+        const step = (left) => left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+        step(n);
+      });
+      const settle = async () => { await tick(); await frames(3); await tick(); };
+
+      // Seeded, so a storm that finds something can be replayed exactly.
+      const seed = Number(params.get("seed") ?? 0x5eed) >>> 0;
+      let rng = seed;
+      const random = () => {
+        rng = (rng + 0x6d2b79f5) >>> 0;
+        let t = rng;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      const pick = (list) => list[Math.floor(random() * list.length)];
+
+      const report_ = () => {
+        document.getElementById("result").textContent =
+          `seed ${seed}\n` + results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
+      };
+
+      /**
+       * The oracle. It does not read scrollWidth: it asks where the items
+       * actually are, so padding, gaps and spacers can never count as hidden
+       * content. Returns null inside the sub-pixel band where "is one pixel
+       * hidden?" has no stable answer across zoom levels.
+       */
+      const ITEM = "[data-item]";
+      function oracleToken(el, axis) {
+        const style = getComputedStyle(el);
+        if (style.display === "none" || !el.isConnected) return { token: null };
+        const items = $$(ITEM, el);
+        const box = el.getBoundingClientRect();
+        if (items.length === 0 || box.width === 0 || box.height === 0) return { token: null };
+        const lo = axis === "x" ? "left" : "top";
+        const hi = axis === "x" ? "right" : "bottom";
+        const first = Math.min(...items.map((item) => item.getBoundingClientRect()[lo]));
+        const last = Math.max(...items.map((item) => item.getBoundingClientRect()[hi]));
+        // Rects are in zoomed pixels and scroll metrics in layout pixels;
+        // compare in layout pixels.
+        const scale = (axis === "x" ? box.width / el.offsetWidth : box.height / el.offsetHeight) || 1;
+        const start = (box[lo] - first) / scale;
+        const end = (last - box[hi]) / scale;
+        // scrollWidth and clientWidth are whole pixels over fractional
+        // layout, so under ~2.5px hidden there is no stable answer. The
+        // contract: 2.5px or more is always advertised, 0.5px or less never.
+        const ambiguous = (v) => v > 0.5 && v < 2.5;
+        if (ambiguous(start) || ambiguous(end)) return { token: undefined };
+        const showStart = start >= 2.5;
+        const showEnd = end >= 2.5;
+        return { token: overflowFadeToken(axis, { canScroll: showStart || showEnd, showStart, showEnd }) };
+      }
+
+      function overlays(axis) {
+        return $$(axis === "x" ? ".gp-scroll-cue" : ".gp-scroll-cue-y", document.querySelector(`[data-cue-host="${axis}"]`));
+      }
+
+      /** Token on the element, overlays in the host, and mask in the cascade
+       * all agree with the oracle; `undefined` from the oracle skips. */
+      function agrees(el, axis, otherEls = []) {
+        const { token } = oracleToken(el, axis);
+        if (token === undefined) return "ambiguous";
+        const actual = el.dataset.gpFade ?? null;
+        const expectedOverlays = token === null ? 0 : token.endsWith("both") ? 2 : 1;
+        const mask = getComputedStyle(el).maskImage || getComputedStyle(el).webkitMaskImage || "none";
+        const stray = otherEls.filter((other) => other.dataset.gpFade !== undefined);
+        if (actual !== token) return `token ${actual} ≠ ${token}`;
+        if (overlays(axis).length !== expectedOverlays) return `${overlays(axis).length} overlays ≠ ${expectedOverlays}`;
+        if ((token === null) !== (mask === "none")) return `mask ${mask.slice(0, 24)} with token ${token}`;
+        if (stray.length) return `stray token on ${stray.map((s) => s.dataset.scroller).join(",")}`;
+        return "ok";
+      }
+
+      function fill(el, count, width = 46) {
+        el.replaceChildren(...Array.from({ length: count }, (_, i) => {
+          const item = document.createElement("button");
+          item.dataset.item = String(i);
+          item.className = "gp-btn shrink-0";
+          item.style.width = `${width}px`;
+          item.style.height = "28px";
+          item.textContent = String(i);
+          return item;
+        }));
+      }
+
+      (async () => {
+        try {
+          const host = mount(Host, { target: document.getElementById("stage") });
+          await settle();
+          const { strip, other, toolbar, column } = host.elements();
+          const row = toolbar.querySelector("[data-row]");
+          const xs = [strip, other, toolbar];
+
+          // ---- baseline geometry ------------------------------------------
+          fill(strip, 4);
+          fill(other, 3);
+          await settle();
+          check("a strip that fits carries no fade, no mask and no cue", () => agrees(strip, "x", [other, toolbar]) === "ok" && strip.dataset.gpFade === undefined);
+          fill(strip, 20);
+          strip.scrollLeft = 0;
+          await settle();
+          check("an overflowing strip fades its end", () => strip.dataset.gpFade === "x-end" && agrees(strip, "x", [other, toolbar]) === "ok");
+          strip.scrollLeft = 300;
+          await settle();
+          check("mid-scroll fades both edges", () => strip.dataset.gpFade === "x-both" && agrees(strip, "x") === "ok");
+          strip.scrollLeft = strip.scrollWidth;
+          await settle();
+          check("at the end only the start fades", () => strip.dataset.gpFade === "x-start" && agrees(strip, "x") === "ok");
+          check("the cue overlay paints nothing", () => overlays("x").every((el) => {
+            const cs = getComputedStyle(el);
+            return cs.backgroundImage === "none" && cs.backgroundColor === "rgba(0, 0, 0, 0)";
+          }));
+
+          // ---- padding is not content -------------------------------------
+          // A padded min-w-max toolbar whose controls all fit, with only its
+          // own end padding past the edge, must not advertise more.
+          host.retarget("toolbar");
+          fill(row, 6, 50);
+          await settle();
+          const controls = 6 * 50 + 5 * 8; // widths plus gap-2
+          const padded = controls + 2 * 12; // px-3
+          for (const hidden of [1, 4, 8, 11]) {
+            toolbar.style.width = `${padded - hidden}px`;
+            toolbar.scrollLeft = 0;
+            await settle();
+            check(`a toolbar hiding only ${hidden}px of its end padding shows no cue`, () =>
+              toolbar.scrollWidth > toolbar.clientWidth && toolbar.dataset.gpFade === undefined && overlays("x").length === 0);
+          }
+          toolbar.style.width = `${padded - 40}px`;
+          toolbar.scrollLeft = 0;
+          await settle();
+          check("a toolbar hiding a real control still shows its end cue", () => toolbar.dataset.gpFade === "x-end" && agrees(toolbar, "x") === "ok");
+          toolbar.style.width = `${padded - 8}px`;
+          toolbar.scrollLeft = toolbar.scrollWidth;
+          await settle();
+          check("scrolled to the end, the start padding alone shows no start cue", () => toolbar.dataset.gpFade === undefined);
+          toolbar.style.width = "";
+
+          // ---- retarget never shows the previous scroller's state ---------
+          host.retarget("strip");
+          fill(strip, 20);
+          strip.scrollLeft = 0;
+          fill(other, 2);
+          await settle();
+          check("before retarget the strip carries its end fade", () => strip.dataset.gpFade === "x-end");
+          host.retarget("other");
+          flushSync();
+          await tick();
+          // No frame has passed: whatever is on screen now is the first paint.
+          check("the first frame after retarget shows the new scroller's state", () =>
+            strip.dataset.gpFade === undefined && other.dataset.gpFade === undefined && overlays("x").length === 0);
+          await settle();
+          check("…and stays right once measured", () => agrees(other, "x", [strip, toolbar]) === "ok");
+          fill(other, 20);
+          other.scrollLeft = 0;
+          await settle();
+          host.retarget("strip");
+          strip.scrollLeft = strip.scrollWidth;
+          flushSync();
+          await tick();
+          check("retargeting between two overflowing strips paints the new one's edges at once", () =>
+            other.dataset.gpFade === undefined && strip.dataset.gpFade === "x-start");
+
+          // ---- hidden, unmounted, hinted ----------------------------------
+          strip.style.display = "none";
+          await settle();
+          check("a hidden scroller drops its fade and cue", () => strip.dataset.gpFade === undefined && overlays("x").length === 0);
+          strip.style.display = "";
+          await settle();
+          check("…and gets them back when shown", () => agrees(strip, "x") === "ok" && strip.dataset.gpFade !== undefined);
+          host.setMounted(false);
+          await settle();
+          check("unmounting the cue removes the mask from its scroller", () => xs.every((el) => el.dataset.gpFade === undefined));
+          strip.scrollLeft = 0;
+          fill(strip, 30);
+          await settle();
+          check("…and nothing writes one back afterwards", () => strip.dataset.gpFade === undefined);
+          host.setMounted(true);
+          await settle();
+          host.setHint({ canScroll: true, showStart: true, showEnd: false });
+          await settle();
+          check("a supplied hint wins over measurement", () => strip.dataset.gpFade === "x-start" && overlays("x").length === 1);
+          host.setHint(EMPTY_OVERFLOW_HINT);
+          await settle();
+          check("an empty hint clears the fade", () => strip.dataset.gpFade === undefined && overlays("x").length === 0);
+          host.setHint(undefined);
+          await settle();
+          check("dropping the hint goes back to measurement", () => agrees(strip, "x") === "ok");
+
+          // ---- the vertical axis ------------------------------------------
+          column.replaceChildren(...Array.from({ length: 30 }, (_, i) => {
+            const item = document.createElement("div");
+            item.dataset.item = String(i);
+            item.style.height = "24px";
+            item.textContent = `row ${i}`;
+            return item;
+          }));
+          column.scrollTop = 0;
+          await settle();
+          check("a vertical scroller fades its bottom", () => column.dataset.gpFade === "y-end" && agrees(column, "y") === "ok");
+          column.scrollTop = column.scrollHeight;
+          await settle();
+          check("…and its top at the end", () => column.dataset.gpFade === "y-start" && agrees(column, "y") === "ok");
+
+          // ---- churn must not pin removed children ------------------------
+          for (let i = 0; i < 400; i += 1) {
+            fill(strip, 1 + (i % 25));
+            if (i % 20 === 0) await frames(1);
+          }
+          await settle();
+          check("400 rounds of child churn leave no removed element observed", () => detachedHeld() === 0);
+
+          // ---- the storm --------------------------------------------------
+          const OPS = Number(params.get("ops") ?? 300);
+          const mismatches = [];
+          let ambiguous = 0;
+          let current = "strip";
+          for (let i = 0; i < OPS; i += 1) {
+            const op = pick(["width", "width", "scroll", "scroll", "fill", "retarget", "display", "zoom", "pad"]);
+            const el = current === "strip" ? strip : current === "other" ? other : toolbar;
+            const items = current === "toolbar" ? row : el;
+            if (op === "width") el.style.width = `${(120 + random() * 320).toFixed(2)}px`;
+            else if (op === "scroll") el.scrollLeft = pick([0, el.scrollWidth, random() * el.scrollWidth]);
+            else if (op === "fill") fill(items, Math.floor(random() * 18), 20 + Math.floor(random() * 50));
+            else if (op === "retarget") { current = pick(["strip", "other", "toolbar"]); host.retarget(current); }
+            else if (op === "display") el.style.display = el.style.display === "none" ? "" : (random() < 0.3 ? "none" : "");
+            else if (op === "zoom") document.querySelector('[data-cue-host="x"]').style.zoom = String(pick([0.8, 0.9, 1, 1.1, 1.25, 1.5, 2]));
+            else if (op === "pad") row.className = `flex items-center justify-between gap-2 ${pick(["px-3", "px-1", "px-6", "pl-2", ""])} py-1.5 min-w-max w-full`;
+            await settle();
+            const target = current === "strip" ? strip : current === "other" ? other : toolbar;
+            const verdict = agrees(target, "x", xs.filter((x) => x !== target));
+            if (verdict === "ambiguous") ambiguous += 1;
+            else if (verdict !== "ok") mismatches.push(`#${i} ${op} on ${current}: ${verdict}`);
+          }
+          console.log(`[scroll-cue] storm seed=${seed} ops=${OPS} ambiguous=${ambiguous} mismatches=${mismatches.length}`, mismatches.slice(0, 5));
+          check(`${OPS} random resizes, scrolls, refills, retargets, hides and zooms leave the cue agreeing with the items (${mismatches.slice(0, 2).join("; ") || "no mismatch"})`, () => mismatches.length === 0);
+          check("the storm decided most steps rather than skipping them as sub-pixel", () => ambiguous < OPS / 4);
+          document.querySelector('[data-cue-host="x"]').style.zoom = "";
+          for (const el of xs) { el.style.display = ""; el.style.width = ""; }
+
+          // ---- fractional zoom sweep --------------------------------------
+          host.retarget("strip");
+          fill(strip, 8, 46);
+          const sweepMismatches = [];
+          for (const zoom of [0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2]) {
+            document.querySelector('[data-cue-host="x"]').style.zoom = String(zoom);
+            for (let width = 360; width <= 420; width += 1.37) {
+              strip.style.width = `${width.toFixed(2)}px`;
+              strip.scrollLeft = 0;
+              await settle();
+              const verdict = agrees(strip, "x");
+              if (verdict !== "ok" && verdict !== "ambiguous") sweepMismatches.push(`zoom ${zoom} width ${width.toFixed(2)}: ${verdict}`);
+            }
+          }
+          document.querySelector('[data-cue-host="x"]').style.zoom = "";
+          strip.style.width = "";
+          check(`fractional widths at eight zoom levels never show a cue over nothing (${sweepMismatches.slice(0, 2).join("; ") || "clean"})`, () => sweepMismatches.length === 0);
+
+          // ---- the wheel --------------------------------------------------
+          fill(strip, 30);
+          strip.scrollLeft = 0;
+          await settle();
+          const unbind = bindHorizontalWheel(strip);
+          const wheel = (init) => {
+            const event = new WheelEvent("wheel", { bubbles: true, cancelable: true, ...init });
+            strip.dispatchEvent(event);
+            return event;
+          };
+          let event = wheel({ deltaY: 100 });
+          check("a vertical wheel pans the strip and claims the event", () => strip.scrollLeft === 100 && event.defaultPrevented);
+          event = wheel({ deltaY: 100, ctrlKey: true });
+          check("a pinch or ctrl+wheel zoom is left to the page", () => strip.scrollLeft === 100 && !event.defaultPrevented);
+          event = wheel({ deltaY: 3, deltaMode: WheelEvent.DOM_DELTA_LINE });
+          check("a line-mode wheel moves by lines, not pixels", () => strip.scrollLeft >= 100 + 3 * 16 && event.defaultPrevented);
+          const before = strip.scrollLeft;
+          event = wheel({ deltaY: 1, deltaMode: WheelEvent.DOM_DELTA_PAGE });
+          check("a page-mode wheel moves by most of a viewport", () => strip.scrollLeft - before >= strip.clientWidth * 0.5);
+          strip.scrollLeft = strip.scrollWidth;
+          event = wheel({ deltaY: 100 });
+          check("at the end the wheel is released so the page can scroll on", () => !event.defaultPrevented);
+          strip.scrollLeft = 50;
+          const claimed = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 100 });
+          claimed.preventDefault();
+          strip.dispatchEvent(claimed);
+          check("an event something else already claimed is not handled twice", () => strip.scrollLeft === 50);
+          unbind();
+          event = wheel({ deltaY: 100 });
+          check("unbinding stops the wheel mapping", () => strip.scrollLeft === 50 && !event.defaultPrevented);
+
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report_();
+        } catch (error) {
+          stopped(error);
+          report_();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, seed }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      })();
+    </script>
+  </body>
+</html>

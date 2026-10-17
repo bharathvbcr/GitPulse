@@ -3,9 +3,9 @@
   import { get } from "svelte/store";
   import { fade, scale } from "svelte/transition";
   import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
-  import { promptState } from "../stores/modalStore";
+  import { isPromptOpen } from "../stores/modalStore";
   import { sameRepo, isCaseInsensitiveFs, displayName } from "../repos/paths";
   import { backdropFade, cardScale } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
@@ -14,7 +14,7 @@
   import { shellOwnsKey } from "../keyboard/terminalFocus";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
-  import { highlightMatches } from "../branches/groupBranches";
+  import { checkoutNameFor, highlightMatches } from "../branches/groupBranches";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
   import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
@@ -44,7 +44,7 @@
   let mode = $derived.by(() => parsed.mode);
   let effectiveSearchText = $derived(parsed.text);
   let currentMode = $derived(PALETTE_MODES.find(entry => entry.mode === mode) ?? PALETTE_MODES[0]);
-  let repoPath = $derived($repoStore.currentPath);
+  let repoPath = $derived($currentRepoPath);
   let commands = $derived(buildCommands($repoStore, changeMode, { onClone, onRebase }));
   let isRemoteSearch = $derived(mode === "files" || mode === "symbols" || mode === "workspace");
   let symbolSearchNote = $derived(mode === "symbols" ? searchResult.note : null);
@@ -52,11 +52,12 @@
 
   // Query text does not reload the file list; filtering operates on the current
   // snapshot. The opening epoch, repository generation and Retry refresh it.
+  const repoGeneration = $derived($repoStore.generation);
   $effect(() => {
     const open = isOpen;
     const searchMode = mode;
     const path = repoPath;
-    const generation = $repoStore.generation;
+    const generation = repoGeneration;
     const searchText = searchMode === "files" ? "" : effectiveSearchText;
     const semantic = searchMode === "workspace" ? parsed.semantic : false;
     void generation; void retrySignal;
@@ -96,7 +97,7 @@
       const root = workspaceRoot(hit.repo, searchResult.repos);
       return { id: `ws:${hit.repo}:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`, label: hit.symbol_name, description: `${hit.repo} · ${hit.kind} · ${hit.file_path}:${hit.span_start_line}`, filePath: hit.file_path, category: "Cross-repo symbols", icon: FileCode, disabledReason: root ? undefined : `The workspace registry cannot uniquely resolve ${hit.repo}. Open Map to repair its registration.`, action: () => { if (root) return openWorkspaceHit(root, hit.file_path); } };
     });
-    if (mode === "branches") return $repoStore.branches.map(branch => ({ id: `branch:${repoPath}:${branch.name}`, label: branch.name, description: branch.is_current ? "Current branch" : `${branch.last_author} · ${branch.last_summary}`, category: branch.is_remote ? "Remote branches" : "Local branches", icon: GitBranch, disabledReason: branch.is_current ? "This branch is already checked out." : worktreeUnavailable($repoStore), action: () => repoStore.checkoutBranch(branch.name) }));
+    if (mode === "branches") return $repoStore.branches.map(branch => ({ id: `branch:${repoPath}:${branch.name}`, label: branch.name, description: branch.is_current ? "Current branch" : `${branch.last_author} · ${branch.last_summary}`, category: branch.is_remote ? "Remote branches" : "Local branches", icon: GitBranch, disabledReason: branch.is_current ? "This branch is already checked out." : worktreeUnavailable($repoStore), action: () => repoStore.checkoutBranch(checkoutNameFor(branch)) }));
     if (mode === "commits") {
       if ($graphStore.visiblePath !== repoPath) return [];
       return $graphStore.commits.map(commit => ({ id: `commit:${repoPath}:${commit.id}`, label: commit.summary, description: `${commit.id.slice(0, 8)} · ${commit.author_name}`, keywords: `${commit.id} ${commit.author_email}`, category: "Loaded commits", icon: GitCommit, action: async () => { await repoStore.selectCommitDiff(commit.id); repoStore.setActiveTab("history", "diff"); } }));
@@ -161,7 +162,7 @@
   }
 
   function modalOccupied(): boolean {
-    return get(promptState) !== null || Boolean(document.querySelector('[aria-modal="true"]:not([data-command-palette])'));
+    return isPromptOpen() || Boolean(document.querySelector('[aria-modal="true"]:not([data-command-palette])'));
   }
 
   function requestOpen() {

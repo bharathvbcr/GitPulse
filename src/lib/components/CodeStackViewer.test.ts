@@ -90,10 +90,31 @@ describe("CodeStackViewer load correctness", () => {
     // instance block by its closing tag.
     const effectStart = source.indexOf("$effect(() => {\n    const repo");
     const effect = source.slice(effectStart, source.lastIndexOf("</script>"));
-    expect(effect).toContain("$repoStore.currentPath");
-    expect(effect).toContain("$repoStore.generation");
-    // Memo guard: unrelated store emissions must not refetch.
-    expect(effect).toContain("generation === prevGeneration) return;");
+    expect(effect).toContain("const repo = $currentRepoPath;");
+    expect(effect).toContain("void generation;");
+    // Both keys compare by value, so unrelated store emissions do not refetch.
+    expect(source).toContain("const generation = $derived($repoStore.generation);");
+  });
+
+  it("fetches only while mounted: one effect owns every load, with cleanup, and nothing polls", () => {
+    // The backend walk is per refresh, so the frontend must not start one
+    // outside the mounted view: loadStack is called from the effect (cancelled
+    // by its cleanup), from the Retry button, and after a restack, and no
+    // timer or event listener starts it.
+    expect(source).not.toMatch(/setInterval|setTimeout|listen\(/);
+    const effectStart = source.indexOf("$effect(() => {\n    const repo");
+    const effect = source.slice(effectStart, source.lastIndexOf("</script>"));
+    expect(effect).toContain("void loadStack(repo);");
+    expect(effect).toContain("inflight?.cancel();");
+    expect(effect).toMatch(/return \(\) => \{/);
+    // WorkView mounts the view lazily, only while the branch-chains detail is open.
+    const work = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "WorkView.svelte"), "utf8");
+    expect(work).toMatch(/\{#if showStackDetail\}\s*<[^>]*>\s*<LazyView load=\{loadStack\}/);
+  });
+
+  it("says out loud how many branches the backend left unresolved", () => {
+    expect(source).toContain("unresolvedStackNotice(payload)");
+    expect(source).toContain('data-testid="stack-unresolved"');
   });
 
   it("shows a loading state instead of a false empty state on first fetch", () => {

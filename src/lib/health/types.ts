@@ -2,6 +2,7 @@
  * Shapes of the dependency-health report, shared by the Health view and the
  * report formatter. Field names mirror the Rust `DepsHealthReport` wire type.
  */
+import { isRecord } from "../record";
 
 export interface HealthIssue {
   severity: string;
@@ -73,6 +74,14 @@ export interface ScanLimitNotice {
   inventory_only?: boolean;
 }
 
+/** How many audit targets were found versus audited, and which were not. */
+export interface AuditCoverage {
+  found: number;
+  audited: number;
+  /** `family:path` for each found target that was not audited. */
+  unaudited: string[];
+}
+
 export interface DepsHealthReport {
   node_version?: string | null;
   npm_version?: string | null;
@@ -97,6 +106,8 @@ export interface DepsHealthReport {
   scanners_ran?: string[];
   /** True only when every discovered supported audit target completed. */
   audit_complete?: boolean;
+  /** Targets found versus audited. Absent on reports from older builds. */
+  audit_coverage?: AuditCoverage;
   manifests: NpmManifest[];
   ecosystems: EcosystemHint[];
   issues: HealthIssue[];
@@ -153,6 +164,13 @@ export interface DependabotReport {
   slug: string;
   alerts: DependabotAlertInfo[];
   truncated: boolean;
+  /**
+   * Severity tiers whose alerts are missing because that tier's request failed
+   * or the fetch deadline cut it off. Non-empty means `alerts` is a lower
+   * bound, not "all but these": a critical alert may be among the missing.
+   * Absent is none.
+   */
+  partial_tiers?: string[];
   error?: string | null;
   /** Present only when `available` is false; omitted on success (serde skip). */
   unavailable_reason?: GithubUnavailableReason;
@@ -190,13 +208,11 @@ export interface CodeScanningReport {
   slug: string;
   alerts: CodeScanningAlertInfo[];
   truncated: boolean;
+  /** Same contract as {@link DependabotReport.partial_tiers}. */
+  partial_tiers?: string[];
   error?: string | null;
   /** Present only when `available` is false; omitted on success (serde skip). */
   unavailable_reason?: GithubUnavailableReason;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function stringArray(value: unknown, label: string): string[] {
@@ -235,6 +251,7 @@ function parseGithubSecurityEnvelope<TAlert>(
   slug: string;
   alerts: TAlert[];
   truncated: boolean;
+  partial_tiers: string[];
   error?: string | null;
   unavailable_reason?: GithubUnavailableReason;
 } {
@@ -265,6 +282,7 @@ function parseGithubSecurityEnvelope<TAlert>(
     slug: typeof value.slug === "string" ? value.slug : "",
     alerts: Array.isArray(value.alerts) ? (value.alerts as TAlert[]) : [],
     truncated: value.truncated === true,
+    partial_tiers: stringArray(value.partial_tiers, `${kind} partial_tiers`),
     error: typeof error === "string" ? error : error === null ? null : undefined,
     unavailable_reason: parseUnavailableReason(value.unavailable_reason),
   };
@@ -321,6 +339,24 @@ function parseNpmManifest(value: unknown): NpmManifest {
   };
 }
 
+function parseAuditCoverage(value: unknown): AuditCoverage | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.found !== "number" ||
+    typeof value.audited !== "number" ||
+    !Number.isFinite(value.found) ||
+    !Number.isFinite(value.audited)
+  ) {
+    throw new Error("health: audit_coverage was corrupt");
+  }
+  return {
+    found: value.found,
+    audited: value.audited,
+    unaudited: stringArray(value.unaudited, "audit_coverage.unaudited"),
+  };
+}
+
 function parseAudit(value: unknown): AuditSummary {
   if (!isRecord(value) || typeof value.total !== "number" || !Number.isFinite(value.total)) {
     throw new Error("health: audit.total was not a number");
@@ -369,6 +405,7 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
     const manifests = stringArray(item.manifests, "ecosystem manifests");
     ecosystems.push({ family: item.family, manifests, note: item.note });
   }
+  const auditCoverage = parseAuditCoverage(value.audit_coverage);
   const notices = value.limit_notices;
   if (notices !== undefined && !Array.isArray(notices)) {
     throw new Error("health: limit_notices was not a list");
@@ -387,6 +424,7 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
     bundler_audit_present: typeof value.bundler_audit_present === "boolean" ? value.bundler_audit_present : undefined,
     scanners_ran: value.scanners_ran === undefined ? undefined : stringArray(value.scanners_ran, "scanners_ran"),
     audit_complete: typeof value.audit_complete === "boolean" ? value.audit_complete : undefined,
+    audit_coverage: auditCoverage,
     manifests: value.manifests.map(parseNpmManifest),
     ecosystems,
     issues: value.issues as HealthIssue[],

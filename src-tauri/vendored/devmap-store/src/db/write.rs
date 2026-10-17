@@ -2,8 +2,8 @@ use super::Store;
 #[cfg(feature = "parse")]
 use super::{
     bucket_identities, charge, claim_matching_candidate, decode_stored_outcome, edge_tuple,
-    lock_conn, refusal, stored_is_parse_failure, validate_head_sha, EdgeTuple, GenerationWriteOpts,
-    RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
+    is_budget_refusal_json, lock_conn, refusal, stored_is_parse_failure, validate_head_sha,
+    EdgeTuple, GenerationWriteOpts, RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
 };
 #[cfg(feature = "parse")]
 use crate::schema::BUILD_HISTORY_RETENTION;
@@ -55,9 +55,9 @@ impl Store {
             engine_json,
             extraction_json,
         } = payload;
-        if let Some(id) = tx
+        if let Some((id, stored_outcome)) = tx
             .prepare_cached(
-                "SELECT payload_id FROM file_payloads
+                "SELECT payload_id, parse_outcome_json FROM file_payloads
                   WHERE file_id = ?1 AND content_hash = ?2 AND language = ?3
                     AND COALESCE(grammar_version, '') = ?4
                     AND COALESCE(analyzer_version, '') = ?5",
@@ -70,10 +70,42 @@ impl Store {
                     grammar_version,
                     analyzer_version
                 ],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
         {
+            // DECLARED INTERIM: a retained-generation immutability exception,
+            // tracked by ft-3bdf1450d4367fc8c7ba0c01fbe7cfe3 (task_id
+            // devmap-payload-identity-budget-refusal), which gives a budget
+            // refusal its own payload identity and removes this UPDATE.
+            //
+            // The key names the content and the extractor, and a wall-clock
+            // budget refusal is neither: it is the machine's load at the
+            // moment of the build. Sharing the row would keep the refusal as
+            // the stored payload of a later generation that parsed the same
+            // bytes. The unique index admits one row per identity, so the
+            // recovered extraction replaces the refused one in place -- which
+            // also rewrites what every retained older generation reads from
+            // this row (`a_retained_older_generation_keeps_the_refusal_it_was_
+            // built_with`, ignored against the card). Only refusal -> non-
+            // refusal is ever promoted; the reverse is not written, and
+            // `latest_budget_refusals` does not read this row, so status does
+            // not depend on either.
+            if is_budget_refusal_json(&stored_outcome)
+                && !is_budget_refusal_json(parse_outcome_json)
+            {
+                tx.prepare_cached(
+                    "UPDATE file_payloads
+                        SET parse_outcome_json = ?2, engine_json = ?3, extraction_json = ?4
+                      WHERE payload_id = ?1",
+                )?
+                .execute(params![
+                    id,
+                    parse_outcome_json,
+                    engine_json,
+                    extraction_json
+                ])?;
+            }
             return Ok(id);
         }
         tx.prepare_cached(
@@ -93,6 +125,82 @@ impl Store {
             extraction_json
         ])?;
         Ok(tx.last_insert_rowid())
+    }
+
+    /// Replaces every value a secret file holds in the store, in every
+    /// retained generation and in every stored payload, with the withheld
+    /// marker.
+    ///
+    /// Extraction already withholds a secret file's values, so a store built
+    /// from scratch never holds one. This is for the rows that did not come
+    /// from that extraction: a previous generation's rows carried forward for
+    /// an unchanged file, a cache row served back, and the generations a store
+    /// written before the rule still retains — which is the store `devmap`
+    /// copies between worktrees. Asked once per build, inside its write
+    /// transaction, so no committed generation holds a secret file's value.
+    ///
+    /// Inserted then deleted rather than updated in place: `value` is in the
+    /// key, and two values at one site collapse to one marker row.
+    #[cfg(feature = "parse")]
+    fn scrub_secret_values(tx: &Connection) -> Result<()> {
+        use devmap_extract::secret::{
+            is_secret_path, withhold_secret_values_json, WITHHELD_LITERAL_VALUE,
+        };
+        let secret_ids: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare("SELECT id, path FROM paths")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, path) = row?;
+                if is_secret_path(&path) {
+                    ids.push((id, path));
+                }
+            }
+            ids
+        };
+        let mut withhold = tx.prepare(
+            "INSERT OR IGNORE INTO generation_literals
+                (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
+             SELECT generation_id, file_id, line, span_start, ?2, qualified_name, symbol_name
+               FROM generation_literals
+              WHERE generation_id IN (SELECT id FROM generations)
+                AND file_id = ?1 AND value <> ?2",
+        )?;
+        // `generation_id IN (…)` leads with the key's first column, so each
+        // secret file costs an index probe per retained generation rather than
+        // a scan of every literal in the store.
+        let mut drop_values = tx.prepare(
+            "DELETE FROM generation_literals
+              WHERE generation_id IN (SELECT id FROM generations)
+                AND file_id = ?1 AND value <> ?2",
+        )?;
+        let mut payloads =
+            tx.prepare("SELECT payload_id, extraction_json FROM file_payloads WHERE file_id = ?1")?;
+        let mut rewrite =
+            tx.prepare("UPDATE file_payloads SET extraction_json = ?2 WHERE payload_id = ?1")?;
+        for (id, path) in secret_ids {
+            withhold.execute(params![id, WITHHELD_LITERAL_VALUE])?;
+            drop_values.execute(params![id, WITHHELD_LITERAL_VALUE])?;
+            let rows = payloads
+                .query_map(params![id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>>>()?;
+            for (payload_id, json) in rows {
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(&json).map_err(|error| {
+                        refusal(format!(
+                            "stored extraction payload {payload_id} for {path} is invalid: {error}"
+                        ))
+                    })?;
+                if withhold_secret_values_json(&path, &mut payload) {
+                    rewrite.execute(params![payload_id, payload.to_string()])?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Generation-scoped FTS rowid: high 32 bits = generation, low 32 = ordinal.
@@ -193,6 +301,25 @@ impl Store {
                     extraction.file_path
                 )));
             }
+        }
+        // An affected path is never carried, and fresh rows are written only
+        // for the extractions in hand, so an affected path that is neither in
+        // the slice nor declared deleted would get no row at all: the file
+        // silently absent from the generation, its symbols dropped by a write
+        // that never said it was deleting them. The caller has to account for
+        // every path it names — an extraction, or a deletion.
+        let declared_deleted: std::collections::HashSet<&str> =
+            opts.deleted_paths.iter().map(String::as_str).collect();
+        let mut unaccounted = opts.affected_paths.iter().filter(|path| {
+            !unique_paths.contains(path.as_str()) && !declared_deleted.contains(path.as_str())
+        });
+        if let Some(first) = unaccounted.next() {
+            return Err(refusal(format!(
+                "{} affected path(s) have neither an extraction nor a deletion in this write \
+                 (for example {first}); name each affected path in the extractions or in \
+                 deleted_paths, or the generation would drop it without a declared deletion",
+                1 + unaccounted.count()
+            )));
         }
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
@@ -1002,10 +1129,14 @@ impl Store {
             if !full_rewrite {
                 let mut stmt = tx.prepare(
                     "SELECT gap, path, reason FROM generation_coverage_gaps
-                     WHERE generation_id = ?1 AND gap != ?2",
+                     WHERE generation_id = ?1 AND gap NOT IN (?2, ?3)",
                 )?;
                 let rows = stmt.query_map(
-                    params![prev, crate::coverage::GAP_DISCOVERY_REFUSED],
+                    params![
+                        prev,
+                        crate::coverage::GAP_DISCOVERY_REFUSED,
+                        crate::coverage::GAP_OVER_LIMIT
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1071,6 +1202,34 @@ impl Store {
         // inventory cannot name is a graph degraded for a file nobody can look
         // at, and a summary claiming none while rows exist is the over-claim
         // this whole inventory exists to end.
+        // Over-limit rows, whole, with the same two-halves guard. Compared by
+        // path set and with "not measured" read as empty: a writer that did not
+        // walk the tree passes neither, and one that did passes both.
+        let over_limit_paths: std::collections::BTreeSet<&str> = opts
+            .over_limit
+            .iter()
+            .flatten()
+            .map(|row| row.path.as_str())
+            .collect();
+        let analysed_over_limit: std::collections::BTreeSet<&str> = analysis
+            .over_limit_files
+            .iter()
+            .flatten()
+            .map(|file| file.path.as_str())
+            .collect();
+        if over_limit_paths != analysed_over_limit {
+            return Err(refusal(format!(
+                "generation would store over-limit rows for {over_limit_paths:?} but its \
+                 analysis records {analysed_over_limit:?}; the two must be one measurement"
+            )));
+        }
+        for row in opts.over_limit.iter().flatten() {
+            gap_rows.push((
+                crate::coverage::GAP_OVER_LIMIT.to_string(),
+                row.path.clone(),
+                row.reason.clone(),
+            ));
+        }
         if measured_refusals != analysis.discovery_refused_files {
             return Err(refusal(format!(
                 "generation would store {measured_refusals:?} discovery refusal(s) but its \
@@ -1096,10 +1255,12 @@ impl Store {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 refusal("dead-symbol row count exceeds SQLite generation ordinal capacity")
             })?;
+            let evidence = dead.evidence.as_ref();
             tx.execute(
                 "INSERT INTO generation_dead_symbols
-                 (generation_id, ordinal, file_path, symbol_name, confidence, is_exempt, exemption_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (generation_id, ordinal, file_path, symbol_name, confidence, is_exempt,
+                  exemption_reason, evidence_sites, evidence_path, evidence_byte)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     gen_id,
                     ordinal,
@@ -1107,7 +1268,10 @@ impl Store {
                     dead.symbol_name,
                     confidence_millis(dead.confidence) as f64 / 1000.0,
                     dead.is_exempt as i32,
-                    dead.exemption_reason
+                    dead.exemption_reason,
+                    evidence.map(|evidence| evidence.sites),
+                    evidence.and_then(|evidence| evidence.first_path.as_deref()),
+                    evidence.and_then(|evidence| evidence.first_byte),
                 ],
             )?;
         }
@@ -1645,6 +1809,7 @@ impl Store {
                 }
             }
         }
+        Self::scrub_secret_values(&tx)?;
         let page_count: i64 = tx.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let page_size: i64 = tx.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let build_ms = opts

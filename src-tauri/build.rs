@@ -1,3 +1,6 @@
+#[path = "build_support/app_commands.rs"]
+mod app_commands;
+
 fn main() {
     embed_test_manifest();
     compile_apple_intelligence();
@@ -7,8 +10,24 @@ fn main() {
     // Omit the default from the .res and embed comctl32 once via catch-all
     // link args, which is the only cargo instruction that reaches
     // `unittests src/lib.rs`.
+    //
+    // An app manifest is what makes Tauri enforce capabilities on the app's
+    // own commands. Without one every local window could call every command;
+    // with one, a command is callable only from a window whose capability
+    // names its `allow-<command>` permission. The list is read from the
+    // handler registration so a new command cannot be forgotten here, and
+    // arrives denied until a capability grants it.
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let lib_rs = std::fs::read_to_string("src/lib.rs")
+        .unwrap_or_else(|error| panic!("cannot read src/lib.rs for the app ACL: {error}"));
+    let commands: Vec<&'static str> = app_commands::handler_commands(&lib_rs)
+        .into_iter()
+        .map(|name| &*Box::leak(name.into_boxed_str()))
+        .collect();
+    let commands: &'static [&'static str] = Box::leak(commands.into_boxed_slice());
     tauri_build::try_build(
         tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(commands))
             .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest()),
     )
     .unwrap_or_else(|error| panic!("error found during tauri-build: {error}"));

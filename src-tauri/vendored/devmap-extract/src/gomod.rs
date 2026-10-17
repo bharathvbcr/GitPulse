@@ -1,9 +1,12 @@
 //! Go module manifests (`go.mod`) collected alongside source, not as source.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::model::DiscoverySkipReason;
 
 /// One `go.mod` in the indexed tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -92,6 +95,50 @@ fn parse_replace_spec(spec: &str) -> Option<(String, String)> {
     Some((module, target))
 }
 
+/// What one manifest read came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManifestRead {
+    /// Nothing at the path: a package nobody installed, a `references` entry
+    /// naming a directory with no config. Not a hole.
+    Absent,
+    /// There, and passed over the way discovery passes over the same shape:
+    /// not a regular file, or bytes past the source ceiling. Not a hole either —
+    /// `DiscoverySkipReason::Oversized` is not a refusal, and this agrees.
+    Skipped,
+    Read(String),
+    /// There, and not read: the reason it could not be.
+    Refused(String),
+}
+
+/// Read one manifest under `root`, through the one reader that keeps a read
+/// inside the repository.
+///
+/// Both manifest readers used `fs::read_to_string`, which follows every link it
+/// meets. A `go.mod` symlinked out of the repository was read and its module
+/// indexed, and a tsconfig `extends` chain through a linked package directory
+/// read whatever config sat at the far end — bytes the repository does not
+/// contain, put into a graph that claims to describe it, which is the line
+/// `candidate_kind` draws for source. `safe_fs::read_repo_source` is that line
+/// for a read by path: the canonical target must stay under the root (a linked
+/// *ancestor* included, which a final-component check cannot see), the open
+/// does not follow links and does not block on a FIFO, a non-regular file is
+/// refused, and the size is bounded.
+pub(crate) fn read_manifest(root: &Path, rel_path: &str, byte_limit: u64) -> ManifestRead {
+    // A directory, a FIFO, a socket — or a link to one: not a file a config
+    // could be read from, and stepped over exactly as discovery steps over the
+    // same shape (`CandidateKind::Other`). A lookup that fails falls through,
+    // so a dangling link or one in a loop is refused below rather than passed.
+    if fs::metadata(root.join(rel_path)).is_ok_and(|meta| !meta.is_file()) {
+        return ManifestRead::Skipped;
+    }
+    match crate::safe_fs::read_repo_source(Some(root), rel_path, byte_limit) {
+        Ok(source) => ManifestRead::Read(source),
+        Err(error) if crate::tsconfig::is_absent(&error) => ManifestRead::Absent,
+        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => ManifestRead::Skipped,
+        Err(error) => ManifestRead::Refused(error.to_string()),
+    }
+}
+
 /// Collect every non-gitignored `go.mod` under `root`.
 pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
     collect_project_manifests(root).map(|manifests| manifests.go_modules)
@@ -103,19 +150,544 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
 pub struct ProjectManifests {
     pub go_modules: Vec<GoModule>,
     pub ts_projects: Vec<crate::tsconfig::TsProject>,
+    /// Every manifest this pass opened or tried to, repo-relative. The read
+    /// verdict on each of these is this pass's own, current answer.
+    pub examined: BTreeSet<String>,
+    /// The manifests among `examined` that exist and could not be read, by
+    /// path.
+    ///
+    /// Recorded because "could not read" and "nothing there" must not share a
+    /// representation. A `go.mod` or `tsconfig.json` this pass skips takes
+    /// its module prefix or its `paths` with it, every import that named one
+    /// is filed `External`, and nothing downstream could tell that from a
+    /// repository with no such mapping. Discovery already refuses the
+    /// manifests it walks to; this pass also reads ones discovery never
+    /// sees — an `extends` target under `node_modules/`, a `go.mod` under a
+    /// directory the default index excludes — and those had no record
+    /// anywhere.
+    pub refusals: Vec<(String, DiscoverySkipReason)>,
+    /// Every `Cargo.toml` package this pass read, with the names a `use` may
+    /// spell its library by.
+    ///
+    /// A crate's directory name is not its name. GitPulse's library lives in
+    /// `src-tauri`, is packaged as `gitpulse` and built as `[lib] name =
+    /// "gitpulse_lib"`, so `use gitpulse_lib::…` named an in-repo crate the
+    /// resolver only knew by its directory and filed every such import
+    /// `External` — "expected, not worth acting on" — about code it indexes.
+    pub rust_crates: Vec<RustCrateManifest>,
+    /// The packages an npm / yarn / bun workspace links into the tree, by the
+    /// name an importer spells them: `@acme/shared` → `packages/shared`. See
+    /// [`crate::workspaces`].
+    pub ts_workspaces: Vec<crate::workspaces::WorkspacePackage>,
+    /// The Python source roots each `pyproject.toml` / `setup.cfg` declares
+    /// (see [`crate::pyproject`]), one entry per manifest that declares any.
+    pub python_roots: Vec<crate::pyproject::PythonSourceRoots>,
+    /// The Swift targets `Package.swift` and an XcodeGen `project.yml` declare,
+    /// and the folders each compiles. A folder two targets list belongs to
+    /// both; the path heuristic answers only for a file no manifest claims.
+    pub swift_targets: Vec<crate::swifttargets::SwiftTarget>,
+    /// Every Gradle settings script this pass read, with the module
+    /// directories its `include` statements name. A module's sources live under
+    /// `<module>/src/<set>/{java,kotlin}`, which no fixed root list can know.
+    pub gradle_modules: Vec<GradleSettings>,
+}
+
+/// One `settings.gradle(.kts)`: the directory it sits in and the module
+/// directories it includes, each repo-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GradleSettings {
+    pub dir: String,
+    pub modules: Vec<String>,
+}
+
+/// One `Cargo.toml` package: the directory it governs, the crate names its
+/// library answers to — `[package] name` with `-` read as `_`, and `[lib]
+/// name` when set — and the target root files its manifest places by hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RustCrateManifest {
+    /// Repo-relative directory holding the `Cargo.toml`; empty at the root.
+    pub dir: String,
+    pub names: Vec<String>,
+    /// The library's root file, repo-relative, when `[lib] path` names one.
+    /// `None` is Cargo's default, `<dir>/src/lib.rs`.
+    ///
+    /// A crate root is where `crate::` and `mod x;` are relative to. Without
+    /// this a library at `lib/core.rs` had no root at all: no `src` ancestor
+    /// placed it, and its name pointed at a `src/lib.rs` that does not exist.
+    pub lib_path: Option<String>,
+    /// The binary roots `[[bin]] path` names, repo-relative. A `[[bin]]`
+    /// without a `path` is Cargo's auto-discovered `src/bin/<name>.rs` or
+    /// `src/main.rs`, which the path convention already places.
+    pub bin_paths: Vec<String>,
+}
+
+/// What one `Cargo.toml` declares: its package (absent for a virtual
+/// workspace) and its `[workspace] members`, each as written relative to the
+/// manifest's directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CargoManifest {
+    pub package: Option<RustCrateManifest>,
+    pub workspace_members: Vec<String>,
+}
+
+/// A target `path` from a manifest at `dir`, repo-relative.
+fn cargo_target_path(dir: &str, key: &str, value: &toml::Value) -> Result<String, String> {
+    let Some(path) = value.as_str() else {
+        return Err(format!("`{key}` is not a string"));
+    };
+    crate::pyproject::anchor(dir, path)
+        .map_err(|reason| format!("`{key}`: {reason}"))?
+        .ok_or_else(|| format!("`{key}` names the manifest's own directory, not a file"))
+}
+
+/// Read one `Cargo.toml` at repo-relative `dir`.
+///
+/// `Err` is a manifest that does not say what its crate is: TOML that does
+/// not parse, neither `[package]` nor `[workspace]` (Cargo refuses that too),
+/// a package with no name, or a target path or member list of the wrong shape.
+/// A virtual workspace is `Ok` with no package — a different answer from a
+/// manifest that could not be read, which used to share `None` with it and be
+/// dropped without a record.
+pub fn parse_cargo_manifest(dir: &str, source: &str) -> Result<CargoManifest, String> {
+    let manifest: toml::Table = source
+        .parse()
+        .map_err(|error| format!("could not be parsed as TOML: {error}"))?;
+    let workspace_members = match manifest.get("workspace") {
+        None => Vec::new(),
+        Some(workspace) => {
+            let workspace = workspace.as_table().ok_or("`workspace` is not a table")?;
+            match workspace.get("members") {
+                None => Vec::new(),
+                Some(members) => members
+                    .as_array()
+                    .ok_or("`workspace.members` is not an array")?
+                    .iter()
+                    .map(|member| {
+                        member
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or("`workspace.members` holds an entry that is not a string")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
+    };
+    let Some(package) = manifest.get("package") else {
+        if manifest.contains_key("workspace") {
+            return Ok(CargoManifest {
+                package: None,
+                workspace_members,
+            });
+        }
+        return Err("declares neither a `[package]` nor a `[workspace]`".to_string());
+    };
+    let package = package.as_table().ok_or("`package` is not a table")?;
+    let name = package
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .ok_or("`[package]` has no `name`")?;
+    let mut names = vec![name.replace('-', "_")];
+    let mut lib_path = None;
+    if let Some(lib) = manifest.get("lib") {
+        let lib = lib.as_table().ok_or("`lib` is not a table")?;
+        if let Some(name) = lib.get("name") {
+            let name = name.as_str().ok_or("`lib.name` is not a string")?;
+            names.push(name.replace('-', "_"));
+        }
+        if let Some(path) = lib.get("path") {
+            lib_path = Some(cargo_target_path(dir, "lib.path", path)?);
+        }
+    }
+    let mut bin_paths = Vec::new();
+    if let Some(bins) = manifest.get("bin") {
+        for bin in bins.as_array().ok_or("`bin` is not an array of tables")? {
+            let bin = bin
+                .as_table()
+                .ok_or("`bin` holds an entry that is not a table")?;
+            if let Some(path) = bin.get("path") {
+                bin_paths.push(cargo_target_path(dir, "bin.path", path)?);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    bin_paths.sort();
+    bin_paths.dedup();
+    Ok(CargoManifest {
+        package: Some(RustCrateManifest {
+            dir: dir.to_string(),
+            names,
+            lib_path,
+            bin_paths,
+        }),
+        workspace_members,
+    })
+}
+
+/// The library names a `Cargo.toml` declares, or `None` when it declares no
+/// package (a virtual workspace manifest) or does not parse. The collector
+/// reads [`parse_cargo_manifest`], which tells those two apart.
+pub fn parse_cargo_crate_names(source: &str) -> Option<Vec<String>> {
+    parse_cargo_manifest("", source)
+        .ok()?
+        .package
+        .map(|package| package.names)
+}
+
+/// The declared paths of one read `Cargo.toml` that do not exist: target
+/// roots that are not files and workspace members with no manifest.
+///
+/// A glob member (`crates/*`) is checked by its literal leading directory: the
+/// walk finds whatever manifests are under it, and only a base that does not
+/// exist is certainly wrong.
+fn cargo_missing_paths(root: &Path, dir: &str, manifest: &CargoManifest) -> Vec<String> {
+    let mut missing = Vec::new();
+    if let Some(package) = &manifest.package {
+        for path in package.lib_path.iter().chain(&package.bin_paths) {
+            if !root.join(path).is_file() {
+                missing.push(format!("target `{path}`"));
+            }
+        }
+    }
+    for member in &manifest.workspace_members {
+        let literal: Vec<&str> = member
+            .split('/')
+            .take_while(|part| !part.contains(['*', '?', '[']))
+            .collect();
+        let is_glob = literal.len() != member.split('/').count();
+        let anchored = match crate::pyproject::anchor(dir, &literal.join("/")) {
+            Ok(path) => path.unwrap_or_default(),
+            Err(_) => {
+                missing.push(format!("member `{member}` (outside the repository)"));
+                continue;
+            }
+        };
+        let present = if is_glob {
+            anchored.is_empty() || root.join(&anchored).is_dir()
+        } else {
+            root.join(&anchored).join("Cargo.toml").is_file()
+        };
+        if !present {
+            missing.push(format!("member `{member}`"));
+        }
+    }
+    missing
+}
+
+impl ProjectManifests {
+    /// Whether this pass has just read `path` cleanly and is the only pass
+    /// that could have refused it.
+    ///
+    /// The incremental drain carries the previous generation's refusals
+    /// forward and drops only what it re-decided. A manifest discovery does
+    /// not walk is re-decided by every manifest pass and by nothing else, so
+    /// without this a repaired one never leaves the inventory. A path
+    /// discovery admits is left to discovery's verdict, which the drain
+    /// re-decides on its own terms.
+    pub fn repaired(&self, path: &str) -> bool {
+        self.examined.contains(path)
+            && !crate::languages::is_indexable_source(path)
+            && !self.refusals.iter().any(|(refused, _)| refused == path)
+    }
+}
+
+/// What the parallel manifest walk gathers, under one lock.
+#[derive(Default)]
+struct Found {
+    modules: Vec<GoModule>,
+    rust_crates: Vec<RustCrateManifest>,
+    python_roots: Vec<crate::pyproject::PythonSourceRoots>,
+    swift_targets: Vec<crate::swifttargets::SwiftTarget>,
+    gradle_modules: Vec<GradleSettings>,
+    ts_configs: Vec<String>,
+    package_manifests: Vec<(String, crate::workspaces::PackageManifest)>,
+    examined: BTreeSet<String>,
+    refusals: Vec<(String, DiscoverySkipReason)>,
+    /// A walk error about the pass as a whole: the root, or nothing at all.
+    fatal: Option<ignore::Error>,
+}
+
+/// One walked entry: a manifest is collected, read or refused; anything else
+/// is passed over.
+fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync::Mutex<Found>) {
+    let path = entry.path();
+    // The name first: it costs nothing, and it rules out all but a handful of
+    // the entries. Asking `path.is_file()` first was a `stat` of every file in
+    // the tree — on this repository 5,800 of them, on the warm build path, to
+    // find a few dozen manifests.
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let is_go_mod = file_name == "go.mod";
+    let is_cargo_toml = file_name == "Cargo.toml";
+    let is_package_json = file_name == "package.json";
+    let is_python_manifest = file_name == "pyproject.toml" || file_name == "setup.cfg";
+    let is_swift_manifest = crate::swifttargets::is_swift_manifest_name(file_name);
+    let is_gradle_settings = crate::gradle::is_gradle_settings(file_name);
+    if !is_go_mod
+        && !is_cargo_toml
+        && !is_package_json
+        && !is_python_manifest
+        && !is_swift_manifest
+        && !is_gradle_settings
+        && !crate::tsconfig::is_ts_config_name(file_name)
+    {
+        return;
+    }
+    // A link is a candidate whatever it points at. `is_file()` follows it and
+    // answered `false` for a dangling one, so a `go.mod` naming nothing was
+    // passed over like a directory; `read_manifest` decides what any link is
+    // worth, under the same containment rule as source. The walk's own file
+    // type is the entry's, unfollowed, and free.
+    if !entry
+        .file_type()
+        .is_some_and(|kind| kind.is_file() || kind.is_symlink())
+    {
+        return;
+    }
+    let Some(rel_str) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
+        return;
+    };
+    let rel_str = rel_str.replace('\\', "/");
+    if is_python_manifest {
+        visit_python_manifest(root, &rel_str, found);
+        return;
+    }
+    if is_swift_manifest {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => {
+                match crate::swifttargets::parse_swift_manifest(&rel_str, &source) {
+                    Ok(targets) => found.swift_targets.extend(targets),
+                    // A manifest naming targets this reader could not follow is
+                    // a gap, not an empty answer: the files it governs fall back
+                    // to the path heuristic and the inventory says so.
+                    Err(reason) => found
+                        .refusals
+                        .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+                }
+            }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_cargo_toml {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => {
+                let dir = rel_str
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir.to_string())
+                    .unwrap_or_default();
+                match parse_cargo_manifest(&dir, &source) {
+                    Ok(manifest) => {
+                        // A path the manifest names that is not there is a
+                        // gap, reported the way a missing Python root is; what
+                        // the manifest does name correctly is still used.
+                        let missing = cargo_missing_paths(root, &dir, &manifest);
+                        if !missing.is_empty() {
+                            found.refusals.push((
+                                rel_str,
+                                DiscoverySkipReason::Unreadable {
+                                    reason: format!(
+                                        "names paths that do not exist: {}",
+                                        missing.join(", ")
+                                    ),
+                                },
+                            ));
+                        }
+                        if let Some(package) = manifest.package {
+                            found.rust_crates.push(package);
+                        }
+                    }
+                    // A manifest that does not say what its crate is takes the
+                    // crate's name with it, and every `use <name>::…` would be
+                    // filed `External` with nothing saying why.
+                    Err(reason) => found.refusals.push((
+                        rel_str,
+                        DiscoverySkipReason::Unreadable {
+                            reason: format!("could not be read as a Cargo manifest: {reason}"),
+                        },
+                    )),
+                }
+            }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_package_json {
+        let read = read_manifest(root, &rel_str, crate::tsconfig::MAX_CONFIG_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => match crate::workspaces::parse_package_json(&source) {
+                Ok(manifest) => found.package_manifests.push((rel_str, manifest)),
+                Err(reason) => found
+                    .refusals
+                    .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+            },
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_gradle_settings {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => match crate::gradle::parse_modules(&source) {
+                Ok(modules) => {
+                    let dir = rel_str
+                        .rsplit_once('/')
+                        .map(|(dir, _)| dir.to_string())
+                        .unwrap_or_default();
+                    let modules = modules
+                        .into_iter()
+                        .map(|module| {
+                            if dir.is_empty() {
+                                module
+                            } else {
+                                format!("{dir}/{module}")
+                            }
+                        })
+                        .collect();
+                    found.gradle_modules.push(GradleSettings { dir, modules });
+                }
+                // An include list that cannot be read is not "no modules": every
+                // import into one would be filed external with nothing saying
+                // the settings script was the reason.
+                Err(reason) => found.refusals.push((
+                    rel_str,
+                    DiscoverySkipReason::Unreadable {
+                        reason: format!("could not be parsed: {reason}"),
+                    },
+                )),
+            },
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if !is_go_mod {
+        crate::recover_lock(found).ts_configs.push(rel_str);
+        return;
+    }
+    // Read outside the lock: this is the part worth running in parallel.
+    let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+    let mut found = crate::recover_lock(found);
+    found.examined.insert(rel_str.clone());
+    match read {
+        // A `go.mod` that reads and names no module is as lost as one that
+        // cannot be read: its prefix is what maps every import under it, and
+        // dropping it without a record filed those imports `External` with
+        // nothing saying why.
+        ManifestRead::Read(source) => match parse_go_mod(&rel_str, &source) {
+            Some(module) => found.modules.push(module),
+            None => found.refusals.push((
+                rel_str,
+                DiscoverySkipReason::Unreadable {
+                    reason: "could not be parsed: no `module` directive names a module path"
+                        .to_string(),
+                },
+            )),
+        },
+        ManifestRead::Absent | ManifestRead::Skipped => {}
+        // The error's own text, as discovery records the same failure, so a
+        // `go.mod` both passes refuse is one row with one reason.
+        ManifestRead::Refused(reason) => found
+            .refusals
+            .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+    }
+}
+
+/// Read one `pyproject.toml` or `setup.cfg` for the source roots it declares.
+///
+/// A manifest that does not parse, or names a root outside the repository or
+/// one that is not a directory, is a refusal row — the same record a `go.mod`
+/// gets — so "this project declares no roots" and "this project's roots could
+/// not be read" are different answers downstream.
+fn visit_python_manifest(root: &Path, rel_str: &str, found: &std::sync::Mutex<Found>) {
+    let read = read_manifest(root, rel_str, crate::MAX_SOURCE_BYTES);
+    let dir = rel_str
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default();
+    let mut found = crate::recover_lock(found);
+    found.examined.insert(rel_str.to_string());
+    let refuse = |found: &mut Found, reason: String| {
+        found.refusals.push((
+            rel_str.to_string(),
+            DiscoverySkipReason::Unreadable { reason },
+        ));
+    };
+    match read {
+        ManifestRead::Read(source) => {
+            let parsed = if rel_str.ends_with("setup.cfg") {
+                crate::pyproject::parse_setup_cfg_roots(&dir, &source)
+            } else {
+                crate::pyproject::parse_pyproject_roots(&dir, &source)
+            };
+            match parsed {
+                Ok(mut declared) => {
+                    // A root the manifest names that is not a directory on
+                    // disk is dropped from the set and reported: the resolver
+                    // would otherwise probe a path that cannot hold a module.
+                    let missing: Vec<String> = declared
+                        .roots
+                        .iter()
+                        .filter(|path| !root.join(path.as_str()).is_dir())
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        declared.roots.retain(|path| !missing.contains(path));
+                        refuse(
+                            &mut found,
+                            format!(
+                                "names Python source root(s) that are not directories: {}",
+                                missing.join(", ")
+                            ),
+                        );
+                    }
+                    if !declared.roots.is_empty() {
+                        found.python_roots.push(declared);
+                    }
+                }
+                Err(reason) => refuse(&mut found, reason),
+            }
+        }
+        ManifestRead::Absent | ManifestRead::Skipped => {}
+        ManifestRead::Refused(reason) => refuse(&mut found, reason),
+    }
 }
 
 /// One walk for every manifest kind, so a build pays for the tree once: this
 /// is already the second walk of it on the build path.
 pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests> {
-    let mut modules = Vec::new();
-    let mut ts_configs: Vec<String> = Vec::new();
     let walk_root = root.to_path_buf();
-    let marker_error = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let marker_error_writer = std::sync::Arc::clone(&marker_error);
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
+    let marker_errors = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+        String,
+        String,
+    >::new()));
+    let marker_error_writer = std::sync::Arc::clone(&marker_errors);
+    // The same rule sources as discovery, from the same owner: a manifest the
+    // cold walk skips must not be read by this one, or a `.ignore`d `go.mod`
+    // would map modules for sources the graph never holds.
+    let walker = crate::walk_builder(root)
         .filter_entry(move |entry| {
             if entry.path() == walk_root || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 return true;
@@ -125,83 +697,89 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
                 Err(error) => {
                     // Let the walk report a directory it cannot open through
                     // the below-root refusal path below. Discovery already
-                    // accounts for that hole; an unreadable marker inside an
-                    // otherwise readable directory still fails this pass.
+                    // accounts for that hole.
                     if fs::read_dir(entry.path()).is_err() {
                         return true;
                     }
-                    crate::recover_lock(&marker_error_writer).get_or_insert_with(|| {
-                        format!(
-                            "cannot examine {}/CACHEDIR.TAG: {error}",
-                            entry.path().display()
-                        )
-                    });
+                    // An unreadable marker inside a readable directory is the
+                    // directory refused, as discovery refuses it — not the
+                    // whole pass failed. Failing it here failed every daemon
+                    // drain of the tree, while `devmap build`'s discovery had
+                    // already recorded the same directory and carried on.
+                    // Worded as discovery words it, so the two passes' rows
+                    // for one directory are one row.
+                    if let Ok(relative) = entry.path().strip_prefix(&walk_root) {
+                        crate::recover_lock(&marker_error_writer).insert(
+                            relative.to_string_lossy().replace('\\', "/"),
+                            format!("CACHEDIR.TAG could not be examined: {error}"),
+                        );
+                    }
                     false
                 }
             }
         })
-        .build();
-    for result in walker {
-        let entry = match result {
-            Ok(entry) => entry,
-            // Stepped over when it names a path below the root, for the reason
-            // `collect_sources_with_report` gives — and one more of its own.
-            // This is the *second* walk of the same tree on the build path
-            // (`main.rs`: `resolver.index_go_modules(&collect_go_modules(path)?)`),
-            // so fixing only the first left `devmap build` exiting 1 on a
-            // `chmod 000` directory exactly as before, after discovery had
-            // already recorded that directory as a refusal and carried on.
-            //
-            // Nothing is recorded here: this walk has no report to record into,
-            // and the loss is already disclosed by the discovery pass over the
-            // same tree. A second entry for the same directory would double
-            // count it. Go modules are enrichment — a directory this cannot
-            // open holds no `go.mod` it can read, and the map is still worth
-            // having without it.
-            Err(error) => {
-                if crate::walk_error_path(&error)
-                    .and_then(|path| path.strip_prefix(root).ok())
-                    .is_none_or(|relative| relative.as_os_str().is_empty())
-                {
-                    // Names the root, or names nothing: about the pass rather
-                    // than about an entry under it, and not steppable.
-                    return Err(error.into());
+        // In parallel: this walk is on the warm build path now, where it was
+        // a third of a no-change build single-threaded. Nothing below depends
+        // on visit order — every collection is sorted, or is a set, before it
+        // leaves this function.
+        .build_parallel();
+    let found = std::sync::Mutex::new(Found::default());
+    walker.run(|| {
+        Box::new(|result| {
+            let entry = match result {
+                Ok(entry) => entry,
+                // Stepped over when it names a path below the root, for the
+                // reason `collect_sources_with_report` gives — and one more of
+                // its own. This is the *second* walk of the same tree on the
+                // build path, so fixing only the first left `devmap build`
+                // exiting 1 on a `chmod 000` directory exactly as before,
+                // after discovery had already recorded that directory as a
+                // refusal and carried on.
+                //
+                // Nothing is recorded here: this walk has no report to record
+                // into, and the loss is already disclosed by the discovery pass
+                // over the same tree. A second entry for the same directory
+                // would double count it.
+                Err(error) => {
+                    if crate::walk_error_path(&error)
+                        .and_then(|path| path.strip_prefix(root).ok())
+                        .is_none_or(|relative| relative.as_os_str().is_empty())
+                    {
+                        // Names the root, or names nothing: about the pass
+                        // rather than about an entry under it, and not
+                        // steppable.
+                        crate::recover_lock(&found).fatal.get_or_insert(error);
+                        return ignore::WalkState::Quit;
+                    }
+                    return ignore::WalkState::Continue;
                 }
-                continue;
-            }
-        };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let is_go_mod = file_name == "go.mod";
-        if !is_go_mod && !crate::tsconfig::is_ts_config_name(file_name) {
-            continue;
-        }
-        let Ok(rel) = path.strip_prefix(root) else {
-            continue;
-        };
-        let Some(rel_str) = rel.to_str() else {
-            continue;
-        };
-        let rel_str = rel_str.replace('\\', "/");
-        if !is_go_mod {
-            ts_configs.push(rel_str);
-            continue;
-        }
-        let Ok(source) = fs::read_to_string(path) else {
-            continue;
-        };
-        if let Some(module) = parse_go_mod(&rel_str, &source) {
-            modules.push(module);
-        }
+            };
+            visit_manifest_entry(root, &entry, &found);
+            ignore::WalkState::Continue
+        })
+    });
+    let Found {
+        mut modules,
+        mut rust_crates,
+        mut python_roots,
+        mut swift_targets,
+        mut gradle_modules,
+        mut ts_configs,
+        mut package_manifests,
+        mut examined,
+        mut refusals,
+        fatal,
+    } = found
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(error) = fatal {
+        return Err(error.into());
     }
-    if let Some(reason) = crate::recover_lock(&marker_error).take() {
-        anyhow::bail!("{reason}");
-    }
+    refusals.extend(
+        std::mem::take(&mut *crate::recover_lock(&marker_errors))
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
     modules.sort_by(|left, right| {
         right
             .prefix
@@ -211,10 +789,42 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
             .then_with(|| left.dir.cmp(&right.dir))
     });
     ts_configs.sort();
-    let ts_projects = crate::tsconfig::build_ts_projects(root, &ts_configs);
+    rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    package_manifests.sort_by(|left, right| left.0.cmp(&right.0));
+    let workspaces = crate::workspaces::link_workspaces(&package_manifests);
+    refusals.extend(
+        workspaces
+            .gaps
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
+    python_roots.sort_by(|left, right| {
+        left.dir
+            .cmp(&right.dir)
+            .then_with(|| left.roots.cmp(&right.roots))
+    });
+    swift_targets.sort_by(|left, right| {
+        (&left.name, &left.paths, left.package).cmp(&(&right.name, &right.paths, right.package))
+    });
+    gradle_modules.sort_by(|left, right| left.dir.cmp(&right.dir));
+    let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
+    examined.extend(ts.examined);
+    refusals.extend(
+        ts.unreadable
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
+    refusals.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(ProjectManifests {
         go_modules: modules,
-        ts_projects,
+        ts_projects: ts.projects,
+        examined,
+        refusals,
+        rust_crates,
+        ts_workspaces: workspaces.packages,
+        python_roots,
+        swift_targets,
+        gradle_modules,
     })
 }
 

@@ -28,27 +28,35 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
 
+      # Nightly, pinned: `cargo llvm-cov --branch` is unstable, and without it
+      # the Rust report carries line data only, so "Rust coverage" meant lines.
+      # Pinned to a dated toolchain so a nightly regression cannot turn this
+      # workflow red on its own; bump the date deliberately. The gating build
+      # in ci.yml stays on stable.
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly-2026-10-05
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@671164c891d3e20f5b8ece04798d0154d1262d65 # cargo-llvm-cov
 
       - name: Key the Rust cache to this runner image
         shell: bash
         run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
@@ -56,12 +64,14 @@ jobs:
       # Bun installs and runs the package scripts; Vitest still executes on
       # Node through its own shebang.
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
 
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
@@ -77,7 +87,7 @@ jobs:
           }
 
       - name: Upload Frontend Coverage Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: frontend-lcov
           path: coverage/lcov.info
@@ -88,11 +98,11 @@ jobs:
           # One thread: instrumented pipe/shebang/stub-devmap fixtures time out
           # under 4-way contention even after isolating fan-out and giving the
           # child its full timeout after a process slot.
-          xvfb-run -a dbus-run-session -- cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info -- --test-threads=1
+          xvfb-run -a dbus-run-session -- cargo llvm-cov --branch --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info -- --test-threads=1
           # Reuse the counters from the lcov run. A second test execution hid
           # its failures behind `> rust-coverage-summary.txt` and could fail
           # the job minutes after `lcov.info` had already been written.
-          xvfb-run -a dbus-run-session -- cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --summary-only --no-run > rust-coverage-summary.txt
+          xvfb-run -a dbus-run-session -- cargo llvm-cov --branch --manifest-path src-tauri/Cargo.toml --workspace --summary-only --no-run > rust-coverage-summary.txt
           cat rust-coverage-summary.txt
 
       - name: Verify Rust LCOV Was Produced
@@ -106,7 +116,7 @@ jobs:
         run: bun run check:coverage
 
       - name: Upload Rust Coverage Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: rust-lcov
           path: lcov.info

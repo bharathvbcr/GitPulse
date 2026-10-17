@@ -3,8 +3,10 @@
 //! Transcribed from a live `.devcouncil/state.sqlite` rather than from the
 //! SQLModel class definitions, because what the harness has to interoperate
 //! with is the file on disk, not the ORM's intent. Every statement is
-//! `IF NOT EXISTS`, so opening an existing DevCouncil store leaves it exactly
-//! as it was.
+//! `IF NOT EXISTS`, so opening an existing DevCouncil store leaves its live
+//! tables as they were. Tables this build retired are the exception: they are
+//! dropped on open, without a schema-version bump, because a newer stamp would
+//! make every older binary refuse the file and nothing reads or writes them.
 //!
 //! `ux_task_leases_active` is the important line. It is the partial unique
 //! index that makes two builders racing for one task resolve to exactly one
@@ -84,18 +86,6 @@ CREATE TABLE IF NOT EXISTS requirements (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE IF NOT EXISTS assumptions (
-    id VARCHAR NOT NULL,
-    statement VARCHAR NOT NULL,
-    confidence VARCHAR NOT NULL,
-    impact VARCHAR NOT NULL,
-    reversible BOOLEAN NOT NULL,
-    requires_user_confirmation BOOLEAN NOT NULL,
-    linked_requirement_ids_json VARCHAR NOT NULL DEFAULT '[]',
-    status VARCHAR NOT NULL DEFAULT 'open',
-    PRIMARY KEY (id)
-);
-
 CREATE TABLE IF NOT EXISTS evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type VARCHAR NOT NULL,
@@ -120,8 +110,8 @@ CREATE TABLE IF NOT EXISTS gaps (
     suggested_command VARCHAR,
     acceptance_criterion_id VARCHAR,
     expected_verification_method VARCHAR,
-    -- Added after schema 9 shipped, so a store created earlier gains them in
-    -- `ensure_gap_output_columns`, not here.
+    -- Added after schema 9 shipped; a store created earlier gains them in
+    -- `migrate`, which adds every column this DDL defines that the table lacks.
     stdout_path VARCHAR,
     stderr_path VARCHAR,
     PRIMARY KEY (id)
@@ -165,79 +155,6 @@ CREATE TABLE IF NOT EXISTS gap_history (
     PRIMARY KEY (task_id, gap_id)
 );
 
-CREATE TABLE IF NOT EXISTS critique_findings (
-    id VARCHAR NOT NULL,
-    source_agent VARCHAR NOT NULL,
-    target_plan_id VARCHAR NOT NULL,
-    severity VARCHAR NOT NULL,
-    finding_type VARCHAR NOT NULL,
-    claim VARCHAR NOT NULL,
-    linked_requirement_id VARCHAR,
-    suggested_requirement VARCHAR,
-    suggested_task VARCHAR,
-    falsifiable_check VARCHAR NOT NULL,
-    status VARCHAR NOT NULL DEFAULT 'open',
-    PRIMARY KEY (id)
-);
-
-CREATE TABLE IF NOT EXISTS project_state (
-    id VARCHAR NOT NULL,
-    current_phase VARCHAR NOT NULL,
-    history_json VARCHAR NOT NULL DEFAULT '[]',
-    PRIMARY KEY (id)
-);
-
-CREATE TABLE IF NOT EXISTS shell_sessions (
-    id VARCHAR NOT NULL,
-    task_id VARCHAR NOT NULL,
-    lease_id VARCHAR,
-    shell VARCHAR NOT NULL,
-    cwd VARCHAR NOT NULL,
-    status VARCHAR NOT NULL,
-    started_at VARCHAR NOT NULL,
-    ended_at VARCHAR,
-    PRIMARY KEY (id)
-);
-CREATE INDEX IF NOT EXISTS ix_shell_sessions_task_id ON shell_sessions (task_id);
-
-CREATE TABLE IF NOT EXISTS shell_command_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id VARCHAR NOT NULL,
-    session_id VARCHAR,
-    command VARCHAR NOT NULL,
-    status VARCHAR NOT NULL,
-    exit_code INTEGER,
-    reason VARCHAR NOT NULL DEFAULT '',
-    stdout_path VARCHAR NOT NULL DEFAULT '',
-    stderr_path VARCHAR NOT NULL DEFAULT '',
-    created_at VARCHAR NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_shell_command_events_task_id ON shell_command_events (task_id);
-
-CREATE TABLE IF NOT EXISTS file_change_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id VARCHAR,
-    lease_id VARCHAR,
-    session_id VARCHAR,
-    path VARCHAR NOT NULL,
-    operation VARCHAR NOT NULL,
-    allowed BOOLEAN NOT NULL,
-    reason VARCHAR NOT NULL DEFAULT '',
-    created_at VARCHAR NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_file_change_events_task_id ON file_change_events (task_id);
-
-CREATE TABLE IF NOT EXISTS semantic_diffs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id VARCHAR NOT NULL,
-    before_snapshot_path VARCHAR NOT NULL,
-    after_snapshot_path VARCHAR NOT NULL,
-    classifications_json VARCHAR NOT NULL DEFAULT '[]',
-    summary VARCHAR NOT NULL DEFAULT '',
-    created_at VARCHAR NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_semantic_diffs_task_id ON semantic_diffs (task_id);
-
 CREATE TABLE IF NOT EXISTS agent_handoffs (
     id VARCHAR NOT NULL,
     task_id VARCHAR NOT NULL,
@@ -250,19 +167,6 @@ CREATE TABLE IF NOT EXISTS agent_handoffs (
     PRIMARY KEY (id)
 );
 CREATE INDEX IF NOT EXISTS ix_agent_handoffs_task_id ON agent_handoffs (task_id);
-
-CREATE TABLE IF NOT EXISTS correction_manifests (
-    id VARCHAR NOT NULL,
-    task_id VARCHAR NOT NULL,
-    run_id VARCHAR,
-    manifest_path VARCHAR NOT NULL,
-    retry_budget INTEGER NOT NULL DEFAULT 3,
-    attempt INTEGER NOT NULL DEFAULT 0,
-    status VARCHAR NOT NULL,
-    created_at VARCHAR NOT NULL,
-    PRIMARY KEY (id)
-);
-CREATE INDEX IF NOT EXISTS ix_correction_manifests_task_id ON correction_manifests (task_id);
 
 CREATE TABLE IF NOT EXISTS verification_runs (
     id VARCHAR NOT NULL,
@@ -383,41 +287,183 @@ fn normalise_ddl(sql: &str) -> String {
         .collect()
 }
 
-/// Columns added to `gaps` after schema 9 shipped, with their types.
-const GAP_OUTPUT_COLUMNS: &[(&str, &str)] =
-    &[("stdout_path", "VARCHAR"), ("stderr_path", "VARCHAR")];
+/// One column as `PRAGMA table_info` reports it.
+struct Column {
+    name: String,
+    ty: String,
+    not_null: bool,
+    default: Option<String>,
+    primary_key: bool,
+}
 
-/// Adds the gap output-path columns to a `gaps` table created without them.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<Column>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Column {
+            name: row.get("name")?,
+            ty: row.get("type")?,
+            not_null: row.get::<_, i64>("notnull")? != 0,
+            default: row.get("dflt_value")?,
+            primary_key: row.get::<_, i64>("pk")? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every column [`SCHEMA`] defines that `conn`'s tables lack, as
+/// `(table, column)`, in a stable order.
 ///
-/// `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so without
-/// this a store in use before the columns existed would refuse every
-/// `gap-upsert` with "no such column" — the longest-lived stores first.
-///
-/// The change is additive and nullable, and it deliberately does not move
-/// `SCHEMA_VERSION`. That number is asserted by the Go client and shared with
-/// DevCouncil's planner; it exists to stop a binary reading rows through the
-/// wrong column layout. Two optional columns that older binaries never name in
-/// an INSERT or SELECT cannot produce that, while bumping it would make every
-/// installed client refuse every store this build has opened.
-///
-/// Two processes opening the same old store can both see a column missing and
-/// both add it; the loser's "duplicate column" is re-checked rather than
-/// reported, the same way `ensure_schema_version` treats its insert race.
-pub fn ensure_gap_output_columns(conn: &Connection) -> rusqlite::Result<()> {
-    for (name, ty) in GAP_OUTPUT_COLUMNS {
-        if gaps_has_column(conn, name)? {
-            continue;
+/// Derived from [`SCHEMA`] itself — created in a scratch database and read back
+/// through `PRAGMA table_info` — rather than from a second hand-kept list, so
+/// a column added to the DDL above is ensured on old stores without anyone
+/// remembering to name it twice. `CREATE TABLE IF NOT EXISTS` leaves an
+/// existing table as it is; before this, only the two `gaps` output columns
+/// were added, so a store from before schema 7 passed health, was stamped as
+/// current, and then failed every `task` read with "no such column".
+fn missing_columns(conn: &Connection) -> rusqlite::Result<Vec<(String, Column)>> {
+    let scratch = Connection::open_in_memory()?;
+    scratch.execute_batch(SCHEMA)?;
+    let mut tables = scratch.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let tables: Vec<String> = tables
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut missing = Vec::new();
+    for table in tables {
+        let have: Vec<String> = table_columns(conn, &table)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        for column in table_columns(&scratch, &table)? {
+            if !have.contains(&column.name) {
+                missing.push((table.clone(), column));
+            }
         }
-        if let Err(err) = conn.execute_batch(&format!("ALTER TABLE gaps ADD COLUMN {name} {ty}"))
-            && !gaps_has_column(conn, name)?
-        {
-            return Err(err);
+    }
+    Ok(missing)
+}
+
+fn add_missing_columns(
+    conn: &Connection,
+    budget: &mut Option<usize>,
+) -> std::result::Result<(), String> {
+    let missing =
+        missing_columns(conn).map_err(|e| format!("columns could not be compared: {e}"))?;
+    for (table, column) in missing {
+        // SQLite refuses to add a primary key, and a NOT NULL column with no
+        // default (existing rows would have nothing to hold). Neither can be
+        // repaired in place, so say so rather than half-migrate.
+        if column.primary_key || (column.not_null && column.default.is_none()) {
+            return Err(format!(
+                "table {table} lacks column {}, which cannot be added to an existing table",
+                column.name
+            ));
         }
+        spend(budget)?;
+        let mut ddl = format!(
+            "ALTER TABLE {table} ADD COLUMN {} {}",
+            column.name, column.ty
+        );
+        if column.not_null {
+            ddl.push_str(" NOT NULL");
+        }
+        if let Some(default) = &column.default {
+            ddl.push_str(&format!(" DEFAULT {default}"));
+        }
+        conn.execute_batch(&ddl)
+            .map_err(|e| format!("column {table}.{} could not be added: {e}", column.name))?;
     }
     Ok(())
 }
 
-fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+/// Brings an existing store's columns and `schema_version` up to this build,
+/// as one transaction.
+///
+/// The columns and the stamp commit together or not at all: stamping first, or
+/// stamping without the columns, is what left a v6 store reading as v9 while
+/// missing the column `task` selects. A newer-than-known version is refused
+/// before anything is touched. An up-to-date store that does not still hold a
+/// retired table takes no write lock — this runs on every open. The first open
+/// that finds one takes a write lock only long enough to drop it.
+pub fn migrate(conn: &Connection, known: u32) -> std::result::Result<(), String> {
+    migrate_inner(conn, known, &mut None)
+}
+
+/// Fails the migration after `steps` write steps (each column added, then the
+/// version stamp), so a test can crash it at every point and check that the
+/// store is left exactly as it was found.
+#[doc(hidden)]
+pub fn migrate_failing_after(
+    conn: &Connection,
+    known: u32,
+    steps: usize,
+) -> std::result::Result<(), String> {
+    migrate_inner(conn, known, &mut Some(steps))
+}
+
+fn spend(budget: &mut Option<usize>) -> std::result::Result<(), String> {
+    match budget {
+        Some(0) => Err("injected failure".to_string()),
+        Some(n) => {
+            *n -= 1;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+fn migrate_inner(
+    conn: &Connection,
+    known: u32,
+    budget: &mut Option<usize>,
+) -> std::result::Result<(), String> {
+    let read_version = |conn: &Connection| -> std::result::Result<Option<i64>, String> {
+        conn.query_row(
+            "SELECT version FROM schema_version WHERE id = 'singleton'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("schema_version could not be read: {e}"))
+    };
+    let current = read_version(conn)?;
+    if let Some(v) = current {
+        check_version(v, known)?;
+    }
+    // Before the early return: a store already at this version still carries
+    // the retired tables until the first open of this build drops them.
+    drop_retired_tables(conn)?;
+    let missing =
+        missing_columns(conn).map_err(|e| format!("columns could not be compared: {e}"))?;
+    if missing.is_empty() && current == Some(known as i64) {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("migration could not take the write lock: {e}"))?;
+    let outcome = (|| {
+        // Re-read under the lock: another process may have migrated, or a
+        // newer binary may have stamped a higher version, since the look above.
+        if let Some(v) = read_version(conn)? {
+            check_version(v, known)?;
+        }
+        add_missing_columns(conn, budget)?;
+        spend(budget)?;
+        ensure_schema_version(conn, known)
+    })();
+    match outcome {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("migration could not commit: {e}")),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(gaps)")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -484,6 +530,67 @@ pub fn ensure_schema_version(conn: &Connection, known: u32) -> std::result::Resu
                 .map_err(|e| format!("schema_version could not be upgraded: {e}"))?;
             }
             Ok(())
+        }
+    }
+}
+
+/// Tables removed from [`SCHEMA`]. Nothing in this crate or the Go host reads
+/// or writes them. `assumptions`, `project_state` and `critique_findings` were
+/// planning state, retired with the Python `planning/` package in Phase 7.
+/// The shell, file-change and semantic-diff tables never grew a producer.
+/// `correction_manifests` was named by a comment and never inserted.
+///
+/// The names stay here, not in the DDL, so an existing file loses them on
+/// open. The schema version is unchanged: a newer stamp makes every older
+/// binary refuse the file, and an older binary only creates these tables again
+/// empty.
+const RETIRED_TABLES: &[&str] = &[
+    "assumptions",
+    "critique_findings",
+    "project_state",
+    "shell_sessions",
+    "shell_command_events",
+    "file_change_events",
+    "semantic_diffs",
+    "correction_manifests",
+];
+
+fn drop_retired_tables(conn: &Connection) -> std::result::Result<(), String> {
+    let mut present = Vec::new();
+    for name in RETIRED_TABLES {
+        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(format!("retired table name {name} is not an identifier"));
+        }
+        let found: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("retired table {name} could not be checked: {e}"))?;
+        if found != 0 {
+            present.push(*name);
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("retired tables could not be locked: {e}"))?;
+    let outcome = (|| -> std::result::Result<(), String> {
+        for name in present {
+            conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{name}\""))
+                .map_err(|e| format!("retired table {name} could not be dropped: {e}"))?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("retired tables could not be committed: {e}")),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
         }
     }
 }

@@ -106,16 +106,18 @@ pub fn resolution_kind_label(resolution: &devmap_resolve::model::Resolution) -> 
 /// storing `1` there would make a certain edge indistinguishable from a
 /// one-candidate ambiguity in every aggregate that reads the column.
 ///
-/// This is the denominator resolver memory actually tracks. Since
-/// `AMBIGUOUS_FANOUT_CAP` bounds emitted edges but not the candidate list the
-/// `Arc<Resolution>` holds, the two stopped being the same number, and every
-/// metric derived from the store was counting the wrong one.
+/// This is the denominator resolver memory actually tracks: the candidate list
+/// the `Arc<Resolution>` holds, which is not the number of edges emitted for
+/// it. Since S2 the resolver's own ambiguous bare names emit no edge at all
+/// (they are ledger rows), so the edges that carry it are a language server's
+/// dispatch sets.
 pub fn ambiguous_candidate_total(
     resolution: Option<&devmap_resolve::model::Resolution>,
 ) -> Option<i64> {
     match resolution? {
         devmap_resolve::model::Resolution::AmbiguousGlobal { candidates, .. }
-        | devmap_resolve::model::Resolution::LanguageServerDispatch { candidates, .. } => {
+        | devmap_resolve::model::Resolution::LanguageServerDispatch { candidates, .. }
+        | devmap_resolve::model::Resolution::Dispatch { candidates, .. } => {
             i64::try_from(candidates.len()).ok()
         }
         _ => None,

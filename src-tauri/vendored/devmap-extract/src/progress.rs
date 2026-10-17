@@ -17,10 +17,29 @@ struct State {
     cache_hits: usize,
     failed: usize,
     invalid: bool,
+    budget_retry: BudgetRetryCounts,
+}
+
+/// What the serial parse-budget retry did, as the build's JSON reports it
+/// (`file_progress.extraction.budget_retry`). Files are the unit; the paths of
+/// the ones still refused are in `status`'s `parse_failed` inventory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BudgetRetryCounts {
+    /// Files the parallel pass refused for budget.
+    pub refused: usize,
+    /// Of those, re-run serially.
+    pub retried: usize,
+    /// Of those retried, parsed.
+    pub recovered: usize,
+    /// Refused and never re-run (retry cap or cancellation).
+    pub not_retried: usize,
+    /// Still refused in the final result.
+    pub still_refused: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct FileSnapshot {
+    pub budget_retry: BudgetRetryCounts,
     pub total: Option<usize>,
     pub completed: usize,
     pub cache_hits: usize,
@@ -62,6 +81,14 @@ impl FileProgress {
             state.total.is_none_or(|total| state.completed > total) || (cached && failed);
     }
 
+    /// Record the outcome of the serial budget retry for this phase.
+    pub fn record_budget_retry(&self, counts: BudgetRetryCounts) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .budget_retry = counts;
+    }
+
     pub fn snapshot(&self) -> FileSnapshot {
         let state = self
             .state
@@ -85,6 +112,7 @@ impl State {
         let rate = (known && self.completed >= 10 && seconds >= 1.0)
             .then(|| self.completed as f64 / seconds);
         FileSnapshot {
+            budget_retry: self.budget_retry,
             total: self.total,
             completed: self.completed,
             cache_hits: self.cache_hits,
@@ -106,13 +134,23 @@ impl State {
 pub struct FileDelta {
     pub added: usize,
     pub changed: usize,
+    /// Indexed paths that are no longer in the tree.
     pub removed: usize,
+    /// Indexed paths still in the tree that grew past `MAX_SOURCE_BYTES`.
+    ///
+    /// Not folded into `removed`, though both lose the file's rows: "deleted"
+    /// and "skipped: over limit" call for opposite responses, and reporting a
+    /// 1.7 MB generated client as removed told a reader the callers it held
+    /// were gone from the code rather than from the index. Serialized under the
+    /// name `status.delta` uses, so the two surfaces spell one fact one way.
+    #[serde(rename = "skipped_over_limit")]
+    pub over_limit: usize,
     pub unchanged: usize,
 }
 
 impl FileDelta {
     pub fn is_unchanged(&self) -> bool {
-        self.added == 0 && self.changed == 0 && self.removed == 0
+        self.added == 0 && self.changed == 0 && self.removed == 0 && self.over_limit == 0
     }
 }
 

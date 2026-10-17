@@ -1,16 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
 /**
  * The architecture docs listed "Tokio" beside "Rayon" as though both were
  * direct dependencies, so a contributor could reasonably write `use tokio::…`
- * and find it does not compile. Tokio is present only transitively through
- * Tauri.
+ * and find it does not compile. Tokio was then present only transitively
+ * through Tauri; it is now a direct, exactly pinned dependency (the sized
+ * runtime in `pools.rs` and the background-command semaphore).
  *
  * A prose claim about a manifest drifts the moment the manifest changes, so
- * this pins the two together: adding tokio as a direct dependency should fail
- * here and point at the sentence that then needs rewriting.
+ * this pins the manifest, the lockfile and the sentence together: changing any
+ * of them alone should fail here and point at the one that needs rewriting.
  */
 const cargo = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
 const architecture = readFileSync(new URL("../docs/ARCHITECTURE.md", import.meta.url), "utf8");
@@ -66,11 +68,23 @@ describe("architecture documentation contract", () => {
     expect(deps).toContain("rayon");
   });
 
-  it("keeps the docs' 'tokio is not a direct dependency' claim true", () => {
-    // If this fails because tokio was added deliberately, the fix is to update
-    // the async-runtime note in ARCHITECTURE.md, not to delete this test.
-    expect(deps).not.toContain("tokio");
-    expect(architecture).toContain("Tokio is present, but transitively through Tauri");
+  it("keeps the docs' claim about tokio as a direct dependency true", () => {
+    // Tokio became a direct dependency deliberately (the sized runtime and the
+    // background-command semaphore), and ARCHITECTURE.md's async-runtime note
+    // says so. If this fails, the manifest, the lockfile or that sentence has
+    // drifted from the others; fix the one that is wrong, do not delete this.
+    expect(deps).toContain("tokio");
+    const line = /^tokio\s*=.*$/m.exec(cargo)?.[0] ?? "";
+    const pinned = /version\s*=\s*"=([0-9][^"]*)"/.exec(line)?.[1];
+    expect(pinned, "tokio must carry an exact '=' version pin").toBeDefined();
+    const lock = readFileSync(new URL("../src-tauri/Cargo.lock", import.meta.url), "utf8");
+    const resolved = [
+      ...lock.matchAll(/\[\[package\]\]\nname = "tokio"\nversion = "([^"]+)"/g),
+    ].map((match) => match[1]);
+    expect(resolved, "Cargo.lock must resolve exactly the pinned tokio").toEqual([pinned]);
+    expect(architecture).toContain("`tokio` are the direct concurrency dependencies");
+    expect(architecture).toContain("2 to 4 async workers, at most 64 blocking threads");
+    expect(architecture).not.toContain("Tokio is present, but transitively through Tauri");
   });
 
   it("does not name Tokio in the backend diagrams alongside a real dependency", () => {
@@ -88,10 +102,7 @@ describe("architecture documentation contract", () => {
 
   it("points at the real off-thread mechanism", () => {
     expect(architecture).toContain("tauri::async_runtime::spawn_blocking");
-    const commands = readFileSync(
-      new URL("../src-tauri/src/commands/mod.rs", import.meta.url),
-      "utf8",
-    );
+    const commands = readCommandsSource();
     // The doc names `off_thread`; it must still exist and use that runtime.
     expect(commands).toContain("async fn off_thread");
     expect(commands).toContain("tauri::async_runtime::spawn_blocking");

@@ -371,11 +371,15 @@ pub fn extract_notebook(
 }
 
 /// Production entry: every cell receives only the remaining shared budget.
-pub(crate) fn extract_notebook_bounded(path: &str, raw: &str) -> Extraction {
+pub(crate) fn extract_notebook_bounded(
+    path: &str,
+    raw: &str,
+    budget: std::time::Duration,
+) -> Extraction {
     extract_notebook_with_parser(
         path,
         raw,
-        crate::treesitter::DEFAULT_PARSE_BUDGET,
+        budget,
         crate::treesitter::extract_treesitter_with_budget,
     )
 }
@@ -430,9 +434,9 @@ fn extract_notebook_with_parser(
     if std::time::Instant::now() >= deadline {
         return base(
             ParseOutcome::Failed {
-                reason: format!(
+                reason: crate::treesitter::budget_refusal_reason(format!(
                     "notebook extraction exceeded the {budget:?} budget before parsing"
-                ),
+                )),
             },
             ExtractionEngine::Unavailable {
                 requested_language: "notebook".to_string(),
@@ -574,13 +578,21 @@ fn extract_notebook_with_parser(
         diagnostics,
     );
     let mut partial_ranges = Vec::new();
+    let mut nameless_ranges = Vec::new();
     let mut incomplete = Vec::new();
     for (index, cell) in cells.iter().enumerate() {
         let fail = |reason: String| {
+            // A budget stamp stays first, so `is_budget_refusal` still
+            // recognises the failure once the cell context is added.
+            let reason = match reason.strip_prefix(crate::model::BUDGET_REFUSAL_PREFIX) {
+                Some(rest) => crate::treesitter::budget_refusal_reason(format!(
+                    "notebook code cell {}: {rest}",
+                    index + 1
+                )),
+                None => format!("notebook code cell {}: {reason}", index + 1),
+            };
             base(
-                ParseOutcome::Failed {
-                    reason: format!("notebook code cell {}: {reason}", index + 1),
-                },
+                ParseOutcome::Failed { reason },
                 ExtractionEngine::Notebook {
                     kernel_language: language.to_string(),
                 },
@@ -594,11 +606,15 @@ fn extract_notebook_with_parser(
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return fail(format!("extraction exceeded the shared {budget:?} budget"));
+            return fail(crate::treesitter::budget_refusal_reason(format!(
+                "extraction exceeded the shared {budget:?} budget"
+            )));
         }
         let parsed = parse(&synthetic, language, &buffer, remaining);
         if std::time::Instant::now() >= deadline {
-            return fail(format!("extraction exceeded the shared {budget:?} budget"));
+            return fail(crate::treesitter::budget_refusal_reason(format!(
+                "extraction exceeded the shared {budget:?} budget"
+            )));
         }
         if let ParseOutcome::Failed { reason } = &parsed.parse_outcome {
             return fail(reason.clone());
@@ -608,7 +624,13 @@ fn extract_notebook_with_parser(
         };
         match parsed.parse_outcome {
             ParseOutcome::Clean => {}
-            ParseOutcome::Partial { error_ranges } => partial_ranges.extend(error_ranges),
+            ParseOutcome::Partial {
+                error_ranges,
+                nameless_ranges: nameless,
+            } => {
+                partial_ranges.extend(error_ranges);
+                nameless_ranges.extend(nameless);
+            }
             ParseOutcome::Fallback { reason } | ParseOutcome::Skipped { reason } => {
                 incomplete.push(format!("cell {}: {reason}", index + 1));
             }
@@ -646,8 +668,11 @@ fn extract_notebook_with_parser(
     } else if !partial_ranges.is_empty() {
         partial_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
         partial_ranges.dedup();
+        nameless_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+        nameless_ranges.dedup();
         extraction.parse_outcome = ParseOutcome::Partial {
             error_ranges: partial_ranges,
+            nameless_ranges,
         };
     }
     extraction.local_bindings.sort();
@@ -657,7 +682,9 @@ fn extract_notebook_with_parser(
     if std::time::Instant::now() >= deadline {
         return base(
             ParseOutcome::Failed {
-                reason: format!("notebook finalization exceeded the shared {budget:?} budget"),
+                reason: crate::treesitter::budget_refusal_reason(format!(
+                    "notebook finalization exceeded the shared {budget:?} budget"
+                )),
             },
             ExtractionEngine::Notebook {
                 kernel_language: language.to_string(),
@@ -738,8 +765,12 @@ fn relocate_cell(
             rewrite_owner(owner);
         }
     }
-    if let ParseOutcome::Partial { error_ranges } = &mut parsed.parse_outcome {
-        for range in error_ranges {
+    if let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &mut parsed.parse_outcome
+    {
+        for range in error_ranges.iter_mut().chain(nameless_ranges.iter_mut()) {
             let mut span = Span {
                 start_byte: range.start_byte,
                 end_byte: range.end_byte,
@@ -831,6 +862,56 @@ mod tests {
             .symbols
             .iter()
             .all(|symbol| symbol.kind == SymbolKind::File));
+    }
+
+    #[test]
+    fn every_notebook_budget_refusal_is_stamped_and_cell_context_keeps_the_stamp() {
+        let raw = notebook("python", &[("code", "def first():\n    pass")]);
+        // The shared budget runs out during the cell.
+        let overran = extract_notebook_with_parser(
+            "budget.ipynb",
+            &raw,
+            std::time::Duration::from_millis(50),
+            |path, language, source, remaining| {
+                std::thread::sleep(remaining + std::time::Duration::from_millis(2));
+                crate::extract_treesitter(path, language, source)
+            },
+        );
+        assert!(overran.is_budget_refusal(), "{:?}", overran.parse_outcome);
+        // A cell's own stamped refusal keeps its stamp once the cell is named.
+        let cell_refused = extract_notebook_with_parser(
+            "budget.ipynb",
+            &raw,
+            std::time::Duration::from_secs(60),
+            |path, language, source, _| {
+                crate::treesitter::extract_treesitter_with_budget(
+                    path,
+                    language,
+                    source,
+                    std::time::Duration::ZERO,
+                )
+            },
+        );
+        assert!(cell_refused.is_budget_refusal());
+        assert!(matches!(
+            &cell_refused.parse_outcome,
+            ParseOutcome::Failed { reason } if reason.contains("notebook code cell 1")
+        ));
+        // A cell that fails for another reason stays unstamped.
+        let other = extract_notebook_with_parser(
+            "budget.ipynb",
+            &raw,
+            std::time::Duration::from_secs(60),
+            |path, _, source, _| {
+                crate::treesitter::refused_extraction(
+                    path,
+                    "python",
+                    source,
+                    "grammar fault".into(),
+                )
+            },
+        );
+        assert!(other.is_parse_failure() && !other.is_budget_refusal());
     }
 
     #[test]

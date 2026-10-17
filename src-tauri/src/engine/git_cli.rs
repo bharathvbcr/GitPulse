@@ -1,6 +1,7 @@
+use crate::diff::{Expect, WriteFailure};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -22,6 +23,9 @@ pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(unix)]
 mod pipe_drain;
 
+#[cfg(all(test, unix))]
+mod grace_adversarial;
+
 #[cfg(any(not(unix), test))]
 mod thread_io;
 
@@ -33,7 +37,11 @@ pub use hooks::{
 };
 
 mod preflight;
-pub use preflight::{git_preflight, GitPreflight, GitPreflightStatus, MIN_GIT_VERSION};
+pub use preflight::{
+    git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
+    MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
+};
+pub(crate) use preflight::{git_supports, DIFF_MERGES_OPTION, SINCE_AS_FILTER};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -88,7 +96,7 @@ pub fn validate_repo_path(repo_path: &str) -> Result<PathBuf, String> {
     Err(format!("Not a Git repository: {}", canonical.display()))
 }
 
-fn is_git_repository(canonical: &Path) -> bool {
+pub(crate) fn is_git_repository(canonical: &Path) -> bool {
     if canonical.join(".git").exists() {
         return true;
     }
@@ -175,11 +183,102 @@ pub fn sandbox_join(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
             Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
                 return Err("File path escapes the repository".into());
             }
+            Component::Normal(name) if is_git_metadata_component(name) => {
+                return Err(git_metadata_message(file_path));
+            }
             Component::CurDir | Component::Normal(_) => {}
         }
     }
     let joined = repo.join(rel);
     Ok(joined)
+}
+
+fn git_metadata_message(file_path: &str) -> String {
+    format!("Git metadata cannot be read or written as a repository file: {file_path}")
+}
+
+/// True when one path component names git's own metadata directory, in any
+/// spelling the platform's filesystem would resolve to it. Mirrors what git's
+/// `verify_path` refuses in a checkout: `.git` compared case-insensitively
+/// after dropping trailing dots and spaces (Windows ignores both), an NTFS
+/// alternate-data-stream suffix (`.git::$INDEX_ALLOCATION`), and on Windows
+/// the 8.3 short name `git~1`. `.gitignore`, `.gitkeep`, `.github` and
+/// `.gitattributes` are ordinary files and pass.
+///
+/// This is the lexical half. A symlink into the git directory, a hashed 8.3
+/// name, or a `gitdir:` layout with another name is caught by the resolved
+/// path in [`sandbox_join_write`].
+///
+/// Known gap, not closed here: a nested repository or worktree whose `.git`
+/// FILE points at a gitdir inside the tree under another name (`sub/.git` ->
+/// `gitdir: ../.modules/sub`) is refused only at `sub/.git` itself, not at the
+/// directory it names. Closing it means parsing every in-tree `.git` file.
+pub fn is_git_metadata_component(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    // `.git:stream` and `.git::$INDEX_ALLOCATION` open the directory on NTFS.
+    let base = name.split(':').next().unwrap_or("");
+    let base = base.trim_end_matches(['.', ' ']);
+    base.eq_ignore_ascii_case(".git") || (cfg!(windows) && base.eq_ignore_ascii_case("git~1"))
+}
+
+/// [`sandbox_join_canonical`] for a path about to be written, read for write
+/// authority or moved: it also refuses a target that resolves into the
+/// repository's private or common git directory. The lexical check in
+/// [`sandbox_join`] cannot see a symlink alias of `.git` or a `.bare` layout,
+/// where the git directory has another name. Both directories come from
+/// `repository_trust::git_directories`, which reads the `.git` file and
+/// spawns no git.
+///
+/// It follows a symlink at the final component, which is what a save wants
+/// (the bytes go to what the name resolves to). A create, move or delete acts
+/// on the entry itself and uses [`sandbox_join_write_entry`].
+pub fn sandbox_join_write(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+    let resolved = sandbox_join_canonical(repo, file_path)?;
+    guard_write_target(repo, file_path, resolved)
+}
+
+/// [`sandbox_join_write`] for an operation on the entry itself (create, move,
+/// delete): the parent is resolved and checked, and the final name is appended
+/// as it stands, so a symlink is the link and a dangling link is a name that
+/// exists, not an error.
+///
+/// The git-metadata refusal still holds: the name itself is checked
+/// lexically, and a parent that resolves into the git directory is refused. A
+/// link whose TARGET is in `.git` can be moved or deleted as a link, which
+/// never touches `.git`. The repository root is never a target, however it is
+/// spelled.
+pub fn sandbox_join_write_entry(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+    if Path::new(file_path)
+        .components()
+        .all(|component| matches!(component, Component::CurDir))
+    {
+        return Err(root_message(file_path));
+    }
+    let resolved = sandbox_join_entry(repo, file_path)?;
+    guard_write_target(repo, file_path, resolved)
+}
+
+fn root_message(file_path: &str) -> String {
+    format!("Refusing to change the repository root: {file_path}")
+}
+
+/// What no write target may be: the repository root, or anything at or under
+/// its private or common git directory.
+fn guard_write_target(repo: &Path, file_path: &str, resolved: PathBuf) -> Result<PathBuf, String> {
+    let root = repo
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve repository path '{}': {}", repo.display(), e))?;
+    if resolved == root {
+        return Err(root_message(file_path));
+    }
+    let (private, common) = crate::repository_trust::git_directories(repo)?;
+    for dir in [private, common] {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if resolved.starts_with(&dir) {
+            return Err(git_metadata_message(file_path));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Like [`sandbox_join`], but safe against symlinks that point outside the repo.
@@ -268,9 +367,118 @@ pub fn sandbox_join_entry(repo: &Path, file_path: &str) -> Result<PathBuf, Strin
 }
 
 pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<(), String> {
+    sandbox_write_expecting(repo_path, file_path, None, content).map(|_| ())
+}
+
+/// The one sandboxed write. With `expected` the file is replaced only if it
+/// still holds exactly those bytes: `Ok(false)` means it does not (changed, or
+/// gone) and nothing was written, `Ok(true)` that the content was written. The
+/// bytes are compared under the same anchored read the replacement uses.
+/// `None` writes unconditionally, which is [`sandbox_write`].
+pub fn sandbox_write_expecting(
+    repo_path: &str,
+    file_path: &str,
+    expected: Option<&str>,
+    content: &str,
+) -> Result<bool, String> {
+    let dest = write_target(repo_path, file_path)?;
+    let expect = expected.map_or(Expect::Any, |bytes| Expect::Bytes(bytes.as_bytes()));
+    match crate::diff::write_regular_expecting(&dest, expect, |_| Ok(content.as_bytes().to_vec())) {
+        Ok(_) => Ok(true),
+        Err(WriteFailure::Changed { .. }) => Ok(false),
+        Err(failure) => Err(failure.to_string()),
+    }
+}
+
+/// The sandboxed target of a write: inside the repository, through no symlink
+/// that leaves it, and not git's own metadata.
+fn write_target(repo_path: &str, file_path: &str) -> Result<PathBuf, String> {
     let repo = validate_repo(repo_path)?;
-    let dest = sandbox_join_canonical(&repo, file_path)?;
-    crate::diff::write_regular(&dest, content.as_bytes())
+    sandbox_join_write(&repo, file_path)
+}
+
+/// Why a file write through [`sandbox_create`] or [`sandbox_save_edited_text`]
+/// did not happen. It crosses the IPC boundary as `{code, message, ...}`;
+/// every variant carries a `message` fit to show, and the code is what the
+/// editor branches on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum FileWriteError {
+    /// A create found something at the path. Nothing was written.
+    AlreadyExists { message: String, path: String },
+    /// The save's base is not what is on disk now. `expected` is the base the
+    /// draft carried and `actual` the token of the disk, so the editor can
+    /// re-save over exactly that version if the user chooses to.
+    ChangedOnDisk {
+        message: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    /// Refused or failed before anything was written.
+    Refused { message: String },
+}
+
+impl FileWriteError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::AlreadyExists { message, .. }
+            | Self::ChangedOnDisk { message, .. }
+            | Self::Refused { message } => message,
+        }
+    }
+
+    fn from_failure(failure: WriteFailure, path: &str, expected: Option<&str>) -> Self {
+        match failure {
+            WriteFailure::AlreadyExists => Self::AlreadyExists {
+                message: format!("'{path}' already exists"),
+                path: path.to_string(),
+            },
+            WriteFailure::Changed { actual } => Self::ChangedOnDisk {
+                message: format!(
+                    "'{path}' changed on disk since it was opened. Nothing was written."
+                ),
+                path: path.to_string(),
+                expected: expected.unwrap_or_default().to_string(),
+                actual,
+            },
+            WriteFailure::Other(message) => Self::Refused { message },
+        }
+    }
+}
+
+impl std::fmt::Display for FileWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for FileWriteError {}
+
+impl From<String> for FileWriteError {
+    fn from(message: String) -> Self {
+        Self::Refused { message }
+    }
+}
+
+/// A saved file's new base: the token the next save of this draft carries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedFile {
+    pub disk_base: String,
+}
+
+/// Creates an empty file that must not exist yet, making its parent folders.
+/// Anything already at the path (file, directory or link, tracked or ignored)
+/// is [`FileWriteError::AlreadyExists`] and is left untouched, including when
+/// it appears between the check and the publish.
+pub fn sandbox_create(repo_path: &str, file_path: &str) -> Result<(), FileWriteError> {
+    // The entry, not what it resolves to: a link at the path (dangling or not)
+    // is something already there, and `Expect::Absent` must see the link.
+    let repo = validate_repo(repo_path)?;
+    let dest = sandbox_join_write_entry(&repo, file_path)?;
+    crate::diff::write_regular_expecting(&dest, Expect::Absent, |_| Ok(Vec::new()))
+        .map(|_| ())
+        .map_err(|failure| FileWriteError::from_failure(failure, file_path, None))
 }
 
 /// Saves text that came out of the file editor. Unlike [`sandbox_write`],
@@ -283,47 +491,161 @@ pub fn sandbox_write_edited_text(
     file_path: &str,
     content: &str,
 ) -> Result<(), String> {
-    let repo = validate_repo(repo_path)?;
-    let dest = sandbox_join_canonical(&repo, file_path)?;
-    let existing = match std::fs::symlink_metadata(&dest) {
-        Ok(_) => Some(crate::engine::git_reader::read_working_tree_file(
-            &dest,
-            crate::engine::budget::MAX_FILE_BYTES,
-        )?),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(format!("Cannot inspect '{file_path}': {err}")),
-    };
-    let bytes =
-        crate::engine::text_shape::encode_edited_text(file_path, existing.as_deref(), content)?;
-    crate::diff::write_regular(&dest, &bytes)
+    sandbox_save_edited_text(repo_path, file_path, content, None)
+        .map(|_| ())
+        .map_err(|failure| failure.to_string())
 }
 
-/// True for inherited environment names that can redirect git's config,
-/// transport, or credential resolution away from what the user picked.
+/// [`sandbox_write_edited_text`] with the draft's base. `expected_base` is the
+/// `disk_base` the editor was given when it opened the file (see
+/// [`crate::diff::content_token`]); the save is refused as
+/// [`FileWriteError::ChangedOnDisk`] when the file no longer has those bytes,
+/// judged against the same read the line endings are chosen from and the swap
+/// re-checks. `None` is an explicit overwrite.
+pub fn sandbox_save_edited_text(
+    repo_path: &str,
+    file_path: &str,
+    content: &str,
+    expected_base: Option<&str>,
+) -> Result<SavedFile, FileWriteError> {
+    let dest = write_target(repo_path, file_path)?;
+    let expect = expected_base.map_or(Expect::Any, Expect::Token);
+    crate::diff::write_regular_expecting(&dest, expect, |existing| {
+        crate::engine::text_shape::encode_edited_text(file_path, existing, content)
+    })
+    .map(|disk_base| SavedFile { disk_base })
+    .map_err(|failure| FileWriteError::from_failure(failure, file_path, expected_base))
+}
+
+/// Environment names git reads that can redirect it away from the repository
+/// and settings the caller picked, or change what it prints. Every git child
+/// has these removed ([`pin_git_environment`]), whichever builder spawned it.
 ///
-/// `GIT_CONFIG_PARAMETERS` is the shell-quoted config channel (`'alias.st=!sh
-/// -c …'` outranks even repo-local config), so it is injected by definition;
-/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are listed here too so the
-/// classification stays in lockstep with the explicit strip list in
-/// [`git_command`] — anything stripped must classify as injected.
+/// - the repository pointers: where the index, objects, alternates, common dir,
+///   namespace and shallow file live;
+/// - the config channels, `GIT_CONFIG_PARAMETERS` being the shell-quoted one
+///   (`'alias.st=!sh -c …'` outranks even repo-local config);
+/// - transport and credential redirection: `GIT_SSH`, `GIT_SSH_COMMAND`,
+///   `GIT_PROXY_COMMAND`, `GIT_ASKPASS` and friends;
+/// - output and matching behaviour: `GIT_DIFF_OPTS` overrides `-U3`, and the
+///   pathspec switches (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+///   `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`) retarget the `:(literal)`
+///   pathspecs the writers rely on, so `stage f*.txt` could touch other files;
+/// - `GIT_ATTR_SOURCE`, which swaps the attributes diffs and filters see.
+const STRIPPED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_ATTR_SOURCE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_EXEC_PATH",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_PROXY_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_DIFF_OPTS",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
+/// Families of names removed by prefix: the numbered config channel, credential
+/// helper overrides, and every tracing switch (`GIT_TRACE`, `GIT_TRACE2*`,
+/// `GIT_TRACE_PACKET`, ...), whose output floods stderr and pushes the fatal
+/// line out of the few bytes of it that are kept.
+const STRIPPED_GIT_ENV_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "GIT_CREDHELPER",
+    "GIT_TRACE",
+];
+
+/// True for inherited environment names [`pin_git_environment`] removes.
 fn is_injected_git_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with("GIT_CONFIG_KEY_")
-        || upper.starts_with("GIT_CONFIG_VALUE_")
-        || upper.starts_with("GIT_CREDHELPER")
-        || matches!(
-            upper.as_str(),
-            "GIT_CONFIG_COUNT"
-                | "GIT_CONFIG_PARAMETERS"
-                | "GIT_CONFIG_GLOBAL"
-                | "GIT_CONFIG_SYSTEM"
-                | "GIT_SSH_COMMAND"
-                | "GIT_SSH_VARIANT"
-                | "GIT_ASKPASS"
-                | "GIT_EXTERNAL_DIFF"
-                | "GIT_SEQUENCE_EDITOR"
-                | "GIT_EXEC_PATH"
-        )
+    STRIPPED_GIT_ENV.contains(&upper.as_str())
+        || STRIPPED_GIT_ENV_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+}
+
+/// Config every git child is run with, ahead of its subcommand, so a
+/// developer's own settings cannot change what the parsers read:
+/// `core.quotepath` keeps non-ASCII paths as raw bytes; `log.showSignature`
+/// prints a "No signature" line (and runs gpg) in front of every commit id;
+/// the colour settings put ANSI escapes in diffs (the specific keys outrank
+/// `color.ui`, so they are pinned too); `diff.noprefix` and
+/// `diff.mnemonicPrefix` change the `a/` `b/` prefixes the diff parser keys on.
+const PINNED_GIT_CONFIG: &[&str] = &[
+    "core.quotepath=false",
+    "log.showSignature=false",
+    "color.ui=never",
+    "color.diff=never",
+    "color.status=never",
+    "color.branch=never",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+];
+
+/// Subcommands that print a patch, where `diff.external` (a config key, which
+/// no `-c` can blank) would run a program instead of git's own diff.
+const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
+
+/// The patch subcommands that print a signature header (and run the verifier
+/// to do it) when `log.showSignature` or `--show-signature` asks. `--no-show-signature`
+/// rides every one of them from here, so no read has to remember it; `diff` is
+/// left out because it rejects the flag. It turns off that header only: it does
+/// not touch the `%G*` placeholders, which always verify, and those are kept
+/// out of every bulk format string by a source-scan test.
+const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
+
+/// The one place the environment of a git child is decided. Both spawn
+/// builders ([`git_command_with_env`] for git itself and
+/// [`build_capture_command_in`] for tools that shell out to git, such as `gh`)
+/// call it, so they cannot drift apart: a setting added here reaches both.
+///
+/// Prompts and pagers are off, the locale is `C` (the parsers match git's
+/// English words), optional locks are skipped so a read never contends with a
+/// writer, every name in [`STRIPPED_GIT_ENV`] and [`STRIPPED_GIT_ENV_PREFIXES`]
+/// is removed, and the editors are pinned to `true`.
+///
+/// Editors are neutralized AFTER the strip, which would otherwise remove
+/// `GIT_SEQUENCE_EDITOR` right back out again. Removal alone is not enough:
+/// with none set, git falls back to `core.editor` and then to vi, and any
+/// subcommand that wants a message (`rebase --continue`, `am --continue`,
+/// `merge --continue`, a bare `commit`) launches it against a null stdin and
+/// blocks until the command timeout — surfacing as "git timed out" rather than
+/// a result. `true` exits 0 immediately, so git accepts the message it
+/// prepared. Every message-bearing call here already passes `-m` or
+/// `--no-edit`, so no existing caller's behaviour changes.
+fn pin_git_environment(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    for name in STRIPPED_GIT_ENV {
+        cmd.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if is_injected_git_env(&name.to_string_lossy()) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd.env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
 }
 
 /// Reads `PATH`/`HOME` from the process and defers to
@@ -366,62 +688,23 @@ fn git_command_with_env(
         )
     });
     let mut cmd = Command::new(program.as_deref().unwrap_or_else(|| Path::new("git")));
-    // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
-    // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
-    // porcelain text output arrives C-quoted ("\\346\\226\\207...") while `-z`
-    // output emits raw bytes, so the same file matches under two different
-    // spellings. Harmless for commands whose output has no paths at all.
-    // Inherited CI-style environments can export GIT_* pointers that redirect
-    // git's index, object database, alternates, common dir, namespace, or
-    // config away from the repository the user actually picked. Strip them all
-    // so a GUI-initiated git call always operates on the repo it was given.
-    cmd.args(["-c", "core.quotepath=false"])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_NAMESPACE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        // The numbered-config channel (GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n /
-        // VALUE_n) and the shell-quoted GIT_CONFIG_PARAMETERS channel inject
-        // arbitrary config without any of the names above — the latter
-        // outranks even repo-local config, so an `alias.*=!sh -c …` planted
-        // there would execute on the next GUI status call.
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_SEQUENCE_EDITOR")
-        .env_remove("GIT_EXEC_PATH");
-    for (name, _) in std::env::vars_os() {
-        if is_injected_git_env(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
+    // The pinned config goes ahead of the caller's arguments, so a `-c` the
+    // caller passes itself still wins; `--no-ext-diff` goes right after the
+    // subcommand of a patch-printing command.
+    for pin in PINNED_GIT_CONFIG {
+        cmd.args(["-c", pin]);
     }
-    // Editors are neutralized AFTER the strip loop, which would otherwise
-    // remove GIT_SEQUENCE_EDITOR right back out again.
-    //
-    // Stripping the editor variables is not enough on its own: with none set,
-    // git falls back to `core.editor` and then to vi, and any subcommand that
-    // wants a message (`rebase --continue`, `am --continue`, `merge
-    // --continue`, a bare `commit`) launches it against a null stdin and
-    // blocks until the 90s command timeout — surfacing as "git timed out"
-    // rather than a result. `true` is a real program that exits 0 immediately,
-    // so git accepts the message it prepared and the command completes.
-    //
-    // This changes no existing caller's behavior: every message-bearing call
-    // in this codebase already passes `-m` or `--no-edit`, so no editor was
-    // ever supposed to open. It converts a whole class of hangs into success.
-    cmd.env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true");
+    match subcommand_index(args) {
+        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => {
+            cmd.args(&args[..=at]).arg("--no-ext-diff");
+            if SIGNATURE_PRINTING_SUBCOMMANDS.contains(&args[at]) {
+                cmd.arg("--no-show-signature");
+            }
+            cmd.args(&args[at + 1..])
+        }
+        _ => cmd.args(args),
+    };
+    pin_git_environment(&mut cmd);
     // Git resolves its own helpers through the child's PATH, so a GUI launch
     // handed them the same minimal `/usr/bin:/bin:/usr/sbin:/sbin` that hid
     // `gh` and `cargo` from us: `gpg` for a signed commit, the interpreter a
@@ -491,8 +774,20 @@ pub fn git_text_capped(
     args: &[&str],
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), String> {
-    let (bytes, incomplete) = git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)?;
+    let (bytes, incomplete) = git_bytes_capped(repo, args, cap)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+}
+
+/// [`git_text_capped`] without the UTF-8 decode: git's exact stdout bytes plus
+/// the truncation flag. For the one reader whose consumer defines its input as
+/// bytes (the Lappi caller contract), where a lossy decode would substitute
+/// U+FFFD for what git printed while still reporting a matching length.
+pub fn git_bytes_capped(
+    repo: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+    git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)
 }
 
 /// Runs `git` in `repo` and hands back the finished run *whatever* its exit
@@ -505,7 +800,7 @@ pub fn git_text_capped(
 /// `Err(String)`, and a caller that cannot tell them apart ends up reporting a
 /// commit it could not look at as a commit it looked at and found nothing on.
 pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, None)
+    git_captured_inner(repo, args, None, MAX_OUTPUT_BYTES)
 }
 
 /// [`git_captured`] with `stdin_bytes` fed to the child, for git's `--batch`
@@ -515,21 +810,241 @@ pub(crate) fn git_captured_with_stdin(
     args: &[&str],
     stdin_bytes: &[u8],
 ) -> Result<BoundedRun, String> {
-    git_captured_inner(repo, args, Some(stdin_bytes))
+    git_captured_inner(repo, args, Some(stdin_bytes), MAX_OUTPUT_BYTES)
+}
+
+/// What a [`read_objects_batch`] caller expects to find at each id: the object
+/// type git must report, and the noun its error messages use for it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchObject {
+    pub kind: &'static str,
+    pub noun: &'static str,
+}
+
+/// Ids more than this many in one `cat-file --batch` question. A caller
+/// already bounds its list (the pulse walk by `MAX_PULSE_COMMITS`); this is
+/// the reader's own ceiling, so no caller can hand it an unbounded stdin.
+const MAX_BATCH_OBJECTS: usize = 100_000;
+
+/// Reads objects in one `git cat-file --batch`, where each used to cost its
+/// own process, and maps each one's bytes through `extract`.
+///
+/// Every answer is taken by the size git declares, never by lines: an object
+/// may hold any byte, newlines included. A missing object, one of another
+/// type, an answer that names another id, and a stream that stops short are
+/// each an `Err` for the objects they leave unread, never an empty value. A
+/// stream cut at `budget` (or by the deadline) is read as far as it is whole:
+/// the objects before the cut keep their answers, and every later one is an
+/// `Err` that says the output was cut.
+pub(crate) fn read_objects_batch<T: Clone>(
+    repo: &Path,
+    oids: &[String],
+    object: BatchObject,
+    budget: usize,
+    extract: &dyn Fn(&[u8]) -> T,
+) -> HashMap<String, Result<T, String>> {
+    let mut answers: HashMap<String, Result<T, String>> = HashMap::new();
+    // Git answers with an object's lowercase name whatever case it was asked
+    // by, and the stream is matched to its questions by that name, so every
+    // question is lowercased; the answer is given back under the spelling the
+    // caller used too.
+    let mut respelled: Vec<(&String, String)> = Vec::new();
+    let mut asked: HashSet<String> = HashSet::new();
+    let mut sent: Vec<String> = Vec::new();
+    let mut query = String::new();
+    for oid in oids {
+        let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
+        if !shaped {
+            answers
+                .entry(oid.clone())
+                .or_insert_with(|| Err(format!("{oid:?} is not a {} id", object.noun)));
+            continue;
+        }
+        let lower = oid.to_ascii_lowercase();
+        if lower != *oid {
+            respelled.push((oid, lower.clone()));
+        }
+        if !asked.insert(lower.clone()) {
+            continue;
+        }
+        if sent.len() == MAX_BATCH_OBJECTS {
+            answers.insert(
+                lower,
+                Err(format!(
+                    "more than {MAX_BATCH_OBJECTS} objects were asked for at once"
+                )),
+            );
+            continue;
+        }
+        query.push_str(&lower);
+        query.push('\n');
+        sent.push(lower);
+    }
+    if !sent.is_empty() {
+        let questions: Vec<&str> = sent.iter().map(String::as_str).collect();
+        fetch_objects(
+            repo,
+            &query,
+            &questions,
+            object,
+            budget,
+            extract,
+            &mut answers,
+        );
+    }
+    for (original, lower) in respelled {
+        if let Some(answer) = answers.get(&lower).cloned() {
+            answers.insert(original.clone(), answer);
+        }
+    }
+    answers
+}
+
+/// Runs one `cat-file --batch` for `questions` (lowercase ids, `query` is the
+/// same list one per line) and records an answer for each in `answers`.
+fn fetch_objects<T>(
+    repo: &Path,
+    query: &str,
+    sent: &[&str],
+    object: BatchObject,
+    budget: usize,
+    extract: &dyn Fn(&[u8]) -> T,
+    answers: &mut HashMap<String, Result<T, String>>,
+) {
+    let run = git_captured_inner(
+        repo,
+        &["cat-file", "--batch"],
+        Some(query.as_bytes()),
+        budget,
+    );
+    let run = match run {
+        Ok(run) => run,
+        Err(e) => {
+            mark_unread(answers, sent, &format!("could not run git cat-file: {e}"));
+            return;
+        }
+    };
+    // A stream cut at the budget or the deadline is a prefix whose child was
+    // stopped, so it exits unsuccessfully: it is read as far as it is whole
+    // instead of being discarded as a failed run.
+    if !run.success && run.incomplete.is_none() {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        mark_unread(
+            answers,
+            sent,
+            &format!("git cat-file --batch failed: {stderr}"),
+        );
+        return;
+    }
+    let cut = run
+        .incomplete
+        .as_ref()
+        .map(|reason| format!("git cat-file {}", reason.describe()));
+    read_batch_answers(&run.stdout, sent, object, extract, cut.as_deref(), answers);
+}
+
+/// Where a body of the declared `size` starting at `pos` ends, if the stream
+/// holds all of it and the newline git writes after it. A size is the
+/// stream's own claim, so it is never trusted to fit in `usize` arithmetic.
+fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
+    let end = pos.checked_add(size.parse::<usize>().ok()?)?;
+    (out.get(end) == Some(&b'\n')).then_some(end)
+}
+
+/// Marks every object in `rest` unread for the same reason.
+fn mark_unread<T>(answers: &mut HashMap<String, Result<T, String>>, rest: &[&str], why: &str) {
+    for oid in rest {
+        answers.insert((*oid).to_string(), Err(why.to_string()));
+    }
+}
+
+/// Splits a `cat-file --batch` stream into the answers to `sent`, in order.
+/// Once the stream is out of step with its questions, nothing after that
+/// point is attributed to any of them. `cut` is why the stream ended early,
+/// when it did, and is what a question left unanswered by it reports.
+pub(crate) fn read_batch_answers<T>(
+    out: &[u8],
+    sent: &[&str],
+    object: BatchObject,
+    extract: &dyn Fn(&[u8]) -> T,
+    cut: Option<&str>,
+    answers: &mut HashMap<String, Result<T, String>>,
+) {
+    let noun = object.noun;
+    let mut pos = 0usize;
+    for (index, oid) in sent.iter().enumerate() {
+        let Some(end) = out[pos..].iter().position(|&b| b == b'\n') else {
+            let why = cut.map_or_else(
+                || format!("git cat-file answered nothing for this {noun}"),
+                |cut| format!("{cut} before this {noun} was read"),
+            );
+            mark_unread(answers, &sent[index..], &why);
+            return;
+        };
+        let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
+        pos += end + 1;
+        let fields: Vec<&str> = header.split(' ').collect();
+        if fields.first() != Some(oid) {
+            // Every later answer is now out of step with its question.
+            mark_unread(
+                answers,
+                &sent[index..],
+                &format!("git cat-file answered {header:?} for {noun} {oid}"),
+            );
+            return;
+        }
+        let answer = match fields.as_slice() {
+            [_, kind, size] if *kind == object.kind => match body_end(out, pos, size) {
+                Some(end) => {
+                    let content = extract(&out[pos..end]);
+                    pos = end + 1;
+                    Ok(content)
+                }
+                None => {
+                    let why = cut.map_or_else(
+                        || format!("git cat-file cut the {noun} {oid} short"),
+                        |cut| format!("{cut} inside the {noun} {oid}"),
+                    );
+                    mark_unread(answers, &sent[index..], &why);
+                    return;
+                }
+            },
+            [_, "missing"] => Err(format!("the {noun} {oid} is missing from this repository")),
+            [_, kind, size] => match body_end(out, pos, size) {
+                // Skipped by its size so the next answer stays in step.
+                Some(end) => {
+                    pos = end + 1;
+                    Err(format!("{oid} is a {kind}, not a {noun}"))
+                }
+                None => {
+                    mark_unread(
+                        answers,
+                        &sent[index..],
+                        &format!("git cat-file answered {header:?}"),
+                    );
+                    return;
+                }
+            },
+            _ => Err(format!("git cat-file answered {header:?} for {noun} {oid}")),
+        };
+        answers.insert((*oid).to_string(), answer);
+    }
 }
 
 fn git_captured_inner(
     repo: &Path,
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
 ) -> Result<BoundedRun, String> {
     crate::repository_trust::require(repo)?;
     let label = format!("git {}", subcommand(args));
-    run_bounded(
+    run_bounded_capped(
         git_command(Some(repo), args),
         &label,
         DEFAULT_TIMEOUT,
         stdin_bytes,
+        stdout_cap,
     )
 }
 
@@ -742,6 +1257,45 @@ fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     dirs
 }
 
+/// Whose `PATH` a spawn was handed, which decides whether the
+/// [`gui_launch_fallback_dirs`] may widen it.
+///
+/// The fallback dirs repair an *inherited* PATH that a GUI launch left
+/// minimal. A PATH a caller chose on purpose — a test simulating a host with
+/// a tool absent — is the whole answer, and widening it made the choice
+/// meaningless: a scan told "cargo-deny is not on this PATH" still found
+/// `/opt/homebrew/bin/cargo-deny` on any host that had one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathSource {
+    /// Read from the process environment: searched first, then the fallback
+    /// dirs, and the child's PATH is extended the same way.
+    Inherited,
+    /// Supplied by the caller: searched alone, and handed to the child as is.
+    Explicit,
+}
+
+/// Directories a bare program name is searched in, in precedence order.
+///
+/// Single owner of that list for resolution ([`resolve_spawn_program_in`],
+/// [`find_external_tool_with`]). Empty entries are dropped: POSIX reads one as
+/// "the current directory".
+fn tool_search_dirs(
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    if source == PathSource::Inherited {
+        dirs.extend(gui_launch_fallback_dirs(home));
+    }
+    dirs
+}
+
 /// First entry of `dirs` holding a spawnpable file named `program`.
 ///
 /// Deliberately stricter than an `is_file()` scan so resolution matches what
@@ -941,14 +1495,16 @@ pub(crate) fn extended_child_path(
     if path_var.is_some_and(|value| value.len() >= MAX_INHERITED_PATH_BYTES) {
         return None;
     }
-    // Empty entries are dropped: POSIX reads one as "the current directory",
-    // which would let whatever repo the user has open inject executables into
-    // every spawned tool's lookup path.
+    // Only absolute entries survive. An empty entry is POSIX for "the current
+    // directory", and `.`, `bin` or `./node_modules/.bin` resolve against the
+    // child's cwd, which for git helpers and sidecars is the repository the
+    // user opened. Keeping any of them would let an untrusted clone put its
+    // own `git-*`, `node` or `npm` ahead of the real ones.
     let mut entries: Vec<PathBuf> = path_var
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
+        .filter(|entry| entry.is_absolute())
         .collect();
     if path_var.is_none() && cfg!(unix) {
         // PATH entirely absent (daemon/launchd-style contexts): seed the Unix
@@ -1055,17 +1611,21 @@ pub(crate) fn resolve_spawn_program_with(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> String {
+    resolve_spawn_program_in(program, path_var, home, PathSource::Inherited)
+}
+
+/// [`resolve_spawn_program_with`] for a `path_var` of known [`PathSource`]:
+/// an explicit one is searched alone.
+pub(crate) fn resolve_spawn_program_in(
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> String {
     if program.contains('/') || program.contains('\\') {
         return program.to_string();
     }
-    let mut dirs: Vec<PathBuf> = path_var
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    dirs.extend(gui_launch_fallback_dirs(home));
-    find_in_dirs(program, &dirs)
+    find_in_dirs(program, &tool_search_dirs(path_var, home, source))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.to_string())
 }
@@ -1102,14 +1662,11 @@ pub(crate) fn find_external_tool_with(
     if program.is_empty() || program.contains('/') || program.contains('\\') {
         return None;
     }
-    let mut dirs: Vec<PathBuf> = path_var
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    dirs.extend(gui_launch_fallback_dirs(home));
-    find_in_dirs(program, &dirs).map(|p| p.to_string_lossy().into_owned())
+    find_in_dirs(
+        program,
+        &tool_search_dirs(path_var, home, PathSource::Inherited),
+    )
+    .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Windows' legacy path limit. Beyond it a path needs the `\\?\` prefix to be
@@ -1175,13 +1732,29 @@ fn simplified_windows_path(path: &str) -> Option<String> {
 /// On every other platform this is `canonicalize`, unchanged.
 pub(crate) fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = path.canonicalize()?;
+    Ok(match canonical.to_str() {
+        Some(text) => PathBuf::from(plain_path_text(text)),
+        None => canonical,
+    })
+}
+
+/// `path` in the spelling git takes as a command-line argument.
+///
+/// [`canonicalize_plain`] for a path that is already in hand as text: the
+/// repository admission and trust identity spell every checkout `\\?\C:\...`
+/// (the sandbox containment checks depend on that), and git refuses that form
+/// as an argument -- `git worktree add '\\?\C:\...\wt'` dies with `could not
+/// create leading directories ... Invalid argument`. A path with no ordinary
+/// spelling (beyond the legacy limit, a device path) is returned unchanged.
+///
+/// The same string reaches the command gate and the spawn, so both judge one
+/// spelling. Identity off Windows, where a backslash is a filename character.
+pub(crate) fn plain_path_text(path: &str) -> String {
     #[cfg(windows)]
-    {
-        if let Some(simplified) = canonical.to_str().and_then(simplified_windows_path) {
-            return Ok(PathBuf::from(simplified));
-        }
+    if let Some(simplified) = simplified_windows_path(path) {
+        return simplified;
     }
-    Ok(canonical)
+    path.to_owned()
 }
 
 /// Assembles the `capture_command` child with injectable `PATH`/home lookups,
@@ -1202,46 +1775,45 @@ pub(crate) fn build_capture_command(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Command {
-    let resolved = resolve_spawn_program_with(program, path_var, home);
+    build_capture_command_in(
+        program,
+        args,
+        cwd,
+        extra_env,
+        path_var,
+        home,
+        PathSource::Inherited,
+    )
+}
+
+/// [`build_capture_command`] for a `path_var` of known [`PathSource`]. An
+/// explicit PATH is both the resolution search path and, verbatim apart from
+/// dropped empty entries, the child's PATH — so nothing the child re-resolves
+/// (a shebang interpreter, a nested tool) reaches past it either.
+fn build_capture_command_in(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> Command {
+    let resolved = resolve_spawn_program_in(program, path_var, home, source);
     let mut cmd = Command::new(&resolved);
-    // The same injected-GIT-* strip [`git_command`] applies: captured tools
-    // shell out to git themselves (`gh pr checkout` fetches and merges in the
-    // repo; npm/go/cargo read git config), and CI-style inherited pointers
-    // (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would redirect
-    // them off the repository the caller picked. Applied before `extra_env`,
-    // so a caller that explicitly passes one of these still wins.
-    for (name, _) in std::env::vars_os() {
-        if is_injected_git_env(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
-    }
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_NAMESPACE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_EXEC_PATH")
-        // Same editor pin as [`git_command`], for the same two reasons: these
-        // tools shell out to git themselves (`gh pr checkout` fetches and
-        // merges), and a spawned editor against a null stdin blocks until the
-        // timeout. Removal alone would leave git's `core.editor` config
-        // fallback open, so both variables are pinned to a program that exits
-        // immediately.
-        .env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true")
-        .env("GH_PROMPT_DISABLED", "1")
+    // The same environment [`git_command`] gives git ([`pin_git_environment`]):
+    // captured tools shell out to git themselves (`gh pr checkout` fetches and
+    // merges in the repo; npm/go/cargo read git config), and CI-style inherited
+    // pointers (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would
+    // redirect them off the repository the caller picked, a localized message
+    // would defeat the parsers, and a credential manager could prompt. Applied
+    // before `extra_env`, so a caller that explicitly passes one of these
+    // still wins.
+    pin_git_environment(&mut cmd);
+    cmd.env("GH_PROMPT_DISABLED", "1")
         // gh consults this before printing update notices; keep subprocess
         // output deterministic instead of interleaving a self-update banner.
         .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1251,8 +1823,22 @@ pub(crate) fn build_capture_command(
     }
     if !cfg!(windows) {
         // Applied before `extra_env` so an explicit caller-provided PATH wins.
-        if let Some(child_path) = extended_child_path(path_var, home) {
-            cmd.env("PATH", child_path);
+        match source {
+            PathSource::Inherited => {
+                if let Some(child_path) = extended_child_path(path_var, home) {
+                    cmd.env("PATH", child_path);
+                }
+            }
+            // Never left to inherit: the process PATH is exactly what an
+            // explicit one replaces.
+            PathSource::Explicit => {
+                match path_var.and_then(|value| {
+                    std::env::join_paths(tool_search_dirs(Some(value), home, source)).ok()
+                }) {
+                    Some(child_path) => cmd.env("PATH", child_path),
+                    None => cmd.env_remove("PATH"),
+                };
+            }
         }
     }
     for (key, value) in extra_env {
@@ -1283,13 +1869,16 @@ pub fn capture_command(
         extra_env,
         path_var.as_deref(),
         home.as_deref(),
+        PathSource::Inherited,
     )
 }
 
 /// [`capture_command`] with injectable `PATH`/home lookups — the seam its
 /// callers fill from the process environment by default. Tests use it to run
 /// the exact production spawn path under a simulated GUI-minimal environment
-/// without mutating process-global state.
+/// without mutating process-global state. `source` says which of those two
+/// `path_var` is; see [`PathSource`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_command_with_env(
     program: &str,
     args: &[&str],
@@ -1298,8 +1887,9 @@ pub(crate) fn capture_command_with_env(
     extra_env: &[(&str, &str)],
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
+    source: PathSource,
 ) -> Result<CapturedOutput, String> {
-    let cmd = build_capture_command(program, args, cwd, extra_env, path_var, home);
+    let cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
 
     let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
     Ok(CapturedOutput {
@@ -1422,6 +2012,11 @@ const DEFERRED_MARKER: &str = " deferred under load after ";
 /// argument named `-c` for every read that set a config value, and an
 /// `--attr-source=<oid>` would have put an object id where a command belongs.
 pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    subcommand_index(args).map_or("", |at| args[at])
+}
+
+/// Where in `args` the subcommand is, past git's global options.
+fn subcommand_index(args: &[&str]) -> Option<usize> {
     /// Global options whose value is the next argument.
     const TAKES_VALUE: [&str; 6] = [
         "-c",
@@ -1431,15 +2026,15 @@ pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
         "--namespace",
         "--config-env",
     ];
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
+    let mut rest = args.iter().enumerate();
+    while let Some((at, arg)) = rest.next() {
         if TAKES_VALUE.contains(arg) {
             rest.next();
         } else if !arg.starts_with('-') {
-            return arg;
+            return Some(at);
         }
     }
-    ""
+    None
 }
 
 /// True when `err` is the gate declining to start a child under load. The
@@ -1577,6 +2172,11 @@ pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low"
         ),
+        Refusal::Pressure { reactive } => format!(
+            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while the host is under memory \
+             pressure",
+            if reactive { "reactive" } else { "background" }
+        ),
     }
 }
 
@@ -1603,8 +2203,15 @@ fn next_poll_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(POLL_BACKOFF_MAX)
 }
 
+/// True when `err` says a command ended because its own timeout elapsed,
+/// whether it ran out of time while running or while waiting for a process
+/// slot. A load deferral never carries the marker, so it is not one.
+pub(crate) fn is_timed_out(err: &str) -> bool {
+    err.contains(TIMEOUT_MARKER)
+}
+
 fn is_timeout_error(program: &str, err: &str) -> bool {
-    err.starts_with(program) && err.contains(TIMEOUT_MARKER)
+    err.starts_with(program) && is_timed_out(err)
 }
 
 /// What one pipe drain produced.
@@ -1616,6 +2223,10 @@ fn is_timeout_error(program: &str, err: &str) -> bool {
 #[derive(Default)]
 struct Drained {
     bytes: Vec<u8>,
+    /// Bytes already handed to a streaming observer and dropped from `bytes`
+    /// (see [`ProcessObserver::drains_stdout`]); they still count against the
+    /// cap, so a streamed read is as bounded as a buffered one.
+    discarded: usize,
     /// Cut off at the byte cap: the child had more to say.
     truncated: bool,
     /// Why the read stopped, when it was not end-of-stream.
@@ -1624,9 +2235,16 @@ struct Drained {
 
 impl Drained {
     fn append(&mut self, bytes: &[u8], cap: usize) {
-        let take = bytes.len().min(cap.saturating_sub(self.bytes.len()));
+        let held = self.bytes.len().saturating_add(self.discarded);
+        let take = bytes.len().min(cap.saturating_sub(held));
         self.bytes.extend_from_slice(&bytes[..take]);
         self.truncated |= take < bytes.len();
+    }
+
+    /// Drops what an observer has now seen, keeping its length in the budget.
+    fn discard_observed(&mut self) {
+        self.discarded = self.discarded.saturating_add(self.bytes.len());
+        self.bytes.clear();
     }
 }
 
@@ -1753,6 +2371,15 @@ pub(crate) trait ProcessObserver {
         false
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
+    /// True when the observer keeps what it needs from stdout itself, so the
+    /// run need not retain it: each chunk is dropped once `output` has seen it
+    /// and the returned [`BoundedRun::stdout`] holds only the unseen tail
+    /// (empty in practice). The byte cap still applies to the stream as a
+    /// whole. For a reader of a long stream that wants a few bytes per record
+    /// out of megabytes, which would otherwise be buffered whole.
+    fn drains_stdout(&self) -> bool {
+        false
+    }
 }
 
 impl ProcessObserver for () {}
@@ -2124,6 +2751,12 @@ pub(crate) enum Refusal {
     /// Background work refused without waiting: the rate budget was at or
     /// below the reserve kept for reactive reads.
     Shed,
+    /// Refused without waiting because the host is under memory pressure and
+    /// this class is shed while it lasts (`sysload::governor`). Carries the
+    /// deferral marker, so the frontend retries it once the pressure clears.
+    Pressure {
+        reactive: bool,
+    },
     /// No concurrency slot became free before the command's own deadline.
     TimedOut {
         deadline: Duration,
@@ -2148,7 +2781,7 @@ impl AdmissionCounters {
     fn count(&mut self, refusal: Refusal) {
         match refusal {
             Refusal::Refused { .. } => self.refused += 1,
-            Refusal::Shed => self.shed += 1,
+            Refusal::Shed | Refusal::Pressure { .. } => self.shed += 1,
             Refusal::TimedOut { .. } => self.timed_out += 1,
             Refusal::Cancelled => self.cancelled += 1,
         }
@@ -2197,6 +2830,11 @@ struct GateState {
     /// Decisions that could not consult the shared budget and fell back to
     /// this process's own (a lock held past its patience, an I/O error).
     shared_fallbacks: u64,
+    /// Decisions the shared budget denied but could not record. Refused like
+    /// any denial (and so also in `shed` / `deferred`), counted here as well so
+    /// a record that has stopped taking writes shows in the report instead of
+    /// only in a log line that is throttled.
+    shared_unrecorded_denials: u64,
     /// Admitted children by what they were (`git status`, `gh`, ...). The
     /// class totals said the budget was spent; this says on what, which is
     /// the question every refusal raised and no log could answer.
@@ -2345,21 +2983,35 @@ impl SpawnGate {
     }
 
     /// Asks the shared budget for the token a non-interactive spawn is about
-    /// to spend. `true` when it was granted or could not be asked (counted,
-    /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when
-    /// the processes together have spent it.
-    fn take_shared(&self, state: &mut GateState, class: Admission) -> bool {
+    /// to spend. Does file IO and may wait on a lock another process holds, so
+    /// it must be called with the gate mutex released; the answer is applied
+    /// by [`Self::settle_shared`].
+    fn ask_shared(&self, class: Admission) -> shared_budget::Take {
         let Some(shared) = &self.shared else {
-            return true;
+            return shared_budget::Take::Granted;
         };
         let floor = if class == Admission::Background {
             self.background_reserve()
         } else {
             0
         };
-        match shared.take(floor, self.burst, self.refill_per_sec) {
+        shared.take(floor, self.burst, self.refill_per_sec)
+    }
+
+    /// Applies [`Self::ask_shared`]'s answer under the gate lock: `true` when
+    /// the token was granted or the record could not be consulted (counted,
+    /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when the
+    /// processes together have spent it, whether or not the record could be
+    /// rewritten to say so (counted apart, in `shared_unrecorded_denials`).
+    fn settle_shared(&self, state: &mut GateState, taken: shared_budget::Take) -> bool {
+        match taken {
             shared_budget::Take::Granted => true,
             shared_budget::Take::Denied => false,
+            shared_budget::Take::DeniedUnrecorded(reason) => {
+                state.shared_unrecorded_denials = state.shared_unrecorded_denials.saturating_add(1);
+                log_unrecorded_denial(&reason, state.shared_unrecorded_denials);
+                false
+            }
             shared_budget::Take::Unavailable(reason) => {
                 state.shared_fallbacks = state.shared_fallbacks.saturating_add(1);
                 log_shared_fallback(&reason, state.shared_fallbacks);
@@ -2369,10 +3021,10 @@ impl SpawnGate {
     }
 
     /// One line on where this gate's rate budget lives, for the report.
-    fn sharing_report(&self, fallbacks: u64) -> String {
+    fn sharing_report(&self, fallbacks: u64, unrecorded_denials: u64) -> String {
         match (&self.shared, &self.shared_note) {
             (Some(shared), _) => format!(
-                "budget=shared({}) fallbacks={fallbacks}",
+                "budget=shared({}) unrecorded_denials={unrecorded_denials} fallbacks={fallbacks}",
                 shared.path().display()
             ),
             (None, Some(note)) => format!("budget=per-process ({note})"),
@@ -2424,6 +3076,24 @@ impl SpawnGate {
         let class = current_admission();
         let background = class == Admission::Background;
         let interactive = class == Admission::Interactive;
+        // The load governor's verdict, one owner (`sysload::governor`): under
+        // memory pressure these classes are refused at once with the
+        // deferral marker. A user action is never shed, and neither is a read
+        // credited to one (`take_post_action_credit` promoted it already).
+        if !interactive {
+            let shed = crate::sysload::shed();
+            if (background && shed.background) || (!background && shed.reactive) {
+                let refusal = Refusal::Pressure {
+                    reactive: !background,
+                };
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .counters[class.index()]
+                .count(refusal);
+                return Err(refusal);
+            }
+        }
         let rate_limited = self.refill_per_sec != u32::MAX
             && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed);
         let entered = Instant::now();
@@ -2451,6 +3121,12 @@ impl SpawnGate {
         }
         reservation.held = background || interactive;
         let mut token_wait_started: Option<Instant> = None;
+        // A token the shared budget granted while the gate lock was released.
+        // Kept for the next pass, which re-reads the gate before spending it:
+        // the slot it was asked for may have gone to another waiter meanwhile.
+        // One that is never spent (the waiter is cancelled or times out first)
+        // is lost to the shared budget, which has no way to take it back.
+        let mut shared_token_held = false;
         let outcome = loop {
             // The cancel check is the caller's code. Under the gate lock, a
             // check that took a lock of its own or spawned anything would
@@ -2485,7 +3161,7 @@ impl SpawnGate {
             // available slot if no background child is running, so sustained
             // reactive traffic cannot indefinitely postpone all indexing. A
             // waiting user action outranks both.
-            let eligible = match class {
+            let eligibility = |state: &GateState| match class {
                 Admission::Interactive => true,
                 Admission::Background => {
                     state.waiting_interactive == 0 && state.background < (self.limit / 4).max(1)
@@ -2497,18 +3173,48 @@ impl SpawnGate {
                             || state.in_flight < self.limit.saturating_sub(1))
                 }
             };
-            self.refill(&mut state, now);
-            let mut tokens_ok = match class {
+            let tokens_available = |state: &GateState| match class {
                 Admission::Interactive => true,
                 Admission::Reactive => !rate_limited || state.tokens >= 1,
                 Admission::Background => !rate_limited || state.tokens > self.background_reserve(),
             };
+            let mut eligible = eligibility(&state);
+            self.refill(&mut state, now);
+            let mut tokens_ok = tokens_available(&state);
             // The shared budget is asked last, and only by a spawn that would
             // otherwise start now, so a granted token is spent at once below
             // and never taken for a waiter that then gives up.
-            if tokens_ok && rate_limited && !interactive && state.in_flight < self.limit && eligible
+            if tokens_ok
+                && rate_limited
+                && !interactive
+                && !shared_token_held
+                && state.in_flight < self.limit
+                && eligible
+                && self.shared.is_some()
             {
-                tokens_ok = self.take_shared(&mut state, class);
+                // The shared record is a file under a lock that may sleep-poll
+                // for [`shared_budget::LOCK_PATIENCE`], and a denial writes it
+                // too. None of that may happen under the gate mutex, where it
+                // would queue every other acquire, a user action included,
+                // behind a background re-poll. Released like the cancel check
+                // above, and everything is re-read once the answer is in.
+                drop(state);
+                let taken = self.ask_shared(class);
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.settle_shared(&mut state, taken) {
+                    shared_token_held = true;
+                    // The lock was released: another waiter may have taken the
+                    // slot or the local token, so both are read again. The
+                    // deadline is not: a token already granted is spent, not
+                    // thrown away because the wait for it ran long.
+                    eligible = eligibility(&state);
+                    tokens_ok = tokens_available(&state);
+                } else {
+                    tokens_ok = false;
+                }
             }
             if !tokens_ok {
                 // Background is shed at once: it is the first thing to go
@@ -2541,7 +3247,8 @@ impl SpawnGate {
         if let Err(refusal) = outcome {
             state.counters[class.index()].count(refusal);
             let counters = state.counters;
-            let sharing = self.sharing_report(state.shared_fallbacks);
+            let sharing =
+                self.sharing_report(state.shared_fallbacks, state.shared_unrecorded_denials);
             drop(state);
             // A refused waiter must release its reservation.
             self.released.notify_all();
@@ -2592,6 +3299,17 @@ impl SpawnGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .counters[class.index()]
         .coalesced += 1;
+    }
+
+    /// Takes back a [`Self::note_coalesced`] for a joiner whose leader timed
+    /// out and who asks again: it was not answered by another's child.
+    fn note_uncoalesced(&self, class: Admission) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counters = &mut state.counters[class.index()];
+        counters.coalesced = counters.coalesced.saturating_sub(1);
     }
 
     #[cfg(test)]
@@ -2730,20 +3448,80 @@ fn shared_budget_path() -> Result<PathBuf, String> {
 }
 
 /// Every child the gate actually started, so a test can count spawns in its
-/// own repository instead of inferring them from timing. Bounded: the whole
-/// suite shares it, and only the newest entries matter to a running test.
+/// own repository instead of inferring them from timing.
+///
+/// Kept per working directory. The suite shares one process, and a log shared
+/// by every test is evicted by whichever tests spawn the most: a test counting
+/// its own children by position (`spawns_in(cwd).len()` before and after) then
+/// lost its oldest entries to its neighbours and counted short, more often the
+/// longer it ran, which is to say under load. A test's directory is only ever
+/// pushed to by that test, so its entries are evicted by nothing but its own
+/// volume, and a directory that has gone quiet is the first to be dropped.
 #[cfg(test)]
 pub(crate) mod spawn_log {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Mutex;
 
     use super::Admission;
 
-    const CAPACITY: usize = 16_384;
-    type Entry = (PathBuf, Vec<String>, Admission);
-    static LOG: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+    /// Entries kept for one directory, and directories kept at once.
+    const PER_DIRECTORY: usize = 16_384;
+    const DIRECTORIES: usize = 1_024;
+    type Entry = (Vec<String>, Admission);
+
+    struct Log {
+        per_directory: usize,
+        directories: usize,
+        by_directory: HashMap<PathBuf, (u64, VecDeque<Entry>)>,
+        touched: u64,
+    }
+
+    impl Log {
+        fn bounded(per_directory: usize, directories: usize) -> Self {
+            Self {
+                per_directory,
+                directories,
+                by_directory: HashMap::new(),
+                touched: 0,
+            }
+        }
+
+        fn push(&mut self, cwd: &Path, entry: Entry) {
+            self.touched += 1;
+            let touched = self.touched;
+            if !self.by_directory.contains_key(cwd) && self.by_directory.len() >= self.directories {
+                // The directory nothing has spawned in for longest.
+                if let Some(stale) = self
+                    .by_directory
+                    .iter()
+                    .min_by_key(|(_, (last, _))| *last)
+                    .map(|(dir, _)| dir.clone())
+                {
+                    self.by_directory.remove(&stale);
+                }
+            }
+            let (last, entries) = self
+                .by_directory
+                .entry(cwd.to_path_buf())
+                .or_insert_with(|| (touched, VecDeque::new()));
+            *last = touched;
+            if entries.len() == self.per_directory {
+                entries.pop_front();
+            }
+            entries.push_back(entry);
+        }
+
+        fn entries(&self, cwd: &Path) -> Vec<Entry> {
+            self.by_directory
+                .get(cwd)
+                .map(|(_, entries)| entries.iter().cloned().collect())
+                .unwrap_or_default()
+        }
+    }
+
+    static LOG: Mutex<Option<Log>> = Mutex::new(None);
 
     pub(super) fn record(cmd: &Command) {
         let Some(cwd) = cmd.get_current_dir() else {
@@ -2753,13 +3531,11 @@ pub(crate) mod spawn_log {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let mut log = LOG
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if log.len() == CAPACITY {
-            log.pop_front();
-        }
-        log.push_back((cwd.to_path_buf(), argv, super::current_admission()));
+        let class = super::current_admission();
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| Log::bounded(PER_DIRECTORY, DIRECTORIES))
+            .push(cwd, (argv, class));
     }
 
     /// Argument vectors of every recorded child whose working directory was
@@ -2776,10 +3552,50 @@ pub(crate) mod spawn_log {
     pub(crate) fn classed_spawns_in(cwd: &Path) -> Vec<(Vec<String>, Admission)> {
         LOG.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(dir, _, _)| dir == cwd)
-            .map(|(_, argv, class)| (argv.clone(), *class))
-            .collect()
+            .as_ref()
+            .map(|log| log.entries(cwd))
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn entry() -> Entry {
+            (vec!["status".into()], Admission::Reactive)
+        }
+
+        /// The defect: a count taken by position was shortened by other tests'
+        /// spawns. One directory's volume no longer evicts another's entries.
+        #[test]
+        fn a_busy_neighbour_does_not_evict_a_quiet_directory() {
+            let mut log = Log::bounded(8, 4);
+            let (quiet, busy) = (Path::new("/quiet"), Path::new("/busy"));
+            for _ in 0..3 {
+                log.push(quiet, entry());
+            }
+            for _ in 0..100 {
+                log.push(busy, entry());
+            }
+            assert_eq!(log.entries(quiet).len(), 3);
+            assert_eq!(log.entries(busy).len(), 8, "bounded by its own volume");
+        }
+
+        #[test]
+        fn the_directory_that_went_quiet_is_the_one_dropped() {
+            let mut log = Log::bounded(8, 3);
+            let (first, live) = (Path::new("/first"), Path::new("/live"));
+            log.push(first, entry());
+            log.push(live, entry());
+            for other in ["/a", "/b", "/c", "/d"] {
+                log.push(Path::new(other), entry());
+                // A live directory keeps spawning, so it stays.
+                log.push(live, entry());
+            }
+            assert!(log.entries(first).is_empty(), "the quiet one went");
+            assert!(!log.entries(live).is_empty(), "the busy one stayed");
+            assert_eq!(log.by_directory.len(), 3, "never more than its bound");
+        }
     }
 }
 
@@ -2802,6 +3618,22 @@ struct SharedReadKey {
 struct SharedRead {
     result: Mutex<Option<Result<BoundedRun, String>>>,
     done: Condvar,
+    /// Where this flight's joiners go when its leader's deadline passed
+    /// before theirs: the one flight that asks again for all of them, set by
+    /// the first to arrive. It stays reachable from here after the gate has
+    /// admitted it, because everyone who asks was waiting before its child
+    /// started, which is all the "joined while queued" rule protects.
+    retry: Mutex<Option<Arc<SharedRead>>>,
+}
+
+impl SharedRead {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            done: Condvar::new(),
+            retry: Mutex::new(None),
+        })
+    }
 }
 
 fn shared_reads() -> &'static Mutex<HashMap<SharedReadKey, Arc<SharedRead>>> {
@@ -2813,6 +3645,12 @@ fn shared_reads() -> &'static Mutex<HashMap<SharedReadKey, Arc<SharedRead>>> {
 /// queued at the gate. Only for commands that cannot change repository state:
 /// a shared write would report one write's outcome as another's. Commands
 /// without a working directory, or with stdin, are never shared.
+///
+/// `timeout` is this caller's own budget, whichever side of the flight it is
+/// on. A joiner stops waiting for the leader's child when its own deadline
+/// passes, with the timeout a solo call would report, and the leader runs on
+/// untouched. A leader's timeout is the leader's: a joiner with budget left
+/// runs its own read for what remains instead of adopting it.
 fn run_read_shared(
     mut cmd: Command,
     label: &str,
@@ -2820,8 +3658,160 @@ fn run_read_shared(
     stdout_cap: usize,
     gate: &'static SpawnGate,
 ) -> Result<BoundedRun, String> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt = timeout;
+    // The flight whose leader timed out last, and the longest prefix any such
+    // leader printed: a keeping caller's rerun may reach its deadline with
+    // less than that.
+    let mut after: Option<Arc<SharedRead>> = None;
+    let mut prefix: Option<BoundedRun> = None;
+    loop {
+        let outcome = match run_read_shared_once(
+            &mut cmd,
+            label,
+            attempt,
+            deadline,
+            stdout_cap,
+            gate,
+            after.as_ref(),
+        ) {
+            SharedAttempt::Done(result) => result,
+            SharedAttempt::LeaderTimedOut { flight, printed } => {
+                if let Some(run) = printed {
+                    if prefix
+                        .as_ref()
+                        .is_none_or(|kept| run.stdout.len() > kept.stdout.len())
+                    {
+                        prefix = Some(run);
+                    }
+                }
+                after = Some(flight);
+                attempt = deadline.saturating_duration_since(Instant::now());
+                if attempt.is_zero() {
+                    deadline_expired(label, timeout)
+                } else {
+                    continue;
+                }
+            }
+        };
+        return if after.is_some() {
+            as_the_callers_deadline(outcome, prefix, label, timeout)
+        } else {
+            outcome
+        };
+    }
+}
+
+/// How one pass through the shared-read queue ended.
+enum SharedAttempt {
+    Done(Result<BoundedRun, String>),
+    /// The leader this caller joined ran out of its own time while this
+    /// caller's deadline has not come. Its timeout is not this caller's
+    /// answer, so the caller asks again, on `flight`'s retry. `printed` is
+    /// what the leader had read when it was stopped.
+    LeaderTimedOut {
+        flight: Arc<SharedRead>,
+        printed: Option<BoundedRun>,
+    },
+}
+
+/// A caller that asked again after a leader's timeout ends at its own
+/// deadline like a solo call: naming the budget it was given rather than the
+/// remainder a rerun was handed, and, when it keeps prefixes, with the
+/// longest prefix it saw, since a solo call over the same budget would have
+/// read at least that much.
+fn as_the_callers_deadline(
+    outcome: Result<BoundedRun, String>,
+    prefix: Option<BoundedRun>,
+    label: &str,
+    timeout: Duration,
+) -> Result<BoundedRun, String> {
+    if !is_deadline_outcome(&outcome) {
+        return outcome;
+    }
+    let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
+    let longer = |own: usize| {
+        prefix
+            .as_ref()
+            .filter(|_| keeping_deadline_prefix())
+            .is_some_and(|kept| kept.stdout.len() > own)
+    };
+    match outcome {
+        Ok(run) if !longer(run.stdout.len()) => Ok(rename_deadline(run, message)),
+        Err(error) if !longer(0) => {
+            // A refusal to wait any longer for a slot says so; only the bare
+            // timeout is rewritten.
+            Err(if error.ends_with(SLOT_WAIT_SUFFIX) {
+                error
+            } else {
+                message
+            })
+        }
+        // The leader's prefix outweighs this caller's own.
+        _ => match prefix {
+            Some(kept) => Ok(rename_deadline(kept, message)),
+            None => Err(message),
+        },
+    }
+}
+
+fn rename_deadline(mut run: BoundedRun, message: String) -> BoundedRun {
+    if let Some(Incomplete::Deadline { message: slot, .. }) = &mut run.incomplete {
+        *slot = message;
+    }
+    run
+}
+
+/// Whether a flight's outcome is its leader's deadline rather than an answer.
+fn is_deadline_outcome(outcome: &Result<BoundedRun, String>) -> bool {
+    match outcome {
+        Ok(run) => matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+        Err(message) => is_timed_out(message),
+    }
+}
+
+/// What a solo call that ran out of `timeout` reports: the prefix form for a
+/// caller keeping deadline prefixes, the error otherwise (see
+/// [`run_admitted`]).
+fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, String> {
+    let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
+    if keeping_deadline_prefix() {
+        return Ok(BoundedRun {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            success: false,
+            status_code: -1,
+            incomplete: Some(Incomplete::Deadline {
+                message,
+                over_cap: None,
+            }),
+            stderr_incomplete: None,
+            cancelled: false,
+        });
+    }
+    note_process_failure(&message);
+    Err(message)
+}
+
+fn run_read_shared_once(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    deadline: Instant,
+    stdout_cap: usize,
+    gate: &'static SpawnGate,
+    after: Option<&Arc<SharedRead>>,
+) -> SharedAttempt {
     let Some(cwd) = cmd.get_current_dir().map(Path::to_path_buf) else {
-        return run_with_gate(&mut cmd, label, timeout, None, stdout_cap, &mut (), gate);
+        return SharedAttempt::Done(run_with_gate(
+            cmd,
+            label,
+            timeout,
+            None,
+            stdout_cap,
+            &mut (),
+            gate,
+        ));
     };
     let key = SharedReadKey {
         cwd,
@@ -2835,17 +3825,31 @@ fn run_read_shared(
         let mut reads = table
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match reads.get(&key) {
-            Some(flight) => (Arc::clone(flight), false),
+        // Callers whose leader timed out share one retry flight, however
+        // far its child has got, so a hung read meets one new child and not
+        // one per caller. The table is held, so the first to arrive decides.
+        let mut retry = after.map(|previous| {
+            previous
+                .retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let known = retry
+            .as_deref()
+            .and_then(Clone::clone)
+            .or_else(|| reads.get(&key).cloned());
+        let (flight, leader) = match known {
+            Some(flight) => (flight, false),
             None => {
-                let flight = Arc::new(SharedRead {
-                    result: Mutex::new(None),
-                    done: Condvar::new(),
-                });
+                let flight = SharedRead::new();
                 reads.insert(key.clone(), Arc::clone(&flight));
                 (flight, true)
             }
+        };
+        if let Some(slot) = retry.as_deref_mut() {
+            slot.get_or_insert_with(|| Arc::clone(&flight));
         }
+        (flight, leader)
     };
     if !leader {
         gate.note_coalesced(key.class);
@@ -2853,23 +3857,43 @@ fn run_read_shared(
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The leader always publishes, even when it panics (`Publish`), and
-        // its own wait is bounded by `timeout` twice over: queue, then run.
-        while result.is_none() {
+        // The leader always publishes, even when it panics (`Publish`), but
+        // its child may outlast this caller's deadline: wait no longer than
+        // that. An answer that is there wins over a deadline that has just
+        // passed. There is no cancel on this path to poll: the read runs
+        // without an observer, so only the deadline bounds the wait.
+        let shared = loop {
+            if let Some(shared) = result.as_ref() {
+                break Some(shared.clone());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break None;
+            }
             result = flight
                 .done
-                .wait(result)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(result, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        };
+        drop(result);
+        let Some(shared) = shared else {
+            return SharedAttempt::Done(deadline_expired(label, timeout));
+        };
+        if is_deadline_outcome(&shared) && Instant::now() < deadline {
+            // Not answered by another's child after all.
+            gate.note_uncoalesced(key.class);
+            return SharedAttempt::LeaderTimedOut {
+                flight: Arc::clone(&flight),
+                printed: shared.ok(),
+            };
         }
-        let shared = result
-            .clone()
-            .unwrap_or_else(|| Err(format!("{label} shared read lost")));
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
         if let Err(message) = &shared {
             note_process_failure(message);
         }
-        return shared;
+        return SharedAttempt::Done(shared);
     }
 
     /// Closes the table entry and publishes whatever the leader ended with,
@@ -2901,7 +3925,7 @@ fn run_read_shared(
         outcome: None,
     };
     let outcome = run_admitted(
-        &mut cmd,
+        cmd,
         label,
         timeout,
         None,
@@ -2912,7 +3936,7 @@ fn run_read_shared(
     );
     publish.outcome = Some(outcome.clone());
     drop(publish);
-    outcome
+    SharedAttempt::Done(outcome)
 }
 
 /// Removes `flight` from the table if it is still the entry for `key`; a
@@ -2958,20 +3982,41 @@ fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str, top: impl FnOn
 /// running total at most every [`REFUSAL_REPORT_INTERVAL`].
 fn log_shared_fallback(reason: &str, total: u64) {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let now = Instant::now();
-    {
-        let mut last = LAST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_REPORT_INTERVAL) {
-            return;
-        }
-        *last = Some(now);
+    if !report_due(&LAST) {
+        return;
     }
     log::warn!(
         target: "spawn_gate",
         "shared spawn budget unavailable for a decision ({total} so far); used this process's own: {reason}"
     );
+}
+
+/// A denial the shared record could not persist, logged at most every
+/// [`REFUSAL_REPORT_INTERVAL`], with the running total. The spawn was refused
+/// all the same.
+fn log_unrecorded_denial(reason: &str, total: u64) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    if !report_due(&LAST) {
+        return;
+    }
+    log::warn!(
+        target: "spawn_gate",
+        "shared spawn budget denied a decision it could not record ({total} so far); refused: {reason}"
+    );
+}
+
+/// Whether `last` is older than [`REFUSAL_REPORT_INTERVAL`]; if so, now is
+/// recorded as the latest report.
+fn report_due(last: &Mutex<Option<Instant>>) -> bool {
+    let now = Instant::now();
+    let mut last = last
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_REPORT_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 const REFUSAL_REPORT_INTERVAL: Duration = Duration::from_secs(30);
@@ -3098,6 +4143,11 @@ thread_local! {
     #[cfg(test)]
     static FORCED_FAILURE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Labels of the children this thread asked the gate to run, newest last,
+    /// for [`spawn_labels_during`].
+    #[cfg(test)]
+    static SPAWN_LABELS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Fails only the spawns on this thread whose arguments include this one.
     #[cfg(test)]
     static FORCED_FAILURE_ARG: std::cell::RefCell<Option<String>> =
@@ -3205,6 +4255,16 @@ pub(crate) fn with_forced_spawn_failure_of<T>(arg: &str, body: impl FnOnce() -> 
     body()
 }
 
+/// True while this thread is inside [`with_forced_spawn_failure`] or
+/// [`with_forced_spawn_failure_of`]. Process-wide caches of spawn results
+/// consult it: the forced refusal is thread-local, the cache is shared, and
+/// another test warming the cache would otherwise let the real tool answer past
+/// the refusal.
+#[cfg(test)]
+pub(crate) fn forced_failure_active() -> bool {
+    FORCE_SPAWN_FAILURE.get() || FORCED_FAILURE_ARG.with(|slot| slot.borrow().is_some())
+}
+
 #[cfg(test)]
 fn forced_failure_matches(cmd: &Command) -> bool {
     FORCED_FAILURE_ARG.with(|slot| {
@@ -3231,6 +4291,55 @@ pub(crate) fn with_forced_spawn_failure_then<T>(
     with_forced_spawn_failure(body)
 }
 
+/// Runs `body` and returns the label of every child it asked this thread's
+/// gate to spawn — the spawn-count assertion for "one process, not N". Only
+/// spawns made on the calling thread are seen, which is where a synchronous
+/// reader makes them.
+#[cfg(test)]
+pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String>) {
+    SPAWN_LABELS.with(|labels| labels.borrow_mut().clear());
+    let result = body();
+    let seen = SPAWN_LABELS.with(|labels| std::mem::take(&mut *labels.borrow_mut()));
+    (result, seen)
+}
+
+/// Asks `child` to stop and spends the grace reading its pipes.
+///
+/// A child told to stop writes while it cleans up, and one blocked on a full
+/// pipe cannot finish, so a sleeping grace gets it SIGKILLed with its
+/// `.git/index.lock` still held. The wait is the output poll itself, so the
+/// grace both waits and drains, and procguard still ends it at [`CHILD_GRACE`]
+/// however much arrives; the bytes land in the same capped buffers. Stdin is
+/// closed once the ask has been sent and not fed again: a cleanup that reads
+/// stdin to EOF must see it, but never before the ask. And `input.finish()` afterwards still only turns undelivered
+/// bytes into an error for a successful, uncancelled run. A panic inside the
+/// wait is handled by `Registration::drop`, which force-kills a child no reap
+/// path has claimed. Where the platform cannot ask there is no grace, and on
+/// non-Unix the pipe workers already read on their own threads.
+fn ask_and_drain(
+    guard: &crate::procguard::Registration,
+    child: &mut std::process::Child,
+    #[cfg(unix)] output: &mut pipe_drain::OutputDrains,
+    #[cfg(not(unix))] _output: &mut thread_io::OutputDrains,
+    #[cfg(unix)] input: &mut pipe_drain::InputFeed<'_>,
+    #[cfg(not(unix))] _input: &mut thread_io::InputFeed,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    return guard.ask_then_stop_and_reap_waiting(child, &mut |span| {
+        // First wait: SIGTERM has already been sent, so a child that reads
+        // EOF now was asked to stop first and cannot take truncated input
+        // for the whole of it.
+        input.close();
+        output.drain_ready();
+        if output.wait_with_input(span, None).is_err() {
+            std::thread::sleep(span);
+        }
+        output.drain_ready();
+    });
+    #[cfg(not(unix))]
+    guard.ask_then_stop_and_reap(child)
+}
+
 /// [`run_with_gate`] with `on_admitted` called after the gate admits the
 /// child and before it is spawned — the last moment at which nothing has been
 /// read yet, which is what [`run_read_shared`] needs to stop new joiners.
@@ -3245,6 +4354,8 @@ fn run_admitted(
     gate: &'static SpawnGate,
     on_admitted: &dyn Fn(),
 ) -> Result<BoundedRun, String> {
+    #[cfg(test)]
+    SPAWN_LABELS.with(|labels| labels.borrow_mut().push(label.to_string()));
     #[cfg(test)]
     if FORCE_DEFERRAL.get() {
         return Err(refusal_message(label, Refusal::Shed));
@@ -3387,7 +4498,7 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    let output = match thread_io::OutputDrains::new(
+    let mut output = match thread_io::OutputDrains::new(
         child.stdout.take(),
         child.stderr.take(),
         stdout_cap,
@@ -3412,7 +4523,7 @@ fn run_admitted_inner(
             }
         };
     #[cfg(not(unix))]
-    let input = match thread_io::InputFeed::new(
+    let mut input = match thread_io::InputFeed::new(
         child.stdin.take(),
         stdin_bytes.unwrap_or_default(),
         _permit.clone(),
@@ -3440,7 +4551,9 @@ fn run_admitted_inner(
         input.pump();
         output.observe(observer, &mut cursors);
         if observer.cancelled() {
-            break match guard.stop_and_reap(&mut child, Duration::ZERO) {
+            // Asked first: git removes its own `.git/index.lock` when asked and
+            // cannot when killed, so a cancelled commit would block the next.
+            break match ask_and_drain(&guard, &mut child, &mut output, &mut input) {
                 Ok(status) => Halt::Exited(status, true),
                 Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
             };
@@ -3454,9 +4567,11 @@ fn run_admitted_inner(
                 if Instant::now() >= deadline {
                     let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
                     // Reap before reading the rest of the pipes: a live child
-                    // can hold them open, and the prefix is whatever was
-                    // already printed, not a reason to wait out the grace.
-                    guard.stop_and_reap(&mut child, Duration::ZERO).ok();
+                    // can hold them open. The ask comes first so git can
+                    // release `.git/index.lock`; a child that ignores it is
+                    // killed after [`CHILD_GRACE`], which a child that exits
+                    // sooner does not wait out.
+                    ask_and_drain(&guard, &mut child, &mut output, &mut input).ok();
                     break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
@@ -3698,7 +4813,10 @@ fn git_run_inner(
         if remaining.is_zero() {
             return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
         }
-        let mut out = if shared && stdin_bytes.is_none() {
+        // A hook-running command is cancellable and can write, so it is
+        // never shared whatever the caller asked: the shared path has no
+        // observer to poll.
+        let mut out = if shared && stdin_bytes.is_none() && hooked.is_none() {
             run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
         } else if let Some((_, run)) = &hooked {
             let mut cmd = cmd;
@@ -3744,11 +4862,7 @@ fn git_run_inner(
                 );
                 continue;
             }
-            if diagnosis.len() > MAX_FAILURE_MESSAGE_BYTES {
-                let cut = truncate_utf8_bytes(diagnosis, MAX_FAILURE_MESSAGE_BYTES);
-                return Err(format!("{cut}… (git {} output truncated)", sub));
-            }
-            return Err(diagnosis.to_owned());
+            return Err(clamp_failure_message(diagnosis, sub));
         }
         return Err(format!(
             "git {} failed with status {}",
@@ -3804,16 +4918,38 @@ fn incomplete_is_failure(sub: &str, reason: Incomplete) -> String {
 /// drags megabytes into an error string.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2_000;
 
-/// Truncates `s` to at most `max_bytes` on a UTF-8 character boundary.
-fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
+/// Share of [`MAX_FAILURE_MESSAGE_BYTES`] given to the head of a clamped
+/// failure; the tail gets the rest. A hook or command opens with routine
+/// chatter and *ends* with the reason it failed.
+const FAILURE_HEAD_SHARE_PERCENT: usize = 35;
+
+/// Bounds a failure diagnosis to [`MAX_FAILURE_MESSAGE_BYTES`], keeping both
+/// ends on UTF-8 boundaries and announcing what was dropped.
+///
+/// Head-only truncation kept the wrong half: a pre-push hook running CI
+/// printed its command banners and test-runner warnings first, so the 2 KB
+/// head held only those and the failing check at the end was discarded.
+/// The frontend's `clampMessage` keeps both ends for the same reason.
+fn clamp_failure_message(diagnosis: &str, sub: &str) -> String {
+    if diagnosis.len() <= MAX_FAILURE_MESSAGE_BYTES {
+        return diagnosis.to_owned();
     }
-    let mut cut = max_bytes;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
+    let head_budget = MAX_FAILURE_MESSAGE_BYTES * FAILURE_HEAD_SHARE_PERCENT / 100;
+    let tail_budget = MAX_FAILURE_MESSAGE_BYTES - head_budget;
+    let mut head_end = head_budget;
+    while !diagnosis.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    &s[..cut]
+    let mut tail_start = diagnosis.len() - tail_budget;
+    while !diagnosis.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n… {} bytes elided (git {sub} output truncated) …\n{}",
+        &diagnosis[..head_end],
+        tail_start - head_end,
+        &diagnosis[tail_start..],
+    )
 }
 
 #[cfg(test)]
@@ -4049,7 +5185,8 @@ mod tests {
         let shed = with_background_processes(|| gate.acquire_until(far(), &|| false).err());
         assert_eq!(shed, Some(Refusal::Shed));
         assert!(
-            began.elapsed() < std::time::Duration::from_millis(500),
+            began.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(500)),
             "shedding must not wait out the budget: {:?}",
             began.elapsed()
         );
@@ -4058,6 +5195,72 @@ mod tests {
             "the reserve is for refreshes"
         );
         assert_eq!(gate.counters()[Admission::Background.index()].shed, 1);
+    }
+
+    /// Under memory pressure (the load governor's verdict) the gate sheds its
+    /// own optional classes with the deferral marker the frontend retries on:
+    /// background at `warn`, background and reactive at `critical` or a
+    /// thrashing compressor. A user action is never shed, a read credited to
+    /// one is not shed either, and everything resumes once the pressure
+    /// clears. No spawn budget is spent on a shed spawn.
+    #[test]
+    fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resumes() {
+        use super::{with_admission, with_background_processes, Admission, Refusal};
+        use crate::sysload::{GovernorInput, Level};
+        let gate = super::SpawnGate::new(8);
+        let far = || Instant::now() + std::time::Duration::from_secs(10);
+        let background =
+            || with_background_processes(|| gate.acquire_until(far(), &|| false).err());
+        let reactive = || {
+            with_admission(Admission::Reactive, || {
+                gate.acquire_until(far(), &|| false).err()
+            })
+        };
+        let interactive = || {
+            with_admission(Admission::Interactive, || {
+                gate.acquire_until(far(), &|| false).err()
+            })
+        };
+
+        let calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        assert_eq!(
+            (background(), reactive(), interactive()),
+            (None, None, None)
+        );
+        drop(calm);
+
+        let warn = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Warn));
+        assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
+        assert_eq!((reactive(), interactive()), (None, None));
+        drop(warn);
+
+        let critical =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
+        assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+        assert_eq!(interactive(), None, "a click is never shed");
+        let message = refusal_message("git status", Refusal::Pressure { reactive: true });
+        assert!(is_deferred_under_load(&message), "{message}");
+        assert!(message.contains("memory pressure"), "{message}");
+        let counters = gate.counters();
+        assert_eq!(counters[Admission::Background.index()].shed, 2);
+        assert_eq!(counters[Admission::Reactive.index()].shed, 1);
+        drop(critical);
+
+        // A thrashing compressor sheds like critical while the level lags.
+        let thrash = crate::sysload::inject_governor(GovernorInput {
+            compressor_thrash: true,
+            ..GovernorInput::test_pressure(Level::Normal)
+        });
+        assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+        drop(thrash);
+
+        // Cleared: everything resumes.
+        let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        assert_eq!(
+            (background(), reactive(), interactive()),
+            (None, None, None)
+        );
     }
 
     /// A waiting user action takes the next free slot even with refreshes
@@ -4306,7 +5509,8 @@ mod tests {
             slowest = slowest.max(waited);
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(4)),
             "join took {:?}; a refused spawn must not sit until the 90s git deadline",
             started.elapsed()
         );
@@ -4332,7 +5536,9 @@ mod tests {
             let gate = Arc::clone(&gate);
             let admitted = Arc::clone(&admitted);
             threads.push(std::thread::spawn(move || {
-                while started.elapsed() < std::time::Duration::from_millis(500) {
+                while started.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(500))
+                {
                     if let Some(permit) = gate
                         .acquire(std::time::Instant::now() + std::time::Duration::from_millis(15))
                     {
@@ -4345,11 +5551,19 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+        // The cap is a rate, so it is measured against the window that actually
+        // ran: coverage_relaxed stretches the 500 ms window tenfold under
+        // instrumentation, and a bound fixed for 500 ms then fails on refills
+        // the gate was right to grant. Windows up to a second keep the bound the
+        // fixed version had (a second of refill plus 4 of slack); an uncapped
+        // gate admits hundreds in the same window.
+        let window = started.elapsed().as_secs_f64();
         let n = admitted.load(Ordering::Relaxed);
+        let cap = 8 + (4.0 * window.max(1.0)).ceil() as u32 + 4;
         assert!(n >= 8, "burst was not issued: {n}");
         assert!(
-            n <= 8 + 4 + 4,
-            "concurrent storm admitted {n}; cap is burst 8 plus 4/s"
+            n <= cap,
+            "concurrent storm admitted {n} in {window:.2}s; cap is burst 8 plus 4/s = {cap}"
         );
     }
 
@@ -4495,6 +5709,32 @@ mod tests {
         );
         assert!(error.contains("output truncated"));
     }
+
+    /// End to end: a failing command whose cause is its last line keeps that
+    /// line in the error, however much it printed before it.
+    #[cfg(unix)]
+    #[test]
+    fn failure_diagnosis_keeps_the_last_line_of_long_output() {
+        let dir = crate::test_support::git_repo();
+        let error = git_run_capped(
+            Some(dir.path()),
+            &[
+                "-c",
+                "alias.noisy=!yes chatter | head -n 2000 >&2; echo 'error: failed to push some refs' >&2; exit 1",
+                "noisy",
+            ],
+            Duration::from_secs(5),
+            None,
+            1024,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("chatter"), "{error}");
+        assert!(
+            error.ends_with("error: failed to push some refs"),
+            "failing tail dropped: …{}",
+            &error[error.len().saturating_sub(120)..]
+        );
+    }
     #[test]
     #[cfg(unix)]
     fn audit_capture_refuses_incomplete_stderr() {
@@ -4508,22 +5748,76 @@ mod tests {
         assert!(result.is_err(), "capture erased stderr completeness");
     }
     #[cfg(unix)]
+    const RETRYING_ALIAS: &str =
+        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1";
+
+    /// Where the total budget runs out between two lock retries decides which
+    /// seam reports it: the top of the loop returns an error, a child killed
+    /// in flight returns its prefix tagged [`Incomplete::Deadline`]. Which one
+    /// happens depends on the backoff (pid-derived) and on scheduling, so a
+    /// capped caller must accept either, and a caller that needs the whole
+    /// stream must get an error from both.
+    #[cfg(unix)]
     #[test]
     fn audit_lock_retries_share_one_total_deadline() {
         let dir = crate::test_support::git_repo();
         let started = Instant::now();
-        let error = git_run_capped(Some(dir.path()), &[
-            "-c", "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1", "retry"
-        ], Duration::from_millis(150), None, 1024).unwrap_err();
+        let capped = git_run_capped(
+            Some(dir.path()),
+            &["-c", RETRYING_ALIAS, "retry"],
+            Duration::from_millis(150),
+            None,
+            1024,
+        );
+        let whole = git_timeout(
+            Some(dir.path()),
+            &["-c", RETRYING_ALIAS, "retry"],
+            Duration::from_millis(150),
+            None,
+        );
+        // Two sequential runs of one 150 ms budget each.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(1000)),
             "retries renewed the timeout: {:?}",
             started.elapsed()
         );
+        match capped {
+            Err(error) => assert!(error.contains("timed out"), "{error}"),
+            Ok((_, Some(Incomplete::Deadline { message, .. }))) => {
+                assert!(message.contains("timed out"), "{message}")
+            }
+            other => panic!("a deadline must never look like success: {other:?}"),
+        }
+        let error = whole.expect_err("a caller that needs the whole stream cannot accept a prefix");
         assert!(
             error.contains("timed out"),
             "deadline expiry must be explicit: {error}"
         );
+    }
+
+    /// The in-flight half, deterministically: no lock error, so the budget can
+    /// only run out inside the child.
+    #[cfg(unix)]
+    #[test]
+    fn audit_a_deadline_in_flight_is_a_tagged_prefix_for_capped_callers() {
+        let dir = crate::test_support::git_repo();
+        let args = ["-c", "alias.slow=!sleep 5", "slow"];
+        let capped = git_run_capped(
+            Some(dir.path()),
+            &args,
+            Duration::from_millis(100),
+            None,
+            1024,
+        )
+        .expect("a killed child is a tagged prefix, not an error");
+        assert!(
+            matches!(capped.1, Some(Incomplete::Deadline { .. })),
+            "{:?}",
+            capped.1
+        );
+        let error = git_timeout(Some(dir.path()), &args, Duration::from_millis(100), None)
+            .expect_err("whole-stream callers fail a deadline");
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[cfg(unix)]
@@ -4589,7 +5883,7 @@ mod tests {
             Some(&vec![b'x'; 1024 * 1024]),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "stdin join outlived the child: {:?}",
             started.elapsed()
         );
@@ -4939,6 +6233,7 @@ mod tests {
             &[],
             Some(std::ffi::OsStr::new("")),
             None,
+            PathSource::Inherited,
         );
         match classify_tool_probe("gitpulse-no-such-tool-7f3a", missing) {
             ToolProbe::NotFound(error) => {
@@ -5304,7 +6599,7 @@ mod tests {
             ),
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "bounded run should finish promptly once pipes drain"
         );
     }
@@ -5345,6 +6640,74 @@ mod tests {
             Path::new(&resolved),
             &tool,
             "bare name must resolve through the fallback dir on an empty PATH"
+        );
+    }
+
+    /// An explicit PATH is the whole search path: the same tool in the same
+    /// fallback dir stays unresolved, and the child is handed that PATH
+    /// without the fallback dirs, so neither the spawn nor anything the child
+    /// re-resolves can reach past it.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_path_is_not_widened_by_fallback_dirs() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("gitpulse-fake-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        assert_eq!(
+            resolve_spawn_program_in(
+                "gitpulse-fake-tool",
+                Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+                Some(home.path().as_os_str()),
+                PathSource::Explicit,
+            ),
+            "gitpulse-fake-tool",
+            "a tool outside the explicit PATH must not resolve"
+        );
+
+        let cmd = build_capture_command_in(
+            "gitpulse-fake-tool",
+            &[],
+            None,
+            &[],
+            Some(std::ffi::OsStr::new("/usr/bin::/bin")),
+            Some(home.path().as_os_str()),
+            PathSource::Explicit,
+        );
+        assert_eq!(
+            cmd.get_program(),
+            std::ffi::OsStr::new("gitpulse-fake-tool")
+        );
+        let child_path: Vec<Option<std::ffi::OsString>> = cmd
+            .get_envs()
+            .filter(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+            .collect();
+        assert_eq!(
+            child_path,
+            vec![Some(std::ffi::OsString::from("/usr/bin:/bin"))],
+            "the child gets the explicit PATH, empty entries dropped, nothing appended"
+        );
+
+        // No explicit value at all is not "inherit the process PATH".
+        let unset = build_capture_command_in(
+            "sh",
+            &[],
+            None,
+            &[],
+            None,
+            Some(home.path().as_os_str()),
+            PathSource::Explicit,
+        );
+        assert!(
+            unset
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new("PATH") && value.is_none()),
+            "an explicit unset PATH must be removed from the child"
         );
     }
 
@@ -5533,16 +6896,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn git_launch_preserves_relative_path_resolution_and_unset_path_defaults() {
-        // Relative PATH entries have child-cwd semantics; let the OS retain
-        // those semantics rather than silently bypassing a user-selected git.
+    fn git_launch_drops_relative_path_entries_and_unset_path_defaults() {
+        // A relative PATH entry has child-cwd semantics, and the child's cwd
+        // is the repository: it is dropped rather than honoured, so git is
+        // resolved from the absolute entries and never from inside the repo.
         let cmd = git_command_with_env(
             None,
             &["status"],
             Some(std::ffi::OsStr::new("relative:/usr/bin")),
             None,
         );
-        assert_eq!(cmd.get_program(), "git");
+        assert!(Path::new(cmd.get_program()).is_absolute());
         let cmd = git_command_with_env(None, &["status"], None, None);
         assert!(Path::new(cmd.get_program()).is_absolute());
     }
@@ -5851,6 +7215,26 @@ mod tests {
             [Path::new("/usr/bin"), Path::new("/bin")],
             "unset PATH must seed the Unix default search set"
         );
+    }
+
+    /// A relative entry resolves against the child's cwd, which is the repo.
+    #[cfg(unix)]
+    #[test]
+    fn extended_child_path_drops_relative_entries() {
+        let home = tempfile::TempDir::new().unwrap();
+        let hostile = extended_child_path(
+            Some(std::ffi::OsStr::new(
+                "./node_modules/.bin:.:bin:/usr/local/bin:../x:node_modules/.bin",
+            )),
+            Some(home.path().as_os_str()),
+        )
+        .expect("join");
+        let entries: Vec<PathBuf> = std::env::split_paths(&hostile).collect();
+        assert!(
+            entries.iter().all(|e| e.is_absolute()),
+            "relative PATH entries must be dropped: {entries:?}"
+        );
+        assert_eq!(entries.first(), Some(&PathBuf::from("/usr/local/bin")));
     }
 
     /// The extended child PATH appends only the fallback dirs that are not
@@ -6390,6 +7774,38 @@ mod tests {
         );
     }
 
+    /// The text form of [`canonicalize_plain`], for the paths the command gate
+    /// and `git worktree add` receive already spelled: a canonicalized checkout
+    /// joined with a lane directory.
+    #[cfg(windows)]
+    #[test]
+    fn plain_path_text_drops_the_verbatim_prefix_git_cannot_use() {
+        assert_eq!(
+            plain_path_text(r"\\?\C:\Users\runneradmin\repo\.gitpulse\worktrees\lane"),
+            r"C:\Users\runneradmin\repo\.gitpulse\worktrees\lane"
+        );
+        assert_eq!(
+            plain_path_text(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        // No ordinary spelling exists: unchanged rather than invented.
+        assert_eq!(
+            plain_path_text(r"\\?\Volume{0123}\repo"),
+            r"\\?\Volume{0123}\repo"
+        );
+        assert_eq!(plain_path_text(r"C:\already\plain"), r"C:\already\plain");
+    }
+
+    /// Off Windows a backslash is a filename character and `\\?\` means
+    /// nothing, so every spelling is left exactly as given.
+    #[cfg(not(windows))]
+    #[test]
+    fn plain_path_text_is_the_identity_off_windows() {
+        for path in [r"\\?\C:\repo\wt", "/tmp/repo/wt", r"/tmp/odd\name", ""] {
+            assert_eq!(plain_path_text(path), path);
+        }
+    }
+
     /// Off Windows there is nothing to strip, and a backslash is an ordinary
     /// filename character -- rewriting one would rename the file.
     #[cfg(not(windows))]
@@ -6478,6 +7894,240 @@ mod tests {
         }
     }
 
+    /// The environment of every git child, from either builder. `gh` and the
+    /// other captured tools shell out to git, so they must see the same locale,
+    /// credential, lock and redirect settings git itself is given — the capture
+    /// builder used to set only a third of them.
+    fn git_environment_of(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_builders_pin_the_same_git_environment() {
+        let git = git_environment_of(&git_command(Some(Path::new("/tmp")), &["status"]));
+        let capture = git_environment_of(&build_capture_command_in(
+            "gh",
+            &["--version"],
+            None,
+            &[],
+            None,
+            None,
+            PathSource::Inherited,
+        ));
+        for key in [
+            "LC_ALL",
+            "GCM_INTERACTIVE",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+        ] {
+            assert!(
+                git.get(key).is_some_and(Option::is_some),
+                "git_command sets {key}"
+            );
+            assert_eq!(
+                capture.get(key),
+                git.get(key),
+                "the capture builder's {key}"
+            );
+        }
+        assert_eq!(git["LC_ALL"].as_deref(), Some("C"));
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_SHALLOW_FILE",
+            "GIT_ATTR_SOURCE",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_PROXY_COMMAND",
+            "GIT_DIFF_OPTS",
+        ] {
+            assert_eq!(git.get(key), Some(&None), "git_command must remove {key}");
+            assert_eq!(
+                capture.get(key),
+                Some(&None),
+                "the capture builder must remove {key}"
+            );
+        }
+    }
+
+    /// Tracing floods stderr, of which only a few bytes are kept: the fatal
+    /// line is the one that goes missing. Every `GIT_TRACE*` switch is removed
+    /// by name or by prefix, including ones this build has never heard of.
+    #[test]
+    fn every_git_trace_switch_is_stripped() {
+        let name = "GIT_TRACE2_EVENT_NESTING_FROM_THE_FUTURE";
+        assert!(is_injected_git_env(name));
+        for name in [
+            "GIT_TRACE",
+            "GIT_TRACE_PACKET",
+            "GIT_TRACE2",
+            "git_trace_setup",
+        ] {
+            assert!(is_injected_git_env(name), "{name}");
+        }
+        assert!(
+            !is_injected_git_env("GIT_AUTHOR_NAME"),
+            "identity is not redirection"
+        );
+    }
+
+    /// A developer's `log.showSignature`, colour and diff-prefix settings change
+    /// what the parsers read, so each rides every invocation; and a patch
+    /// command never hands the diff to `diff.external`.
+    #[test]
+    fn git_command_pins_output_format_config_and_skips_the_external_diff() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            git_command(Some(Path::new("/tmp")), args)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let log = argv(&["log", "-n1", "--format=%H"]);
+        for pin in [
+            "log.showSignature=false",
+            "color.ui=never",
+            "diff.noprefix=false",
+            "diff.mnemonicPrefix=false",
+        ] {
+            assert!(
+                log.windows(2).any(|pair| pair[0] == "-c" && pair[1] == pin),
+                "missing -c {pin} in {log:?}"
+            );
+        }
+        for patch in ["diff", "show", "log"] {
+            let args = argv(&[patch, "HEAD"]);
+            let at = args.iter().position(|a| a == patch).expect("subcommand");
+            assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
+            // `diff` rejects `--no-show-signature`; `show` and `log` carry it
+            // so a signature header is never printed (and verified) for them.
+            if patch == "diff" {
+                assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+            } else {
+                assert_eq!(args[at + 2], "--no-show-signature", "{patch}: {args:?}");
+                assert_eq!(args[at + 3], "HEAD", "{patch}: {args:?}");
+            }
+        }
+        let notes_log = argv(&["-c", "x.y=z", "log", "-n1"]);
+        let at = notes_log.iter().position(|a| a == "log").unwrap();
+        assert_eq!(notes_log[at + 2], "--no-show-signature", "{notes_log:?}");
+        assert!(
+            !argv(&["diff", "--cached"])
+                .iter()
+                .any(|a| a == "--no-show-signature"),
+            "diff must not receive a flag it rejects"
+        );
+        // A global option with a value before the subcommand does not hide it,
+        // and a command that prints no patch is left alone.
+        let notes = argv(&["-c", "x.y=z", "notes", "show", "HEAD"]);
+        assert!(!notes.iter().any(|a| a == "--no-ext-diff"), "{notes:?}");
+        let global = argv(&["-C", "/tmp", "diff", "--cached"]);
+        let at = global.iter().position(|a| a == "diff").unwrap();
+        assert_eq!(global[at + 1], "--no-ext-diff", "{global:?}");
+    }
+
+    /// A batch stream that ends because its budget or deadline did keeps the
+    /// answers that are whole and says, for each one it lost, that the output
+    /// was cut: not "answered nothing", which would blame git for the cap.
+    #[test]
+    fn a_cut_batch_keeps_its_whole_answers_and_names_the_cut_for_the_rest() {
+        const OBJECT: BatchObject = BatchObject {
+            kind: "commit",
+            noun: "commit",
+        };
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let sent = [a.as_str(), b.as_str(), c.as_str()];
+        let run = |stream: &[u8]| {
+            let mut answers: HashMap<String, Result<usize, String>> = HashMap::new();
+            read_batch_answers(
+                stream,
+                &sent,
+                OBJECT,
+                &<[u8]>::len,
+                Some("git cat-file output exceeded 64 bytes"),
+                &mut answers,
+            );
+            answers
+        };
+        // The stream stops between answers: `c` was never started.
+        let between = run(format!("{a} commit 2\nhi\n{b} commit 3\nabc\n").as_bytes());
+        assert_eq!(between[&a], Ok(2));
+        assert_eq!(between[&b], Ok(3));
+        assert!(between[&c].as_ref().unwrap_err().contains("exceeded 64"));
+        // The stream stops inside `b`'s body: `a` stays, `b` and `c` are cut.
+        let inside = run(format!("{a} commit 2\nhi\n{b} commit 30\nabc").as_bytes());
+        assert_eq!(inside[&a], Ok(2));
+        for oid in [&b, &c] {
+            let err = inside[oid].as_ref().unwrap_err();
+            assert!(err.contains("exceeded 64") && err.contains(&b), "{err}");
+        }
+    }
+
+    /// An observer that keeps what it needs sees every byte of a long stream
+    /// while the run retains almost none of it, and the byte cap still ends a
+    /// stream that outruns it.
+    #[cfg(unix)]
+    #[test]
+    fn a_draining_observer_streams_without_the_run_buffering_the_output() {
+        struct Counting {
+            seen: usize,
+        }
+        impl ProcessObserver for Counting {
+            fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+                if matches!(stream, OutputStream::Stdout) {
+                    self.seen += bytes.len();
+                }
+            }
+            fn drains_stdout(&self) -> bool {
+                true
+            }
+        }
+        let run_with_cap = |cap: usize| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "head -c 3000000 /dev/zero"]);
+            let mut observer = Counting { seen: 0 };
+            let run = run_observed(
+                &mut cmd,
+                "sh",
+                Duration::from_secs(30),
+                None,
+                cap,
+                &mut observer,
+            )
+            .expect("run");
+            (run, observer.seen)
+        };
+        let (whole, seen) = run_with_cap(4_000_000);
+        assert!(whole.incomplete.is_none(), "{:?}", whole.incomplete);
+        assert_eq!(seen, 3_000_000, "the observer saw the whole stream");
+        assert!(
+            whole.stdout.len() < 1_000_000,
+            "the run kept {} of 3,000,000 bytes",
+            whole.stdout.len()
+        );
+        let (cut, seen) = run_with_cap(100_000);
+        assert_eq!(cut.incomplete, Some(Incomplete::OverCap(100_000)));
+        assert!(
+            seen <= 100_000,
+            "the cap bounds a streamed read too: {seen}"
+        );
+    }
+
     /// The editor variables are PINNED rather than removed, and the difference
     /// is a security property, not a style choice.
     ///
@@ -6553,7 +8203,7 @@ mod tests {
         };
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
@@ -6630,7 +8280,7 @@ mod tests {
         .expect("bytes written before the deadline are the result");
         drop(kept);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
@@ -6755,7 +8405,8 @@ mod tests {
                 )
                 .expect("prefix");
                 assert!(
-                    started.elapsed() < Duration::from_secs(5),
+                    started.elapsed()
+                        < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
                     "reader {index} took {:?}",
                     started.elapsed()
                 );
@@ -6803,16 +8454,17 @@ mod tests {
             "GIT_EXTERNAL_DIFF",
             "GIT_SEQUENCE_EDITOR",
             "GIT_EXEC_PATH",
+            // Tracing floods the few bytes of stderr that are kept, and the
+            // fatal line is the one that goes missing.
+            "GIT_TRACE",
+            "GIT_SSH",
+            "GIT_PROXY_COMMAND",
+            "GIT_DIFF_OPTS",
+            "GIT_LITERAL_PATHSPECS",
         ] {
             assert!(is_injected_git_env(name), "{name} must be stripped");
         }
-        for safe in [
-            "GIT_AUTHOR_NAME",
-            "GIT_PAGER",
-            "EDITOR",
-            "PATH",
-            "GIT_TRACE",
-        ] {
+        for safe in ["GIT_AUTHOR_NAME", "GIT_PAGER", "EDITOR", "PATH"] {
             assert!(!is_injected_git_env(safe), "{safe} must survive");
         }
     }
@@ -7009,7 +8661,7 @@ mod tests {
         let err = run_bounded(cmd, "sh", Duration::from_secs(1), None).expect_err("timeout");
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
             "timeout handling must stay bounded (one shared grace window), took {:?}",
             started.elapsed()
         );
@@ -7577,6 +9229,494 @@ mod tests {
         );
     }
 
+    /// The harness for joiner-deadline tests: a gate whose only slot is held,
+    /// so every read queues and the first caller leads a flight the rest join.
+    #[cfg(unix)]
+    struct JoinerRig {
+        gate: &'static SpawnGate,
+        _dir: tempfile::TempDir,
+        cwd: PathBuf,
+        held: Vec<super::SpawnPermit<'static>>,
+    }
+
+    #[cfg(unix)]
+    impl JoinerRig {
+        fn new() -> Self {
+            Self::with_slots(1)
+        }
+
+        /// A gate of `slots` slots, every one held until [`Self::release`].
+        fn with_slots(slots: usize) -> Self {
+            let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(slots)));
+            let dir = tempfile::TempDir::new().unwrap();
+            let cwd = dir.path().canonicalize().unwrap();
+            let held = (0..slots)
+                .map(|_| {
+                    gate.acquire(Instant::now() + Duration::from_secs(5))
+                        .unwrap()
+                })
+                .collect();
+            Self {
+                gate,
+                _dir: dir,
+                cwd,
+                held,
+            }
+        }
+
+        /// A read of `script` (run by `sh -c`) in the rig's directory.
+        fn read(
+            &self,
+            script: &str,
+            timeout: Duration,
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+            self.read_as(script, timeout, false)
+        }
+
+        /// [`Self::read`] from a caller that keeps a deadline's prefix, as
+        /// `git_run_inner` does for every production read.
+        fn read_keeping(
+            &self,
+            script: &str,
+            timeout: Duration,
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+            self.read_as(script, timeout, true)
+        }
+
+        fn read_as(
+            &self,
+            script: &str,
+            timeout: Duration,
+            keep_prefix: bool,
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+            let (gate, cwd, script) = (self.gate, self.cwd.clone(), script.to_string());
+            thread::spawn(move || {
+                let _kept = keep_prefix.then(KeepDeadlinePrefix::enter);
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", script.as_str()]).current_dir(&cwd);
+                let started = Instant::now();
+                let result = super::run_read_shared(cmd, "joined-read", timeout, 4096, gate);
+                (result, started.elapsed())
+            })
+        }
+
+        fn flight_open(&self) -> bool {
+            super::shared_reads()
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.cwd == self.cwd)
+        }
+
+        fn wait_for_flight(&self) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !self.flight_open() {
+                assert!(Instant::now() < until, "the leader never queued");
+                thread::yield_now();
+            }
+        }
+
+        fn wait_for_joins(&self, joins: u64) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while self.gate.counters()[super::Admission::Reactive.index()].coalesced < joins {
+                assert!(Instant::now() < until, "the joiners never queued");
+                thread::yield_now();
+            }
+        }
+
+        fn release(&mut self) {
+            self.held.clear();
+        }
+    }
+
+    /// A joiner returns by its own deadline, not the leader's child's, and the
+    /// leader neither dies nor loses its answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_returns_by_its_own_deadline_while_the_leader_runs_on() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 2; echo leader-done", Duration::from_secs(10));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 2; echo leader-done", Duration::from_millis(200));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (joined, waited) = joiner.join().unwrap();
+        let error = joined.expect_err("the joiner's 200 ms ran out");
+        assert_eq!(error, format!("joined-read{TIMEOUT_MARKER}0.2s"));
+        assert!(is_timed_out(&error));
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(1200)),
+            "the joiner sat for {waited:?}"
+        );
+        let (led, _) = leader.join().unwrap();
+        let led = led.expect("the leader was not disturbed");
+        assert!(led.success && led.incomplete.is_none(), "{led:?}");
+        assert_eq!(String::from_utf8_lossy(&led.stdout).trim(), "leader-done");
+    }
+
+    /// The leader's deadline is the leader's: a joiner with budget left runs
+    /// its own read instead of being handed the leader's timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_with_budget_left_does_not_inherit_the_leaders_timeout() {
+        let mut rig = JoinerRig::new();
+        let script = "if [ -e ran ]; then echo second; else touch ran; sleep 5; fi";
+        let leader = rig.read(script, Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read(script, Duration::from_secs(10));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (led, _) = leader.join().unwrap();
+        let error = led.expect_err("the leader's 300 ms ran out");
+        assert!(is_timed_out(&error), "{error}");
+        let (joined, _) = joiner.join().unwrap();
+        let run = joined.expect("the joiner had budget to run its own read");
+        assert!(run.success && run.incomplete.is_none(), "{run:?}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "second");
+    }
+
+    /// The leader's deadline error is a joiner's answer once the joiner's own
+    /// budget is gone too: it does not loop on a clock that has already run.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_whose_budget_also_ran_out_reports_its_own_timeout() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 5", Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 5", Duration::from_millis(350));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (led, _) = leader.join().unwrap();
+        assert!(is_timed_out(&led.expect_err("leader deadline")));
+        let (joined, waited) = joiner.join().unwrap();
+        let error = joined.expect_err("joiner deadline");
+        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
+            "{waited:?}"
+        );
+    }
+
+    /// Many joiners with mixed deadlines each leave at their own, and the
+    /// joiner that outlasts the child shares it: one process in all.
+    #[cfg(unix)]
+    #[test]
+    fn joiners_with_mixed_deadlines_each_leave_at_their_own() {
+        let mut rig = JoinerRig::new();
+        let script = format!(
+            "echo $$ >> '{}/pids'; sleep 1.5; echo shared",
+            rig.cwd.display()
+        );
+        let leader = rig.read(&script, Duration::from_secs(10));
+        rig.wait_for_flight();
+        let short: Vec<_> = [150u64, 300, 450, 150, 300]
+            .iter()
+            .map(|ms| (*ms, rig.read(&script, Duration::from_millis(*ms))))
+            .collect();
+        let long = rig.read(&script, Duration::from_secs(10));
+        rig.wait_for_joins(6);
+        rig.release();
+        for (ms, joiner) in short {
+            let (joined, waited) = joiner.join().unwrap();
+            let error = joined.expect_err("a short joiner outlasted by the child");
+            assert!(is_timed_out(&error), "{error}");
+            assert!(
+                waited
+                    < Duration::from_millis(ms)
+                        + crate::test_support::coverage_relaxed(Duration::from_millis(900)),
+                "{ms} ms joiner took {waited:?}"
+            );
+        }
+        for handle in [leader, long] {
+            let (run, _) = handle.join().unwrap();
+            let run = run.expect("the shared read finished");
+            assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "shared");
+        }
+        let started = std::fs::read_to_string(rig.cwd.join("pids")).unwrap();
+        assert_eq!(started.lines().count(), 1, "one child for all: {started}");
+    }
+
+    /// A joiner still hears a leader that panics: the wait is bounded, but the
+    /// wake from `Publish` stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_leader_that_panics_still_wakes_a_joiner_before_its_deadline() {
+        let rig = JoinerRig::new();
+        let (gate, cwd) = (rig.gate, rig.cwd.clone());
+        let leader = thread::spawn(move || {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "true"]).current_dir(&cwd);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::with_forced_spawn_failure_then(
+                    move || {
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while gate.counters()[super::Admission::Reactive.index()].coalesced < 1
+                            && Instant::now() < until
+                        {
+                            thread::yield_now();
+                        }
+                        panic!("the leader's read panicked");
+                    },
+                    || {
+                        super::run_read_shared(
+                            cmd,
+                            "joined-read",
+                            Duration::from_secs(10),
+                            4096,
+                            gate,
+                        )
+                    },
+                )
+            }));
+        });
+        rig.wait_for_flight();
+        let joiner = rig.read("true", Duration::from_secs(10));
+        let (joined, waited) = joiner.join().unwrap();
+        leader.join().unwrap();
+        let error = joined.expect_err("a panicked leader has no answer");
+        assert!(error.contains("ended without a result"), "{error}");
+        assert!(waited < Duration::from_secs(4), "{waited:?}");
+    }
+
+    /// A joiner handed almost no time, as a lock retry passes, answers with
+    /// its timeout at once instead of waiting on the leader.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_with_almost_no_time_left_does_not_wait_for_the_leader() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 1.5; echo done", Duration::from_secs(10));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 1.5; echo done", Duration::from_millis(1));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (joined, waited) = joiner.join().unwrap();
+        assert!(is_timed_out(&joined.expect_err("1 ms")));
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(800)),
+            "{waited:?}"
+        );
+        assert!(leader.join().unwrap().0.expect("leader").success);
+    }
+
+    /// A joiner whose deadline falls exactly when the leader publishes gets
+    /// one coherent answer, never a hang and never a torn result.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_deadline_racing_the_publish_gets_one_coherent_answer() {
+        for round in 0..10u64 {
+            let mut rig = JoinerRig::new();
+            let leader = rig.read("sleep 0.3; echo raced", Duration::from_secs(10));
+            rig.wait_for_flight();
+            let joiner = rig.read(
+                "sleep 0.3; echo raced",
+                Duration::from_millis(300 + round * 3),
+            );
+            rig.wait_for_joins(1);
+            rig.release();
+            let (joined, waited) = joiner.join().unwrap();
+            match joined {
+                Ok(run) => assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "raced"),
+                Err(error) => assert!(is_timed_out(&error), "{error}"),
+            }
+            assert!(waited < Duration::from_secs(3), "{waited:?}");
+            assert!(leader.join().unwrap().0.expect("leader").success);
+        }
+    }
+
+    /// A caller that keeps deadline prefixes, as every production read does,
+    /// gets the marked form when its joiner deadline passes. The joiner has no
+    /// bytes of its own: the child is the leader's.
+    #[cfg(unix)]
+    #[test]
+    fn a_keeping_joiner_that_runs_out_reports_a_marked_empty_run() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read_keeping("sleep 2; echo late", Duration::from_secs(10));
+        rig.wait_for_flight();
+        let joiner = rig.read_keeping("sleep 2; echo late", Duration::from_millis(200));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (joined, _) = joiner.join().unwrap();
+        let run = joined.expect("a keeping caller gets the prefix form, not an error");
+        assert!(!run.success && run.stdout.is_empty(), "{run:?}");
+        let Some(Incomplete::Deadline { message, over_cap }) = &run.incomplete else {
+            panic!("expected a deadline marker: {run:?}");
+        };
+        assert_eq!(message, &format!("joined-read{TIMEOUT_MARKER}0.2s"));
+        assert!(over_cap.is_none());
+        assert!(leader.join().unwrap().0.expect("leader").success);
+    }
+
+    /// The leader's prefix is the best answer a keeping joiner can get when
+    /// its own rerun has too little time left to print anything: a solo call
+    /// with the joiner's budget would have returned those bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerunning_joiner_keeps_the_leaders_prefix_when_its_own_run_yields_less() {
+        let mut rig = JoinerRig::new();
+        let script = "if [ -e ran ]; then sleep 5; else touch ran; echo partial; sleep 5; fi";
+        let leader = rig.read_keeping(script, Duration::from_millis(400));
+        rig.wait_for_flight();
+        let joiner = rig.read_keeping(script, Duration::from_millis(900));
+        rig.wait_for_joins(1);
+        rig.release();
+        let (led, _) = leader.join().unwrap();
+        let led = led.expect("keeping leader");
+        assert_eq!(String::from_utf8_lossy(&led.stdout).trim(), "partial");
+        let (joined, waited) = joiner.join().unwrap();
+        let run = joined.expect("keeping joiner");
+        assert!(
+            matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+            "{run:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).trim(),
+            "partial",
+            "the leader's prefix was thrown away"
+        );
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(2500)),
+            "{waited:?}"
+        );
+    }
+
+    /// A rerun spends what is left of the caller's own budget, never a fresh
+    /// one: a leader's timeout does not give its joiner more time in all, and
+    /// the timeout it reports is still the budget it was given.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_never_outlasts_the_joiners_total_budget() {
+        let mut rig = JoinerRig::new();
+        let leader = rig.read("sleep 5", Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read("sleep 5", Duration::from_millis(900));
+        rig.wait_for_joins(1);
+        rig.release();
+        assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+        let (joined, waited) = joiner.join().unwrap();
+        let error = joined.expect_err("joiner deadline");
+        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(1900)),
+            "{waited:?}"
+        );
+        assert_eq!(
+            error,
+            format!("joined-read{TIMEOUT_MARKER}0.9s"),
+            "a joiner's timeout names its own budget, not the remainder"
+        );
+    }
+
+    /// Joiners of a leader that timed out all ask again. They ask once, as one
+    /// flight: a hung git must not meet a stampede of children where it used
+    /// to meet one.
+    #[cfg(unix)]
+    #[test]
+    fn a_leaders_timeout_sends_its_joiners_to_one_new_child() {
+        // Whether the unfixed code stampedes depends on how fast the first
+        // rerun reaches the gate, so ask over several rounds.
+        for round in 0..4 {
+            let mut rig = JoinerRig::with_slots(16);
+            let script = format!("echo $$ >> '{}/pids'; sleep 2", rig.cwd.display());
+            let leader = rig.read(&script, Duration::from_millis(300));
+            rig.wait_for_flight();
+            let joiners: Vec<_> = (0..12)
+                .map(|_| rig.read(&script, Duration::from_millis(1000)))
+                .collect();
+            rig.wait_for_joins(12);
+            rig.release();
+            assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+            for joiner in joiners {
+                let (joined, _) = joiner.join().unwrap();
+                assert!(is_timed_out(&joined.expect_err("every rerun hung")));
+            }
+            let started = std::fs::read_to_string(rig.cwd.join("pids")).unwrap();
+            assert_eq!(
+                started.lines().count(),
+                2,
+                "round {round}: the leader's child and one shared retry: {started}"
+            );
+        }
+    }
+
+    /// `coalesced` counts reads answered without a child of their own. A
+    /// joiner whose leader timed out and who then ran its own child was not.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiner_that_reruns_is_not_counted_as_coalesced() {
+        let mut rig = JoinerRig::new();
+        let script = "if [ -e ran ]; then echo second; else touch ran; sleep 5; fi";
+        let leader = rig.read(script, Duration::from_millis(300));
+        rig.wait_for_flight();
+        let joiner = rig.read(script, Duration::from_secs(10));
+        rig.wait_for_joins(1);
+        rig.release();
+        assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+        assert!(joiner.join().unwrap().0.expect("rerun").success);
+        let counters = rig.gate.counters()[super::Admission::Reactive.index()];
+        assert_eq!(counters.admitted, 3, "the rig's held slot and two children");
+        assert_eq!(
+            counters.coalesced, 0,
+            "no read was answered by another's child"
+        );
+    }
+
+    /// A caller that can be cancelled never takes the shared path, which has
+    /// no observer to poll: a hook-running command asked for through the
+    /// shared entry point still honours the cancel.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_running_command_is_never_shared_so_it_stays_cancellable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .status_locked()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        }
+        crate::test_support::trust_repo(&repo);
+        let hook = repo.join(".git/hooks/pre-commit");
+        let marker = repo.join(".git/hook-started");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let canceller = {
+            let (repo, marker) = (repo.clone(), marker.clone());
+            thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(20);
+                while !marker.exists() {
+                    assert!(Instant::now() < until, "hook never started");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                cancel_hooked_git(&repo)
+            })
+        };
+        let started = Instant::now();
+        let error =
+            git_text_shared(&repo, &["commit", "--allow-empty", "-m", "x"]).expect_err("cancelled");
+        assert!(marker.exists(), "the hook never ran: {error}");
+        assert_eq!(canceller.join().unwrap(), 1, "the run was registered");
+        assert!(is_hooked_git_cancelled(&error), "{error}");
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// A rate-limit refusal after ~2s used to print the command's own 30s or
     /// 90s deadline as "timed out after 89.99s waiting for a process slot",
     /// so a launch under load read as git hanging. It must say it was
@@ -7613,7 +9753,7 @@ mod tests {
             }
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "refusals sat until the command deadline: {:?}",
             started.elapsed()
         );
@@ -8070,6 +10210,293 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("pkg/.gitkeep")).unwrap(), b"");
     }
 
+    fn mtime(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn create_refuses_existing_tracked_untracked_ignored_lf_crlf_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let root = dir.path();
+        let raw = root.to_string_lossy().into_owned();
+        std::fs::write(root.join(".gitignore"), "ignored-*\n").unwrap();
+        let shapes: [(&str, &[u8]); 3] =
+            [("lf", b"a\nb\n"), ("crlf", b"a\r\nb\r\n"), ("empty", b"")];
+        let mut cases = Vec::new();
+        for (shape, bytes) in shapes {
+            for kind in ["tracked", "untracked", "ignored"] {
+                let name = if kind == "ignored" {
+                    format!("ignored-{shape}.txt")
+                } else {
+                    format!("{kind}-{shape}.txt")
+                };
+                std::fs::write(root.join(&name), bytes).unwrap();
+                if kind == "tracked" {
+                    git_text(root, &["add", "--", &name]).unwrap();
+                }
+                let before = mtime(&root.join(&name));
+                cases.push((name, bytes, before));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        for (name, bytes, before) in cases {
+            let err = sandbox_create(&raw, &name).expect_err(&name);
+            assert!(
+                matches!(err, FileWriteError::AlreadyExists { .. }),
+                "{name}: {err:?}"
+            );
+            assert_eq!(std::fs::read(root.join(&name)).unwrap(), bytes, "{name}");
+            assert_eq!(mtime(&root.join(&name)), before, "{name} mtime");
+        }
+    }
+
+    #[test]
+    fn create_refuses_dir_and_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let root = dir.path();
+        let raw = root.to_string_lossy().into_owned();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        std::fs::write(root.join("target.txt"), "keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target.txt", root.join("link.txt")).unwrap();
+        for name in ["folder", "link.txt"] {
+            if !root.join(name).exists() && std::fs::symlink_metadata(root.join(name)).is_err() {
+                continue;
+            }
+            let err = sandbox_create(&raw, name).expect_err(name);
+            assert!(
+                matches!(err, FileWriteError::AlreadyExists { .. }),
+                "{name}: {err:?}"
+            );
+        }
+        assert_eq!(std::fs::read(root.join("target.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn create_makes_an_empty_file_and_its_folders() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let raw = dir.path().to_string_lossy().into_owned();
+        sandbox_create(&raw, "a/b/new.txt").expect("create");
+        assert_eq!(std::fs::read(dir.path().join("a/b/new.txt")).unwrap(), b"");
+    }
+
+    #[test]
+    fn new_folder_keeps_nonempty_gitkeep() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/.gitkeep"), "keep me\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let err = sandbox_create(&raw, "pkg/.gitkeep").expect_err("exists");
+        assert!(
+            matches!(err, FileWriteError::AlreadyExists { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("pkg/.gitkeep")).unwrap(),
+            b"keep me\n"
+        );
+    }
+
+    fn open_base(raw: &str, file: &str) -> String {
+        crate::engine::GitReader::get_file_blob(raw, file, None)
+            .unwrap()
+            .disk_base
+            .expect("a working-tree read carries a base")
+    }
+
+    #[test]
+    fn save_with_stale_base_is_refused_and_disk_keeps_external_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        std::fs::write(dir.path().join("a.txt"), "agent wrote this\n").unwrap();
+        let err = sandbox_save_edited_text(&raw, "a.txt", "my draft\n", Some(&base))
+            .expect_err("stale base");
+        match err {
+            FileWriteError::ChangedOnDisk {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, base);
+                assert_eq!(actual, open_base(&raw, "a.txt"));
+            }
+            other => panic!("expected changed_on_disk, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"agent wrote this\n"
+        );
+    }
+
+    #[test]
+    fn save_with_current_base_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        sandbox_save_edited_text(&raw, "a.txt", "two\n", Some(&base)).expect("current base");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn saved_returns_new_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        let saved = sandbox_save_edited_text(&raw, "a.txt", "two\n", Some(&base)).unwrap();
+        assert_eq!(saved.disk_base, open_base(&raw, "a.txt"));
+        // The returned base is the one the next save of the same draft carries.
+        sandbox_save_edited_text(&raw, "a.txt", "three\n", Some(&saved.disk_base))
+            .expect("chained save");
+    }
+
+    #[test]
+    fn view_only_reads_skip_the_base_and_the_editor_open_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let open = crate::engine::GitReader::get_file_blob(&raw, "a.txt", None).unwrap();
+        assert!(
+            open.disk_base.is_some(),
+            "the editor open must carry a base"
+        );
+        let view = crate::engine::GitReader::get_file_blob_view(&raw, "a.txt", None).unwrap();
+        assert_eq!(
+            view.disk_base, None,
+            "a view-only read must not pay for one"
+        );
+        assert_eq!(view.text, open.text);
+        assert_eq!(
+            crate::engine::GitReader::get_file_content(&raw, "a.txt", None).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
+    fn crlf_base_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("w.txt"), "a\r\nb\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "w.txt");
+        let saved = sandbox_save_edited_text(&raw, "w.txt", "a\nB\n", Some(&base)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("w.txt")).unwrap(),
+            b"a\r\nB\r\n"
+        );
+        assert_eq!(saved.disk_base, open_base(&raw, "w.txt"));
+    }
+
+    #[test]
+    fn a_file_renamed_while_open_reports_absent_and_overwrite_recreates_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        std::fs::rename(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+        let err = sandbox_save_edited_text(&raw, "a.txt", "x\n", Some(&base)).expect_err("gone");
+        let FileWriteError::ChangedOnDisk { actual, .. } = err else {
+            panic!("expected changed_on_disk, got {err:?}");
+        };
+        assert_eq!(actual, "absent");
+        sandbox_save_edited_text(&raw, "a.txt", "x\n", Some(&actual)).expect("overwrite");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"x\n");
+    }
+
+    #[test]
+    fn file_write_error_serializes_to_the_contract_shape() {
+        let keys = |error: FileWriteError| -> (String, Vec<String>) {
+            let value = serde_json::to_value(&error).unwrap();
+            let object = value.as_object().unwrap();
+            let mut keys: Vec<String> = object.keys().cloned().collect();
+            keys.sort();
+            (object["code"].as_str().unwrap().to_string(), keys)
+        };
+        let strings = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            keys(FileWriteError::AlreadyExists {
+                message: "m".into(),
+                path: "p".into()
+            }),
+            (
+                "already_exists".to_string(),
+                strings(&["code", "message", "path"])
+            )
+        );
+        assert_eq!(
+            keys(FileWriteError::ChangedOnDisk {
+                message: "m".into(),
+                path: "p".into(),
+                expected: "e".into(),
+                actual: "a".into()
+            }),
+            (
+                "changed_on_disk".to_string(),
+                strings(&["actual", "code", "expected", "message", "path"])
+            )
+        );
+        assert_eq!(
+            keys(FileWriteError::from("no".to_string())),
+            ("refused".to_string(), strings(&["code", "message"]))
+        );
+        let saved = serde_json::to_value(SavedFile {
+            disk_base: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(saved, serde_json::json!({ "disk_base": "x" }));
+    }
+
+    #[test]
+    fn git_metadata_components_are_recognised_and_lookalikes_are_not() {
+        use std::ffi::OsStr;
+        for name in [
+            ".git",
+            ".GIT",
+            ".Git",
+            ".git.",
+            ".git ",
+            ".git. .",
+            ".git:stream",
+            ".git::$INDEX_ALLOCATION",
+        ] {
+            assert!(is_git_metadata_component(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            ".gitignore",
+            ".gitkeep",
+            ".github",
+            ".gitattributes",
+            ".gitmodules",
+            "git",
+            "x.git",
+            "git~1x",
+            "..git",
+            "",
+        ] {
+            assert!(!is_git_metadata_component(OsStr::new(name)), "{name}");
+        }
+        assert_eq!(
+            is_git_metadata_component(OsStr::new("GIT~1")),
+            cfg!(windows)
+        );
+        for path in [".git/config", "a/.git/hooks/x", "sub/.GIT", "a/.git./b"] {
+            assert!(sandbox_join(Path::new("/r"), path).is_err(), "{path}");
+        }
+        for path in [".gitignore", ".github/x", "sub/.gitattributes"] {
+            assert!(sandbox_join(Path::new("/r"), path).is_ok(), "{path}");
+        }
+    }
+
     #[test]
     fn get_file_blob_reports_no_text_shape_for_binary_files() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8082,12 +10509,41 @@ mod tests {
     }
 
     #[test]
-    fn truncate_utf8_bytes_cuts_on_a_character_boundary() {
-        let s = "éééé"; // each é is 2 bytes
-        assert_eq!(truncate_utf8_bytes(s, 100), s);
-        assert_eq!(truncate_utf8_bytes(s, 3).len(), 2);
-        assert!(truncate_utf8_bytes(s, 3).is_char_boundary(truncate_utf8_bytes(s, 3).len()));
-        assert!(!truncate_utf8_bytes(s, 3).contains('\u{FFFD}'));
+    fn clamp_failure_message_cuts_on_character_boundaries() {
+        let short = "éééé"; // each é is 2 bytes
+        assert_eq!(clamp_failure_message(short, "push"), short);
+        // Odd budgets land mid-character at both cut points.
+        let long = format!("x{}", "é".repeat(MAX_FAILURE_MESSAGE_BYTES));
+        let clamped = clamp_failure_message(&long, "push");
+        assert!(!clamped.contains('\u{FFFD}'));
+        assert!(clamped.len() < MAX_FAILURE_MESSAGE_BYTES + 100);
+        assert!(clamped.contains("bytes elided (git push output truncated)"));
+    }
+
+    /// A pre-push hook prints its banners and warnings first and the failing
+    /// check last; the clamp must keep the last line, not only the first.
+    #[test]
+    fn clamp_failure_message_keeps_the_failing_tail() {
+        let chatter = "stderr | Received `false` for a non-boolean attribute\n".repeat(200);
+        let diagnosis =
+            format!("$ node scripts/local-ci.js\n{chatter}FAIL src/a.test.ts > breaks\nerror: failed to push some refs");
+        let clamped = clamp_failure_message(&diagnosis, "push");
+        assert!(clamped.starts_with("$ node scripts/local-ci.js"));
+        assert!(clamped.ends_with("FAIL src/a.test.ts > breaks\nerror: failed to push some refs"));
+        let elided: usize = clamped
+            .split("… ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("elision notice names a byte count");
+        let kept = clamped.len()
+            - clamped
+                .lines()
+                .find(|l| l.contains("elided"))
+                .unwrap()
+                .len()
+            - 2;
+        assert_eq!(kept + elided, diagnosis.len());
     }
 
     fn init_plain_git_repo(dir: &Path) {
@@ -8164,7 +10620,137 @@ mod tests {
                 .unwrap_err()
                 .contains("timed out")
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
+    }
+
+    /// A child that floods stdout and, once asked to stop, writes a large
+    /// cleanup burst before releasing its marker. The marker is only removed
+    /// if the run keeps reading its pipes while the child is being asked.
+    #[cfg(unix)]
+    const GRACE_FLOODER: &str = r#"
+        trap 'head -c 80000 /dev/zero; echo cleaned >&2; rm -f "$1"; exit 0' TERM
+        touch "$1"
+        while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
+    "#;
+
+    #[cfg(unix)]
+    fn grace_flooder(script: &str, marker: &Path) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).arg("sh").arg(marker);
+        cmd
+    }
+
+    /// R2-02: the grace after a deadline reads the pipes, so a child blocked
+    /// on a full pipe can run its SIGTERM cleanup instead of being killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_grace_keeps_draining_so_cleanup_after_sigterm_completes() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let run = run_bounded(
+            grace_flooder(GRACE_FLOODER, &marker),
+            "flooder",
+            Duration::from_millis(600),
+            None,
+        )
+        .expect("a deadline keeps its prefix");
+        // A deadline discards the exit status, so marker removal is the signal
+        // that the child was reaped by the ask: only its SIGTERM trap removes it.
+        assert!(
+            !marker.exists(),
+            "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cleaned"),
+            "the cleanup line was not read: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(!run.success, "a deadline is never success");
+        assert!(!run.cancelled);
+        assert!(
+            matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
+            "{:?}",
+            run.incomplete
+        );
+    }
+
+    /// R2-02, cancel path: the same shape, reached through the observer.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_grace_keeps_draining_so_cleanup_after_sigterm_completes() {
+        struct CancelOnceStarted(PathBuf);
+        impl ProcessObserver for CancelOnceStarted {
+            fn cancelled(&self) -> bool {
+                self.0.exists()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let mut observer = CancelOnceStarted(marker.clone());
+        let mut cmd = grace_flooder(GRACE_FLOODER, &marker);
+        let run = run_observed(
+            &mut cmd,
+            "flooder",
+            Duration::from_secs(20),
+            None,
+            MAX_OUTPUT_BYTES,
+            &mut observer,
+        )
+        .expect("a cancel returns the run");
+        assert!(run.cancelled);
+        assert!(!run.success);
+        // Reaped by the ask: the trap exits 0, a SIGKILLed child reports -1.
+        assert_eq!(run.status_code, 0, "the child was killed, not asked");
+        assert!(
+            !marker.exists(),
+            "SIGTERM cleanup never ran: the child was wedged on a full pipe until SIGKILL"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cleaned"),
+            "the cleanup line was not read: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// R2-02: a child that ignores the ask is still killed once the grace is
+    /// spent, however much it writes meanwhile, and what it wrote while being
+    /// asked is read. The ask is observed (the trap runs) only because the
+    /// pipes are drained.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_at_the_end_of_a_drained_grace() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lock");
+        let script = r#"
+            trap 'head -c 80000 /dev/zero; echo term-seen >&2' TERM
+            touch "$1"
+            while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
+        "#;
+        let started = Instant::now();
+        let run = run_bounded(
+            grace_flooder(script, &marker),
+            "stubborn",
+            Duration::from_millis(300),
+            None,
+        )
+        .expect("a deadline keeps its prefix");
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(
+                    Duration::from_millis(300) + Duration::from_secs(2)
+                ),
+            "the grace must stay bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
+        assert!(!run.success);
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("term-seen"),
+            "the trap could not run while the pipe was full: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 
     #[test]
@@ -8195,7 +10781,146 @@ mod tests {
         assert!(out.cancelled && !out.success);
         assert_eq!(out.stdout, b"progress");
         assert_eq!(observer.0, b"progress");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
+    }
+
+    // ------------------------------------------------------------------
+    // Adversarial batch-stream cases (CARD 16).
+    // ------------------------------------------------------------------
+
+    fn adv_answers(
+        stream: &[u8],
+        ids: &[&str],
+        cut: Option<&str>,
+    ) -> HashMap<String, Result<usize, String>> {
+        const OBJECT: BatchObject = BatchObject {
+            kind: "commit",
+            noun: "commit",
+        };
+        let mut answers = HashMap::new();
+        read_batch_answers(stream, ids, OBJECT, &<[u8]>::len, cut, &mut answers);
+        answers
+    }
+
+    /// A size that lies low ends the body mid-object, where no newline waits:
+    /// that answer and every one after it are unread, never re-framed.
+    #[test]
+    fn a_size_that_lies_low_leaves_this_and_every_later_commit_unread() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let stream = format!("{a} commit 2\nhi\n{b} commit 3\nabcdef\n{c} commit 1\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b, &c], None);
+        assert_eq!(got[&a], Ok(2));
+        assert!(got[&b].is_err(), "{:?}", got[&b]);
+        assert!(got[&c].is_err(), "{:?}", got[&c]);
+    }
+
+    /// A size that lies high swallows the next header: cut short, rest unread.
+    #[test]
+    fn a_size_that_lies_high_is_cut_short_not_misattributed() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let stream = format!("{a} commit 500\nhi\n{b} commit 1\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b], None);
+        assert!(got[&a].is_err() && got[&b].is_err(), "{got:?}");
+    }
+
+    /// A size too large for usize arithmetic.
+    #[test]
+    fn a_size_beyond_usize_is_an_error_not_a_panic() {
+        let a = "a".repeat(40);
+        for size in [
+            "18446744073709551615",
+            "99999999999999999999999",
+            "-1",
+            "1e3",
+            "",
+        ] {
+            let stream = format!("{a} commit {size}\nhi\n");
+            let got = adv_answers(stream.as_bytes(), &[&a], None);
+            assert!(got[&a].is_err(), "{size:?}: {got:?}");
+        }
+    }
+
+    /// The stream ends in the middle of a header line, then in the middle of
+    /// the very first byte: every id is answered, none as a value.
+    #[test]
+    fn a_stream_cut_inside_a_header_or_empty_leaves_all_unread() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let half = format!("{a} commit 2\nhi\n{b} comm");
+        let got = adv_answers(half.as_bytes(), &[&a, &b], None);
+        assert_eq!(got[&a], Ok(2));
+        assert!(got[&b].is_err());
+        let none = adv_answers(b"", &[&a, &b], None);
+        assert!(none[&a].is_err() && none[&b].is_err());
+    }
+
+    /// `missing` and `ambiguous` carry no body, so the next answer stays in
+    /// step; a stray extra header field is an error for that id only.
+    #[test]
+    fn missing_and_ambiguous_answers_keep_the_following_answers_in_step() {
+        let (a, b, c, d) = (
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40),
+            "d".repeat(40),
+        );
+        let stream =
+            format!("{a} missing\n{b} ambiguous\n{c} commit 3\nabc\n{d} commit 1 extra\nx\n");
+        let got = adv_answers(stream.as_bytes(), &[&a, &b, &c, &d], None);
+        assert!(got[&a].is_err());
+        assert!(got[&b].is_err());
+        assert_eq!(got[&c], Ok(3));
+        assert!(got[&d].is_err());
+    }
+
+    /// A commit message that is itself a perfectly formed batch answer for the
+    /// next id, with an honest size from git, must stay inside its own body.
+    #[test]
+    fn a_body_that_forges_the_next_answer_stays_inside_its_own_size() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let forged = format!("{b} commit 5\nFORGE\n");
+        let stream = format!(
+            "{a} commit {}\n{forged}\n{b} commit 4\nreal\n",
+            forged.len()
+        );
+        let got = adv_answers(stream.as_bytes(), &[&a, &b], None);
+        assert_eq!(got[&a], Ok(forged.len()));
+        assert_eq!(
+            got[&b],
+            Ok(4),
+            "b is the answer after a's own body, not the forgery"
+        );
+    }
+
+    /// 100,005 ids in one call: the first 100,000 are asked, the rest are
+    /// errors, and the call returns without stalling on a full pipe.
+    #[test]
+    fn an_oversized_id_list_is_capped_and_does_not_stall_the_pipe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-b", "main"]);
+        let oids: Vec<String> = (0..100_005u64).map(|n| format!("{n:040x}")).collect();
+        let started = std::time::Instant::now();
+        let got = read_objects_batch(
+            dir.path(),
+            &oids,
+            BatchObject {
+                kind: "commit",
+                noun: "commit",
+            },
+            64 * 1024 * 1024,
+            &<[u8]>::len,
+        );
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(60)),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.len(), oids.len(), "every id gets an answer");
+        assert!(got.values().all(Result::is_err), "nothing here is a commit");
+        let capped = got
+            .values()
+            .filter(|r| r.as_ref().unwrap_err().contains("asked for at once"))
+            .count();
+        assert_eq!(capped, 5);
     }
 }
 
@@ -8203,10 +10928,33 @@ mod tests {
 #[cfg(test)]
 mod admission_scope_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     fn leak(gate: SpawnGate) -> &'static SpawnGate {
         Box::leak(Box::new(gate))
+    }
+
+    /// A gate whose bucket cannot refill during the test. The rate is real
+    /// time, so on a loaded machine the second between two spawns that a test
+    /// calls "budget spent" arrives, a token lands, and the spawn it expected
+    /// to be refused is admitted. Putting the bucket's clock in the future
+    /// makes elapsed time zero for as long as the test runs.
+    fn frozen(gate: SpawnGate) -> &'static SpawnGate {
+        let gate = leak(gate);
+        gate.state.lock().unwrap().tokens_at = Some(Instant::now() + Duration::from_secs(86_400));
+        gate
+    }
+
+    /// Keeps `repo`'s post-action credit open for the test: its window is real
+    /// time too, and thirty-two real process spawns do not fit in three
+    /// seconds on a busy machine. The window's own expiry is pinned by
+    /// `a_credit_expires_with_its_window`, against explicit instants.
+    #[cfg(unix)]
+    fn hold_credit_open(repo: &Path) {
+        let mut credits = post_action_credits().lock().unwrap();
+        credits.get_mut(repo).expect("a credit was granted").until =
+            Instant::now() + Duration::from_secs(86_400);
     }
 
     fn shared_gate(path: &Path, burst: u32, rate: u32) -> &'static SpawnGate {
@@ -8259,6 +11007,182 @@ mod admission_scope_tests {
         assert!(admits(b), "a reactive read still has the reserve");
     }
 
+    /// B has every process-bucket token, and the shared record is spent. When
+    /// B cannot rewrite the record the denial is still a denial: no
+    /// non-interactive spawn starts and it is not counted as a fallback.
+    /// A user action never asks the record, so it still starts.
+    #[test]
+    fn a_denial_the_record_cannot_persist_does_not_admit_a_background_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let a = shared_gate(&path, 8, 1);
+        let b = shared_gate(&path, 8, 1);
+        while admits(a) {}
+        b.shared.as_ref().unwrap().fail_writes(true);
+        assert!(
+            !admits(b),
+            "a reactive spawn rode a failed write past the budget"
+        );
+        let shed = with_admission(Admission::Background, || {
+            b.acquire_until(Instant::now() + Duration::from_millis(50), &|| false)
+                .map(|_| ())
+        });
+        assert_eq!(shed.err(), Some(Refusal::Shed));
+        assert_eq!(b.state.lock().unwrap().shared_fallbacks, 0);
+        // The report counts those denials on their own line, apart from the
+        // ordinary denial A met when it spent the record and from fallbacks.
+        let (fallbacks, unrecorded) = {
+            let state = b.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert!(unrecorded >= 2, "the reactive and the background denial");
+        let report = b.sharing_report(fallbacks, unrecorded);
+        assert!(
+            report.ends_with(&format!("unrecorded_denials={unrecorded} fallbacks=0")),
+            "{report}"
+        );
+        let ordinary = {
+            let state = a.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert_eq!(ordinary, (0, 0), "a recorded denial is neither");
+        let clicked = with_admission(Admission::Interactive, || {
+            b.acquire_until(Instant::now() + Duration::from_millis(50), &|| false)
+                .map(|_| ())
+        });
+        assert_eq!(clicked, Ok(()), "a user action does not ask the record");
+    }
+
+    /// Spawns `gate` admits in `class` before it refuses, its own bucket
+    /// frozen so only the budgets decide.
+    fn drain(gate: &SpawnGate, class: Admission) -> usize {
+        let mut admitted = 0;
+        while with_admission(class, || {
+            gate.acquire(Instant::now() + Duration::from_millis(20))
+                .is_some()
+        }) {
+            admitted += 1;
+        }
+        admitted
+    }
+
+    /// CHARACTERIZATION, awaiting the owner's ruling (ft-d41b8491, part 2): a
+    /// grant whose record write fails is the documented fail-open, so when
+    /// writes fail on every take the record never decrements and the shared
+    /// cap is gone: each of N processes is granted its own whole bucket. This
+    /// pins the aggregate as it is, with the healthy record beside it, so a
+    /// ruling that bounds it (a fixed floor after repeated write failures)
+    /// has to change this test on purpose.
+    #[test]
+    fn writes_failing_on_every_take_grant_each_process_its_own_bucket() {
+        let (burst, rate) = production_spawn_rate();
+        let reserve = (burst / 4) as usize;
+        let burst = burst as usize;
+        let mut rows = Vec::new();
+        for processes in [1usize, 2, 4, 8] {
+            let mut aggregate = [0usize; 4];
+            for (slot, (writes_fail, class)) in [
+                (false, Admission::Reactive),
+                (true, Admission::Reactive),
+                (false, Admission::Background),
+                (true, Admission::Background),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("budget");
+                let gates: Vec<_> = (0..processes)
+                    .map(|_| {
+                        let gate =
+                            SpawnGate::with_rate(16, burst as u32, rate).sharing(Ok(path.clone()));
+                        let gate = frozen(gate);
+                        gate.shared.as_ref().unwrap().fail_writes(writes_fail);
+                        gate
+                    })
+                    .collect();
+                let started = Instant::now();
+                aggregate[slot] = gates.iter().map(|gate| drain(gate, class)).sum();
+                // The shared record refills in real time at `rate`.
+                let refill =
+                    (started.elapsed().as_secs_f64() * f64::from(rate)).ceil() as usize + 1;
+                let (own, shared) = match class {
+                    Admission::Background => (burst - reserve, burst - reserve),
+                    _ => (burst, burst),
+                };
+                if writes_fail {
+                    assert_eq!(
+                        aggregate[slot],
+                        processes * own,
+                        "{processes} processes, {class:?}: each its own bucket"
+                    );
+                } else {
+                    assert!(
+                        (shared..=shared + refill).contains(&aggregate[slot]),
+                        "{processes} processes, {class:?}: {} for one shared bucket",
+                        aggregate[slot]
+                    );
+                }
+            }
+            rows.push(format!(
+                "N={processes}: reactive healthy {} / writes failing {}; background healthy {} / writes failing {}",
+                aggregate[0], aggregate[1], aggregate[2], aggregate[3]
+            ));
+        }
+        println!("{}", rows.join("\n"));
+    }
+
+    /// The two counters are separate, add exactly under concurrent deciders of
+    /// one gate, and saturate rather than wrap; the reason (which names the
+    /// path) is only logged, never part of the report's counts.
+    #[test]
+    fn unrecorded_denials_and_fallbacks_count_apart_exactly_and_saturate() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = shared_gate(&dir.path().join("budget"), 8, 1);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for i in 0..500 {
+                        let taken = if i % 5 == 0 {
+                            shared_budget::Take::Unavailable("held".into())
+                        } else {
+                            shared_budget::Take::DeniedUnrecorded("full".into())
+                        };
+                        let mut state = gate.state.lock().unwrap();
+                        assert_eq!(gate.settle_shared(&mut state, taken), i % 5 == 0);
+                    }
+                });
+            }
+        });
+        let (fallbacks, unrecorded) = {
+            let state = gate.state.lock().unwrap();
+            (state.shared_fallbacks, state.shared_unrecorded_denials)
+        };
+        assert_eq!((fallbacks, unrecorded), (200, 800));
+
+        let mut state = gate.state.lock().unwrap();
+        state.shared_unrecorded_denials = u64::MAX;
+        state.shared_fallbacks = u64::MAX;
+        assert!(!gate.settle_shared(
+            &mut state,
+            shared_budget::Take::DeniedUnrecorded("x".into())
+        ));
+        assert!(gate.settle_shared(&mut state, shared_budget::Take::Unavailable("x".into())));
+        assert_eq!(
+            (state.shared_fallbacks, state.shared_unrecorded_denials),
+            (u64::MAX, u64::MAX)
+        );
+        let report = gate.sharing_report(state.shared_fallbacks, state.shared_unrecorded_denials);
+        assert!(
+            report.ends_with(&format!(
+                "unrecorded_denials={} fallbacks={}",
+                u64::MAX,
+                u64::MAX
+            )),
+            "{report}"
+        );
+    }
+
     #[test]
     fn a_user_action_neither_waits_for_nor_spends_the_shared_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -8279,19 +11203,74 @@ mod admission_scope_tests {
         );
     }
 
+    /// The shared record's file lock can sleep-poll for a few milliseconds and
+    /// a denial writes the file. With the gate mutex held across that, every
+    /// other acquire, a user's click included, queued behind a background
+    /// re-poll.
+    #[test]
+    fn a_user_action_does_not_queue_behind_the_shared_budget_io() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let gate = shared_gate(&path, 100_000, 100_000);
+        // Another process pinning the record: every shared take now waits out
+        // the whole lock patience before falling back.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let pollers: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = gate.acquire(Instant::now() + Duration::from_millis(200));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut fastest = Duration::MAX;
+        for _ in 0..20 {
+            let started = Instant::now();
+            let clicked = with_admission(Admission::Interactive, || {
+                gate.acquire_until(Instant::now() + Duration::from_millis(500), &|| false)
+                    .map(|_| ())
+            });
+            fastest = fastest.min(started.elapsed());
+            assert_eq!(clicked, Ok(()));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for poller in pollers {
+            poller.join().unwrap();
+        }
+        holder.unlock().unwrap();
+        assert!(
+            fastest < Duration::from_millis(5),
+            "every user action waited behind shared-budget IO: fastest was {fastest:?}"
+        );
+    }
+
     #[test]
     fn an_unusable_shared_record_leaves_the_gate_on_its_own_budget_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the record should be.
         let gate = leak(SpawnGate::with_rate(16, 4, 1).sharing(Ok(dir.path().to_path_buf())));
         assert!(gate.shared.is_none());
-        let report = gate.sharing_report(0);
+        let report = gate.sharing_report(0, 0);
         assert!(report.starts_with("budget=per-process ("), "{report}");
         let admitted = (0..8).filter(|_| admits(gate)).count();
         assert_eq!(admitted, 4, "the process bucket still holds");
 
         let unpathed = SpawnGate::with_rate(16, 4, 1).sharing(Err("no home".into()));
-        assert_eq!(unpathed.sharing_report(0), "budget=per-process (no home)");
+        assert_eq!(
+            unpathed.sharing_report(0, 0),
+            "budget=per-process (no home)"
+        );
         // The unlimited test gate has nothing to share, and says that.
         let unlimited = SpawnGate::new(4).sharing(Ok(dir.path().join("x")));
         assert!(unlimited.shared.is_none());
@@ -8312,7 +11291,7 @@ mod admission_scope_tests {
         assert!(admits(gate), "a stopped holder must not stop this process");
         let fallbacks = gate.state.lock().unwrap().shared_fallbacks;
         assert_eq!(fallbacks, 1);
-        assert!(gate.sharing_report(fallbacks).ends_with("fallbacks=1"));
+        assert!(gate.sharing_report(fallbacks, 0).ends_with("fallbacks=1"));
         holder.unlock().unwrap();
     }
 
@@ -8321,7 +11300,7 @@ mod admission_scope_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("budget");
         let gate = shared_gate(&path, 4, 1);
-        let report = gate.sharing_report(0);
+        let report = gate.sharing_report(0, 0);
         assert!(report.starts_with("budget=shared("), "{report}");
         assert!(report.contains(&path.display().to_string()), "{report}");
     }
@@ -8405,8 +11384,8 @@ mod admission_scope_tests {
         let repo = dir.path().canonicalize().unwrap();
         let other = tempfile::tempdir().unwrap();
         let other = other.path().canonicalize().unwrap();
-        // One token, a refill too slow to matter inside this test.
-        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        // One token, and no refill at all inside this test.
+        let gate = frozen(SpawnGate::with_rate(16, 1, 1));
         reactive_spawn_in(gate, &repo).expect("the one token");
         let starved = reactive_spawn_in(gate, &repo).unwrap_err();
         assert!(
@@ -8423,19 +11402,18 @@ mod admission_scope_tests {
         let read: Result<(), String> = run_command_scope(|| Ok(()));
         read.unwrap();
         assert!(reactive_spawn_in(gate, &other).is_err());
-        let started = Instant::now();
+        hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
                 .unwrap_or_else(|e| panic!("credited spawn {i} refused: {e}"));
         }
-        // Spent: what is admitted now is only the 1/s refill, not more credit.
+        // Spent, and the bucket cannot refill: nothing more is admitted.
         let extra = (0..6)
             .take_while(|_| reactive_spawn_in(gate, &repo).is_ok())
             .count();
-        let refill = started.elapsed().as_secs() as usize + 1;
-        assert!(
-            extra <= refill,
-            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit (refill allows {refill})"
+        assert_eq!(
+            extra, 0,
+            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit"
         );
     }
 
@@ -8447,14 +11425,36 @@ mod admission_scope_tests {
     fn a_tab_activation_admits_its_hydrate_when_the_budget_is_spent() {
         let dir = crate::test_support::git_repo();
         let repo = dir.path().canonicalize().unwrap();
-        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        let gate = frozen(SpawnGate::with_rate(16, 1, 1));
         reactive_spawn_in(gate, &repo).expect("the one token");
         assert!(reactive_spawn_in(gate, &repo).is_err(), "budget spent");
 
         note_tab_activated(repo.to_str().unwrap()).expect("activation");
+        hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
                 .unwrap_or_else(|e| panic!("activation read {i} refused: {e}"));
+        }
+    }
+
+    /// What the two credit tests rely on: a frozen bucket takes no token from
+    /// the passing of time, however long a loaded machine makes a test, while
+    /// an ordinary one does.
+    #[test]
+    fn a_frozen_bucket_does_not_refill_and_an_ordinary_one_does() {
+        let later = Instant::now() + Duration::from_secs(30);
+        for (gate, refilled) in [
+            (frozen(SpawnGate::with_rate(16, 4, 1)), false),
+            (leak(SpawnGate::with_rate(16, 4, 1)), true),
+        ] {
+            let mut state = gate.state.lock().unwrap();
+            state.tokens = 0;
+            if refilled {
+                // An ordinary gate starts its clock at its first look.
+                state.tokens_at = Some(Instant::now());
+            }
+            gate.refill(&mut state, later);
+            assert_eq!(state.tokens > 0, refilled, "tokens {}", state.tokens);
         }
     }
 

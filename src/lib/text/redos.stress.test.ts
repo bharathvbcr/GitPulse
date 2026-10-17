@@ -24,6 +24,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { hasUnboundedNesting } from "./lineSearch";
+import { wallClockBudget } from "../testing/wallClock";
 
 /** Deterministic PRNG, so a failure is reproducible from its seed alone. */
 function rng(seed: number): () => number {
@@ -138,7 +139,7 @@ describe("catastrophic-backtracking guard under fuzz", () => {
       "util",
     ]) {
       expect(hasUnboundedNesting(pattern), pattern).toBe(false);
-      expect(slowestHostileRun(pattern, 250).ms, pattern).toBeLessThan(250);
+      expect(slowestHostileRun(pattern, 250).ms, pattern).toBeLessThan(wallClockBudget(250));
     }
   });
 });

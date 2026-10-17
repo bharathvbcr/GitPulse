@@ -53,7 +53,7 @@ fn harness() -> Harness {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = TerminalSessions::default();
+    let state = common::terminals();
     let output = Arc::new(Mutex::new(Vec::new()));
     let captured = output.clone();
     let ack = state.clone();
@@ -95,7 +95,7 @@ fn read_pid(path: &std::path::Path, within: Duration) -> i32 {
     let deadline = Instant::now() + within;
     loop {
         if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse::<i32>() {
+            if let Some(pid) = text.trim().parse::<i32>().ok().filter(|pid| *pid > 1) {
                 return pid;
             }
         }
@@ -131,6 +131,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), script]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     let job = read_pid(&pidfile, Duration::from_secs(5));
@@ -138,7 +139,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         .exits
         .recv_timeout(Duration::from_secs(5))
         .expect("the shell exited, so the session must end without waiting for its job");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(5)));
     assert_eq!(exit["id"], session.id.as_str());
     assert_eq!(exit["exit_code"], 3);
     assert!(
@@ -154,6 +155,10 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
 /// Closing an idle interactive shell must hang it up, not SIGKILL it: only a
 /// shell that receives SIGHUP passes it on to its jobs. Killing it outright
 /// orphans every job it started, and the orphan then holds the terminal.
+///
+/// Bash by name, not `/bin/sh`: re-sending the hangup to its jobs is the
+/// shell's doing, bash does it, and `/bin/sh` is dash on Debian and Ubuntu.
+/// The job outlived the close on ubuntu-latest, where `/bin/sh` is dash.
 #[test]
 fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     let h = harness();
@@ -166,9 +171,10 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
         dir.path().to_str().unwrap(),
         24,
         80,
-        Some("/bin/sh".into()),
+        Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(
@@ -182,7 +188,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     assert!(alive(job));
     let started = Instant::now();
     kill_session(&h.state, &session.id).expect("Close must finish, not ask for a retry");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     let deadline = Instant::now() + Duration::from_secs(3);
     while alive(job) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -215,20 +221,24 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
             "trap '' HUP; printf ready; while :; do sleep 1; done".into(),
         ]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
     let started = Instant::now();
     kill_session(&h.state, &session.id).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // A program that ignores the hangup is given the 2.5 s grace (an agent's
+    // SessionEnd needs seconds) and is then killed; the bound is that grace
+    // plus slack, which is what keeps Close from hanging on it.
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(6)));
     h.exits
         .recv_timeout(Duration::from_secs(3))
         .expect("a closed session reports its exit");
 }
 
 /// Quitting closes every session at once. A shell that ignores the hangup
-/// costs its full kill grace; one after another, a dock of them made quitting
-/// wait for the sum.
+/// costs its full hangup grace (2.5 s); one after another, a dock of them made
+/// quitting wait for the sum.
 #[test]
 fn quitting_closes_every_session_concurrently() {
     const SESSIONS: usize = 12;
@@ -248,6 +258,7 @@ fn quitting_closes_every_session_concurrently() {
                 format!("trap '' HUP; printf 'ready-{index};'; while :; do sleep 1; done"),
             ]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
         )
         .unwrap();
     }
@@ -261,8 +272,9 @@ fn quitting_closes_every_session_concurrently() {
     let started = Instant::now();
     gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
     let took = started.elapsed();
-    // Each close waits out a 200 ms hangup grace: 2.4 s in sequence.
-    assert!(took < Duration::from_millis(1500), "shutdown took {took:?}");
+    // Each close waits out the 2.5 s hangup grace: 30 s in sequence. Together
+    // it is one grace, whatever the number of sessions.
+    assert!(took < Duration::from_secs(6), "shutdown took {took:?}");
     for _ in 0..SESSIONS {
         h.exits
             .recv_timeout(Duration::from_secs(2))
@@ -286,6 +298,7 @@ fn a_session_starts_in_the_requested_directory_inside_the_repository() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "pwd -P; exit 0".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     h.exits.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -329,6 +342,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
         );
         assert!(
             result.is_err(),
@@ -346,6 +360,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "exit 0".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle())
     )
     .is_err());
     // A refusal consumed no capacity and started no process.
@@ -361,6 +376,7 @@ fn a_start_directory_outside_the_repository_is_refused_not_replaced() {
             Some("/bin/sh".into()),
             Some(vec!["-c".into(), "exit 0".into()]),
             None,
+            gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
         )
         .unwrap();
         assert_eq!(
@@ -386,6 +402,7 @@ fn context_names_the_foreground_program_and_follows_cd() {
         Some("/bin/sh".into()),
         Some(vec!["-i".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
     write_to_session(&h.state, &session.id, "cd docs/guide && echo moved\n").unwrap();
@@ -467,6 +484,7 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                         Some("/bin/sh".into()),
                         Some(vec!["-i".into()]),
                         None,
+                        gitpulse_lib::terminal::OutputSink::events(&handle),
                     )
                     .expect("capacity is never exhausted: THREADS is below the session cap");
                     let reader_state = state.clone();
@@ -513,11 +531,138 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                 Some("/bin/sh".into()),
                 Some(vec!["-c".into(), "sleep 30".into()]),
                 None,
+                gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
             )
             .expect("a slot leaked during the race"),
         );
     }
     gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
+}
+
+/// Sixteen closers on one session, plus a bystander session and a process in
+/// a group of its own: exactly one close does the stopping, every other closer
+/// returns Ok without signalling anything, a close after the session is gone is
+/// a no-op, and nothing outside the session is touched.
+#[test]
+fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
+    use std::os::unix::process::CommandExt;
+    let h = harness();
+    let _cleanup = TerminalCleanup(h.state.clone());
+    let dir = repo();
+    let pidfile = dir.path().join("job.pid");
+    let doomed = spawn_session(
+        h.app.handle(),
+        &h.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/bash".into()),
+        Some(vec!["-i".into()]),
+        None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+    )
+    .unwrap();
+    write_to_session(
+        &h.state,
+        &doomed.id,
+        &format!("sleep 30 & echo $! > '{}'; echo armed\n", pidfile.display()),
+    )
+    .unwrap();
+    assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));
+    let job = read_pid(&pidfile, Duration::from_secs(5));
+    let bystander = spawn_session(
+        h.app.handle(),
+        &h.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/sh".into()),
+        Some(vec!["-c".into(), "sleep 30".into()]),
+        None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+    )
+    .unwrap();
+    let mut outsider = std::process::Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn_locked()
+        .expect("outsider");
+
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| {
+                kill_session(&h.state, &doomed.id).expect("every closer is answered");
+            });
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while alive(job) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(job);
+    // SAFETY: the job is this test's own grandchild.
+    unsafe { libc::kill(job, libc::SIGKILL) };
+    assert!(!survived, "the session's job outlived its close");
+    kill_session(&h.state, &doomed.id).expect("closing a closed session is a no-op");
+    assert!(
+        outsider.try_wait().unwrap().is_none(),
+        "a close reached a process outside the session"
+    );
+    assert!(
+        gitpulse_lib::terminal::list_sessions(&h.state)
+            .unwrap()
+            .iter()
+            .any(|listing| listing.id == bystander.id),
+        "closing one session ended another"
+    );
+    let _ = outsider.kill();
+    let _ = outsider.wait();
+}
+
+/// A close is marked as GitPulse's own before the first signal leaves, so a
+/// reader that sees the child die never counts our hangup as an external death.
+/// The shell traps SIGHUP and records that it arrived; at that moment the close
+/// is still waiting out its grace, so the session must already read as ending.
+#[test]
+fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
+    let h = harness();
+    let _cleanup = TerminalCleanup(h.state.clone());
+    let dir = repo();
+    let marker = dir.path().join("hup.seen");
+    let script = format!(
+        "trap 'echo hup > {}; sleep 20' HUP; echo armed; while :; do sleep 0.1; done",
+        marker.display()
+    );
+    let session = spawn_session(
+        h.app.handle(),
+        &h.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/bash".into()),
+        Some(vec!["-c".into(), script]),
+        None,
+        gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
+    )
+    .unwrap();
+    assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));
+    std::thread::scope(|scope| {
+        let closer = scope.spawn(|| kill_session(&h.state, &session.id));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "the hangup never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ending = gitpulse_lib::terminal::list_sessions(&h.state)
+            .unwrap()
+            .iter()
+            .any(|listing| listing.id == session.id && listing.ending);
+        assert!(
+            ending,
+            "the hangup was sent before the session was marked as ended by GitPulse"
+        );
+        closer.join().unwrap().expect("close finishes");
+    });
 }
 
 mod common;

@@ -1,7 +1,9 @@
 <script lang="ts">
   import { RefreshCw } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
+  import { repoScope } from "../repos/repoScope.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
@@ -53,17 +55,21 @@
   let triggerEl: HTMLButtonElement | undefined = $state();
   let refreshing = $state(false);
 
+  // Keyed on the repository alone, so the store's other publishes do not
+  // resubscribe — each resubscription restarted the metric's debounce.
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       rawSnapshot = null;
       mix = EMPTY;
       open = false;
       return;
     }
-    return locMetric.subscribe(path, (snap: MetricSnapshot<LanguageStatsReport>) => {
-      rawSnapshot = snap;
-    });
+    return untrack(() =>
+      locMetric.subscribe(path, (snap: MetricSnapshot<LanguageStatsReport>) => {
+        rawSnapshot = snap;
+      }),
+    );
   });
 
   $effect(() => {
@@ -91,14 +97,34 @@
     close();
   }
 
+  /**
+   * The status bar is mounted once per window. The subscription above follows
+   * the active repository by itself; what it cannot do is close the breakdown
+   * panel that was opened over the previous repository's languages, let a
+   * rescan of that repository keep this one's Rescan button disabled, or stop
+   * the previous repository's breakdown showing for a frame.
+   */
+  const tabScope = repoScope(
+    () => $currentRepoPath,
+    () => {
+      open = false;
+      refreshing = false;
+      // The metric hands the new repository's current snapshot to the effect
+      // above only after this frame; until then the old one must not be drawn.
+      rawSnapshot = null;
+      mix = EMPTY;
+    },
+  );
+
   async function rescan() {
     const repoPath = $repoStore.currentPath;
     if (!repoPath || refreshing) return;
+    const epoch = tabScope.epoch;
     refreshing = true;
     try {
       await locMetric.refresh(repoPath, { force: true });
     } finally {
-      refreshing = false;
+      if (tabScope.isCurrent(epoch)) refreshing = false;
     }
   }
 

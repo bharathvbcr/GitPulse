@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 83 contracts over
- * 211 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 103 contracts over
+ * 251 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -60,7 +60,6 @@ export const TERMINAL_TS_SOURCE = path.join(REPO_ROOT, "src", "lib", "terminal",
 export const TERMINAL_STRUCTS = Object.freeze([
   "TerminalRunResult",
   "TerminalSpawned",
-  "TerminalOutputPayload",
   "TerminalExitPayload",
   "TerminalContext",
   "TerminalListing",
@@ -113,8 +112,20 @@ export const CONTRACTS = Object.freeze([
   { label: "hygiene", rustPath: rust("storage", "hygiene", "mod.rs"), tsPath: ts("storage", "hygiene", "types.ts"), structs: ["CacheEntry", "CacheInventory", "HygienePlan", "HygieneOutcome"] },
   { label: "workbench", rustPath: rust("workbench.rs"), tsPath: ts("workbench", "client.ts"), structs: ["WorkbenchError"] },
   { label: "attempt-review", rustPath: rust("workbench", "review.rs"), tsPath: ts("workbench", "attemptReview.ts"), structs: ["AttemptReview"] },
+  { label: "verify-status", rustPath: rust("workbench", "verify_status.rs"), tsPath: ts("workbench", "verifyStatus.ts"), structs: ["PostedVerifyStatus"] },
   { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
   { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
+  // Whether Claude Code saved a hosted conversation (`cmd_terminal_conversations`):
+  // Resume is offered only when `transcript` reads "found".
+  { label: "conversation-transcript", rustPath: rust("workbench", "conversation.rs"), tsPath: ts("terminal", "transcripts.ts"), structs: ["ConversationTranscript"] },
+  // Which process holds the terminals (`cmd_terminal_backend`): the quit
+  // dialog asks whether to leave sessions running only when it reads "host".
+  { label: "terminal-backend", rustPath: TERMINAL_RUST_SOURCE, tsPath: ts("terminal", "quitChoice.ts"), structs: ["TerminalBackendStatus"] },
+  // A mass external-signal death, on the `terminal-incident` event and in
+  // `cmd_terminal_incidents`. The offer to resume the dead sessions and the
+  // Health list both read it, and `sender` is what keeps "who killed them"
+  // from becoming "nobody did" when a field is renamed.
+  { label: "terminal-incident", rustPath: rust("terminal", "incident.rs"), tsPath: ts("terminal", "incident.ts"), structs: ["TerminalIncidentPayload", "Sender"] },
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },
   // Apple Intelligence crosses IPC as four structs, and the error is one of
   // them on purpose: the frontend branches on `code`, so a rename there would
@@ -126,24 +137,33 @@ export const CONTRACTS = Object.freeze([
   { label: "ingest", rustPath: rust("ingest", "mod.rs"), tsPath: ts("ingest", "types.ts"), structs: ["CatchUp"] },
   { label: "grants", rustPath: rust("grants", "mod.rs"), tsPath: ts("grants", "types.ts"), structs: ["Grant", "Grantor", "GrantScope", "GrantView"] },
   { label: "local-scan", rustPath: rust("harness", "protocol.rs"), tsPath: ts("ai", "scan.ts"), structs: ["ScanModel", "ScanServer", "ScanResult"] },
-  { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskEvidence", "TaskGap", "TaskRun", "TaskView"] },
+  { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskEvidence", "TaskGap", "DevCouncilRun", "TaskView"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupCandidate", "BranchCleanupPlan", "CommitReviewReport", "TagCleanupPlan", "TagCleanupEntry"] },
-  { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  { label: "release", rustPath: rust("commands", "refs.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  // The doc vault's coverage honesty (`notScanned` is what says a search or a
+  // rename did not see every note) and a rename's per-file results, which are
+  // how a partial rename is told apart from a complete one.
+  { label: "docs-vault", rustPath: rust("docs", "mod.rs"), tsPath: ts("docs", "client.ts"), structs: ["DocsStatus", "BrokenLink"] },
+  { label: "docs-rename", rustPath: rust("docs", "rename.rs"), tsPath: ts("docs", "client.ts"), structs: ["DocRenameOutcome", "DocRenameFailure"] },
   // The envelope on every gated command: `policy` travels with `output` so the
   // UI can tell an approved action from one that ran with no gate available.
   // Renaming either field would have broken 33 commands at once, silently.
-  { label: "guarded", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["Guarded"] },
+  { label: "guarded", rustPath: rust("commands", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["Guarded"] },
   { label: "branches", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["BranchInfo", "TagInfo", "TagList"] },
   { label: "commits", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitDetails", "CommitFileChange"] },
-  { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
+  { label: "graph", rustPath: rust("commands", "commit_graph.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
   { label: "refs", rustPath: rust("graph", "refs.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["RefDecoration"] },
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
-  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
+  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
+  { label: "file-write", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("files", "types.ts"), structs: ["SavedFile"] },
   { label: "markdown-render", rustPath: rust("markdown", "mod.rs"), tsPath: ts("files", "markdevRender.ts"), structs: ["RenderedMarkdown", "MarkdownHeading", "FrontmatterField"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry", "ResetPreview", "PreviewCommit"] },
-  { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult"] },
+  { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult", "WorktreeRemoval"] },
+  // The hooks file as the approval dialog shows it: `approved` decides whether
+  // the panel offers to approve, so a renamed field would read as unapproved.
+  { label: "worktree-hooks", rustPath: rust("engine", "worktree_hooks.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeHooksPreview", "WorktreeHooksConfig"] },
   // A commit refused for want of an identity offers to set one from these;
   // a renamed field would prefill nothing and look like "no identity".
   { label: "git-identity", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "gitPreflight.ts"), structs: ["GitIdentity"] },
@@ -161,7 +181,7 @@ export const CONTRACTS = Object.freeze([
   { label: "fleet", rustPath: rust("insights", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetRepoFacet", "FleetSnapshot", "FleetCommitStats"] },
   { label: "fleet-metrics", rustPath: rust("ledger", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetMetrics", "FleetMetricsInput", "FleetLanguageStat"] },
   { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
-  { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
+  { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["ResolvedRepo"] },
   // On-device drafting availability. The tagged `state` union is what keeps an
   // ineligible Mac, a switched-off setting and a bridge-less build apart, so a
   // drift here would collapse three different answers into one message.
@@ -190,7 +210,11 @@ export const CONTRACTS = Object.freeze([
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "conflict-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictSnapshot", "ConflictStage", "ConflictSaveRequest", "ConflictSaveOutcome"] },
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
+  // The commit-graph census inside StorageReport. `unknown` and the nullable
+  // facts are what keep "could not check" from rendering as "missing".
+  { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport"] },
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
+  { label: "commit-signature", rustPath: rust("engine", "commit_signature.rs"), tsPath: ts("pulse", "types.ts"), structs: ["CommitSignatureCheck"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
   // Agent-session notifications. Three files because the envelope, the
@@ -200,7 +224,7 @@ export const CONTRACTS = Object.freeze([
   // lost, so a field that silently read as undefined would report zero — the
   // exact "a check that did not run looks like one that passed" shape this
   // subsystem exists to avoid.
-  { label: "session-alerts", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertsView"] },
+  { label: "session-alerts", rustPath: rust("commands", "app.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertsView"] },
   { label: "session-alert-status", rustPath: rust("alerts", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertStatus"] },
   // What an agent stood asking for while no page listened. A renamed field
   // here would replay every waiting agent as asking nothing.
@@ -208,11 +232,22 @@ export const CONTRACTS = Object.freeze([
   { label: "session-alert-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertSettings"] },
   { label: "lappi", rustPath: rust("lappi", "mod.rs"), tsPath: ts("stores", "lappiStore.ts"), structs: ["LappiView"] },
   { label: "lappi-store", rustPath: rust("lappi", "record.rs"), tsPath: ts("stores", "lappiStore.ts"), structs: ["StoreStatus"] },
+  // Host load (`sysload`). Health reads these to say how much memory agents
+  // use and whether the sampler is alive; a renamed field would read as
+  // undefined, and an undefined footprint or tick count renders as nothing at
+  // all — the "could not look" that must never pass for "nothing there".
+  { label: "host-load-sampler", rustPath: rust("sysload", "sampler.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadStatus", "HostLoadPulse"] },
+  { label: "host-load-sensor", rustPath: rust("sysload.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["SensorReport", "Clock"] },
+  { label: "host-load-snapshot", rustPath: rust("sysload", "snapshot.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Snapshot", "WriterIdentity", "TickStats"] },
+  { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores"] },
+  { label: "host-load-processes", rustPath: rust("sysload", "procscan.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ProcView", "AgentSession", "LaunchedTree", "ForeignProcess", "Orphan", "MemguardHealth", "SessionCount"] },
+  { label: "host-load-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings"] },
+  { label: "host-load-governor", rustPath: rust("sysload", "governor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["GovernorVerdict", "GovernorReport", "GovernorPulse", "Shed"] },
   // What an agent CLI starts with in a terminal tab, and which modes this
   // build can expand. `modes` and `launchers` are what the chooser renders, so
   // a renamed field would empty the chooser rather than fail — leaving a panel
   // that offers nothing while reporting nothing wrong.
-  { label: "agent-defaults", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "agentDefaultsStore.ts"), structs: ["AgentDefaultsView"] },
+  { label: "agent-defaults", rustPath: rust("commands", "app.rs"), tsPath: ts("stores", "agentDefaultsStore.ts"), structs: ["AgentDefaultsView"] },
   { label: "agent-models", rustPath: rust("workbench", "agent_models.rs"), tsPath: ts("terminal", "agentModelCatalog.ts"), structs: ["AgentModelOption", "AgentModelCatalog"] },
   // Per-repository DevCouncil setup, and the inventory behind it. These land
   // on every repository the user opens, so a rename that made `exclude` or
@@ -235,6 +270,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repo-operation", rustPath: rust("engine", "repo_op.rs"), tsPath: ts("repos", "operation.ts"), structs: ["RepoOperation"] },
   { label: "stash-options", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashSaveOptions"] },
   { label: "file-delete", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("files", "types.ts"), structs: ["DeleteOutcome"] },
+  { label: "checkout-outcome", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["CheckoutOutcome"] },
   { label: "content-search", rustPath: rust("engine", "content_search.rs"), tsPath: ts("search", "types.ts"), structs: ["ContentMatch", "ContentSearchReport", "ContentSearchOptions"] },
   { label: "stash", rustPath: rust("engine", "stash.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashEntry", "StashList"] },
   { label: "remotes", rustPath: rust("engine", "remotes.rs"), tsPath: ts("repos", "remotes.ts"), structs: ["RemoteInfo", "RemoteList"] },
@@ -258,6 +294,10 @@ export const CONTRACTS = Object.freeze([
   // The durable log's self-report. `degraded` is the field that must not
   // drift: drop it and an incomplete log renders as a complete one.
   { label: "diagnostics", rustPath: rust("logging.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["PersistedLog"] },
+  // A degraded subsystem and a mismatched daemon are only ever shown, so a
+  // dropped field would silently stop saying so.
+  { label: "degraded-subsystems", rustPath: rust("supervisor.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["Degraded"] },
+  { label: "daemon-status", rustPath: rust("daemon_lock.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["DaemonStatus"] },
 ]);
 
 /**
@@ -390,6 +430,14 @@ function normalizeRustType(type) {
   if (/^(?:u|i)(?:8|16|32|64|128|size)$/.test(compact) || /^(?:f32|f64)$/.test(compact)) {
     return "number";
   }
+  // A generic wire type (`Reading<u64>`) is its name with each argument read
+  // the same way, so `Reading<u64>` and TypeScript's `Reading<number>` meet.
+  // Without this no field of a generic type could ever agree with its twin.
+  const generic = /^((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)<(.*)>$/.exec(compact);
+  if (generic) {
+    const args = splitTopLevel(generic[2], ",").map(normalizeRustType);
+    return `${stripTypePath(generic[1])}<${args.join(",")}>`;
+  }
   // `crate::graph::RefDecoration` and `RefDecoration` are one wire type; serde
   // never writes a struct's path, and TypeScript has no notion of one. Keeping
   // the qualifier made every cross-module field read as drift, which is why
@@ -457,6 +505,20 @@ function normalizeTsType(type) {
   // `Record<string, V>` and `{ [key: string]: V }` are the same JSON object.
   const record = /^Record<string,(.*)>$/.exec(compact) ?? /^\{\[\w+:string\]:(.*?);?\}$/.exec(compact);
   if (record) return `Record<string,${normalizeTsType(record[1])}>`;
+  // A tuple of one element type is the JSON array a Rust `[T; N]` writes:
+  // `[number, number, number]` is `[f64; 3]`. A mixed tuple stays a tuple.
+  const tuple = /^\[(.+)\]$/.exec(compact);
+  if (tuple) {
+    const elements = splitTopLevel(tuple[1], ",").map(normalizeTsType);
+    if (elements.every((element) => element === elements[0])) return `${elements[0]}[]`;
+    return `[${elements.join(",")}]`;
+  }
+  // A generic wire type, argument by argument, as on the Rust side.
+  const generic = /^([A-Za-z_]\w*)<(.*)>$/.exec(compact);
+  if (generic) {
+    const args = splitTopLevel(generic[2], ",").map(normalizeTsType);
+    return `${generic[1]}<${args.join(",")}>`;
+  }
   if (compact === "string" || compact === "boolean" || compact === "number" || compact === "null" || compact === "undefined") {
     return compact;
   }

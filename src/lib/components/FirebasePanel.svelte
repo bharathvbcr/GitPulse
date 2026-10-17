@@ -64,7 +64,7 @@
   import DeliveryTimeline from "./DeliveryTimeline.svelte";
   import { anyInFlight } from "../delivery/transitions";
   import { createLivePoll, type LiveState } from "../delivery/livePoll";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { reportPanelError } from "../diagnostics/report";
   import { formatError } from "../ui/formatError";
   import EmptyState from "./EmptyState.svelte";
@@ -434,7 +434,7 @@
 
   $effect(() => {
     if (liveState.kind !== "live") return;
-    return createVisibleInterval(() => (timelineNow = Date.now()), 1_000);
+    return createAdaptiveTimer(() => (timelineNow = Date.now()), 1_000);
   });
 
   /**

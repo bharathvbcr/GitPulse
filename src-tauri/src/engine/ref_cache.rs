@@ -210,6 +210,21 @@ impl RefStamp {
     }
 }
 
+/// The state of the files a ref listing over some namespaces is a function of,
+/// for a caller that coalesces concurrent asks itself and needs to know
+/// whether anything moved between two of them. Opaque: the only operation is
+/// equality, and a stamp is returned whether or not it has settled, because a
+/// caller comparing two reads is not storing an answer under it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stamp(RefStamp);
+
+/// [`Stamp`] of `namespaces`; `None` when the walk cannot describe the state
+/// (a symlink, an unreadable entry, too many refs), which is never equal to
+/// anything.
+pub(crate) fn stamp(repo: &Path, namespaces: &[&str]) -> Option<Stamp> {
+    RefStamp::read(repo, namespaces).map(Stamp)
+}
+
 #[derive(Default)]
 struct Walk {
     entries: Vec<(PathBuf, Option<FileIdentity>)>,
@@ -323,10 +338,29 @@ pub(crate) fn git_text_capped(
 }
 
 /// `run` answers with the text and whether it may be kept.
-fn through(
+///
+/// Called directly by a listing whose non-zero exit can be an answer rather
+/// than a failure (`git notes list` on a ref this git cannot load), which the
+/// single `Err` of [`git_text`] cannot tell apart. `run` still owns the spawn,
+/// so it still goes through [`git_cli`] and its gate.
+pub(crate) fn through(
     repo: &Path,
     namespaces: &[&str],
     args: &[&str],
+    run: impl FnOnce() -> Result<(String, bool), String>,
+) -> Result<String, String> {
+    through_stamped(repo, args, stamp(repo, namespaces).as_ref(), run)
+}
+
+/// [`through`] with the stamp the caller already read for `namespaces`, so a
+/// caller that compares stamps itself (single-flight coalescing) reads the
+/// files once per call, not twice. `None` is a stamp that could not be read,
+/// as in [`stamp`]: the answer is computed and not kept. Settledness is
+/// judged here, so the clock is still read in one place.
+pub(crate) fn through_stamped(
+    repo: &Path,
+    args: &[&str],
+    stamp: Option<&Stamp>,
     run: impl FnOnce() -> Result<(String, bool), String>,
 ) -> Result<String, String> {
     crate::repository_trust::require(repo)?;
@@ -334,7 +368,10 @@ fn through(
         repo: repo.to_path_buf(),
         argv: args.iter().map(|arg| (*arg).to_string()).collect(),
     };
-    let stamp = RefStamp::read(repo, namespaces).filter(|stamp| stamp.settled(SystemTime::now()));
+    let stamp = stamp
+        .map(|stamp| &stamp.0)
+        .filter(|stamp| stamp.settled(SystemTime::now()))
+        .cloned();
     if let Some(stamp) = &stamp {
         let table = kept().lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = table.get(&key) {
@@ -399,6 +436,32 @@ fn note_hit() {
     HITS.with(|cell| cell.set(cell.get() + 1));
 }
 
+/// Held by every test that counts on an answer staying kept, and by the one
+/// that fills the budget: that one evicts whatever else is in the
+/// process-wide table. Shared with the callers' own tests (provenance), whose
+/// kept answers live in the same table.
+#[cfg(test)]
+pub(crate) fn retention() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `f` with no racy window, so every stamp is stored: what the oracle
+/// then proves is that the stamp itself sees every change, with no help from
+/// the window.
+#[cfg(test)]
+pub(crate) fn eager<T>(f: impl FnOnce() -> T) -> T {
+    RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RACY_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,29 +496,6 @@ mod tests {
     const HEAD_ONLY: &[&str] = &["refs/heads"];
     const HEAD_ARGS: &[&str] = &["rev-parse", "HEAD"];
 
-    /// Runs `f` with no racy window, so every stamp is stored: what the oracle
-    /// then proves is that the stamp itself sees every change, with no help
-    /// Held by every test that counts on an answer staying kept, and by the
-    /// one that fills the budget: that one evicts whatever else is in the
-    /// process-wide table.
-    fn retention() -> std::sync::MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// from the window.
-    fn eager<T>(f: impl FnOnce() -> T) -> T {
-        RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                RACY_OVERRIDE.with(|cell| cell.set(None));
-            }
-        }
-        let _reset = Reset;
-        f()
-    }
-
     fn hits() -> u64 {
         HITS.with(std::cell::Cell::get)
     }
@@ -484,7 +524,7 @@ mod tests {
 
     fn fixture(ref_format: Option<&str>) -> Option<Fixture> {
         let holder = tempfile::tempdir().unwrap();
-        let base = holder.path().canonicalize().unwrap();
+        let base = crate::engine::git_cli::canonicalize_plain(holder.path()).unwrap();
         let main = base.join("main");
         std::fs::create_dir(&main).unwrap();
         let mut init = vec!["init", "-q", "-b", "main"];
@@ -895,7 +935,7 @@ mod tests {
         };
         assert_eq!(exact(&["rev-parse", "HEAD"]), 1, "head id");
         assert_eq!(
-            exact(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            exact(&["symbolic-ref", "--quiet", "HEAD"]),
             1,
             "current branch"
         );
@@ -1083,6 +1123,67 @@ mod tests {
         })
         .unwrap();
         assert!(!kept().lock().unwrap().contains_key(&huge));
+    }
+
+    /// A 100,000-commit window is read as 5,000-commit chunks (about 1.3 MB
+    /// each at a typical 260 bytes a record), because one answer that size
+    /// exceeded [`MAX_ENTRY_BYTES`] and was never kept. Every chunk of such a
+    /// window stays kept together; a longer one evicts oldest-first and never
+    /// passes the byte budget.
+    #[test]
+    fn a_hundred_thousand_commit_window_stays_kept_as_chunks_and_evicts_oldest_first() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let chunk_bytes = 5_000 * 260;
+        assert!(chunk_bytes < MAX_ENTRY_BYTES, "a chunk must fit one entry");
+        let chunks_in_window = 100_000 / 5_000;
+        assert!(
+            chunks_in_window * chunk_bytes <= MAX_KEPT_BYTES && chunks_in_window < MAX_ENTRIES,
+            "the window must fit the budget it is meant to fit"
+        );
+        let key = |n: usize| Key {
+            repo: fx.main.clone(),
+            argv: vec!["log".into(), format!("chunk-{n}")],
+        };
+        let keep_chunk = |n: usize| {
+            eager(|| {
+                through(&fx.main, TAGS, &["log", &format!("chunk-{n}")], || {
+                    Ok(("c".repeat(chunk_bytes), true))
+                })
+            })
+            .unwrap();
+        };
+        for n in 0..chunks_in_window {
+            keep_chunk(n);
+        }
+        {
+            let table = kept().lock().unwrap();
+            for n in 0..chunks_in_window {
+                assert!(
+                    table.contains_key(&key(n)),
+                    "chunk {n} of the window was not kept"
+                );
+            }
+        }
+        // Growing past the budget evicts the oldest chunks, not the newest.
+        for n in chunks_in_window..chunks_in_window + 12 {
+            keep_chunk(n);
+        }
+        let table = kept().lock().unwrap();
+        let bytes: usize = table
+            .iter()
+            .filter(|(k, _)| k.repo == fx.main)
+            .map(|(_, entry)| entry.value.len())
+            .sum();
+        assert!(bytes <= MAX_KEPT_BYTES, "{bytes} bytes kept");
+        assert!(
+            !table.contains_key(&key(0)),
+            "the oldest chunk outlived the budget"
+        );
+        assert!(
+            table.contains_key(&key(chunks_in_window + 11)),
+            "the newest chunk was evicted"
+        );
     }
 
     /// A timestamp from the future is never settled.

@@ -33,6 +33,12 @@ export const WATCHER_REFRESH_DEBOUNCE_MS = 200;
 export const BACKGROUND_REFRESH_MIN_MS = 30_000;
 /** Least time between any two background refreshes, across every tab. */
 export const BACKGROUND_REFRESH_SPACING_MS = 5_000;
+/**
+ * How long a refresh may run before a newer event stops waiting for it. A
+ * snapshot that outlives this is hung, not slow; its late answer is
+ * discarded by the store's own run token.
+ */
+export const INFLIGHT_MAX_MS = 60_000;
 
 export interface WatcherRefreshDeps {
   now(): number;
@@ -42,8 +48,13 @@ export interface WatcherRefreshDeps {
   isActive(key: string): boolean;
   /** Whether the window is hidden — not merely unfocused. */
   isHidden(): boolean;
-  /** Runs the full refresh of `key`'s session. */
-  refresh(key: string): void;
+  /**
+   * Runs the full refresh of `key`'s session. A returned promise is the
+   * refresh in flight: the policy starts no second refresh of that key until
+   * it settles (either way), and owes one trailing refresh for the events
+   * that arrived meanwhile.
+   */
+  refresh(key: string): void | Promise<unknown>;
 }
 
 export interface WatcherRefreshPolicy {
@@ -76,6 +87,12 @@ interface Entry {
   lastRunAt: number | null;
   /** An event arrived while hidden; pay it when shown. */
   owedWhileHidden: boolean;
+  /** When the refresh of this key still running started; null when none is. */
+  inflightSince: number | null;
+  /** Identifies that refresh, so the late settle of an abandoned one is ignored. */
+  inflightRun: number;
+  /** An event settled while `inflight`; one more refresh follows it. */
+  owedAfterInflight: boolean;
 }
 
 export function createWatcherRefreshPolicy(deps: WatcherRefreshDeps): WatcherRefreshPolicy {
@@ -103,7 +120,15 @@ export function createWatcherRefreshPolicy(deps: WatcherRefreshDeps): WatcherRef
   const entryFor = (key: string): Entry => {
     let entry = entries.get(key);
     if (!entry) {
-      entry = { timer: null, backgroundDueAt: null, lastRunAt: null, owedWhileHidden: false };
+      entry = {
+        timer: null,
+        backgroundDueAt: null,
+        lastRunAt: null,
+        owedWhileHidden: false,
+        inflightSince: null,
+        inflightRun: 0,
+        owedAfterInflight: false,
+      };
       entries.set(key, entry);
     }
     return entry;
@@ -128,10 +153,35 @@ export function createWatcherRefreshPolicy(deps: WatcherRefreshDeps): WatcherRef
       entry.owedWhileHidden = true;
       return;
     }
+    // A snapshot on a large repository can outlast the interval between
+    // settled events. Starting another beside it multiplies the git children
+    // the first is still waiting on, and its answer is discarded the moment
+    // the newer one lands. Remember the debt and pay it once, after.
+    // Bounded: a refresh that never settles must not silence the key for good.
     const now = deps.now();
+    if (entry.inflightSince !== null && now - entry.inflightSince < INFLIGHT_MAX_MS) {
+      entry.owedAfterInflight = true;
+      return;
+    }
     entry.lastRunAt = now;
     if (wasBackground) lastBackgroundRunAt = now;
-    deps.refresh(key);
+    const running = deps.refresh(key);
+    if (running === undefined || running === null) return;
+    const run = entry.inflightRun + 1;
+    entry.inflightRun = run;
+    entry.inflightSince = now;
+    const settled = () => {
+      if (entry.inflightRun !== run) return;
+      entry.inflightSince = null;
+      if (disposed || entries.get(key) !== entry) return;
+      if (!entry.owedAfterInflight) return;
+      entry.owedAfterInflight = false;
+      // Through the normal rules, so the trailing refresh is debounced,
+      // spaced, or held for a hidden window like any other.
+      schedule(key);
+    };
+    // The refresh reports its own failures; a rejection here only ends it.
+    Promise.resolve(running).then(settled, settled);
   };
 
   const armActive = (key: string, entry: Entry) => {
@@ -181,6 +231,7 @@ export function createWatcherRefreshPolicy(deps: WatcherRefreshDeps): WatcherRef
       const entry = entryFor(key);
       disarm(entry);
       entry.owedWhileHidden = false;
+      entry.owedAfterInflight = false;
       entry.lastRunAt = deps.now();
     },
     onVisibilityChange() {
@@ -204,7 +255,10 @@ export function createWatcherRefreshPolicy(deps: WatcherRefreshDeps): WatcherRef
     },
     owed() {
       return [...entries.entries()]
-        .filter(([, entry]) => entry.timer !== null || entry.owedWhileHidden)
+        .filter(
+          ([, entry]) =>
+            entry.timer !== null || entry.owedWhileHidden || entry.owedAfterInflight,
+        )
         .map(([key]) => key);
     },
   };

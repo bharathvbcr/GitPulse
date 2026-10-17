@@ -1,9 +1,10 @@
 <script lang="ts">
   import type { LanguageInfo } from "../../files/types";
   import type { CommitGraphPayload } from "../../stores/graphStore";
-  import { onMount } from "svelte";
-  import { createVisibleInterval } from "../../dom/visibleInterval";
-  import { repoStore } from "../../stores/repoStore";
+  import { onMount, untrack } from "svelte";
+  import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
+  import { currentHeadTip } from "../../stores/headTip";
   import { invoke } from "../../ipc/invoke";
   import {
     Activity,
@@ -19,6 +20,7 @@
   } from "@lucide/svelte";
   import { formatAge } from "../../storage/format";
   import { askConfirm } from "../../stores/modalStore";
+  import { reportFailure } from "../../stores/mutationOutcome";
   import { promptQuickCommit } from "../../commit/quickCommit";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import {
@@ -55,8 +57,6 @@
   // Language info for selected file
   let detectedLang = $state<{ name: string; color_hex: string; category: string } | null>(null);
 
-  let lastFingerprint = "";
-
   // Periodic refresh ticker for "just now" / relative age
   let tick = $state(0);
   onMount(() => {
@@ -64,7 +64,7 @@
     // them. The status poll already refuses to work on a hidden window; this
     // ticker used to keep firing behind other windows, invalidating derived
     // state across the pane every five seconds for a label nobody could see.
-    const stopTicking = createVisibleInterval(() => (tick += 1), 5000);
+    const stopTicking = createAdaptiveTimer(() => (tick += 1), 5000);
     return () => {
       stopTicking();
       commitGuard?.cancel();
@@ -104,29 +104,32 @@
   }
 
   async function stageAll() {
-    await repoStore.stageAll();
+    return await repoStore.stageAll();
   }
 
   async function unstageAll() {
-    await repoStore.unstageAll();
+    return await repoStore.unstageAll();
   }
 
   async function stageFile(path: string) {
-    await repoStore.stageFile(path);
+    return await repoStore.stageFile(path);
   }
 
   async function unstageFile(path: string) {
-    await repoStore.unstageFile(path);
+    return await repoStore.unstageFile(path);
   }
 
   async function discardFile(path: string) {
+    // The repository this file belongs to, held across the confirm.
+    const target = repoStore.captureTarget();
     const confirmed = await askConfirm({
       title: "Discard Changes",
       message: `Discard all uncommitted changes to ${path}? This cannot be undone.`,
       confirmLabel: "Discard Changes",
     });
     if (!confirmed) return;
-    await repoStore.discardChanges(path);
+    const outcome = await repoStore.discardChanges(path, target);
+    reportFailure(outcome, "Could not discard the changes");
   }
 
   // Load commit history & language detection when selectedFile changes
@@ -179,24 +182,32 @@
     }
   }
 
+  const statusKey = $derived(statusLiveKey($repoStore.statuses));
   $effect(() => {
-    const key = statusLiveKey($repoStore.statuses);
-    if (key === lastFingerprint) return;
-    lastFingerprint = key;
-    lastRefreshed = Date.now();
+    void statusKey;
+    untrack(() => (lastRefreshed = Date.now()));
   });
 
+  // Keyed by value on the repository, the selection and HEAD (see
+  // `currentHeadTip`): a commit, pull or checkout is what can change this
+  // file's history, and the store's other publishes are not. No teardown
+  // cancels the load: `loadFileDetails` cancels its own predecessor, and
+  // unmount is handled in `onMount`.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo && selectedFile) {
-      void loadFileDetails(repo, selectedFile);
-    } else {
-      commitGuard?.cancel();
-      commitGuard = null;
-      isLoadingCommits = false;
-      recentCommits = [];
-      detectedLang = null;
-    }
+    const repo = $currentRepoPath;
+    const file = selectedFile;
+    void $currentHeadTip;
+    untrack(() => {
+      if (repo && file) {
+        void loadFileDetails(repo, file);
+      } else {
+        commitGuard?.cancel();
+        commitGuard = null;
+        isLoadingCommits = false;
+        recentCommits = [];
+        detectedLang = null;
+      }
+    });
   });
 </script>
 

@@ -214,18 +214,21 @@ fn hung_gh_probe_is_bounded() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+    let serial = common::env::env_serial();
     let old_path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var(
-        "PATH",
-        format!("{}:{}", fake_bin.path().display(), old_path),
-    );
+    let present;
     let start = Instant::now();
-    let present = gitpulse_lib::github::gh_cli_present();
-    std::env::set_var("PATH", old_path);
+    {
+        let _env = common::env::bind_env(&serial).set(
+            "PATH",
+            format!("{}:{}", fake_bin.path().display(), old_path),
+        );
+        present = gitpulse_lib::github::gh_cli_present();
+    }
 
     assert!(!present, "a hanging gh must not count as present");
     assert!(
-        start.elapsed() < Duration::from_secs(30),
+        start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(30)),
         "probe took {:?}; it must be bounded well below the fake gh's 300s sleep",
         start.elapsed()
     );
@@ -254,10 +257,12 @@ fn git_cli_strips_planted_git_config_parameters() {
         .expect("spawn git config");
     assert!(output.status.success());
 
-    // Process-global mutation is tolerable here: every other test that
-    // reaches git through the engine strips exactly this variable (that is
-    // the behavior under test), so parallel tests cannot observe the plant.
-    std::env::set_var("GIT_CONFIG_PARAMETERS", "'user.name=PWNED_NAME'");
+    // Scoped and serialized: the plant reaches every raw `git` in this binary
+    // while it is set, and the binding removes it even if an assertion below
+    // fails.
+    let serial = common::env::env_serial();
+    let planted =
+        common::env::bind_env(&serial).set("GIT_CONFIG_PARAMETERS", "'user.name=PWNED_NAME'");
 
     let control = std::process::Command::new("git")
         .args(["config", "user.name"])
@@ -270,7 +275,7 @@ fn git_cli_strips_planted_git_config_parameters() {
         .expect("engine git call must succeed with planted env");
     let ours_name = ours.trim().to_string();
 
-    std::env::remove_var("GIT_CONFIG_PARAMETERS");
+    drop(planted);
 
     assert_eq!(
         control_name, "PWNED_NAME",
@@ -555,3 +560,193 @@ fn clone_repo_still_clones_local_file_urls() {
 }
 
 mod common;
+
+// ---------------------------------------------------------------------------
+// Git metadata is not a writable target. The write gate is the MANVI sidecar,
+// which is absent by default, so the sandbox itself must refuse.
+// ---------------------------------------------------------------------------
+
+const HOSTILE_CONFIG: &str = "[core]\n\tfsmonitor = sh -c 'touch /tmp/pwn'\n";
+
+fn dot_git_config(repo: &Path) -> Vec<u8> {
+    std::fs::read(repo.join(".git/config")).expect("read .git/config")
+}
+
+#[test]
+fn writing_dot_git_config_is_refused_and_the_config_is_untouched() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    let before = dot_git_config(repo_dir.path());
+
+    for path in [".git/config", ".GIT/config", ".git./config", ".git /config"] {
+        let edited = gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+            &repo_str,
+            path,
+            HOSTILE_CONFIG,
+        );
+        assert!(edited.is_err(), "edited-text write to {path} must fail");
+        let raw = sandbox_write_raw(&repo_str, path);
+        assert!(raw.is_err(), "raw write to {path} must fail");
+        assert_eq!(
+            dot_git_config(repo_dir.path()),
+            before,
+            "{path} changed .git/config"
+        );
+    }
+}
+
+fn sandbox_write_raw(repo: &str, path: &str) -> Result<(), String> {
+    gitpulse_lib::engine::git_cli::sandbox_write(repo, path, HOSTILE_CONFIG)
+}
+
+#[test]
+fn moving_an_untracked_file_into_dot_git_hooks_is_refused() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    std::fs::write(repo_dir.path().join("x"), "#!/bin/sh\ntouch /tmp/pwn\n").unwrap();
+
+    let result = GitWriter::move_path(&repo_str, "x", ".git/hooks/x", |_| Ok(()));
+    assert!(result.is_err(), "move into .git/hooks must fail");
+    assert!(!repo_dir.path().join(".git/hooks/x").exists());
+    assert!(repo_dir.path().join("x").exists(), "the source stays put");
+
+    // The other end: moving a file out of git metadata is just as refused.
+    let result = GitWriter::move_path(&repo_str, ".git/HEAD", "stolen", |_| Ok(()));
+    assert!(result.is_err(), "move out of .git must fail");
+    assert!(repo_dir.path().join(".git/HEAD").exists());
+}
+
+#[test]
+fn ordinary_dot_git_prefixed_names_still_write() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    for path in [".gitignore", ".gitkeep", ".github/x", "sub/.gitattributes"] {
+        gitpulse_lib::engine::git_cli::sandbox_write(&repo_str, path, "ok\n")
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join(path)).unwrap(),
+            "ok\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_alias_of_dot_git_cannot_be_written_through() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    std::os::unix::fs::symlink(repo.join(".git"), repo.join("meta")).unwrap();
+    let before = dot_git_config(&repo);
+
+    assert!(sandbox_write_raw(&repo_str, "meta/config").is_err());
+    assert!(gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+        &repo_str,
+        "meta/config",
+        HOSTILE_CONFIG
+    )
+    .is_err());
+    assert_eq!(dot_git_config(&repo), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_gitdir_file_layout_protects_the_real_git_directory() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    // The `.bare` layout: the git directory has another name and `.git` is a
+    // file that points at it.
+    std::fs::rename(repo.join(".git"), repo.join(".bare")).unwrap();
+    std::fs::write(repo.join(".git"), "gitdir: .bare\n").unwrap();
+    common::trust_repo(&repo);
+    let repo_str = repo.to_string_lossy().into_owned();
+    let before = std::fs::read(repo.join(".bare/config")).unwrap();
+
+    assert!(sandbox_write_raw(&repo_str, ".bare/config").is_err());
+    assert!(gitpulse_lib::engine::git_cli::sandbox_write_edited_text(
+        &repo_str,
+        ".bare/hooks/pre-commit",
+        HOSTILE_CONFIG
+    )
+    .is_err());
+    assert_eq!(std::fs::read(repo.join(".bare/config")).unwrap(), before);
+    assert!(!repo.join(".bare/hooks/pre-commit").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn deleting_a_symlink_removes_only_the_link_whatever_it_points_at() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+    std::fs::create_dir(repo.join("real")).unwrap();
+    std::fs::write(repo.join("real/f.txt"), "inside").unwrap();
+    let before = dot_git_config(&repo);
+    std::os::unix::fs::symlink(repo.join("real"), repo.join("to_dir")).unwrap();
+    std::os::unix::fs::symlink(repo.join(".git"), repo.join("to_git")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.join("to_outside")).unwrap();
+
+    for link in ["to_dir", "to_git", "to_outside"] {
+        let result = GitWriter::delete_path(&repo_str, link, |_| Ok(()));
+        assert!(result.is_ok(), "{link}: {result:?}");
+        assert!(
+            std::fs::symlink_metadata(repo.join(link)).is_err(),
+            "{link} is still there"
+        );
+    }
+    assert_eq!(std::fs::read(repo.join("real/f.txt")).unwrap(), b"inside");
+    assert_eq!(
+        std::fs::read(outside.path().join("secret.txt")).unwrap(),
+        b"outside"
+    );
+    assert_eq!(dot_git_config(&repo), before);
+    assert!(repo.join(".git/HEAD").exists());
+}
+
+#[test]
+fn moving_onto_the_repository_root_is_refused_in_every_spelling() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_str = repo_dir.path().to_string_lossy().into_owned();
+    std::fs::write(repo_dir.path().join("keep.txt"), "keep").unwrap();
+    for destination in [".", "./.", "./"] {
+        let result = GitWriter::move_path(&repo_str, "keep.txt", destination, |_| Ok(()));
+        assert!(result.is_err(), "{destination:?} accepted: {result:?}");
+        assert_eq!(
+            std::fs::read(repo_dir.path().join("keep.txt")).unwrap(),
+            b"keep",
+            "{destination:?} moved the file"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_into_dot_git_moves_as_a_link_and_touches_nothing_in_it() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo = repo_dir.path().canonicalize().unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    let before = dot_git_config(&repo);
+    std::os::unix::fs::symlink(repo.join(".git"), repo.join("meta")).unwrap();
+
+    GitWriter::move_path(&repo_str, "meta", "meta2", |_| Ok(())).expect("the link moves");
+    assert!(std::fs::symlink_metadata(repo.join("meta2"))
+        .unwrap()
+        .is_symlink());
+    assert!(std::fs::symlink_metadata(repo.join("meta")).is_err());
+    assert_eq!(dot_git_config(&repo), before, "the move reached .git");
+
+    // Through the link is still refused, by whichever name reaches it.
+    assert!(sandbox_write_raw(&repo_str, "meta2/config").is_err());
+    assert!(GitWriter::move_path(&repo_str, "meta2/hooks", "x", |_| Ok(())).is_err());
+    assert_eq!(dot_git_config(&repo), before);
+}

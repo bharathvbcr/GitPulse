@@ -27,13 +27,13 @@
   // component when switching views while an accepted write may still settle.
   const fileSaveQueue = editorFileSaveQueue;
   const viewerOwners = createLatestOwnerRegistry<{
-    completeSave(path: string, savedContent: string, tabs: EditorTabState): void;
+    completeSave(path: string, savedContent: string, tabs: EditorTabState, savedBase: string | null): void;
   }>();
 </script>
 
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import {
     PanelLeftClose,
@@ -55,6 +55,10 @@
   import { copyText } from "../desktop/clipboard";
   import { askConfirm } from "../stores/modalStore";
   import { openInDefaultApp } from "../desktop/openInShell";
+  import type { Guarded } from "../stores/harnessStore";
+  import type { SavedFile } from "../files/types";
+  import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
+  import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
   import FileTreePanel from "./files/FileTreePanel.svelte";
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
@@ -74,6 +78,7 @@
     discardEditorDraft,
     editorDraft,
     emptyEditorTabs,
+    isEditorDraftConflicted,
     isEditorTabDirty,
     openPinned,
     openPreview,
@@ -106,6 +111,9 @@
   let lastAppliedStoreFile = "";
   let viewerLease: LatestOwnerLease | null = null;
 
+  /** The disk version a refused save saw, for the file it was refused on. */
+  let saveRefusal = $state<{ repo: string; path: string; actual: string | null } | null>(null);
+
   let openTabs = $derived(tabState.tabs);
   let activeTabPath = $derived(tabState.active);
   let activeDraft = $derived(
@@ -114,6 +122,21 @@
   let activeTabDirty = $derived(
     activeTabPath ? isEditorTabDirty(tabState, activeTabPath) : false,
   );
+  /**
+   * Set while the open file's draft was made from a version of it that is no
+   * longer on disk: a save was refused, or the blob that reloaded carries a
+   * different base than the draft. `actual` is the version Overwrite saves over.
+   */
+  let activeConflict = $derived.by(() => {
+    if (!activeTabPath || !activeDraft) return null;
+    if (saveRefusal?.repo === hydratedRepo && saveRefusal.path === activeTabPath) {
+      return { actual: saveRefusal.actual };
+    }
+    const diskBase = activeBlob?.path === activeTabPath ? activeBlob.disk_base : null;
+    return isEditorDraftConflicted(activeDraft, diskBase) && diskBase
+      ? { actual: diskBase }
+      : null;
+  });
   let paneLayout = $derived(resolveFilePaneLayout({
     containerWidth: fileViewWidth,
     explorerRequested: explorerOpen,
@@ -278,8 +301,76 @@
   }
 
   function handleDraftChange(path: string, newContent: string, sourceContent: string) {
-    tabState = updateEditorDraft(tabState, path, newContent, sourceContent);
+    // The first keystroke records the disk version this draft is made from;
+    // `updateEditorDraft` ignores the base on every later one.
+    const base = activeBlob?.path === path ? activeBlob.disk_base ?? null : null;
+    // A refusal belongs to the draft it refused; a new draft starts clean.
+    if (!tabState.drafts[path] && saveRefusal?.repo === hydratedRepo && saveRefusal.path === path) {
+      saveRefusal = null;
+    }
+    tabState = updateEditorDraft(tabState, path, newContent, sourceContent, base);
     persistTabs(hydratedRepo);
+  }
+
+  /**
+   * A save that carries the draft's base. A `changed_on_disk` refusal keeps
+   * the draft, records the disk version it saw (the Overwrite base), and
+   * reloads the blob so Compare shows what is there now; the error is still
+   * thrown so the editor stays in edit mode.
+   */
+  async function saveDraft(path: string, newContent: string, overrideBase?: string | null) {
+    // The repository the save was started in: a refusal belongs to it, not to
+    // whichever repository has the same relative path open when it settles.
+    const repo = hydratedRepo;
+    try {
+      await handleFileSave(path, newContent, overrideBase);
+      saveRefusal = null;
+    } catch (err: unknown) {
+      const typed = readFileWriteError(err);
+      if (repo && typed?.code === "changed_on_disk") {
+        saveRefusal = { repo, path, actual: typed.actual };
+        void loadFileContent(path);
+      } else if (repo && err instanceof UnbasedDraft) {
+        // No version to judge by: the banner offers Overwrite as the way out.
+        saveRefusal = { repo, path, actual: null };
+      }
+      throw err;
+    }
+  }
+
+  /** Overwrite: save the draft over exactly the disk version the refusal saw. */
+  async function overwriteDraft() {
+    const path = activeTabPath;
+    const draft = activeDraft;
+    const conflict = activeConflict;
+    if (!path || !draft || !conflict) return;
+    // With no version on record the write is unconditional, so it is asked for.
+    if (
+      conflict.actual === null &&
+      !(await askConfirm({
+        title: "Overwrite Without a Known Version?",
+        message: `${path} has no recorded disk version. Saving will replace whatever is on disk, including changes made since you started editing.`,
+        confirmLabel: "Overwrite",
+        cancelLabel: "Keep Editing",
+        destructive: true,
+      }))
+    ) {
+      return;
+    }
+    try {
+      await saveDraft(path, draft.content, conflict.actual);
+    } catch (err: unknown) {
+      repoStore.setError(formatError(err));
+    }
+  }
+
+  /** Reload: discard the draft (after confirming) and show what is on disk. */
+  async function reloadFromDisk() {
+    const path = activeTabPath;
+    if (!path) return;
+    if (!(await requestDiscardDraft(path))) return;
+    saveRefusal = null;
+    await loadFileContent(path);
   }
 
   async function requestDiscardDraft(path: string): Promise<boolean> {
@@ -297,29 +388,42 @@
     path: string,
     savedContent: string,
     tabs: Tabs,
+    savedBase: string | null,
   ) {
     if (!isCurrentViewer(repo)) return;
     tabState = tabs;
     if (activeTabPath === path && activeBlob?.path === path) {
-      activeBlob = { ...activeBlob, text: savedContent };
+      // The blob now is what was written, so its base is the saved one: left
+      // stale it would read as an external change to the next keystroke.
+      activeBlob = { ...activeBlob, text: savedContent, disk_base: savedBase };
     }
   }
 
-  function completeCachedEditorSave(repo: string, path: string, savedContent: string) {
+  function completeCachedEditorSave(
+    repo: string,
+    path: string,
+    savedContent: string,
+    savedBase: string | null,
+  ) {
     const cached = tabCache.get(repo);
     if (!cached) return;
     // The cache is synchronously updated on every keystroke. Completing
     // against this latest state, rather than the initiating instance's state,
     // preserves a draft typed while the backend write was in flight.
-    const tabs = completeEditorSave(cached.tabs, path, savedContent);
+    const tabs = completeEditorSave(cached.tabs, path, savedContent, savedBase);
     tabCache.set(repo, { ...cached, tabs });
     recordEditorDrafts(repo, Object.keys(tabs.drafts));
     // Dispatch through the registry rather than this initiating component:
     // after a view remount the newest owner receives the latest cached state.
-    viewerOwners.current(repo)?.completeSave(path, savedContent, tabs);
+    viewerOwners.current(repo)?.completeSave(path, savedContent, tabs, savedBase);
   }
 
-  async function handleFileSave(path: string, newContent: string) {
+  /**
+   * `overrideBase` undefined saves against the draft's own base (or, with no
+   * draft, the blob just shown); a string saves against that version, which is
+   * how Overwrite names the one it already saw; null is an unconditional write.
+   */
+  async function handleFileSave(path: string, newContent: string, overrideBase?: string | null) {
     const repo = hydratedRepo;
     if (!repo || !path) throw new Error("No active file to save");
     if ($repoStore.currentPath !== repo) {
@@ -332,12 +436,20 @@
       if ($repoStore.currentPath !== repo) {
         throw new Error("Repository changed before save; the editor draft was kept");
       }
-      await invoke("cmd_write_file_content", {
+      const judged = saveBase(
+        tabCache.get(repo)?.tabs.drafts[path],
+        activeBlob?.path === path ? activeBlob.disk_base : null,
+        overrideBase,
+      );
+      if (judged === "unbased") throw new UnbasedDraft(path);
+      const expectedBase = judged.base;
+      const saved = await invoke<Guarded<SavedFile>>("cmd_write_file_content", {
         repoPath: repo,
         filePath: path,
         content: newContent,
+        expectedBase,
       });
-      completeCachedEditorSave(repo, path, newContent);
+      completeCachedEditorSave(repo, path, newContent, saved.output.disk_base);
       if ($repoStore.currentPath === repo) await repoStore.refresh();
     });
   }
@@ -445,15 +557,15 @@
   }
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     if (repo === hydratedRepo) return;
     if (hydratedRepo) untrack(() => persistTabs(hydratedRepo));
     viewerLease?.release();
     hydratedRepo = repo;
     viewerLease = repo
       ? viewerOwners.claim(repo, {
-          completeSave: (path, savedContent, tabs) =>
-            applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs),
+          completeSave: (path, savedContent, tabs, savedBase) =>
+            applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs, savedBase),
         })
       : null;
     lastAppliedStoreFile = "";
@@ -496,8 +608,9 @@
     prevLoadKey = "";
   });
 
+  const storeSelection = $derived($repoStore.selectedFilePath);
   $effect(() => {
-    const storeSelected = $repoStore.selectedFilePath;
+    const storeSelected = storeSelection;
     if (!storeSelected) {
       lastAppliedStoreFile = "";
       return;
@@ -514,12 +627,13 @@
     });
   });
 
+  const activeStatusCode = $derived(
+    tabState.active ? ($repoStore.statuses.find((s) => s.path === tabState.active)?.status_code ?? "") : "",
+  );
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const path = tabState.active;
-    const code = path
-      ? ($repoStore.statuses.find((s) => s.path === path)?.status_code ?? "")
-      : "";
+    const code = activeStatusCode;
     const key = `${repo ?? ""}\u0000${path ?? ""}\u0000${code}`;
     if (key === prevLoadKey) return;
     prevLoadKey = key;
@@ -836,12 +950,22 @@
             <span class="max-w-md font-mono text-[11px]">{fileError}</span>
           </div>
         {:else if activeBlob && activeTabPath}
+          {#if activeConflict && activeDraft}
+            <EditorConflictBanner
+              path={activeTabPath}
+              unbased={activeConflict.actual === null}
+              disk={activeBlob.text ?? ""}
+              draft={activeDraft.content}
+              onReload={() => void reloadFromDisk()}
+              onOverwrite={() => void overwriteDraft()}
+            />
+          {/if}
           <MediaViewer
             filePath={activeTabPath}
             blob={activeBlob}
             draftContent={activeDraft?.content ?? null}
             dirty={activeTabDirty}
-            onSave={(newContent) => handleFileSave(activeTabPath, newContent)}
+            onSave={(newContent) => saveDraft(activeTabPath, newContent)}
             onDraftChange={(newContent, sourceContent) =>
               handleDraftChange(activeTabPath, newContent, sourceContent)}
             onRequestDiscard={() => requestDiscardDraft(activeTabPath)}

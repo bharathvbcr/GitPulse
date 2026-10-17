@@ -7,7 +7,21 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{Result, StoreError};
+use crate::{Result, StoreError, write_transaction};
+
+/// Refuses a value bound for a column the store later embeds *raw* into its
+/// replies. A shape check (leading `{`, trailing `]`) lets text through that
+/// closes its container early and splices keys beside it; only a full scan of
+/// the grammar proves the text is one value and nothing else.
+fn require_json(
+    field: &str,
+    text: &str,
+    check: fn(&str) -> std::result::Result<(), String>,
+) -> Result<()> {
+    check(text).map_err(|why| StoreError::BadScope {
+        reason: format!("{field} is not well-formed JSON: {why}"),
+    })
+}
 
 /// Ceiling on one evidence/gaps list reply. Far past any honest task, short of
 /// a reply that would flood the Go client's `maxOutput` budget.
@@ -195,11 +209,11 @@ pub fn evidence_append(
             reason: "evidence type is empty".into(),
         });
     }
-    if !data_json.trim_start().starts_with('{') && !data_json.trim_start().starts_with('[') {
-        return Err(StoreError::BadScope {
-            reason: "evidence data_json must be a JSON object or array".into(),
-        });
-    }
+    require_json(
+        "evidence data_json (an object or array)",
+        data_json,
+        crate::json::check_container,
+    )?;
     conn.execute(
         "INSERT INTO evidence (type, task_id, requirement_id, acceptance_criterion_id, data_json)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -267,15 +281,24 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
             reason: "gap id is required".into(),
         });
     }
-    let tx = conn.unchecked_transaction()?;
+    require_json(
+        "gap evidence_json (an array)",
+        &gap.evidence_json,
+        crate::json::check_array,
+    )?;
+    // IMMEDIATE: `current_run` reads `gap_runs` before anything is written.
+    write_transaction(conn, |tx| gap_upsert_in(tx, gap))
+}
+
+fn gap_upsert_in(tx: &Connection, gap: &GapRow) -> Result<()> {
     if let Some(task_id) = gap
         .task_id
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
     {
-        let run = current_run(&tx, task_id)?;
-        record_sighting(&tx, task_id, &gap.id, &gap.gap_type, run)?;
+        let run = current_run(tx, task_id)?;
+        record_sighting(tx, task_id, &gap.id, &gap.gap_type, run)?;
     }
     let blocking: i64 = if gap.blocking { 1 } else { 0 };
     tx.execute(
@@ -319,7 +342,6 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
             gap.stderr_path,
         ],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -339,22 +361,75 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
 /// The counter advances on every call, including one with no gaps, which is
 /// what makes a disappearance observable at all.
 pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result<()> {
+    // IMMEDIATE: `advance_run` reads `gap_runs` before anything is written.
+    write_transaction(conn, |tx| gaps_replace_in(tx, task_id, gaps))
+}
+
+/// The most gaps one replacement may carry. A set past it is refused loudly:
+/// the caller built it from something that is not a verification, and a task
+/// with this many open gaps is not one an agent can act on anyway.
+pub const MAX_GAPS_PER_REPLACE: usize = 500;
+
+/// Rewrites a replacement set to what the table can hold for `task_id`: every
+/// row belongs to the key task, and one row stands for each id.
+///
+/// The DELETE below is keyed on the task, so a row whose `task_id` named some
+/// other task (or none) was inserted outside the set that clears it: the task's
+/// list came back empty, and the next replace failed `UNIQUE constraint failed:
+/// gaps.id` for as long as the stray row lived. Rewriting to the key makes the
+/// row clearable. A duplicate id inside the set collapses to its last
+/// occurrence, in first-seen order — the same result the per-gap upsert path
+/// produced — instead of aborting the whole replacement on the second insert.
+fn normalise_gaps(task_id: &str, gaps: &[GapRow]) -> Result<Vec<GapRow>> {
+    if gaps.len() > MAX_GAPS_PER_REPLACE {
+        return Err(StoreError::BadScope {
+            reason: format!(
+                "{} gaps in one replacement exceeds the limit of {MAX_GAPS_PER_REPLACE}",
+                gaps.len()
+            ),
+        });
+    }
+    let mut out: Vec<GapRow> = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        if gap.id.trim().is_empty() {
+            return Err(StoreError::BadScope {
+                reason: "gap id is required".into(),
+            });
+        }
+        let mut row = gap.clone();
+        row.task_id = Some(task_id.to_string());
+        match out.iter().position(|seen| seen.id == row.id) {
+            Some(at) => out[at] = row,
+            None => out.push(row),
+        }
+    }
+    Ok(out)
+}
+
+fn gaps_replace_in(tx: &Connection, task_id: &str, gaps: &[GapRow]) -> Result<()> {
     if task_id.trim().is_empty() {
         return Err(StoreError::BadScope {
             reason: "task_id is required to replace gaps".into(),
         });
     }
-    let tx = conn.unchecked_transaction()?;
+    let gaps = normalise_gaps(task_id, gaps)?;
+    for gap in &gaps {
+        require_json(
+            "gap evidence_json (an array)",
+            &gap.evidence_json,
+            crate::json::check_array,
+        )?;
+    }
 
     // Advance this task's run counter first, so every sighting below agrees on
     // which run it is recording.
-    let run = advance_run(&tx, task_id)?;
-    for gap in gaps {
-        record_sighting(&tx, task_id, &gap.id, &gap.gap_type, run)?;
+    let run = advance_run(tx, task_id)?;
+    for gap in &gaps {
+        record_sighting(tx, task_id, &gap.id, &gap.gap_type, run)?;
     }
 
     tx.execute("DELETE FROM gaps WHERE task_id = ?1", params![task_id])?;
-    for gap in gaps {
+    for gap in &gaps {
         let blocking: i64 = if gap.blocking { 1 } else { 0 };
         tx.execute(
             "INSERT INTO gaps
@@ -382,8 +457,36 @@ pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result
             ],
         )?;
     }
-    tx.commit()?;
     Ok(())
+}
+
+/// Records one verification and its gaps as a single transaction: the run row
+/// (when given) and the replacement gap set commit together or not at all, so
+/// a run is never stored with a status and no gaps, and a failure part-way
+/// leaves the previous gaps intact.
+pub fn verification_commit(
+    conn: &Connection,
+    run: Option<&VerificationRun>,
+    task_id: &str,
+    gaps: &[GapRow],
+) -> Result<()> {
+    if let Some(run) = run
+        && run.task_id != task_id
+    {
+        return Err(StoreError::BadScope {
+            reason: format!(
+                "run {} belongs to task {:?}, not {task_id:?}",
+                run.id, run.task_id
+            ),
+        });
+    }
+    // IMMEDIATE: with no run the first statement is `advance_run`'s read.
+    write_transaction(conn, |tx| {
+        if let Some(run) = run {
+            run_record(tx, run)?;
+        }
+        gaps_replace_in(tx, task_id, gaps)
+    })
 }
 
 /// Starts a new run for a task and returns its number.
@@ -515,6 +618,16 @@ pub fn gap_history_list(
 /// Lists gaps, optionally filtered by task. Cap + truncate flag as evidence.
 pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow>, bool)> {
     let limit = (MAX_LIST_ROWS + 1) as i64;
+    // A read-only handle cannot add the two output columns a long-lived store
+    // may lack, so a missing column reads as absent rather than failing the
+    // whole list.
+    let output_columns = if crate::schema::gaps_has_column(conn, "stdout_path")?
+        && crate::schema::gaps_has_column(conn, "stderr_path")?
+    {
+        "stdout_path, stderr_path"
+    } else {
+        "NULL, NULL"
+    };
     let map_row = |row: &rusqlite::Row<'_>| {
         let blocking: i64 = row.get(8)?;
         Ok(GapRow {
@@ -537,23 +650,23 @@ pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow
         })
     };
     let rows: Vec<GapRow> = if let Some(tid) = task_id {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
                     acceptance_criterion_id, expected_verification_method,
-                    stdout_path, stderr_path
-             FROM gaps WHERE task_id = ?1 ORDER BY id LIMIT ?2",
-        )?;
+                    {output_columns}
+             FROM gaps WHERE task_id = ?1 ORDER BY id LIMIT ?2"
+        ))?;
         stmt.query_map(params![tid, limit], map_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
                     acceptance_criterion_id, expected_verification_method,
-                    stdout_path, stderr_path
-             FROM gaps ORDER BY id LIMIT ?1",
-        )?;
+                    {output_columns}
+             FROM gaps ORDER BY id LIMIT ?1"
+        ))?;
         stmt.query_map(params![limit], map_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -568,6 +681,16 @@ pub fn run_record(conn: &Connection, run: &VerificationRun) -> Result<()> {
             reason: "verification run id and task_id are required".into(),
         });
     }
+    require_json(
+        "run environment_json (an object)",
+        &run.environment_json,
+        crate::json::check_object,
+    )?;
+    require_json(
+        "run commands_json (an array)",
+        &run.commands_json,
+        crate::json::check_array,
+    )?;
     conn.execute(
         "INSERT INTO verification_runs
             (id, task_id, sandbox, environment_json, commands_json, status, started_at, finished_at)

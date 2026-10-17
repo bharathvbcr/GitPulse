@@ -237,6 +237,16 @@ export function formatCoverageReport(
         const reason = safeText(artifact.skip_reason);
         line += reason ? ` — skipped: ${reason}` : " — skipped";
       }
+      // Data the scanner refused to count: say so, or the totals read as the
+      // whole report.
+      const dropped = [
+        [artifact.stale_files, "stale file"],
+        [artifact.unresolved_files, "unresolved file"],
+        [artifact.lines_past_eof, "line past end of file"],
+      ]
+        .filter(([count]) => typeof count === "number" && count > 0)
+        .map(([count, what]) => `${count} ${what}${count === 1 ? "" : "s"}`);
+      if (dropped.length > 0) line += ` — dropped from totals: ${dropped.join(", ")}`;
       out.push(line);
     }
     if (artifactRows.length > MAX_ARTIFACTS_LISTED) {

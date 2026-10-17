@@ -35,7 +35,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
@@ -56,13 +56,13 @@
     harnessStore,
     type AiGeneration,
   } from "../stores/harnessStore";
-  import { copyText } from "../desktop/clipboard";
+  import { copyText, createCopyFlash } from "../desktop/clipboard";
   import { coverageGap, formatHealthReport, formatDeadCodeStatus, observedTotal } from "../health/report";
   import {
     githubAlertsCache,
     loadGithubAlerts,
   } from "../health/githubAlerts";
-  import { buildRunnablePlanSteps } from "../terminal/tokenize";
+  import { buildRunnablePlanSteps, type RunnablePlanStep } from "../terminal/tokenize";
   import { PROMPT_LAUNCHERS, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
   import { PROVIDER_LABELS } from "../workbench/taskHandoff";
   import { HEALTH_AGENT_ACTIONS, healthAgentPrompt, type HealthAgentAction } from "../health/agentPrompts";
@@ -73,6 +73,7 @@
 
   import {
     dependabotBadgeClass as badgeClassFor,
+    formatAuditCoverage,
     issueClass,
     severityClass,
     toneChipClass,
@@ -86,15 +87,17 @@
   import { keyedList } from "../ui/eachKeys";
   import HealthSection from "./health/HealthSection.svelte";
   import HealthTable from "./health/HealthTable.svelte";
+  import HostLoadSection from "./health/HostLoadSection.svelte";
   import HealthSummaryCard from "./health/HealthSummaryCard.svelte";
   import GithubAlertsSection from "./health/GithubAlertsSection.svelte";
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
+  import TerminalIncidentsSection from "./health/TerminalIncidentsSection.svelte";
+  import { runManviAction } from "../terminal/manviAction";
   import { formatError } from "../ui/formatError";
   import {
     formatRunDetail,
     formatRunSummary,
     runPassed,
-    type TerminalRunResult,
   } from "../terminal/runResult";
   import { reportPanelError } from "../diagnostics/report";
   import { getCodeintelStatus, getDeadSymbols } from "../codeintel/client";
@@ -149,16 +152,7 @@
   let planError = $state<string | null>(null);
   let planCopied = $state(false);
 
-  interface RunnableStep {
-    id: string;
-    number: number | null;
-    text: string;
-    command: string | null;
-    argv: string[] | null;
-    error?: string;
-  }
-
-  let planSteps = $derived.by<RunnableStep[]>(() => {
+  let planSteps = $derived.by<RunnablePlanStep[]>(() => {
     if (!plan?.text) return [];
     return buildRunnablePlanSteps(plan.text);
   });
@@ -198,6 +192,7 @@
 
   /** A clean result is valid only after every discovered supported target ran. */
   let auditComplete = $derived(report?.audit_complete === true);
+  let auditCensus = $derived(formatAuditCoverage(report?.audit_coverage));
   let auditsRan = $derived((report?.scanners_ran ?? []).length > 0);
 
   /** Open Dependabot alerts, for the header badge. */
@@ -623,17 +618,13 @@
     return `${text}\n${stamps.join("\n")}`;
   }
 
-  let copyTimer: number | null = null;
-  let planCopyTimer: number | null = null;
+  const copyFlash = createCopyFlash((value) => (copied = value));
+  const planCopyFlash = createCopyFlash((value) => (planCopied = value));
 
   async function copyReport() {
     const text = renderedReport();
     if (!text) return;
-    if (await copyText(text)) {
-      copied = true;
-      if (copyTimer !== null) window.clearTimeout(copyTimer);
-      copyTimer = window.setTimeout(() => (copied = false), 1500);
-    }
+    await copyFlash.copy(text);
   }
 
   /**
@@ -662,30 +653,21 @@
     }
   }
 
-  async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
+  async function runStep(step: RunnablePlanStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath) return false;
     const actionLabel = step.command ?? step.text;
-    let actionRecorded = false;
     stepResults[step.id] = { running: true };
 
     try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
+      const res = await runManviAction({
         repoPath,
-        args: step.argv,
+        argv: step.argv,
         actionKind: "health",
-        // Long enough for a cold install/build; the backend clamps to [1s, 30min].
-        timeoutSecs: 600,
+        journalKind: "remediation-step",
+        label: actionLabel,
       });
       const passed = runPassed(res);
-      harnessStore.recordAction({
-        repoPath,
-        kind: "remediation-step",
-        label: actionLabel,
-        ok: passed,
-        verdict: res.policy ?? null,
-      });
-      actionRecorded = true;
       if (!guard.isLive()) return false;
 
       stepResults[step.id] = {
@@ -701,14 +683,6 @@
 
       return passed;
     } catch (err) {
-      if (!actionRecorded) {
-        harnessStore.recordAction({
-          repoPath,
-          kind: "remediation-step",
-          label: actionLabel,
-          ok: false,
-        });
-      }
       if (!guard.isLive()) return false;
       const msg = formatError(err);
       stepResults[step.id] = {
@@ -742,11 +716,7 @@
 
   async function copyPlan() {
     if (!plan?.text) return;
-    if (await copyText(plan.text)) {
-      planCopied = true;
-      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
-      planCopyTimer = window.setTimeout(() => (planCopied = false), 1500);
-    }
+    await planCopyFlash.copy(plan.text);
   }
 
   let agentLauncher = $state<PromptLauncher>("claude");
@@ -756,7 +726,7 @@
   let agentCopied = $state(false);
   let agentError = $state<string | null>(null);
   let agentNotice = $state<string | null>(null);
-  let agentCopyTimer: number | null = null;
+  const agentCopyFlash = createCopyFlash((value) => (agentCopied = value));
   /**
    * The one pending launch, cancelled with the repository it was started for.
    * A prompt built for the previous checkout must never open in the next.
@@ -817,9 +787,7 @@
     const ok = await copyText(text);
     if (agentPrompt !== text) return;
     if (ok) {
-      agentCopied = true;
-      if (agentCopyTimer !== null) window.clearTimeout(agentCopyTimer);
-      agentCopyTimer = window.setTimeout(() => (agentCopied = false), 1500);
+      agentCopyFlash.flash();
     } else {
       agentError = "Could not copy. Open Preview prompt and copy it from there.";
       agentPreviewOpen = true;
@@ -835,14 +803,14 @@
       fixInflight?.cancel();
       stepsInflight?.cancel();
       cancelHealthAgentLaunch();
-      if (copyTimer !== null) window.clearTimeout(copyTimer);
-      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
-      if (agentCopyTimer !== null) window.clearTimeout(agentCopyTimer);
+      copyFlash.dispose();
+      planCopyFlash.dispose();
+      agentCopyFlash.dispose();
     };
   });
 
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       inflight?.cancel();
       dependabotInflight?.cancel();
@@ -1420,6 +1388,9 @@
             >Direct</button>
           </div>
         {/snippet}
+        {#if auditCensus}
+          <p class="text-textMuted {HEALTH_PROSE_WIDTH}" data-testid="audit-coverage">{auditCensus}.</p>
+        {/if}
         {#if !report.npm_cli_present && report.manifests.length > 0}
           <p class="text-textMuted {HEALTH_PROSE_WIDTH}">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</p>
         {:else if visibleVulns.length === 0}
@@ -1681,6 +1652,15 @@
             No dead-code result for this repository yet.
           </p>
         {/if}
+      </HealthSection>
+
+      <TerminalIncidentsSection />
+
+      <!-- Machine-wide, not this repository's: the same readings under every
+           repository's Health. Last, because it is context for the findings
+           above rather than one of them. -->
+      <HealthSection id="host-load">
+        <HostLoadSection />
       </HealthSection>
     {:else}
       <div class="text-textMuted">Open a repository to scan dependency health.</div>

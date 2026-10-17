@@ -10,7 +10,11 @@
 //! several repositories open to walk back into the "Too many open files" storm
 //! that [`crate::limits`] and the gate exist to prevent.
 
-use crate::engine::git_cli::{git, git_captured, git_captured_with_stdin, validate_repo};
+use crate::engine::git_cli::{
+    git, git_captured, git_captured_with_stdin, read_objects_batch, validate_repo, BatchObject,
+    BoundedRun, MAX_OUTPUT_BYTES,
+};
+use crate::engine::{git_reader, ref_cache};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -149,151 +153,18 @@ fn decode_note<T: DeserializeOwned>(
         .map_err(|e| format!("the note on {notes_ref} for {commit_sha} did not decode: {e}"))
 }
 
+/// What [`read_note_blobs`] expects at each id it is asked for.
+const NOTE_BLOB: BatchObject = BatchObject {
+    kind: "blob",
+    noun: "note blob",
+};
+
 /// Reads note blobs in one `git cat-file --batch`, where each noted commit used
-/// to cost a `git notes show`.
-///
-/// Every answer is taken by the size git declares, never by lines: a note may
-/// hold any byte, newlines included. A blob git reports missing, an answer that
-/// names another object, and a stream that stops short are each an `Err` for
-/// the blobs they leave unread, never an empty note.
+/// to cost a `git notes show`. The framing, the by-size reading and every
+/// failure shape belong to [`read_objects_batch`], which the commit-signature
+/// reader shares; this only says what a note blob is.
 fn read_note_blobs(repo: &Path, oids: &[String]) -> HashMap<String, Result<Vec<u8>, String>> {
-    let mut answers: HashMap<String, Result<Vec<u8>, String>> = HashMap::new();
-    let mut sent: Vec<&str> = Vec::new();
-    let mut query = String::new();
-    for oid in oids {
-        if answers.contains_key(oid) || sent.contains(&oid.as_str()) {
-            continue;
-        }
-        let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
-        if !shaped {
-            answers.insert(oid.clone(), Err(format!("{oid:?} is not a note blob id")));
-            continue;
-        }
-        query.push_str(oid);
-        query.push('\n');
-        sent.push(oid);
-    }
-    if sent.is_empty() {
-        return answers;
-    }
-    let run = match git_captured_with_stdin(repo, &["cat-file", "--batch"], query.as_bytes()) {
-        Ok(run) => run,
-        Err(e) => {
-            unread(
-                &mut answers,
-                &sent,
-                &format!("could not run git cat-file: {e}"),
-            );
-            return answers;
-        }
-    };
-    if !run.success {
-        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
-        unread(
-            &mut answers,
-            &sent,
-            &format!("git cat-file --batch failed: {stderr}"),
-        );
-        return answers;
-    }
-    if let Some(reason) = &run.incomplete {
-        unread(
-            &mut answers,
-            &sent,
-            &format!("git cat-file {}", reason.describe()),
-        );
-        return answers;
-    }
-
-    read_batch_answers(&run.stdout, &sent, &mut answers);
-    answers
-}
-
-/// Where a body of the declared `size` starting at `pos` ends, if the stream
-/// holds all of it and the newline git writes after it. A size is the
-/// stream's own claim, so it is never trusted to fit in `usize` arithmetic.
-fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
-    let end = pos.checked_add(size.parse::<usize>().ok()?)?;
-    (out.get(end) == Some(&b'\n')).then_some(end)
-}
-
-/// Marks every blob in `rest` unread for the same reason.
-fn unread(answers: &mut HashMap<String, Result<Vec<u8>, String>>, rest: &[&str], why: &str) {
-    for oid in rest {
-        answers.insert((*oid).to_string(), Err(why.to_string()));
-    }
-}
-
-/// Splits a `cat-file --batch` stream into the answers to `sent`, in order.
-/// Once the stream is out of step with its questions, nothing after that
-/// point is attributed to any of them.
-fn read_batch_answers(
-    out: &[u8],
-    sent: &[&str],
-    answers: &mut HashMap<String, Result<Vec<u8>, String>>,
-) {
-    let mut pos = 0usize;
-    for (index, oid) in sent.iter().enumerate() {
-        let Some(end) = out[pos..].iter().position(|&b| b == b'\n') else {
-            unread(
-                answers,
-                &sent[index..],
-                "git cat-file answered nothing for this note",
-            );
-            return;
-        };
-        let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
-        pos += end + 1;
-        let fields: Vec<&str> = header.split(' ').collect();
-        if fields.first() != Some(oid) {
-            // Every later answer is now out of step with its question.
-            unread(
-                answers,
-                &sent[index..],
-                &format!("git cat-file answered {header:?} for note blob {oid}"),
-            );
-            return;
-        }
-        let answer = match fields.as_slice() {
-            [_, "blob", size] => match body_end(out, pos, size) {
-                Some(end) => {
-                    let content = out[pos..end].to_vec();
-                    pos = end + 1;
-                    Ok(content)
-                }
-                None => {
-                    unread(
-                        answers,
-                        &sent[index..],
-                        &format!("git cat-file cut the note blob {oid} short"),
-                    );
-                    return;
-                }
-            },
-            [_, "missing"] => Err(format!(
-                "the note blob {oid} is missing from this repository"
-            )),
-            [_, kind, size] => match body_end(out, pos, size) {
-                // Skipped by its size so the next answer stays in step.
-                Some(end) => {
-                    pos = end + 1;
-                    Err(format!("{oid} is a {kind}, not a note blob"))
-                }
-                None => {
-                    unread(
-                        answers,
-                        &sent[index..],
-                        &format!("git cat-file answered {header:?}"),
-                    );
-                    return;
-                }
-            },
-            _ => Err(format!(
-                "git cat-file answered {header:?} for note blob {oid}"
-            )),
-        };
-        answers.insert((*oid).to_string(), answer);
-    }
+    read_objects_batch(repo, oids, NOTE_BLOB, MAX_OUTPUT_BYTES, &<[u8]>::to_vec)
 }
 
 /// Appends or replaces a verification note for a commit.
@@ -717,7 +588,8 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
     let text = String::from_utf8_lossy(&run.stdout);
     for (line, row) in text.lines().zip(sent) {
         answers[row] = match line.split_once(' ') {
-            Some((sha, "commit")) if sha.len() == 40 => Ok(sha.to_string()),
+            // 40 hex digits (SHA-1) or 64 (SHA-256 repositories).
+            Some((sha, "commit")) if matches!(sha.len(), 40 | 64) => Ok(sha.to_string()),
             _ => Err(format!(
                 "{} does not name a commit in this repository",
                 revs[row]
@@ -737,20 +609,42 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
 /// Returns `Err` when the listing itself failed. A ref that does not exist yet
 /// is not a failure — it is a repository where nothing has been noted, and
 /// answers an empty set.
+///
+/// The listing is a function of the notes ref alone: the tree a notes ref
+/// names never changes under it. So it is kept by [`ref_cache`] against a
+/// stamp of that ref (and of `packed-refs`, which can hold it) and served
+/// again until the ref moves. Every freshness batch used to list both refs
+/// anew, and the branch and pull-request lists ask on every refresh. A
+/// failure, a cut-off listing and a missing ref an older git refuses to load
+/// are never kept.
 fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>, String> {
     let ref_arg = ref_arg(notes_ref);
-    let run = git_captured(repo, &["notes", &ref_arg, "list"])?;
+    let args = ["notes", ref_arg.as_str(), "list"];
+    let listing = ref_cache::through(repo, &[notes_ref], &args, || {
+        notes_listing(&git_captured(repo, &args)?, notes_ref)
+    })?;
 
-    if !run.success {
-        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
-        // "no note found" / a missing ref is absence, not failure.
-        if stderr.contains("Cannot load notes ref") || stderr.is_empty() {
-            return Ok(HashMap::new());
-        }
-        return Err(format!("git notes list failed: {stderr}"));
-    }
-    // A truncated listing would report noted commits as unnoted, which reads
-    // downstream as "this commit was never verified".
+    // `<note blob> <annotated commit>`, one per line.
+    Ok(listing
+        .lines()
+        .filter_map(|line| {
+            line.split_once(' ')
+                .map(|(blob, commit)| (commit.trim().to_string(), blob.trim().to_string()))
+        })
+        .collect())
+}
+
+/// What one `git notes list` run says about the noted commits: the listing
+/// and whether it may be kept, or why it is not an answer.
+///
+/// Completeness is established *before* the exit status is read. A run killed
+/// at its deadline or cancelled has a non-zero status and an empty stderr,
+/// which is also how a ref that does not exist yet looks; reading the status
+/// first turned a timed-out listing into "nothing has been noted", and every
+/// commit then showed as unverified instead of unexamined.
+fn notes_listing(run: &BoundedRun, notes_ref: &str) -> Result<(String, bool), String> {
+    // A truncated listing would report noted commits as unnoted, which
+    // reads downstream as "this commit was never verified".
     if let Some(reason) = &run.incomplete {
         return Err(format!(
             "git notes list {} for {notes_ref}; \
@@ -758,15 +652,19 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>
             reason.describe()
         ));
     }
-
-    // `<note blob> <annotated commit>`, one per line.
-    Ok(String::from_utf8_lossy(&run.stdout)
-        .lines()
-        .filter_map(|line| {
-            line.split_once(' ')
-                .map(|(blob, commit)| (commit.trim().to_string(), blob.trim().to_string()))
-        })
-        .collect())
+    if run.cancelled {
+        return Err(format!("git notes list for {notes_ref} was cancelled"));
+    }
+    if !run.success {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        // A missing ref is absence, not failure. Only a run that finished
+        // can say so: this is the one empty-stderr non-zero exit that means it.
+        if stderr.contains("Cannot load notes ref") || stderr.is_empty() {
+            return Ok((String::new(), false));
+        }
+        return Err(format!("git notes list failed: {stderr}"));
+    }
+    Ok((String::from_utf8_lossy(&run.stdout).into_owned(), true))
 }
 
 /// The base a distance is measured against when the caller does not name one.
@@ -1018,6 +916,7 @@ fn freshness_rows(
     } else {
         read_note_blobs(repo, &wanted)
     };
+    let tips = tip_distances(repo, &base, &plans);
 
     // Third pass: measure and assemble.
     plans
@@ -1031,9 +930,10 @@ fn freshness_rows(
                     session,
                 } => (sha, verification, session),
             };
-            let (distance, unmeasured_reason) = match &base {
-                Ok(base) => measure_distance(repo, &sha, base),
-                Err(reason) => (None, reason.clone()),
+            let (distance, unmeasured_reason) = match (&base, tips.get(&sha)) {
+                (Ok(_), Some(&distance)) => (Some(distance), String::new()),
+                (Ok(base), None) => measure_distance(repo, &sha, base),
+                (Err(reason), _) => (None, reason.clone()),
             };
             // The listing says these notes are there. A read that fails now is
             // a note we could not get at, so the entry says the notes were not
@@ -1077,6 +977,43 @@ fn freshness_rows(
                 commit_sha: sha,
             }
         })
+        .collect()
+}
+
+/// Distances for every measured row that is a branch or remote-tracking tip,
+/// from one `for-each-ref`, keyed by tip sha.
+///
+/// A row's distance is how many commits the base has that it does not: the
+/// *behind* half of `%(ahead-behind:<base>)`, the count `rev-list --count
+/// <sha>..<base>` answers one row at a time. One walk per row was up to 256
+/// processes for a single badge refresh, past the spawn gate's whole burst;
+/// the rows the branch and pull-request lists send are all tips, so this one
+/// answers them all, and it is the same listing (kept by [`ref_cache`]) the
+/// branch statistics read. A row missing here — no ref's tip, a git older
+/// than the atom, a count too large for the type — is measured by its own
+/// walk, exactly as before.
+///
+/// A single measured row skips the listing: its own walk is one process, and
+/// a commit opened from history is rarely a tip.
+fn tip_distances(
+    repo: &Path,
+    base: &Result<String, String>,
+    plans: &[RowPlan],
+) -> HashMap<String, u32> {
+    let measured = plans
+        .iter()
+        .filter(|plan| matches!(plan, RowPlan::Measure { .. }))
+        .count();
+    let Ok(base) = base else {
+        return HashMap::new();
+    };
+    if measured < 2 {
+        return HashMap::new();
+    }
+    git_reader::tip_counts_against(repo, base)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(tip, (_ahead, behind))| Some((tip, u32::try_from(behind).ok()?)))
         .collect()
 }
 
@@ -1140,6 +1077,7 @@ impl NoteSource {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use crate::engine::git_cli::Incomplete;
     use crate::procguard::LockedSpawn;
     use std::process::Command;
 
@@ -1752,7 +1690,14 @@ mod batch_tests {
         let sent = [a.as_str(), b.as_str(), c.as_str()];
         let read = |stream: &[u8]| {
             let mut answers = HashMap::new();
-            read_batch_answers(stream, &sent, &mut answers);
+            crate::engine::git_cli::read_batch_answers(
+                stream,
+                &sent,
+                NOTE_BLOB,
+                &<[u8]>::to_vec,
+                None,
+                &mut answers,
+            );
             assert_eq!(answers.len(), 3, "every blob is answered");
             answers
         };
@@ -1893,5 +1838,179 @@ mod batch_tests {
             row.distance, None,
             "a badge row cannot select without a listing"
         );
+    }
+
+    /// The branch list and the pull-request list ask again on every refresh,
+    /// and each ask used to list both notes refs anew: 108 `git notes` in the
+    /// first 32 s of one launch. A listing is a function of its notes ref, so
+    /// while the ref has not moved it is not asked for again — and the moment
+    /// it does move, it is.
+    #[test]
+    fn a_notes_ref_that_has_not_moved_is_listed_once() {
+        let _kept = crate::engine::ref_cache::retention();
+        let repo = Repo::new(3);
+        repo.verify("HEAD~1", "passed");
+        let revs: Vec<String> = (0..3).map(|n| repo.rev(&format!("HEAD~{n}"))).collect();
+        let root = repo.path().canonicalize().unwrap();
+        let listings = |from: usize| {
+            crate::engine::git_cli::spawn_log::spawns_in(&root)[from..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "notes"))
+                .count()
+        };
+
+        crate::engine::ref_cache::eager(|| {
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let first = freshness_batch(repo.as_str(), &revs, Some("main"));
+            assert_eq!(listings(before), 2, "both refs are listed the first time");
+
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let again = freshness_batch(repo.as_str(), &revs, Some("main"));
+            assert_eq!(
+                listings(before),
+                0,
+                "neither ref moved, so neither is listed"
+            );
+            assert_eq!(first, again, "the kept listing answers exactly as git did");
+
+            // A new note moves the verification ref: that listing is asked
+            // for again and the new note is seen; the sessions ref is not.
+            repo.verify("HEAD", "failed");
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let moved = freshness_batch(repo.as_str(), &revs, Some("main"));
+            assert_eq!(listings(before), 1, "only the ref that moved is listed");
+            assert_eq!(
+                moved[0].verification.as_ref().map(|v| v.verdict.as_str()),
+                Some("failed"),
+                "{moved:?}"
+            );
+        });
+    }
+
+    /// One `rev-list --count` per noted row was up to 256 processes for one
+    /// badge refresh, past the gate's whole burst. Every row the branch and
+    /// pull-request lists send is a branch or remote-tracking tip, and one
+    /// `for-each-ref` measures all of those at once.
+    #[test]
+    fn a_batch_of_branch_tips_measures_every_distance_in_one_process() {
+        let repo = Repo::new(5);
+        for n in 1..5 {
+            repo.git(&["branch", &format!("b{n}"), &format!("HEAD~{n}")]);
+            repo.verify(&format!("b{n}"), "passed");
+        }
+        let tips: Vec<String> = (1..5).map(|n| repo.rev(&format!("b{n}"))).collect();
+        let root = repo.path().canonicalize().unwrap();
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+        let rows = freshness_batch(repo.as_str(), &tips, Some("main"));
+        let used = crate::engine::git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let count = |needle: &str| {
+            used.iter()
+                .filter(|argv| argv.iter().any(|a| a == needle))
+                .count()
+        };
+        assert_eq!(count("rev-list"), 0, "{used:?}");
+        assert_eq!(count("for-each-ref"), 1, "{used:?}");
+        let distances: Vec<Option<u32>> = rows.iter().map(|row| row.distance).collect();
+        assert_eq!(
+            distances,
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "{rows:?}"
+        );
+        for (row, tip) in rows.iter().zip(&tips) {
+            let single = compute_freshness(repo.as_str(), tip, Some("main"));
+            assert_eq!(row.distance, single.distance, "{tip}");
+            assert_eq!(row.confidence, single.confidence, "{tip}");
+        }
+    }
+
+    /// A noted commit that is no ref's tip is still measured, by its own walk,
+    /// beside the tips the one listing measured.
+    #[test]
+    fn a_noted_commit_off_every_tip_is_still_measured() {
+        let repo = Repo::new(4);
+        repo.git(&["branch", "b1", "HEAD~1"]);
+        repo.verify("b1", "passed");
+        repo.verify("HEAD~2", "passed");
+        repo.verify("HEAD~3", "passed");
+        let revs: Vec<String> = ["b1", "HEAD~2", "HEAD~3"]
+            .iter()
+            .map(|spec| repo.rev(spec))
+            .collect();
+        let root = repo.path().canonicalize().unwrap();
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+        let rows = freshness_batch(repo.as_str(), &revs, Some("main"));
+        let used = crate::engine::git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let distances: Vec<Option<u32>> = rows.iter().map(|row| row.distance).collect();
+        assert_eq!(distances, vec![Some(1), Some(2), Some(3)], "{rows:?}");
+        let walks = used
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "rev-list"))
+            .count();
+        assert_eq!(walks, 2, "one walk per commit no listing covered: {used:?}");
+    }
+
+    fn run(success: bool, stderr: &str, incomplete: Option<Incomplete>) -> BoundedRun {
+        BoundedRun {
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            success,
+            status_code: if success { 0 } else { 1 },
+            incomplete,
+            stderr_incomplete: None,
+            cancelled: false,
+        }
+    }
+
+    /// A listing killed at its deadline exits non-zero with an empty stderr,
+    /// which is also how a notes ref that does not exist yet looks. It must be
+    /// an error, not "nothing has been noted": the latter shows every commit as
+    /// unverified instead of unexamined.
+    #[test]
+    fn a_notes_listing_cut_short_is_an_error_not_an_empty_set() {
+        let deadline = Incomplete::Deadline {
+            message: "git notes timed out after 30s".into(),
+            over_cap: None,
+        };
+        let cut = notes_listing(&run(false, "", Some(deadline)), VERIFICATION_NOTES_REF);
+        assert!(cut.is_err(), "a timed-out listing read as {cut:?}");
+
+        let over_cap = notes_listing(&run(true, "", Some(Incomplete::OverCap(8))), "refs/notes/x");
+        assert!(over_cap.is_err(), "{over_cap:?}");
+
+        let mut cancelled = run(false, "", None);
+        cancelled.cancelled = true;
+        assert!(notes_listing(&cancelled, "refs/notes/x").is_err());
+
+        // A finished run is what may call a missing ref absence.
+        assert_eq!(
+            notes_listing(&run(false, "", None), "refs/notes/x"),
+            Ok((String::new(), false))
+        );
+    }
+
+    /// Every revision failed to resolve in a SHA-256 repository: the resolver
+    /// accepted only 40-character object names.
+    #[test]
+    fn a_sha256_repository_resolves_and_notes_its_commits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo(dir);
+        repo.git(&["init", "-b", "main", "--object-format=sha256"]);
+        crate::test_support::trust_repo(repo.path());
+        repo.git(&["config", "user.name", "T"]);
+        repo.git(&["config", "user.email", "t@e.com"]);
+        std::fs::write(repo.path().join("f"), "1\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-m", "c0"]);
+        let sha = repo.rev("HEAD");
+        assert_eq!(sha.len(), 64, "the fixture must be a SHA-256 repository");
+
+        let resolved = resolve_revisions(repo.path(), &["HEAD".to_string()], 8);
+        assert_eq!(resolved, vec![Ok(sha.clone())]);
+
+        repo.verify("HEAD", "passed");
+        let f = freshness_batch(repo.as_str(), &[sha], Some("main"))
+            .pop()
+            .expect("one row");
+        assert!(f.verification.is_some(), "the note was not found: {f:?}");
     }
 }

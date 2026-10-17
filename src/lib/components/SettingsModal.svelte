@@ -49,6 +49,7 @@
   } from "../ui/settingsSections";
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
+  import { readLaunchAtLogin, writeLaunchAtLogin, type LaunchAtLogin } from "../desktop/launchAtLogin";
   import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
   import { appleIntelligenceStatus, appleReady, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
@@ -73,9 +74,11 @@
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
+  import HostLoadSetting from "./HostLoadSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
+  import KeepTerminalsSetting from "./KeepTerminalsSetting.svelte";
   import AgentSettingSourcesSetting from "./AgentSettingSourcesSetting.svelte";
   import AgentModelSettings from "./AgentModelSettings.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
@@ -91,7 +94,7 @@
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
-  let launchAtLogin = $state(false);
+  let launchAtLogin = $state<LaunchAtLogin>({ state: "unknown", error: "still reading" });
 
   /**
    * Settings is the only entry point to the tour, so it has to get out of the
@@ -104,24 +107,11 @@
   }
 
   async function refreshLaunchAtLogin() {
-    try {
-      const { isEnabled } = await import("@tauri-apps/plugin-autostart");
-      launchAtLogin = await isEnabled();
-    } catch {
-      launchAtLogin = false;
-    }
+    launchAtLogin = await readLaunchAtLogin();
   }
 
   async function setLaunchAtLogin(next: boolean) {
-    try {
-      const { enable, disable, isEnabled } = await import("@tauri-apps/plugin-autostart");
-      if (next) await enable();
-      else await disable();
-      launchAtLogin = await isEnabled();
-    } catch (error) {
-      launchAtLogin = false;
-      console.warn("Launch at login unavailable:", error);
-    }
+    launchAtLogin = await writeLaunchAtLogin(next);
   }
 
   $effect(() => {
@@ -158,6 +148,7 @@
       // live answer is the row's own content, and a Mac that merely has it
       // switched off still needs the row in order to be told so.
       appleIntelligence: $hostPlatform.os === "macos",
+      macos: $hostPlatform.os === "macos",
     }),
   );
   const filter = $derived(matchSettings(query, unsupported));
@@ -455,6 +446,13 @@
     },
   ];
 
+  const TERMINAL_SCROLLBACK_OPTIONS: readonly { value: string; label: string; title: string }[] =
+    [500, 1000, 2000, 5000, 10000, 20000].map((rows) => ({
+      value: String(rows),
+      label: rows.toLocaleString("en-US"),
+      title: `Keep ${rows.toLocaleString("en-US")} rows of history`,
+    }));
+
   const TAB_WIDTH_OPTIONS: readonly { value: string; label: string; title: string }[] =
     TAB_WIDTHS.map((width) => ({
       value: String(width),
@@ -698,6 +696,62 @@
                     </p>
                   </div>
 
+                  <div data-setting="terminal-gpu" hidden={!shown("terminal-gpu")}>
+                    <SettingToggle
+                      label="GPU terminal rendering"
+                      description="Draws the terminals you can see with WebGL instead of page elements, which keeps a continuously redrawing agent off the interface's main thread."
+                      ariaLabel="GPU terminal rendering"
+                      checked={$interfaceStore.terminalGpu}
+                      onchange={(next) => interfaceStore.setTerminalGpu(next)}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug">
+                      On by default. Turn it off if terminal text draws wrongly on your
+                      graphics hardware. A terminal whose GPU context is lost goes back to
+                      the ordinary renderer for the rest of its life on its own.
+                    </p>
+                  </div>
+
+                  <div data-setting="terminal-option-as-meta" hidden={!shown("terminal-option-as-meta")}>
+                    <SettingToggle
+                      label="Option as Meta in terminals"
+                      description="Option+B and Option+F move by word and Option+key reaches shell and agent shortcuts, instead of typing a symbol."
+                      ariaLabel="Option as Meta in terminals"
+                      checked={$interfaceStore.terminalOptionAsMeta}
+                      onchange={(next) => interfaceStore.setTerminalOptionAsMeta(next)}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug">
+                      On by default. Turn it off if your keyboard layout types a
+                      character with Option, such as @ on a German layout: with it on,
+                      that character cannot be typed inside a terminal. Option-click
+                      still selects text in programs that capture the mouse. Applies to
+                      open terminals at once.
+                    </p>
+                  </div>
+
+                  <div data-setting="terminal-scrollback" hidden={!shown("terminal-scrollback")}>
+                    <div class="text-textMuted text-[10px] mb-1.5">Terminal scrollback: shells (rows)</div>
+                    <SettingSegment
+                      ariaLabel="Shell terminal scrollback rows"
+                      options={TERMINAL_SCROLLBACK_OPTIONS}
+                      value={String($interfaceStore.terminalScrollback)}
+                      onselect={(rows) => interfaceStore.setTerminalScrollback(Number(rows))}
+                    />
+                    <div class="text-textMuted text-[10px] mt-2 mb-1.5">Terminal scrollback: agents and task runs (rows)</div>
+                    <SettingSegment
+                      ariaLabel="Agent terminal scrollback rows"
+                      options={TERMINAL_SCROLLBACK_OPTIONS}
+                      value={String($interfaceStore.terminalAgentScrollback)}
+                      onselect={(rows) => interfaceStore.setTerminalAgentScrollback(Number(rows))}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
+                      Rows of history each terminal keeps. Every terminal holds about
+                      twelve bytes per column per row whether or not the row has text
+                      (roughly 12 MB for 5,000 rows at 200 columns), and the terminals
+                      of every repository tab you have visited stay open, so agents
+                      default to 1,000. Lowering a value trims open terminals at once.
+                    </p>
+                  </div>
+
                   <div data-setting="timestamps" hidden={!shown("timestamps")}>
                     <div class="flex items-center justify-between mb-1.5">
                       <span class="text-textMuted text-[10px]">Timestamps</span>
@@ -819,9 +873,13 @@
                         label="Launch at login"
                         description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
                         ariaLabel="Launch GitPulse at login"
-                        checked={launchAtLogin}
+                        checked={launchAtLogin.state === "on"}
+                        disabled={launchAtLogin.state === "unknown"}
                         onchange={(next) => void setLaunchAtLogin(next)}
                       />
+                      {#if launchAtLogin.state === "unknown"}
+                        <p class="mt-1 text-[10px] text-amber-500" role="status">Launch at login is unknown: it could not be read ({launchAtLogin.error}).</p>
+                      {/if}
                     </div>
                   </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>
@@ -1141,6 +1199,9 @@
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="lappi" hidden={!shown("lappi")}>
                   <LappiSettings active={isOpen && activeSection === "agents"} />
                 </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="host-load" hidden={!shown("host-load")}>
+                  <HostLoadSetting active={isOpen && activeSection === "agents"} />
+                </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">
                     Agents connect through the native Codex plugin package
@@ -1169,6 +1230,26 @@
                               {mcpInfo.binary_error}
                             {/if}
                           </div>
+                          <div class="text-textMuted text-[10px] font-mono break-all" data-testid="hook-binary-status">
+                            gitpulse-hook:
+                            {#if mcpInfo.hook_found}
+                              {mcpInfo.hook_path}
+                            {:else}
+                              not reachable. {mcpInfo.hook_error}
+                            {/if}
+                          </div>
+                          {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
+                            <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-1" data-testid="path-status">
+                              {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
+                                `gitpulse-mcp` and `gitpulse-hook` are not on PATH, so the plugin's own manifests cannot start them.
+                              {:else if !mcpInfo.binary_on_path}
+                                `gitpulse-mcp` is not on PATH, so the plugin's own manifest cannot start it.
+                              {:else}
+                                `gitpulse-hook` is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
+                              {/if}
+                              Copy the manifests below instead: they name the binaries by absolute path.
+                            </div>
+                          {/if}
                           <div class="text-textMuted text-[10px] mt-1">
                             {#if mcpInfo.plugin_found}
                               Plugin: {mcpInfo.plugin_path}
@@ -1191,11 +1272,20 @@
                         <button
                           type="button"
                           class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
-                          disabled={!mcpInfo.plugin_mcp_json}
-                          onclick={() => void copyMcp("mcp", mcpInfo?.plugin_mcp_json ?? "")}
+                          disabled={!mcpInfo.mcp_config_json}
+                          onclick={() => void copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")}
                         >
                           {#if mcpCopied === "mcp"}<Check size={10} />{:else}<Copy size={10} />{/if}
                           .mcp.json
+                        </button>
+                        <button
+                          type="button"
+                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                          disabled={!mcpInfo.hooks_config_json}
+                          onclick={() => void copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")}
+                        >
+                          {#if mcpCopied === "hooks"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                          hooks.json
                         </button>
                       </div>
                       {#if mcpInfo.tools.length > 0}
@@ -1276,6 +1366,9 @@
                     Shells, agent tabs and task terminals that may be open together, across every repository — up to {MAX_TERMINAL_SESSIONS}, {DEFAULT_TERMINAL_SESSIONS} unless you change it.
                     Applies to the next session. Lowering it closes nothing; new sessions wait until enough close.
                   </AgentLimitSetting>
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
+                  <KeepTerminalsSetting active={isOpen && activeSection === "agents"} />
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
                   <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import ManviOpsPanel from "./ManviOpsPanel.svelte";
 
@@ -62,12 +63,13 @@ describe("ManviOpsPanel deferred issue-load drain", () => {
   });
 
   it("drops a stale queued repo when a genuine repo change lands", () => {
-    // The effect memoizes on lastRepo (store emissions carry fresh objects
-    // per ~6s poll and must not re-run the resets); a real change first
-    // discards any request queued for an older repo.
-    const lastRepoIdx = source.indexOf("lastRepo = repo;");
-    expect(lastRepoIdx).toBeGreaterThan(-1);
-    expect(source.indexOf("pendingIssueRepo = null;", lastRepoIdx)).toBeGreaterThan(lastRepoIdx);
+    // The effect keys on the repository path store (store emissions carry
+    // fresh objects per ~6s poll and must not re-run the resets); a real
+    // change first discards any request queued for an older repo.
+    const resetIdx = source.indexOf("function resetForRepository(repo: string | null) {");
+    expect(resetIdx).toBeGreaterThan(-1);
+    expect(source).toContain("untrack(() => resetForRepository(repo));");
+    expect(source.indexOf("pendingIssueRepo = null;", resetIdx)).toBeGreaterThan(resetIdx);
   });
 });
 
@@ -179,7 +181,7 @@ describe("ManviOpsPanel issue monitor task integration", () => {
   });
 
   it("subscribes to live workbench-changed events with debounced refresh and teardown", () => {
-    expect(source).toContain('listen("workbench-changed", scheduleRefreshRepoTasks)');
+    expect(source).toContain("changed: scheduleRefreshRepoTasks");
     expect(source).toContain("createListenerTracker()");
     expect(source).toContain("listeners.dispose();");
     expect(source).toContain("function scheduleRefreshRepoTasks()");
@@ -190,5 +192,33 @@ describe("ManviOpsPanel issue monitor task integration", () => {
     expect(source).toContain("const currentGen = ++repoTasksGeneration;");
     expect(source).toContain("currentGen === repoTasksGeneration");
     expect(source).toContain("if ($repoStore.currentPath === repoPath)");
+  });
+
+  it("leaves task reloads to workbench-changed once it is listening", () => {
+    // ft-0ff882a6: the 60 s issue poll re-read every task although the
+    // change listener already reloads them on each change.
+    expect(source).toContain("if (!opts.background || !tasksFollowChanges) void loadRepoTasks(repo);");
+    expect(source).toContain("tasksFollowChanges = true;");
+    expect(source).toContain("createAdaptiveTimer(() => {");
+  });
+});
+
+describe("ManviOpsPanel cleanup runs against the repository it asked about", () => {
+  it.each([
+    ["cleanTags", "repoStore.deleteTag(name, target)"],
+    ["cleanBranches", "repoStore.deleteBranch(candidate.name, false, target)"],
+  ])("%s names its repository before the confirm and stops on a refusal", (name, call) => {
+    const body = functionBody(source, name);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(body.indexOf("repoStore.captureTarget()")).toBeLessThan(body.indexOf("await askConfirm("));
+    expect(body).toContain(call);
+    expect(body).toContain("outcome.refused");
+    expect(body).not.toMatch(/\$repoStore\.currentPath !== repo\) break/);
+  });
+
+  it("offers every Undo through the one owner and never restores by hand", () => {
+    expect(functionBody(source, "cleanBranches")).toContain("offerBranchUndo(");
+    expect(source).not.toContain("repoStore.createBranch(");
+    expect(source).not.toContain("Restored ${restoredTips.length}");
   });
 });

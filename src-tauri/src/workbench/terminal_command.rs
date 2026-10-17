@@ -1,6 +1,7 @@
 //! Provider arguments and one temporary source file for an explicitly requested
 //! terminal attempt. User task text never becomes shell syntax or an argv blob.
 
+use super::claude_hook;
 use super::WorkbenchError;
 use crate::engine::git_cli::{
     capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
@@ -48,12 +49,15 @@ impl BriefFile {
             std::process::id(),
             FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         // Not recursive: an existing directory at this name is refused rather
         // than adopted, so a planted one cannot become the agent's grant.
         builder
@@ -456,10 +460,17 @@ pub(crate) fn launch_model_choice(
     Ok(Some(choice))
 }
 
+/// The longest value the store records for one model field on a run — the
+/// vendored store's `runs.rs` refuses more — with `fallback` counted joined,
+/// as it is stored. Above any real id; a plain terminal tab records nothing
+/// and is held only to [`MAX_MODEL_ID_LEN`] per name.
+pub(crate) const MAX_RECORDED_MODEL_FIELD: usize = 128;
+
 /// A [`ModelChoice`] as the store records it on a run (`model_choice`): one
 /// string per field, `fallback` joined by commas — a model name never holds
-/// one ([`validate_model_id`]).
-pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
+/// one ([`validate_model_id`]). A field longer than the store records is
+/// refused here, by name, before a launch prepares anything for it.
+pub(crate) fn model_choice_record(choice: &ModelChoice) -> Result<serde_json::Value, String> {
     let mut record = serde_json::Map::new();
     for (field, value) in [
         ("model", choice.model.clone()),
@@ -471,10 +482,16 @@ pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
         ("advisor", choice.advisor.clone()),
     ] {
         if let Some(value) = value {
+            if value.len() > MAX_RECORDED_MODEL_FIELD {
+                return Err(format!(
+                    "The {field} setting is {} bytes as a task attempt records it; an attempt records at most {MAX_RECORDED_MODEL_FIELD}.",
+                    value.len()
+                ));
+            }
             record.insert(field.into(), serde_json::Value::String(value));
         }
     }
-    serde_json::Value::Object(record)
+    Ok(serde_json::Value::Object(record))
 }
 
 /// The run's recorded choice back as a [`ModelChoice`]; `None` for a run that
@@ -511,7 +528,7 @@ pub(crate) fn model_choice_from_record(
 }
 
 /// Keys for Claude Code's session-scoped `--settings` object, with their values.
-type ClaudeSettings = Vec<(&'static str, String)>;
+type ClaudeSettings = Vec<(&'static str, serde_json::Value)>;
 
 /// A [`ModelChoice`] as `provider`'s own flags, plus any keys that belong in
 /// Claude Code's `--settings` object. Validated first, so nothing a launch
@@ -533,7 +550,9 @@ fn model_flags(
         let Some(value) = value else { continue };
         match model_control(provider, field) {
             Some(ModelControl::Flag(flag)) => flags.extend([flag.to_owned(), value.clone()]),
-            Some(ModelControl::ClaudeSetting(key)) => settings.push((key, value.clone())),
+            Some(ModelControl::ClaudeSetting(key)) => {
+                settings.push((key, serde_json::Value::String(value.clone())))
+            }
             None => return Err(format!("{provider} does not take a {field} setting.")),
         }
     }
@@ -562,7 +581,7 @@ fn merge_claude_settings(flags: &mut Vec<String>, entries: ClaudeSettings) -> Re
         None => (None, serde_json::Map::new()),
     };
     for (key, value) in entries {
-        object.insert(key.to_owned(), serde_json::Value::String(value));
+        object.insert(key.to_owned(), value);
     }
     let merged = serde_json::Value::Object(object).to_string();
     match at {
@@ -583,6 +602,9 @@ pub(crate) struct LaunchOptions<'a> {
     pub setting_sources: Option<&'a str>,
     /// The user's model choice for this launcher, if they made one.
     pub model: Option<&'a ModelChoice>,
+    /// The `gitpulse-hook` binary to run as this launch's PreToolUse hook,
+    /// when the launch is to carry it (see [`claude_hook`]). Claude Code only.
+    pub hook: Option<&'a Path>,
 }
 
 /// Every flag an agent launch adds for the user's settings rather than for
@@ -610,7 +632,61 @@ pub(crate) fn launch_flags(
         flags.extend(model);
         merge_claude_settings(&mut flags, settings)?;
     }
+    if let (Some(binary), "claude") = (options.hook, provider) {
+        let hooks = claude_hook::settings_hooks(binary)?;
+        merge_claude_settings(&mut flags, vec![("hooks", hooks)])?;
+    }
     Ok(flags)
+}
+
+/// Where the caller's own `--settings` sits in `args`, before any `--`
+/// separator: after it every argument is the prompt, even one that reads
+/// `--settings`.
+fn caller_settings_at(args: &[String]) -> Option<usize> {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    args[..end].iter().position(|arg| arg == "--settings")
+}
+
+/// Folds the launch's `--settings` object into one the caller already passed.
+///
+/// `--settings` takes one value, so two occurrences would drop the first —
+/// the notification channel and the command gate along with it. The caller's
+/// keys win; their hooks stay and ours are added after them. A caller value
+/// that is a file path cannot be merged into, so the caller's is kept as it
+/// is and the launch's own settings are dropped, which is logged.
+fn fold_caller_settings(flags: Vec<String>, args: &mut [String], at: usize) -> Vec<String> {
+    let Some(ours_at) = flags.iter().position(|flag| flag == "--settings") else {
+        return flags;
+    };
+    let ours: Option<serde_json::Map<String, serde_json::Value>> = flags
+        .get(ours_at + 1)
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let theirs: Option<serde_json::Map<String, serde_json::Value>> = args
+        .get(at + 1)
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    match (ours, theirs) {
+        (Some(ours), Some(mut theirs)) => {
+            for (key, value) in ours {
+                if key == "hooks" {
+                    let merged = claude_hook::merge_hooks(theirs.get("hooks"), value);
+                    theirs.insert(key, merged);
+                } else {
+                    theirs.entry(key).or_insert(value);
+                }
+            }
+            args[at + 1] = serde_json::Value::Object(theirs).to_string();
+        }
+        _ => log::warn!(
+            target: "workbench",
+            "a launch's own --settings was dropped: the caller passed a --settings that is not a JSON object"
+        ),
+    }
+    let mut rest = flags;
+    rest.drain(ours_at..(ours_at + 2).min(rest.len()));
+    rest
 }
 
 /// A plain agent tab's arguments with the [`launch_flags`] in front.
@@ -628,11 +704,16 @@ pub(crate) fn with_launch_flags(
         Some(provider) => launch_flags(provider, options)?,
         None => Vec::new(),
     };
+    let mut caller = args.clone().unwrap_or_default();
+    let flags = match caller_settings_at(&caller) {
+        Some(at) => fold_caller_settings(flags, &mut caller, at),
+        None => flags,
+    };
     if flags.is_empty() {
-        return Ok(args);
+        return Ok(args.map(|_| caller));
     }
     let mut out = flags;
-    out.extend(args.unwrap_or_default());
+    out.extend(caller);
     Ok(Some(out))
 }
 
@@ -707,22 +788,29 @@ pub(super) fn check(
     mode: &str,
     options: &LaunchOptions<'_>,
 ) -> Result<(), WorkbenchError> {
-    let version = capture_command(
-        program,
-        &["--version"],
-        Some(Path::new(cwd)),
-        Duration::from_secs(8),
-        &[],
-    )
-    .map_err(|e| error("capability_error", e))?;
-    let help = capture_command(
-        program,
-        &["--help"],
-        Some(Path::new(cwd)),
-        Duration::from_secs(8),
-        &[],
-    )
-    .map_err(|e| error("capability_error", e))?;
+    // `--version` and `--help` describe the binary, not the repository or the
+    // launch, and used to run serially before every agent launch. They are
+    // kept per binary (path, size, mtime), so an upgrade is seen at once.
+    static PROBES: crate::tool_capability::BinaryProbeCache<
+        Result<(CapturedOutput, CapturedOutput), String>,
+    > = crate::tool_capability::BinaryProbeCache::new();
+    let probed = PROBES.get_or_probe(program, || {
+        let probe = |arg: &str| {
+            capture_command(
+                program,
+                &[arg],
+                Some(Path::new(cwd)),
+                Duration::from_secs(8),
+                &[],
+            )
+        };
+        let outcome = probe("--version").and_then(|v| probe("--help").map(|h| (v, h)));
+        // A refusal or a failed run may pass on the next try; only a binary
+        // that answered both is remembered.
+        let cacheable = outcome.as_ref().is_ok_and(|(v, h)| v.success && h.success);
+        (outcome, cacheable)
+    });
+    let (version, help) = probed.map_err(|e| error("capability_error", e))?;
     advertises(provider, mode, options, &version, &help)
 }
 
@@ -1029,6 +1117,20 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
         }
     };
     Ok((flags, mode == "inspect"))
+}
+
+/// The environment half of the launch table: what every PTY launch carries
+/// beside [`policy`]'s flags, by name, with `None` meaning "remove it".
+///
+/// `GITPULSE_RUN_ID` is the task attempt's run id, and absent from every
+/// other terminal — removed rather than left alone, because a GitPulse that
+/// was itself started inside an attempt (a dev build run from an agent's
+/// terminal) would otherwise hand that outer run's id to every shell tab, and
+/// each would be counted as part of a run it has nothing to do with. Every
+/// descendant inherits the value, which is how the host-load scan attributes a
+/// child that launchd adopted to the run that started it.
+pub(crate) fn launch_env(run_id: Option<&str>) -> [(&'static str, Option<String>); 1] {
+    [(crate::sysload::RUN_ID_ENV, run_id.map(str::to_owned))]
 }
 
 /// What a launched agent is told about finishing. How to work is not said
@@ -1400,6 +1502,7 @@ mod tests {
             notify,
             setting_sources,
             model: None,
+            hook: None,
         }
     }
 
@@ -1594,7 +1697,10 @@ mod tests {
         assert_eq!(separator, args.len() - 2, "{args:?}");
         assert!(args.iter().position(|a| a == "--add-dir").unwrap() < separator);
         assert!(args.iter().position(|a| a == "--settings").unwrap() < separator);
-        assert!(args[separator + 1].contains(&*brief.path.to_string_lossy()));
+        // The prompt carries the path as a JSON string, so a Windows path's
+        // backslashes are doubled there.
+        let quoted = serde_json::to_string(&*brief.path.to_string_lossy()).unwrap();
+        assert!(args[separator + 1].contains(&quoted), "{args:?}");
 
         // An id Claude would refuse is left out, never reshaped into one.
         for id in ["run", "6F1C2A7E0D4B4C1E9A553B0E8F2D9C11", "../../run", ""] {
@@ -1936,6 +2042,39 @@ mod tests {
         );
         assert_eq!(removed, 0);
         assert!(live.path.exists());
+    }
+
+    /// `--version` and `--help` ran serially before every agent launch. They
+    /// describe the binary, so they run once per binary (path, size, mtime).
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_clis_version_and_help_are_probed_once_per_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        let write = |tag: &str| {
+            std::fs::write(
+                &bin,
+                format!("#!/bin/sh\ncase \"$1\" in --version) echo 'Claude Code {tag}';; *) echo 'usage';; esac\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("1.0");
+        let program = bin.to_str().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let spawns = |program: &str| {
+            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                // The verdict is not the point (the fake advertises no flags);
+                // how many children were started to reach it is.
+                let _ = super::check(program, cwd, "claude", "ask", &opts(true, None));
+            });
+            labels.len()
+        };
+        assert_eq!(spawns(program), 2, "first launch: --version and --help");
+        assert_eq!(spawns(program), 0, "second launch reuses the answer");
+        write("2.0.1-longer");
+        assert_eq!(spawns(program), 2, "an upgraded binary is probed again");
     }
 
     #[test]
@@ -2631,6 +2770,7 @@ mod model_tests {
                     notify: true,
                     setting_sources: Some("user"),
                     model: Some(&choice),
+                    hook: None,
                 },
                 Some(vec!["--".into(), "Fix the failing test".into()]),
             )
@@ -2672,6 +2812,7 @@ mod model_tests {
                     notify: true,
                     setting_sources: None,
                     model: Some(&choice),
+                    hook: None,
                 },
             },
         )
@@ -2938,6 +3079,7 @@ mod model_tests {
                     notify: true,
                     setting_sources: None,
                     model: Some(&choice),
+                    hook: None,
                 },
             )
             .unwrap_or_else(|error| panic!("{launcher}: {}", error.message));
@@ -2947,7 +3089,10 @@ mod model_tests {
 
 #[cfg(test)]
 mod launch_choice_tests {
-    use super::{launch_model_choice, model_choice_from_record, model_choice_record};
+    use super::{
+        launch_model_choice, model_choice_from_record, model_choice_record,
+        MAX_RECORDED_MODEL_FIELD,
+    };
     use crate::tool_config::ModelChoice;
     use serde_json::json;
 
@@ -3006,7 +3151,7 @@ mod launch_choice_tests {
             advisor: Some("opus".into()),
             ..choice(Some("opus[1m]"), Some("high"))
         };
-        let record = model_choice_record(&original);
+        let record = model_choice_record(&original).unwrap();
         assert_eq!(
             record,
             json!({"model":"opus[1m]","effort":"high","fallback":"sonnet,haiku","advisor":"opus"})
@@ -3015,5 +3160,178 @@ mod launch_choice_tests {
         assert_eq!(model_choice_from_record(&json!(null)).unwrap(), None);
         assert!(model_choice_from_record(&json!({"temperature":"1"})).is_err());
         assert!(model_choice_from_record(&json!({"model":7})).is_err());
+    }
+
+    /// The store refuses a recorded field over 128 bytes; the record says so
+    /// first, naming the field, and counts `fallback` the way it is stored.
+    #[test]
+    fn the_record_refuses_a_field_the_store_would() {
+        let at_cap = "m".repeat(MAX_RECORDED_MODEL_FIELD);
+        assert!(model_choice_record(&choice(Some(&at_cap), None)).is_ok());
+        let over = "m".repeat(MAX_RECORDED_MODEL_FIELD + 1);
+        let refused = model_choice_record(&choice(Some(&over), None)).unwrap_err();
+        assert!(
+            refused.contains("model") && refused.contains("128"),
+            "{refused}"
+        );
+        let half = "f".repeat(MAX_RECORDED_MODEL_FIELD / 2);
+        let joined = ModelChoice {
+            fallback: Some(vec![half.clone(), half]),
+            ..ModelChoice::default()
+        };
+        let refused = model_choice_record(&joined).unwrap_err();
+        assert!(refused.contains("fallback"), "{refused}");
+    }
+}
+
+#[cfg(test)]
+mod hook_launch_tests {
+    use super::{launch_flags, with_launch_flags, LaunchOptions};
+    use serde_json::Value;
+    use std::path::Path;
+
+    const HOOK: &str = "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook";
+
+    fn with_hook(notify: bool) -> LaunchOptions<'static> {
+        LaunchOptions {
+            notify,
+            hook: Some(Path::new(HOOK)),
+            ..LaunchOptions::default()
+        }
+    }
+
+    fn settings_of(argv: &[String]) -> Value {
+        let at = argv
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--settings").count(),
+            1,
+            "{argv:?}"
+        );
+        serde_json::from_str(&argv[at + 1]).expect("settings JSON")
+    }
+
+    #[test]
+    fn one_settings_object_carries_the_channel_and_the_hooks() {
+        let flags = launch_flags("claude", &with_hook(true)).unwrap();
+        let settings = settings_of(&flags);
+        let mut keys: Vec<_> = settings.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["hooks", "preferredNotifChannel"]);
+        let commands: Vec<String> = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["hooks"][0]["command"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(commands.len(), 2);
+        for command in commands {
+            assert!(command.starts_with(&format!("'{HOOK}' ")), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_hook_rides_a_launch_that_sends_no_notification_flags() {
+        let flags = launch_flags("claude", &with_hook(false)).unwrap();
+        let settings = settings_of(&flags);
+        assert_eq!(
+            settings.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["hooks"]
+        );
+    }
+
+    #[test]
+    fn no_hook_leaves_the_launch_exactly_as_it_was() {
+        let flags = launch_flags(
+            "claude",
+            &LaunchOptions {
+                notify: true,
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            flags,
+            ["--settings", r#"{"preferredNotifChannel":"terminal_bell"}"#]
+        );
+    }
+
+    #[test]
+    fn only_claude_takes_the_hook() {
+        for provider in ["codex", "grok", "agy"] {
+            let flags = launch_flags(provider, &with_hook(false)).unwrap();
+            assert!(
+                !flags.iter().any(|f| f == "--settings"),
+                "{provider}: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callers_own_settings_object_is_merged_not_duplicated() {
+        let caller = vec![
+            "--settings".to_owned(),
+            r#"{"model":"opus","preferredNotifChannel":"iterm2","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"mine"}]}]}}"#
+                .to_owned(),
+            "--".to_owned(),
+            "hello".to_owned(),
+        ];
+        let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller))
+            .unwrap()
+            .unwrap();
+        let settings = settings_of(&argv);
+        assert_eq!(settings["model"], "opus");
+        // The caller's own value wins over the launch's.
+        assert_eq!(settings["preferredNotifChannel"], "iterm2");
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0]["hooks"][0]["command"], "mine");
+        assert_eq!(argv[argv.len() - 2..], ["--", "hello"]);
+    }
+
+    #[test]
+    fn a_settings_file_path_from_the_caller_is_kept_and_nothing_is_doubled() {
+        let caller = vec!["--settings".to_owned(), "/tmp/their.json".to_owned()];
+        let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv, caller);
+    }
+
+    #[test]
+    fn a_prompt_that_reads_settings_is_not_a_settings_flag() {
+        let caller = vec!["--".to_owned(), "--settings".to_owned(), "{}".to_owned()];
+        let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv.iter().filter(|a| *a == "--settings").count(), 2);
+        assert_eq!(argv[argv.len() - 3..], ["--", "--settings", "{}"]);
+        assert!(settings_of(&argv[..argv.len() - 3]).get("hooks").is_some());
+    }
+
+    #[test]
+    fn resume_and_session_id_arguments_pass_through_untouched() {
+        for caller in [
+            vec!["--resume", "6f0a6d1e-1111-4222-8333-444455556666"],
+            vec!["--session-id", "6f0a6d1e-1111-4222-8333-444455556666"],
+            vec!["--continue"],
+        ] {
+            let caller: Vec<String> = caller.into_iter().map(str::to_owned).collect();
+            let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller.clone()))
+                .unwrap()
+                .unwrap();
+            assert!(argv.ends_with(&caller), "{argv:?}");
+            assert!(settings_of(&argv[..argv.len() - caller.len()])
+                .get("hooks")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn no_flags_and_no_arguments_stay_no_arguments() {
+        let none = with_launch_flags(Some("claude"), &LaunchOptions::default(), None).unwrap();
+        assert_eq!(none, None);
     }
 }

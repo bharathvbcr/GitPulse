@@ -344,7 +344,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Go,
         lsp_id: "gopls",
         viz_color: "#00ADD8",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
         liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
@@ -752,6 +752,11 @@ pub fn detect_language(path: &Path) -> &'static str {
         || filename == "go.mod"
         || filename == "jsconfig.json"
         || filename == "tsconfig.json"
+        // Read for the components it registers, which the framework
+        // instantiates by name (`androidmanifest::parse_components`).
+        || filename == "AndroidManifest.xml"
+        // Read for its product types (`wiring::xcode_builds_only_apps`).
+        || filename == "project.pbxproj"
     {
         return "config";
     }
@@ -1388,6 +1393,8 @@ mod tests {
             "go.mod",
             "jsconfig.json",
             "tsconfig.json",
+            "AndroidManifest.xml",
+            "project.pbxproj",
         ] {
             assert_eq!(
                 detect_language(Path::new(filename)),

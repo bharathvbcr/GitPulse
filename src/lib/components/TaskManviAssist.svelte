@@ -19,11 +19,12 @@
     type Enhancement,
     type EnhancementConfiguration,
     type EnhancementField,
+    type LockableField,
     type EnhancementMutation,
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, appendedHistory, liveEnhancement, refreshedHistory, type AssistEngine } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, appendedHistory, enhancementMoved, liveEnhancement, refreshedHistory, type AssistEngine } from "../workbench/taskEnhance";
   import { timestampFormat } from "../ui/timestampFormat";
   import {
     appleBadge,
@@ -56,7 +57,7 @@
     description = $bindable(""),
     repositoryIds = [],
     repositoryNames = [],
-    lockedFields = $bindable<EnhancementField[]>([]),
+    lockedFields = $bindable<LockableField[]>([]),
     prepareTask = async (): Promise<Task | null> => task,
     onApplied,
     onBusy,
@@ -86,7 +87,7 @@
      * around. A caller that has no names passes none and the line is omitted.
      */
     repositoryNames?: readonly string[];
-    lockedFields?: EnhancementField[];
+    lockedFields?: LockableField[];
     prepareTask?: () => Promise<Task | null>;
     onApplied: (task: Task) => void;
     onBusy: (busy: boolean) => void;
@@ -228,7 +229,7 @@
   );
   /** Why the selected proposal cannot be applied here, or "" when it can. */
   const applyBlock = $derived(enhancementApplyBlock(proposal, task));
-  const liveAttempt = $derived(liveEnhancement(proposal) || liveEnhancement(latestActive) || entries.some((entry) => liveEnhancement(entry)));
+  const liveAttempt = $derived(liveEnhancement(proposal, now) || liveEnhancement(latestActive, now) || entries.some((entry) => liveEnhancement(entry, now)));
   const stale = $derived(Boolean(proposal && task && proposal.source_revision !== task.revision));
   const ready = $derived(proposal?.state === "ready");
   /**
@@ -291,7 +292,7 @@
   );
   const revisionDirty = $derived(proposal?.fields.some((field) => revisionDraft[field] !== proposal?.proposed[field]) ?? false);
   const failureAdvice = $derived(proposal?.failure ? explainEnhancementFailure(proposal.failure) : null);
-  const expiredLive = $derived(Boolean(proposal && liveEnhancement(proposal) && now >= proposal.expires_at));
+  const expiredLive = $derived(Boolean(proposal && liveEnhancement(proposal, now) && now >= proposal.expires_at));
 
   function toggleField(field: EnhancementField, on: boolean) {
     if (acting || disabled || lockedFields.includes(field)) return;
@@ -369,7 +370,8 @@
   // the one-live-attempt guard stay true while it runs.
   $effect(() => {
     if (!active || !visible || !latestActive || !liveEnhancement(latestActive) || latestActive.id === proposal?.id) return;
-    return createAdaptiveTimer(() => { if (!acting && !editing) void history(); }, 2000);
+    const id = latestActive.id;
+    return createAdaptiveTimer(() => { if (!acting && !editing) void follow(id); }, 2000);
   });
   /**
    * Read the model configuration, sharing one request between callers.
@@ -487,11 +489,30 @@
     try {
       const next = await bounded(getEnhancement(id));
       if (disposed || ticket !== epoch || acting || proposal?.id !== id || next.revision < (proposal?.revision ?? 0)) return;
-      proposal = next;
       error = "";
+      // Nothing moved: keep the object on screen and skip the history read.
+      if (!enhancementMoved(proposal, next)) return;
+      proposal = next;
       if (task) void history();
     } catch (cause) {
       if (!disposed && ticket === epoch) error = `Status refresh failed: ${explainError(cause)}`;
+    } finally { polling = false; }
+  }
+
+  /**
+   * Follows a live attempt the review is not on. One read of that attempt
+   * per tick; the history (two reads) only when it moved.
+   */
+  async function follow(id: string) {
+    if (polling || acting || disposed || !active || readBackgroundDocument()) return;
+    polling = true;
+    try {
+      const next = await bounded(getEnhancement(id));
+      if (disposed || latestActive?.id !== id || !enhancementMoved(latestActive, next)) return;
+      void history();
+    } catch {
+      // Fall back to the read this tick used to make; it reports its own failure.
+      if (!disposed) void history();
     } finally { polling = false; }
   }
 
@@ -552,7 +573,8 @@
       // this check belongs to neither of them in particular.
       const existing = await bounded(latestEnhancement(saved.id, LIVE_ENHANCEMENT_STATES));
       if (disposed) return;
-      if (existing) {
+      // The filter is the store's states, not its clock: a pending proposal past its expiry no longer counts.
+      if (existing && liveEnhancement(existing)) {
         const current = await bounded(getEnhancement(existing.id));
         if (!disposed) { proposal = current; note = "A suggestion is already in progress."; await history(); }
         return;
@@ -748,7 +770,7 @@
   {#if ready && (dirty || stale)}<p class="warn">{dirty ? "Save or reload your edits before accepting a suggestion." : "This suggestion is for an older task revision. Request a fresh suggestion."}</p>{/if}
   {#if error}<p role="alert" class="error">{error}</p>{/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
-  {#if proposal && liveEnhancement(proposal)}
+  {#if proposal && liveEnhancement(proposal, now)}
     <p class="meta" role="status">
       {proposal.state === "running" ? "Manvi is drafting…" : proposal.state === "cancel_requested" ? "Waiting for cancellation…" : "Waiting to start."}
       {#if expiredLive} The deadline passed; termination is unconfirmed.{/if}

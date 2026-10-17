@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import { createRepoStore, type RepoState } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
-import { buildMenuState, countAgentsWaiting, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
+import { blockedWhilePrompting, buildMenuState, countAgentsWaiting, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
 import { MENU_LIMITS } from "./menuContract";
 import type { AttentionKind, SessionActivity } from "../terminal/sessionActivity";
 
@@ -242,4 +242,16 @@ describe("agents waiting on the reader", () => {
     expect(waiting(Number.NaN)).toBe(0);
     expect(waiting(Number.POSITIVE_INFINITY)).toBe(0);
   });
+});
+
+describe("blockedWhilePrompting", () => {
+  it.each(["activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone", "create-branch", "rename-branch", "quick-commit", "stash"])(
+    "blocks %s while a prompt is open",
+    (id) => expect(blockedWhilePrompting(id)).toBe(true),
+  );
+
+  it.each(["stage-all", "zoom-in", "check-updates", "fleet"])(
+    "leaves %s alone",
+    (id) => expect(blockedWhilePrompting(id)).toBe(false),
+  );
 });

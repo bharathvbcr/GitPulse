@@ -569,7 +569,146 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the resolver joins to a Metal entry point of that name. Served warm, a row
 /// without them leaves every macro-stamped kernel unsearchable and every
 /// `pipeline("…")` host unlinked.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "77";
+///
+/// v78 was stamped by two lanes on different payloads. The read-tools lane's
+/// v78 withholds what a secret file (`policy.SecretPathPatterns`) writes: its
+/// literal values become `secret::WITHHELD_LITERAL_VALUE`, its docstrings are
+/// dropped and its string-made references removed. A row without that for
+/// such a file holds the credentials themselves, and since a row is reused for
+/// as long as the file is unchanged, it would keep serving them — and keep
+/// them in a store that is copied between worktrees — until someone edited
+/// the file.
+///
+/// The dead-policy lane's v78 is the dead-policy card's extractor half: cgo
+/// `//export` and `//go:linkname` functions and `#[tauri::command]` functions
+/// are runtime entry points; every symbol inside a TypeScript `declare module`
+/// / `declare global` block or a `.d.ts` file is structurally exempt; a
+/// destructuring default (`{ sleep = defaultSleep }`) is a use, not a
+/// parameter binding; a Swift custom-operator use is a call and a
+/// standard-operator overload is exempt; and a Swift `Type.member` value
+/// carries its receiver. A row without them keeps every one of those symbols
+/// looking uncalled.
+///
+/// v79 is both v78 payloads together, under a number neither lane stamped: a
+/// row stamped 78 by either lane lacks the other's half.
+///
+/// v80 records `ParseOutcome::Partial::nameless_ranges`, the error regions
+/// that hold no identifier character. A v79 row reads back with that list
+/// empty, which charges every such region against the dead-code ceiling —
+/// a lone `}` would keep a whole language out of the confident tier until
+/// the file was edited.
+///
+/// v81 records the Rust facts the receiver and path rules read (inline modules,
+/// `Deref` targets, implicit operator/drop/from candidates, `generate_handler!`
+/// lists, `macro_rules!` expansions). v82 records a Go file's declarations,
+/// local scopes and call receivers as structured facts (`go_facts`), the input
+/// of the resolver's Go type evaluator. Two lanes each stamped 81 on these
+/// different payloads; the later one is 82, so no two extractions share a
+/// version.
+///
+/// v83 records the TypeScript lane's extraction: the workspace-package map
+/// (`workspaces.rs`), member-qualified ids for class-field and object-literal
+/// members (`store.ts::paperService.fetchOne`, not `store.ts::fetchOne`), and
+/// `export default` as an export named `default`. That lane changed what a
+/// TypeScript file extracts to without stamping a version, so a v82 row would
+/// keep serving the old ids.
+///
+/// v84 binds a Swift or Kotlin callable's parameters and a closure's parameters
+/// (and the implicit `it` / `$0`) as local bindings of that scope. A v83 row has
+/// none, so a bare call to a function-typed parameter, or a receiver typed by
+/// another function's same-named parameter, would still be bound to a project
+/// namesake from a warm cache. The resolver lane stamped 81 on this payload; it
+/// landed after the Rust, Go and TypeScript lanes, so it is 84.
+///
+/// v85 records the implicit `__enter__` call of a Python `with Class(...)`
+/// statement. A v84 row has no such call, so the context manager's `__enter__`
+/// would keep looking uncalled until the file was edited. The Python lane
+/// stamped 82 on this payload; it landed after the others, so it is 85.
+///
+/// v86 records the Swift lane's extraction: protocol requirements as symbols
+/// (`Interface` members, so a call through a protocol-typed value has a direct
+/// edge), and scope-aware Swift locals (`swiftscope`). A v85 row lacks them, so
+/// the requirement would keep looking undeclared and the call unattributed from
+/// a warm cache. The Swift lane carried no stamp of its own, so it is 86.
+///
+/// v87 is the Kotlin accuracy payload: a Kotlin parameter, typed local and
+/// primary-constructor `val` carry a `Type` reference (so a receiver written
+/// through them is typed), a Kotlin/Java file records its `package` header, a
+/// Kotlin file records its scope-function lambdas, a callable reference, a
+/// `super.m()` and an explicit-type-argument call are calls, a Kotlin function
+/// carries its written return type and an extension property is a symbol; an
+/// `AndroidManifest.xml` is an indexed config whose components are entry
+/// points; a Ruby `attr_*` / `define_method` is a method symbol and an
+/// `include` / `prepend` is heritage. A v86 row has none of these, which
+/// leaves every receiver through a constructor property or a parameter
+/// untyped, and every manifest-only class a dead-code candidate, until the
+/// file is edited. The Kotlin lane stamped 82 on this payload; it landed after
+/// the others, so it is 87.
+///
+/// v88 is the dead-policy lane's payload, stamped 81 and 82 there: a Rust
+/// method of a type declared inside a function is keyed under that function
+/// (`with_guard.Guard.drop`, not `Guard.drop`); a Kotlin callable reference
+/// (`template::m`, `Type::m`) carries its receiver on the name reference; a
+/// Rust `fn main` outside every `src/` tree is an entry point; a Rust
+/// `pub(crate)`/`pub(super)`/`pub(in …)` item carries a `ModulePrivateScope`
+/// annotation; `project.pbxproj` is indexed; a `Package.swift` carries a
+/// `ModulePrivateScope` per executable target; and a qualified JS/TS base
+/// (`extends React.Component`) is one `Heritage` reference per segment,
+/// innermost first, as Python's dotted bases already were. A v87 row keeps the
+/// old Rust keys and lacks every one of those facts. It landed after the
+/// Kotlin lane, so it is 88.
+///
+/// v89 types a Rust parameter, local or field written `dyn Trait` / `impl
+/// Trait` (bare, behind a reference, or in a `Box`/`Rc`/`Arc`) by its one named
+/// trait, so a method call on it reaches the trait's declaration. A v88 row
+/// leaves such a binding untyped, so the call would stay an unattributed miss
+/// from a warm cache until the file was edited. It also records a Python
+/// `importlib.import_module("pkg.mod")` with a literal name as a scoped module
+/// handle (`PathLoadKind::ModuleName`), which a v88 row lacks, so `mod.f()`
+/// through it would stay unresolved. The resolver-accuracy lane stamped 88
+/// on this payload; it landed after the dead-policy lane, so it is 89.
+///
+/// v90 (rust lane) is the second L-Rust payload: a `macro_rules!` definition is a `Macro`
+/// symbol its same-file invocations reference; a Rust file records the type
+/// parameter of each blanket impl (`rust_blanket_impl_params`) and the
+/// `From::from` candidate of each `?` in a function returning `Result<_, E>`
+/// (`rust_try_conversions`); and a bare call of a same-file `const`/`static`
+/// function pointer also calls the function its initializer names. A v89 row
+/// has no macro symbol and none of those facts, so the blanket-impl method, the
+/// `?` conversion and the pointer's target would stay without a caller from a
+/// warm cache until the file was edited.
+///
+/// v90 (ts/go lane) records a TypeScript `method_signature` inside an `interface_declaration`
+/// as a `Method` symbol, and a Go struct or interface embedding (a field or
+/// type element with no name) as a `Heritage` reference. A v89 row has neither,
+/// so a call through an interface stays unbound and a Go embedding stays
+/// invisible until the file is edited.
+///
+/// v90 (main's Swift recall lane) is the Swift receiver-typing payload: a
+/// receiver or constructor named through a same-file `typealias` is the aliased
+/// type, `(x as? T)?.m()` is a call on `T`, a tuple parameter's member is a
+/// receiver of its written type, a bare call of a type's own parameterless
+/// method types the local it initialises, a SwiftData `fetch(FetchDescriptor<T>)`
+/// is `[T]`, a Swift name is not a local inside its own initializer, a member
+/// chain after a sum (`a + b.c.run()`) has the receiver `b.c`, and the file's
+/// own scoping (a generic parameter, a local typealias, an associatedtype, a
+/// rebinding) makes the extractor abstain.
+///
+/// v92 integrates the Rust, TypeScript/Go and Swift lanes (the Swift lane adds
+/// `swift_type_aliases` to the extractor output without a bump).
+///
+/// v93 integrates main into that branch. Main stamped 90 on the Swift
+/// receiver-typing payload above while this branch's lanes stamped 90 (Rust,
+/// TypeScript/Go) and 92 on other payloads, so 93 is a number no binary has
+/// cached under a different meaning.
+///
+/// v94 marks a Python `from m import *` with the alias `*` (as a Go dot-import
+/// is marked by `.`), so the resolver can tell a star import from `import m`,
+/// and records a JS/TS
+/// module-scope `const`/`let`/`var` name in `scope_locals` under the file's own
+/// name, so a private module-scope binding is no longer invisible. A v93 row has
+/// neither.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "94";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

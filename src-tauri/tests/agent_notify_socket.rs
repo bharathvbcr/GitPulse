@@ -14,6 +14,11 @@
 
 #![cfg(unix)]
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -259,7 +264,7 @@ fn a_hook_that_exits_without_connecting_is_reported_promptly_not_awaited() {
         "a state report with no session reached the socket"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(10)),
         "waiting for a connection that never came took {:?}",
         started.elapsed()
     );
@@ -301,7 +306,7 @@ fn a_socket_that_is_not_there_costs_the_turn_nothing() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(10)),
         "an absent socket held the turn for {:?}",
         started.elapsed()
     );

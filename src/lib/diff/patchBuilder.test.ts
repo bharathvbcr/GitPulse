@@ -261,6 +261,45 @@ describe("serializeSelectivePatch (wire-format twin)", () => {
     expect(text).not.toContain("+kept tail");
   });
 
+  it("serializes the marker after a trailing context row", () => {
+    const raw = "--- a/eof.txt\n+++ b/eof.txt\n@@ -1,3 +1,3 @@\n-old\n+new\n tail\n\\ No newline at end of file\n";
+    const text = stagedPatch(raw, ["del", "add"]);
+    expect(text).toBe(
+      [
+        "--- a/eof.txt",
+        "+++ b/eof.txt",
+        "@@ -1,2 +1,2 @@",
+        "-old",
+        "+new",
+        " tail",
+        "\\ No newline at end of file",
+      ].join("\n") + "\n"
+    );
+  });
+
+  it("keeps the context marker when the replacement in front of it is only partly selected", () => {
+    const raw = "--- a/eof.txt\n+++ b/eof.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n\\ No newline at end of file\n";
+    const text = stagedPatch(raw, ["add"]);
+    expect(text).toBe(
+      [
+        "--- a/eof.txt",
+        "+++ b/eof.txt",
+        "@@ -1,2 +1,3 @@",
+        " old",
+        "+new",
+        " tail",
+        "\\ No newline at end of file",
+      ].join("\n") + "\n"
+    );
+  });
+
+  it("flags only the hunk that ends the file when several hunks are present", () => {
+    const raw = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n same\n@@ -9,2 +9,2 @@\n-x\n+y\n tail\n\\ No newline at end of file\n";
+    const text = stagedPatch(raw, ["del", "add"]);
+    expect(text.match(/No newline/g)).toHaveLength(1);
+    expect(text.endsWith(" tail\n\\ No newline at end of file\n")).toBe(true);
+  });
+
   it("counts marker lines toward neither side's totals", () => {
     const raw = "--- a/x.txt\n+++ b/x.txt\n@@ -1,1 +1,1 @@\n-solo\n\\ No newline at end of file\n+solo too\n\\ No newline at end of file\n";
     const text = stagedPatch(raw, ["del", "add"]);

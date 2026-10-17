@@ -7,8 +7,7 @@
     <button id="checks" disabled style="position:fixed;top:4px;right:4px;z-index:100">Run terminal checks</button>
     <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;z-index:100;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
     <script type="module">
-      import { mockIPCWithEvents } from "./tauriMocks";
-      import { emit } from "@tauri-apps/api/event";
+      import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
       import { createChecks } from "./checks.ts";
       import "../src/app.css";
 
@@ -24,8 +23,18 @@
       /** What `cmd_terminal_context` reports for every session: where it is, and whether a job runs. */
       let contextDir = "";
       let contextBusy = false;
+      /** `cmd_terminal_context` never answers: a host too loaded to scan processes. */
+      let contextHangs = false;
+      /** Sessions a tab let go of without Close (`cmd_terminal_detach`). */
+      const detachedIds = new Set();
       /** `startDir` of every `cmd_terminal_spawn`, in order. */
       const startDirs = [];
+      /** The launch half of every `cmd_terminal_spawn`: program, mode, acknowledgement. */
+      const launches = [];
+      /** `cmd_agent_defaults` answers a saved "Skip permissions" for Claude; otherwise it is unimplemented, as before. */
+      let bypassDefaults = false;
+      /** Every `cmd_terminal_run` the Console sent, and the replies it gets, in order. */
+      const consoleRuns = [], consoleReplies = [];
       /** Every URL handed to the OS opener, so a refused scheme is provably
        * refused rather than merely unobserved. */
       const opened = [];
@@ -37,7 +46,8 @@
         const bytes = new TextEncoder().encode(text);
         for (let i = 0; i < bytes.length; i += 4096) {
           const slice = bytes.subarray(i, i + 4096);
-          await emit("terminal-output", { id, data_b64: btoa(String.fromCharCode(...slice)), bytes: slice.length });
+          pushOutput(id, slice);
+          await Promise.resolve();
         }
       };
       /** One line carrying every span class the linkifier must judge: an
@@ -48,17 +58,20 @@
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
           case "plugin:opener|open_url": opened.push(args.url ?? args.path); return null;
+          case "cmd_terminal_run": consoleRuns.push(args); return consoleReplies.shift() ?? { exit_code: 0, timed_out: false, stdout_tail: "", stderr_tail: "", truncated: false, truncation_reason: null, policy: null };
           case "cmd_terminal_spawn": {
             const id = `fixture-${++report.spawned}`;
+            adoptOutput(id, args);
             sessions.set(id, args.repoPath);
             startDirs.push(args.startDir ?? null);
+            launches.push({ program: args.program ?? null, permissionMode: args.permissionMode ?? null, acknowledged: args.acknowledged ?? null });
             if (earlyLoss) {
               earlyLoss = false;
               // Listeners are already attached. These bytes have to land before
               // the id returns, which is the only moment the bus can lose them.
               return (async () => {
-                for (let i = 0; i < 129; i++) await emit("terminal-output", { id, data_b64: "QQ==", bytes: 1 });
-                await emit("terminal-exit", { id, exit_code: 0, signal: "", error: null, reaped: true });
+                for (let i = 0; i < 129; i++) pushOutput(id, "A");
+                await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
                 showReport();
                 return { id, cwd: args.repoPath, shell: "/bin/zsh" };
               })();
@@ -75,6 +88,9 @@
             showReport();
             return { id, cwd: args.repoPath, shell: "/bin/zsh" };
           }
+          case "cmd_agent_defaults":
+            if (!bypassDefaults) throw new Error(`Unimplemented fixture: ${cmd}`);
+            return { defaults: { permission: { claude: "bypass" } }, modes: ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"], launchers: ["claude", "codex", "grok", "agy"] };
           case "cmd_terminal_ack":
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
@@ -92,6 +108,12 @@
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
           case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          // A tab unmounted without Close: the host keeps the process.
+          case "cmd_terminal_detach": {
+            const kept = sessions.has(args.sessionId);
+            if (kept) detachedIds.add(args.sessionId);
+            report.detached = (report.detached ?? 0) + (kept ? 1 : 0); showReport(); return kept;
+          }
           // What a reload leaves behind: a session the host still runs that
           // this page never started.
           // A task attempt's run record: the one place that names its task,
@@ -104,8 +126,13 @@
             return JSON.stringify({ ok: true, item: { kind: "external_terminal", id: "fixture-run", revision: 2, updated_at: 1, task_id: "fixture-task", source_revision: 1, task_title: "Fix the flaky test", repository_id: "repo", provider: "claude", permission_mode: "ask", state: "running", cwd: "/fixture/GitPulse", created_at: now, expires_at: now + 300, session_id: "fixture-task-session", exit_code: null, reason: "", outcome_uncertain: false } });
           }
           case "cmd_terminal_sessions":
-            return [{ id: "fixture-detached", shell: "/bin/zsh", cwd: "/fixture/GitPulse", repo: "/fixture/GitPulse", launcher: null, run_id: null, detached: true }];
+            // The host's own sessions as it lists them, plus one a reload left.
+            return [
+              { id: "fixture-detached", shell: "/bin/zsh", cwd: "/fixture/GitPulse", repo: "/fixture/GitPulse", launcher: null, run_id: null, detached: true },
+              ...[...sessions].filter(([id]) => id !== "fixture-detached").map(([id, root]) => ({ id, shell: "/bin/zsh", cwd: root, repo: root, launcher: null, run_id: null, detached: detachedIds.has(id) })),
+            ];
           case "cmd_terminal_attach": {
+            adoptOutput(args.sessionId, args);
             report.attaches = [...(report.attaches ?? []), { sessionId: args.sessionId, rows: args.rows, cols: args.cols }];
             sessions.set(args.sessionId, "/fixture/GitPulse");
             setTimeout(() => void output(args.sessionId, "\r\n/fixture/GitPulse $ "), 50);
@@ -115,9 +142,13 @@
           case "cmd_terminal_context": {
             const root = sessions.get(args.sessionId);
             if (!root) throw new Error(`Terminal session '${args.sessionId}' not found`);
+            // A host that never answers: the page's own deadline is all that ends the wait.
+            if (contextHangs) return new Promise(() => {});
             return {
               process: contextBusy ? "cargo" : "zsh",
               busy: contextBusy,
+              // The real host always reports it: foreground and jobs are separate questions.
+              jobs: contextBusy,
               cwd: contextDir ? `${root}/${contextDir}` : root,
               repo_dir: contextDir,
             };
@@ -147,6 +178,10 @@
       await repoStore.openRepo("/fixture/GitPulse");
       interfaceStore.setTerminalFontSize(12);
       interfaceStore.setTerminalDockHeight(400);
+      // The checks read the grid back from xterm's DOM rows (hover targets,
+      // row heights, rendered text), which only the DOM renderer writes. The
+      // GPU block turns WebGL on for itself and off again when it is done.
+      interfaceStore.setTerminalGpu(false);
       // Per repository tab: this opens the dock on /fixture/GitPulse, the tab
       // that is active, and deliberately NOT on /fixture/Other.
       repoStore.setTerminalOpen(true);
@@ -215,7 +250,7 @@
       async function runChecks() {
         const { results, check, stopped } = createChecks();
         try {
-          const writesBefore = report.writes;
+          let writesBefore = report.writes;
           const status = () => visible('[role="status"]')[0]?.textContent;
           const input = async (text) => {
             const field = label("Find in terminal output");
@@ -238,6 +273,57 @@
             if (bad) throw new Error(JSON.stringify(bad));
             return true;
           });
+
+          // ---- xterm options that only the real renderer can show.
+          // Option+B on a Mac keyboard composes a glyph unless Option is Meta;
+          // xterm keys the ESC prefix off keyCode, not the composed character.
+          // Off a Mac, xterm sends the ESC prefix for Alt without being asked, so
+          // there the row proves the key reaches the PTY and not the option; the
+          // row says which host it ran on, so a pass is never read as more.
+          {
+            const onMac = /Mac/.test(navigator.platform);
+            const helper = visible("textarea.xterm-helper-textarea")[0] ?? document.querySelector("textarea.xterm-helper-textarea");
+            const writesBeforeOption = written.length;
+            helper.focus();
+            helper.dispatchEvent(new KeyboardEvent("keydown", { key: "∫", code: "KeyB", keyCode: 66, altKey: true, bubbles: true, cancelable: true }));
+            await wait();
+            check(
+              onMac
+                ? "Option+B sends ESC b on macOS instead of composing a glyph"
+                : "Alt+B sends ESC b (non-macOS host: macOptionIsMeta is not exercised here)",
+              () => written.slice(writesBeforeOption).includes("\u001bb"),
+            );
+          }
+          // The setting is applied to a live terminal: with it off the same key
+          // composes instead of sending ESC b. Only a Mac has anything to turn off.
+          if (/Mac/.test(navigator.platform)) {
+            interfaceStore.setTerminalOptionAsMeta(false);
+            await wait();
+            const writesBeforeOff = written.length;
+            document.querySelector("textarea.xterm-helper-textarea").dispatchEvent(new KeyboardEvent("keydown", { key: "∫", code: "KeyB", keyCode: 66, altKey: true, bubbles: true, cancelable: true }));
+            await wait();
+            check("with Option as Meta off, Option+B no longer sends ESC b (setting applied live)", () => !written.slice(writesBeforeOff).includes("\u001bb"));
+            interfaceStore.setTerminalOptionAsMeta(true);
+            await wait();
+          }
+          // CHARACTERIZATION, not a fix test: it passes with the old and the
+          // current code. xterm floors a row to whole DEVICE pixels, so the row
+          // height times the display's pixel ratio is an integer at 11px text
+          // (a half-pixel CSS row on a 2x display is still whole device pixels).
+          interfaceStore.setTerminalFontSize(11);
+          await wait(400);
+          check("characterization: rendered rows are a whole number of device pixels at 11px text", () => {
+            const heights = visible(".xterm-rows > div").map((row) => parseFloat(row.style.height));
+            if (!heights.length) throw new Error("no rows rendered");
+            const ratio = window.devicePixelRatio || 1;
+            const bad = heights.filter((height) => Math.abs(height * ratio - Math.round(height * ratio)) > 0.01);
+            if (bad.length) throw new Error(`row heights ${[...new Set(bad)].join(", ")} CSS px at ${ratio}x`);
+            return true;
+          });
+          interfaceStore.setTerminalFontSize(12);
+          await wait(400);
+          // The Option+B above is this block's own write, not linkification's.
+          writesBefore = report.writes;
 
           // ---- Linkification, against the real xterm and the real provider.
           // Source assertions can show the provider is registered; only this
@@ -326,16 +412,142 @@
           button("Repository GitPulse").click(); await wait();
           check("returning restores both original tabs", () => visible('[role="tab"]').length === 2 && report.killed === 0);
           check("returning restores this repository's own dock", () => visible("[data-terminal-dock]").length === 1);
+
+          // ---- GPU renderer: attended sessions only, DOM after a loss.
+          {
+            const sessionsAll = () => [...document.querySelectorAll("[data-terminal-session]")];
+            const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
+            const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
+            const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
+            check("this browser can create a WebGL2 context (the GPU checks below need one)",
+              () => !!document.createElement("canvas").getContext("webgl2"));
+            check("with the setting off, no session holds a WebGL context",
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            interfaceStore.setTerminalGpu(true); await wait();
+            check("the session on screen draws through WebGL", () => {
+              const [el] = shown();
+              if (shown().length !== 1) throw new Error(`${shown().length} sessions on screen`);
+              return el.dataset.renderer === "webgl" && el.querySelectorAll("canvas").length > 0;
+            });
+            check("sessions that are not on screen hold no WebGL context", () => {
+              const rows = hidden().map((el) => `${el.dataset.renderer}/${el.querySelectorAll("canvas").length}`);
+              if (rows.length < 2) throw new Error(`expected the other tab and the other repository's session hidden, saw ${rows.length}`);
+              return rows.every((row) => row === "dom/0");
+            });
+            button("Hide the terminal dock").click(); await wait();
+            check("hiding the dock releases the on-screen session's context too",
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            button("Show terminal").click(); await wait();
+            const [target] = shown();
+            check("showing the dock again attaches a fresh context", () => target?.dataset.renderer === "webgl");
+            // The addon also adds a 2D link layer (`xterm-link-layer`); the
+            // WebGL canvas is the one without a layer class.
+            const canvas = [...target.querySelectorAll("canvas")].find((el) => ![...el.classList].some((name) => name.endsWith("-layer")));
+            const gl = canvas?.getContext("webgl2");
+            check("the on-screen session's canvas holds a live WebGL2 context", () => !!gl && !gl.isContextLost());
+            // Resolves on the canvas's own target phase, after the session's
+            // capture listener has already reacted to the loss.
+            const lostAt = new Promise((resolve) => canvas.addEventListener("webglcontextlost", () => resolve(performance.now()), { once: true }));
+            gl.getExtension("WEBGL_lose_context").loseContext();
+            const lost = await lostAt;
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const settled = performance.now() - lost;
+            check("a lost context is disposed at once: no canvas left in the pane", () => !target.querySelector("canvas"));
+            check("the session is marked lost", () => target.dataset.renderer === "lost");
+            check("the DOM renderer draws the same rows on the next frame, so the pane never blanks", () => {
+              const text = domText(target);
+              if (!text) throw new Error("no DOM rows two frames after the loss");
+              // Not the addon's own three-second wait for a restore.
+              if (settled > 1000) throw new Error(`DOM rows took ${Math.round(settled)} ms`);
+              return true;
+            });
+            button("Hide the terminal dock").click(); await wait();
+            button("Show terminal").click(); await wait();
+            check("a lost session is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
+            check("another session still gets WebGL when it comes on screen",
+              () => shown().length === 1 && shown()[0] !== target && shown()[0].dataset.renderer === "webgl");
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
+            check("switching back leaves the other session without a context and this one on the DOM",
+              () => shown()[0] === target && target.dataset.renderer === "lost" && hidden().every((el) => !el.querySelector("canvas")));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
+            interfaceStore.setTerminalGpu(false); await wait();
+            check("turning the setting off returns a live WebGL session to the DOM renderer",
+              () => shown()[0] !== target && shown()[0].dataset.renderer === "dom" && !!domText(shown()[0])
+                && sessionsAll().every((el) => !el.querySelector("canvas")));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
+          }
+
+          // ---- Frame probe (OSC 7700), as scripts/tui-redraw-bench.mjs drives it.
+          {
+            const writesBeforeProbe = written.length;
+            await output("fixture-1", "\u001b]7700;frames-start\u0007");
+            await wait(500);
+            await output("fixture-1", "\u001b]7700;frames-stop\u0007");
+            await wait();
+            const replies = written.slice(writesBeforeProbe).filter((data) => data.startsWith("\u001b]7700;frames;"));
+            check("the frame probe answers a stop through the PTY, once", () => {
+              if (replies.length !== 1) throw new Error(`${replies.length} replies: ${JSON.stringify(replies)}`);
+              return /^\u001b\]7700;frames;n=[1-9]\d*;dropped=\d+;fraction=[\d.]+;period=[\d.]+;p50=[\d.]+;p95=[\d.]+;ms=\d+\u0007$/.test(replies[0]);
+            });
+            check("the probe's sequences draw nothing on the grid",
+              () => !visible(".xterm-rows").some((rows) => /7700|frames/.test(rows.textContent ?? "")));
+            // The reply above is this block's own write, not a control's.
+            writesBefore = report.writes;
+          }
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
           button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
+          {
+            // The resize handle is a WAI-ARIA separator: it reports its value,
+            // and the arrow keys nudge the dock without a pointer.
+            const handle = visible('[role="separator"][aria-label="Resize the terminal dock"]')[0];
+            const valueBefore = Number(handle?.getAttribute("aria-valuenow"));
+            if (handle) await press(handle, "ArrowUp");
+            const grown = dock.getBoundingClientRect().height, valueUp = Number(handle?.getAttribute("aria-valuenow"));
+            if (handle) await press(handle, "ArrowDown");
+            check("the dock's resize separator grows on ArrowUp and shrinks back on ArrowDown, reporting its value",
+              () => Boolean(handle) && grown > height && valueUp > valueBefore
+                && Math.abs(dock.getBoundingClientRect().height - height) < 1 && Number(handle.getAttribute("aria-valuenow")) === valueBefore);
+          }
           button("Toggle narrow layout").click(); await wait();
           check("narrow toolbar stays inside its panel", () => label("Terminal").scrollWidth === label("Terminal").clientWidth);
           button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", () => report.spawned === beforeHide + 1);
           check("terminal palette follows the completed theme transition", () => getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
           button("Console").click(); await wait();
           check("the console command field has an accessible name", () => !!label("Console command"));
+          {
+            // Console has no tabs: a tab chord there belongs to the command
+            // field, so it must open nothing and must not be swallowed.
+            const spawnedBefore = report.spawned;
+            const field = label("Console command");
+            field.focus();
+            const chord = new KeyboardEvent("keydown", { key: "T", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+            field.dispatchEvent(chord); await wait();
+            check("a tab chord in the Console opens nothing and is left to the command field",
+              () => report.spawned === spawnedBefore && !chord.defaultPrevented);
+            const run = async (text) => {
+              field.value = text; field.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+              await press(field, "Enter"); await wait(); await wait();
+            };
+            const consoleText = () => visible("[data-terminal-dock]")[0]?.textContent ?? document.body.textContent;
+            await run('echo "unterminated');
+            check("a command that does not tokenize is refused before anything runs", () => consoleRuns.length === 0);
+            consoleReplies.push({ exit_code: 0, timed_out: false, stdout_tail: "On branch main", stderr_tail: "", truncated: true, truncation_reason: null, policy: null });
+            await run("git status --short");
+            check("a Console command runs once, tokenized, against this repository",
+              () => consoleRuns.length === 1 && JSON.stringify(consoleRuns[0].args) === JSON.stringify(["git", "status", "--short"])
+                && typeof consoleRuns[0].repoPath === "string" && consoleRuns[0].repoPath.startsWith("/fixture/") && consoleRuns[0].timeoutSecs === 600);
+            check("an incomplete output says so even when the backend gave no reason",
+              () => consoleText().includes("On branch main") && consoleText().includes("[Output is incomplete: reason unavailable]"));
+            consoleReplies.push({ exit_code: 2, timed_out: false, stdout_tail: "", stderr_tail: "partial", truncated: true, truncation_reason: "the stream was not read to the end", policy: null });
+            await run("git log");
+            check("an incomplete output carries the backend's reason, never an invented cap",
+              () => consoleText().includes("[Output is incomplete: the stream was not read to the end]") && !consoleText().includes("exceeded cap") && consoleText().includes("exit 2"));
+            button("Clear")?.click(); await wait();
+            check("Clear empties the Console's output", () => !consoleText().includes("On branch main") && !consoleText().includes("the stream was not read"));
+          }
           button("Shell").click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
           for (let i = 0; i < 20; i++) button("Increase terminal text size")?.click();
           await wait(); check("font size is bounded", () => button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);
@@ -503,6 +715,23 @@
           await wait(300);
           check("an idle shell closes without a question",
             () => !get(promptState) && report.killed === killedBeforeIdle + 1);
+          // A host too slow to describe the shell is not an idle shell. The
+          // context read used to time out into null, null meant "nothing
+          // running", and the close went through unasked.
+          contextHangs = true;
+          const tabsBeforeHang = visible('[role="tab"]').length;
+          const killedBeforeHang = report.killed;
+          await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
+          const hangDeadline = performance.now() + 15000;
+          while (performance.now() < hangDeadline && !get(promptState)) await wait(100);
+          const unsure = get(promptState);
+          check("closing a terminal whose context read never answers asks first, saying it could not tell",
+            () => unsure?.options.mode === "confirm" && unsure.options.message.includes("could not tell") && report.killed === killedBeforeHang);
+          completePrompt(false);
+          await wait(200);
+          check("declining that question keeps the session running",
+            () => visible('[role="tab"]').length === tabsBeforeHang && report.killed === killedBeforeHang);
+          contextHangs = false;
           // A reload used to leave its sessions running, unlisted, uncounted,
           // and — once one printed a window's worth — killed for want of an
           // acknowledgement. The new page adopts them.
@@ -549,6 +778,37 @@
           }
           check("expand ceiling is taller than the old 900px cap", () => TERMINAL_DOCK_MAX_HEIGHT > 900);
           check("controls never write to the shell", () => report.writes === writesBefore);
+          {
+            // The reported defect, through the real dock: a repository tab
+            // closed while its session was busy unmounted the panel, and the
+            // unmount killed the process. It is now detached and listed.
+            const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+            const { get } = await import("svelte/store");
+            const other = get(repoStore).openTabs.find((tab) => tab.name === "Other");
+            if (!other) throw new Error("fixture has no Other repository tab");
+            contextBusy = true;
+            const killedBefore = report.killed;
+            const detachedBefore = report.detached ?? 0;
+            const closingRepo = repoStore.closeTab(other.id);
+            const askedDeadline = performance.now() + 2000;
+            while (performance.now() < askedDeadline && !get(promptState)) await wait(20);
+            const question = get(promptState)?.options.message ?? "";
+            check("closing a repository tab says a running session keeps running",
+              () => question.includes("keeps running") && !question.includes("is stopped"));
+            completePrompt(true);
+            await closingRepo;
+            const keptDeadline = performance.now() + 3000;
+            while (performance.now() < keptDeadline && (report.detached ?? 0) === detachedBefore) await wait(20);
+            check("a busy session in a closed repository tab is detached, never killed",
+              () => (report.detached ?? 0) === detachedBefore + 1 && report.killed === killedBefore);
+            if (!label("Sessions across repositories")) { button("All terminal sessions").click(); await wait(); }
+            const listedDeadline = performance.now() + 2000;
+            const kept = () => [...(label("Sessions across repositories")?.children ?? [])]
+              .some((el) => (el.textContent ?? "").includes("not shown in any tab"));
+            while (performance.now() < listedDeadline && !kept()) await wait(20);
+            check("the kept session is listed under Sessions, where it can be shown or stopped", kept);
+            contextBusy = false;
+          }
           check("no runtime errors", () => report.errors.length === 0);
         } catch (error) {
           stopped(error);
@@ -694,12 +954,15 @@
           if (!lastWriteId) throw new Error("no session received the typed text");
           const ackMark = acks.length;
           const killedBeforeCorrupt = report.killed;
-          await emit("terminal-output", { id: lastWriteId, data_b64: "!!!!", bytes: 4 });
+          // One message longer than a read can make. Rust reserved its length,
+          // so it is repaid in full and never painted; the process is not killed.
+          const OVERSIZE = 64 * 1024 + 1;
+          pushOutput(lastWriteId, new Uint8Array(OVERSIZE).fill(65));
           const corruptDeadline = performance.now() + 2000;
-          while (performance.now() < corruptDeadline && !acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4)) await wait(20);
-          check("a corrupt chunk acknowledges its reserved length", () =>
-            acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4) && report.killed === killedBeforeCorrupt);
-          await emit("terminal-output", { id: lastWriteId, data_b64: "A".repeat(8193) });
+          const repaid = () => acks.slice(ackMark).filter((row) => row.sessionId === lastWriteId).reduce((sum, row) => sum + row.bytes, 0);
+          while (performance.now() < corruptDeadline && repaid() < OVERSIZE) await wait(20);
+          check("an oversize message is repaid in full and the process kept", () =>
+            repaid() === OVERSIZE && report.killed === killedBeforeCorrupt);
           const liveDeadline = performance.now() + 2000;
           let liveStatus = "";
           while (performance.now() < liveDeadline) {
@@ -752,6 +1015,71 @@
         return results;
       }
 
+      /**
+       * A saved "Skip permissions" default for Claude, through the real dock
+       * and on the renderer the app uses. The agreement is an overlay laid on
+       * the grid; WebGL adds a full-size link-layer canvas with its own
+       * z-index, which once stacked above the overlay and took every click,
+       * so "Start this session" did nothing. `element.click()` cannot see
+       * that, so the pointer's target is read with `elementFromPoint`.
+       *
+       * Runs last: it opens a Claude tab and leaves it, which would shift the
+       * spawn counts every earlier check reads.
+       */
+      async function runBypass() {
+        const { results, check, stopped } = createChecks();
+        try {
+          interfaceStore.setTerminalGpu(true);
+          bypassDefaults = true;
+          const spawnedBefore = report.spawned;
+          button("New session type").click(); await wait();
+          const option = visible('[aria-label="Session types"] [role="option"]').find((el) => el.textContent.trim() === "Claude");
+          if (!option) throw new Error("the launcher menu has no Claude option");
+          option.click(); await wait();
+          const create = button("New Claude session");
+          check("a Claude session can be opened (no session limit in the way)", () => !create.disabled);
+          create.click();
+          const overlay = () => visible("[data-terminal-acknowledge]")[0];
+          const askedDeadline = performance.now() + 3000;
+          while (performance.now() < askedDeadline && !overlay()) await wait(20);
+          check("a saved bypass default asks before anything spawns", () => !!overlay() && report.spawned === spawnedBefore);
+          const host = overlay().parentElement.querySelector("[data-terminal-session]");
+          const glDeadline = performance.now() + 3000;
+          while (performance.now() < glDeadline && !(host.dataset.renderer === "webgl" && host.querySelector("canvas.xterm-link-layer"))) await wait(20);
+          // Without this the hit tests below pass on the DOM renderer for free.
+          check("the waiting Claude tab draws through WebGL, with its full-size link layer",
+            () => host.dataset.renderer === "webgl" && !!host.querySelector("canvas.xterm-link-layer"));
+          const reaches = (el) => {
+            const box = el.getBoundingClientRect();
+            const top = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+            if (el === top || el.contains(top)) return true;
+            throw new Error(`the pointer lands on ${top?.tagName}.${top?.className}`);
+          };
+          const ack = overlay().querySelector('[data-testid="bypass-acknowledge"]');
+          const decline = overlay().querySelector('[data-testid="bypass-decline"]');
+          check("the pointer reaches Start this session", () => reaches(ack));
+          check("the pointer reaches the ask-every-time choice", () => reaches(decline));
+          ack.click();
+          const spawnDeadline = performance.now() + 3000;
+          while (performance.now() < spawnDeadline && report.spawned === spawnedBefore) await wait(20);
+          check("Start this session spawns Claude in bypass, acknowledged", () => {
+            const launch = launches.at(-1);
+            if (report.spawned !== spawnedBefore + 1) throw new Error(`${report.spawned - spawnedBefore} spawns`);
+            return launch.program === "claude" && launch.permissionMode === "bypass" && launch.acknowledged === true;
+          });
+          check("the agreement is gone once the session starts", () => !overlay());
+          check("no runtime errors", () => report.errors.length === 0);
+        } catch (error) {
+          stopped(error);
+        } finally {
+          bypassDefaults = false;
+          interfaceStore.setTerminalGpu(false);
+        }
+        report.bypass = results;
+        showReport();
+        return results;
+      }
+
       document.querySelector("#checks").onclick = async (event) => { event.currentTarget.disabled = true; await runChecks(); };
       document.querySelector("#stress").onclick = async (event) => { event.currentTarget.disabled = true; await runStress(); };
       document.querySelector("#checks").disabled = false;
@@ -772,7 +1100,8 @@
         await wait(600);
         const checks = await runChecks();
         const stress = checks.every((row) => row.pass) ? await runStress() : [];
-        const results = [...checks, ...stress];
+        const bypass = stress.length && stress.every((row) => row.pass) ? await runBypass() : [];
+        const results = [...checks, ...stress, ...bypass];
         document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
       }

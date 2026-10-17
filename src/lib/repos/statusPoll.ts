@@ -8,7 +8,46 @@
  * already running, or the previous poll has not landed yet.
  */
 
+import { CADENCE_CEILING_MS } from "../runtime/loadCadence";
+import type { RepoChange } from "./events";
+
 export const STATUS_POLL_INTERVAL_MS = 6_000;
+/**
+ * How many times its own cost a poll waits before the next one. `git status`
+ * on a large work tree took 4 s on average (9.4 s at worst), and a fixed 6 s
+ * rest after it kept git running about 40% of the time on the one repository
+ * someone was looking at. Ten times the last duration holds the duty cycle
+ * under 10% whatever the repository costs.
+ */
+export const STATUS_POLL_COST_FACTOR = 10;
+/** No rest is ever longer than the cadence ceiling, however slow the last poll was. */
+export const STATUS_POLL_MAX_INTERVAL_MS = CADENCE_CEILING_MS;
+
+export interface PollRestInput {
+  /** How long the last poll's `git status` took; null before the first. */
+  lastDurationMs: number | null;
+}
+
+/**
+ * The rest between one poll finishing and the next starting, before the
+ * event-loop stretch `decideCadence` adds on top: never shorter than
+ * {@link STATUS_POLL_INTERVAL_MS}, and never shorter than
+ * {@link STATUS_POLL_COST_FACTOR} times what the last poll cost.
+ *
+ * There is deliberately NO longer rest for a repository that looks quiet. The
+ * worktree watch is non-recursive (`watcher/debouncer.rs`), so an unstaged
+ * edit to a nested file writes nothing under `.git` and raises no event: this
+ * poll is the primary detector of ordinary edits, and a quiet minute must not
+ * make the first edit after it up to a minute late.
+ */
+export function statusPollRestMs(input: PollRestInput): number {
+  const base = STATUS_POLL_INTERVAL_MS;
+  const cost =
+    input.lastDurationMs !== null && Number.isFinite(input.lastDurationMs) && input.lastDurationMs > 0
+      ? input.lastDurationMs * STATUS_POLL_COST_FACTOR
+      : 0;
+  return Math.min(STATUS_POLL_MAX_INTERVAL_MS, Math.max(base, cost));
+}
 
 /**
  * Structural shape the publish gate compares; FileStatus is compatible.
@@ -135,4 +174,41 @@ export function shouldRunStatusPoll(input: PollGateInput): boolean {
     return false;
   }
   return true;
+}
+
+const MAX_POLLED_PATHS = 64;
+const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd|mdx)$/i;
+
+/**
+ * The change a status poll observed, in the watcher's vocabulary, or null when
+ * the two lists are the same.
+ *
+ * The worktree watch is non-recursive, so an edit to `docs/guide.md` reaches
+ * no `repo-changed` event and the code index and document vault stayed stale
+ * until something touched the index. The poll already reads the whole
+ * worktree's status, so it names what moved: every row that appeared,
+ * disappeared or changed. An entry that is, or may contain, a document (a
+ * Markdown name, or no extension) also marks `documents`, as the watcher does.
+ */
+export function changeFromStatusPoll(
+  before: readonly StatusLike[],
+  after: readonly StatusLike[],
+): RepoChange | null {
+  const prior = new Map(before.map((row) => [row.path, row]));
+  const touched: string[] = [];
+  for (const row of after) {
+    const old = prior.get(row.path);
+    prior.delete(row.path);
+    if (old === undefined || !statusEqual(old, row)) touched.push(row.path);
+  }
+  touched.push(...prior.keys());
+  if (touched.length === 0) return null;
+  const mayHoldDocuments = touched.some(
+    (path) => MARKDOWN_EXT.test(path) || path.endsWith("/") || !/\.[^/]*$/.test(path),
+  );
+  return {
+    kinds: mayHoldDocuments ? ["worktree", "documents"] : ["worktree"],
+    paths: touched.slice(0, MAX_POLLED_PATHS),
+    paths_truncated: touched.length > MAX_POLLED_PATHS,
+  };
 }

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, develop, codex/gitpulse-schema20-qualification-20260909]
+    branches: [main, master, develop]
   pull_request:
     branches: [main, master, develop]
   # Run by hand on a branch, so a fix is verified before its PR exists.
@@ -28,7 +28,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install System Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -37,7 +39,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
 
@@ -51,7 +53,7 @@ jobs:
         run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
@@ -59,12 +61,14 @@ jobs:
       # Bun installs and runs the package scripts; Vitest, Vite and
       # svelte-check still execute on Node through their own shebangs.
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
 
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
@@ -98,6 +102,15 @@ jobs:
       - name: Coverage Type Contract Check
         if: ${{ !cancelled() }}
         run: bun run check:types
+
+      # The vendored crates must be byte-identical to what VENDOR.json recorded.
+      # No upstream checkout exists here, so this is the local-edit half of the
+      # vendor check; drift from upstream is a refresh signal, never a CI
+      # failure (see the `# Drift` header in scripts/vendor-crates.mjs). The
+      # bytes are pinned LF by .gitattributes, so one leg answers for all three.
+      - name: Vendored Crates Unedited
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: bun run check:vendor-edits
 
       # No --tag on a CI build: with the flag absent the gate still requires
       # all five version manifests to agree and simply skips the tag
@@ -168,6 +181,19 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
 
+      - name: Terminal Suites Against the Terminal Host
+        # The same terminal suites, every session registry backed by a real
+        # gitpulse-ptyd rather than the engine in the test process
+        # (docs/TERMINAL_HOST.md, migration step 2). The host is Unix-only.
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a dbus-run-session -- bun run test:terminal-host
+          else
+            bun run test:terminal-host
+          fi
+
   # release.yml builds Linux aarch64 and Windows arm64 only on a tag, so a
   # broken ARM leg would first fail with every other platform already on the
   # draft. This bundles both on their real runners, through the same
@@ -185,7 +211,9 @@ jobs:
         platform: [ubuntu-22.04-arm, windows-11-arm]
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install System Dependencies (Linux)
         if: startsWith(matrix.platform, 'ubuntu-')
@@ -194,22 +222,24 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Key the Rust cache to this runner image
         shell: bash
         run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
@@ -220,7 +250,7 @@ jobs:
       # No release inputs: tauri-action builds and bundles without uploading.
       - name: Build Tauri Bundles
         id: tauri
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
 
       - name: Installer Names Match The Release Manifest
         shell: bash
@@ -241,10 +271,12 @@ jobs:
       GUSSET_PIN: 92c205609f02ab116a12844a074a8b424c121359
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Checkout DevCouncil
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: bharathvbcr/DevCouncil
           ref: ${{ env.DEVCOUNCIL_PIN }}
@@ -252,7 +284,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout Gusset
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: bharathvbcr/gusset
           ref: ${{ env.GUSSET_PIN }}
@@ -273,21 +305,23 @@ jobs:
           done
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go/go.mod
           cache: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
 
       - name: Go vet and test without the engine
         working-directory: go
@@ -309,3 +343,41 @@ jobs:
 
       - name: gusset-check
         run: bun run gusset:check
+
+  # The pre-push hook refuses a commit authored or committed as a test fixture,
+  # but only in a checkout whose core.hooksPath is .githooks, and only when not
+  # bypassed. This runs the same check over what the push or pull request adds,
+  # so a clone without the hooks cannot publish one unnoticed.
+  fixture-authors:
+    name: No commit authored as a test fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The base of the range must be present to exclude it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Refuse commits authored as a test fixture
+        shell: bash
+        env:
+          TIP: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # A new branch pushes the zero oid as `before`, and a force push can
+          # name a commit no ref holds any more; both fall back to the default
+          # branch, so the range is never empty for want of a base.
+          if [[ -z "$BASE" ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE="$(git rev-parse --verify "origin/$DEFAULT_BRANCH")"
+          fi
+          echo "Checking $(git rev-list --count "$TIP" --not "$BASE") commit(s) in $BASE..$TIP"
+          bun run check:fixture-authors "$TIP" "$BASE"

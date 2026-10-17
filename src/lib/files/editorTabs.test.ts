@@ -9,6 +9,7 @@ import {
   dirtyEditorTabPaths,
   editorDraft,
   emptyEditorTabs,
+  isEditorDraftConflicted,
   isEditorTabDirty,
   openPinned,
   openPreview,
@@ -161,5 +162,68 @@ describe("editorTabs", () => {
     state = updateEditorDraft(state, "a.ts", "changed", "original");
     state = updateEditorDraft(state, "a.ts", "original", "original");
     expect(isEditorTabDirty(state, "a.ts")).toBe(false);
+  });
+
+  describe("the disk version a draft was made from", () => {
+    const dirty = () => {
+      let state = openPinned(emptyEditorTabs(), "a.ts");
+      state = updateEditorDraft(state, "a.ts", "mine", "v1 text", "3:v1");
+      return state;
+    };
+
+    it("is recorded by the first dirtying keystroke", () => {
+      expect(editorDraft(dirty(), "a.ts")).toEqual({
+        content: "mine",
+        sourceContent: "v1 text",
+        base: "3:v1",
+      });
+    });
+
+    it("is kept when later keystrokes arrive carrying a reloaded blob", () => {
+      // The file changed on disk and its blob reloaded: the editor now reports
+      // the new text and base with every keystroke. The draft must not adopt
+      // them, or the external change would stop being a conflict.
+      const state = updateEditorDraft(dirty(), "a.ts", "mine!", "agent text", "9:v2");
+      expect(editorDraft(state, "a.ts")).toEqual({
+        content: "mine!",
+        sourceContent: "v1 text",
+        base: "3:v1",
+      });
+    });
+
+    it("drops the draft when it is edited back to the text it was made from", () => {
+      const state = updateEditorDraft(dirty(), "a.ts", "v1 text", "agent text", "9:v2");
+      expect(isEditorTabDirty(state, "a.ts")).toBe(false);
+    });
+
+    it("re-bases a draft that is still dirty when an older snapshot is saved", () => {
+      const newer = updateEditorDraft(dirty(), "a.ts", "mine plus more", "v1 text", "3:v1");
+      const after = completeEditorSave(newer, "a.ts", "mine", "4:saved");
+      expect(editorDraft(after, "a.ts")).toEqual({
+        content: "mine plus more",
+        sourceContent: "mine",
+        base: "4:saved",
+      });
+    });
+
+    it("clears the draft when the saved text is the draft", () => {
+      expect(isEditorTabDirty(completeEditorSave(dirty(), "a.ts", "mine", "4:saved"), "a.ts")).toBe(
+        false,
+      );
+    });
+
+    it("conflicts when the reloaded blob carries a different base than the draft", () => {
+      const draft = editorDraft(dirty(), "a.ts");
+      expect(isEditorDraftConflicted(draft, "9:v2")).toBe(true);
+      expect(isEditorDraftConflicted(draft, "3:v1")).toBe(false);
+      expect(isEditorDraftConflicted(draft, null)).toBe(false);
+      expect(isEditorDraftConflicted(draft, undefined)).toBe(false);
+      expect(isEditorDraftConflicted(undefined, "9:v2")).toBe(false);
+      const unbased = editorDraft(
+        updateEditorDraft(openPinned(emptyEditorTabs(), "a.ts"), "a.ts", "x", "y"),
+        "a.ts",
+      );
+      expect(isEditorDraftConflicted(unbased, "9:v2")).toBe(false);
+    });
   });
 });

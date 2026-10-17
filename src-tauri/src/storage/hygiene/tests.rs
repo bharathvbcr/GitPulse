@@ -1,6 +1,7 @@
 use super::{
-    cancel, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
-    prepare_with_activity, providers, tree, HygienePlan, EXECUTION, MAX_PLANS, TTL,
+    cancel, exclusive, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
+    prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
+    PREPARATION, TTL,
 };
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
@@ -567,4 +568,138 @@ fn differently_cased_credentials_and_known_model_formats_are_preserved() {
         );
         fs::remove_file(path).unwrap();
     }
+}
+
+/// Panics on another thread while it holds `lock`, which poisons it.
+fn poison<T: Send>(lock: &'static Mutex<T>) {
+    let _ = std::thread::spawn(move || {
+        let _held = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        panic!("injected panic under a hygiene lock");
+    })
+    .join();
+    assert!(lock.is_poisoned());
+}
+
+/// The defect: a poisoned lock was reported as "another operation is running"
+/// for the rest of the process, so cleanup could never run again.
+#[test]
+fn a_panic_under_any_hygiene_lock_does_not_disable_cleanup() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    for (lock, busy) in [
+        (&EXECUTION, "execution busy"),
+        (&PREPARATION, "preparation busy"),
+        (&INVENTORY, "inventory busy"),
+    ] {
+        poison(lock);
+        {
+            let taken = exclusive(lock, busy);
+            assert!(taken.is_ok(), "{busy}: a poisoned lock was refused");
+            // Genuine contention is still contention.
+            assert_eq!(exclusive(lock, busy).err().as_deref(), Some(busy));
+        }
+        lock.clear_poison();
+    }
+    // End to end through the real operation, with the plan store poisoned too.
+    let (_temp, repo) = fixture();
+    poison(plans());
+    poison(&EXECUTION);
+    let view = preview(&repo);
+    assert!(
+        execute_with_activity(repo.to_str().unwrap(), &view.id, |_, _| Ok(()), |_| Ok(())).is_ok()
+    );
+    plans().clear_poison();
+    EXECUTION.clear_poison();
+}
+
+/// A long-lived tool process elsewhere on the machine (five `uvx` MCP proxies
+/// here) says nothing about whether *this* directory is in use; the path-scoped
+/// open-file scan is the check that does.
+#[cfg(unix)]
+#[test]
+fn an_unrelated_build_tool_process_does_not_block_cleanup() {
+    use crate::procguard::LockedSpawn;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("target");
+    fs::create_dir(&artifact).unwrap();
+    // A process whose command name is `uv`, with its cwd and files elsewhere.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let uv = elsewhere.path().join("uv");
+    fs::copy("/bin/sleep", &uv).unwrap();
+    fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = std::process::Command::new(&uv)
+        .arg("30")
+        .current_dir(elsewhere.path())
+        .spawn_locked()
+        .expect("start the stand-in uv process");
+    let verdict = super::activity_check(&artifact);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(verdict.is_ok(), "{verdict:?}");
+}
+
+/// ~/Code held ~84k entries and the 40k budget went partial, so the scheduled
+/// run refused. A repository is an inventory unit; its source tree is not
+/// walked, and directories are counted once.
+#[test]
+fn discovery_does_not_walk_repository_source_trees() {
+    let root = tempfile::tempdir().unwrap();
+    let base = crate::engine::git_cli::canonicalize_plain(root.path()).unwrap();
+    for r in 0..6 {
+        let repo = base.join(format!("repo{r}"));
+        crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&repo);
+        for d in 0..30 {
+            let dir = repo.join(format!("src/pkg{d}"));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..500 {
+                File::create(dir.join(format!("f{f}.rs"))).unwrap();
+            }
+        }
+    }
+    let found = super::discovery::discover(&[base], &[], &AtomicBool::new(false));
+    assert!(
+        !found.partial,
+        "visited {} issues {:?}",
+        found.visited, found.issues
+    );
+    assert_eq!(found.repos.len(), 6);
+    assert!(found.visited < 100, "visited {}", found.visited);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_cache_root_is_an_error_not_zero_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("blob"), vec![0u8; 4096]).unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let Err(error) = tree::snapshot(&link, false, &AtomicBool::new(false)) else {
+        panic!("a symlinked root must not measure as an empty success");
+    };
+    assert!(error.contains("symlink"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_partial_removal_says_entries_were_already_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    // Removal refuses symlinked hops, and the OS temp dir sits behind one.
+    let dir = crate::engine::git_cli::canonicalize_plain(temp.path())
+        .unwrap()
+        .join("target");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a"), "aaaa").unwrap();
+    fs::write(dir.join("b"), "bbbb").unwrap();
+    let snapshot = tree::snapshot(&dir, false, &AtomicBool::new(false)).unwrap();
+    // Entries are removed leaves-first in reverse order: `b` goes, then the
+    // changed `a` stops the sweep.
+    fs::write(dir.join("a"), "changed after preview").unwrap();
+    let error = tree::remove_reviewed(&dir, &snapshot, &AtomicBool::new(false)).unwrap_err();
+    assert!(!dir.join("b").exists(), "b was removed before the stop");
+    assert!(error.contains("already removed"), "{error}");
 }

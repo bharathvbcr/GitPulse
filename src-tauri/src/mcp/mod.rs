@@ -24,6 +24,9 @@
 //! `harness::guard_command`, and every writing tool must be added to the
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
+#[cfg(test)]
+mod adversarial_tests;
+mod budget;
 pub mod complete;
 pub mod devmap_parity;
 pub mod page;
@@ -36,13 +39,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::insights::{self, McpToolInfo};
+use crate::tasks::file_tasks as ft;
+use crate::workbench::intake;
+use validate::{tool_args, Spec, ToolArgs};
 
 /// MCP 2.0 / 2026-07-28. The only modern version this build speaks.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 pub const SERVER_NAME: &str = "gitpulse-mcp";
 
-/// Legacy handshake-based revisions this binary still answers.
+/// Legacy handshake-based revisions this binary still answers, newest first.
+/// The first is what an `initialize` for any version not listed here is answered
+/// with: the lifecycle spec says the server "MUST respond with another protocol
+/// version it supports. This SHOULD be the *latest* version supported by the
+/// server", and it is the client's job to disconnect if it cannot use it.
 pub const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
+
+/// Largest single JSON-RPC message, in either direction, matching the harness
+/// sidecar's frame cap. The one owner of the figure: the transport refuses to
+/// read or write a line past it, and every result budget (tool results, ledger
+/// pages, resource documents) is derived from it, so they cannot drift apart.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 const TOOLS_TTL_MS: u64 = 3_600_000;
 const DISCOVER_TTL_MS: u64 = 3_600_000;
@@ -64,6 +80,11 @@ pub const BUDGET_MAX: u32 = 200_000;
 /// Longest `repo_path` / symbol argument accepted. Well past any real path,
 /// short enough that a megabyte of `A`s is refused before it reaches git.
 pub(crate) const MAX_ARG_CHARS: u32 = 4_096;
+/// Longest resource `uri` accepted: a `repo_path` at its limit with every
+/// character percent-encoded as four bytes, and the scheme and facet around it.
+/// A `uri` is echoed back in the document and in errors, so one the size of the
+/// frame would make every response about it too big to send.
+pub(crate) const MAX_URI_BYTES: usize = MAX_ARG_CHARS as usize * 12 + 256;
 
 pub fn server_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -264,55 +285,348 @@ fn destructive_tool(
     tool
 }
 
-pub(crate) fn bounded_string_prop(description: &str, min_len: usize, max_len: usize) -> Value {
-    let mut obj = json!({
-        "type": "string",
-        "description": description,
-        "maxLength": max_len
-    });
-    if min_len > 0 {
-        obj["minLength"] = json!(min_len);
+// Tool arguments.
+//
+// One struct per tool, declared with `tool_args!`, prints the advertised
+// `inputSchema` and is what the handler reads. A handler cannot read an argument
+// the schema does not declare (the field does not exist), and a declared argument
+// nothing reads is dead code, which `clippy -D warnings` refuses. Before this,
+// both directions were held by a test that scanned the handler's source text.
+
+pub(crate) fn repo_spec() -> Spec {
+    Spec::chars(
+        "Absolute path to a git repository",
+        1,
+        MAX_ARG_CHARS as usize,
+    )
+}
+
+pub(crate) fn path_spec(description: &'static str) -> Spec {
+    Spec::chars(description, 1, MAX_ARG_CHARS as usize)
+}
+
+pub(crate) fn budget_spec() -> Spec {
+    Spec::int("Maximum tokens of results", 1, u64::from(BUDGET_MAX))
+}
+
+/// A task named the way the board names it: its `task_id` or its `item_id`.
+fn task_ref_spec(description: &'static str) -> Spec {
+    Spec::chars(description, 1, 128)
+}
+
+/// The largest revision a client that reads numbers as doubles can name.
+const MAX_REVISION: u64 = 9_007_199_254_740_991;
+
+fn revision_spec(description: &'static str) -> Spec {
+    Spec::int(description, 1, MAX_REVISION)
+}
+
+/// A caller's idempotency key for a task write: the same key with the same
+/// request replays the first answer instead of writing again, so a call whose
+/// response was lost can be sent again safely.
+fn request_id_spec() -> Spec {
+    Spec::chars(
+        "Optional idempotency key (letters, digits, '-' and '_'). Send the same key to repeat this call after a lost response; the store answers with the first result instead of writing twice",
+        1,
+        120,
+    )
+}
+
+const SEVERITIES: &[&str] = &["none", "low", "medium", "high", "critical"];
+
+tool_args! {
+    /// The tools that take only the repository.
+    struct RepoArgs {
+        repo_path: String = repo_spec(),
     }
-    obj
 }
 
-pub(crate) fn string_array_prop(description: &str, max_items: usize, max_item_len: usize) -> Value {
-    json!({
-        "type": "array",
-        "description": description,
-        "items": {
-            "type": "string",
-            "maxLength": max_item_len
+tool_args! {
+    /// The code-intelligence tools that answer one budgeted question about a
+    /// repository.
+    struct BudgetArgs {
+        repo_path: String = repo_spec(),
+        budget: Option<u32> = budget_spec(),
+    }
+}
+
+tool_args! {
+    struct SearchArgs {
+        repo_path: String = repo_spec(),
+        query: String = path_spec("Symbol name or prefix"),
+        budget: Option<u32> = budget_spec(),
+    }
+}
+
+tool_args! {
+    struct ActiveChangesArgs {
+        repo_path: String = repo_spec(),
+        worktree_path: Option<String> = path_spec("Worktree to inspect; defaults to repo_path"),
+        limit: Option<u32> = Spec::int(
+            "Maximum files to return (default 200, max 500)",
+            1,
+            u64::from(CHANGES_MAX_LIMIT),
+        ),
+    }
+}
+
+tool_args! {
+    struct ChangeContextArgs {
+        repo_path: String = repo_spec(),
+        worktree_path: Option<String> = path_spec("Worktree to describe; defaults to repo_path"),
+    }
+}
+
+tool_args! {
+    struct LedgerEventsArgs {
+        repo_path: String = repo_spec(),
+        cursor: Option<i64> = Spec::int(
+            "Return events with an id greater than this. 0 (the default) starts at the beginning of history.",
+            0,
+            i64::MAX.unsigned_abs(),
+        ),
+        limit: Option<u32> = Spec::int(
+            "Maximum number of events (default 50, max 1000)",
+            1,
+            u64::from(LEDGER_MAX_LIMIT),
+        ),
+    }
+}
+
+tool_args! {
+    struct TaskViewArgs {
+        repo_path: String = repo_spec(),
+        task_id: Option<String> = path_spec("Optional task id to filter evidence, gaps, and runs"),
+    }
+}
+
+tool_args! {
+    struct AddTaskArgs {
+        repo_path: String = repo_spec(),
+        title: String = Spec::chars("Task title: one line", 1, ft::MAX_TASK_TITLE),
+        description: Option<String> = Spec::bytes(
+            "Background and problem statement (Markdown)",
+            0,
+            ft::MAX_TASK_DESCRIPTION,
+        ),
+        task_id: Option<String> = Spec::bytes(
+            "Stable key for this task (letters, digits, '-', '_', '.'), e.g. 'gp-auth-flow'. Defaults to 'gp-' plus the title's slug.",
+            1,
+            ft::MAX_TASK_KEY,
+        ),
+        status: Option<String> = Spec::one_of("Board column (default inbox)", &ft::STATUSES),
+        priority: Option<u8> = Spec::int(
+            "Priority: 0 (urgent), 1 (high), 2 (normal, default), 3 (low)",
+            0,
+            3,
+        ),
+        severity: Option<String> = Spec::one_of("Severity (default none)", SEVERITIES),
+        kind: Option<String> = Spec::bytes(
+            "Type, e.g. feature (default), bug, refactor, chore, spike",
+            1,
+            ft::MAX_KIND_BYTES,
+        ),
+        owner: Option<String> = Spec::bytes("Assignee, e.g. '@alice'", 1, ft::MAX_OWNER_BYTES),
+        due: Option<String> = Spec::chars("Due date as YYYY-MM-DD, or Unix seconds", 1, 32),
+        labels: Option<Vec<String>> =
+            Spec::bytes_array("Labels", ft::MAX_TASK_LABELS, ft::MAX_LABEL_BYTES),
+        repositories: Option<Vec<String>> = Spec::bytes_array(
+            "Other related repository names; kept as a section of the description",
+            ft::MAX_TASK_REPOSITORIES,
+            ft::MAX_REPOSITORY_BYTES,
+        ),
+        planned_files: Option<Vec<String>> = Spec::bytes_array(
+            "Files the work is expected to touch; kept as a section of the description",
+            ft::MAX_TASK_PLANNED_FILES,
+            ft::MAX_PLANNED_FILE_BYTES,
+        ),
+        acceptance_criteria: Option<Vec<String>> = Spec::bytes_array(
+            "Definition of done, one item each",
+            ft::MAX_TASK_CRITERIA,
+            ft::MAX_CRITERION_BYTES,
+        ),
+        logs: Option<String> = Spec::bytes(
+            "Raw logs or traces kept verbatim as evidence",
+            0,
+            ft::MAX_TASK_LOGS,
+        ),
+        overwrite: Option<bool> = Spec::flag(
+            "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours.",
+        ),
+        reviewed_related: Option<Vec<String>> = Spec::chars_array(
+            "item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work",
+            intake::MAX_REVIEWED_RELATED,
+            128,
+        ),
+    }
+}
+
+tool_args! {
+    struct ImportTasksArgs {
+        repo_path: String = repo_spec(),
+        tasks_dir: Option<String> = Spec::bytes(
+            "Tasks directory relative to the repository root (default 'tasks')",
+            1,
+            ft::MAX_TASKS_DIR,
+        ),
+        replace: Option<bool> = Spec::flag(
+            "Overwrite the board copy of briefs already imported with the file's current content (default false)",
+        ),
+    }
+}
+
+tool_args! {
+    struct ListTasksArgs {
+        repo_path: String = repo_spec(),
+        status: Option<String> = Spec::one_of("Only this column", &ft::STATUSES),
+        archived: Option<bool> = Spec::flag(
+            "true lists the archive instead of the board (default false)",
+        ),
+        limit: Option<u64> = Spec::int("Maximum tasks to return (default 50, max 200)", 1, 200),
+        cursor: Option<String> = Spec::chars("next_cursor from a previous page", 1, 180),
+    }
+}
+
+tool_args! {
+    struct GetTaskArgs {
+        repo_path: String = repo_spec(),
+        task_id: String = task_ref_spec(
+            "The task_id it was added or imported with, or its board item_id",
+        ),
+    }
+}
+
+tool_args! {
+    struct CompleteTaskArgs {
+        repo_path: String = repo_spec(),
+        task_id: String = task_ref_spec(
+            "The task id from your brief ('Task: <id>'), its board item_id, or the task_id it was filed with",
+        ),
+        status: Option<String> = Spec::one_of("Where the task goes (default done)", &intake::AGENT_STATUSES),
+        summary: Option<String> = Spec::chars(
+            "What you changed and how you verified it, in a few lines; appended to the task's logs",
+            1,
+            intake::MAX_SUMMARY_CHARS,
+        ),
+        expected_revision: Option<i64> = revision_spec(
+            "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
+        ),
+        request_id: Option<String> = request_id_spec(),
+    }
+}
+
+tool_args! {
+    struct DeleteTaskArgs {
+        repo_path: String = repo_spec(),
+        task_id: String = task_ref_spec(
+            "The task_id it was filed with, or its board item_id from gitpulse_list_tasks",
+        ),
+        reason: String = Spec::chars(
+            "Why the task is being deleted, in a line or two; recorded in its history",
+            1,
+            intake::MAX_REASON_CHARS,
+        ),
+        expected_revision: Option<i64> = revision_spec(
+            "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
+        ),
+        even_if_running: Option<bool> = Spec::flag(
+            "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false",
+        ),
+        request_id: Option<String> = request_id_spec(),
+    }
+}
+
+tool_args! {
+    struct MergeSourceArgs {
+        task_id: String = task_ref_spec("Its task_id or board item_id"),
+        expected_revision: Option<i64> = revision_spec(
+            "Only merge if this task is still at this revision when the merge starts",
+        ),
+    }
+}
+
+tool_args! {
+    struct MergeTasksArgs {
+        repo_path: String = repo_spec(),
+        into_task_id: String = task_ref_spec("The task that stays: its task_id or board item_id"),
+        into_expected_revision: Option<i64> = revision_spec(
+            "Only merge if the target is still at this revision when the merge starts",
+        ),
+        sources: Vec<MergeSourceArgs> = Spec::ObjArray {
+            desc: "The tasks to fold in and delete",
+            min_items: 1,
+            max_items: intake::MAX_MERGE_SOURCES,
+            item: MergeSourceArgs::object_schema,
         },
-        "maxItems": max_items
-    })
+        reason: String = Spec::chars(
+            "Why these are one task, in a line or two; recorded on the target and on every source",
+            1,
+            intake::MAX_REASON_CHARS,
+        ),
+        even_if_running: Option<bool> = Spec::flag(
+            "Merge a source even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false",
+        ),
+    }
 }
 
-pub(crate) fn repo_prop() -> Value {
-    json!({
-        "type": "string",
-        "description": "Absolute path to a git repository",
-        "minLength": 1,
-        "maxLength": MAX_ARG_CHARS
-    })
+tool_args! {
+    struct CodeintelImpactArgs {
+        repo_path: String = repo_spec(),
+        target: String = path_spec("Symbol or file path"),
+        budget: Option<u32> = budget_spec(),
+    }
 }
 
-pub(crate) fn path_prop(description: &str) -> Value {
-    json!({
-        "type": "string",
-        "description": description,
-        "minLength": 1,
-        "maxLength": MAX_ARG_CHARS
-    })
+tool_args! {
+    struct CodeintelDependenciesArgs {
+        repo_path: String = repo_spec(),
+        file_path: String = path_spec("Repo-relative file whose dependencies to read"),
+        budget: Option<u32> = budget_spec(),
+    }
 }
 
-pub(crate) fn budget_prop() -> Value {
-    json!({
-        "type": "integer",
-        "description": "Maximum tokens of results",
-        "minimum": 1,
-        "maximum": BUDGET_MAX
-    })
+tool_args! {
+    struct CodeintelTraceArgs {
+        repo_path: String = repo_spec(),
+        from: String = path_spec("Symbol to trace from"),
+        to: String = path_spec("Symbol to trace to"),
+        budget: Option<u32> = budget_spec(),
+    }
+}
+
+tool_args! {
+    struct SuspectsArgs {
+        repo_path: String = repo_spec(),
+        symptom: String = path_spec("Symbol that is misbehaving — a qualified node id, or a bare name"),
+        since: String = path_spec("Revision the window opens at (a commit, tag or branch)"),
+        // Bounded, like every other numeric argument here. The cone grows with
+        // depth and each file it reaches costs a `git blame` subprocess, so an
+        // unbounded depth is an unbounded amount of work asked for by one
+        // integer. Ten is already far past the point where a dependency chain
+        // explains a regression.
+        depth: Option<u32> = Spec::int(
+            "How many call edges out from the symptom to follow (default 3)",
+            1,
+            10,
+        ),
+    }
+}
+
+tool_args! {
+    struct ProvenanceArgs {
+        repo_path: String = repo_spec(),
+        commit_sha: String = path_spec("Commit SHA"),
+        base_branch: Option<String> = path_spec("Base branch to compute distance against (default HEAD)"),
+    }
+}
+
+/// Read a tool's arguments, which [`validate_arguments`] has already accepted.
+///
+/// Extraction repeats none of the bounds; it refuses what a schema cannot say
+/// about Rust: a number that is not exactly an integer, one too wide for its
+/// target, a string over a byte bound. Never a default in place of a refusal.
+pub(crate) fn parse<T: ToolArgs>(name: &str, arguments: &Value) -> Result<T, String> {
+    T::from_args(arguments).map_err(|violations| validate::refusal(name, &violations))
 }
 
 /// The shape every code-intelligence tool returns.
@@ -417,9 +731,9 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_insights",
             "Repository insights",
-            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code sessions per worktree path; kinds it cannot observe, such as Codex, are reported unknown), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
-            json!({ "repo_path": repo_prop() }),
-            &["repo_path"],
+            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
+            RepoArgs::properties(),
+            &RepoArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -438,8 +752,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_status",
             "Repository status",
             "Inspect repository status, worktrees, ledger, and code graph availability",
-            json!({ "repo_path": repo_prop() }),
-            &["repo_path"],
+            RepoArgs::properties(),
+            &RepoArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -455,17 +769,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_active_changes",
             "Active changes",
             "Working-tree file list for a worktree (path, staged, conflicted, churn), capped. A failed read is reported rather than an empty list.",
-            json!({
-                "repo_path": repo_prop(),
-                "worktree_path": path_prop("Worktree to inspect; defaults to repo_path"),
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum files to return (default 200, max 500)",
-                    "minimum": 1,
-                    "maximum": CHANGES_MAX_LIMIT
-                }
-            }),
-            &["repo_path"],
+            ActiveChangesArgs::properties(),
+            &ActiveChangesArgs::required(),
             ok_error_output(
                 json!({
                     "repo_path": { "type": "string" },
@@ -482,19 +787,16 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_collision_risk",
             "Collision risk",
             "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed.",
-            json!({ "repo_path": repo_prop() }),
-            &["repo_path"],
+            RepoArgs::properties(),
+            &RepoArgs::required(),
             collision_risk_output(),
         ),
         tool(
             "gitpulse_change_context",
             "Change context",
             "In-flight context for one worktree: branch, dirty files, parked merge/rebase, bound task, and collisions that involve it.",
-            json!({
-                "repo_path": repo_prop(),
-                "worktree_path": path_prop("Worktree to describe; defaults to repo_path")
-            }),
-            &["repo_path"],
+            ChangeContextArgs::properties(),
+            &ChangeContextArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -517,23 +819,9 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow.",
-            json!({
-                "repo_path": repo_prop(),
-                "cursor": {
-                    "type": "integer",
-                    "description": "Return events with an id greater than this. 0 (the default) starts at the beginning of history.",
-                    "minimum": 0,
-                    "maximum": i64::MAX as u64
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of events (default 50, max 1000)",
-                    "minimum": 1,
-                    "maximum": LEDGER_MAX_LIMIT
-                }
-            }),
-            &["repo_path"],
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix).",
+            LedgerEventsArgs::properties(),
+            &LedgerEventsArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -554,45 +842,16 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_task_view",
             "Task view",
             "Read task leases plus evidence, gaps, and verification runs from dc-store. Never acquires a lease.",
-            json!({
-                "repo_path": repo_prop(),
-                "task_id": path_prop("Optional task id to filter evidence, gaps, and runs")
-            }),
-            &["repo_path"],
+            TaskViewArgs::properties(),
+            &TaskViewArgs::required(),
             json!({ "type": "object" }),
         ),
         mutating_tool(
             "gitpulse_add_task",
             "Add task",
             "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. Planned files are kept as a section of the description. Recorded in the board's event history.",
-            json!({
-                "repo_path": repo_prop(),
-                "title": bounded_string_prop("Task title: one line, at most 300 characters", 1, 1200),
-                "description": bounded_string_prop("Background and problem statement (Markdown)", 0, crate::tasks::file_tasks::MAX_TASK_DESCRIPTION),
-                "task_id": bounded_string_prop("Stable key for this task (letters, digits, '-', '_', '.'), e.g. 'gp-auth-flow'. Defaults to 'gp-' plus the title's slug.", 1, crate::tasks::file_tasks::MAX_TASK_KEY),
-                "status": { "type": "string", "enum": crate::tasks::file_tasks::STATUSES, "maxLength": 32, "description": "Board column (default inbox)" },
-                "priority": {
-                    "type": "integer",
-                    "description": "Priority: 0 (urgent), 1 (high), 2 (normal, default), 3 (low)",
-                    "minimum": 0,
-                    "maximum": 3
-                },
-                "severity": { "type": "string", "enum": ["none", "low", "medium", "high", "critical"], "maxLength": 32, "description": "Severity (default none)" },
-                "kind": bounded_string_prop("Type, e.g. feature (default), bug, refactor, chore, spike", 1, crate::tasks::file_tasks::MAX_KIND_BYTES),
-                "owner": bounded_string_prop("Assignee, e.g. '@alice'", 1, crate::tasks::file_tasks::MAX_OWNER_BYTES),
-                "due": bounded_string_prop("Due date as YYYY-MM-DD, or Unix seconds", 1, 32),
-                "labels": string_array_prop("Labels", crate::tasks::file_tasks::MAX_TASK_LABELS, crate::tasks::file_tasks::MAX_LABEL_BYTES),
-                "repositories": string_array_prop("Other related repository names; kept as a section of the description", crate::tasks::file_tasks::MAX_TASK_REPOSITORIES, crate::tasks::file_tasks::MAX_REPOSITORY_BYTES),
-                "planned_files": string_array_prop("Files the work is expected to touch; kept as a section of the description", crate::tasks::file_tasks::MAX_TASK_PLANNED_FILES, crate::tasks::file_tasks::MAX_PLANNED_FILE_BYTES),
-                "acceptance_criteria": string_array_prop("Definition of done, one item each", crate::tasks::file_tasks::MAX_TASK_CRITERIA, crate::tasks::file_tasks::MAX_CRITERION_BYTES),
-                "logs": bounded_string_prop("Raw logs or traces kept verbatim as evidence (up to 256 KiB)", 0, crate::tasks::file_tasks::MAX_TASK_LOGS),
-                "overwrite": {
-                    "type": "boolean",
-                    "description": "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours."
-                },
-                "reviewed_related": string_array_prop("item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work", crate::workbench::intake::MAX_RELATED, 128)
-            }),
-            &["repo_path", "title"],
+            AddTaskArgs::properties(),
+            &AddTaskArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -616,15 +875,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_import_tasks",
             "Import task briefs",
             "Put the Markdown task briefs in the repository's tasks folder onto the GitPulse task board. Requires the repository to be trusted. Idempotent: a brief already on the board is left alone unless replace is true, and a task deleted on the board stays deleted. Every file is accounted for: a brief that cannot be read is reported by name with the reason, and ok is true only when every file was placed.",
-            json!({
-                "repo_path": repo_prop(),
-                "tasks_dir": bounded_string_prop("Tasks directory relative to the repository root (default 'tasks')", 1, crate::tasks::file_tasks::MAX_TASKS_DIR),
-                "replace": {
-                    "type": "boolean",
-                    "description": "Overwrite the board copy of briefs already imported with the file's current content (default false)"
-                }
-            }),
-            &["repo_path"],
+            ImportTasksArgs::properties(),
+            &ImportTasksArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -651,20 +903,9 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_list_tasks",
             "List tasks",
-            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done.",
-            json!({
-                "repo_path": repo_prop(),
-                "status": { "type": "string", "enum": crate::tasks::file_tasks::STATUSES, "maxLength": 32, "description": "Only this column" },
-                "archived": { "type": "boolean", "description": "true lists the archive instead of the board (default false)" },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum tasks to return (default 50, max 200)",
-                    "minimum": 1,
-                    "maximum": 200
-                },
-                "cursor": bounded_string_prop("next_cursor from a previous page", 1, 180)
-            }),
-            &["repo_path"],
+            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done. A page is never cut to fit the result budget (that would skip rows or leave `has_more` with no `next_cursor`): a page too large to return is a tool error telling you to retry with a smaller `limit`.",
+            ListTasksArgs::properties(),
+            &ListTasksArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -683,11 +924,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_get_task",
             "Get task",
             "Read one task from the GitPulse task board with its canonical agent brief — the same Markdown GitPulse hands an agent it launches. Accepts the task_id it was added with, or an item_id from gitpulse_list_tasks.",
-            json!({
-                "repo_path": repo_prop(),
-                "task_id": bounded_string_prop("The task_id it was added or imported with, or its board item_id", 1, 128)
-            }),
-            &["repo_path", "task_id"],
+            GetTaskArgs::properties(),
+            &GetTaskArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -703,20 +941,9 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_complete_task",
             "Complete task",
-            "Move your GitPulse board task to done when the work is finished (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
-            json!({
-                "repo_path": repo_prop(),
-                "task_id": bounded_string_prop("The task id from your brief ('Task: <id>'), its board item_id, or the task_id it was filed with", 1, 128),
-                "status": { "type": "string", "enum": crate::workbench::intake::AGENT_STATUSES, "maxLength": 32, "description": "Where the task goes (default done)" },
-                "summary": bounded_string_prop("What you changed and how you verified it, in a few lines; appended to the task's logs", 1, crate::workbench::intake::MAX_SUMMARY_CHARS * 4),
-                "expected_revision": {
-                    "type": "integer",
-                    "description": "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
-                    "minimum": 1,
-                    "maximum": 9_007_199_254_740_991_i64
-                }
-            }),
-            &["repo_path", "task_id"],
+            "Move your GitPulse board task to done when the work is finished. Done is evidence-gated: it lands only if Manvi's verification passed for your worktree's current head, otherwise the task goes to review with the reason (held_for_review: true) for a person to judge, and no argument changes that (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
+            CompleteTaskArgs::properties(),
+            &CompleteTaskArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -738,22 +965,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_delete_task",
             "Delete task",
             "Delete a task card from the GitPulse task board — the same delete as the board's own Delete. Pass the task_id it was filed with or its board item_id, and a reason: the reason is appended to the task's logs first, so it stays in the task's history. The delete is soft (the row and its history stay in the GitPulse profile and the id is never reused), but there is no undelete over MCP; only the person can bring it back. Use it only for a task that should not exist — a duplicate, or one merged into another — never to finish work (use gitpulse_complete_task). A task linked to other repositories as well is refused (shared_task). Idempotent: a task already deleted is reported as unchanged. With expected_revision, a task that changed since you read it is refused so you can re-read it. Requires the repository to be trusted in GitPulse.",
-            json!({
-                "repo_path": repo_prop(),
-                "task_id": bounded_string_prop("The task_id it was filed with, or its board item_id from gitpulse_list_tasks", 1, 128),
-                "reason": bounded_string_prop("Why the task is being deleted, in a line or two; recorded in its history", 1, crate::workbench::intake::MAX_REASON_CHARS * 4),
-                "expected_revision": {
-                    "type": "integer",
-                    "description": "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
-                    "minimum": 1,
-                    "maximum": 9_007_199_254_740_991_i64
-                },
-                "even_if_running": {
-                    "type": "boolean",
-                    "description": "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false"
-                }
-            }),
-            &["repo_path", "task_id", "reason"],
+            DeleteTaskArgs::properties(),
+            &DeleteTaskArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -775,42 +988,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_merge_tasks",
             "Merge tasks",
             "Merge duplicate or overlapping tasks on the GitPulse task board into one that stays. Each source becomes a '## Merged from <item_id>' section of the target's description, with its status, priority and description; the target also gets every source's acceptance criteria and labels, the most urgent priority, highest severity and earliest due date among them, and a log block with your reason. Its title, status and owner stay. Then each source is deleted — the same soft delete as gitpulse_delete_task, with your reason in its history and the target named, so an agent launched on it is pointed at the target — and only at the revision that was copied, so no edit is ever lost with it. Source logs stay in each source's history. There is no unmerge over MCP; only the person can bring a source back. Refused, with nothing written: a source linked to another repository too (shared_task), one an agent may still be working on (task_in_use, unless even_if_running), a done target with an open source (target_done), a target whose description the person locked (field_locked), a merge too large for one task (merge_too_large). If it is interrupted or the board changes under it, it reports ok: false with outcome partial and every source's outcome; run the same call again to finish — nothing is copied twice. Idempotent: an already-merged source is reported as already_merged. Requires the repository to be trusted in GitPulse.",
-            json!({
-                "repo_path": repo_prop(),
-                "into_task_id": bounded_string_prop("The task that stays: its task_id or board item_id", 1, 128),
-                "into_expected_revision": {
-                    "type": "integer",
-                    "description": "Only merge if the target is still at this revision when the merge starts",
-                    "minimum": 1,
-                    "maximum": 9_007_199_254_740_991_i64
-                },
-                "sources": {
-                    "type": "array",
-                    "description": "The tasks to fold in and delete",
-                    "minItems": 1,
-                    "maxItems": crate::workbench::intake::MAX_MERGE_SOURCES,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": bounded_string_prop("Its task_id or board item_id", 1, 128),
-                            "expected_revision": {
-                                "type": "integer",
-                                "description": "Only merge if this task is still at this revision when the merge starts",
-                                "minimum": 1,
-                                "maximum": 9_007_199_254_740_991_i64
-                            }
-                        },
-                        "required": ["task_id"],
-                        "additionalProperties": false
-                    }
-                },
-                "reason": bounded_string_prop("Why these are one task, in a line or two; recorded on the target and on every source", 1, crate::workbench::intake::MAX_REASON_CHARS * 4),
-                "even_if_running": {
-                    "type": "boolean",
-                    "description": "Merge a source even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false"
-                }
-            }),
-            &["repo_path", "into_task_id", "sources", "reason"],
+            MergeTasksArgs::properties(),
+            &MergeTasksArgs::required(),
             json!({
                 "type": "object",
                 "properties": {
@@ -837,83 +1016,48 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_codeintel_search",
             "Symbol search",
             "Search symbols across indexed code files via in-process devmap",
-            json!({
-                "repo_path": repo_prop(),
-                "query": path_prop("Symbol name or prefix"),
-                "budget": budget_prop()
-            }),
-            &["repo_path", "query"],
+            SearchArgs::properties(),
+            &SearchArgs::required(),
             codeintel_output(),
         ),
         tool(
             "gitpulse_codeintel_impact",
             "Impact / blast radius",
             "Compute downstream blast radius / affected callers for a symbol or file",
-            json!({
-                "repo_path": repo_prop(),
-                "target": path_prop("Symbol or file path"),
-                "budget": budget_prop()
-            }),
-            &["repo_path", "target"],
+            CodeintelImpactArgs::properties(),
+            &CodeintelImpactArgs::required(),
             codeintel_output(),
         ),
         tool(
             "gitpulse_codeintel_dependencies",
             "File dependencies",
             "What a file depends on — the mirror of impact. Answers outgoing edges from the devmap code graph",
-            json!({
-                "repo_path": repo_prop(),
-                "file_path": path_prop("Repo-relative file whose dependencies to read"),
-                "budget": budget_prop()
-            }),
-            &["repo_path", "file_path"],
+            CodeintelDependenciesArgs::properties(),
+            &CodeintelDependenciesArgs::required(),
             codeintel_output(),
         ),
         tool(
             "gitpulse_codeintel_trace",
             "Trace between symbols",
             "Shortest edge path between two symbols in the devmap code graph",
-            json!({
-                "repo_path": repo_prop(),
-                "from": path_prop("Symbol to trace from"),
-                "to": path_prop("Symbol to trace to"),
-                "budget": budget_prop()
-            }),
-            &["repo_path", "from", "to"],
+            CodeintelTraceArgs::properties(),
+            &CodeintelTraceArgs::required(),
             codeintel_output(),
         ),
         tool(
             "gitpulse_codeintel_dead_symbols",
             "Dead symbols",
             "Unreferenced symbols in the indexed code graph. Unavailable is reported, never an empty list that reads as none found.",
-            json!({
-                "repo_path": repo_prop(),
-                "budget": budget_prop()
-            }),
-            &["repo_path"],
+            BudgetArgs::properties(),
+            &BudgetArgs::required(),
             codeintel_output(),
         ),
         tool(
             "gitpulse_codeintel_suspects",
             "Regression suspects",
             "Which commits since `since` could have caused a symptom. Blames only the lines belonging to symbols the symptom depends on, so the answer is the dependency cone rather than the file's recent history. The window ends at the commit the index was built at, never HEAD. An empty list with available=true means nothing in the window touched the cone; refusals are reported in walk_incomplete and make the list a lower bound.",
-            json!({
-                "repo_path": repo_prop(),
-                "symptom": path_prop("Symbol that is misbehaving — a qualified node id, or a bare name"),
-                "since": path_prop("Revision the window opens at (a commit, tag or branch)"),
-                // Bounded, like every other numeric argument here. The cone
-                // grows with depth and each file it reaches costs a `git blame`
-                // subprocess, so an unbounded depth is an unbounded amount of
-                // work asked for by one integer. Ten is already far past the
-                // point where a dependency chain explains a regression.
-                "depth": {
-                    "type": "integer",
-                    "description": "How many call edges out from the symptom to follow (default 3)",
-                    "minimum": 1,
-                    "maximum": 10
-                }
-            }),
-            &["repo_path", "symptom", "since"],
+            SuspectsArgs::properties(),
+            &SuspectsArgs::required(),
             // [`crate::codeintel::CodeintelSuspectsPayload`]: the ranked list
             // and what was examined, kept together because `scope` is what
             // tells an empty list that is a finding from one that was cut short.
@@ -941,12 +1085,8 @@ fn build_tools() -> Vec<Value> {
             "gitpulse_provenance",
             "Commit provenance",
             "Read Git-native verification notes and confidence decay for a commit",
-            json!({
-                "repo_path": repo_prop(),
-                "commit_sha": path_prop("Commit SHA"),
-                "base_branch": path_prop("Base branch to compute distance against (default HEAD)")
-            }),
-            &["repo_path", "commit_sha"],
+            ProvenanceArgs::properties(),
+            &ProvenanceArgs::required(),
             json!({ "type": "object" }),
         ),
     ];
@@ -1005,23 +1145,30 @@ fn list_result(
     Ok(cacheable(modern, envelope(modern, body), ttl_ms))
 }
 
-fn complete_tool_result(modern: bool, payload: Value) -> Value {
-    // The serialized JSON also goes in a text block: the spec asks for it
-    // ("a tool that returns structured content SHOULD also return the
-    // serialized JSON in a TextContent block") and legacy clients read nothing
-    // else.
-    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|error| {
-        json!({ "ok": false, "error": format!("result could not be serialized: {error}") })
-            .to_string()
-    });
-    let mut body = json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": false
-    });
-    if modern {
-        body["structuredContent"] = payload;
+/// A tool's successful result, fitted to `budget` bytes on the wire (see
+/// [`budget`]): the payload as `structuredContent` in the modern era, and its
+/// compact serialization in a text block in both.
+///
+/// The text is there because the spec asks for it ("a tool that returns
+/// structured content SHOULD also return the serialized JSON in a TextContent
+/// block") and legacy clients read nothing else. It is compact because
+/// pretty-printing cost a third again, and bounded in the modern era because
+/// carrying every large payload twice at full size did the rest. A payload too
+/// large to cut is a tool execution error that says so.
+fn complete_tool_result(modern: bool, payload: Value, budget: usize) -> Value {
+    match budget::fit(modern, payload, budget) {
+        Ok(fitted) => {
+            let mut body = json!({
+                "content": [{ "type": "text", "text": fitted.text }],
+                "isError": false
+            });
+            if let Some(structured) = fitted.structured {
+                body["structuredContent"] = structured;
+            }
+            envelope(modern, body)
+        }
+        Err(message) => tool_exec_error(modern, message),
     }
-    envelope(modern, body)
 }
 
 /// A tool *execution* error: reported inside the result so a model can
@@ -1050,22 +1197,7 @@ fn validate_arguments(name: &str, arguments: &Value) -> Result<(), String> {
     if violations.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "invalid arguments for {name}: {}",
-        violations
-            .iter()
-            .map(validate::Violation::render)
-            .collect::<Vec<_>>()
-            .join("; ")
-    ))
-}
-
-fn parse_string_vec(val: &Value) -> Option<Vec<String>> {
-    val.as_array().map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect()
-    })
+    Err(validate::refusal(name, &violations))
 }
 
 /// Open the task board's profile. `create` is for writes; a read of a machine
@@ -1080,13 +1212,21 @@ fn open_task_profile(create: bool) -> Result<Option<dc_store::Store>, String> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        return dc_store::Store::open(&path)
-            .map(Some)
-            .map_err(|e| e.to_string());
+        return open_shared_profile(dc_store::Store::open(&path));
     }
-    dc_store::Store::open_existing(&path)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    open_shared_profile(dc_store::Store::open_existing(&path))
+}
+
+/// The task profile is shared with the desktop app, which owns its schema.
+/// This server may be older or newer than the app, so its handle never
+/// upgrades: a request that needs the upgrade fails with
+/// `schema_upgrade_required` and leaves the profile as it found it.
+fn open_shared_profile(
+    opened: Result<dc_store::Store, dc_store::StoreError>,
+) -> Result<Option<dc_store::Store>, String> {
+    let mut store = opened.map_err(|e| e.to_string())?;
+    store.refuse_workbench_upgrades();
+    Ok(Some(store))
 }
 
 #[cfg(not(test))]
@@ -1189,16 +1329,14 @@ pub(crate) fn read_insights(read: impl Fn() -> Value, retry: &DeferralRetry<'_>)
     .0
 }
 
-/// The production retry: real clock, real sleep, a window from `started`.
-fn with_production_retry<T>(
-    started: std::time::Instant,
-    body: impl FnOnce(&DeferralRetry<'_>) -> T,
-) -> T {
+/// Calls `body` with the production retry: real clock, real sleep, a window
+/// counted from now.
+fn with_production_retry<T>(body: impl FnOnce(&DeferralRetry<'_>) -> T) -> T {
     body(&DeferralRetry {
         sleep: &std::thread::sleep,
         jitter: &process_jitter,
         now: &std::time::Instant::now,
-        deadline: started + DEFERRAL_RETRY_WINDOW,
+        deadline: std::time::Instant::now() + DEFERRAL_RETRY_WINDOW,
     })
 }
 
@@ -1209,7 +1347,7 @@ fn read_address(
     retry: &DeferralRetry<'_>,
 ) -> Result<crate::ledger::bindings::BindingAddress, String> {
     retry_once_on_deferral(
-        || crate::ledger::bindings::repository_address(repo),
+        || crate::ledger::bindings::repository_address_readonly(repo),
         |result| {
             result
                 .as_ref()
@@ -1221,152 +1359,108 @@ fn read_address(
 }
 
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
-    let started = std::time::Instant::now();
-    with_production_retry(started, |retry| {
-        handle_tool_call_with(name, arguments, retry)
-    })
-}
-
-fn handle_tool_call_with(
-    name: &str,
-    arguments: &Value,
-    retry: &DeferralRetry<'_>,
-) -> Result<Value, String> {
-    // Every arm below reads arguments the schema has already accepted, so a
-    // missing required field is unreachable here and the `ok_or` fallbacks are
-    // belt-and-braces rather than the real check.
+    // The schema refuses what it can say (bounds, enums, unknown keys); `parse`
+    // then reads the accepted call into the tool's struct, and refuses what the
+    // schema cannot (a number that is not exactly an integer). Neither step
+    // ever substitutes a default for an argument that was sent.
     validate_arguments(name, arguments)?;
     match name {
         "gitpulse_insights" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            Ok(read_insights(|| json!(insights::snapshot(repo)), retry))
+            let a: RepoArgs = parse(name, arguments)?;
+            Ok(with_production_retry(|retry| {
+                read_insights(|| json!(insights::snapshot(&a.repo_path)), retry)
+            }))
         }
         "gitpulse_status" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            resources::status_document(repo)
+            let a: RepoArgs = parse(name, arguments)?;
+            resources::status_document(&a.repo_path)
         }
         "gitpulse_active_changes" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let worktree = arguments["worktree_path"].as_str();
-            let limit = arguments["limit"].as_u64().map(|n| n as u32);
-            Ok(read_insights(
-                || json!(insights::active_changes(repo, worktree, limit)),
-                retry,
-            ))
+            let a: ActiveChangesArgs = parse(name, arguments)?;
+            Ok(with_production_retry(|retry| {
+                read_insights(
+                    || {
+                        json!(insights::active_changes(
+                            &a.repo_path,
+                            a.worktree_path.as_deref(),
+                            a.limit
+                        ))
+                    },
+                    retry,
+                )
+            }))
         }
         "gitpulse_collision_risk" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            Ok(read_insights(
-                || json!(insights::collision_risk(repo)),
-                retry,
-            ))
+            let a: RepoArgs = parse(name, arguments)?;
+            Ok(with_production_retry(|retry| {
+                read_insights(|| json!(insights::collision_risk(&a.repo_path)), retry)
+            }))
         }
         "gitpulse_change_context" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let worktree = arguments["worktree_path"].as_str();
-            Ok(read_insights(
-                || json!(insights::change_context(repo, worktree)),
-                retry,
-            ))
+            let a: ChangeContextArgs = parse(name, arguments)?;
+            Ok(with_production_retry(|retry| {
+                read_insights(
+                    || {
+                        json!(insights::change_context(
+                            &a.repo_path,
+                            a.worktree_path.as_deref()
+                        ))
+                    },
+                    retry,
+                )
+            }))
         }
-        "gitpulse_ledger_events" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let limit = arguments["limit"]
-                .as_u64()
-                .map(|n| n as u32)
-                .unwrap_or(LEDGER_DEFAULT_LIMIT);
-            let address = read_address(repo, retry)?;
-            // `tail` pages *forward* from a cursor — deliberately, so a
-            // consumer holding the last id it saw gets the same answer whether
-            // it has been listening for an hour or just opened. This tool
-            // pinned the cursor at 0 and exposed no way to move it, so it
-            // always returned the oldest events with no way to reach recent
-            // ones. `total` was the returned count wearing the name of the
-            // history size, which reads as a complete answer over a ledger of
-            // any size; `returned` says what it is, `truncated` says when more
-            // follow, and `next_cursor` is what to pass to get them.
-            let cursor = arguments["cursor"].as_i64().unwrap_or(0);
-            match crate::ledger::tail_readonly(&address.anchor, cursor, limit)
-                .map_err(|e| e.to_string())?
-            {
-                Some(events) => {
-                    let truncated = events.len() as u32 >= limit;
-                    let next_cursor = events.last().map(|event| event.id);
-                    Ok(json!({
-                        "ok": true,
-                        "returned": events.len(),
-                        "truncated": truncated,
-                        "next_cursor": next_cursor,
-                        "events": events,
-                    }))
-                }
-                None => Ok(json!({
-                    "ok": false,
-                    "error": "no ledger in this repository yet; nothing has been recorded",
-                    "returned": 0,
-                    "truncated": false,
-                    "events": [],
-                })),
-            }
-        }
-        "gitpulse_task_view" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let address = read_address(repo, retry)?;
-            let task_id = arguments["task_id"].as_str();
-            let view = crate::tasks::view_filtered(&address.anchor, task_id);
-            Ok(json!(view))
-        }
+        "gitpulse_ledger_events" => ledger_events(parse(name, arguments)?),
+        "gitpulse_task_view" => task_view(parse(name, arguments)?),
         "gitpulse_add_task" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let title = arguments["title"].as_str().ok_or("missing title")?;
-            let text = |key: &str| arguments[key].as_str().map(str::to_string);
-            let key = match arguments["task_id"].as_str() {
-                Some(key) => key.to_string(),
-                None => format!("gp-{}", crate::tasks::file_tasks::slugify(title)),
+            let a: AddTaskArgs = parse(name, arguments)?;
+            let key = match a.task_id {
+                Some(key) => key,
+                None => format!("gp-{}", ft::slugify(&a.title)),
             };
-            let task = crate::workbench::intake::ExternalTask {
+            let task = intake::ExternalTask {
                 key,
-                title: title.to_string(),
-                description: text("description").unwrap_or_default(),
-                status: text("status"),
-                priority: arguments["priority"]
-                    .as_u64()
-                    .map(|p| p.min(u64::from(u8::MAX)) as u8),
-                severity: text("severity"),
-                kind: text("kind"),
-                owner: text("owner"),
-                due: text("due"),
-                labels: parse_string_vec(&arguments["labels"]).unwrap_or_default(),
-                acceptance_criteria: parse_string_vec(&arguments["acceptance_criteria"])
-                    .unwrap_or_default(),
-                planned_files: parse_string_vec(&arguments["planned_files"]).unwrap_or_default(),
-                repositories: parse_string_vec(&arguments["repositories"]).unwrap_or_default(),
-                logs: text("logs"),
+                title: a.title,
+                description: a.description.unwrap_or_default(),
+                status: a.status,
+                priority: a.priority,
+                severity: a.severity,
+                kind: a.kind,
+                owner: a.owner,
+                due: a.due,
+                labels: a.labels.unwrap_or_default(),
+                acceptance_criteria: a.acceptance_criteria.unwrap_or_default(),
+                planned_files: a.planned_files.unwrap_or_default(),
+                repositories: a.repositories.unwrap_or_default(),
+                logs: a.logs,
             };
-            let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
-            let reviewed = parse_string_vec(&arguments["reviewed_related"]).unwrap_or_default();
+            let reviewed = a.reviewed_related.unwrap_or_default();
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
-            crate::workbench::intake::add_task(&store, repo, task, overwrite, &reviewed)
-                .map_err(workbench_message)
+            intake::add_task(
+                &store,
+                &a.repo_path,
+                task,
+                a.overwrite.unwrap_or(false),
+                &reviewed,
+            )
+            .map_err(workbench_message)
         }
         "gitpulse_import_tasks" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let replace = arguments["replace"].as_bool().unwrap_or(false);
+            let a: ImportTasksArgs = parse(name, arguments)?;
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
-            crate::workbench::intake::import_briefs(
+            intake::import_briefs(
                 &store,
-                repo,
-                arguments["tasks_dir"].as_str(),
-                replace,
+                &a.repo_path,
+                a.tasks_dir.as_deref(),
+                a.replace.unwrap_or(false),
             )
             .map(|report| json!(report))
             .map_err(workbench_message)
         }
         "gitpulse_list_tasks" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let limit = arguments["limit"].as_u64().unwrap_or(50);
+            let a: ListTasksArgs = parse(name, arguments)?;
             let Some(store) = open_task_profile(false)? else {
                 return Ok(json!({
                     "ok": true, "repository": null, "returned": 0, "total": 0, "has_more": false,
@@ -1374,142 +1468,176 @@ fn handle_tool_call_with(
                     "note": "GitPulse has no task board on this machine yet: nothing has been filed. That is not the same as a board whose tasks are all done.",
                 }));
             };
-            crate::workbench::intake::list_tasks(
+            intake::list_tasks(
                 &store,
-                repo,
-                arguments["status"].as_str(),
-                arguments["archived"].as_bool().unwrap_or(false),
-                limit,
-                arguments["cursor"].as_str(),
+                &a.repo_path,
+                a.status.as_deref(),
+                a.archived.unwrap_or(false),
+                a.limit.unwrap_or(50),
+                a.cursor.as_deref(),
             )
             .map_err(workbench_message)
         }
         "gitpulse_get_task" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let task = arguments["task_id"].as_str().ok_or("missing task_id")?;
-            let store = open_task_profile(false)?
-                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
-            crate::workbench::intake::get_task(&store, repo, task).map_err(workbench_message)
+            let a: GetTaskArgs = parse(name, arguments)?;
+            let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
+            intake::get_task(&store, &a.repo_path, &a.task_id).map_err(workbench_message)
         }
         "gitpulse_complete_task" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let task = arguments["task_id"].as_str().ok_or("missing task_id")?;
-            let status = arguments["status"].as_str().unwrap_or("done");
+            let a: CompleteTaskArgs = parse(name, arguments)?;
             // Reading, not creating: a task to complete has to exist already.
-            let store = open_task_profile(false)?
-                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
-            crate::workbench::intake::complete_task(
+            let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
+            intake::complete_task(
                 &store,
-                repo,
-                task,
-                status,
-                arguments["expected_revision"].as_i64(),
-                arguments["summary"].as_str(),
+                &a.repo_path,
+                &a.task_id,
+                a.status.as_deref().unwrap_or("done"),
+                a.expected_revision,
+                a.summary.as_deref(),
+                a.request_id.as_deref(),
             )
             .map_err(workbench_message)
         }
         "gitpulse_delete_task" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let task = arguments["task_id"].as_str().ok_or("missing task_id")?;
-            let reason = arguments["reason"].as_str().ok_or("missing reason")?;
+            let a: DeleteTaskArgs = parse(name, arguments)?;
             // Reading, not creating: a task to delete has to exist already.
-            let store = open_task_profile(false)?
-                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
-            crate::workbench::intake::delete_task(
+            let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
+            intake::delete_task(
                 &store,
-                repo,
-                task,
-                arguments["expected_revision"].as_i64(),
-                reason,
-                arguments["even_if_running"].as_bool().unwrap_or(false),
+                &a.repo_path,
+                &a.task_id,
+                a.expected_revision,
+                &a.reason,
+                a.even_if_running.unwrap_or(false),
+                a.request_id.as_deref(),
             )
             .map_err(workbench_message)
         }
         "gitpulse_merge_tasks" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let named = |task: &Value, revision: &Value| -> Result<_, String> {
-                Ok(crate::workbench::intake::MergeTask {
-                    task: task.as_str().ok_or("missing task_id")?.to_owned(),
-                    expected_revision: revision.as_i64(),
-                })
+            let a: MergeTasksArgs = parse(name, arguments)?;
+            let into = intake::MergeTask {
+                task: a.into_task_id,
+                expected_revision: a.into_expected_revision,
             };
-            let into = named(
-                &arguments["into_task_id"],
-                &arguments["into_expected_revision"],
-            )?;
-            let sources = arguments["sources"]
-                .as_array()
-                .ok_or("missing sources")?
-                .iter()
-                .map(|source| named(&source["task_id"], &source["expected_revision"]))
-                .collect::<Result<Vec<_>, _>>()?;
-            let reason = arguments["reason"].as_str().ok_or("missing reason")?;
+            let sources: Vec<intake::MergeTask> = a
+                .sources
+                .into_iter()
+                .map(|source| intake::MergeTask {
+                    task: source.task_id,
+                    expected_revision: source.expected_revision,
+                })
+                .collect();
             // Reading, not creating: tasks to merge have to exist already.
-            let store = open_task_profile(false)?
-                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
-            crate::workbench::intake::merge_tasks(
+            let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
+            intake::merge_tasks(
                 &store,
-                repo,
+                &a.repo_path,
                 &into,
                 &sources,
-                reason,
-                arguments["even_if_running"].as_bool().unwrap_or(false),
+                &a.reason,
+                a.even_if_running.unwrap_or(false),
             )
             .map_err(workbench_message)
         }
         name if name.starts_with("devmap_") => devmap_parity::handle(name, arguments),
         "gitpulse_codeintel_search" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let query = arguments["query"].as_str().ok_or("missing query")?;
-            let budget = arguments["budget"].as_u64().map(|b| b as u32);
-            Ok(json!(crate::codeintel::search(repo, query, budget)))
+            let a: SearchArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::search(
+                &a.repo_path,
+                &a.query,
+                a.budget
+            )))
         }
         "gitpulse_codeintel_impact" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let target = arguments["target"].as_str().ok_or("missing target")?;
-            let budget = arguments["budget"].as_u64().map(|b| b as u32);
-            Ok(json!(crate::codeintel::impact(repo, target, budget)))
+            let a: CodeintelImpactArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::impact(
+                &a.repo_path,
+                &a.target,
+                a.budget
+            )))
         }
         "gitpulse_codeintel_dependencies" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let file = arguments["file_path"].as_str().ok_or("missing file_path")?;
-            let budget = arguments["budget"].as_u64().map(|b| b as u32);
-            Ok(json!(crate::codeintel::dependencies(repo, file, budget)))
+            let a: CodeintelDependenciesArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::dependencies(
+                &a.repo_path,
+                &a.file_path,
+                a.budget
+            )))
         }
         "gitpulse_codeintel_trace" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let from = arguments["from"].as_str().ok_or("missing from")?;
-            let to = arguments["to"].as_str().ok_or("missing to")?;
-            let budget = arguments["budget"].as_u64().map(|b| b as u32);
+            let a: CodeintelTraceArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::trace_between(
-                repo, from, to, budget
+                &a.repo_path,
+                &a.from,
+                &a.to,
+                a.budget
             )))
         }
         "gitpulse_codeintel_dead_symbols" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let budget = arguments["budget"].as_u64().map(|b| b as u32);
-            Ok(json!(crate::codeintel::dead_symbols(repo, budget)))
+            let a: BudgetArgs = parse(name, arguments)?;
+            Ok(json!(crate::codeintel::dead_symbols(
+                &a.repo_path,
+                a.budget
+            )))
         }
         "gitpulse_codeintel_suspects" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let symptom = arguments["symptom"].as_str().ok_or("missing symptom")?;
-            let since = arguments["since"].as_str().ok_or("missing since")?;
-            let depth = arguments["depth"].as_u64().map(|d| d as u32);
+            let a: SuspectsArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::suspects(
-                repo, symptom, since, depth
+                &a.repo_path,
+                &a.symptom,
+                &a.since,
+                a.depth
             )))
         }
         "gitpulse_provenance" => {
-            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let commit_sha = arguments["commit_sha"]
-                .as_str()
-                .ok_or("missing commit_sha")?;
-            let base = arguments["base_branch"].as_str();
-            let freshness = crate::engine::provenance::compute_freshness(repo, commit_sha, base);
-            Ok(json!(freshness))
+            let a: ProvenanceArgs = parse(name, arguments)?;
+            Ok(json!(crate::engine::provenance::compute_freshness(
+                &a.repo_path,
+                &a.commit_sha,
+                a.base_branch.as_deref()
+            )))
         }
         _ => Err(format!("Unknown tool: {name}")),
     }
+}
+
+/// What a read or a write of a task that must already exist says when this
+/// machine has no board.
+const NO_BOARD: &str = "GitPulse has no task board on this machine yet: nothing has been filed.";
+
+fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
+    let address = with_production_retry(|retry| read_address(&a.repo_path, retry))?;
+    // `tail` pages *forward* from a cursor — deliberately, so a
+    // consumer holding the last id it saw gets the same answer whether
+    // it has been listening for an hour or just opened. This tool
+    // pinned the cursor at 0 and exposed no way to move it, so it
+    // always returned the oldest events with no way to reach recent
+    // ones. `total` was the returned count wearing the name of the
+    // history size, which reads as a complete answer over a ledger of
+    // any size; `returned` says what it is, `truncated` says when more
+    // follow, and `next_cursor` is what to pass to get them.
+    resources::ledger_page(
+        &address.anchor,
+        a.cursor.unwrap_or(0),
+        a.limit.unwrap_or(LEDGER_DEFAULT_LIMIT),
+    )
+}
+
+fn task_view(a: TaskViewArgs) -> Result<Value, String> {
+    let address = with_production_retry(|retry| read_address(&a.repo_path, retry))?;
+    let mut view = crate::tasks::view_filtered(&address.anchor, a.task_id.as_deref());
+    // The view is also what the desktop app reads whole, so the cap is here, at
+    // the MCP boundary. Each row's stored JSON text is cut the way a ledger
+    // page cuts its own; the result budget then cuts the lists themselves and
+    // sets `evidence_truncated` / `gaps_truncated`.
+    let cap = crate::ledger::ROW_FIELD_CAP_BYTES;
+    for evidence in &mut view.evidence {
+        evidence.data_json = crate::ledger::bound_json_text(&evidence.data_json, cap);
+    }
+    for gap in &mut view.gaps {
+        gap.evidence_json = crate::ledger::bound_json_text(&gap.evidence_json, cap);
+    }
+    Ok(json!(view))
 }
 
 fn meta_object(params: &Value) -> Option<&Value> {
@@ -1592,11 +1720,15 @@ impl Ready {
             self.id.clone(),
             -32603,
             format!(
-                "{} exceeded the {} ms server budget and was abandoned",
+                "{} exceeded the {} ms server budget and the client stopped waiting; the work is not cancelled and may still finish, so a write's outcome is unknown. Read the state back before retrying",
                 self.method,
                 budget.as_millis()
             ),
-            Some(json!({ "method": self.method, "timeoutMs": budget.as_millis() as u64 })),
+            Some(json!({
+                "method": self.method,
+                "timeoutMs": budget.as_millis() as u64,
+                "outcomeUnknown": true,
+            })),
         )
     }
 
@@ -1610,6 +1742,20 @@ impl Ready {
             -32603,
             format!("{} panicked; the server is still running", self.method),
             Some(json!({ "method": self.method })),
+        )
+    }
+
+    /// The answer to send when no thread could be started to run this request.
+    /// The request never ran, so the client may retry it.
+    pub fn unstarted(&self) -> JsonRpcResponse {
+        err(
+            self.id.clone(),
+            -32603,
+            format!(
+                "{} did not run: the server could not start a thread for it; retry",
+                self.method
+            ),
+            Some(json!({ "method": self.method, "ran": false })),
         )
     }
 }
@@ -1678,9 +1824,9 @@ pub fn accept(req: JsonRpcRequest, era: &mut Era) -> Accepted {
 
     if req.method == "initialize" {
         *era = Era::Legacy;
-        let requested = req.params["protocolVersion"]
-            .as_str()
-            .unwrap_or("2024-11-05");
+        // An absent version asks for nothing in particular, so it gets the same
+        // answer as an unknown one rather than being assumed to mean the oldest.
+        let requested = req.params["protocolVersion"].as_str().unwrap_or("");
         let protocol_version = if LEGACY_VERSIONS.contains(&requested) {
             requested
         } else if requested == PROTOCOL_VERSION {
@@ -1688,7 +1834,7 @@ pub fn accept(req: JsonRpcRequest, era: &mut Era) -> Accepted {
             // they asked for so they are not stuck, and name the modern version.
             PROTOCOL_VERSION
         } else {
-            LEGACY_VERSIONS[1]
+            LEGACY_VERSIONS[0]
         };
         return Accepted::Answered(ok(
             id,
@@ -1772,6 +1918,13 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
         },
         "resources/read" => match params.get("uri").and_then(Value::as_str) {
             None => invalid_params(id, "Invalid params: uri must be a string"),
+            Some(target) if target.len() > MAX_URI_BYTES => invalid_params(
+                id,
+                format!(
+                    "Invalid params: uri is {} bytes; the limit is {MAX_URI_BYTES}",
+                    target.len()
+                ),
+            ),
             Some(target) => match resources::read(target) {
                 Ok(contents) => ok(id, envelope(modern, json!({ "contents": contents }))),
                 // A URI this server does not address is the caller's to fix; a
@@ -1818,7 +1971,10 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
                 );
             }
             match handle_tool_call(name, &arguments) {
-                Ok(payload) => ok(id, complete_tool_result(modern, payload)),
+                Ok(payload) => {
+                    let room = budget::tool_budget(&id);
+                    ok(id, complete_tool_result(modern, payload, room))
+                }
                 // Unknown tool is a protocol error: no argument the model could
                 // change would make the call succeed.
                 Err(message) if message.starts_with("Unknown tool:") => {
@@ -2151,6 +2307,54 @@ mod tests {
         // Modern-only fields must not leak into a legacy result.
         for modern_only in ["resultType", "ttlMs", "cacheScope", "_meta"] {
             assert!(result.get(modern_only).is_none(), "{modern_only} leaked");
+        }
+    }
+
+    /// Regression (oldest-version fallback): a client asking for a revision this
+    /// binary does not list was answered 2024-11-05, the *oldest* it speaks,
+    /// under which `outputSchema` and `structuredContent` (the `ok` and
+    /// `unscanned_worktrees` facets) may be ignored. The spec says the latest.
+    #[test]
+    fn an_unlisted_requested_version_is_answered_with_the_newest_supported() {
+        assert!(
+            LEGACY_VERSIONS.windows(2).all(|pair| pair[0] > pair[1]),
+            "LEGACY_VERSIONS must be newest first: {LEGACY_VERSIONS:?}"
+        );
+        for requested in [
+            json!("2025-06-18"),
+            json!("2025-03-26"),
+            json!("1999-01-01"),
+            json!(null),
+        ] {
+            let mut era = Era::Unknown;
+            let resp = process_request(
+                request(
+                    "initialize",
+                    Some(json!(1)),
+                    json!({ "protocolVersion": requested, "capabilities": {} }),
+                ),
+                &mut era,
+            )
+            .expect("answered");
+            assert_eq!(
+                resp.result.unwrap()["protocolVersion"],
+                LEGACY_VERSIONS[0],
+                "requested {requested}"
+            );
+        }
+        // A listed version is still answered with itself.
+        for version in LEGACY_VERSIONS {
+            let mut era = Era::Unknown;
+            let resp = process_request(
+                request(
+                    "initialize",
+                    Some(json!(1)),
+                    json!({ "protocolVersion": version }),
+                ),
+                &mut era,
+            )
+            .expect("answered");
+            assert_eq!(resp.result.unwrap()["protocolVersion"], *version);
         }
     }
 
@@ -2529,6 +2733,23 @@ mod tests {
     }
 
     #[test]
+    fn ledger_events_says_where_event_time_lives() {
+        // Event time rides in `detail_json`: the event contract is closed to a
+        // new top-level field, so the tool is where a reader learns of it.
+        let tool = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .expect("tool");
+        let description = tool["description"].as_str().expect("a description");
+        assert!(
+            description.contains("detail_json.occurred_at"),
+            "{description}"
+        );
+        assert!(description.contains("task_basis"), "{description}");
+        assert!(description.contains("`ts_utc` is when the row was appended"));
+    }
+
+    #[test]
     fn ledger_events_can_reach_recent_history_not_only_the_oldest_page() {
         // `tail` pages forward from a cursor by design. This tool pinned that
         // cursor at 0 and exposed no way to move it, so it always returned the
@@ -2556,6 +2777,233 @@ mod tests {
         assert!(tool["outputSchema"]["properties"]["total"].is_null());
     }
 
+    /// A trusted repository whose ledger holds `rows` events carrying `detail`
+    /// bytes each, and the anchor to read it back by.
+    fn repository_with_ledger_rows(rows: usize, detail: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", &repo])
+            .output_locked()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        crate::test_support::trust_repo(dir.path());
+        let address = crate::ledger::bindings::repository_address(&repo).expect("address");
+        for n in 0..rows {
+            let id = crate::ledger::record(crate::ledger::Draft {
+                repo_path: address.anchor.clone(),
+                action: "session.command".into(),
+                object: Some(format!("echo {n}")),
+                actor_kind: Some(crate::ledger::ActorKind::Agent),
+                outcome: Some(crate::ledger::Outcome::Ok),
+                detail_json: Some(json!({ "note": "d".repeat(detail) }).to_string()),
+                ..Default::default()
+            });
+            assert!(id.is_some(), "row {n} was not recorded");
+        }
+        (dir, repo)
+    }
+
+    /// A resource `uri` is echoed in the document and in every error about it,
+    /// so one the size of the frame could never be answered. It is refused at
+    /// the boundary, by size, without echoing it.
+    #[test]
+    fn an_over_long_resource_uri_is_refused_at_the_request_boundary() {
+        let long = format!("gitpulse://insights/{}", "a".repeat(MAX_URI_BYTES));
+        let response = call(
+            "resources/read",
+            json!({ "uri": long, "_meta": modern_meta() }),
+        );
+        let size = wire_len(&response);
+        let error = response.error.expect("refused");
+        assert_eq!(error["code"], -32602);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("limit"), "{message}");
+        assert!(message.len() < 200, "the uri was echoed: {}", message.len());
+        assert!(size < 1024);
+
+        // A uri at the limit still reaches the reader, which answers about it.
+        let at_limit = format!(
+            "gitpulse://insights/{}",
+            "a".repeat(MAX_URI_BYTES - "gitpulse://insights/".len())
+        );
+        assert_eq!(at_limit.len(), MAX_URI_BYTES);
+        let response = call(
+            "resources/read",
+            json!({ "uri": at_limit, "_meta": modern_meta() }),
+        );
+        let refused_by_size = response
+            .error
+            .as_ref()
+            .and_then(|error| error["message"].as_str())
+            .is_some_and(|message| message.contains("the limit is"));
+        assert!(!refused_by_size, "a uri at the limit is not over it");
+    }
+
+    fn wire_len(response: &JsonRpcResponse) -> usize {
+        serde_json::to_string(response).expect("serializes").len() + 1
+    }
+
+    /// 1000 rows of about 6.5 KiB is 6.5 MB of ledger, past the 4 MiB frame the
+    /// transport can carry. A page must come back bounded, say it is partial,
+    /// and hand back the cursor that continues exactly where it stopped.
+    #[test]
+    fn a_6_mib_ledger_is_paged_within_the_frame_without_skipping_or_repeating() {
+        let (_dir, repo) = repository_with_ledger_rows(1000, 6_500);
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_ledger_events")
+            .expect("tool")["outputSchema"]
+            .clone();
+        let mut cursor = 0_i64;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let response = call(
+                "tools/call",
+                json!({
+                    "name": "gitpulse_ledger_events",
+                    "arguments": { "repo_path": repo, "limit": 1000, "cursor": cursor },
+                    "_meta": modern_meta(),
+                }),
+            );
+            assert!(
+                wire_len(&response) <= 4 * 1024 * 1024,
+                "page {pages} is {} bytes on the wire",
+                wire_len(&response)
+            );
+            let result = response.result.expect("a result");
+            assert_eq!(result["isError"], false, "{result:.300}");
+            let page = result["structuredContent"].clone();
+            let violations = validate::validate(&page, &schema);
+            assert!(
+                violations.is_empty(),
+                "page violates its schema: {violations:?}"
+            );
+            let events = page["events"].as_array().expect("events");
+            assert_eq!(page["returned"], events.len());
+            seen.extend(events.iter().map(|e| e["id"].as_i64().expect("id")));
+            let last = events.last().expect("a page always makes progress")["id"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(
+                page["next_cursor"], last,
+                "next_cursor is the last returned id"
+            );
+            pages += 1;
+            if pages == 1 {
+                assert_eq!(
+                    page["truncated"], true,
+                    "the first page cannot be the whole ledger"
+                );
+            }
+            if page["truncated"] != true {
+                break;
+            }
+            assert!(pages < 40, "paging does not terminate");
+            cursor = last;
+        }
+        assert!(pages > 1, "6.5 MB of rows came back as one page");
+        assert_eq!(seen.len(), 1000, "paging skipped or repeated a row");
+        assert!(
+            seen.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "paging skipped or repeated a row: {seen:?}"
+        );
+    }
+
+    /// What the result budget adds to a call, alone: the budget step on a real
+    /// insights payload, min of 500, with no git underneath. Timing only, so it
+    /// is ignored; run it in release with
+    /// `cargo test --release --lib -- --ignored --nocapture the_budget_step`.
+    #[test]
+    #[ignore = "timing only, no assertion on speed"]
+    fn the_budget_step_alone_on_a_real_insights_payload() {
+        let (dir, repo) = repository_with_ledger_rows(1, 10);
+        let _keep = dir;
+        let payload = handle_tool_call("gitpulse_insights", &json!({ "repo_path": repo }))
+            .expect("insights answers");
+        let bytes = serde_json::to_string(&payload).unwrap().len();
+        let room = budget::tool_budget(&json!(1));
+        let mut least = std::time::Duration::MAX;
+        for _ in 0..500 {
+            let copy = payload.clone();
+            let started = std::time::Instant::now();
+            let fitted = std::hint::black_box(budget::fit(true, copy, room));
+            least = least.min(started.elapsed());
+            assert!(fitted.is_ok());
+        }
+        let mut before = std::time::Duration::MAX;
+        for _ in 0..500 {
+            let started = std::time::Instant::now();
+            let text = std::hint::black_box(serde_json::to_string_pretty(&payload));
+            before = before.min(started.elapsed());
+            assert!(text.is_ok());
+        }
+        println!(
+            "budget::fit on a {bytes} byte insights payload: min {least:?} of 500 \
+             (the pretty-printed text it replaced: min {before:?})"
+        );
+    }
+
+    /// A modern client reads `structuredContent`; the text block exists for
+    /// clients that read nothing else. Both full-size doubled every large
+    /// result on the wire. Modern gets one full copy and a bounded mirror, and a
+    /// legacy client (which has only the text) gets the whole budget in it.
+    #[test]
+    fn a_large_payload_has_one_full_copy_and_a_bounded_text_mirror() {
+        let (_dir, repo) = repository_with_ledger_rows(120, 6_500);
+        let arguments = json!({ "repo_path": repo, "limit": 1000 });
+
+        let modern = modern_call(
+            "tools/call",
+            json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+        );
+        let text = modern["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.len() <= 256 * 1024,
+            "the modern text mirror is {} bytes",
+            text.len()
+        );
+        let mirror: Value = serde_json::from_str(text).expect("the mirror is still JSON");
+        assert!(
+            mirror["events"].is_array(),
+            "the mirror keeps the payload's shape"
+        );
+        let structured = &modern["structuredContent"];
+        assert_eq!(structured["events"].as_array().expect("events").len(), 120);
+        assert!(
+            structured["events"].to_string().len() > 256 * 1024,
+            "the fixture is not large enough to exercise the mirror"
+        );
+        assert!(
+            !text.contains("\n  "),
+            "the text is compact, not pretty-printed"
+        );
+
+        let mut era = Era::Unknown;
+        process_request(request("initialize", Some(json!(0)), json!({})), &mut era);
+        let legacy = process_request(
+            request(
+                "tools/call",
+                Some(json!(1)),
+                json!({ "name": "gitpulse_ledger_events", "arguments": arguments }),
+            ),
+            &mut era,
+        )
+        .expect("answered")
+        .result
+        .expect("result");
+        assert!(legacy.get("structuredContent").is_none());
+        let body: Value =
+            serde_json::from_str(legacy["content"][0]["text"].as_str().expect("text"))
+                .expect("legacy text is JSON");
+        assert_eq!(
+            body["events"].as_array().expect("events").len(),
+            120,
+            "a legacy client has only the text; it must not be shortened"
+        );
+    }
+
     /// Every declared property the payload carries as `null` must declare
     /// `null` among its types. `validate` reads an optional `null` as an absent
     /// argument, which is right for input; a client checking `structuredContent`
@@ -2579,6 +3027,166 @@ mod tests {
         found
     }
 
+    /// Pointer to the non-empty list with the most serialized bytes, at any depth.
+    fn largest_nonempty_list(
+        value: &Value,
+        pointer: &mut String,
+        best: &mut Option<(usize, String)>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                if !items.is_empty() {
+                    let size = value.to_string().len();
+                    if best.as_ref().is_none_or(|(most, _)| size > *most) {
+                        *best = Some((size, pointer.clone()));
+                    }
+                }
+                for (index, item) in items.iter().enumerate() {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{index}"));
+                    largest_nonempty_list(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{}", key.replace('~', "~0").replace('/', "~1")));
+                    largest_nonempty_list(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pointer to the longest string in `value`, at any depth.
+    fn longest_string(value: &Value, pointer: &mut String, best: &mut Option<(usize, String)>) {
+        match value {
+            Value::String(text) => {
+                if best.as_ref().is_none_or(|(most, _)| text.len() > *most) {
+                    *best = Some((text.len(), pointer.clone()));
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{index}"));
+                    longest_string(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    let mark = pointer.len();
+                    pointer.push_str(&format!("/{}", key.replace('~', "~0").replace('/', "~1")));
+                    longest_string(item, pointer, best);
+                    pointer.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Inflate the longest string of a real tool payload to 300 KB of lines (a
+    /// log field: every newline costs six bytes once it is escaped into the text
+    /// block and again as a string), past the text mirror's half-budget but far
+    /// inside the budget, in the modern era. The call must succeed with the
+    /// payload whole in `structuredContent` and meet its `outputSchema`; an
+    /// error here is a tool that fails on a large field the budget could carry.
+    /// False when the payload holds no string.
+    fn probe_a_long_string(name: &str, label: &str, schema: &Value, payload: &Value) -> bool {
+        let mut best = None;
+        longest_string(payload, &mut String::new(), &mut best);
+        let Some((_, pointer)) = best else {
+            return false;
+        };
+        let mut inflated = payload.clone();
+        if let Some(slot) = inflated.pointer_mut(&pointer) {
+            *slot = Value::String("x\n".repeat(150_000));
+        }
+        let fitted = budget::fit(true, inflated.clone(), budget::tool_budget(&json!(1)))
+            .unwrap_or_else(|error| {
+                panic!("{name} on {label}: a long string failed: {error:.200}")
+            });
+        assert_eq!(
+            fitted.structured.as_ref(),
+            Some(&inflated),
+            "{name} on {label}: structuredContent was cut for a string"
+        );
+        let violations: Vec<String> = validate::validate(&inflated, schema)
+            .iter()
+            .map(validate::Violation::render)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "{name} on {label}: a long string violates its outputSchema: {violations:?}"
+        );
+        true
+    }
+
+    /// Inflate the largest list of a real tool payload past 200 KiB and fit it
+    /// to 64 KiB: the result must still meet the tool's `outputSchema`, say it
+    /// was cut, stay inside the budget and keep every top-level key (all seven
+    /// facets of an insights snapshot survive). False when the payload holds no
+    /// list to inflate.
+    fn probe_under_a_small_budget(
+        name: &str,
+        label: &str,
+        schema: &Value,
+        payload: &Value,
+    ) -> bool {
+        const BUDGET: usize = 64 * 1024;
+        let mut inflated = payload.clone();
+        let mut best = None;
+        largest_nonempty_list(&inflated, &mut String::new(), &mut best);
+        let Some((_, pointer)) = best else {
+            return false;
+        };
+        let Some(Value::Array(items)) = inflated.pointer_mut(&pointer) else {
+            return false;
+        };
+        for _ in 0..40 {
+            if serde_json::to_string(&items).map_or(0, |text| text.len()) > 200_000 {
+                break;
+            }
+            let more = items.clone();
+            items.extend(more);
+        }
+        let fitted = budget::fit(true, inflated.clone(), BUDGET)
+            .unwrap_or_else(|error| panic!("{name} on {label}: {error}"));
+        let structured = fitted.structured.expect("modern structured content");
+        let wire = budget::escaped_len(&fitted.text)
+            + serde_json::to_string(&structured)
+                .expect("serializes")
+                .len();
+        assert!(
+            wire <= BUDGET,
+            "{name} on {label}: {wire} bytes for a {BUDGET} byte budget"
+        );
+        assert!(
+            structured[budget::TRUNCATION_KEY].is_object(),
+            "{name} on {label} was cut without saying so"
+        );
+        let violations: Vec<String> = validate::validate(&structured, schema)
+            .iter()
+            .map(validate::Violation::render)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "{name} on {label}: the cut payload violates its outputSchema: {violations:?}"
+        );
+        let nulls = nulls_the_schema_does_not_allow(&structured, schema, "");
+        assert!(nulls.is_empty(), "{name} on {label}: {nulls:?}");
+        for key in payload.as_object().expect("an object payload").keys() {
+            assert!(
+                structured.get(key).is_some(),
+                "{name} on {label}: the cut dropped {key}"
+            );
+        }
+        true
+    }
+
     fn validate_allows_null(schema: &Value) -> bool {
         match schema.get("type") {
             Some(Value::String(name)) => name == "null",
@@ -2589,6 +3197,31 @@ mod tests {
         }
     }
 
+    /// Tools whose `outputSchema` is only `{"type":"object"}`, each with why.
+    ///
+    /// An object-only schema accepts any object, so validating against it
+    /// proves nothing; leaving that silent is how "every tool validated" came
+    /// to mean "five of them". Each is named here instead, and
+    /// `every_advertised_tool_result_matches_its_declared_output_schema` fails
+    /// both for a tool missing from this list and for one that no longer
+    /// belongs on it.
+    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[
+        (
+            "gitpulse_task_view",
+            "relays Manvi's task view; the shape is Manvi's contract",
+        ),
+        (
+            "gitpulse_provenance",
+            "relays git-notes provenance records, which carry per-commit free-form fields",
+        ),
+    ];
+
+    fn is_object_only_exempt(name: &str) -> bool {
+        OBJECT_ONLY_OUTPUT_SCHEMAS
+            .iter()
+            .any(|(exempt, _)| *exempt == name)
+    }
+
     /// A tool's result is checked by the client against its `outputSchema`,
     /// and a mismatch fails the whole call. `gitpulse_change_context` declared
     /// `collisions` an array while it has always returned the collision facet
@@ -2597,8 +3230,16 @@ mod tests {
     /// been deleted (the collision scan fails), and on a path that is not a
     /// repository at all, because the failure paths are where a payload
     /// drifts from its happy-path shape.
+    ///
+    /// Every advertised tool is held to it, the task-board writers included
+    /// (they run as one lifecycle on the healthy repository), and a tool whose
+    /// every call errored is a failure, not a skip: this used to `continue`
+    /// past an error and require five of the 27 tools, so the other 22 could
+    /// drift without a test noticing. The only tools exempt are those named in
+    /// [`OBJECT_ONLY_OUTPUT_SCHEMAS`], each with the reason its schema is not
+    /// typed here.
     #[test]
-    fn every_read_only_tool_result_matches_its_declared_output_schema() {
+    fn every_advertised_tool_result_matches_its_declared_output_schema() {
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -2664,14 +3305,69 @@ mod tests {
 
         let missing = "/no/such/gitpulse-output-schema-repo".to_string();
 
+        // One repository with an indexed generation, so the DevMap tools answer
+        // with data rather than only their unavailable envelopes.
+        let indexed_dir = crate::codeintel::tests::repo_with_one_generation();
+        let indexed = indexed_dir.path().to_string_lossy().into_owned();
+        crate::test_support::trust_repo(indexed_dir.path());
+
         let mut validated = std::collections::BTreeSet::new();
-        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing] {
+        let mut probed = std::collections::BTreeSet::<String>::new();
+        let mut strings_probed = std::collections::BTreeSet::<String>::new();
+        let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut check =
+            |name: &str,
+             label: &str,
+             schema: &Value,
+             outcome: Result<Value, String>,
+             validated: &mut std::collections::BTreeSet<String>| {
+                // An execution error is reported as `isError` text and carries no
+                // structured content, so there is no schema to meet. It is recorded
+                // rather than skipped: a tool with no successful call is reported
+                // below.
+                let payload = match outcome {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        errors
+                            .entry(name.to_string())
+                            .or_default()
+                            .push(format!("{label}: {error}"));
+                        return;
+                    }
+                };
+                let violations: Vec<String> = validate::validate(&payload, schema)
+                    .iter()
+                    .map(validate::Violation::render)
+                    .collect();
+                assert!(
+                violations.is_empty(),
+                "{name} on {label} violates its outputSchema: {violations:?}\npayload: {payload}"
+            );
+                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
+                assert!(
+                    nulls.is_empty(),
+                    "{name} on {label} returns null where its outputSchema forbids it: {nulls:?}"
+                );
+                validated.insert(name.to_string());
+                if probe_under_a_small_budget(name, label, schema, &payload) {
+                    probed.insert(name.to_string());
+                }
+                if probe_a_long_string(name, label, schema, &payload) {
+                    strings_probed.insert(name.to_string());
+                }
+            };
+        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing, &indexed] {
             for tool in tools() {
                 let name = tool["name"].as_str().expect("name");
+                // Exempt tools are still run and held to the object schema they
+                // declare; only a tool that never succeeds escapes (below).
                 if tool["annotations"]["readOnlyHint"] != true {
                     continue;
                 }
                 let mut arguments = json!({ "repo_path": repo });
+                if tool["inputSchema"]["properties"]["targets"].is_object() {
+                    arguments["targets"] = json!(["probe_caller"]);
+                }
                 for extra in [
                     "query",
                     "target",
@@ -2682,33 +3378,171 @@ mod tests {
                     "task_id",
                     "symptom",
                     "since",
+                    "file",
+                    "content",
                 ] {
                     if tool["inputSchema"]["properties"][extra].is_object() {
                         arguments[extra] = json!("probe");
                     }
                 }
-                // An execution error is reported as `isError` text and carries
-                // no structured content, so there is no schema to meet.
-                let Ok(payload) = handle_tool_call(name, &arguments) else {
-                    continue;
-                };
-                let schema = &tool["outputSchema"];
-                let violations: Vec<String> = validate::validate(&payload, schema)
-                    .iter()
-                    .map(validate::Violation::render)
-                    .collect();
-                assert!(
-                    violations.is_empty(),
-                    "{name} on {repo} violates its outputSchema: {violations:?}\npayload: {payload}"
+                check(
+                    name,
+                    repo,
+                    &tool["outputSchema"],
+                    handle_tool_call(name, &arguments),
+                    &mut validated,
                 );
-                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
-                assert!(
-                    nulls.is_empty(),
-                    "{name} on {repo} returns null where its outputSchema forbids it: {nulls:?}"
-                );
-                validated.insert(name.to_string());
             }
         }
+
+        // The writers, as the lifecycle an agent runs: file two tasks, import
+        // briefs, finish one, merge the other into it, delete a third. Each
+        // reply is held to the schema the tool advertises. The task profile is
+        // the fixture's own (`PROFILE_OVERRIDE`), so nothing here touches a
+        // real board.
+        let schema_of = |name: &str| -> Value {
+            tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["outputSchema"].clone())
+                .unwrap_or_else(|| panic!("{name} is not advertised"))
+        };
+        let mut call_writer =
+            |name: &str, arguments: Value, validated: &mut std::collections::BTreeSet<String>| {
+                let outcome = handle_tool_call(name, &arguments);
+                check(
+                    name,
+                    "the task-board lifecycle",
+                    &schema_of(name),
+                    outcome,
+                    validated,
+                );
+            };
+        for (task, title) in [
+            ("gp-schema-first", "Rotate the signing keys"),
+            ("gp-schema-second", "Paginate the activity feed"),
+            ("gp-schema-third", "Compress the ledger archives"),
+        ] {
+            call_writer(
+                "gitpulse_add_task",
+                json!({ "repo_path": healthy, "task_id": task, "title": title, "status": "ready", "priority": 2 }),
+                &mut validated,
+            );
+        }
+        call_writer(
+            "gitpulse_import_tasks",
+            json!({ "repo_path": healthy }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_complete_task",
+            json!({ "repo_path": healthy, "task_id": "gp-schema-first", "status": "review", "summary": "schema probe" }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_merge_tasks",
+            json!({
+                "repo_path": healthy,
+                "into_task_id": "gp-schema-first",
+                "sources": [{ "task_id": "gp-schema-second" }],
+                "reason": "schema probe: duplicate of the first"
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_delete_task",
+            json!({ "repo_path": healthy, "task_id": "gp-schema-third", "reason": "schema probe cleanup" }),
+            &mut validated,
+        );
+        // And the readers that depend on those tasks existing.
+        for name in ["gitpulse_list_tasks", "gitpulse_get_task"] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let arguments = json!({ "repo_path": healthy, "task_id": "gp-schema-first" });
+            check(
+                name,
+                "the task-board lifecycle",
+                &tool["outputSchema"],
+                handle_tool_call(name, &arguments),
+                &mut validated,
+            );
+        }
+
+        // The budget probe ran on real payloads, not only on the shapes this
+        // test invented: a tool with no list in its payload cannot be probed,
+        // so the ones that must be are named.
+        for name in [
+            "gitpulse_insights",
+            "gitpulse_change_context",
+            "gitpulse_get_task",
+        ] {
+            assert!(
+                probed.contains(name),
+                "{name} was never held to the result budget; probed: {probed:?}"
+            );
+        }
+        assert!(
+            probed.len() >= 5,
+            "only {probed:?} could be inflated and budgeted"
+        );
+        // Every advertised tool whose result holds a string was run with a
+        // long one at the mirror threshold.
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("name");
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            assert!(
+                strings_probed.contains(name) || !validated.contains(name),
+                "{name} has no string to inflate in any payload this test reached: \
+                 strings probed: {strings_probed:?}"
+            );
+        }
+
+        // Every advertised tool is validated or explicitly exempt. A tool whose
+        // every call errored was never checked, and says why.
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("name");
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            assert!(
+                validated.contains(name),
+                "{name} was never validated against its outputSchema (every call errored): {:?}",
+                errors.get(name)
+            );
+        }
+        // The DevMap tools are exempt from a typed schema, not from a payload:
+        // each must have produced a checked object on at least one repository.
+        for name in devmap_parity::TOOL_NAMES {
+            assert!(
+                validated.contains(*name),
+                "{name} was never validated against its declared outputSchema: {:?}",
+                errors.get(*name)
+            );
+        }
+        // The allow-list cannot go stale: an exempt tool must still declare
+        // only an object, and a tool that gained a real schema must leave it.
+        for (name, reason) in OBJECT_ONLY_OUTPUT_SCHEMAS {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == *name)
+                .unwrap_or_else(|| panic!("{name} is exempt but no longer advertised"));
+            assert_eq!(
+                tool["outputSchema"],
+                json!({ "type": "object" }),
+                "{name} now declares a real outputSchema; drop it from OBJECT_ONLY_OUTPUT_SCHEMAS ({reason})"
+            );
+        }
+        assert!(
+            tools().iter().all(|tool| {
+                let name = tool["name"].as_str().unwrap();
+                tool["outputSchema"] != json!({ "type": "object" }) || is_object_only_exempt(name)
+            }),
+            "a tool declares only {{\"type\":\"object\"}} without being listed, with a reason, in OBJECT_ONLY_OUTPUT_SCHEMAS"
+        );
         // A tool that only ever errored here was never checked; these are the
         // ones whose declared shapes this test was written against.
         for name in [
@@ -2935,6 +3769,69 @@ mod tests {
         (dir, profile, repo)
     }
 
+    /// The task profile belongs to the desktop app. An MCP server that shares
+    /// it may be older or newer, so it never moves the schema: a request that
+    /// needs the upgrade is refused with a typed error and leaves the profile,
+    /// and every other host's view of it, untouched.
+    #[test]
+    fn the_mcp_server_never_upgrades_a_shared_task_profile() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let database = profile.path().join("workbench.sqlite");
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "title": "Filed before the profile aged"}),
+        );
+        assert!(!error, "{added}");
+
+        // The profile as an older desktop app left it.
+        let held_back = rusqlite::Connection::open(&database).unwrap();
+        held_back
+            .execute("UPDATE work_meta SET version = 11 WHERE id = 1", [])
+            .unwrap();
+        drop(held_back);
+
+        for (tool, arguments) in [
+            (
+                "gitpulse_add_task",
+                json!({"repo_path": repo, "title": "Needs the upgrade"}),
+            ),
+            ("gitpulse_list_tasks", json!({"repo_path": repo})),
+        ] {
+            let (error, refused) = tool_json(tool, arguments);
+            assert!(error, "{tool}: {refused}");
+            assert!(
+                refused
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("schema_upgrade_required"),
+                "{tool}: {refused}"
+            );
+        }
+        // A write that fails for another reason still must not upgrade first:
+        // the schema step runs before the request is read.
+        let store = open_task_profile(true).unwrap().unwrap();
+        let error = store
+            .workbench_request("items.put", "{}")
+            .expect_err("refused before the request is looked at");
+        assert_eq!(error.code, "schema_upgrade_required", "{}", error.message);
+        drop(store);
+        let after = rusqlite::Connection::open(&database).unwrap();
+        let version: i64 = after
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 11, "the profile was left at the schema it had");
+        assert!(
+            !profile
+                .path()
+                .join("workbench.sqlite.pre-schema-11.bak")
+                .exists(),
+            "an upgrade that did not run took no backup"
+        );
+    }
+
     /// The defect this replaced: `gitpulse_add_task` reported success and the
     /// task appeared on no board. So the assertion is made through the exact
     /// calls the board makes — `registerRepository`, then a repository-scoped
@@ -3122,7 +4019,7 @@ mod tests {
             format!("At most {} bytes. |", ft::MAX_OWNER_BYTES),
             format!(
                 "At most {} `item_id`s",
-                crate::workbench::intake::MAX_RELATED
+                crate::workbench::intake::MAX_REVIEWED_RELATED
             ),
             format!(
                 "`reason` is required (at most {} characters)",
@@ -3238,6 +4135,13 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let id = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
         let (board, _) = board_task(profile.path(), &repo, id);
+        // An agent's `done` needs Manvi's passed verdict for the current head.
+        crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        crate::workbench::intake::gate_tests::verified(
+            &dc_store::Store::open(profile.path().join("workbench.sqlite")).unwrap(),
+            &dir,
+            id,
+        );
         let before = board
             .board_request("items.get", &json!({"id": id}).to_string())
             .unwrap()["item"]
@@ -3289,7 +4193,11 @@ mod tests {
         }
         let logs = after["logs"].as_str().unwrap();
         assert!(
-            logs.starts_with("first trace\n\n--- Agent moved this task to done ("),
+            logs.starts_with("first trace\n\n--- Verification passed ("),
+            "the verdict is attached to the history: {logs}"
+        );
+        assert!(
+            logs.contains("\n\n--- Agent moved this task to done ("),
             "{logs}"
         );
         assert!(logs.ends_with(summary), "{logs}");
@@ -3332,6 +4240,11 @@ mod tests {
         crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
         let id = "0b7d4e2a-91c3-4f6e-8a2d-5c4b3a291e70";
         let (board, _) = board_task(profile.path(), &repo, id);
+        crate::workbench::intake::gate_tests::verified(
+            &dc_store::Store::open(profile.path().join("workbench.sqlite")).unwrap(),
+            &dir,
+            id,
+        );
         let lane = dir.path().join(".gitpulse/worktrees/import-0b7d4e2a");
         crate::test_support::git_in(
             dir.path(),
@@ -3971,6 +4884,62 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_says_the_work_may_still_finish_and_the_outcome_is_unknown() {
+        let ready = Ready {
+            id: json!(7),
+            modern: true,
+            method: "tools/call".into(),
+            params: json!({}),
+        };
+        let response = ready.timed_out(std::time::Duration::from_millis(1500));
+        let error = response.error.expect("an error");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("not cancelled"), "{message}");
+        assert!(message.contains("outcome is unknown"), "{message}");
+        assert!(!message.contains("was abandoned"), "{message}");
+        assert_eq!(error["data"]["outcomeUnknown"], true);
+    }
+
+    /// With 26 or more related open tasks, `add_task` used to be impossible:
+    /// it required every related id in `reviewed_related`, whose schema capped
+    /// the array at the 25 a refusal names.
+    #[test]
+    fn a_task_can_be_filed_after_reviewing_more_than_twenty_five_related_ones() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let mut ids: Vec<String> = Vec::new();
+        for n in 0..30 {
+            let (error, filed) = tool_json(
+                "gitpulse_add_task",
+                json!({
+                    "repo_path": repo, "task_id": format!("imp-{n}"),
+                    "title": format!("Importer crash handling case{n}x"), "labels": ["import"],
+                    "reviewed_related": ids,
+                }),
+            );
+            assert!(
+                !error,
+                "filing task {n} with {} reviewed: {filed}",
+                ids.len()
+            );
+            ids.push(filed["item_id"].as_str().unwrap().to_owned());
+        }
+        // A refusal names one page and says the rest follow.
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "imp-last", "title": "Importer crash handling again", "labels": ["import"] }),
+        );
+        assert!(error, "{refused}");
+        let message = refused.as_str().unwrap();
+        assert!(message.contains("30 open tasks"), "{message}");
+        assert!(message.contains("and 5 more"), "{message}");
+        assert!(
+            message.contains("the next refusal names the following ones"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn related_work_folds_into_a_task_the_person_made_on_the_board() {
         let (dir, profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
@@ -4147,6 +5116,1687 @@ mod tests {
         assert_eq!(page["total"], 2);
     }
 
+    // ---- typed arguments: the integer policy, the advertised bounds, the schema contract ----
+
+    /// The person edits a card after an agent read it at revision 1.
+    fn person_edits(board: &crate::workbench::WorkbenchState, id: &str) {
+        let mut edit = board
+            .board_request("items.get", &json!({ "id": id }).to_string())
+            .unwrap()["item"]
+            .clone();
+        for key in [
+            "revision",
+            "updated_at",
+            "created_at",
+            "completed_at",
+            "locked_fields",
+        ] {
+            edit.as_object_mut().unwrap().remove(key);
+        }
+        edit["request_id"] = json!(format!("person-edit-{id}"));
+        edit["expected_revision"] = json!(1);
+        edit["title"] = json!("Edited by the person");
+        board.board_request("items.put", &edit.to_string()).unwrap();
+    }
+
+    fn board_item(board: &crate::workbench::WorkbenchState, id: &str) -> Value {
+        board
+            .board_request("items.get", &json!({ "id": id }).to_string())
+            .unwrap()["item"]
+            .clone()
+    }
+
+    #[test]
+    fn complete_task_with_a_whole_float_revision_still_conflicts() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "board-task-1";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        person_edits(&board, id);
+
+        let (error, stale) = tool_json(
+            "gitpulse_complete_task",
+            json!({ "repo_path": repo, "task_id": id, "expected_revision": 1.0 }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        assert_eq!(board_item(&board, id)["status"], "in_progress");
+    }
+
+    #[test]
+    fn delete_task_with_a_whole_float_revision_still_conflicts() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "board-task-1";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        person_edits(&board, id);
+
+        let (error, stale) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": id, "reason": "Duplicate.", "expected_revision": 1.0 }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        assert_eq!(
+            board_item(&board, id)["title"],
+            "Edited by the person",
+            "the task is still on the board"
+        );
+    }
+
+    #[test]
+    fn merge_tasks_with_a_whole_float_into_revision_still_conflicts() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (board, _) = board_task(profile.path(), &repo, "board-keep");
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-import", "title": "Importer survives a crash",
+                    "reviewed_related": ["board-keep"] }),
+        );
+        assert!(!error, "{added}");
+        person_edits(&board, "board-keep");
+
+        let (error, stale) = tool_json(
+            "gitpulse_merge_tasks",
+            json!({ "repo_path": repo, "into_task_id": "board-keep", "into_expected_revision": 1.0,
+                    "sources": [{ "task_id": "gp-dup-import" }], "reason": "Same work." }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        assert_eq!(
+            board_item(&board, "board-keep")["description"],
+            "Background",
+            "nothing was folded in"
+        );
+    }
+
+    #[test]
+    fn merge_tasks_with_a_whole_float_source_revision_still_conflicts() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (_board, _) = board_task(profile.path(), &repo, "board-keep");
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-import", "title": "Importer survives a crash",
+                    "reviewed_related": ["board-keep"] }),
+        );
+        assert!(!error, "{added}");
+        let board =
+            crate::workbench::WorkbenchState::for_profile(&profile.path().join("workbench.sqlite"));
+        person_edits(&board, added["item_id"].as_str().unwrap());
+
+        let (error, stale) = tool_json(
+            "gitpulse_merge_tasks",
+            json!({ "repo_path": repo, "into_task_id": "board-keep",
+                    "sources": [{ "task_id": "gp-dup-import", "expected_revision": 1.0 }],
+                    "reason": "Same work." }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+    }
+
+    fn ledger_repo_with_events(count: usize) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::test_support::git_in(dir.path(), &["init", "-q"]);
+        crate::test_support::trust_repo(dir.path());
+        let repo = dir
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        for _ in 0..count {
+            crate::ledger::append(crate::ledger::Draft {
+                repo_path: repo.clone(),
+                action: "git.commit".to_string(),
+                actor_kind: Some(crate::ledger::ActorKind::Human),
+                outcome: Some(crate::ledger::Outcome::Ok),
+                ..Default::default()
+            })
+            .expect("append");
+        }
+        (dir, repo)
+    }
+
+    #[test]
+    fn ledger_events_cursor_3_0_continues_after_event_3() {
+        let (_dir, repo) = ledger_repo_with_events(6);
+        let (error, page) = tool_json(
+            "gitpulse_ledger_events",
+            json!({ "repo_path": repo, "cursor": 3.0 }),
+        );
+        assert!(!error, "{page}");
+        assert_eq!(page["returned"], 3, "{page}");
+        assert_eq!(page["events"][0]["id"], 4, "never restarts at 0: {page}");
+    }
+
+    #[test]
+    fn ledger_events_cursor_above_i64_max_is_invalid_params() {
+        let (_dir, repo) = ledger_repo_with_events(2);
+        for cursor in [json!(9_223_372_036_854_775_808_u64), json!(u64::MAX)] {
+            let (error, refused) = tool_json(
+                "gitpulse_ledger_events",
+                json!({ "repo_path": repo, "cursor": cursor }),
+            );
+            assert!(error, "{cursor}: {refused}");
+            assert!(refused.as_str().unwrap().contains("cursor"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn list_tasks_limit_10_0_returns_ten_not_fifty() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let words = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima",
+        ];
+        let mut filed: Vec<String> = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            let (error, added) = tool_json(
+                "gitpulse_add_task",
+                json!({ "repo_path": repo, "task_id": format!("gp-limit-{index}"),
+                        "title": format!("{word} {}", word.len() * 7919),
+                        "reviewed_related": filed }),
+            );
+            assert!(!error, "{added}");
+            filed.push(added["item_id"].as_str().unwrap().to_string());
+        }
+        let (error, ten) = tool_json(
+            "gitpulse_list_tasks",
+            json!({ "repo_path": repo, "limit": 10 }),
+        );
+        assert!(!error, "{ten}");
+        assert_eq!(ten["returned"], 10, "{ten}");
+        let (error, float_ten) = tool_json(
+            "gitpulse_list_tasks",
+            json!({ "repo_path": repo, "limit": 10.0 }),
+        );
+        assert!(!error, "{float_ten}");
+        assert_eq!(float_ten["returned"], 10, "{float_ten}");
+    }
+
+    #[test]
+    fn add_task_priority_1_0_is_high() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "title": "Prioritised work", "priority": 1.0 }),
+        );
+        assert!(!error, "{added}");
+        assert_eq!(added["priority"], 1, "{added}");
+    }
+
+    #[test]
+    fn a_u32_argument_of_4294967296_is_refused() {
+        for tool in tools() {
+            let name = tool["name"].as_str().unwrap();
+            for (argument, schema) in tool["inputSchema"]["properties"].as_object().unwrap() {
+                // The arguments that reach a `u32` (or narrower) parameter.
+                let reaches_u32 = schema["maximum"]
+                    .as_u64()
+                    .is_some_and(|max| max <= u64::from(u32::MAX));
+                if schema["type"] != "integer" || !reaches_u32 {
+                    continue;
+                }
+                let mut arguments = sample(&tool["inputSchema"]);
+                arguments["repo_path"] = json!("/no/such/repo");
+                arguments[argument] = json!(4_294_967_296_u64);
+                let error = handle_tool_call(name, &arguments)
+                    .expect_err(&format!("{name}.{argument} accepted 2^32"));
+                assert!(
+                    error.starts_with("invalid arguments for") && error.contains(argument.as_str()),
+                    "{name}.{argument}: {error}"
+                );
+            }
+        }
+    }
+
+    /// The slice of this file's production code that holds `start` up to `end`.
+    fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let from = source.find(start).unwrap_or_else(|| panic!("no {start}"));
+        let rest = &source[from..];
+        &rest[..rest.find(end).unwrap_or_else(|| panic!("no {end}"))]
+    }
+
+    #[test]
+    fn no_handler_reads_raw_arguments() {
+        let mod_rs = include_str!("mod.rs");
+        let parity = include_str!("devmap_parity.rs");
+        for (what, body) in [
+            (
+                "handle_tool_call",
+                between(mod_rs, "fn handle_tool_call(", "\nfn meta_object("),
+            ),
+            (
+                "devmap_parity::handle",
+                between(parity, "pub fn handle(", "#[cfg(test)]"),
+            ),
+        ] {
+            for needle in ["arguments[", ".as_i64()", ".as_u64()", " as u32"] {
+                assert_eq!(
+                    body.matches(needle).count(),
+                    0,
+                    "{what} still reads the raw arguments with `{needle}`"
+                );
+            }
+        }
+    }
+
+    // -- bounded strings --
+
+    #[derive(Clone)]
+    enum Seg {
+        Key(String),
+        First,
+    }
+
+    struct Bounded {
+        tool: String,
+        path: Vec<Seg>,
+        name: String,
+        max: u64,
+        description: String,
+        in_array: bool,
+    }
+
+    fn bounded_strings() -> Vec<Bounded> {
+        fn walk(tool: &str, schema: &Value, path: &mut Vec<Seg>, out: &mut Vec<Bounded>) {
+            for (name, prop) in schema["properties"].as_object().unwrap() {
+                path.push(Seg::Key(name.clone()));
+                match prop["type"].as_str() {
+                    Some("string") if prop["enum"].is_null() => out.push(Bounded {
+                        tool: tool.to_string(),
+                        path: path.clone(),
+                        name: name.clone(),
+                        max: prop["maxLength"].as_u64().expect("maxLength"),
+                        description: prop["description"].as_str().unwrap_or_default().into(),
+                        in_array: false,
+                    }),
+                    Some("array") => {
+                        path.push(Seg::First);
+                        match prop["items"]["type"].as_str() {
+                            Some("string") => out.push(Bounded {
+                                tool: tool.to_string(),
+                                path: path.clone(),
+                                name: name.clone(),
+                                max: prop["items"]["maxLength"].as_u64().expect("maxLength"),
+                                description: prop["description"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .into(),
+                                in_array: true,
+                            }),
+                            Some("object") => walk(tool, &prop["items"], path, out),
+                            _ => {}
+                        }
+                        path.pop();
+                    }
+                    _ => {}
+                }
+                path.pop();
+            }
+        }
+        let mut out = Vec::new();
+        for tool in tools() {
+            walk(
+                tool["name"].as_str().unwrap(),
+                &tool["inputSchema"],
+                &mut Vec::new(),
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// The smallest arguments the schema accepts.
+    fn sample(schema: &Value) -> Value {
+        match schema["type"].as_str() {
+            Some("string") => match schema["enum"].as_array().and_then(|e| e.first()) {
+                Some(first) => first.clone(),
+                None => json!("x"),
+            },
+            Some("integer" | "number") => schema["minimum"].clone(),
+            Some("boolean") => json!(false),
+            Some("array") => Value::Array(
+                (0..schema["minItems"].as_u64().unwrap_or(0))
+                    .map(|_| sample(&schema["items"]))
+                    .collect(),
+            ),
+            Some("object") => {
+                let mut object = serde_json::Map::new();
+                for name in schema["required"].as_array().into_iter().flatten() {
+                    let name = name.as_str().unwrap();
+                    object.insert(name.to_string(), sample(&schema["properties"][name]));
+                }
+                Value::Object(object)
+            }
+            other => panic!("no sample for {other:?}"),
+        }
+    }
+
+    fn set_at(root: &mut Value, path: &[Seg], value: Value) {
+        let mut at = root;
+        for seg in path {
+            at = match seg {
+                Seg::Key(key) => &mut at[key.as_str()],
+                Seg::First => {
+                    if at.is_null() {
+                        *at = json!([]);
+                    }
+                    let items = at.as_array_mut().expect("an array");
+                    if items.is_empty() {
+                        items.push(Value::Null);
+                    }
+                    &mut items[0]
+                }
+            };
+        }
+        *at = value;
+    }
+
+    fn declared_unit(field: &Bounded) -> Option<&'static str> {
+        let each = if field.in_array { "each item " } else { "" };
+        ["characters", "bytes"].into_iter().find(|unit| {
+            field
+                .description
+                .contains(&format!("{each}at most {} {unit}", field.max))
+        })
+    }
+
+    #[test]
+    fn every_bounded_string_description_names_its_unit() {
+        let fields = bounded_strings();
+        assert!(fields.len() >= 40, "only {} bounded strings", fields.len());
+        for field in &fields {
+            assert!(
+                declared_unit(field).is_some(),
+                "{}.{} (max {}) does not say whether its bound is characters or bytes: {:?}",
+                field.tool,
+                field.name,
+                field.max,
+                field.description
+            );
+        }
+    }
+
+    #[test]
+    fn every_bounded_string_accepts_its_limit_and_refuses_one_more() {
+        let (_dir, _profile, _repo) = task_fixture();
+        let invalid = |result: &Result<Value, String>| matches!(result, Err(error) if error.starts_with("invalid arguments for"));
+        for field in bounded_strings() {
+            let unit = declared_unit(&field)
+                .unwrap_or_else(|| panic!("{}.{} names no unit", field.tool, field.name));
+            let schema = tools()
+                .into_iter()
+                .find(|t| t["name"] == field.tool.as_str())
+                .unwrap()["inputSchema"]
+                .clone();
+            let attempt = |text: String| {
+                let mut arguments = sample(&schema);
+                arguments["repo_path"] = json!("/no/such/repo");
+                set_at(&mut arguments, &field.path, json!(text));
+                handle_tool_call(&field.tool, &arguments)
+            };
+            let max = field.max as usize;
+            let (euro_fit, euro_over) = if unit == "bytes" {
+                (max / 3, max / 3 + 1)
+            } else {
+                (max, max + 1)
+            };
+            for (what, text) in [
+                ("ASCII at the limit", "a".repeat(max)),
+                (
+                    "3-byte characters at the limit",
+                    "\u{20ac}".repeat(euro_fit),
+                ),
+            ] {
+                let result = attempt(text);
+                assert!(
+                    !invalid(&result),
+                    "{}.{} {what} was refused: {result:?}",
+                    field.tool,
+                    field.name
+                );
+            }
+            for (what, text) in [
+                ("ASCII over the limit", "a".repeat(max + 1)),
+                (
+                    "3-byte characters over the limit",
+                    "\u{20ac}".repeat(euro_over),
+                ),
+            ] {
+                let result = attempt(text);
+                assert!(
+                    invalid(&result),
+                    "{}.{} {what} was accepted: {result:?}",
+                    field.tool,
+                    field.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn add_task_title_bound_is_max_task_title_everywhere() {
+        use crate::tasks::file_tasks as ft;
+        let tool = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_add_task")
+            .unwrap();
+        let title = &tool["inputSchema"]["properties"]["title"];
+        assert_eq!(title["maxLength"], ft::MAX_TASK_TITLE);
+        assert!(
+            title["description"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("at most {} characters", ft::MAX_TASK_TITLE)),
+            "{title}"
+        );
+        let call = |text: String| {
+            validate_arguments(
+                "gitpulse_add_task",
+                &json!({ "repo_path": "/r", "title": text }),
+            )
+        };
+        assert!(call("\u{20ac}".repeat(ft::MAX_TASK_TITLE)).is_ok());
+        assert!(call("\u{20ac}".repeat(ft::MAX_TASK_TITLE + 1)).is_err());
+        assert!(ft::validate_title(&"\u{20ac}".repeat(ft::MAX_TASK_TITLE)).is_ok());
+        assert!(ft::validate_title(&"\u{20ac}".repeat(ft::MAX_TASK_TITLE + 1)).is_err());
+    }
+
+    // -- the published contract --
+
+    /// A schema without its prose: what a client's code can depend on.
+    fn without_descriptions(schema: &Value) -> Value {
+        match schema {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(key, value)| !(key.as_str() == "description" && value.is_string()))
+                    .map(|(key, value)| (key.clone(), without_descriptions(value)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_descriptions).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// The only bounds that changed on purpose: the schema now says what the
+    /// handler enforces: a title was advertised at 1200 characters and refused
+    /// past 300, a summary at 16000 and refused past 4000, a reason at 4000 and
+    /// refused past 1000. `(tool, JSON pointer into its inputSchema, new maximum)`.
+    fn deliberate_bound_changes() -> [(&'static str, &'static str, usize); 4] {
+        [
+            (
+                "gitpulse_add_task",
+                "/properties/title/maxLength",
+                ft::MAX_TASK_TITLE,
+            ),
+            (
+                "gitpulse_complete_task",
+                "/properties/summary/maxLength",
+                intake::MAX_SUMMARY_CHARS,
+            ),
+            (
+                "gitpulse_delete_task",
+                "/properties/reason/maxLength",
+                intake::MAX_REASON_CHARS,
+            ),
+            (
+                "gitpulse_merge_tasks",
+                "/properties/reason/maxLength",
+                intake::MAX_REASON_CHARS,
+            ),
+        ]
+    }
+
+    #[test]
+    fn input_schemas_are_backward_compatible() {
+        let snapshot: Value =
+            serde_json::from_str(include_str!("tool_input_schemas.snapshot.json")).unwrap();
+        let mut snapshot = snapshot.as_object().unwrap().clone();
+        for (tool, pointer, value) in deliberate_bound_changes() {
+            assert_ne!(
+                snapshot[tool].pointer(pointer),
+                Some(&json!(value)),
+                "{tool} {pointer} was already {value}: drop it from the allowlist"
+            );
+            *snapshot[tool]
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("{tool} has no {pointer}")) = json!(value);
+        }
+        let current = tools();
+        let names: Vec<&str> = current
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            snapshot
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            names
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the set of tools changed"
+        );
+        for tool in &current {
+            let name = tool["name"].as_str().unwrap();
+            assert_eq!(
+                without_descriptions(&tool["inputSchema"]),
+                without_descriptions(&snapshot[name]),
+                "{name}: the published inputSchema changed beyond the deliberate bounds"
+            );
+        }
+    }
+
+    // -- the typed arguments: one struct per tool --
+
+    /// A value with its nulls removed, so an echoed optional field and an
+    /// absent one compare equal.
+    fn without_nulls(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| (k.clone(), without_nulls(v)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_nulls).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// What extraction must hand back for an argument the validator accepted.
+    fn canonical(prop: &Value, probe: &Value) -> Value {
+        match (prop["type"].as_str(), probe) {
+            (Some("integer"), Value::Number(number)) => {
+                let exact = validate::exact_int(number).expect("an accepted integer is exact");
+                match u64::try_from(exact) {
+                    Ok(unsigned) => json!(unsigned),
+                    Err(_) => json!(i64::try_from(exact).expect("fits i64")),
+                }
+            }
+            (Some("number"), Value::Number(number)) => {
+                json!(number.as_f64().expect("a float") as f32 as f64)
+            }
+            _ => probe.clone(),
+        }
+    }
+
+    /// For every argument of one tool and every awkward value: either the
+    /// validator refuses the call, or extraction reads exactly what was sent.
+    /// Never a call that passes validation and then reaches the handler as a
+    /// default, a clamp, or a refusal the schema did not announce.
+    fn property_table<T: ToolArgs>(name: &str) {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not advertised"));
+        let schema = tool["inputSchema"].clone();
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            T::FIELDS
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            properties
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "{name}: the struct and the schema name different arguments"
+        );
+        let base = sample(&schema);
+        assert!(validate::validate(&base, &schema).is_empty(), "{name}");
+        assert!(T::from_args(&base).is_ok(), "{name}");
+
+        let mut extra = base.clone();
+        extra["zz_not_an_argument"] = json!(1);
+        assert!(!validate::validate(&extra, &schema).is_empty(), "{name}");
+        assert!(T::from_args(&extra).is_err(), "{name}");
+
+        for (field, prop) in properties {
+            let mut probes: Vec<Option<Value>> = vec![None];
+            probes.extend(
+                [
+                    json!(null),
+                    json!(true),
+                    json!(0),
+                    json!(-1),
+                    json!(1),
+                    json!(5.0),
+                    json!(5.5),
+                    json!(1e300),
+                    json!(9_007_199_254_740_993.0_f64),
+                    json!(9_223_372_036_854_775_808_u64),
+                    json!(u64::MAX),
+                    json!(4_294_967_296_u64),
+                    json!(""),
+                    json!("5"),
+                    json!([]),
+                    json!([1]),
+                    json!({}),
+                    json!(["x"]),
+                    json!([{}]),
+                    json!([{ "task_id": "x" }]),
+                ]
+                .map(Some),
+            );
+            let limit = |schema: &Value| schema["maxLength"].as_u64().unwrap_or(0) as usize;
+            if prop["type"] == "string" {
+                probes.push(Some(json!("a".repeat(limit(prop)))));
+                probes.push(Some(json!("a".repeat(limit(prop) + 1))));
+            }
+            if prop["items"]["type"] == "string" {
+                probes.push(Some(json!(["a".repeat(limit(&prop["items"]))])));
+                probes.push(Some(json!(["a".repeat(limit(&prop["items"]) + 1)])));
+            }
+            for probe in probes {
+                let mut args = base.clone();
+                match &probe {
+                    None => {
+                        args.as_object_mut().unwrap().remove(field);
+                    }
+                    Some(value) => args[field.as_str()] = value.clone(),
+                }
+                let violations = validate::validate(&args, &schema);
+                let extracted = T::from_args(&args);
+                let shown = probe.as_ref().map_or("<absent>".to_string(), |v| {
+                    v.to_string().chars().take(40).collect()
+                });
+                if violations.is_empty() {
+                    assert!(
+                        extracted.is_ok(),
+                        "{name}.{field} = {shown}: the validator passed what extraction refuses: {:?}",
+                        extracted.err()
+                    );
+                }
+                if let Ok(parsed) = &extracted {
+                    let echoed = parsed.to_value();
+                    match &probe {
+                        Some(value) if !value.is_null() => assert_eq!(
+                            without_nulls(&echoed[field.as_str()]),
+                            without_nulls(&canonical(prop, value)),
+                            "{name}.{field} = {shown}"
+                        ),
+                        _ => assert!(
+                            echoed[field.as_str()].is_null(),
+                            "{name}.{field} = {shown} read as {}",
+                            echoed[field.as_str()]
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A tool's name, the `inputSchema` its args struct prints, and the
+    /// property check for that struct.
+    type ArgsRow = (&'static str, fn() -> Value, fn(&str));
+
+    /// One row per advertised tool.
+    fn args_registry() -> Vec<ArgsRow> {
+        macro_rules! rows {
+            ($(($name:literal, $ty:ty)),+ $(,)?) => {
+                vec![$((
+                    $name,
+                    <$ty as ToolArgs>::object_schema as fn() -> Value,
+                    property_table::<$ty> as fn(&str),
+                )),+]
+            };
+        }
+        use devmap_parity as dm;
+        rows![
+            ("gitpulse_insights", RepoArgs),
+            ("gitpulse_status", RepoArgs),
+            ("gitpulse_active_changes", ActiveChangesArgs),
+            ("gitpulse_collision_risk", RepoArgs),
+            ("gitpulse_change_context", ChangeContextArgs),
+            ("gitpulse_ledger_events", LedgerEventsArgs),
+            ("gitpulse_task_view", TaskViewArgs),
+            ("gitpulse_add_task", AddTaskArgs),
+            ("gitpulse_import_tasks", ImportTasksArgs),
+            ("gitpulse_list_tasks", ListTasksArgs),
+            ("gitpulse_get_task", GetTaskArgs),
+            ("gitpulse_complete_task", CompleteTaskArgs),
+            ("gitpulse_delete_task", DeleteTaskArgs),
+            ("gitpulse_merge_tasks", MergeTasksArgs),
+            ("gitpulse_codeintel_search", SearchArgs),
+            ("gitpulse_codeintel_impact", CodeintelImpactArgs),
+            ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
+            ("gitpulse_codeintel_trace", CodeintelTraceArgs),
+            ("gitpulse_codeintel_dead_symbols", BudgetArgs),
+            ("gitpulse_codeintel_suspects", SuspectsArgs),
+            ("gitpulse_provenance", ProvenanceArgs),
+            ("devmap_status", RepoArgs),
+            ("devmap_search", SearchArgs),
+            ("devmap_dependencies", dm::DependenciesArgs),
+            ("devmap_impact", dm::ImpactArgs),
+            ("devmap_trace", dm::TraceArgs),
+            ("devmap_neighbors", dm::NeighborsArgs),
+            ("devmap_dead_symbols", BudgetArgs),
+            ("devmap_clones", BudgetArgs),
+            ("devmap_preview", dm::PreviewArgs),
+            ("devmap_explore", dm::ExploreArgs),
+            ("devmap_affected_tests", dm::AffectedTestsArgs),
+        ]
+    }
+
+    /// The advertised `inputSchema` is printed by the struct the handler reads,
+    /// so a handler cannot read an argument the schema does not declare, and the
+    /// schema cannot advertise one the handler never reads (a declared field
+    /// nothing reads is dead code, which `clippy -D warnings` refuses). This
+    /// replaces the test that scanned the handler's source text for the same
+    /// thing.
+    #[test]
+    fn every_tool_input_schema_is_its_args_struct() {
+        let advertised = tools();
+        let registry = args_registry();
+        let listed: Vec<&str> = advertised
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let registered: Vec<&str> = registry.iter().map(|(name, ..)| *name).collect();
+        assert_eq!(registered, listed, "one row per advertised tool, in order");
+        for (name, schema, _) in registry {
+            let tool = advertised.iter().find(|t| t["name"] == name).unwrap();
+            assert_eq!(tool["inputSchema"], schema(), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_tool_argument_fails_validation_or_extracts_exactly() {
+        for (name, _, check) in args_registry() {
+            check(name);
+        }
+    }
+
+    #[test]
+    fn suspects_depth_5_0_is_honoured() {
+        let call = |depth: Value| {
+            SuspectsArgs::from_args(&json!({
+                "repo_path": "/r", "symptom": "s", "since": "HEAD~1", "depth": depth
+            }))
+            .expect("extracts")
+            .depth
+        };
+        assert_eq!(call(json!(5.0)), Some(5));
+        assert_eq!(call(json!(5)), Some(5));
+        assert_eq!(call(Value::Null), None);
+    }
+
+    /// Hostile-input attacks on the typed-argument layer. Everything here runs
+    /// the validator and the extractor over what the advertised schemas say,
+    /// never over values a person picked to fit the implementation.
+    mod adversarial {
+        use super::*;
+        use validate::Violation;
+
+        type Extract = fn(&Value) -> Result<Value, Vec<Violation>>;
+
+        fn extract<T: ToolArgs>(arguments: &Value) -> Result<Value, Vec<Violation>> {
+            T::from_args(arguments).map(|parsed| parsed.to_value())
+        }
+
+        /// One extractor per advertised tool, independent of `args_registry`.
+        fn extractors() -> Vec<(&'static str, Extract)> {
+            macro_rules! rows {
+                ($(($name:literal, $ty:ty)),+ $(,)?) => {
+                    vec![$(($name, extract::<$ty> as Extract)),+]
+                };
+            }
+            use devmap_parity as dm;
+            rows![
+                ("gitpulse_insights", RepoArgs),
+                ("gitpulse_status", RepoArgs),
+                ("gitpulse_active_changes", ActiveChangesArgs),
+                ("gitpulse_collision_risk", RepoArgs),
+                ("gitpulse_change_context", ChangeContextArgs),
+                ("gitpulse_ledger_events", LedgerEventsArgs),
+                ("gitpulse_task_view", TaskViewArgs),
+                ("gitpulse_add_task", AddTaskArgs),
+                ("gitpulse_import_tasks", ImportTasksArgs),
+                ("gitpulse_list_tasks", ListTasksArgs),
+                ("gitpulse_get_task", GetTaskArgs),
+                ("gitpulse_complete_task", CompleteTaskArgs),
+                ("gitpulse_delete_task", DeleteTaskArgs),
+                ("gitpulse_merge_tasks", MergeTasksArgs),
+                ("gitpulse_codeintel_search", SearchArgs),
+                ("gitpulse_codeintel_impact", CodeintelImpactArgs),
+                ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
+                ("gitpulse_codeintel_trace", CodeintelTraceArgs),
+                ("gitpulse_codeintel_dead_symbols", BudgetArgs),
+                ("gitpulse_codeintel_suspects", SuspectsArgs),
+                ("gitpulse_provenance", ProvenanceArgs),
+                ("devmap_status", RepoArgs),
+                ("devmap_search", SearchArgs),
+                ("devmap_dependencies", dm::DependenciesArgs),
+                ("devmap_impact", dm::ImpactArgs),
+                ("devmap_trace", dm::TraceArgs),
+                ("devmap_neighbors", dm::NeighborsArgs),
+                ("devmap_dead_symbols", BudgetArgs),
+                ("devmap_clones", BudgetArgs),
+                ("devmap_preview", dm::PreviewArgs),
+                ("devmap_explore", dm::ExploreArgs),
+                ("devmap_affected_tests", dm::AffectedTestsArgs),
+            ]
+        }
+
+        fn schema_of(name: &str) -> Value {
+            tools()
+                .into_iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not advertised"))["inputSchema"]
+                .clone()
+        }
+
+        /// The call survives the validator and extraction, as the server does it.
+        fn accepted(name: &str, extract: Extract, arguments: &Value) -> bool {
+            validate_arguments(name, arguments).is_ok() && extract(arguments).is_ok()
+        }
+
+        fn short(value: &Value) -> String {
+            value.to_string().chars().take(80).collect()
+        }
+
+        /// A number from an integer that may be outside `i64`/`u64`.
+        fn int_json(value: i128) -> Value {
+            if let Ok(signed) = i64::try_from(value) {
+                json!(signed)
+            } else if let Ok(unsigned) = u64::try_from(value) {
+                json!(unsigned)
+            } else {
+                json!(value as f64)
+            }
+        }
+
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % (n.max(1) as u64)) as usize
+            }
+        }
+
+        const WEIRD: [&str; 12] = [
+            "\0",
+            "\u{feff}",
+            "\u{202e}",
+            "e\u{301}",
+            "😀",
+            "€",
+            "\u{10ffff}",
+            "\u{7f}",
+            "a",
+            " ",
+            "\n",
+            "\u{200d}",
+        ];
+
+        /// A random JSON value, leaning on the boundaries `schema` declares.
+        fn gen(rng: &mut Rng, schema: &Value, depth: u8) -> Value {
+            let max_len = schema["maxLength"].as_u64().unwrap_or(16).min(70_000) as usize;
+            let min = schema["minimum"].as_i64().unwrap_or(0) as i128;
+            let max = schema["maximum"].as_u64().unwrap_or(100) as i128;
+            match rng.below(15) {
+                0 => Value::Null,
+                1 => json!(rng.below(2) == 0),
+                2 => {
+                    let candidates = [min - 1, min, min + 1, max - 1, max, max + 1, 0, -1, 1];
+                    int_json(candidates[rng.below(candidates.len())])
+                }
+                3 => {
+                    let floats = [
+                        5.0,
+                        5.5,
+                        -0.0,
+                        0.0,
+                        1e300,
+                        -1e300,
+                        1e-320,
+                        -1e-320,
+                        9_007_199_254_740_991.0,
+                        9_007_199_254_740_992.0,
+                        9_223_372_036_854_775_808.0,
+                        18_446_744_073_709_551_616.0,
+                        4_294_967_296.0,
+                        0.5,
+                        1.0,
+                        f64::MAX,
+                        f64::MIN_POSITIVE,
+                    ];
+                    json!(floats[rng.below(floats.len())])
+                }
+                4 => {
+                    let anchors = [min, max];
+                    let anchor = anchors[rng.below(2)] + rng.below(3) as i128 - 1;
+                    json!(anchor as f64)
+                }
+                5 => json!("a".repeat(rng.below(max_len + 2))),
+                6 => json!("a".repeat(max_len)),
+                7 => json!("a".repeat(max_len + 1)),
+                8 => json!("€".repeat(max_len / 3 + rng.below(2))),
+                9 => {
+                    let mut text = String::new();
+                    for _ in 0..rng.below(24) {
+                        text.push_str(WEIRD[rng.below(WEIRD.len())]);
+                    }
+                    json!(text)
+                }
+                10 if depth < 2 => {
+                    let items = &schema["items"];
+                    Value::Array(
+                        (0..rng.below(5))
+                            .map(|_| gen(rng, items, depth + 1))
+                            .collect(),
+                    )
+                }
+                11 => {
+                    let wanted = schema["maxItems"].as_u64().unwrap_or(3).min(3_000) as usize;
+                    let count = (wanted + rng.below(2)).min(3_000);
+                    let element = match schema["items"]["type"].as_str() {
+                        Some("string") => json!("a"),
+                        Some("object") => json!({ "task_id": "a" }),
+                        _ => json!(1),
+                    };
+                    Value::Array(vec![element; count])
+                }
+                12 if depth < 2 => {
+                    let keys = [
+                        "__proto__",
+                        "task_id",
+                        "a",
+                        "Repo_Path",
+                        "expected_revision",
+                    ];
+                    let mut object = serde_json::Map::new();
+                    for _ in 0..rng.below(4) {
+                        object.insert(
+                            keys[rng.below(keys.len())].to_string(),
+                            gen(rng, &Value::Null, depth + 1),
+                        );
+                    }
+                    Value::Object(object)
+                }
+                13 => match schema["enum"].as_array() {
+                    Some(values) if !values.is_empty() => {
+                        let mut pick = values[rng.below(values.len())].clone();
+                        if rng.below(3) == 0 {
+                            pick = json!(format!("{}x", pick.as_str().unwrap_or("")));
+                        }
+                        pick
+                    }
+                    _ => json!("x"),
+                },
+                _ => json!(rng.below(1000) as u64),
+            }
+        }
+
+        /// The invariants the validator and the extractor owe each other.
+        fn judge(name: &str, extract: Extract, schema: &Value, arguments: &Value) -> (bool, bool) {
+            let violations = validate::validate(arguments, schema);
+            let extracted = extract(arguments);
+            let shown = short(arguments);
+
+            // Extraction owns the byte bounds, so a call the validator passed may
+            // still be refused for those, and only for those.
+            let only_bytes = extracted.as_ref().err().is_some_and(|refused| {
+                refused.iter().all(|v| v.message.contains("bytes of UTF-8"))
+            });
+            if violations.is_empty() && !only_bytes {
+                assert!(
+                    extracted.is_ok(),
+                    "{name}: the validator passed what extraction refuses: {shown} -> {:?}",
+                    extracted.as_ref().err()
+                );
+            }
+            if let Err(refused) = &extracted {
+                assert!(!refused.is_empty(), "{name}: an empty refusal for {shown}");
+            }
+            if extracted.is_ok() {
+                for violation in &violations {
+                    assert!(
+                        violation.message.starts_with("must "),
+                        "{name}: extraction read what the validator refused for a reason that is not a bound ({}): {shown}",
+                        violation.render()
+                    );
+                }
+            }
+            let known = schema["properties"].as_object().unwrap();
+            let named = violations
+                .iter()
+                .chain(extracted.as_ref().err().into_iter().flatten());
+            for violation in named {
+                let head = violation
+                    .path
+                    .split(['[', '.'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    known.contains_key(&head) || arguments.get(&head).is_some(),
+                    "{name}: a refusal that names no argument: {:?} for {shown}",
+                    violation.path
+                );
+            }
+            if let Some(first) = violations.first() {
+                let message = validate::refusal(name, &violations);
+                assert!(message.starts_with(&format!("invalid arguments for {name}: ")));
+                assert!(message.contains(&first.path), "{name}: {message}");
+            }
+            (violations.is_empty(), extracted.is_ok())
+        }
+
+        #[test]
+        fn a_seeded_fuzz_keeps_validation_and_extraction_in_agreement() {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let (mut accepted_calls, mut refused_calls) = (0usize, 0usize);
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                let fields: Vec<String> = schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
+                let base = sample(&schema);
+                for _ in 0..300 {
+                    let mut arguments = base.clone();
+                    for _ in 0..=rng.below(3) {
+                        let field = &fields[rng.below(fields.len())];
+                        match rng.below(10) {
+                            0 => {
+                                arguments.as_object_mut().unwrap().remove(field);
+                            }
+                            1 => {
+                                arguments[format!("junk{}", rng.below(5))] = json!(1);
+                            }
+                            _ => {
+                                arguments[field.as_str()] =
+                                    gen(&mut rng, &schema["properties"][field], 0);
+                            }
+                        }
+                    }
+                    let (valid, extracted) = judge(name, extract, &schema, &arguments);
+                    if valid && extracted {
+                        accepted_calls += 1;
+                    } else {
+                        refused_calls += 1;
+                    }
+                }
+                // Whole-object noise: keys drawn from the fields and from junk.
+                for _ in 0..100 {
+                    let mut arguments = serde_json::Map::new();
+                    for _ in 0..rng.below(6) {
+                        let key = if rng.below(4) == 0 {
+                            "__proto__".to_string()
+                        } else {
+                            fields[rng.below(fields.len())].clone()
+                        };
+                        let sub = schema["properties"]
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        arguments.insert(key, gen(&mut rng, &sub, 0));
+                    }
+                    judge(name, extract, &schema, &Value::Object(arguments));
+                }
+            }
+            assert!(
+                accepted_calls > 200 && refused_calls > 200,
+                "the fuzz explored one side only: {accepted_calls} accepted, {refused_calls} refused"
+            );
+        }
+
+        #[test]
+        fn every_integer_argument_at_and_around_its_bounds_as_integer_and_whole_float() {
+            let max_exact: i128 = 999_999_999_999_999;
+            let mut checked = 0;
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    if prop["type"] != "integer" {
+                        continue;
+                    }
+                    let min = prop["minimum"].as_i64().expect("minimum") as i128;
+                    let max = prop["maximum"].as_u64().expect("maximum") as i128;
+                    for value in [min - 1, min, max, max + 1] {
+                        let inside = (min..=max).contains(&value);
+                        let forms = [
+                            (int_json(value), true),
+                            (
+                                json!(value as f64),
+                                (-max_exact..=max_exact).contains(&value),
+                            ),
+                        ];
+                        for (sent, representable) in forms {
+                            let mut arguments = base.clone();
+                            arguments[field.as_str()] = sent.clone();
+                            let shown = format!("{name}.{field} = {sent}");
+                            let validated = validate_arguments(name, &arguments);
+                            if inside && representable {
+                                validated.unwrap_or_else(|e| panic!("{shown} refused: {e}"));
+                                let read = extract(&arguments)
+                                    .unwrap_or_else(|e| panic!("{shown} not extracted: {e:?}"));
+                                assert_eq!(read[field.as_str()], int_json(value), "{shown}");
+                            } else {
+                                let error = validated.expect_err(&format!("{shown} was accepted"));
+                                assert!(error.contains(field.as_str()), "{shown}: {error}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(checked > 100, "only {checked} integer probes ran");
+        }
+
+        #[test]
+        fn merge_sources_revisions_are_held_to_the_same_bounds() {
+            let schema = schema_of("gitpulse_merge_tasks");
+            let item = &schema["properties"]["sources"]["items"]["properties"]["expected_revision"];
+            let max = item["maximum"].as_u64().expect("maximum") as i128;
+            let min = item["minimum"].as_i64().expect("minimum") as i128;
+            let base = |revision: Value| {
+                json!({
+                    "repo_path": "/no/such/repo",
+                    "into_task_id": "a",
+                    "reason": "r",
+                    "sources": [{ "task_id": "b", "expected_revision": revision }]
+                })
+            };
+            for (value, ok) in [(min - 1, false), (min, true), (max, true), (max + 1, false)] {
+                for sent in [int_json(value), json!(value as f64)] {
+                    let arguments = base(sent.clone());
+                    let validated = validate_arguments("gitpulse_merge_tasks", &arguments);
+                    let float_beyond_exact = sent.is_f64() && value.abs() > 999_999_999_999_999;
+                    if ok && !float_beyond_exact {
+                        validated.unwrap_or_else(|e| panic!("{sent}: {e}"));
+                        let read = extract::<MergeTasksArgs>(&arguments).expect("extracts");
+                        assert_eq!(
+                            read["sources"][0]["expected_revision"],
+                            int_json(value),
+                            "{sent}"
+                        );
+                    } else {
+                        let error = validated.expect_err(&format!("{sent} accepted"));
+                        assert!(error.contains("sources[0].expected_revision"), "{error}");
+                    }
+                }
+            }
+        }
+
+        /// How a string field counts its bound, from what its schema says.
+        fn unit_of(prop: &Value) -> Option<&'static str> {
+            let description = prop["description"].as_str().unwrap_or_default();
+            if description.contains("bytes, UTF-8)") {
+                Some("bytes")
+            } else if description.contains("characters)") {
+                Some("characters")
+            } else {
+                None
+            }
+        }
+
+        /// Every string argument and every string-array item of every tool.
+        fn string_fields() -> Vec<(&'static str, Extract, String, Value, bool)> {
+            let mut out = Vec::new();
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    match prop["type"].as_str() {
+                        Some("string") if prop["enum"].is_null() => {
+                            out.push((name, extract, field.clone(), prop.clone(), false));
+                        }
+                        Some("array") if prop["items"]["type"] == "string" => {
+                            let mut shaped = prop.clone();
+                            shaped["maxLength"] = prop["items"]["maxLength"].clone();
+                            out.push((name, extract, field.clone(), shaped, true));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            out
+        }
+
+        fn with_string(base: &Value, field: &str, in_array: bool, text: &str) -> Value {
+            let mut arguments = base.clone();
+            arguments[field] = if in_array { json!([text]) } else { json!(text) };
+            arguments
+        }
+
+        #[test]
+        fn every_string_bound_counts_what_it_says_for_ascii_three_byte_four_byte_and_combining() {
+            let mut checked = 0;
+            for (name, extract, field, prop, in_array) in string_fields() {
+                let max = prop["maxLength"].as_u64().expect("maxLength") as usize;
+                if max > 100_000 {
+                    continue;
+                }
+                let unit = unit_of(&prop)
+                    .unwrap_or_else(|| panic!("{name}.{field} names no unit: {prop}"));
+                let base = sample(&schema_of(name));
+                let bytes = unit == "bytes";
+                // (text unit, its length in the bound's unit)
+                let pieces: [(&str, usize); 4] = [
+                    ("a", 1),
+                    ("€", if bytes { 3 } else { 1 }),
+                    ("😀", if bytes { 4 } else { 1 }),
+                    ("e\u{301}", if bytes { 3 } else { 2 }),
+                ];
+                for (piece, width) in pieces {
+                    let fits = max / width;
+                    let at_limit = piece.repeat(fits);
+                    let over = piece.repeat(fits + 1);
+                    let minimum = prop["minLength"].as_u64().unwrap_or(0) as usize;
+                    if fits >= minimum.max(1) {
+                        let good = with_string(&base, &field, in_array, &at_limit);
+                        validate_arguments(name, &good).unwrap_or_else(|e| {
+                            panic!(
+                                "{name}.{field}: {fits} x {piece:?} ({unit}) refused: {}",
+                                &e[..e.len().min(200)]
+                            )
+                        });
+                        let read = extract(&good)
+                            .unwrap_or_else(|e| panic!("{name}.{field} {piece:?}: {e:?}"));
+                        assert_eq!(
+                            read[field.as_str()],
+                            if in_array {
+                                json!([at_limit])
+                            } else {
+                                json!(at_limit)
+                            },
+                            "{name}.{field} did not echo {piece:?} exactly"
+                        );
+                    }
+                    let bad = with_string(&base, &field, in_array, &over);
+                    assert!(
+                        !accepted(name, extract, &bad),
+                        "{name}.{field}: {} x {piece:?} is over {max} {unit} and was accepted",
+                        fits + 1
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 150, "only {checked} string probes ran");
+        }
+
+        #[test]
+        fn awkward_unicode_survives_extraction_byte_for_byte() {
+            let text = "\u{0}\u{feff}\u{202e}e\u{301}\u{200d}😀\u{7f}\u{10ffff}\n";
+            let mut checked = 0;
+            for (name, extract, field, prop, in_array) in string_fields() {
+                let max = prop["maxLength"].as_u64().unwrap() as usize;
+                if max < text.len()
+                    || prop["minLength"].as_u64().unwrap_or(0) > text.chars().count() as u64
+                {
+                    continue;
+                }
+                let arguments = with_string(&sample(&schema_of(name)), &field, in_array, text);
+                if validate_arguments(name, &arguments).is_err() {
+                    continue;
+                }
+                let read = extract(&arguments).expect("validated, so extracted");
+                let echoed = if in_array {
+                    read[field.as_str()][0].clone()
+                } else {
+                    read[field.as_str()].clone()
+                };
+                assert_eq!(echoed, json!(text), "{name}.{field}");
+                checked += 1;
+            }
+            assert!(checked > 30, "only {checked} fields took the probe");
+        }
+
+        #[test]
+        fn a_value_of_the_wrong_shape_is_refused_naming_its_argument() {
+            let shapes = [
+                json!({}),
+                json!({ "a": { "b": [] } }),
+                json!([]),
+                json!([[]]),
+                json!([{}]),
+                json!(12),
+                json!(true),
+                json!("text"),
+                json!(-0.0),
+            ];
+            let mut checked = 0;
+            for (name, _) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    let expects = prop["type"].as_str().unwrap();
+                    for shape in &shapes {
+                        let fits = match shape {
+                            Value::Object(_) => expects == "object",
+                            Value::Array(items) => {
+                                expects == "array"
+                                    && (items.is_empty()
+                                        || prop["items"]["type"] == "array"
+                                        || (prop["items"]["type"] == "object"
+                                            && items.iter().all(Value::is_object)))
+                            }
+                            Value::Number(_) => matches!(expects, "number" | "integer"),
+                            Value::Bool(_) => expects == "boolean",
+                            Value::String(_) => expects == "string" && prop["enum"].is_null(),
+                            Value::Null => true,
+                        };
+                        if fits {
+                            continue;
+                        }
+                        let mut arguments = base.clone();
+                        arguments[field.as_str()] = shape.clone();
+                        let error = validate_arguments(name, &arguments)
+                            .expect_err(&format!("{name}.{field} accepted {shape}"));
+                        assert!(
+                            error.starts_with(&format!("invalid arguments for {name}: "))
+                                && error.contains(field.as_str()),
+                            "{name}.{field} = {shape}: {error}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 500, "only {checked} wrong shapes ran");
+        }
+
+        #[test]
+        fn a_huge_array_and_a_megabyte_string_are_refused_quickly_and_name_the_argument() {
+            let started = std::time::Instant::now();
+            let megabyte = "x".repeat(2 << 20);
+            for (name, _) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                for (field, prop) in schema["properties"].as_object().unwrap() {
+                    let hostile = match prop["type"].as_str() {
+                        Some("string") => json!(megabyte),
+                        Some("array") => Value::Array(vec![json!(1); 10_000]),
+                        _ => continue,
+                    };
+                    let mut arguments = base.clone();
+                    arguments[field.as_str()] = hostile;
+                    let error = validate_arguments(name, &arguments)
+                        .expect_err(&format!("{name}.{field} accepted a hostile value"));
+                    assert!(error.contains(field.as_str()), "{name}.{field}");
+                }
+            }
+            assert!(
+                started.elapsed()
+                    < crate::test_support::env::coverage_relaxed(std::time::Duration::from_secs(
+                        60
+                    )),
+                "hostile values took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn a_key_that_only_differs_in_case_or_is_a_prototype_name_is_unknown() {
+            for (name, extract) in extractors() {
+                let schema = schema_of(name);
+                let base = sample(&schema);
+                let mut hostile: Vec<String> = vec![
+                    "__proto__".into(),
+                    "constructor".into(),
+                    "prototype".into(),
+                    "$ref".into(),
+                    String::new(),
+                ];
+                for field in schema["properties"].as_object().unwrap().keys() {
+                    hostile.push(field.to_uppercase());
+                    hostile.push(format!("{field} "));
+                    hostile.push(format!(" {field}"));
+                    hostile.push(format!("{field}\u{0}"));
+                    hostile.push(field.replace('_', "-"));
+                }
+                for key in hostile {
+                    let mut arguments = base.clone();
+                    arguments[key.as_str()] = json!(1);
+                    if schema["properties"].get(&key).is_some() {
+                        continue;
+                    }
+                    let error = validate_arguments(name, &arguments)
+                        .expect_err(&format!("{name} accepted the key {key:?}"));
+                    assert!(
+                        error.contains("unknown argument"),
+                        "{name} {key:?}: {error}"
+                    );
+                    assert!(extract(&arguments).is_err(), "{name} {key:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_duplicate_key_is_decided_by_the_json_parser_and_the_winner_is_what_is_validated() {
+            let last_wins: Value =
+                serde_json::from_str(r#"{"repo_path":5,"repo_path":"/no/such/repo"}"#).unwrap();
+            assert_eq!(last_wins["repo_path"], "/no/such/repo");
+            validate_arguments("gitpulse_status", &last_wins).expect("the last key is valid");
+            assert!(extract::<RepoArgs>(&last_wins).is_ok());
+
+            let bad_last: Value =
+                serde_json::from_str(r#"{"repo_path":"/no/such/repo","repo_path":5}"#).unwrap();
+            let error =
+                validate_arguments("gitpulse_status", &bad_last).expect_err("5 is not a path");
+            assert!(error.contains("repo_path"), "{error}");
+            assert!(extract::<RepoArgs>(&bad_last).is_err());
+        }
+
+        #[test]
+        fn json_cannot_carry_what_the_extractor_would_have_to_trust() {
+            for text in [
+                "NaN",
+                "Infinity",
+                "-Infinity",
+                "1e400",
+                "-1e400",
+                "+1",
+                "01",
+                ".5",
+                "5.",
+                "0x10",
+            ] {
+                assert!(
+                    serde_json::from_str::<Value>(text).is_err(),
+                    "{text} parsed as JSON"
+                );
+            }
+            assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+            assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
+            // "-0" is a float, whole, and equal to zero.
+            let negative_zero: Value = serde_json::from_str("-0").unwrap();
+            assert!(validate::exact_int(negative_zero.as_number().unwrap()) == Some(0));
+            let subnormal: Value = serde_json::from_str("1e-320").unwrap();
+            assert!(validate::exact_int(subnormal.as_number().unwrap()).is_none());
+        }
+
+        #[test]
+        fn zero_subnormal_and_borderline_confidences_are_read_within_their_range() {
+            let schema = schema_of("devmap_impact");
+            let base = {
+                let mut base = sample(&schema);
+                base["repo_path"] = json!("/no/such/repo");
+                base
+            };
+            let min = schema["properties"]["min_confidence"]["minimum"]
+                .as_f64()
+                .unwrap();
+            let max = schema["properties"]["min_confidence"]["maximum"]
+                .as_f64()
+                .unwrap();
+            for text in [
+                "0",
+                "-0",
+                "-0.0",
+                "0.0",
+                "1e-320",
+                "5e-324",
+                "1",
+                "1.0",
+                "0.9999999999999999",
+                "0.99999999999999999999",
+                "1.0000000000000002",
+                "-1e-320",
+                "1.0000000000000001",
+            ] {
+                let sent: Value = serde_json::from_str(text).unwrap();
+                let mut arguments = base.clone();
+                arguments["min_confidence"] = sent.clone();
+                let verdict = validate_arguments("devmap_impact", &arguments);
+                let parsed = extract::<devmap_parity::ImpactArgs>(&arguments);
+                let value = sent.as_f64().unwrap();
+                if (min..=max).contains(&value) {
+                    verdict.unwrap_or_else(|e| panic!("{text}: {e}"));
+                    let read = parsed.unwrap_or_else(|e| panic!("{text}: {e:?}"));
+                    let narrowed = read["min_confidence"].as_f64().expect("a number");
+                    assert!(
+                        (min..=max).contains(&narrowed),
+                        "{text} was read as {narrowed}, outside [{min}, {max}]"
+                    );
+                } else {
+                    assert!(verdict.is_err(), "{text} was accepted");
+                }
+            }
+        }
+
+        #[test]
+        fn the_parse_path_has_no_shared_mutable_state_and_is_deterministic_across_threads() {
+            let source = include_str!("validate.rs");
+            let typed = &source[source.find("// Typed arguments").expect("typed section")
+                ..source.find("#[cfg(test)]\nmod tests").expect("tests")];
+            for needle in [
+                "static mut",
+                "thread_local",
+                "OnceLock",
+                "Mutex",
+                "RwLock",
+                "lazy_static",
+                "AtomicU",
+            ] {
+                assert!(
+                    !typed.contains(needle),
+                    "the typed layer holds global state: {needle}"
+                );
+            }
+            let schema = schema_of("gitpulse_ledger_events");
+            let cases: Vec<Value> = (0..40)
+                .map(|n| {
+                    let mut arguments = sample(&schema);
+                    arguments["cursor"] = match n % 4 {
+                        0 => json!(n),
+                        1 => json!(n as f64),
+                        2 => json!(-1),
+                        _ => json!(1e300),
+                    };
+                    arguments
+                })
+                .collect();
+            let verdicts = |cases: &[Value]| -> Vec<(bool, Option<Value>)> {
+                cases
+                    .iter()
+                    .map(|arguments| {
+                        (
+                            validate_arguments("gitpulse_ledger_events", arguments).is_ok(),
+                            extract::<LedgerEventsArgs>(arguments).ok(),
+                        )
+                    })
+                    .collect()
+            };
+            let expected = verdicts(&cases);
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let cases = cases.clone();
+                    std::thread::spawn(move || {
+                        (0..200).all(|_| {
+                            cases
+                                .iter()
+                                .map(|arguments| {
+                                    (
+                                        validate_arguments("gitpulse_ledger_events", arguments)
+                                            .is_ok(),
+                                        extract::<LedgerEventsArgs>(arguments).ok(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                == verdicts(&cases)
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().expect("no panic"));
+            }
+            assert_eq!(expected, verdicts(&cases));
+        }
+
+        #[test]
+        fn nothing_outside_handle_tool_call_dispatches_a_tool() {
+            let production = |source: &'static str| {
+                &source[..source
+                    .find("#[cfg(test)]\nmod tests")
+                    .unwrap_or(source.len())]
+            };
+            let mod_rs = production(include_str!("mod.rs"));
+            assert_eq!(
+                mod_rs.matches("handle_tool_call(").count(),
+                2,
+                "handle_tool_call is defined once and called once, from `run`"
+            );
+            assert_eq!(mod_rs.matches("devmap_parity::handle(").count(), 1);
+            for (file, source) in [
+                ("resources.rs", include_str!("resources.rs")),
+                ("prompts.rs", include_str!("prompts.rs")),
+                ("complete.rs", include_str!("complete.rs")),
+                ("page.rs", include_str!("page.rs")),
+                (
+                    "devmap_parity.rs",
+                    production(include_str!("devmap_parity.rs")),
+                ),
+                (
+                    "bin/gitpulse-mcp.rs",
+                    include_str!("../bin/gitpulse-mcp.rs"),
+                ),
+            ] {
+                for needle in [
+                    "handle_tool_call(",
+                    "devmap_parity::handle(",
+                    "::from_args(",
+                ] {
+                    assert!(
+                        !source.contains(needle),
+                        "{file} dispatches around the validator: {needle}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferral_retry_tests {
+    use super::*;
+
     /// A retry harness with no real clock, sleep or randomness: `jitter` is
     /// what the injected RNG returns, `deadline_in` how far away the request's
     /// deadline is, and `sleeps` records every delay it was asked to wait.
@@ -4303,23 +6953,19 @@ mod tests {
         }
     }
 
-    /// End to end through the tool dispatcher: a spawn gate that sheds every
-    /// read answers `ok: false` with `deferred`/`retry_after_ms` on each
-    /// failed facet, after one retry and no more, and says invalid_worktree
-    /// nowhere. A repository that is genuinely not one still says so, and is
-    /// not retried.
+    /// End to end through the real snapshot and the tool dispatcher: a spawn
+    /// gate that sheds every read answers with `deferred`/`retry_after_ms` on
+    /// each failed facet (after the one real retry, at most 250 ms) and says
+    /// invalid_worktree nowhere; a repository that is genuinely not one still
+    /// says so and carries no deferral.
     #[test]
     fn collision_risk_and_insights_under_a_shed_gate_report_deferral_not_invalid() {
         let repo = crate::test_support::git_repo();
         let path = repo.path().to_str().unwrap();
         for tool in ["gitpulse_collision_risk", "gitpulse_insights"] {
-            let harness = Harness::new(3, ROOMY);
             let answer = crate::engine::git_cli::with_forced_deferral(|| {
-                harness
-                    .run(|retry| handle_tool_call_with(tool, &json!({ "repo_path": path }), retry))
-                    .expect(tool)
+                handle_tool_call(tool, &json!({ "repo_path": path })).expect(tool)
             });
-            assert_eq!(harness.sleeps.borrow().len(), 1, "{tool}: one retry");
             assert!(!answer["ok"].as_bool().unwrap_or(false), "{tool}");
             let text = answer.to_string();
             assert!(!text.contains("invalid_worktree"), "{tool}: {text}");
@@ -4333,20 +6979,11 @@ mod tests {
         }
 
         let plain = tempfile::tempdir().unwrap();
-        let harness = Harness::new(0, ROOMY);
-        let answer = harness
-            .run(|retry| {
-                handle_tool_call_with(
-                    "gitpulse_insights",
-                    &json!({ "repo_path": plain.path().to_str().unwrap() }),
-                    retry,
-                )
-            })
-            .unwrap();
-        assert!(
-            harness.sleeps.borrow().is_empty(),
-            "a real failure is not retried"
-        );
+        let answer = handle_tool_call(
+            "gitpulse_insights",
+            &json!({ "repo_path": plain.path().to_str().unwrap() }),
+        )
+        .unwrap();
         assert!(answer["ledger"].get("deferred").is_none(), "{answer}");
     }
 

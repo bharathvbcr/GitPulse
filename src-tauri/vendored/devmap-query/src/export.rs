@@ -6,6 +6,8 @@
 //! feeds the planning subsystem. That is orchestration, not code intelligence,
 //! and it moves with DevCouncil rather than with the map.
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use serde_json::Value;
@@ -40,21 +42,85 @@ fn xml_legal(ch: char) -> bool {
 /// them emits a document no parser will open. The count of substitutions rides
 /// in the export's own summary, so a caller can tell this happened.
 fn sanitize(text: &str, replaced: &mut usize) -> String {
+    xml(&replace_illegal(text, replaced))
+}
+
+/// [`sanitize`] before escaping: the text XML can hold, not yet markup-safe.
+fn replace_illegal<'a>(text: &'a str, replaced: &mut usize) -> Cow<'a, str> {
     if text.chars().all(xml_legal) {
-        return xml(text);
+        return Cow::Borrowed(text);
     }
-    let cleaned: String = text
-        .chars()
-        .map(|ch| {
-            if xml_legal(ch) {
-                ch
-            } else {
-                *replaced += 1;
-                '\u{fffd}'
+    Cow::Owned(
+        text.chars()
+            .map(|ch| {
+                if xml_legal(ch) {
+                    ch
+                } else {
+                    *replaced += 1;
+                    '\u{fffd}'
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The id each node is written under, by its index; `None` for a node whose
+/// id repeats an earlier one exactly. Also the written id for every raw id,
+/// for the edges.
+///
+/// Sanitising is not injective: `a\x01.py` and `a\x02.py` both become
+/// `a\u{fffd}.py`, and a document declaring one id twice is invalid GraphML
+/// whose edges land on whichever node a reader keeps. So ids are assigned
+/// before anything is written. Every id that needed no repair keeps its name —
+/// a clean id is never renamed to make room. A repaired id that lands on a
+/// taken one is written as `<id>~<n>`, the smallest `n` from 2 not taken,
+/// visiting nodes in input order, so the same graph always exports the same
+/// document. Each such rename is counted in [`GraphmlReport::id_collisions`].
+fn assign_ids<'a>(
+    nodes: &'a [Value],
+    report: &mut GraphmlReport,
+) -> (Vec<Option<String>>, HashMap<&'a str, String>) {
+    let mut written: Vec<Option<String>> = vec![None; nodes.len()];
+    let mut by_raw: HashMap<&'a str, String> = HashMap::with_capacity(nodes.len());
+    let mut taken: HashSet<String> = HashSet::with_capacity(nodes.len());
+    let mut repaired: Vec<(usize, &'a str)> = Vec::new();
+    let mut seen: HashSet<&'a str> = HashSet::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let raw = str_field(node, "id");
+        if !seen.insert(raw) {
+            report.duplicate_nodes += 1;
+            continue;
+        }
+        if raw.chars().all(xml_legal) {
+            taken.insert(raw.to_string());
+            written[index] = Some(raw.to_string());
+            by_raw.insert(raw, raw.to_string());
+        } else {
+            repaired.push((index, raw));
+        }
+    }
+    for (index, raw) in repaired {
+        let base = replace_illegal(raw, &mut report.characters_replaced).into_owned();
+        let id = if taken.contains(&base) {
+            report.id_collisions += 1;
+            // `taken` holds at most one entry per node, so this ends within
+            // `nodes.len() + 2` tries.
+            let mut n = 2usize;
+            loop {
+                let candidate = format!("{base}~{n}");
+                if !taken.contains(&candidate) {
+                    break candidate;
+                }
+                n += 1;
             }
-        })
-        .collect();
-    xml(&cleaned)
+        } else {
+            base
+        };
+        taken.insert(id.clone());
+        written[index] = Some(id.clone());
+        by_raw.insert(raw, id);
+    }
+    (written, by_raw)
 }
 
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -68,6 +134,12 @@ pub struct GraphmlReport {
     pub edges: usize,
     pub edges_dangling: usize,
     pub characters_replaced: usize,
+    /// Nodes whose sanitised id was already taken by another node, and which
+    /// were written under a disambiguated id instead (`<id>~<n>`).
+    pub id_collisions: usize,
+    /// Nodes whose id repeats an earlier node's exactly; only the first is
+    /// written, and edges naming the id land on it.
+    pub duplicate_nodes: usize,
 }
 
 /// GraphML with the node and edge attributes the graph carries.
@@ -139,10 +211,12 @@ pub fn export_graphml(graph: &Value) -> (String, GraphmlReport) {
         !unreliable
     );
 
-    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for node in nodes {
+    let (written_ids, by_raw) = assign_ids(nodes, &mut report);
+    for (node, written_id) in nodes.iter().zip(&written_ids) {
+        let Some(written_id) = written_id else {
+            continue;
+        };
         let id = str_field(node, "id");
-        declared.insert(id.to_string());
         let path = str_field(node, "path");
         let community = {
             let raw = str_field(node, "community").trim();
@@ -174,7 +248,7 @@ pub fn export_graphml(graph: &Value) -> (String, GraphmlReport) {
       <data key="unreachable">{}</data>
     </node>
 "#,
-            sanitize(id, &mut report.characters_replaced),
+            xml(written_id),
             sanitize(str_field(node, "kind"), &mut report.characters_replaced),
             sanitize(path, &mut report.characters_replaced),
             sanitize(str_field(node, "name"), &mut report.characters_replaced),
@@ -195,10 +269,10 @@ pub fn export_graphml(graph: &Value) -> (String, GraphmlReport) {
         // GraphML requires both endpoints to be declared nodes. The graph can
         // carry an edge to a name no node owns — a route handler, an unresolved
         // import — and emitting it produces a document strict readers reject.
-        if !declared.contains(source) || !declared.contains(target) {
+        let (Some(source), Some(target)) = (by_raw.get(source), by_raw.get(target)) else {
             report.edges_dangling += 1;
             continue;
-        }
+        };
         let _ = write!(
             out,
             r#"    <edge id="e{index}" source="{}" target="{}">
@@ -206,8 +280,8 @@ pub fn export_graphml(graph: &Value) -> (String, GraphmlReport) {
       <data key="confidence">{}</data>
     </edge>
 "#,
-            sanitize(source, &mut report.characters_replaced),
-            sanitize(target, &mut report.characters_replaced),
+            xml(source),
+            xml(target),
             sanitize(str_field(edge, "kind"), &mut report.characters_replaced),
             sanitize(
                 str_field(edge, "confidence"),
@@ -331,6 +405,77 @@ mod tests {
 
         // A clean graph reports none, so the count means something.
         assert_eq!(export_graphml(&graph()).1.characters_replaced, 0);
+    }
+
+    fn node_ids(xml: &str) -> Vec<&str> {
+        xml.split(r#"<node id=""#)
+            .skip(1)
+            .map(|rest| &rest[..rest.find('"').unwrap()])
+            .collect()
+    }
+
+    /// Two ids that differ only in characters XML cannot hold both sanitise to
+    /// `a\u{fffd}.py`. Emitted as is, the document declares one id twice and
+    /// every edge to either lands on whichever a reader keeps.
+    #[test]
+    fn ids_that_sanitise_alike_stay_distinct_and_the_collision_is_counted() {
+        let g = json!({
+            "nodes": [
+                {"id": "a\u{1}.py", "kind": "file", "path": "a\u{1}.py"},
+                {"id": "a\u{2}.py", "kind": "file", "path": "a\u{2}.py"},
+                {"id": "b.py", "kind": "file", "path": "b.py"},
+            ],
+            "edges": [
+                {"source": "b.py", "target": "a\u{1}.py", "kind": "imports"},
+                {"source": "b.py", "target": "a\u{2}.py", "kind": "imports"},
+            ],
+        });
+        let (xml, report) = export_graphml(&g);
+        let ids = node_ids(&xml);
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(unique.len(), 3, "duplicate node ids: {ids:?}");
+        assert_eq!(report.id_collisions, 1);
+        // Each edge lands on its own node, not on whichever shares its text.
+        assert!(xml.contains(&format!(r#"source="b.py" target="{}""#, ids[0])));
+        assert!(xml.contains(&format!(r#"source="b.py" target="{}""#, ids[1])));
+        // Deterministic: the same graph exports the same bytes.
+        assert_eq!(export_graphml(&g).0, xml);
+    }
+
+    /// A clean id is never renamed to make room for a sanitised one, even
+    /// when the sanitised one comes first.
+    #[test]
+    fn a_clean_id_keeps_its_name_when_a_sanitised_one_matches_it() {
+        let g = json!({
+            "nodes": [
+                {"id": "a\u{1}.py", "kind": "file"},
+                {"id": "a\u{fffd}.py", "kind": "file"},
+                {"id": "a\u{fffd}.py~2", "kind": "file"},
+            ],
+        });
+        let (xml, report) = export_graphml(&g);
+        let ids = node_ids(&xml);
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "duplicate node ids: {ids:?}");
+        assert!(ids.contains(&"a\u{fffd}.py"));
+        assert!(ids.contains(&"a\u{fffd}.py~2"));
+        assert_eq!(report.id_collisions, 1);
+    }
+
+    /// The same id declared twice is one node; the second is not written.
+    #[test]
+    fn a_repeated_id_is_declared_once_and_counted() {
+        let mut g = graph();
+        g["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "a.py", "kind": "file"}));
+        let (xml, report) = export_graphml(&g);
+        assert_eq!(xml.matches(r#"<node id="a.py">"#).count(), 1);
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.duplicate_nodes, 1);
+        assert_eq!(export_graphml(&graph()).1.duplicate_nodes, 0);
     }
 
     #[test]

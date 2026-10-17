@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { createServer } from "vite";
 
 const run = promisify(execFile);
-export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "pull-requests", "search", "conflicts", "uncommitted", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "agents", "agent-capacity"]);
+export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "pull-requests", "search", "conflicts", "uncommitted", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "scroll-cue", "agents", "agent-capacity", "repo-churn", "diff", "file-tree", "file-viewer", "github-panel", "fleet", "tab-switch", "mutation-routing"]);
 
 /**
  * How long one page may take, from server start to verdict.
@@ -17,11 +17,13 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "pull-requests", 
  * The cap is a hang detector, not a speed target. Every page fits a minute
  * except `tasks`, which drives the whole board — each editor, sheet, view and
  * route guard — through real waits, and already used ~56 of its 60 seconds on
- * an idle host. A page that is long by design gets its own number here; the
- * rest keep the minute, so a hang anywhere else is still caught as fast.
+ * an idle host. `tab-switch` mounts the whole App and makes ~80 settled waits,
+ * which the WebKit runner's clamped timers stretch past a minute. A page that
+ * is long by design gets its own number here; the rest keep the minute, so a
+ * hang anywhere else is still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120 }));
 
 /** @param {string} harness */
 export function harnessDeadlineSeconds(harness) {
@@ -62,27 +64,95 @@ export function chromeBinary() {
     : process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
 }
 
-/** How Chrome is started so that it cannot outlive this runner.
+/** How Chrome is started. Chrome is its own process group, so its helpers can
+ * be ended with it.
  *
- * `finally` covers every way a harness ends inside this process, but not this
- * process being killed — Ctrl-C, a CI step timeout, a SIGKILL — and a plain
- * headless Chrome survives its parent: one was found still running three days
- * after its run. With `--remote-debugging-pipe` Chrome reads its control
- * channel from fds 3 and 4, and the kernel closes those when this process
- * dies, however it dies; Chrome then exits.
+ * `--enable-unsafe-swiftshader` lets a host with no GPU (the CI Linux runner)
+ * fall back to software WebGL, which Chrome otherwise refuses. Without it the
+ * terminal page's GPU checks stop at "this browser can create a WebGL2
+ * context", which was reproduced here with `--disable-gpu`. Where a GPU
+ * exists the flag changes nothing.
  * @param {string} chrome @param {string} profile @param {string} url
  */
 export function chromeLaunch(chrome, profile, url) {
   return {
     file: chrome,
     args: [
-      "--headless", "--remote-debugging-pipe", `--user-data-dir=${profile}`, "--no-first-run",
+      "--headless", `--user-data-dir=${profile}`, "--no-first-run",
       "--no-default-browser-check", "--disable-background-networking", "--window-size=1400,1000",
+      "--enable-unsafe-swiftshader",
       url,
     ],
     /** @type {import('node:child_process').StdioOptions} */
-    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+    stdio: ["ignore", "ignore", "ignore"],
   };
+}
+
+/** The pid to signal to end Chrome's group, or null when it must not be signalled.
+ *
+ * The watchdog fires long after it was told Chrome's pid, so that number may
+ * have been recycled. A `process.kill(-0)` is `kill(0)` (the watchdog's own
+ * group) and `-1` is every process the user owns, so the id is checked, and the
+ * process must still be a group leader whose command line carries this run's
+ * unique profile directory. `readProcess` answers `{ pgid, command }` for a pid
+ * or null when it is gone. Windows has no group to name, so only the id rule and
+ * liveness apply there.
+ * @param {number} chrome @param {string} profile @param {string} platform
+ * @param {number} self @param {(pid: number) => ({ pgid: number, command: string } | null)} readProcess
+ * @returns {number | null}
+ */
+export function chromeVictim(chrome, profile, platform, self, readProcess) {
+  if (!Number.isInteger(chrome) || chrome <= 1 || chrome === self) return null;
+  if (typeof profile !== "string" || profile.length < 2) return null;
+  const info = readProcess(chrome);
+  if (!info) return null;
+  if (platform === "win32") return chrome;
+  if (info.pgid !== chrome || !info.command.includes(profile)) return null;
+  return -chrome;
+}
+
+/** Runs in its own process, polling the runner and the browser. When the
+ * runner is gone it ends Chrome's whole process group and removes the profile.
+ * It exits as soon as either side is gone, so it never outlives the pair.
+ */
+const WATCHDOG = `
+const runner = Number(process.argv[1]), chrome = Number(process.argv[2]), profile = process.argv[3];
+const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const readProcess = pid => {
+  try {
+    const out = require("node:child_process").execFileSync("ps", ["-o", "pgid=,command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    const match = /^(\\d+)\\s+(.*)$/s.exec(out);
+    return match ? { pgid: Number(match[1]), command: match[2] } : null;
+  } catch { return null; }
+};
+${chromeVictim.toString()}
+const tick = setInterval(() => {
+  if (alive(runner)) { if (!alive(chrome)) process.exit(0); return; }
+  clearInterval(tick);
+  const victim = chromeVictim(chrome, profile, process.platform, process.pid, readProcess);
+  if (victim !== null) { try { process.kill(victim, "SIGKILL"); } catch {} }
+  try { require("node:fs").rmSync(profile, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  process.exit(0);
+}, 200);
+`;
+
+/** Starts Chrome so that it cannot outlive this runner.
+ *
+ * `finally` covers every way a harness ends inside this process, but not this
+ * process being killed — Ctrl-C, a CI step timeout, a SIGKILL — and a plain
+ * headless Chrome survives its parent: one was found still running three days
+ * after its run. `--remote-debugging-pipe` does not help: measured with Chrome
+ * 154, the browser keeps running after the pipe's other end closes. So a
+ * detached watchdog, which SIGKILL of the runner cannot reach, ends it.
+ * @param {string} chrome @param {string} profile @param {string} url
+ */
+export function startChrome(chrome, profile, url) {
+  const launch = chromeLaunch(chrome, profile, url);
+  const child = spawn(launch.file, launch.args, { stdio: launch.stdio, detached: process.platform !== "win32" });
+  if (child.pid) {
+    spawn(process.execPath, ["-e", WATCHDOG, String(process.pid), String(child.pid), profile], { detached: true, stdio: "ignore" }).unref();
+  }
+  return child;
 }
 
 /** What a signal or an uncaught error must still undo: the live browser and
@@ -163,8 +233,7 @@ async function runHarness(harness, webkit) {
       browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url, String(seconds + 5)],
         { timeout: (seconds + 5) * 1000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
     } else {
-      const launch = chromeLaunch(chrome, profile, url);
-      browser = spawn(launch.file, launch.args, { stdio: launch.stdio });
+      browser = startChrome(chrome, profile, url);
     }
     const exited = new Promise((_, reject) => {
       browser?.once("error", reject);

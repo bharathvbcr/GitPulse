@@ -1,5 +1,6 @@
 /**
- * Sessions a reloaded page left running.
+ * Sessions left running with no tab: a reloaded page's, or a tab that went
+ * away without being closed (its repository tab closed, its pane failed).
  *
  * A webview reload replaces every renderer object — tabs, the session
  * registry, the event bus — while the processes those tabs started keep
@@ -23,13 +24,17 @@ import { get } from "svelte/store";
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
+import { FAMILY_LOOKUP_MS, terminalDeadline } from "./inputQueue";
 import type { TerminalListing } from "./runResult";
+import { hostedClaude, settleConversation, type createHostedClaudeStore, type ExitFacts } from "./hostedClaude";
 import { terminalSessions, type createSessionRegistry, type TerminalSessionRecord } from "./sessionRegistry";
 import { enqueueTaskTerminal } from "./taskLaunches";
 import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
 import { askConfirm } from "../stores/modalStore";
 
-export const DETACHED_STATUS = "Still running — not shown since the window reloaded";
+export const DETACHED_STATUS = "Still running — not shown in any tab";
+/** A session whose terminal closed but whose process has not exited: stoppable, never shown. */
+export const ENDING_STATUS = "Ending — its process has not exited";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive: boolean }) => Promise<boolean>;
@@ -53,8 +58,8 @@ export function stopQuestion(listing: Pick<TerminalListing, "run_id">, label: st
   return {
     title: `Stop ${label}?`,
     message: listing.run_id
-      ? `${label} is still working on a task from before the window reloaded. Stopping it ends that attempt; it cannot be restarted, only resumed as a new conversation.`
-      : `${label} is still running from before the window reloaded. Stopping it ends whatever it is doing.`,
+      ? `${label} is still working on a task, not shown in any tab. Stopping it ends that attempt; it cannot be restarted, only resumed as a new conversation.`
+      : `${label} is still running, not shown in any tab. Stopping it ends whatever it is doing.`,
   };
 }
 
@@ -85,7 +90,129 @@ export function parseListing(raw: unknown): TerminalListing | null {
     id: row.id as string, shell: row.shell as string, cwd: row.cwd as string, repo: row.repo as string,
     launcher: (row.launcher as string | null) ?? null, run_id: (row.run_id as string | null) ?? null,
     detached: row.detached,
+    ...(row.ending === true ? { ending: true } : {}),
   };
+}
+
+type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
+
+/**
+ * Lists one detached session in Sessions: a record that holds its slot, says
+ * it is still running, can be stopped, and can be shown again, and that goes
+ * when the process exits. `take` admits the record — a fresh reservation for
+ * a session found after a reload, or a tab's own slot handed over
+ * (`keepDetached`). The exit watch is subscribed before `take` returns, so
+ * an exit cannot fall between the old owner and this one.
+ */
+/** Where hosted Claude conversations are recorded (`hostedClaude`); a seam for tests. */
+type Conversations = Pick<ReturnType<typeof createHostedClaudeStore>, "byTerminal" | "ended" | "forget">;
+
+function listDetached(
+  listing: TerminalListing,
+  family: string | null,
+  take: (record: TerminalSessionRecord) => Slot,
+  deps: { invoke: Invoke; confirm: Confirm; bus: PtyBus; conversations?: Conversations },
+): void {
+  const { invoke, confirm, bus } = deps;
+  const conversations = deps.conversations ?? hostedClaude;
+  /**
+   * The end of this process settles its Claude conversation's record, as the
+   * tab that ran it would have (`settleConversation`): a Stop or a clean end
+   * forgets it, a signal from outside keeps it for an incident's "Resume N".
+   * Showing it again does not end anything and settles nothing.
+   */
+  function settle(end: ExitFacts | "closed") {
+    const record = conversations.byTerminal(listing.id);
+    if (record) settleConversation(conversations, record.sessionId, end);
+  }
+  const launcher = launcherOf(listing);
+  const key = `${KEY_PREFIX}${listing.id}`;
+  const label = launcherLabel(launcher);
+  let unsubscribe: (() => void) | null = null;
+  let slot: Slot | null = take({
+    key,
+    repoPath: listing.repo,
+    label,
+    launcher,
+    ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
+    ...(family ? { family } : {}),
+    status: listing.ending ? ENDING_STATUS : DETACHED_STATUS,
+    sessionId: listing.id,
+    async close() {
+      await invoke("cmd_terminal_kill", { sessionId: listing.id });
+      settle("closed");
+      drop();
+    },
+    confirmClose: () => confirm({ ...stopQuestion(listing, label), confirmLabel: "Stop", destructive: true }),
+    // An ending session has no terminal left to show; Stop is all it offers.
+    ...(listing.ending ? {} : { reveal }),
+  });
+  function reveal() {
+    // Queued first, so a refusal leaves the session listed. Then this record
+    // and its exit watch give way, before the tab that takes the session over
+    // reserves its own slot: never listed twice, never counted twice against
+    // the limit.
+    enqueueTaskTerminal({
+      runId: listing.run_id ?? key,
+      repoPath: listing.repo,
+      provider: launcher,
+      title: listing.run_id ? "Task attempt" : label,
+      ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
+      ...(family ? { family } : {}),
+    });
+    drop();
+  }
+  function drop() {
+    unsubscribe?.(); unsubscribe = null;
+    slot?.release(); slot = null;
+  }
+  slot.identify(listing.id);
+  unsubscribe = bus.subscribe(listing.id, {
+    onOutput() {},
+    onExit(event) {
+      settle(event);
+      drop();
+    },
+  });
+}
+
+/**
+ * A tab's view went away while its process runs on (`sessionLifecycle`
+ * `dispose`). Its slot becomes the Sessions record for that process in one
+ * step, so the limit never sees the slot free and the exit is never
+ * unwatched. The host has already detached the session.
+ */
+export function keepDetached(
+  listing: TerminalListing,
+  slot: Slot,
+  deps: { invoke?: Invoke; confirm?: Confirm; bus?: PtyBus; family?: string | null; conversations?: Conversations } = {},
+): void {
+  listDetached(listing, deps.family ?? null, (record) => slot.handOver(record), {
+    invoke: deps.invoke ?? (tauriInvoke as Invoke),
+    confirm: deps.confirm ?? askConfirm,
+    bus: deps.bus ?? tauriBus,
+    ...(deps.conversations ? { conversations: deps.conversations } : {}),
+  });
+}
+
+/**
+ * The repository family a task attempt's session is shown under, or null.
+ * Advisory: null means "stands alone", the same answer an unreadable family
+ * already gives. It is bounded on its own because the lookup is the git pool's
+ * (`cmd_resolve_repo`), which a burst of git commands holds for minutes; left
+ * inside the one deadline around `keep`, a slow family lookup took the whole
+ * hand-over with it and the session was never listed in Sessions.
+ */
+export async function listingFamily(
+  listing: Pick<TerminalListing, "run_id" | "repo">,
+  familyOf: (repo: string) => Promise<string | null>,
+): Promise<string | null> {
+  if (!listing.run_id) return null;
+  try {
+    return await terminalDeadline(familyOf(listing.repo), FAMILY_LOOKUP_MS, "Resolving repository family");
+  } catch {
+    return null;
+  }
 }
 
 function launcherOf(listing: TerminalListing): LauncherKind {
@@ -120,52 +247,14 @@ export async function adoptDetachedSessions(deps: {
     if (!listing?.detached) continue;
     // Adopting twice must not list a session twice.
     if (get(registry).some((record) => record.sessionId === listing.id)) continue;
-    const launcher = launcherOf(listing);
-    const key = `${KEY_PREFIX}${listing.id}`;
-    const label = launcherLabel(launcher);
     // An attempt's terminal is re-opened as a task tab, which any checkout of
     // its repository can host; a plain session is taken over in its own.
     const family = listing.run_id && deps.familyOf ? await deps.familyOf(listing.repo).catch(() => null) : null;
     if (get(registry).some((record) => record.sessionId === listing.id)) continue;
-    let unsubscribe: (() => void) | null = null;
-    // A refused reserve (the shared limit) throws out of here: sessions the
-    // host holds but this page cannot list are reported, not skipped.
-    let slot: ReturnType<typeof registry.reserve> | null = registry.reserve({
-      key,
-      repoPath: listing.repo,
-      label,
-      launcher,
-      ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
-      ...(family ? { family } : {}),
-      status: DETACHED_STATUS,
-      sessionId: listing.id,
-      async close() {
-        await invoke("cmd_terminal_kill", { sessionId: listing.id });
-        drop();
-      },
-      confirmClose: () => confirm({ ...stopQuestion(listing, label), confirmLabel: "Stop", destructive: true }),
-      reveal() {
-        // Queued first, so a refusal leaves the session listed. Then this
-        // record and its exit watch give way, before the tab that takes the
-        // session over reserves its own slot: never listed twice, never
-        // counted twice against the limit.
-        enqueueTaskTerminal({
-          runId: listing.run_id ?? key,
-          repoPath: listing.repo,
-          provider: launcher,
-          title: listing.run_id ? "Task attempt" : label,
-          ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
-          ...(family ? { family } : {}),
-        });
-        drop();
-      },
-    });
-    function drop() {
-      unsubscribe?.(); unsubscribe = null;
-      slot?.release(); slot = null;
-    }
-    slot?.identify(listing.id);
-    unsubscribe = bus.subscribe(listing.id, { onOutput() {}, onExit: drop });
+    // Adopted past the limit if need be: the host holds the process either
+    // way, and a refused reserve aborted the loop, leaving every session after
+    // the first over-limit one running and unlisted.
+    listDetached(listing, family, (record) => registry.adopt(record), { invoke, confirm, bus });
     adopted += 1;
   }
   return adopted;

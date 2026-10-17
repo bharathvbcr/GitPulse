@@ -183,37 +183,37 @@ describe("installer manifest follows the release matrix", () => {
 
 describe("local bundle names", () => {
   const linuxArm = [
-    "/w/src-tauri/target/release/bundle/deb/GitPulse_1.4.0_arm64.deb",
-    "/w/src-tauri/target/release/bundle/rpm/GitPulse-1.4.0-1.aarch64.rpm",
-    "/w/src-tauri/target/release/bundle/appimage/GitPulse_1.4.0_aarch64.AppImage",
+    "/w/src-tauri/target/release/bundle/deb/GitPulse_1.5.0_arm64.deb",
+    "/w/src-tauri/target/release/bundle/rpm/GitPulse-1.5.0-1.aarch64.rpm",
+    "/w/src-tauri/target/release/bundle/appimage/GitPulse_1.5.0_aarch64.AppImage",
   ];
   const windowsArm = [
-    "D:\\a\\GitPulse\\src-tauri\\target\\release\\bundle\\msi\\GitPulse_1.4.0_arm64_en-US.msi",
-    "D:\\a\\GitPulse\\src-tauri\\target\\release\\bundle\\nsis\\GitPulse_1.4.0_arm64-setup.exe",
+    "D:\\a\\GitPulse\\src-tauri\\target\\release\\bundle\\msi\\GitPulse_1.5.0_arm64_en-US.msi",
+    "D:\\a\\GitPulse\\src-tauri\\target\\release\\bundle\\nsis\\GitPulse_1.5.0_arm64-setup.exe",
   ];
 
   it("accepts each ARM runner's bundler output, Windows separators included", () => {
-    expect(inspectBundles({ platform: "ubuntu-22.04-arm", version: "1.4.0", paths: linuxArm }).ok).toBe(true);
-    expect(inspectBundles({ platform: "windows-11-arm", version: "1.4.0", paths: windowsArm }).ok).toBe(true);
+    expect(inspectBundles({ platform: "ubuntu-22.04-arm", version: "1.5.0", paths: linuxArm }).ok).toBe(true);
+    expect(inspectBundles({ platform: "windows-11-arm", version: "1.5.0", paths: windowsArm }).ok).toBe(true);
   });
 
   it("rejects an x64 installer produced on an ARM runner, and a missing format", () => {
     const result = inspectBundles({
       platform: "ubuntu-22.04-arm",
-      version: "1.4.0",
-      paths: [linuxArm[0], linuxArm[1], "/w/bundle/appimage/GitPulse_1.4.0_amd64.AppImage"],
+      version: "1.5.0",
+      paths: [linuxArm[0], linuxArm[1], "/w/bundle/appimage/GitPulse_1.5.0_amd64.AppImage"],
     });
     expect(result.ok).toBe(false);
     expect(result.violations).toEqual([
-      "missing: GitPulse_1.4.0_aarch64.AppImage",
-      "unexpected: GitPulse_1.4.0_amd64.AppImage",
+      "missing: GitPulse_1.5.0_aarch64.AppImage",
+      "unexpected: GitPulse_1.5.0_amd64.AppImage",
     ]);
   });
 
   it("refuses what it cannot judge rather than passing it", () => {
-    expect(() => inspectBundles({ platform: "macos-latest", version: "1.4.0", paths: ["/x/GitPulse.app.tar.gz"] })).toThrow(/rewritten at upload/);
-    expect(() => inspectBundles({ platform: "solaris", version: "1.4.0", paths: linuxArm })).toThrow(/unknown release platform/);
-    expect(() => inspectBundles({ platform: "windows-11-arm", version: "1.4.0", paths: [] })).toThrow(/non-empty array/);
+    expect(() => inspectBundles({ platform: "macos-latest", version: "1.5.0", paths: ["/x/GitPulse.app.tar.gz"] })).toThrow(/rewritten at upload/);
+    expect(() => inspectBundles({ platform: "solaris", version: "1.5.0", paths: linuxArm })).toThrow(/unknown release platform/);
+    expect(() => inspectBundles({ platform: "windows-11-arm", version: "1.5.0", paths: [] })).toThrow(/non-empty array/);
   });
 
   it("checks against tauri.conf.json's version from the CLI", async () => {

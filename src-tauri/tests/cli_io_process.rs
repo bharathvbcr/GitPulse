@@ -1,4 +1,9 @@
 //! Exercise inherited OS streams at the real executable boundary.
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::{self, File};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -208,6 +213,9 @@ fn mcp_stops_when_the_host_keeps_stdout_open_but_stops_reading() {
     let (stdout, held_reader) = pipe_output(true);
     let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"))
         .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        // The window past which a client that stopped reading is judged stalled
+        // (default 10 s); short here so the test measures the ending, not the wait.
+        .env("GITPULSE_MCP_WRITE_TIMEOUT_MS", "500")
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(Stdio::null())
@@ -234,6 +242,9 @@ fn mcp_output_failure_interrupts_an_idle_input_reader() {
     let (stdout, held_reader) = pipe_output(true);
     let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"))
         .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        // The window past which a client that stopped reading is judged stalled
+        // (default 10 s); short here so the test measures the ending, not the wait.
+        .env("GITPULSE_MCP_WRITE_TIMEOUT_MS", "500")
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(Stdio::null())

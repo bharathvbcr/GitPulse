@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { nextHostedTerminals } from "./repoHosts";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
 import { MAX_OPEN_TABS } from "../repos/tabModel";
+import { mulberry32 } from "../__tests__/prng";
 
 /**
  * The hosting rule under churn.
@@ -18,16 +19,6 @@ import { MAX_OPEN_TABS } from "../repos/tabModel";
  * transition looked correct in isolation; only "walk around the workspace for
  * a while and see what accumulated" shows it.
  */
-
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), a | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 /** A workspace the model walks: open repository tabs and each one's dock. */
 interface World {
@@ -68,6 +59,7 @@ describe("terminal hosting under churn", () => {
       let hosted: ReadonlySet<string> = new Set<string>();
       /** Every tab that was ever active while ITS dock was open. */
       const everInvited = new Set<string>();
+      const violations: string[] = [];
 
       for (let i = 0; i < 400; i += 1) {
         const roll = random();
@@ -93,19 +85,21 @@ describe("terminal hosting under churn", () => {
         }
         hosted = step(world, hosted);
 
-        // 1. A panel only ever exists for an OPEN repository tab: closing the
-        //    tab is what disposes the panel and kills its shells.
+        // Checked with plain comparisons and asserted once per seed: building
+        // an expect() and its message for every hosted tab at every step was
+        // ~2M assertion objects, which is what made this test slow.
         for (const id of hosted) {
-          expect(world.openTabs, `seed ${seed} step ${i}`).toContain(id);
-        }
-        // 2. THE DECOUPLING. Nothing is hosted that the user did not open a
-        //    terminal on while looking at it. Merely visiting a repository —
-        //    however many times, with a shell running elsewhere — hosts
-        //    nothing.
-        for (const id of hosted) {
-          expect(everInvited, `seed ${seed} step ${i}: ${id} hosted uninvited`).toContain(id);
+          // 1. A panel only ever exists for an OPEN repository tab: closing
+          //    the tab is what disposes the panel and kills its shells.
+          if (!world.openTabs.includes(id)) violations.push(`seed ${seed} step ${i}: ${id} hosted but not open`);
+          // 2. THE DECOUPLING. Nothing is hosted that the user did not open a
+          //    terminal on while looking at it. Merely visiting a repository —
+          //    however many times, with a shell running elsewhere — hosts
+          //    nothing.
+          if (!everInvited.has(id)) violations.push(`seed ${seed} step ${i}: ${id} hosted uninvited`);
         }
       }
+      expect(violations.slice(0, 5).join("\n"), `seed ${seed}: ${violations.length} violation(s)`).toBe("");
     }
   });
 
@@ -226,6 +220,7 @@ describe("terminal hosting under churn", () => {
       const waiting = new Set<string>();
       let hosted: ReadonlySet<string> = new Set<string>();
       const asked = new Set<string>();
+      const violations: string[] = [];
 
       for (let i = 0; i < 400; i += 1) {
         const roll = random();
@@ -261,15 +256,15 @@ describe("terminal hosting under churn", () => {
           world.activeTabId !== null && world.docks.has(world.activeTabId),
           waiting,
         );
-        const where = `seed ${seed} step ${i}`;
         for (const id of waiting) {
-          if (world.openTabs.includes(id)) expect(hosted.has(id), `${where}: ${id} waits but is not hosted`).toBe(true);
+          if (world.openTabs.includes(id) && !hosted.has(id)) violations.push(`seed ${seed} step ${i}: ${id} waits but is not hosted`);
         }
         for (const id of hosted) {
-          expect(world.openTabs, `${where}: ${id} hosted after its tab closed`).toContain(id);
-          expect(asked, `${where}: ${id} hosted unasked`).toContain(id);
+          if (!world.openTabs.includes(id)) violations.push(`seed ${seed} step ${i}: ${id} hosted after its tab closed`);
+          if (!asked.has(id)) violations.push(`seed ${seed} step ${i}: ${id} hosted unasked`);
         }
       }
+      expect(violations.slice(0, 5).join("\n"), `seed ${seed}: ${violations.length} violation(s)`).toBe("");
     }
   });
 });

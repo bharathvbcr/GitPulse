@@ -5,11 +5,13 @@ import { diagnostics, type DiagnosticsStore } from "../diagnostics/diagnostics";
 import type { VisualCommitRow, LaneConnection } from "../canvas/GraphRenderer";
 import {
   DEFAULT_MAX_COMMITS,
+  GRAPH_CACHE_LIMIT,
   nextLoadLimit,
 } from "./graphLimits";
 import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
 import { isRefScope, type RefScope } from "../graph/refScope";
 import { interfaceStore } from "./interfaceStore";
+import type { CommitSignatureCheck } from "../pulse/types";
 
 export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -31,7 +33,6 @@ export interface CommitDetails {
   committer_date: string;
   summary: string;
   body: string;
-  gpg_status: string;
   co_authors: string[];
   changed_files: CommitFileChange[];
   total_additions: number;
@@ -42,7 +43,26 @@ export interface CommitDetails {
    */
   files_total_count?: number;
   files_list_truncated?: boolean;
+  /**
+   * Present when git's own output was cut at the backend's byte budget (a
+   * clause such as "git output exceeded 4 MB"). Everything derived from the
+   * file records is then a lower bound: the list, the count and the +/-
+   * totals. Absent when git was read to the end.
+   */
+  numstat_truncation_reason?: string;
 }
+
+/**
+ * The details as the panes hold them: the wire payload plus the verdict of the
+ * one-commit signature check, which the store attaches after the details land
+ * (the verifier can take seconds, so it never gates them). `signature_check` is
+ * absent while it runs and `null` when it could not be run. The details
+ * themselves carry no signature verdict, which is why this is not part of the
+ * wire `CommitDetails` above.
+ */
+export type SelectedCommitDetails = CommitDetails & {
+  signature_check?: CommitSignatureCheck | null;
+};
 
 /** A file left out of a truncated commit diff, stats only. */
 export interface SkippedFileStat {
@@ -52,7 +72,7 @@ export interface SkippedFileStat {
 }
 
 /** Wire shape of `cmd_get_commit_diff` (snake_case over IPC). */
-export interface DiffPayload {
+export interface GraphDiffPayload {
   content: string;
   truncated: boolean;
   included_files: number;
@@ -84,7 +104,7 @@ function coerceSkippedFiles(value: unknown): SkippedFileStat[] {
   return files;
 }
 
-function emptyDiffPayload(): DiffPayload {
+function emptyDiffPayload(): GraphDiffPayload {
   return {
     content: "",
     truncated: false,
@@ -97,13 +117,13 @@ function emptyDiffPayload(): DiffPayload {
 }
 
 /**
- * Defensively turns whatever crossed `invoke()` into a `DiffPayload`. The
+ * Defensively turns whatever crossed `invoke()` into a `GraphDiffPayload`. The
  * backend is transitioning from a bare diff string to this object, and other
  * stores still hold `string | null`-typed diff state, so every wrong shape
  * degrades to a safe default instead of throwing downstream: a legacy string
  * becomes an untruncated payload; null, arrays and other junk become empty.
  */
-export function normalizeDiffPayload(raw: unknown): DiffPayload {
+export function normalizeDiffPayload(raw: unknown): GraphDiffPayload {
   if (typeof raw === "string") {
     return { ...emptyDiffPayload(), content: raw };
   }
@@ -143,6 +163,8 @@ export interface RefDecoration {
   kind: RefKind;
   commit_id: string;
   is_head: boolean;
+  /** Owning remote of a remote-tracking ref (longest configured name). */
+  remote?: string;
 }
 
 export interface CommitGraphPayload {
@@ -191,7 +213,7 @@ export interface GraphState {
   refs: RefDecoration[];
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
-  selectedCommitDetails: CommitDetails | null;
+  selectedCommitDetails: SelectedCommitDetails | null;
   isLoading: boolean;
   maxCommits: number;
   visiblePath: string | null;
@@ -215,13 +237,28 @@ export interface GraphState {
   mainlineName: string | null;
 }
 
+/**
+ * What is kept of a repository whose rows were shed: the view it was showing
+ * (so a reload asks for the same page, query, branch and scope) and which
+ * commit was selected. No rows: the next load repopulates them through the
+ * ordinary stale-while-revalidate path, with the loading state because there is
+ * nothing to show meanwhile.
+ */
+interface ShedView {
+  query: string;
+  revision: string | null;
+  refScope: RefScope;
+  maxCommits: number;
+  selectedCommitId: string | null;
+}
+
 interface CachedGraph {
   rows: VisualCommitRow[];
   commits: VisualCommitRow[];
   refs: RefDecoration[];
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
-  selectedCommitDetails: CommitDetails | null;
+  selectedCommitDetails: SelectedCommitDetails | null;
   query: string;
   revision: string | null;
   /**
@@ -236,6 +273,13 @@ interface CachedGraph {
   notices: string[];
   mainlineId: string | null;
   mainlineName: string | null;
+  /**
+   * {@link graphPayloadSignature} of the payload this entry was built from.
+   * Stored, not re-derived: a reload compares against it, and re-deriving it
+   * walked every cached row (up to the commit cap, 14 fields each) on every
+   * watcher refresh, on top of the walk over the new payload.
+   */
+  signature: string;
 }
 function emptyVisible(
   path: string | null,
@@ -333,34 +377,6 @@ export function graphPayloadSignature(payload: {
   return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${notices}\u0001${rows}`;
 }
 
-/**
- * One comparable string for "did the rendered history change". A watcher
- * refresh re-walks history every few seconds; on a quiet repo the payload is
- * structurally identical (fresh identities, same content) and must not
- * republish — every emission wipes the canvas strip cache and re-renders the
- * table. Delegates to {@link graphPayloadSignature} so both call sites share
- * one canonical definition of "structurally identical payload".
- */
-function cachedSignature(cache: {
-  rows: VisualCommitRow[];
-  headId: string | null;
-  refs: RefDecoration[];
-  hasMore: boolean;
-  notices: string[];
-  mainlineId: string | null;
-  mainlineName: string | null;
-}): string {
-  return graphPayloadSignature({
-    rows: cache.rows,
-    head_id: cache.headId,
-    refs: cache.refs,
-    has_more: cache.hasMore,
-    notices: cache.notices,
-    mainline_id: cache.mainlineId,
-    mainline_name: cache.mainlineName,
-  });
-}
-
 export function createGraphStore(
   deps: {
     invoke?: InvokeFn;
@@ -373,8 +389,11 @@ export function createGraphStore(
      * to reset query and branch.
      */
     refScope?: () => RefScope;
+    /** How many repositories keep their rows; see {@link GRAPH_CACHE_LIMIT}. */
+    cacheLimit?: number;
   } = {}
 ) {
+  const cacheLimit = Math.max(1, Math.floor(deps.cacheLimit ?? GRAPH_CACHE_LIMIT));
   const invokeFn = deps.invoke ?? (invoke as InvokeFn);
   // Normalized at the seam: a persisted preference is user data, and the IPC
   // boundary must never receive a value the backend will refuse to
@@ -390,7 +409,16 @@ export function createGraphStore(
   // default sink, same pattern as the invoke seam above.
   const reportFailure =
     deps.diagnostics?.warn ?? ((source: string, detail: unknown) => diagnostics.warn(source, detail));
+  /**
+   * Repositories holding their rows, least recently used first (a Map keeps
+   * insertion order; {@link touch} re-inserts). Bounded by `cacheLimit`.
+   */
   const cache = new Map<string, CachedGraph>();
+  /**
+   * Repositories whose rows were shed to stay within `cacheLimit`. Dropped
+   * with the tab (`evict`), like everything else held per path.
+   */
+  const shed = new Map<string, ShedView>();
   /**
    * Ordering epochs come from store-wide monotonic counters, so a value is
    * never handed out twice. That is what makes pruning safe: evict() deletes
@@ -453,7 +481,43 @@ export function createGraphStore(
   }
 
   function limitFor(repoPath: string): number {
-    return cache.get(repoPath)?.maxCommits ?? DEFAULT_MAX_COMMITS;
+    return cache.get(repoPath)?.maxCommits ?? shed.get(repoPath)?.maxCommits ?? DEFAULT_MAX_COMMITS;
+  }
+
+  /** Marks `path` most recently used. */
+  function touch(path: string, entry: CachedGraph): void {
+    cache.delete(path);
+    cache.set(path, entry);
+  }
+
+  /**
+   * Drops the rows of the least recently used repositories until `cacheLimit`
+   * remain. The visible repository is never a victim, whatever its recency.
+   * What a shed repository keeps is a {@link ShedView}; `evict` is the only
+   * thing that forgets it.
+   */
+  function trim(): void {
+    while (cache.size > cacheLimit) {
+      let victim: string | null = null;
+      for (const path of cache.keys()) {
+        if (path !== visiblePath) {
+          victim = path;
+          break;
+        }
+      }
+      if (victim === null) return;
+      const entry = cache.get(victim);
+      cache.delete(victim);
+      if (entry) {
+        shed.set(victim, {
+          query: entry.query,
+          revision: entry.revision,
+          refScope: entry.refScope,
+          maxCommits: entry.maxCommits,
+          selectedCommitId: entry.selectedCommit?.id ?? null,
+        });
+      }
+    }
   }
 
   async function fetchDetails(
@@ -483,6 +547,50 @@ export function createGraphStore(
       // failure only costs the lower pane's content — but it must still
       // leave a breadcrumb instead of looking like an eternal blank.
       reportFailure("graph-details", `${repoPath}/${commitId}: ${formatError(err)}`);
+      return;
+    }
+    // After the details are on screen and not awaited by anything that gates
+    // them: verifying runs the person's signing program, which has taken ten
+    // seconds for one PGP commit. The backend caches it, so selecting the same
+    // commit again answers at once.
+    void verifySignature(repoPath, token, commitId, seq);
+  }
+
+  /** Attaches the selected commit's signature verification to its details. */
+  async function verifySignature(
+    repoPath: string,
+    token: number,
+    commitId: string,
+    seq?: number
+  ) {
+    let check: CommitSignatureCheck | null;
+    try {
+      // A reply with no verdict in it is a check that did not happen, the same
+      // as a failure: `null`, never left pending.
+      check = (await invokeFn<CommitSignatureCheck | undefined>("cmd_verify_commit_signature", {
+        repoPath,
+        commitId,
+      })) ?? null;
+    } catch (err) {
+      // Not a verdict: the pane says the signature was not checked, never
+      // that the commit is unsigned.
+      reportFailure("graph-signature", `${repoPath}/${commitId}: ${formatError(err)}`);
+      check = null;
+    }
+    if (!isCurrent(repoPath, token)) return;
+    if (seq !== undefined && !selectionCurrent(repoPath, seq)) return;
+    const attach = (details: SelectedCommitDetails | null): SelectedCommitDetails | null =>
+      details?.id === commitId ? { ...details, signature_check: check } : details;
+    const cachedNow = cache.get(repoPath);
+    if (cachedNow && cachedNow.selectedCommit?.id === commitId) {
+      cachedNow.selectedCommitDetails = attach(cachedNow.selectedCommitDetails);
+    }
+    if (visiblePath === repoPath) {
+      update((s) =>
+        s.selectedCommit?.id === commitId
+          ? { ...s, selectedCommitDetails: attach(s.selectedCommitDetails) }
+          : s
+      );
     }
   }
 
@@ -496,6 +604,7 @@ export function createGraphStore(
       }
       const cached = cache.get(path);
       if (cached) {
+        touch(path, cached);
         update((s) => ({
           ...s,
           rows: cached.rows,
@@ -518,8 +627,12 @@ export function createGraphStore(
       }
       update(() => emptyVisible(path, limitFor(path), true));
     },
+    /** How many repositories hold rows right now (at most `cacheLimit`), for tests and diagnostics. */
+    retainedGraphs: (): number => cache.size,
+    /** Everything held for a closed tab: rows, the shed view, and the ordering state. */
     evict: (path: string) => {
       cache.delete(path);
+      shed.delete(path);
       // Prune the ordering maps too: entries for closed repos would otherwise
       // grow without bound. A missing entry orphans every outstanding token
       // for this path (undefined === token is false), which is exactly what
@@ -615,13 +728,16 @@ export function createGraphStore(
         }
 
         const previous = cache.get(repoPath);
+        // One walk over the payload per reload: the cached side was hashed
+        // when it was stored, and the new entry keeps this one.
+        const signature = graphPayloadSignature(payload);
         if (
           previous &&
           previous.query === query &&
           previous.revision === revision &&
           previous.refScope === refScope &&
           previous.maxCommits === max &&
-          cachedSignature(previous) === graphPayloadSignature(payload)
+          previous.signature === signature
         ) {
           // Identical reload: retire the flag, keep every array identity so
           // downstream caches (canvas strips) survive untouched.
@@ -631,7 +747,7 @@ export function createGraphStore(
           return;
         }
 
-        const keepId = previous?.selectedCommit?.id;
+        const keepId = previous?.selectedCommit?.id ?? shed.get(repoPath)?.selectedCommitId ?? undefined;
         const kept = keepId ? payload.rows.find((row) => row.id === keepId) : undefined;
         const selectedCommit =
           kept ?? (payload.rows.length > 0 ? (payload.rows[0] ?? null) : null);
@@ -657,8 +773,11 @@ export function createGraphStore(
           notices: payload.notices ?? [],
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
+          signature,
         };
-        cache.set(repoPath, next);
+        shed.delete(repoPath);
+        touch(repoPath, next);
+        trim();
         if (visiblePath === repoPath) {
           update((s) => ({
             ...s,

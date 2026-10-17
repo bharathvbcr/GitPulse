@@ -6,6 +6,11 @@
 //! the argv builders directly, so they run without `gh` installed and without
 //! network access, and they assert what would actually reach the process.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::github::actions::{
     cancel_run_argv, parse_workflow_list, rerun_run_argv, trigger_workflow_argv,
     validate_workflow_selector,

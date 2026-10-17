@@ -26,7 +26,7 @@
 
 import type { LauncherKind } from "./tabs";
 import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
-import { DEFAULT_TERMINAL_SESSIONS, isTerminalSessionLimit } from "./sessionLimit";
+import { isTerminalSessionLimit } from "./sessionLimit";
 
 /**
  * Permission modes, least authority first, so the dangerous end of the range
@@ -105,9 +105,16 @@ export interface AgentDefaults {
   claude_setting_sources?: ClaudeSettingSource[];
   /**
    * How many terminal sessions may be open at once, across every repository.
-   * Absent means {@link DEFAULT_TERMINAL_SESSIONS}; see `sessionLimit.ts`.
+   * Absent means `DEFAULT_TERMINAL_SESSIONS`; see `sessionLimit.ts`.
    */
   max_terminal_sessions?: number;
+  /**
+   * Terminals are held by `gitpulse-ptyd`, a process of their own, and keep
+   * running when GitPulse quits or crashes (`docs/TERMINAL_HOST.md`). Absent
+   * is off. Read by the app when it starts, so a change applies to the next
+   * launch.
+   */
+  keep_terminals_running?: boolean;
   /**
    * Which model each agent CLI starts with, by launcher. Absent means the
    * CLI's own choice; an entry is never stored empty. Names and levels only —
@@ -164,6 +171,17 @@ export const MODEL_FIELDS_BY_LAUNCHER: Readonly<Partial<Record<LauncherKind, rea
  */
 export const MODEL_SUGGESTIONS: Readonly<Partial<Record<LauncherKind, Partial<Record<ModelField, readonly string[]>>>>> = {
   claude: { advisor: ["fable", "opus", "sonnet"] },
+};
+
+/**
+ * The models a task handoff offers as a choice rather than a typed name,
+ * per launcher and field. Claude Code's four family aliases, which always
+ * name its current model in each family, so the list does not go stale as
+ * model ids change; the advisor offers the three names above. A launcher or
+ * field absent here keeps a free-text field.
+ */
+export const HANDOFF_MODEL_CHOICES: Readonly<Partial<Record<LauncherKind, Partial<Record<"model" | "advisor", readonly string[]>>>>> = {
+  claude: { model: ["fable", "opus", "sonnet", "haiku"], advisor: MODEL_SUGGESTIONS.claude?.advisor },
 };
 
 /**
@@ -303,6 +321,7 @@ export function sanitizeAgentDefaults(
   const sanitized: AgentDefaults = { permission };
   if (isLiveRunLimit(raw.max_live_runs)) sanitized.max_live_runs = raw.max_live_runs;
   if (isTerminalSessionLimit(raw.max_terminal_sessions)) sanitized.max_terminal_sessions = raw.max_terminal_sessions;
+  if (typeof raw.keep_terminals_running === "boolean") sanitized.keep_terminals_running = raw.keep_terminals_running;
   const sources = canonicalSettingSources(raw.claude_setting_sources);
   if (sources) sanitized.claude_setting_sources = sources;
   if (raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)) {
@@ -348,9 +367,4 @@ export function isLiveRunLimit(value: unknown): value is number {
 /** The limit a launch will pass: the stored one, or the store's default. */
 export function liveRunLimit(defaults: AgentDefaults): number {
   return isLiveRunLimit(defaults.max_live_runs) ? defaults.max_live_runs : DEFAULT_LIVE_RUNS;
-}
-
-/** The terminal session limit a save will apply: the stored one, or the default. */
-export function terminalSessionLimitOf(defaults: AgentDefaults): number {
-  return isTerminalSessionLimit(defaults.max_terminal_sessions) ? defaults.max_terminal_sessions : DEFAULT_TERMINAL_SESSIONS;
 }

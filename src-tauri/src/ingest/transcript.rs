@@ -84,9 +84,73 @@ const MUTATING: [&str; 4] = ["Edit", "Write", "NotebookEdit", "Bash"];
 /// gap in what we saw, not a failure of the thing being observed. The caller
 /// counts skips so the gap is reportable.
 pub fn parse_line(line: &str) -> Vec<ToolCall> {
+    match parse_record(line) {
+        LineOutcome::Calls(calls) => calls,
+        LineOutcome::NoCalls | LineOutcome::Unreadable => Vec::new(),
+    }
+}
+
+/// What one transcript line turned out to hold.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LineOutcome {
+    /// Readable, and holds no mutating tool call: not an assistant record, or
+    /// an assistant record of prose and reads.
+    NoCalls,
+    /// Tagged as an assistant record but not JSON this build can read — the one
+    /// outcome that is a gap worth counting.
+    Unreadable,
+    /// The mutating tool calls the record holds. Never empty.
+    Calls(Vec<ToolCall>),
+}
+
+/// The tag the assistant records this parser reads carry, as Claude Code
+/// writes it. Used only to decide whether an unreadable line is a gap worth
+/// counting; a spaced spelling of it is not.
+const ASSISTANT_TAG: &str = "\"type\":\"assistant\"";
+
+#[cfg(test)]
+thread_local! {
+    /// JSON documents this thread has deserialized through [`parse_record`].
+    pub(super) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`parse_line`], saying *why* a line yielded nothing, so no caller has to
+/// deserialize the line a second time to find out.
+///
+/// Most lines of a transcript are tool results and progress records that can
+/// never hold a call, and most assistant lines are prose or reads. A line
+/// that names no `"assistant"` and no `"tool_use"` cannot hold a call whether
+/// or not it is well formed, so it is not built into a document: at most it is
+/// validated, without allocating, when it claims to be an assistant record.
+pub fn parse_record(line: &str) -> LineOutcome {
+    let claims_assistant = line.contains(ASSISTANT_TAG);
+    if !(line.contains("\"assistant\"") && line.contains("\"tool_use\"")) {
+        #[cfg(test)]
+        PARSES.with(|parses| parses.set(parses.get() + usize::from(claims_assistant)));
+        return if claims_assistant && serde_json::from_str::<serde::de::IgnoredAny>(line).is_err() {
+            LineOutcome::Unreadable
+        } else {
+            LineOutcome::NoCalls
+        };
+    }
+    #[cfg(test)]
+    PARSES.with(|parses| parses.set(parses.get() + 1));
     let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
+        return if claims_assistant {
+            LineOutcome::Unreadable
+        } else {
+            LineOutcome::NoCalls
+        };
     };
+    let calls = calls_in(&record);
+    if calls.is_empty() {
+        LineOutcome::NoCalls
+    } else {
+        LineOutcome::Calls(calls)
+    }
+}
+
+fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
     if record.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return Vec::new();
     }
@@ -141,14 +205,96 @@ pub fn parse_line(line: &str) -> Vec<ToolCall> {
     calls
 }
 
-/// Whether `call` belongs to the repository rooted at `repo_path`.
+/// What a call is attributed by: a file tool's own absolute path, a command's
+/// record `cwd`.
+pub fn candidate_path(call: &ToolCall) -> &str {
+    call.file_path.as_deref().unwrap_or(&call.cwd)
+}
+
+/// The root of `roots` that owns `call`: the deepest one its path lies under,
+/// so a worktree nested in the repository takes its own calls and the
+/// repository keeps only what is not under any worktree. Roots are ranked by
+/// their length without trailing separators, so `/repo/` does not outrank
+/// `/repo`; equal depth keeps the first listed.
 ///
-/// A file tool is attributed by its own absolute path; a command by the
-/// record's `cwd`. Both are prefix matches against the repository root, with a
-/// separator check so `/repo-other` never matches `/repo`.
-pub fn belongs_to(call: &ToolCall, repo_path: &str) -> bool {
-    let candidate = call.file_path.as_deref().unwrap_or(&call.cwd);
-    under(candidate, repo_path)
+/// Containment is a prefix match with a separator check, so `/repo-other` is
+/// never under `/repo`. No path is canonicalized, so `/tmp/x` and
+/// `/private/tmp/x` are different roots, and `\` is not a separator; both are
+/// the byte-wise comparison of [`under`], the one place to change for either.
+pub fn attribution_root<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<&'a str> {
+    deepest_root(candidate_path(call), roots)
+}
+
+pub fn deepest_root<'a>(path: &str, roots: &[&'a str]) -> Option<&'a str> {
+    let depth = |root: &str| root.trim_end_matches('/').len();
+    roots
+        .iter()
+        .copied()
+        .filter(|root| under(path, root))
+        .reduce(|best, root| {
+            if depth(root) > depth(best) {
+                root
+            } else {
+                best
+            }
+        })
+}
+
+/// A call longer than this is never read as a removed worktree's.
+const MAX_CWD_BYTES: usize = 4096;
+/// Where isolation worktrees live below a checkout.
+const WORKTREES_DIR: &str = "/.claude/worktrees/";
+
+/// A worktree that has been removed, found from a call's `cwd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Departed<'c, 'r> {
+    /// The removed worktree: `<checkout>/.claude/worktrees/<name>`, exactly,
+    /// borrowed from the call's cwd.
+    pub root: &'c str,
+    /// The deepest live root containing it, which hosts the row.
+    pub host: &'r str,
+}
+
+/// The removed worktree `call` ran in, by its path alone.
+///
+/// GitPulse's isolation worktrees live at `<checkout>/.claude/worktrees/<name>`
+/// and nowhere else, so a cwd under a live root that passes through that shape
+/// at a name which is not itself a live root ran in a worktree that no longer
+/// exists. The deepest such name wins, so `…/a/.claude/worktrees/b` is `b`
+/// whether or not `a` is live. Nothing is read from disk: whether a directory
+/// exists says nothing about whether it was a worktree (a branch switch deletes
+/// plain directories, and a path can fail to stat for reasons other than being
+/// gone), so a deleted plain subdirectory stays with the live root around it.
+///
+/// The call's own path must also lie under the removed worktree. A cwd with an
+/// empty, `.` or `..` segment, a NUL, or more than 4096 bytes is never read as
+/// departed.
+pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &[&'r str]) -> Option<Departed<'c, 'r>> {
+    let cwd = call.cwd.trim_end_matches('/');
+    // Almost every call: nothing below its root has the shape.
+    if cwd.len() > MAX_CWD_BYTES || !cwd.contains(WORKTREES_DIR) {
+        return None;
+    }
+    let host = deepest_root(cwd, roots)?;
+    let host_len = host.trim_end_matches('/').len();
+    let below = &cwd[host_len..];
+    let (mut before_last, mut last) = ("", "");
+    let mut end = host_len;
+    let mut deepest = None;
+    for segment in below.split('/').skip(1) {
+        if matches!(segment, "" | "." | "..") || segment.contains('\0') {
+            return None;
+        }
+        end += 1 + segment.len();
+        if before_last == ".claude" && last == "worktrees" {
+            deepest = Some(end);
+        }
+        (before_last, last) = (last, segment);
+    }
+    let root = &cwd[..deepest?];
+    // A live checkout is the live root's, whatever it is called.
+    let live = roots.iter().any(|live| live.trim_end_matches('/') == root);
+    (!live && under(candidate_path(call), root)).then_some(Departed { root, host })
 }
 
 fn under(path: &str, root: &str) -> bool {
@@ -165,6 +311,11 @@ fn under(path: &str, root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `root` alone would own `call`.
+    fn owned_by(call: &ToolCall, root: &str) -> bool {
+        attribution_root(call, &[root]).is_some()
+    }
 
     fn record(tool: &str, input: &str) -> String {
         format!(
@@ -196,7 +347,7 @@ mod tests {
         assert_eq!(calls[0].command.as_deref(), Some("cargo test"));
         assert!(calls[0].file_path.is_none());
         assert_eq!(calls[0].action(), "session.command");
-        assert!(belongs_to(&calls[0], "/repo"));
+        assert!(owned_by(&calls[0], "/repo"));
     }
 
     #[test]
@@ -259,19 +410,19 @@ mod tests {
     fn attribution_is_by_path_for_files_and_cwd_for_commands() {
         let edit = &parse_line(&record("Edit", r#"{"file_path":"/other/x.rs"}"#))[0];
         // The file's own path wins: an agent can edit outside its cwd.
-        assert!(!belongs_to(edit, "/repo"));
-        assert!(belongs_to(edit, "/other"));
+        assert!(!owned_by(edit, "/repo"));
+        assert!(owned_by(edit, "/other"));
 
         let cmd = &parse_line(&record("Bash", r#"{"command":"ls"}"#))[0];
-        assert!(belongs_to(cmd, "/repo"));
-        assert!(!belongs_to(cmd, "/other"));
+        assert!(owned_by(cmd, "/repo"));
+        assert!(!owned_by(cmd, "/other"));
     }
 
     #[test]
     fn a_sibling_directory_is_not_the_repository() {
         // `/repo-other` must never attribute to `/repo`.
         let c = &parse_line(&record("Edit", r#"{"file_path":"/repo-other/a.rs"}"#))[0];
-        assert!(!belongs_to(c, "/repo"));
+        assert!(!owned_by(c, "/repo"));
         assert!(under("/repo/a.rs", "/repo"));
         assert!(under("/repo/a.rs", "/repo/"));
         assert!(under("/repo", "/repo"));
@@ -281,13 +432,231 @@ mod tests {
 
     #[test]
     fn a_worktree_under_the_repo_attributes_to_the_worktree_root() {
-        // GitPulse opens worktrees as repositories, so the deeper root wins
-        // when both match.
+        // GitPulse opens worktrees as repositories, so both roots contain the
+        // call and the deeper one owns it.
         let c = &parse_line(&record(
             "Edit",
             r#"{"file_path":"/repo/.claude/worktrees/wt/a.rs"}"#,
         ))[0];
-        assert!(belongs_to(c, "/repo"));
-        assert!(belongs_to(c, "/repo/.claude/worktrees/wt"));
+        assert!(owned_by(c, "/repo"));
+        assert!(owned_by(c, "/repo/.claude/worktrees/wt"));
+        assert_eq!(
+            attribution_root(c, &["/repo", "/repo/.claude/worktrees/wt"]),
+            Some("/repo/.claude/worktrees/wt")
+        );
+        // Whatever the order roots are listed in.
+        assert_eq!(
+            attribution_root(c, &["/repo/.claude/worktrees/wt", "/repo"]),
+            Some("/repo/.claude/worktrees/wt")
+        );
+    }
+
+    fn edit_at(path: &str) -> ToolCall {
+        parse_line(&record(
+            "Edit",
+            &serde_json::json!({ "file_path": path }).to_string(),
+        ))
+        .remove(0)
+    }
+
+    #[test]
+    fn the_deepest_root_wins_whatever_its_spelling() {
+        // A trailing separator must not make a shallower root look deeper.
+        let c = edit_at("/repo/.claude/worktrees/wt/a.rs");
+        assert_eq!(
+            attribution_root(&c, &["/repo/", "/repo/.claude/worktrees/wt"]),
+            Some("/repo/.claude/worktrees/wt")
+        );
+        let c = edit_at("/repo/a.rs");
+        assert_eq!(attribution_root(&c, &["/repo/", "/repo"]), Some("/repo/"));
+        // `/repo2` is a sibling of `/repo`, not a deeper or shallower root.
+        let c = edit_at("/repo2/a.rs");
+        assert_eq!(
+            attribution_root(&c, &["/repo", "/repo2", "/repo/.claude/worktrees/wt"]),
+            Some("/repo2")
+        );
+        let c = edit_at("/repo/a.rs");
+        assert_eq!(
+            attribution_root(&c, &["/repo2", "/repo", "/repo/.claude/worktrees/wt"]),
+            Some("/repo")
+        );
+        // Under no root at all.
+        assert_eq!(attribution_root(&edit_at("/other/a.rs"), &["/repo"]), None);
+        assert_eq!(attribution_root(&edit_at("/repo/a.rs"), &[]), None);
+    }
+
+    #[test]
+    fn roots_with_spaces_and_unicode_compare_bytewise() {
+        let root = "/Users/b h/Café Ünï/repo";
+        let wt = "/Users/b h/Café Ünï/repo/.claude/worktrees/ü wt";
+        let c = edit_at(&format!("{wt}/a.rs"));
+        assert_eq!(attribution_root(&c, &[root, wt]), Some(wt));
+        let c = edit_at(&format!("{root}/a.rs"));
+        assert_eq!(attribution_root(&c, &[root, wt]), Some(root));
+        // A different normalization of the same text is a different root.
+        let decomposed = "/Users/b h/Cafe\u{301} Ünï/repo/a.rs";
+        assert_eq!(attribution_root(&edit_at(decomposed), &[root]), None);
+    }
+
+    fn command_in(cwd: &str, path: Option<&str>) -> ToolCall {
+        ToolCall {
+            session_id: "S".into(),
+            ts_utc: "2026-09-01T12:00:00.000Z".into(),
+            version: String::new(),
+            cwd: cwd.into(),
+            git_branch: None,
+            tool: path.map_or("Bash", |_| "Edit").into(),
+            file_path: path.map(str::to_string),
+            command: path.is_none().then(|| "ls".to_string()),
+        }
+    }
+
+    const REPO: &str = "/repo";
+    const WT: &str = "/repo/.claude/worktrees/wt";
+
+    fn departed<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<(String, &'a str)> {
+        departed_root(call, roots).map(|d| (d.root.to_string(), d.host))
+    }
+
+    #[test]
+    fn a_worktree_that_is_not_live_is_the_one_segment_name_under_worktrees() {
+        // The cwd is deep inside the removed worktree; the root is the name.
+        let call = command_in(
+            &format!("{WT}/src-tauri/src"),
+            Some(&format!("{WT}/src-tauri/a.rs")),
+        );
+        assert_eq!(departed(&call, &[REPO]), Some((WT.into(), REPO)));
+        // Trailing separators change nothing.
+        let call = command_in(&format!("{WT}/"), None);
+        assert_eq!(departed(&call, &[REPO]), Some((WT.into(), REPO)));
+        // A live worktree is not departed.
+        let call = command_in(&format!("{WT}/src"), None);
+        assert_eq!(departed(&call, &[REPO, WT]), None);
+        assert_eq!(departed(&call, &[REPO, &format!("{WT}/")]), None);
+    }
+
+    #[test]
+    fn a_plain_subdirectory_is_never_departed() {
+        for cwd in [
+            "/repo/src-tauri",
+            "/repo/.claude",
+            "/repo/.claude/worktrees",
+            "/repo/.claude/other/x",
+            "/repo/old_dir_removed_by_checkout",
+            "/repo/worktrees/x",
+        ] {
+            assert_eq!(departed(&command_in(cwd, None), &[REPO]), None, "{cwd}");
+        }
+    }
+
+    #[test]
+    fn the_deepest_convention_match_wins() {
+        let a = "/repo/.claude/worktrees/a";
+        let b = "/repo/.claude/worktrees/a/.claude/worktrees/b";
+        let call = command_in(&format!("{b}/src"), Some(&format!("{b}/src/x.rs")));
+        // Neither live: b.
+        assert_eq!(departed(&call, &[REPO]), Some((b.into(), REPO)));
+        // a live, b gone: b, hosted by a.
+        assert_eq!(departed(&call, &[REPO, a]), Some((b.into(), a)));
+        // b live: nothing departed.
+        assert_eq!(departed(&call, &[REPO, a, b]), None);
+        // The call's own path must lie under the departed worktree.
+        let call = command_in(&format!("{b}/src"), Some("/repo/src/x.rs"));
+        assert_eq!(departed(&call, &[REPO]), None);
+        // A cwd in a, with a edit in b's tree: a's.
+        let call = command_in(&format!("{a}/src"), Some(&format!("{b}/x.rs")));
+        assert_eq!(departed(&call, &[REPO]), Some((a.into(), REPO)));
+    }
+
+    #[test]
+    fn a_cwd_under_no_live_root_is_nobodys() {
+        let call = command_in("/repo-old/.claude/worktrees/x", None);
+        assert_eq!(departed(&call, &[REPO]), None);
+        assert_eq!(departed(&call, &[]), None);
+    }
+
+    #[test]
+    fn a_hostile_cwd_is_never_departed() {
+        let long = format!("/repo/.claude/worktrees/{}", "x".repeat(64 * 1024));
+        for cwd in [
+            "/repo/.claude/worktrees/../x",
+            "/repo/.claude/worktrees/./x",
+            "/repo/.claude/worktrees//x",
+            "/repo/.claude/worktrees/a\0b",
+            "/repo/../.claude/worktrees/x",
+            long.as_str(),
+        ] {
+            assert_eq!(departed(&command_in(cwd, None), &[REPO]), None, "{cwd:.60}");
+        }
+    }
+
+    #[test]
+    fn a_hundred_thousand_distinct_cwds_are_pure_string_work() {
+        for i in 0..100_000 {
+            let cwd = format!("/repo/.claude/worktrees/gone{i}/src");
+            let call = command_in(&cwd, Some(&format!("{cwd}/a.rs")));
+            let d = departed_root(&call, &[REPO]).unwrap();
+            assert_eq!(
+                d.root.len(),
+                "/repo/.claude/worktrees/gone".len() + i.to_string().len()
+            );
+        }
+    }
+
+    fn parses_for(line: &str) -> (LineOutcome, usize) {
+        let before = PARSES.with(std::cell::Cell::get);
+        let outcome = parse_record(line);
+        (outcome, PARSES.with(std::cell::Cell::get) - before)
+    }
+
+    const PROSE: &str = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-09-01T12:00:00.000Z","message":{"content":[{"type":"text","text":"done"}]}}"#;
+    const TOOL_RESULT: &str =
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
+    const BROKEN: &str = r#"{"type":"assistant", this is not json}"#;
+
+    /// A line is deserialized at most once, whatever it turns out to hold. A
+    /// prose-only assistant line used to be parsed by `parse_line` and again by
+    /// the caller, which parsed it just to learn it was readable.
+    #[test]
+    fn no_line_is_deserialized_twice() {
+        let edit = record("Edit", r#"{"file_path":"/repo/a.rs"}"#);
+        for line in [edit.as_str(), PROSE, TOOL_RESULT, BROKEN, ""] {
+            let (_, parses) = parses_for(line);
+            assert!(parses <= 1, "{parses} parses of {line}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_cannot_hold_a_call_is_never_built_into_a_document() {
+        // A tool result is the bulk of a transcript's bytes. It is neither an
+        // assistant record nor a `tool_use`, so nothing is deserialized.
+        assert_eq!(parses_for(TOOL_RESULT), (LineOutcome::NoCalls, 0));
+    }
+
+    #[test]
+    fn failure_is_reported_distinctly_from_having_no_calls() {
+        assert_eq!(parse_record(BROKEN), LineOutcome::Unreadable);
+        assert_eq!(parse_record(PROSE), LineOutcome::NoCalls);
+        // Broken, but not tagged as an assistant record: not a gap worth
+        // counting, exactly as before.
+        assert_eq!(parse_record("not json at all"), LineOutcome::NoCalls);
+        // A call-bearing line that is truncated mid-record.
+        let edit = record("Edit", r#"{"file_path":"/repo/a.rs"}"#);
+        assert_eq!(
+            parse_record(&edit[..edit.len() - 3]),
+            LineOutcome::Unreadable
+        );
+    }
+
+    #[test]
+    fn parse_line_and_parse_record_agree_on_calls() {
+        let edit = record("Edit", r#"{"file_path":"/repo/a.rs"}"#);
+        match parse_record(&edit) {
+            LineOutcome::Calls(calls) => assert_eq!(calls, parse_line(&edit)),
+            other => panic!("expected calls, got {other:?}"),
+        }
+        // A read-only tool is a readable record with nothing to record.
+        let read = record("Read", r#"{"file_path":"/repo/a.rs"}"#);
+        assert_eq!(parse_record(&read), LineOutcome::NoCalls);
     }
 }

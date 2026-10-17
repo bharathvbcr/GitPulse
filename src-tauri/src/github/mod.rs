@@ -7,7 +7,7 @@ pub mod actions;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubRepoRef {
@@ -46,6 +46,14 @@ pub struct PullRequestInfo {
     /// review. Empty when nobody has reviewed yet — which is the interesting
     /// case, and must stay distinguishable from "reviewed at time zero".
     pub first_review_at: String,
+    /// The head branch lives in a fork. `head_ref` then names a branch of the
+    /// contributor's repository, so it must never be matched to a same-named
+    /// local branch or to `origin/<head_ref>`.
+    #[serde(default)]
+    pub is_cross_repository: bool,
+    /// Login of the head repository's owner; empty when gh did not say.
+    #[serde(default)]
+    pub head_owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -272,6 +280,12 @@ pub struct DependabotReport {
     pub slug: String,
     pub alerts: Vec<DependabotAlertInfo>,
     pub truncated: bool,
+    /// Severity tiers whose alerts are missing from `alerts` because that
+    /// tier's request failed or the fetch deadline cut it off. Non-empty means
+    /// the list is a lower bound (`truncated` is set too): an absent critical
+    /// alert is not a clean bill of health.
+    #[serde(default)]
+    pub partial_tiers: Vec<String>,
     pub error: Option<String>,
     /// Set when `available` is false. Absent on a successful fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,6 +329,9 @@ pub struct CodeScanningReport {
     pub slug: String,
     pub alerts: Vec<CodeScanningAlertInfo>,
     pub truncated: bool,
+    /// Same contract as [`DependabotReport::partial_tiers`].
+    #[serde(default)]
+    pub partial_tiers: Vec<String>,
     pub error: Option<String>,
     /// Set when `available` is false. Absent on a successful fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,6 +422,18 @@ fn is_valid_repo_component(component: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// The web/API host behind a clone host. GitHub's SSH-over-HTTPS endpoint
+/// (`ssh.github.com:443`, for networks that block port 22) serves the same
+/// repositories as `github.com` but has no API or web pages of its own, so
+/// leaving it would aim `gh` and built links at a host that answers neither.
+fn canonical_remote_host(host: &str) -> String {
+    if host.eq_ignore_ascii_case("ssh.github.com") {
+        "github.com".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 /// Splits `host[:port]/owner/name` into a [`GitHubRepoRef`]. The port is
 /// dropped only when `strip_port` says this URL form may carry one and the
 /// suffix is all digits; anything else keeps its `:` and is refused by the
@@ -440,11 +469,14 @@ fn split_owner_repo(host_and_path: &str, strip_port: bool) -> Option<GitHubRepoR
         return None;
     }
     Some(GitHubRepoRef {
-        host: host.to_string(),
+        host: canonical_remote_host(host),
         owner: owner.to_string(),
         name: name.to_string(),
     })
 }
+
+static GH_PROBES: crate::tool_capability::BinaryProbeCache<ToolProbe> =
+    crate::tool_capability::BinaryProbeCache::new();
 
 /// Bounded probe for the `gh` CLI.
 ///
@@ -458,10 +490,24 @@ fn split_owner_repo(host_and_path: &str, strip_port: bool) -> Option<GitHubRepoR
 ///
 /// [`is_spawn_not_found`]: crate::engine::git_cli::is_spawn_not_found
 pub(crate) fn probe_gh_cli() -> ToolProbe {
-    classify_tool_probe(
-        "gh",
-        capture_command("gh", &["--version"], None, Duration::from_secs(10), &[]),
-    )
+    // Every GitHub call asks this first — the live run poll included — and the
+    // answer changes only when the `gh` binary does, so it is kept per binary.
+    // Only a `Present` answer is kept: a shed or failed probe is asked again.
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let path = crate::engine::git_cli::extended_child_path(
+        std::env::var_os("PATH").as_deref(),
+        home.as_deref(),
+    );
+    let program =
+        crate::engine::git_cli::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
+    GH_PROBES.get_or_probe(&program, || {
+        let probe = classify_tool_probe(
+            "gh",
+            capture_command("gh", &["--version"], None, Duration::from_secs(10), &[]),
+        );
+        let cacheable = matches!(probe, ToolProbe::Present(_));
+        (probe, cacheable)
+    })
 }
 
 /// True only when `gh` answered. A probe that hung, failed or never ran is
@@ -512,19 +558,30 @@ pub fn is_github_host(host: &str) -> bool {
     h == "github.com" || h.ends_with(".github.com") || h.ends_with(".ghe.com")
 }
 
-/// `gh` flags that pin a call to this remote (`--repo`, and `--hostname` on GHES).
+/// The value of gh's `-R, --repo [HOST/]OWNER/REPO` flag for this remote.
 ///
-/// Only valid for the repo-context subcommands (`pr`, `issue`, `run`,
-/// `release`), which inherit `-R`. `gh api` has no `--repo` flag and fails
-/// outright when given one; use [`api_host_flags`] there instead — the REST
-/// endpoint path already scopes the request to the repository.
-pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
-    let mut flags = vec!["--repo".to_string(), remote.slug()];
-    if !remote.host.eq_ignore_ascii_case("github.com") {
-        flags.push("--hostname".to_string());
-        flags.push(remote.host.clone());
+/// The host prefix is how gh selects a non-github.com instance for the
+/// repo-context subcommands (`gh help environment`: `GH_REPO` takes the same
+/// `[HOST/]OWNER/REPO` form; there is no `--hostname` flag on `pr`, `issue`,
+/// `run` or `release`). On github.com it is omitted so the line stays exactly
+/// as documented.
+pub fn gh_repo_flag_value(remote: &GitHubRepoRef) -> String {
+    if remote.host.eq_ignore_ascii_case("github.com") {
+        remote.slug()
+    } else {
+        format!("{}/{}/{}", remote.host, remote.owner, remote.name)
     }
-    flags
+}
+
+/// `gh` flags that pin a call to this remote. The one owner of repo pinning
+/// for the repo-context subcommands (`pr`, `issue`, `run`, `release`,
+/// `workflow`): it carries the host inside `--repo` and never a `--hostname`.
+///
+/// `gh api` has no `--repo` flag and fails outright when given one; use
+/// [`api_host_flags`] there instead — the REST endpoint path already scopes
+/// the request to the repository.
+pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
+    vec!["--repo".to_string(), gh_repo_flag_value(remote)]
 }
 
 /// Selects the trusted GitHub remote from `git remote -v` output.
@@ -585,6 +642,10 @@ struct GhPullRequest {
     is_draft: bool,
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<serde_json::Value>,
+    #[serde(rename = "isCrossRepository", default)]
+    is_cross_repository: bool,
+    #[serde(rename = "headRepositoryOwner", default)]
+    head_repository_owner: Option<GhOwner>,
     #[serde(rename = "createdAt", default)]
     created_at: Option<String>,
     #[serde(rename = "updatedAt", default)]
@@ -593,6 +654,12 @@ struct GhPullRequest {
     review_decision: Option<String>,
     #[serde(default)]
     reviews: Option<Vec<GhReview>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhOwner {
+    #[serde(default)]
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -811,7 +878,7 @@ fn list_pull_requests(remote: &GitHubRepoRef) -> Result<(Vec<PullRequestInfo>, b
             // Every name here is verified against `gh pr list --json` with no
             // arguments, which prints the valid set. A field gh does not know
             // fails the WHOLE listing, not just that column.
-            "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup,createdAt,updatedAt,reviewDecision,reviews",
+            "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup,createdAt,updatedAt,reviewDecision,reviews,isCrossRepository,headRepositoryOwner",
         ],
         Duration::from_secs(45),
         None,
@@ -891,6 +958,11 @@ fn parse_pr_list(
             created_at: pr.created_at.unwrap_or_default(),
             updated_at: pr.updated_at.unwrap_or_default(),
             review_decision: pr.review_decision.unwrap_or_default(),
+            is_cross_repository: pr.is_cross_repository,
+            head_owner: pr
+                .head_repository_owner
+                .map(|o| o.login)
+                .unwrap_or_default(),
         })
         .collect();
     Ok((prs, truncated))
@@ -1045,68 +1117,301 @@ const ALERT_DISPLAY_LIMIT: usize = 50;
 /// `available: false` and an explicit reason, so the UI can distinguish "no
 /// open alerts" from "could not check".
 pub fn load_dependabot_alerts(repo_path: &str) -> DependabotReport {
+    load_alert_outcome(repo_path, list_dependabot_alerts).into()
+}
+
+/// What fetching one alert family produced, before it takes the wire shape of
+/// [`DependabotReport`] or [`CodeScanningReport`] (the two share every field
+/// but the alert row type, and the IPC type contract pins each by name).
+struct AlertOutcome<T> {
+    available: bool,
+    cli_present: bool,
+    is_github_remote: bool,
+    slug: String,
+    alerts: Vec<T>,
+    truncated: bool,
+    partial_tiers: Vec<String>,
+    error: Option<String>,
+    unavailable_reason: Option<GithubUnavailableReason>,
+}
+
+impl<T> AlertOutcome<T> {
+    /// A fetch that never ran to an answer (the worker died or was
+    /// cancelled): unavailable with `error`, never an empty success.
+    fn transport_failure(error: String) -> Self {
+        Self {
+            available: false,
+            cli_present: false,
+            is_github_remote: false,
+            slug: String::new(),
+            alerts: Vec::new(),
+            truncated: false,
+            partial_tiers: Vec::new(),
+            error: Some(error),
+            unavailable_reason: Some(GithubUnavailableReason::Transport),
+        }
+    }
+}
+
+macro_rules! report_from_outcome {
+    ($report:ident, $alert:ty) => {
+        impl From<AlertOutcome<$alert>> for $report {
+            fn from(o: AlertOutcome<$alert>) -> Self {
+                Self {
+                    available: o.available,
+                    cli_present: o.cli_present,
+                    is_github_remote: o.is_github_remote,
+                    slug: o.slug,
+                    alerts: o.alerts,
+                    truncated: o.truncated,
+                    partial_tiers: o.partial_tiers,
+                    error: o.error,
+                    unavailable_reason: o.unavailable_reason,
+                }
+            }
+        }
+
+        impl $report {
+            /// The report for a fetch that never ran to an answer.
+            pub fn transport_failure(error: String) -> Self {
+                AlertOutcome::transport_failure(error).into()
+            }
+        }
+    };
+}
+report_from_outcome!(DependabotReport, DependabotAlertInfo);
+report_from_outcome!(CodeScanningReport, CodeScanningAlertInfo);
+
+/// Probes `gh`, finds the GitHub remote, and fetches one alert family.
+///
+/// The single owner of the fail-closed contract both alert loaders share:
+/// every condition that prevents the fetch (no GitHub remote, no `gh` CLI, API
+/// error) comes back as an [`AlertOutcome`] with `available: false` and an
+/// explicit reason, never as an empty success.
+fn load_alert_outcome<T>(
+    repo_path: &str,
+    list: impl FnOnce(&GitHubRepoRef) -> Result<AlertList<T>, String>,
+) -> AlertOutcome<T> {
     let gh = probe_gh_cli();
     let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(r)) => r,
-        // Not an error: a local-only repository simply has no Dependabot data.
-        Ok(None) => return unavailable_dependabot(cli_present, false, String::new(), None),
-        Err(e) => return unavailable_dependabot(cli_present, false, String::new(), Some(e)),
+        // Not an error: a local-only repository simply has no alert data.
+        Ok(None) => return unavailable_alert_outcome(cli_present, false, String::new(), None),
+        Err(e) => return unavailable_alert_outcome(cli_present, false, String::new(), Some(e)),
     };
     if let Some(reason) = gh_unavailable_reason(&gh) {
-        return unavailable_dependabot(cli_present, true, remote.slug(), Some(reason));
+        return unavailable_alert_outcome(cli_present, true, remote.slug(), Some(reason));
     }
-    match list_dependabot_alerts(&remote) {
-        Ok((alerts, truncated)) => DependabotReport {
+    match list(&remote) {
+        Ok(listed) => AlertOutcome {
             available: true,
             cli_present: true,
             is_github_remote: true,
             slug: remote.slug(),
-            alerts,
-            truncated,
+            alerts: listed.alerts,
+            truncated: listed.truncated,
+            partial_tiers: listed.partial_tiers,
             error: None,
             unavailable_reason: None,
         },
-        Err(e) => unavailable_dependabot(true, true, remote.slug(), Some(e)),
+        Err(e) => unavailable_alert_outcome(true, true, remote.slug(), Some(e)),
     }
 }
 
-fn unavailable_dependabot(
+fn unavailable_alert_outcome<T>(
     cli_present: bool,
     is_github_remote: bool,
     slug: String,
     error: Option<String>,
-) -> DependabotReport {
+) -> AlertOutcome<T> {
     let unavailable_reason = Some(classify_github_unavailable(
         is_github_remote,
         cli_present,
         error.as_deref(),
     ));
-    DependabotReport {
+    AlertOutcome {
         available: false,
         cli_present,
         is_github_remote,
         slug,
         alerts: Vec::new(),
         truncated: false,
+        partial_tiers: Vec::new(),
         error,
         unavailable_reason,
     }
 }
 
+/// What listing one alert family produced: the capped rows, whether more
+/// exist, and which severity tiers could not be read.
+struct AlertList<T> {
+    alerts: Vec<T>,
+    truncated: bool,
+    partial_tiers: Vec<String>,
+}
+
+impl<T> AlertList<T> {
+    /// A list missing a tier is a lower bound whatever the cap said, so the
+    /// consumer's "at least N" wording follows from `truncated`.
+    fn new(alerts: Vec<T>, truncated: bool, partial_tiers: Vec<String>) -> Self {
+        Self {
+            truncated: truncated || !partial_tiers.is_empty(),
+            alerts,
+            partial_tiers,
+        }
+    }
+}
+
 fn list_dependabot_alerts(
     remote: &GitHubRepoRef,
-) -> Result<(Vec<DependabotAlertInfo>, bool), String> {
-    let fetch_limit = (ALERT_DISPLAY_LIMIT + 1).to_string();
+) -> Result<AlertList<DependabotAlertInfo>, String> {
     let endpoint = format!(
-        "repos/{}/{}/dependabot/alerts?state=open&per_page={fetch_limit}",
+        "repos/{}/{}/dependabot/alerts?state=open",
         remote.owner, remote.name
     );
-    let out = capture_gh_api(remote, &endpoint)?;
-    if !out.success {
-        return Err(gh_api_error_message(&out));
+    let fetched =
+        fetch_alerts_worst_first(remote, &endpoint, &["critical", "high", "medium", "low"])?;
+    let (alerts, truncated) = parse_dependabot_alerts(&fetched.text, ALERT_DISPLAY_LIMIT)?;
+    Ok(AlertList::new(alerts, truncated, fetched.partial_tiers))
+}
+
+/// Largest page the alerts REST endpoints serve.
+const ALERT_PAGE_MAX: usize = 100;
+
+/// Severity tiers asked for at once. Three keeps the wait to a couple of
+/// rounds without turning one Health open into a burst of `gh` processes.
+const ALERT_TIER_CONCURRENCY: usize = 3;
+
+/// One deadline over a whole alert fetch (the first page and every tier). A
+/// request that has not answered by then is reported as missing, not waited on:
+/// a single `gh api` call was allowed 45 s and a fetch could stack several.
+const ALERT_FETCH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The open alerts of one family as a JSON array, and the severity tiers that
+/// array is missing.
+struct AlertFetch {
+    text: String,
+    /// Tiers whose request failed or was cut off by [`ALERT_FETCH_DEADLINE`].
+    partial_tiers: Vec<String>,
+}
+
+/// One page of alerts: the `query` suffix (`""` or `&severity=high`), the page
+/// size, and the longest the request may take.
+type AlertPageFetch<'a> = dyn Fn(&str, usize, Duration) -> Result<Vec<Value>, String> + Sync + 'a;
+
+/// The worst open alerts of one family: every alert when they fit one page,
+/// else the worst [`ALERT_DISPLAY_LIMIT`] + 1.
+///
+/// "Sort worst-first, then cap" only ranks what was fetched, and the first 51
+/// rows are the newest 51 — a critical alert beyond them was never seen. So:
+/// one full-size page first, which is the whole answer for nearly every
+/// repository; only when that page is full (more may exist) are the severities
+/// asked for, worst first, [`ALERT_TIER_CONCURRENCY`] at a time, until the cap
+/// is passed. Whatever the cap then drops is no worse than what is kept.
+///
+/// A tier that fails or misses the deadline does not discard the others: it is
+/// named in [`AlertFetch::partial_tiers`] and the newest-first page stands in
+/// for what it would have contributed. Only the first page failing fails the
+/// fetch, since then nothing is known.
+fn fetch_alerts_worst_first(
+    remote: &GitHubRepoRef,
+    endpoint: &str,
+    tiers: &[&str],
+) -> Result<AlertFetch, String> {
+    let page = |query: &str, per_page: usize, timeout: Duration| -> Result<Vec<Value>, String> {
+        let out = capture_gh_api(
+            remote,
+            &format!("{endpoint}&per_page={per_page}{query}"),
+            timeout,
+        )?;
+        if !out.success {
+            return Err(gh_api_error_message(&out));
+        }
+        match serde_json::from_str::<Value>(out.stdout_text().trim()) {
+            Ok(Value::Array(rows)) => Ok(rows),
+            Ok(_) => Err("alerts payload must be an array".to_string()),
+            Err(error) => Err(format!("could not parse gh alerts output: {error}")),
+        }
+    };
+    collect_alerts_worst_first(&page, tiers, Instant::now() + ALERT_FETCH_DEADLINE)
+}
+
+/// [`fetch_alerts_worst_first`] over an injected page fetcher and deadline.
+fn collect_alerts_worst_first(
+    page: &AlertPageFetch<'_>,
+    tiers: &[&str],
+    deadline: Instant,
+) -> Result<AlertFetch, String> {
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let json = |rows: &[Value]| serde_json::to_string(rows).map_err(|e| e.to_string());
+    let first = page("", ALERT_PAGE_MAX, remaining())?;
+    if first.len() < ALERT_PAGE_MAX {
+        return Ok(AlertFetch {
+            text: json(&first)?,
+            partial_tiers: Vec::new(),
+        });
     }
-    parse_dependabot_alerts(&out.stdout_text(), ALERT_DISPLAY_LIMIT)
+    // An alert can answer to two tiers (its CodeQL and its security severity);
+    // count it once.
+    let mut seen = std::collections::HashSet::new();
+    let mut worst: Vec<Value> = Vec::new();
+    let mut partial_tiers: Vec<String> = Vec::new();
+    let mut next = 0;
+    while next < tiers.len() && worst.len() <= ALERT_DISPLAY_LIMIT {
+        let budget = remaining();
+        if budget.is_zero() {
+            partial_tiers.extend(tiers[next..].iter().map(|tier| (*tier).to_string()));
+            break;
+        }
+        let wave = &tiers[next..tiers.len().min(next + ALERT_TIER_CONCURRENCY)];
+        next += wave.len();
+        let answers: Vec<Result<Vec<Value>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|tier| {
+                    let query = format!("&severity={tier}");
+                    scope.spawn(move || page(&query, ALERT_DISPLAY_LIMIT + 1, budget))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("alert tier worker panicked".to_string()))
+                })
+                .collect()
+        });
+        for (tier, answer) in wave.iter().zip(answers) {
+            match answer {
+                Ok(rows) => {
+                    for row in rows {
+                        if seen.insert(row.get("number").and_then(Value::as_u64)) {
+                            worst.push(row);
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!(target: "github", "alert tier {tier} not fetched: {error}");
+                    partial_tiers.push((*tier).to_string());
+                }
+            }
+        }
+    }
+    if !partial_tiers.is_empty() {
+        // What the missing tiers would have added is unknown; the newest page
+        // is the one view of them that was actually read.
+        for row in first {
+            if seen.insert(row.get("number").and_then(Value::as_u64)) {
+                worst.push(row);
+            }
+        }
+    }
+    Ok(AlertFetch {
+        text: json(&worst)?,
+        partial_tiers,
+    })
 }
 
 /// Extra flags that pin a read-only `gh api` call to this remote's host.
@@ -1115,7 +1420,7 @@ fn list_dependabot_alerts(
 /// ("unknown flag"), which used to fail every Dependabot fetch. No repo flag
 /// is needed because the REST endpoint path already names the repository;
 /// hostname pinning still matters for GitHub Enterprise remotes.
-fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
+pub(crate) fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
     if remote.host.eq_ignore_ascii_case("github.com") {
         Vec::new()
     } else {
@@ -1124,11 +1429,15 @@ fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
 }
 
 /// Runs one read-only `gh api` call pinned to this remote's host.
-fn capture_gh_api(remote: &GitHubRepoRef, endpoint: &str) -> Result<CapturedOutput, String> {
+fn capture_gh_api(
+    remote: &GitHubRepoRef,
+    endpoint: &str,
+    timeout: Duration,
+) -> Result<CapturedOutput, String> {
     let mut args: Vec<String> = vec!["api".to_string(), endpoint.to_string()];
     args.extend(api_host_flags(remote));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    capture_command("gh", &refs, None, Duration::from_secs(45), &[])
+    capture_command("gh", &refs, None, timeout, &[])
 }
 
 /// HTTP status printed by `gh` (`gh: HTTP 404`), never the process exit code.
@@ -1225,6 +1534,48 @@ fn is_product_disabled_message(message: &str) -> bool {
         || text.contains("no analysis found")
 }
 
+/// True when GitHub's own prose says a 403 is a rate limit (primary
+/// "API rate limit exceeded" or the secondary / abuse limits), not a missing
+/// scope: GitHub answers both with 403, and only 429 is unambiguous.
+fn is_rate_limit_message(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("rate limit exceeded")
+        || text.contains("secondary rate limit")
+        || text.contains("abuse detection")
+}
+
+/// Seconds to wait before retrying, when the failure text carries one:
+/// `Retry-After: N`, `X-RateLimit-Reset: <epoch seconds>` (against `now_epoch`)
+/// or "try again in N seconds/minutes". `None` when GitHub gave no figure.
+fn rate_limit_wait_secs(text: &str, now_epoch: u64) -> Option<u64> {
+    let lower = text.to_ascii_lowercase();
+    let number_after = |key: &str| -> Option<u64> {
+        let rest = &lower[lower.find(key)? + key.len()..];
+        let digits: String = rest
+            .trim_start_matches([':', ' ', '='])
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    };
+    if let Some(n) = number_after("retry-after") {
+        return Some(n);
+    }
+    if let Some(reset) = number_after("x-ratelimit-reset") {
+        return Some(reset.saturating_sub(now_epoch));
+    }
+    let n = number_after("try again in")?;
+    let after = &lower[lower.find("try again in")? + "try again in".len()..];
+    let unit = after
+        .trim_start()
+        .trim_start_matches(|c: char| c.is_ascii_digit());
+    Some(if unit.trim_start().starts_with("min") {
+        n * 60
+    } else {
+        n
+    })
+}
+
 /// Classify why a Dependabot / code-scanning report is unavailable.
 ///
 /// Order: remote → CLI → HTTP status (+ product-disabled prose for 403/404)
@@ -1248,6 +1599,7 @@ pub(crate) fn classify_github_unavailable(
     let product_disabled = is_product_disabled_message(error);
     match status {
         Some(429) => GithubUnavailableReason::RateLimited,
+        Some(403) if is_rate_limit_message(error) => GithubUnavailableReason::RateLimited,
         Some(403) if product_disabled => GithubUnavailableReason::ProductDisabled,
         Some(404) if product_disabled => GithubUnavailableReason::ProductDisabled,
         Some(403) => GithubUnavailableReason::Forbidden,
@@ -1266,22 +1618,35 @@ fn gh_api_error_message(output: &CapturedOutput) -> String {
     let parsed = serde_json::from_str::<Value>(output.stdout_text().trim());
     let http = http_status_from_gh_output(output)
         .or_else(|| parsed.as_ref().ok().and_then(json_http_status));
+    let stderr = bounded_error(output.stderr_text());
+    let mut text = None;
     if let Ok(value) = parsed {
         if let Some(message) = value.get("message").and_then(Value::as_str) {
             if !message.is_empty() {
-                return match http {
+                text = Some(match http {
                     Some(code) => format!("{message} (HTTP {code})"),
                     None => message.to_string(),
-                };
+                });
             }
         }
     }
-    let stderr = bounded_error(output.stderr_text());
-    if stderr.is_empty() {
-        format!("gh exited {}", output.status_code)
-    } else {
-        stderr
+    let mut text = text.unwrap_or_else(|| {
+        if stderr.is_empty() {
+            format!("gh exited {}", output.status_code)
+        } else {
+            stderr.clone()
+        }
+    });
+    if is_rate_limit_message(&text) || http == Some(429) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let hint = format!("{stderr} {}", output.stdout_text());
+        if let Some(wait) = rate_limit_wait_secs(&hint, now) {
+            text.push_str(&format!("; retry in {wait}s"));
+        }
     }
+    text
 }
 
 fn parse_dependabot_alerts(
@@ -1370,72 +1735,31 @@ fn alert_from_json(row: &Value) -> DependabotAlertInfo {
 /// an explicit reason. A 403 ("Advanced Security is not enabled") or missing
 /// `security_events` scope must never look like "no open alerts".
 pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
-    let gh = probe_gh_cli();
-    let cli_present = gh_cli_reported_present(&gh);
-    let remote = match discover_github_remote(repo_path) {
-        Ok(Some(r)) => r,
-        Ok(None) => return unavailable_code_scanning(cli_present, false, String::new(), None),
-        Err(e) => return unavailable_code_scanning(cli_present, false, String::new(), Some(e)),
-    };
-    if let Some(reason) = gh_unavailable_reason(&gh) {
-        return unavailable_code_scanning(cli_present, true, remote.slug(), Some(reason));
-    }
-    match list_code_scanning_alerts(&remote) {
-        Ok((alerts, truncated)) => CodeScanningReport {
-            available: true,
-            cli_present: true,
-            is_github_remote: true,
-            slug: remote.slug(),
-            alerts,
-            truncated,
-            error: None,
-            unavailable_reason: None,
-        },
-        Err(e) => unavailable_code_scanning(true, true, remote.slug(), Some(e)),
-    }
-}
-
-fn unavailable_code_scanning(
-    cli_present: bool,
-    is_github_remote: bool,
-    slug: String,
-    error: Option<String>,
-) -> CodeScanningReport {
-    let unavailable_reason = Some(classify_github_unavailable(
-        is_github_remote,
-        cli_present,
-        error.as_deref(),
-    ));
-    CodeScanningReport {
-        available: false,
-        cli_present,
-        is_github_remote,
-        slug,
-        alerts: Vec::new(),
-        truncated: false,
-        error,
-        unavailable_reason,
-    }
+    load_alert_outcome(repo_path, list_code_scanning_alerts).into()
 }
 
 fn list_code_scanning_alerts(
     remote: &GitHubRepoRef,
-) -> Result<(Vec<CodeScanningAlertInfo>, bool), String> {
-    let fetch_limit = (ALERT_DISPLAY_LIMIT + 1).to_string();
+) -> Result<AlertList<CodeScanningAlertInfo>, String> {
     // Official REST: GET /repos/{owner}/{repo}/code-scanning/alerts
     // Query params confirmed: state, per_page (max 100), ref, tool_name,
-    // severity, page. We request open alerts and one extra row so a cap is
-    // reported rather than silently looking complete. Auth is the same `gh
-    // api` session Dependabot uses — no second token path.
+    // severity, page. We request open alerts, worst first when there are more
+    // than one page, and one extra row so a cap is reported rather than
+    // silently looking complete. Auth is the same `gh api` session Dependabot
+    // uses — no second token path.
     let endpoint = format!(
-        "repos/{}/{}/code-scanning/alerts?state=open&per_page={fetch_limit}",
+        "repos/{}/{}/code-scanning/alerts?state=open",
         remote.owner, remote.name
     );
-    let out = capture_gh_api(remote, &endpoint)?;
-    if !out.success {
-        return Err(gh_api_error_message(&out));
-    }
-    parse_code_scanning_alerts(&out.stdout_text(), ALERT_DISPLAY_LIMIT)
+    let fetched = fetch_alerts_worst_first(
+        remote,
+        &endpoint,
+        &[
+            "critical", "high", "error", "medium", "warning", "low", "note",
+        ],
+    )?;
+    let (alerts, truncated) = parse_code_scanning_alerts(&fetched.text, ALERT_DISPLAY_LIMIT)?;
+    Ok(AlertList::new(alerts, truncated, fetched.partial_tiers))
 }
 
 fn parse_code_scanning_alerts(
@@ -2429,6 +2753,11 @@ mod tests {
     /// Health panel told the reader to install a tool they had.
     #[test]
     fn a_gh_probe_that_never_ran_is_not_reported_as_not_installed() {
+        // The probe is cached per binary and resolved through PATH: take the
+        // serial the PATH-overriding tests hold, and start from no answer, or
+        // the forced failure below is never reached.
+        let _serial = crate::harness::sidecar::test_serial();
+        GH_PROBES.clear();
         let dir = crate::test_support::git_repo();
         crate::test_support::git_in(
             dir.path(),
@@ -2778,7 +3107,21 @@ mod tests {
     }
 
     #[test]
-    fn test_gh_repo_flags_include_hostname_for_ghes() {
+    fn ssh_over_https_endpoint_normalises_to_github_com() {
+        for url in [
+            "ssh://git@ssh.github.com:443/acme/repo.git",
+            "git@ssh.github.com:acme/repo.git",
+            "ssh://git@SSH.GitHub.com/acme/repo",
+        ] {
+            let parsed = parse_github_remote_url(url).unwrap();
+            assert_eq!(parsed.host, "github.com", "{url}");
+            assert_eq!(gh_repo_flags(&parsed), ["--repo", "acme/repo"]);
+            assert_eq!(parsed.html_url(), "https://github.com/acme/repo");
+        }
+    }
+
+    #[test]
+    fn test_gh_repo_flags_carry_host_inside_repo_for_ghes() {
         let remote = GitHubRepoRef {
             host: "github.example.com".into(),
             owner: "acme".into(),
@@ -2789,9 +3132,7 @@ mod tests {
             flags,
             vec![
                 "--repo".to_string(),
-                "acme/gitpulse".to_string(),
-                "--hostname".to_string(),
-                "github.example.com".to_string()
+                "github.example.com/acme/gitpulse".to_string(),
             ]
         );
         let dot_com = GitHubRepoRef {
@@ -3107,24 +3448,13 @@ mod tests {
                 "--label",
                 "ui",
                 "--repo",
-                "o/r",
-                "--hostname",
-                "acme.ghe.com"
+                "acme.ghe.com/o/r"
             ]
         );
         let checkout = pr_checkout_argv(&remote, 42).unwrap();
         assert_eq!(
             checkout,
-            vec![
-                "gh",
-                "pr",
-                "checkout",
-                "42",
-                "--repo",
-                "o/r",
-                "--hostname",
-                "acme.ghe.com"
-            ]
+            vec!["gh", "pr", "checkout", "42", "--repo", "acme.ghe.com/o/r"]
         );
     }
 
@@ -4067,7 +4397,8 @@ mod tests {
             .starts_with("https://github.com/a/r/releases/tag/v1.0.")));
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(30),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(30)),
             "stress parsing must stay bounded, took {:?}",
             started.elapsed()
         );
@@ -4155,5 +4486,507 @@ mod tests {
         lines.push("origin\thttps://github.com/winner/origin.git (push)".into());
         let picked = pick_github_remote(&lines.join("\n")).expect("origin wins");
         assert_eq!(picked.slug(), "winner/origin");
+    }
+
+    /// A `gh` on PATH that rejects `--hostname` the way the real one does
+    /// (`unknown flag: --hostname`, verified against gh 2.102.0) and logs every
+    /// argv it is handed, one line per call.
+    #[cfg(unix)]
+    fn install_fake_gh(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("argv.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{log}'\n\
+             case \"$1\" in --version) echo 'gh version 2.102.0'; exit 0;; esac\n\
+             for a in \"$@\"; do [ \"$a\" = --hostname ] && {{ echo 'unknown flag: --hostname' >&2; exit 1; }}; done\n\
+             echo '[]'\n",
+            log = log.display()
+        );
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        log
+    }
+
+    /// Every repo-context call against a GHES remote must pin the host through
+    /// `--repo HOST/OWNER/REPO`; `gh pr/issue/run/release` have no
+    /// `--hostname` flag, so one in the argv fails the whole panel.
+    #[cfg(unix)]
+    #[test]
+    fn ghes_remote_calls_pin_the_host_inside_repo_and_never_pass_hostname() {
+        let serial = crate::harness::sidecar::test_serial();
+        let fixture = tempfile::TempDir::new().unwrap();
+        let log = install_fake_gh(fixture.path());
+        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://acme.ghe.com/o/r.git"],
+        );
+
+        let ctx = load_github_context(repo.path().to_str().unwrap());
+        assert!(ctx.available, "GHES context must load: {:?}", ctx.error);
+        assert!(ctx.warnings.is_empty(), "{:?}", ctx.warnings);
+        checkout_pull_request(
+            repo.path().to_str().unwrap(),
+            &discover_github_remote(repo.path().to_str().unwrap())
+                .unwrap()
+                .unwrap(),
+            7,
+        )
+        .expect("checkout must not be rejected for --hostname");
+
+        let calls = std::fs::read_to_string(log).unwrap();
+        for sub in [
+            "pr list",
+            "issue list",
+            "run list",
+            "release list",
+            "pr checkout",
+        ] {
+            assert!(
+                calls
+                    .lines()
+                    .any(|l| l.starts_with(sub) && l.contains("--repo acme.ghe.com/o/r")),
+                "`gh {sub}` was not pinned with --repo acme.ghe.com/o/r:\n{calls}"
+            );
+        }
+        assert!(!calls.contains("--hostname"), "{calls}");
+    }
+
+    #[test]
+    fn a_403_rate_limit_is_rate_limited_but_a_scope_403_stays_forbidden() {
+        for msg in [
+            "API rate limit exceeded for user ID 1. (HTTP 403)",
+            "You have exceeded a secondary rate limit. Please wait a few minutes (HTTP 403)",
+            "You have triggered an abuse detection mechanism (HTTP 403)",
+        ] {
+            assert_eq!(
+                classify_github_unavailable(true, true, Some(msg)),
+                GithubUnavailableReason::RateLimited,
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            classify_github_unavailable(
+                true,
+                true,
+                Some("Resource not accessible by personal access token (HTTP 403)")
+            ),
+            GithubUnavailableReason::Forbidden
+        );
+    }
+
+    #[test]
+    fn rate_limit_wait_comes_from_retry_after_reset_or_prose() {
+        assert_eq!(rate_limit_wait_secs("Retry-After: 60", 0), Some(60));
+        assert_eq!(
+            rate_limit_wait_secs("X-RateLimit-Reset: 1700000100", 1700000000),
+            Some(100)
+        );
+        assert_eq!(
+            rate_limit_wait_secs("reset in the past x-ratelimit-reset: 5", 10),
+            Some(0)
+        );
+        assert_eq!(
+            rate_limit_wait_secs("please try again in 2 minutes", 0),
+            Some(120)
+        );
+        assert_eq!(rate_limit_wait_secs("Please wait a few minutes", 0), None);
+    }
+
+    #[test]
+    fn a_fork_pull_request_is_marked_cross_repository_with_its_owner() {
+        let json = br#"[
+            {"number":1,"title":"fork","state":"OPEN","headRefName":"main","baseRefName":"main",
+             "url":"u","isDraft":false,"statusCheckRollup":[],"isCrossRepository":true,
+             "headRepositoryOwner":{"id":"X","login":"contrib"}},
+            {"number":2,"title":"same","state":"OPEN","headRefName":"feat","baseRefName":"main",
+             "url":"u","isDraft":false,"statusCheckRollup":[],"isCrossRepository":false,
+             "headRepositoryOwner":{"id":"Y","login":"acme"}},
+            {"number":3,"title":"old gh","state":"OPEN","headRefName":"x","baseRefName":"main",
+             "url":"u","isDraft":false,"statusCheckRollup":[]}
+        ]"#;
+        let (prs, _) = parse_pr_list(json, 10).unwrap();
+        assert!(prs[0].is_cross_repository);
+        assert_eq!(prs[0].head_owner, "contrib");
+        assert!(!prs[1].is_cross_repository);
+        assert!(!prs[2].is_cross_repository);
+        assert_eq!(prs[2].head_owner, "");
+    }
+
+    /// `gh --version` ran before every GitHub call, the live run poll
+    /// included. The answer changes only with the binary.
+    #[cfg(unix)]
+    #[test]
+    fn the_gh_probe_runs_once_per_binary_not_once_per_call() {
+        let serial = crate::harness::sidecar::test_serial();
+        let fixture = tempfile::TempDir::new().unwrap();
+        install_fake_gh(fixture.path());
+        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        GH_PROBES.clear();
+        let probes = || {
+            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                for _ in 0..5 {
+                    assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
+                }
+            });
+            labels.len()
+        };
+        assert_eq!(probes(), 1, "five calls, one `gh --version`");
+        // The binary changes (a longer script): the cached answer is dropped.
+        let gh = fixture.path().join("bin/gh");
+        let mut script = std::fs::read_to_string(&gh).unwrap();
+        script.push_str("# upgraded\n");
+        std::fs::write(&gh, script).unwrap();
+        assert_eq!(probes(), 1, "an upgraded gh is probed again");
+    }
+
+    /// The flake this pins: `a_gh_probe_that_never_ran_...` clears the cache,
+    /// then asks five surfaces in turn with `gh --version` refused on its
+    /// thread. Any other test that probes `gh` meanwhile (the runs-report
+    /// tests do, before they reach the remote) leaves a `Present` answer in
+    /// the shared cache, and the next surface was answered by the real `gh`
+    /// past the refusal. A refusal forced on this thread must reach the spawn
+    /// whatever the cache holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_probe_failure_is_not_answered_from_a_warm_cache() {
+        let serial = crate::harness::sidecar::test_serial();
+        let fixture = tempfile::TempDir::new().unwrap();
+        install_fake_gh(fixture.path());
+        let path = format!("{}:/usr/bin:/bin", fixture.path().join("bin").display());
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        GH_PROBES.clear();
+        // Another test's probe, as it would leave the cache.
+        assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
+        let refused =
+            crate::engine::git_cli::with_forced_spawn_failure_of("--version", probe_gh_cli);
+        assert!(
+            matches!(refused, ToolProbe::NotRun(_)),
+            "a refused `gh --version` was answered from the cache: {refused:?}"
+        );
+        // The refusal did not evict the real answer, and nothing it saw was kept.
+        assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
+    }
+
+    /// A full first page (100 newest rows, all low) hides a critical alert
+    /// beyond it. Ranking the fetched rows cannot find it; asking by severity
+    /// does.
+    #[cfg(unix)]
+    #[test]
+    fn a_critical_alert_beyond_the_first_page_is_still_ranked_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let serial = crate::harness::sidecar::test_serial();
+        let fixture = tempfile::TempDir::new().unwrap();
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = "#!/bin/sh
+case \"$1\" in --version) echo 'gh version 2.102.0'; exit 0;; esac
+case \"$*\" in
+  *severity=critical*) printf '[{\"number\":9001,\"security_vulnerability\":{\"severity\":\"critical\"}}]';;
+  *severity=low*) i=1; printf '['; while [ $i -le 60 ]; do [ $i -gt 1 ] && printf ','; printf '{\"number\":%s,\"security_vulnerability\":{\"severity\":\"low\"}}' $i; i=$((i+1)); done; printf ']';;
+  *severity=*) printf '[]';;
+  *) i=1; printf '['; while [ $i -le 100 ]; do [ $i -gt 1 ] && printf ','; printf '{\"number\":%s,\"security_vulnerability\":{\"severity\":\"low\"}}' $i; i=$((i+1)); done; printf ']';;
+esac
+";
+        std::fs::write(bin.join("gh"), script).unwrap();
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        assert!(report.available, "{:?}", report.error);
+        assert_eq!(report.alerts[0].number, 9001, "the critical alert leads");
+        assert_eq!(report.alerts[0].severity, "critical");
+        assert!(report.truncated, "more than the cap exist");
+        assert_eq!(report.alerts.len(), ALERT_DISPLAY_LIMIT);
+    }
+
+    /// A fake `gh` whose answer to a full first page (100 low rows) is fixed
+    /// and whose per-severity answers are `severity_cases` (shell `case` arms
+    /// keyed on `*severity=<tier>*`). Returns the fixture dir (kept alive by
+    /// the caller) and the `PATH` that reaches it.
+    #[cfg(unix)]
+    fn fake_alert_gh(severity_cases: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::TempDir::new().unwrap();
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = format!(
+            "#!/bin/sh
+case \"$1\" in --version) echo 'gh version 2.102.0'; exit 0;; esac
+case \"$*\" in
+{severity_cases}
+  *severity=*) printf '[]';;
+  *) i=1; printf '['; while [ $i -le 100 ]; do [ $i -gt 1 ] && printf ','; printf '{{\"number\":%s,\"security_vulnerability\":{{\"severity\":\"low\"}}}}' $i; i=$((i+1)); done; printf ']';;
+esac
+"
+        );
+        std::fs::write(bin.join("gh"), script).unwrap();
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        (fixture, path)
+    }
+
+    #[cfg(unix)]
+    fn github_remote_repo() -> tempfile::TempDir {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        repo
+    }
+
+    /// Dependabot has four severity tiers. Asked one after another, a slow
+    /// answer from each (45 s each, 4.2 s on average in the field) added up to
+    /// the whole of the wait; asked together, up to three at a time, they take
+    /// two rounds. Four tiers of one second each finish in about two seconds,
+    /// where a sequential fetch needs four.
+    #[cfg(unix)]
+    #[test]
+    fn severity_tiers_are_fetched_concurrently_not_one_after_another() {
+        let serial = crate::harness::sidecar::test_serial();
+        let (_fixture, path) = fake_alert_gh("  *severity=*) sleep 1; printf '[]';;");
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = github_remote_repo();
+
+        let started = std::time::Instant::now();
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        let elapsed = started.elapsed();
+        assert!(report.available, "{:?}", report.error);
+        assert!(
+            elapsed < crate::test_support::env::coverage_relaxed(Duration::from_millis(3200)),
+            "four one-second tiers took {elapsed:?}; a sequential fetch needs 4 s"
+        );
+    }
+
+    /// One tier failing (a 502 on `high`) used to discard the tiers already
+    /// fetched, so the Health view said "could not fetch Dependabot alerts"
+    /// next to a critical alert that had been read successfully.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_tier_no_longer_discards_the_other_tiers() {
+        let serial = crate::harness::sidecar::test_serial();
+        let (_fixture, path) = fake_alert_gh(
+            "  *severity=critical*) printf '[{\"number\":9001,\"security_vulnerability\":{\"severity\":\"critical\"}}]';;
+  *severity=high*) echo 'gh: HTTP 502 Bad Gateway' >&2; exit 1;;",
+        );
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = github_remote_repo();
+
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        assert!(
+            report.available,
+            "one failed tier is not an unavailable fetch: {:?}",
+            report.error
+        );
+        assert_eq!(report.alerts[0].number, 9001, "the critical alert is kept");
+        assert!(report.truncated, "a list missing a tier is a lower bound");
+    }
+
+    /// The failed tier is named, on both reports, so the UI can say which
+    /// severities it could not read instead of showing a short list as whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_tier_is_named_on_the_report() {
+        let serial = crate::harness::sidecar::test_serial();
+        let (_fixture, path) = fake_alert_gh(
+            "  *severity=critical*) printf '[{\"number\":9001,\"security_vulnerability\":{\"severity\":\"critical\"}}]';;
+  *severity=high*) echo 'gh: HTTP 502 Bad Gateway' >&2; exit 1;;",
+        );
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = github_remote_repo();
+
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        assert_eq!(report.partial_tiers, vec!["high".to_string()]);
+        assert!(report.error.is_none(), "a partial answer is not an error");
+        assert!(report.unavailable_reason.is_none());
+        // The tier that failed has no rows, and the newest page stands in.
+        assert!(
+            report.alerts.len() > 1,
+            "the newest page is kept: {}",
+            report.alerts.len()
+        );
+    }
+
+    fn page_row(number: u64) -> Value {
+        serde_json::json!({ "number": number })
+    }
+
+    /// A full first page, then per-tier answers from `tier`.
+    fn tiered_fetch<'a>(
+        tier: impl Fn(&str) -> Result<Vec<Value>, String> + Sync + 'a,
+    ) -> impl Fn(&str, usize, Duration) -> Result<Vec<Value>, String> + Sync + 'a {
+        move |query, _per_page, _timeout| {
+            if query.is_empty() {
+                Ok((1..=ALERT_PAGE_MAX as u64).map(page_row).collect())
+            } else {
+                tier(query)
+            }
+        }
+    }
+
+    fn rows_in(fetched: &AlertFetch) -> Vec<Value> {
+        serde_json::from_str(&fetched.text).unwrap()
+    }
+
+    /// At most `ALERT_TIER_CONCURRENCY` tier requests are in flight, and more
+    /// than one is: that is the whole of the speed-up over a sequential loop,
+    /// shown here without a wall clock.
+    #[test]
+    fn tiers_run_up_to_the_concurrency_cap_and_no_further() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let fetch = tiered_fetch(|_| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        let tiers = [
+            "critical", "high", "medium", "low", "note", "warning", "error",
+        ];
+        let fetched =
+            collect_alerts_worst_first(&fetch, &tiers, Instant::now() + Duration::from_secs(30))
+                .unwrap();
+        assert!(fetched.partial_tiers.is_empty());
+        assert_eq!(peak.load(Ordering::SeqCst), ALERT_TIER_CONCURRENCY);
+    }
+
+    /// A tier past the deadline is not waited for and not forgotten: it is
+    /// named, and none of its requests is made.
+    #[test]
+    fn tiers_past_the_deadline_are_named_not_requested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tier_calls = AtomicUsize::new(0);
+        let fetch = tiered_fetch(|_| {
+            tier_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        let fetched =
+            collect_alerts_worst_first(&fetch, &["critical", "high"], Instant::now()).unwrap();
+        assert_eq!(tier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetched.partial_tiers, vec!["critical", "high"]);
+        // Nothing of the tiers was read, so the newest page is what is shown.
+        assert_eq!(rows_in(&fetched).len(), ALERT_PAGE_MAX);
+    }
+
+    /// Every request is handed the time left, never more than the deadline:
+    /// a slow tier cannot hold the fetch past it.
+    #[test]
+    fn each_request_is_bounded_by_the_time_left_on_the_deadline() {
+        let longest = std::sync::Mutex::new(Duration::ZERO);
+        let fetch = |query: &str, _per_page: usize, timeout: Duration| {
+            let mut longest = longest.lock().unwrap();
+            *longest = (*longest).max(timeout);
+            if query.is_empty() {
+                Ok((1..=ALERT_PAGE_MAX as u64).map(page_row).collect())
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let budget = Duration::from_secs(7);
+        collect_alerts_worst_first(&fetch, &["critical"], Instant::now() + budget).unwrap();
+        let longest = *longest.lock().unwrap();
+        assert!(longest <= budget, "a request was allowed {longest:?}");
+        assert!(
+            longest > Duration::from_secs(5),
+            "and not starved: {longest:?}"
+        );
+    }
+
+    /// A tier that errors loses only itself.
+    #[test]
+    fn a_tier_error_keeps_the_rows_of_the_tiers_that_answered() {
+        let fetch = tiered_fetch(|query| match query {
+            "&severity=critical" => Ok(vec![page_row(9001)]),
+            "&severity=high" => Err("HTTP 502".to_string()),
+            _ => Ok(Vec::new()),
+        });
+        let fetched = collect_alerts_worst_first(
+            &fetch,
+            &["critical", "high", "medium"],
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(fetched.partial_tiers, vec!["high"]);
+        let numbers: Vec<u64> = rows_in(&fetched)
+            .iter()
+            .filter_map(|row| row.get("number").and_then(Value::as_u64))
+            .collect();
+        assert!(numbers.contains(&9001));
+        assert_eq!(
+            numbers.len(),
+            ALERT_PAGE_MAX + 1,
+            "the critical row plus the newest page, each counted once"
+        );
+    }
+
+    /// Every tier failing is a short, loudly partial list, never an empty one.
+    #[test]
+    fn all_tiers_failing_is_partial_with_the_newest_page_not_empty() {
+        let fetch = tiered_fetch(|_| Err("HTTP 500".to_string()));
+        let fetched = collect_alerts_worst_first(
+            &fetch,
+            &["critical", "high", "medium", "low"],
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(
+            fetched.partial_tiers,
+            vec!["critical", "high", "medium", "low"]
+        );
+        assert_eq!(rows_in(&fetched).len(), ALERT_PAGE_MAX);
+    }
+
+    /// A first page that fails is the one failure that fails the fetch: there
+    /// is nothing to be partial about.
+    #[test]
+    fn a_failing_first_page_fails_the_fetch() {
+        let fetch = |_: &str, _: usize, _: Duration| -> Result<Vec<Value>, String> {
+            Err("HTTP 401".to_string())
+        };
+        let error = collect_alerts_worst_first(
+            &fetch,
+            &["critical"],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "HTTP 401");
+    }
+
+    /// A page that is not full is the whole answer, with no tier requests.
+    #[test]
+    fn a_short_first_page_asks_for_no_tiers() {
+        let fetch = |query: &str, _: usize, _: Duration| -> Result<Vec<Value>, String> {
+            assert!(
+                query.is_empty(),
+                "no tier request for a short page: {query}"
+            );
+            Ok(vec![page_row(1), page_row(2)])
+        };
+        let fetched = collect_alerts_worst_first(
+            &fetch,
+            &["critical"],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(fetched.partial_tiers.is_empty());
+        assert_eq!(rows_in(&fetched).len(), 2);
     }
 }

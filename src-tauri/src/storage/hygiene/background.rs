@@ -82,6 +82,32 @@ fn location() -> Result<PathBuf, String> {
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist")))
 }
+/// Re-registers the cleaner when its LaunchAgent starts something other than
+/// the running app (moved, translocated, replaced), and says why when it does
+/// not. Returns what it found. An absent agent is left absent: registering is
+/// the user's choice in Settings.
+#[cfg(target_os = "macos")]
+pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, String> {
+    use crate::desktop::launch_agent::{inspect, is_translocated, Registration};
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let path = location()?;
+    if !owned(&path)? {
+        return Ok(Registration::Absent);
+    }
+    let found = inspect(&path, &current)?;
+    if let Registration::Stale { registered } = &found {
+        if is_translocated(&current) {
+            return Err(format!(
+                "the cleaner LaunchAgent starts {registered:?}, but this copy runs from a translocated path; move GitPulse to Applications and reopen it"
+            ));
+        }
+        configure(true).map_err(|error| {
+            format!("the cleaner LaunchAgent starts {registered:?} and could not be re-registered: {error}")
+        })?;
+    }
+    Ok(found)
+}
+
 pub fn supported() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -190,6 +216,8 @@ fn configure_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the macOS-only lint below spawns.
+    #[cfg(target_os = "macos")]
     use crate::procguard::LockedSpawn;
     #[test]
     fn plist_escapes_paths_and_uses_only_explicit_headless_arguments() {

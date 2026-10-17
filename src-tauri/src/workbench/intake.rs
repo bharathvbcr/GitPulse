@@ -21,6 +21,8 @@
 //! than the one the task is filed under, are folded into the description under
 //! their own headings — kept visible, not dropped.
 
+use super::verification_driver;
+use super::verification_gate;
 use super::{query, WorkbenchError};
 use crate::tasks::file_tasks::{self, TaskBrief};
 use dc_store::Store;
@@ -77,40 +79,16 @@ pub(crate) fn resolve(repo_path: &str) -> Result<LocalRepository, WorkbenchError
 
 /// The registered record for a repository, if the board has one. Never writes.
 pub(crate) fn find(store: &Store, identity: &str) -> Result<Option<Value>, WorkbenchError> {
-    let mut cursor: Option<String> = None;
-    for _ in 0..50 {
-        let mut input = json!({"limit":200});
-        if let Some(cursor) = &cursor {
-            input["cursor"] = json!(cursor);
-        }
-        let page = query(store, "repositories.list", &input.to_string())?;
-        let records = page["items"]
-            .as_array()
-            .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid repository page."))?;
-        if let Some(repository) = records
-            .iter()
-            .find(|r| r["identity_key"].as_str() == Some(identity))
-        {
-            return Ok(Some(repository.clone()));
-        }
-        if page["has_more"] != true {
-            return Ok(None);
-        }
-        let next = page["next_cursor"]
-            .as_str()
-            .ok_or_else(|| WorkbenchError::new("protocol_error", "Missing repository cursor."))?;
-        if cursor.as_deref() == Some(next) {
-            return Err(WorkbenchError::new(
-                "protocol_error",
-                "Repository cursor did not advance.",
-            ));
-        }
-        cursor = Some(next.into());
+    // One request through the store's UNIQUE index on the identity.
+    match query(
+        store,
+        "repositories.get",
+        &json!({"identity_key": identity}).to_string(),
+    ) {
+        Ok(found) => Ok(Some(found["item"].clone())),
+        Err(error) if error.code == "not_found" => Ok(None),
+        Err(error) => Err(error),
     }
-    Err(WorkbenchError::new(
-        "registry_limit",
-        "Repository registration requires an indexed identity lookup beyond 10,000 repositories.",
-    ))
 }
 
 /// Find or register a repository. The board's own registration goes through
@@ -497,7 +475,7 @@ fn links(item: &Value, repository_id: &str) -> bool {
         .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(repository_id)))
 }
 
-fn get_item(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
+pub(crate) fn get_item(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
     match query(store, "items.get", &json!({"id":id}).to_string()) {
         Ok(response) => Ok(Some(response["item"].clone())),
         Err(error) if error.code == "not_found" => Ok(None),
@@ -598,7 +576,29 @@ pub(crate) fn place(
     replace: bool,
     position: i64,
 ) -> Result<Placed, WorkbenchError> {
-    place_once(store, repository, task, replace, position, false)
+    place_once(store, repository, task, replace, position, None, false)
+}
+
+/// [`place`] for a task created from a scan of the board: the creating write
+/// names the newest event the scan saw, and the store refuses it with
+/// `board_changed` when any task was added, edited or removed since.
+fn place_scanned(
+    store: &Store,
+    repository: &Value,
+    task: &ExternalTask,
+    replace: bool,
+    position: i64,
+    scan_sequence: Option<u64>,
+) -> Result<Placed, WorkbenchError> {
+    place_once(
+        store,
+        repository,
+        task,
+        replace,
+        position,
+        scan_sequence,
+        false,
+    )
 }
 
 fn place_once(
@@ -607,6 +607,7 @@ fn place_once(
     task: &ExternalTask,
     replace: bool,
     position: i64,
+    scan_sequence: Option<u64>,
     retried: bool,
 ) -> Result<Placed, WorkbenchError> {
     let repository_id = repository["id"]
@@ -661,6 +662,9 @@ fn place_once(
     match &current {
         None => {
             input.insert("expected_revision".into(), json!(0));
+            if let Some(sequence) = scan_sequence {
+                input.insert("scan_sequence".into(), json!(sequence));
+            }
             input.insert("repository_ids".into(), json!([repository_id]));
             input.insert("primary_repository_id".into(), json!(repository_id));
             input.insert("home_workspace_id".into(), Value::Null);
@@ -732,7 +736,15 @@ fn place_once(
                     sequence: None,
                 })
             }
-            Some(_) => place_once(store, repository, task, replace, position, true),
+            Some(_) => place_once(
+                store,
+                repository,
+                task,
+                replace,
+                position,
+                scan_sequence,
+                true,
+            ),
             None => Err(error),
         },
         Err(error) => Err(error),
@@ -812,8 +824,36 @@ const GENERIC_WORDS: &[&str] = &[
     "now",
     "still",
 ];
-/// Bound on the related tasks one refusal names.
+/// Bound on the related tasks one refusal names: a page of the review.
 pub(crate) const MAX_RELATED: usize = 25;
+/// Bound on the `item_id`s one `reviewed_related` may carry: every related
+/// task a repository can have that is worth reviewing one by one. A refusal
+/// names [`MAX_RELATED`] at a time, so a caller reviews page by page and passes
+/// back everything it has read so far; a cap equal to the page size would make
+/// the 26th related task impossible to file.
+pub(crate) const MAX_REVIEWED_RELATED: usize = 500;
+
+/// Whether the caller has named `related` among the open tasks it reviewed.
+/// The one test every path that honours `reviewed_related` applies (the board
+/// intake, `proposals.file`, `proposals.apply`), so they cannot disagree about
+/// what a reviewed task is.
+pub(crate) fn is_reviewed(related: &Value, reviewed: &[String]) -> bool {
+    related["item_id"]
+        .as_str()
+        .is_some_and(|id| reviewed.iter().any(|r| r.trim() == id))
+}
+
+/// Refuse a reviewed set no single call is meant to carry, before it is
+/// searched once per related task.
+pub(crate) fn check_reviewed_len(reviewed: &[String]) -> Result<(), WorkbenchError> {
+    if reviewed.len() > MAX_REVIEWED_RELATED {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("reviewed_related names at most {MAX_REVIEWED_RELATED} tasks."),
+        ));
+    }
+    Ok(())
+}
 /// Bound on the open tasks read to look for related ones.
 const MAX_SCANNED_TASKS: usize = 2000;
 
@@ -976,11 +1016,66 @@ pub(crate) fn add_task(
     replace: bool,
     reviewed_related: &[String],
 ) -> Result<Value, WorkbenchError> {
+    // The related-task scan and the creating write are one decision: the write
+    // carries the sequence the scan started from, and the store refuses it
+    // when the board moved since. One rescan answers a race; a board that keeps
+    // changing under it is reported, not retried forever.
+    add_task_racing(
+        store,
+        repo_path,
+        &task,
+        replace,
+        reviewed_related,
+        &mut || {},
+    )
+}
+
+/// [`add_task`] with a seam between the board scan and the creating write,
+/// where another writer would land: `between` runs once per attempt, after the
+/// scan and before the write.
+fn add_task_racing(
+    store: &Store,
+    repo_path: &str,
+    task: &ExternalTask,
+    replace: bool,
+    reviewed_related: &[String],
+    between: &mut dyn FnMut(),
+) -> Result<Value, WorkbenchError> {
+    match add_task_once(store, repo_path, task, replace, reviewed_related, between) {
+        Err(error) if error.code == "board_changed" => {
+            add_task_once(store, repo_path, task, replace, reviewed_related, between)
+        }
+        other => other,
+    }
+}
+
+/// The newest event sequence on the board, read before a scan so the scan can
+/// only be as new as the number says.
+fn latest_sequence(store: &Store) -> Result<u64, WorkbenchError> {
+    let page = query(store, "events.list", &json!({"limit": 1}).to_string())?;
+    page["latest_sequence"].as_u64().ok_or_else(|| {
+        WorkbenchError::new(
+            "protocol_error",
+            "The store did not report the board's latest sequence.",
+        )
+    })
+}
+
+fn add_task_once(
+    store: &Store,
+    repo_path: &str,
+    task: &ExternalTask,
+    replace: bool,
+    reviewed_related: &[String],
+    between: &mut dyn FnMut(),
+) -> Result<Value, WorkbenchError> {
+    check_reviewed_len(reviewed_related)?;
     let local = resolve_for_agent(repo_path)?;
     // Validate before registering, so a bad request leaves no trace.
     task.item_fields(&local.name)
         .map_err(|message| WorkbenchError::new("invalid_input", message))?;
     let mut related_seen = None;
+    let mut scan_sequence = None;
     if let Some(repository) = find(store, &local.identity)? {
         let repository_id = repository["id"].as_str().unwrap_or_default();
         let own = item_id(repository_id, &task.key);
@@ -1005,15 +1100,12 @@ pub(crate) fn add_task(
             }
         }
         if creating {
-            let related = related_open_tasks(store, repository_id, &own, &task)?;
+            scan_sequence = Some(latest_sequence(store)?);
+            let related = related_open_tasks(store, repository_id, &own, task)?;
             let unreviewed: Vec<&Value> = related
                 .tasks
                 .iter()
-                .filter(|t| {
-                    !reviewed_related
-                        .iter()
-                        .any(|r| t["item_id"].as_str() == Some(r.trim()))
-                })
+                .filter(|t| !is_reviewed(t, reviewed_related))
                 .collect();
             if !unreviewed.is_empty() {
                 let listed: Vec<String> = unreviewed
@@ -1037,6 +1129,13 @@ pub(crate) fn add_task(
                     })
                     .collect();
                 let more = unreviewed.len().saturating_sub(MAX_RELATED);
+                let overflow = if related.tasks.len() > MAX_REVIEWED_RELATED {
+                    format!("\n{} open tasks look related, more than the {MAX_REVIEWED_RELATED} one call can review: fold this into one of them.", related.tasks.len())
+                } else if more > 0 {
+                    format!("\n…and {more} more. Review these, then call again with reviewed_related listing every item_id you have read so far; the next refusal names the following ones.")
+                } else {
+                    String::new()
+                };
                 return Err(WorkbenchError::new(
                     "related_tasks_exist",
                     format!(
@@ -1045,7 +1144,7 @@ pub(crate) fn add_task(
                         if unreviewed.len() == 1 { "" } else { "s" },
                         if unreviewed.len() == 1 { "it" } else { "them" },
                         listed.join("\n"),
-                        if more > 0 { format!("\n…and {more} more; narrow the title or fold this into one of these.") } else { String::new() },
+                        overflow,
                     ),
                 ));
             }
@@ -1056,9 +1155,17 @@ pub(crate) fn add_task(
             }));
         }
     }
+    between();
     let registered = register(store, &local, &fresh_id("repo"), &fresh_id("intake"))?;
     let repository = &registered["repository"];
-    let placed = place(store, repository, &task, replace, now_millis())?;
+    let placed = place_scanned(
+        store,
+        repository,
+        task,
+        replace,
+        now_millis(),
+        scan_sequence,
+    )?;
     match placed.outcome {
         Outcome::AlreadyPresent => Err(WorkbenchError::new(
             "already_exists",
@@ -1353,6 +1460,30 @@ fn task_candidates(repository_id: &str, task: &str) -> Vec<String> {
 /// Every field `items.put` replaces, sent back exactly as read under the
 /// revision it was read at, so a write changes only what its caller sets on
 /// top and a person's edit in between is a conflict rather than overwritten.
+/// Longest caller-supplied request id: the store takes 128, and the record write
+/// of a delete derives its own from it with a suffix.
+const MAX_REQUEST_ID: usize = 120;
+
+/// A caller's own idempotency key for a write, checked at the boundary so a
+/// malformed one is refused before anything is written. The store keys its
+/// receipts by it: the same key with the same payload replays the first
+/// answer instead of writing twice.
+fn check_request_id(supplied: Option<&str>) -> Result<Option<&str>, WorkbenchError> {
+    let Some(id) = supplied else { return Ok(None) };
+    if id.is_empty()
+        || id.len() > MAX_REQUEST_ID
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("request_id must be 1 to {MAX_REQUEST_ID} letters, digits, '-' or '_'."),
+        ));
+    }
+    Ok(Some(id))
+}
+
 fn resend(item: &Value, id: &str, revision: i64, request: &str) -> Map<String, Value> {
     let mut input = Map::new();
     for key in [
@@ -1402,7 +1533,7 @@ fn append_log(logs: &str, block: &str) -> Option<String> {
 /// longer reads as this tool's own last write. A body that itself quotes the
 /// marker on a line of its own is not recognised and would be written again on
 /// a retry: a duplicate, never a write reported that did not happen.
-fn last_block<'a>(logs: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn last_block<'a>(logs: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
     let logs = logs.trim_end();
     let start = logs.rfind(marker)?;
     if start > 0 && !logs[..start].ends_with('\n') {
@@ -1426,6 +1557,10 @@ fn ends_with_block(logs: &str, marker: &str, body: &str) -> bool {
 pub(crate) const AGENT_STATUSES: [&str; 3] = ["in_progress", "review", "done"];
 /// Bound on the completion summary appended to the task's logs.
 pub(crate) const MAX_SUMMARY_CHARS: usize = 4000;
+
+/// Opens the log block that records an agent's `done` held in review. The
+/// host's verification driver finds the held claims by it.
+pub(crate) const HELD_MARKER: &str = "--- Agent asked for done; held in review (";
 
 /// The block a completion summary is recorded as in the task's logs.
 fn summary_block(status: &str, summary: &str, at_ms: i64) -> String {
@@ -1456,7 +1591,9 @@ pub(crate) fn complete_task(
     status: &str,
     expected_revision: Option<i64>,
     summary: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<Value, WorkbenchError> {
+    let request_id = check_request_id(request_id)?;
     if !AGENT_STATUSES.contains(&status) {
         return Err(WorkbenchError::new(
             "invalid_input",
@@ -1472,17 +1609,26 @@ pub(crate) fn complete_task(
     }
     let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
+    let repository_identity = repository["identity_key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     for _ in 0..2 {
         let (id, item) = find_live_task(store, &repository_id, task)?;
         let revision = item["revision"].as_i64().unwrap_or_default();
-        if expected_revision.is_some_and(|expected| expected != revision) {
-            return Err(WorkbenchError::new(
-                "revision_conflict",
-                format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before moving it.", expected_revision.unwrap_or_default()),
-            ));
-        }
         let previous = item["status"].as_str().unwrap_or_default().to_owned();
         let logs = item["logs"].as_str().unwrap_or_default();
+        // An agent's `done` is a claim: it lands as `done` only where Manvi's
+        // verification passed for the work as it stands. A task already done
+        // is never judged again (a retry is `unchanged`).
+        let gate = (status == "done" && previous != "done")
+            .then(|| verification_gate::check(store, &id, &repository_identity));
+        let held = match &gate {
+            Some(verification_gate::Gate::Held(reason)) => Some(reason.clone()),
+            _ => None,
+        };
+        let requested = status;
+        let status = if held.is_some() { "review" } else { status };
         let block = summary.map(|s| summary_block(status, s, now_millis()));
         // The marker carries a timestamp, so compare the summary text itself:
         // the same summary as the last block, under the same status, is a retry.
@@ -1498,13 +1644,29 @@ pub(crate) fn complete_task(
                 "previous_status": previous,
                 "status": item["status"],
                 "revision": item["revision"],
+                "requested_status": requested,
+                "held_for_review": held.is_some(),
+                "verification": held.as_deref().or(match &gate {
+                    Some(verification_gate::Gate::Passed(verdict)) => Some(verdict.as_str()),
+                    _ => None,
+                }),
                 "summary_recorded": summary.is_some() && (outcome == "updated" || recorded),
                 "repository": repository_summary(&repository),
                 "sequence": sequence,
             })
         };
+        // Before the revision check: the identical call retried after its
+        // response was lost carries the revision it read, which its own first
+        // success has since moved. A retry whose state already matches is
+        // `unchanged`, not a conflict.
         if previous == status && (summary.is_none() || recorded) {
             return Ok(response("unchanged", &item, None));
+        }
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(WorkbenchError::new(
+                "revision_conflict",
+                format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before moving it.", expected_revision.unwrap_or_default()),
+            ));
         }
         if previous == "done" && status != "done" {
             return Err(WorkbenchError::new(
@@ -1513,14 +1675,36 @@ pub(crate) fn complete_task(
             ));
         }
         let mut input = resend(&item, &id, revision, "complete");
+        if let Some(request_id) = request_id {
+            input.insert("request_id".into(), json!(request_id));
+        }
         input.insert("status".into(), json!(status));
-        if let Some(block) = &block {
-            let joined = append_log(logs, block).ok_or_else(|| {
-                WorkbenchError::new(
-                    "invalid_input",
-                    "The task's logs are full; move it without a summary, or shorten the summary.",
+        // The verdict goes into the task's history ahead of the agent's own
+        // summary, so the summary stays the last block and a retry still
+        // recognises it.
+        let verdict_block = gate.as_ref().map(|gate| match gate {
+            verification_gate::Gate::Passed(verdict) => {
+                format!(
+                    "--- Verification passed ({}) ---\n{verdict}",
+                    timestamp(now_millis())
                 )
-            })?;
+            }
+            verification_gate::Gate::Held(reason) => format!(
+                "{HELD_MARKER}{}) ---\n{reason}{}",
+                timestamp(now_millis()),
+                verification_driver::target_line(repo_path)
+            ),
+        });
+        if verdict_block.is_some() || block.is_some() {
+            let mut joined = logs.to_owned();
+            for part in verdict_block.iter().chain(block.iter()) {
+                joined = append_log(&joined, part).ok_or_else(|| {
+                    WorkbenchError::new(
+                        "invalid_input",
+                        "The task's logs are full; move it without a summary, or shorten the summary.",
+                    )
+                })?;
+            }
             input.insert("logs".into(), json!(joined));
         }
         match query(store, "items.put", &Value::Object(input).to_string()) {
@@ -1545,6 +1729,36 @@ pub(crate) fn complete_task(
     ))
 }
 
+/// Append `block` to a task's logs and, when `status` is given, move it, on
+/// behalf of the host's verification driver. Held to `expected_revision`: a
+/// task a person changed since the driver last read it is refused with
+/// `revision_conflict` and left exactly as they left it.
+pub(crate) fn annotate_task(
+    store: &Store,
+    id: &str,
+    expected_revision: i64,
+    status: Option<&str>,
+    block: &str,
+) -> Result<Value, WorkbenchError> {
+    let item = get_item(store, id)?
+        .ok_or_else(|| WorkbenchError::new("not_found", "The task no longer exists."))?;
+    let revision = item["revision"].as_i64().unwrap_or_default();
+    if revision != expected_revision {
+        return Err(WorkbenchError::new(
+            "revision_conflict",
+            format!("The task is at revision {revision}, not {expected_revision}."),
+        ));
+    }
+    let mut input = resend(&item, id, revision, "verify");
+    if let Some(status) = status {
+        input.insert("status".into(), json!(status));
+    }
+    let logs = append_log(item["logs"].as_str().unwrap_or_default(), block)
+        .ok_or_else(|| WorkbenchError::new("invalid_input", "The task's logs are full."))?;
+    input.insert("logs".into(), json!(logs));
+    Ok(query(store, "items.put", &Value::Object(input).to_string())?["item"].clone())
+}
+
 /// Bound on the reason an agent gives for deleting or merging a task.
 pub(crate) const MAX_REASON_CHARS: usize = 1000;
 /// Opens the log block a deletion reason is recorded in. Present tense on
@@ -1555,7 +1769,7 @@ const DELETION_MARKER: &str = "--- Agent is deleting this task (";
 /// item id follows, so a deleted task can say where its work went.
 const MERGE_MARKER: &str = "--- Agent merged this task into ";
 
-fn timestamp(at_ms: i64) -> String {
+pub(crate) fn timestamp(at_ms: i64) -> String {
     crate::ledger::ids::iso8601_utc(u64::try_from(at_ms).unwrap_or_default())
 }
 
@@ -1597,36 +1811,17 @@ fn board_repository(store: &Store, repo_path: &str) -> Result<Value, WorkbenchEr
 /// store has never had it. `items.get` hides deleted items, `items.history`
 /// does not.
 fn last_revision(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
-    let mut after = 0_i64;
-    let mut last = None;
-    for _ in 0..50 {
-        let input = json!({"id": id, "limit": 200, "after_revision": after});
-        let page = match query(store, "items.history", &input.to_string()) {
-            Ok(page) => page,
-            Err(error) if error.code == "not_found" => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let revisions = page["items"]
-            .as_array()
-            .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid task history page."))?;
-        if let Some(revision) = revisions.last() {
-            last = Some(revision.clone());
-        }
-        if page["has_more"] != true {
-            return Ok(last);
-        }
-        let next = page["next_cursor"]
-            .as_i64()
-            .filter(|next| *next > after)
-            .ok_or_else(|| {
-                WorkbenchError::new("protocol_error", "Task history cursor did not advance.")
-            })?;
-        after = next;
-    }
-    Err(WorkbenchError::new(
-        "registry_limit",
-        "The task's history is longer than 10,000 revisions; delete it on the board.",
-    ))
+    // Newest first, one row: no walk from revision 0 through every body.
+    let input = json!({"id": id, "limit": 1, "newest_first": true});
+    let page = match query(store, "items.history", &input.to_string()) {
+        Ok(page) => page,
+        Err(error) if error.code == "not_found" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let revisions = page["items"]
+        .as_array()
+        .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid task history page."))?;
+    Ok(revisions.first().cloned())
 }
 
 /// A deleted board task that was linked to `repository_id`, as last recorded.
@@ -1796,6 +1991,16 @@ fn refuse_in_use(
     ))
 }
 
+/// What a caller decided about one delete, handed to the store with it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct DeleteOptions<'a> {
+    /// The caller knows a run may still be working on the task and deletes it
+    /// anyway; the store's own live-run refusal is waived for exactly this.
+    pub even_if_running: bool,
+    /// The caller's idempotency key, already validated by [`check_request_id`].
+    pub request_id: Option<&'a str>,
+}
+
 /// What removing one task came to.
 enum Removal {
     /// Deleted; the store's receipt.
@@ -1826,6 +2031,7 @@ fn record_and_delete(
     block: &str,
     recorded: bool,
     request: &str,
+    delete: DeleteOptions<'_>,
 ) -> Result<Removal, WorkbenchError> {
     let mut revision = item["revision"]
         .as_i64()
@@ -1839,6 +2045,9 @@ fn record_and_delete(
             )
         })?;
         let mut input = resend(item, id, revision, request);
+        if let Some(request_id) = delete.request_id {
+            input.insert("request_id".into(), json!(format!("{request_id}-log")));
+        }
         input.insert("logs".into(), json!(joined));
         match query(store, "items.put", &Value::Object(input).to_string()) {
             Ok(saved) => {
@@ -1855,7 +2064,17 @@ fn record_and_delete(
             Err(error) => return Err(error),
         }
     }
-    let input = json!({"id": id, "request_id": fresh_id(request), "expected_revision": revision});
+    let mut input = json!({
+        "id": id,
+        "request_id": delete.request_id.map_or_else(|| fresh_id(request), str::to_owned),
+        "expected_revision": revision,
+    });
+    // The caller already passed (or waived) this check in the host. The store
+    // repeats it inside the delete's own transaction, so a run that prepared in
+    // between is still refused, and only a caller that said so skips it there.
+    if delete.even_if_running {
+        input["even_if_running"] = json!(true);
+    }
     match query(store, "items.delete", &input.to_string()) {
         Ok(receipt) => {
             // The receipt the board's own delete holds the store to.
@@ -1901,7 +2120,9 @@ pub(crate) fn delete_task(
     expected_revision: Option<i64>,
     reason: &str,
     even_if_running: bool,
+    request_id: Option<&str>,
 ) -> Result<Value, WorkbenchError> {
+    let request_id = check_request_id(request_id)?;
     let reason = check_reason(reason, "this task is being deleted")?;
     let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
@@ -1939,7 +2160,19 @@ pub(crate) fn delete_task(
             Err(error) => return Err(error),
         };
         let revision = item["revision"].as_i64().unwrap_or_default();
-        if expected_revision.is_some_and(|expected| expected != revision) {
+        // A retry after a refused delete finds its own reason already there.
+        let recorded = ends_with_block(
+            item["logs"].as_str().unwrap_or_default(),
+            DELETION_MARKER,
+            reason,
+        );
+        // That earlier call's own block write moved the revision by one. Its
+        // error says "run the same call again", so the identical retry, still
+        // carrying the revision it first read, must not be refused for the
+        // change it made itself.
+        let finishing_own_delete =
+            recorded && expected_revision.is_some_and(|expected| revision == expected + 1);
+        if expected_revision.is_some_and(|expected| expected != revision) && !finishing_own_delete {
             return Err(WorkbenchError::new(
                 "revision_conflict",
                 format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before deleting it.", expected_revision.unwrap_or_default()),
@@ -1947,14 +2180,12 @@ pub(crate) fn delete_task(
         }
         refuse_shared(&item, &repository_id)?;
         refuse_in_use(store, &id, &item, even_if_running)?;
-        // A retry after a refused delete finds its own reason already there.
-        let recorded = ends_with_block(
-            item["logs"].as_str().unwrap_or_default(),
-            DELETION_MARKER,
-            reason,
-        );
         let block = deletion_block(reason, now_millis());
-        match record_and_delete(store, &id, &item, &block, recorded, "delete")? {
+        let options = DeleteOptions {
+            even_if_running,
+            request_id,
+        };
+        match record_and_delete(store, &id, &item, &block, recorded, "delete", options)? {
             Removal::Deleted(receipt) => {
                 return Ok(response(
                     "deleted",
@@ -1993,7 +2224,7 @@ pub(crate) fn delete_task(
     ))
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -2004,9 +2235,31 @@ fn now_millis() -> i64 {
 mod merge;
 pub(crate) use merge::{merge_request, merge_tasks, MergeTask, MAX_MERGE_SOURCES};
 
+#[path = "intake_proposals.rs"]
+mod proposals;
+pub(crate) use proposals::{
+    apply_refinement, file_proposal, refine_split, scan_ref_params, scan_start_params,
+};
+
 #[cfg(test)]
 #[path = "intake_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "intake_proposals_tests.rs"]
+mod proposals_tests;
+
+#[cfg(test)]
+#[path = "intake_store_tests.rs"]
+mod store_tests;
+
+#[cfg(test)]
+#[path = "verification_gate_tests.rs"]
+pub(crate) mod gate_tests;
+
+#[cfg(test)]
+#[path = "verification_driver_tests.rs"]
+mod driver_tests;
 
 #[cfg(test)]
 #[path = "intake_merge_tests.rs"]

@@ -14,7 +14,7 @@
     WrapText,
   } from "@lucide/svelte";
   import { openInDefaultApp } from "../../desktop/openInShell";
-  import { repoStore } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import type { LineEnding } from "../../files/types";
   import { formatError } from "../../ui/formatError";
   import { copyText } from "../../desktop/clipboard";
@@ -27,6 +27,7 @@
     type RenderedMarkdown,
   } from "../../files/markdevRender";
   import { findFragmentTarget, type MarkdownNote } from "../../files/markdownLinks";
+  import { takeAnchor } from "../../files/pendingAnchor";
   import { docsBacklinks, type DocBacklink } from "../../docs/client";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
@@ -51,6 +52,7 @@
       text?: string | null;
       base64?: string | null;
       invalid_utf8_bytes?: number;
+      disk_base?: string | null;
       eol?: LineEnding | null;
     };
     draftContent?: string | null;
@@ -74,8 +76,17 @@
   let stats = $derived<DocumentStats>(calculateDocumentStats(rawContent));
   let outline = $derived(rendered.headings);
   let backlinks = $state<DocBacklink[]>([]);
+  /**
+   * The repository as a primitive, so `note` and the effects below depend on
+   * a string compared by value rather than on the whole store. repoStore
+   * publishes a fresh object per commit-message keystroke and per ~6s status
+   * poll; a `note` built straight from `$repoStore.currentPath` was a new
+   * object each time, which re-rendered the page (re-encoding its pictures)
+   * and refetched the backlinks on every publish.
+   */
+  const repoPath = $derived($currentRepoPath);
   let note = $derived<MarkdownNote | null>(
-    $repoStore.currentPath && filePath ? { repoPath: $repoStore.currentPath, path: filePath } : null,
+    repoPath && filePath ? { repoPath, path: filePath } : null,
   );
 
   /**
@@ -116,7 +127,7 @@
   });
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = repoPath;
     const path = filePath;
     let cancelled = false;
     backlinks = [];
@@ -158,6 +169,14 @@
       repoStore.setError(formatError(err));
     }
   }
+
+  // A link from another note lands on its section once this file's page exists.
+  $effect(() => {
+    void rendered;
+    if (!previewContainerEl || !note || shownFile !== filePath || !rendered.html) return;
+    const fragment = takeAnchor(note.repoPath, note.path);
+    if (fragment) findFragmentTarget(previewContainerEl, fragment)?.scrollIntoView({ block: "start" });
+  });
 
   function scrollToHeading(id: string) {
     if (!previewContainerEl) return;
@@ -379,6 +398,7 @@
           content={sourceContent}
           eol={blob.eol ?? null}
           invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
+          diskBase={blob.disk_base ?? null}
           {draftContent}
           {dirty}
           {onSave}
@@ -396,6 +416,7 @@
             content={sourceContent}
             eol={blob.eol ?? null}
             invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
+            diskBase={blob.disk_base ?? null}
             {draftContent}
             {dirty}
             {onSave}

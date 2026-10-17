@@ -12,6 +12,11 @@
 //! asserting nothing.
 #![cfg(unix)]
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -128,7 +133,10 @@ impl Fixture {
         text.lines()
             .filter_map(|line| {
                 let mut parts = line.split_whitespace();
-                Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+                let child: i32 = parts.next()?.parse().ok()?;
+                let grandchild: i32 = parts.next()?.parse().ok()?;
+                // 0, 1 and negatives address more than one process.
+                (child > 1 && grandchild > 1).then_some((child, grandchild))
             })
             .collect()
     }
@@ -225,11 +233,17 @@ fn sigterm(child: &Child) {
 fn sigterm_reaps_the_git_child_and_its_grandchild() {
     let fixture = Fixture::new();
     let log_dir = tempfile::tempdir().expect("log dir");
+    // The daemon takes a per-profile lock; a scratch profile keeps this test
+    // off the developer's real one (and off a daemon running there).
+    let profile = tempfile::tempdir().expect("profile dir");
     let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulsed"));
     command
         .arg("--once")
         .arg(fixture.repo())
         .env("GITPULSE_LOG_DIR", log_dir.path())
+        .env("HOME", profile.path())
+        .env("XDG_CONFIG_HOME", profile.path())
+        .env("APPDATA", profile.path())
         .stdin(Stdio::null())
         // To files rather than to `null`: a failure here has to be able to say
         // what the daemon thought it was doing, and pipes would need a drain

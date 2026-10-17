@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { IntervalHost } from "../dom/visibleInterval";
+import type { AdaptiveHost } from "../runtime/adaptiveTimer";
 import { createLivePoll, type LiveState } from "./livePoll";
 import type { PollLimits } from "./pollSchedule";
 
@@ -24,13 +24,13 @@ function makeHost() {
   let nextHandle = 1;
   let clock = 0;
 
-  const host: IntervalHost = {
-    setInterval: (handler) => {
+  const host: AdaptiveHost = {
+    setTimeout: (handler) => {
       const handle = nextHandle++;
       timers.set(handle, handler);
       return handle;
     },
-    clearInterval: (handle) => {
+    clearTimeout: (handle) => {
       timers.delete(handle as number);
     },
     addEventListener: (_type, listener) => listeners.add(listener),
@@ -46,7 +46,7 @@ function makeHost() {
     },
     /** Fire every live interval once, as the browser would. */
     fire() {
-      for (const handler of [...timers.values()]) handler();
+      { const due = [...timers.values()]; timers.clear(); for (const handler of due) handler(); }
     },
     get liveTimers() {
       return timers.size;
@@ -297,7 +297,7 @@ describe("visibility", () => {
     h.advance(60_000);
     h.setHidden(false);
     await Promise.resolve();
-    // `createVisibleInterval` runs the tick immediately on rejoin, so what is
+    // `createAdaptiveTimer` runs the tick immediately on rejoin, so what is
     // on screen is current at the moment someone looks at it.
     expect(pollCount()).toBe(1);
     live.dispose();

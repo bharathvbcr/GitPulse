@@ -23,8 +23,16 @@ use crate::engine::git_cli::{sandbox_join_entry, validate_repo};
 /// megabyte CHANGELOG cannot freeze the UI or the backend.
 ///
 /// Rendering is linear in MarkDev's own code, but pulldown-cmark itself is
-/// super-linear on some adversarial inputs (alternating `*a_` quadruples
-/// when it doubles): at this cap that is about a second, off-thread.
+/// super-linear on some adversarial inputs: alternating `*a_` triples take
+/// about four times as long each time the input doubles. Re-measured
+/// 2026-10-10 (release build, Apple silicon): 25 ms at 32 KiB, 96 ms at
+/// 64 KiB, 360 ms at this cap, off-thread. A debug build is about thirty times
+/// slower. The cap stays: lowering it would truncate real notes to defend
+/// against one input shape, and no cheap pre-scan separates that shape from
+/// snake_case-heavy prose without refusing legitimate files. Nesting is not a
+/// cost: quotes, lists, brackets, tables and raw HTML at the cap all render in
+/// under 15 ms without deep recursion
+/// (`hostile_input_at_the_cap_renders_without_exhausting_the_stack`).
 pub const MAX_RENDER_BYTES: usize = 128 * 1024;
 
 /// Most picture bytes one render embeds. The viewer re-renders as a note is
@@ -120,10 +128,12 @@ fn render_with(text: &str, files: Option<(&Path, &Path)>) -> Result<Fragment, HT
             asset_base,
             vault_root,
             file_access,
-            // Remote pictures load — the app's CSP admits https images — and
-            // go without a referrer. Remote audio and video stay blocked by
-            // the CSP's default-src.
-            remote_media: true,
+            // Repository Markdown is untrusted and the app's CSP admits https
+            // images, so a loaded remote picture is a beacon the reader never
+            // asked for. They render as `src="#"` with the address in
+            // `data-withheld-src`; the viewer loads one on click
+            // (`markdownLinks.ts`).
+            remote_media: false,
             max_embedded_bytes: Some(MAX_EMBEDDED_IMAGE_BYTES),
             ..Default::default()
         },
@@ -321,15 +331,63 @@ mod tests {
     }
 
     #[test]
-    fn remote_pictures_load_without_a_referrer() {
-        let rendered = html("![shot](https://example.com/s.png)");
+    fn remote_pictures_are_withheld_until_the_reader_clicks() {
+        let rendered = html("![shot](https://example.com/s.png)\n\n![p](//cdn.example/p.png)");
         assert!(
-            rendered.contains("src=\"https://example.com/s.png\""),
+            !rendered.contains(" src=\"https://example.com"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(" src=\"//cdn.example"), "{rendered}");
+        assert!(rendered.contains("src=\"#\""), "{rendered}");
+        assert!(
+            rendered.contains("data-withheld-src=\"https://example.com/s.png\""),
             "{rendered}"
         );
         assert!(
-            rendered.contains("referrerpolicy=\"no-referrer\""),
+            rendered.contains("data-withheld-src=\"//cdn.example/p.png\""),
             "{rendered}"
+        );
+    }
+
+    /// Hostile shapes at the byte cap each render, on a small stack, and
+    /// the super-linear one (`*a_`) stays bounded at a quarter of the cap, so
+    /// a change that makes it worse than the documented growth shows up here.
+    #[test]
+    fn hostile_input_at_the_cap_renders_without_exhausting_the_stack() {
+        let cases: Vec<(&str, String)> = vec![
+            ("deep quotes", "> ".repeat(MAX_RENDER_BYTES / 2)),
+            ("bare quote markers", ">".repeat(MAX_RENDER_BYTES)),
+            (
+                "deep lists",
+                (0..2000)
+                    .map(|i| format!("{}- a\n", "  ".repeat(i % 60)))
+                    .collect(),
+            ),
+            ("open brackets", "[".repeat(MAX_RENDER_BYTES)),
+            ("unclosed links", "[a](".repeat(MAX_RENDER_BYTES / 4)),
+            ("nested html", "<div>".repeat(MAX_RENDER_BYTES / 5)),
+            (
+                "many footnote refs",
+                (0..8000).map(|i| format!("[^{i}] ")).collect(),
+            ),
+        ];
+        for (name, source) in cases {
+            let (rendered, _) = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || (render(&source, None), ()))
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| panic!("{name} overflowed or panicked"));
+            assert!(rendered.is_ok(), "{name}: {:?}", rendered.err());
+        }
+        let emphasis = "*a_".repeat(MAX_RENDER_BYTES / 3 / 4);
+        let started = std::time::Instant::now();
+        render(&emphasis, None).unwrap();
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
+            "{:?} for a quarter-cap emphasis storm",
+            started.elapsed()
         );
     }
 

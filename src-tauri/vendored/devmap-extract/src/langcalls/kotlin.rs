@@ -43,7 +43,7 @@
 
 use super::jvm_dotnet::{receiver_of, record, CallSite};
 use super::scope::receiver_from;
-use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind};
+use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind, ScopeReceiver};
 use crate::treesitter::is_anonymous_callable;
 use tree_sitter::Node;
 
@@ -64,6 +64,68 @@ fn call_site<'tree>(node: Node<'tree>, source: &str) -> Option<CallSite<'tree>> 
         "call_expression" => {
             let callee = node.named_child(0)?;
             let (name, receiver) = callee_target(callee, source)?;
+            Some(CallSite {
+                call: node,
+                name,
+                receiver,
+                kind: ReferenceKind::Call,
+            })
+        }
+        // `vm::onEvent`, `Type::method`, `this::m`: the grammar parses a bound or
+        // qualified callable reference as a navigation expression whose
+        // separator is the anonymous `::` token. Only that token tells it from
+        // the member access `vm.onEvent`, which is not a call and records
+        // nothing here.
+        "navigation_expression" if has_child_kind(node, "::") => {
+            let count = node.named_child_count();
+            if count < 2 {
+                return None;
+            }
+            let name = node
+                .named_child(count - 1)
+                .filter(|name| name.kind() == "identifier")?;
+            let target = node.named_child(0)?;
+            let receiver = receiver_of(target, source, "this_expression");
+            Some(CallSite {
+                call: node,
+                name,
+                receiver,
+                kind: ReferenceKind::Call,
+            })
+        }
+        // `::helper`: an unbound reference to a function or a constructor.
+        "callable_reference" => {
+            let count = node.named_child_count();
+            let name = node
+                .named_child(count.checked_sub(1)?)
+                .filter(|name| name.kind() == "identifier")?;
+            let receiver = (count > 1)
+                .then(|| node.named_child(0))
+                .flatten()
+                .and_then(|target| receiver_of(target, source, "this_expression"));
+            Some(CallSite {
+                call: node,
+                name,
+                receiver,
+                kind: ReferenceKind::Call,
+            })
+        }
+        // `castOrNull<Task>(x)`: tree-sitter-kotlin-ng reads an explicit type
+        // argument list as two comparisons, `(castOrNull < Task) > (x)`. The
+        // shape is unambiguous — a comparison of a boolean with a parenthesised
+        // expression is not code anyone writes — so the callee is the left-most
+        // operand and the call is recorded.
+        "binary_expression" => {
+            let right = node.child_by_field_name("right")?;
+            let left = node.child_by_field_name("left")?;
+            if right.kind() != "parenthesized_expression"
+                || left.kind() != "binary_expression"
+                || !has_child_kind(node, ">")
+                || !has_child_kind(left, "<")
+            {
+                return None;
+            }
+            let (name, receiver) = callee_target(left.child_by_field_name("left")?, source)?;
             Some(CallSite {
                 call: node,
                 name,
@@ -93,9 +155,9 @@ fn call_site<'tree>(node: Node<'tree>, source: &str) -> Option<CallSite<'tree>> 
             Some(CallSite {
                 call: node,
                 name,
-                receiver: node
-                    .named_child(0)
-                    .and_then(|left| receiver_from(left, source)),
+                receiver: node.named_child(0).and_then(|left| {
+                    literal_receiver(left, source).or_else(|| receiver_from(left, source))
+                }),
                 kind: ReferenceKind::Call,
             })
         }
@@ -128,11 +190,16 @@ fn callee_target<'tree>(
                 return None;
             }
             let target = callee.named_child(0)?;
-            if target.kind() == "super_expression" {
-                return None;
-            }
             let name = callee.named_child(count - 1)?;
-            let receiver = receiver_of(target, source, "this_expression");
+            // `super.m()` is recorded with the receiver `super` so the resolver
+            // can read it against the enclosing type's supertypes. Recording
+            // the bare name instead let same-file resolution bind it to the
+            // override itself; refusing it left the base method uncalled.
+            if target.kind() == "super_expression" {
+                return Some((name, Some("super".to_string())));
+            }
+            let receiver = literal_receiver(target, source)
+                .or_else(|| receiver_of(target, source, "this_expression"));
             Some((name, receiver))
         }
         // A trailing lambda applied to a call, or a call of a call. The inner
@@ -144,4 +211,117 @@ fn callee_target<'tree>(
         kind if is_anonymous_callable(kind) || kind == "lambda_literal" => None,
         _ => None,
     }
+}
+
+/// Whether `node` has a direct child of exactly this kind (an anonymous token).
+fn has_child_kind(node: Node, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|child| child.kind() == kind);
+    found
+}
+
+/// The type a literal receiver has, so `"a b".slugify()` and `1 every 3` are
+/// receiver-bearing calls on `String` and `Int` and join to an extension
+/// function declared on that type. A literal says its own type outright.
+fn literal_receiver(node: Node, source: &str) -> Option<String> {
+    let text = match node.kind() {
+        // `(x as? Door).hello()`: the cast says what the receiver is.
+        "parenthesized_expression" => return cast_type(node, source),
+        "string_literal" => return Some("String".to_string()),
+        "number_literal" => crate::treesitter::get_node_text(node, source),
+        _ => return None,
+    };
+    let kind = if text.ends_with('L') {
+        "Long"
+    } else if text.starts_with("0x") || text.starts_with("0X") || text.starts_with("0b") {
+        "Int"
+    } else if text.contains('.') || text.ends_with(['f', 'F']) {
+        "Double"
+    } else {
+        "Int"
+    };
+    Some(kind.to_string())
+}
+
+/// Every `x.apply { .. }`, `x.run { .. }` and `with(x) { .. }` lambda in the
+/// file, with the written expression its `this` is.
+///
+/// Walked once with an explicit stack: the tree is repository-controlled and a
+/// recursive walk would spend native stack on its depth.
+pub(crate) fn scope_receivers(root: Node, source: &str) -> Vec<ScopeReceiver> {
+    let mut found = Vec::new();
+    let mut worklist = vec![root];
+    while let Some(node) = worklist.pop() {
+        if crate::treesitter::walk_deadline_passed() {
+            break;
+        }
+        if node.kind() == "call_expression" {
+            if let Some(scope) = scope_function_lambda(node, source) {
+                found.push(scope);
+            }
+        }
+        let mut cursor = node.walk();
+        worklist.extend(node.named_children(&mut cursor));
+    }
+    found.sort_by_key(|scope| (scope.body_start, scope.body_end));
+    found
+}
+
+fn scope_function_lambda(call: Node, source: &str) -> Option<ScopeReceiver> {
+    let callee = call.named_child(0)?;
+    let lambda = call
+        .named_child(1)
+        .filter(|node| node.kind() == "annotated_lambda")?
+        .named_child(0)
+        .filter(|node| node.kind() == "lambda_literal")?;
+    let receiver = match callee.kind() {
+        // `x.apply { }` / `x.run { }`
+        "navigation_expression" if callee.named_child_count() == 2 => {
+            let function = callee.named_child(1)?;
+            if !matches!(
+                crate::treesitter::get_node_text(function, source).as_str(),
+                "apply" | "run"
+            ) {
+                return None;
+            }
+            receiver_from(callee.named_child(0)?, source)?
+        }
+        // `with(x) { }`
+        "call_expression" => {
+            let function = callee.named_child(0)?;
+            if function.kind() != "identifier"
+                || crate::treesitter::get_node_text(function, source) != "with"
+            {
+                return None;
+            }
+            let arguments = callee.named_child(1)?;
+            if arguments.named_child_count() != 1 {
+                return None;
+            }
+            receiver_from(arguments.named_child(0)?.named_child(0)?, source)?
+        }
+        _ => return None,
+    };
+    Some(ScopeReceiver {
+        body_start: lambda.start_byte(),
+        body_end: lambda.end_byte(),
+        receiver,
+    })
+}
+
+/// The type a parenthesised `as`/`as?` cast names: `Door` in `(x as? Door)`.
+fn cast_type(parenthesized: Node, source: &str) -> Option<String> {
+    let cast = parenthesized.named_child(0).filter(|inner| {
+        inner.kind() == "as_expression" && parenthesized.named_child_count() == 1
+    })?;
+    let ty = cast.child_by_field_name("right")?;
+    if ty.kind() != "user_type" {
+        return None;
+    }
+    let mut cursor = ty.walk();
+    let name = ty
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .last()?;
+    Some(crate::treesitter::get_node_text(name, source))
 }

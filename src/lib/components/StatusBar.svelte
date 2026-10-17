@@ -23,6 +23,10 @@
   import { RadioTower } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { resolveStatusBarMode } from "../ui/statusBarMode";
+  import { hostLoadPulse, startHostLoad } from "../stores/hostLoadStore";
+  import { statusChip } from "../health/hostLoad";
+  import { onMount } from "svelte";
+  import { Gauge } from "@lucide/svelte";
 
   let {
     onOpenShortcuts,
@@ -55,6 +59,14 @@
    * branch name look current.
    */
   let watchState = $derived($repoStore.watch);
+
+  /**
+   * Host memory pressure, said only when it matters: pressure up, the
+   * compressor thrashing, or the sampler stopped. A quiet machine adds
+   * nothing to the bar (`health/hostLoad.ts` owns the rule).
+   */
+  let loadChip = $derived(statusChip($hostLoadPulse));
+  onMount(() => startHostLoad());
   let watchLabel = $derived(watchMarker(watchState));
 
   let operationState = $derived($repoStore.operation);
@@ -121,6 +133,25 @@
         <RadioTower size={11} class="shrink-0" />
         <span>{watchLabel}</span>
       </span>
+    {/if}
+
+    <!-- Host memory pressure. Absent while the machine is fine. -->
+    {#if loadChip}
+      <button
+        type="button"
+        onclick={() => repoStore.setActiveTab("insights", "health")}
+        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border px-1.5 py-0.2 font-medium transition-colors {loadChip.tone ===
+        'danger'
+          ? 'border-rose-500/50 bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20'
+          : loadChip.tone === 'warn'
+            ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
+            : 'border-border/60 bg-surfaceHover text-textMuted hover:text-textPrimary'}"
+        title={loadChip.title}
+        data-testid="status-host-load"
+      >
+        <Gauge size={11} class="shrink-0" />
+        <span>{loadChip.text}</span>
+      </button>
     {/if}
 
     <!-- Parked operation: merge / rebase / cherry-pick / revert / bisect -->

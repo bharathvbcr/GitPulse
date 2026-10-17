@@ -678,6 +678,90 @@ it("persists bounded terminal preferences through the existing store", () => {
   expect(get(interfaceStore).terminalLauncher).toBe("shell");
 });
 
+it("keeps terminal scrollback within bounds, with a smaller default for agents", () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalScrollback).toBe(5000);
+  expect(get(interfaceStore).terminalAgentScrollback).toBe(1000);
+  interfaceStore.setTerminalScrollback(1e9);
+  interfaceStore.setTerminalAgentScrollback(-3);
+  expect(get(interfaceStore).terminalScrollback).toBe(50_000);
+  expect(get(interfaceStore).terminalAgentScrollback).toBe(100);
+  interfaceStore.setTerminalScrollback(Number.NaN);
+  expect(get(interfaceStore).terminalScrollback).toBe(5000);
+  interfaceStore.reset();
+});
+
+it("treats GPU terminal rendering as on by default, switchable, and falls back to on for a corrupt value", async () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalGpu).toBe(true);
+  interfaceStore.setTerminalGpu(false);
+  expect(get(interfaceStore).terminalGpu).toBe(false);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalGpu).toBe(true);
+
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalGpu: false }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalGpu).toBe(false);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalGpu: "no" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalGpu).toBe(true);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
+it("treats Option as Meta as on by default, switchable, and falls back to on for a corrupt value", async () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);
+  interfaceStore.setTerminalOptionAsMeta(false);
+  expect(get(interfaceStore).terminalOptionAsMeta).toBe(false);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);
+
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalOptionAsMeta: false }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalOptionAsMeta).toBe(false);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalOptionAsMeta: "no" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalOptionAsMeta).toBe(true);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
+it("reads stored terminal scrollback clamped, and ignores a corrupt one", async () => {
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({
+    gitpulse_interface_prefs: JSON.stringify({ terminalScrollback: 2000, terminalAgentScrollback: 99_999_999 }),
+  });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    const loaded = (await import("../interfaceStore")).interfaceStore;
+    expect(get(loaded)).toMatchObject({ terminalScrollback: 2000, terminalAgentScrollback: 50_000 });
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalScrollback: "lots", terminalAgentScrollback: null }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({
+      terminalScrollback: 5000,
+      terminalAgentScrollback: 1000,
+    });
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("reloads terminal preferences and rejects corrupt stored values", async () => {
   const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
   const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalFontSize: 20, terminalLauncher: "manvi" }) });
@@ -687,6 +771,8 @@ it("reloads terminal preferences and rejects corrupt stored values", async () =>
     const first = (await import("../interfaceStore")).interfaceStore;
     expect(get(first)).toMatchObject({ terminalFontSize:20, terminalLauncher:"manvi" });
     first.setTerminalFontSize(18); first.setTerminalLauncher("codex");
+    // Saves are deferred; leaving the page flushes them, as this does.
+    first.flush();
     vi.resetModules();
     expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({ terminalFontSize:18, terminalLauncher:"codex" });
     storage.setItem("gitpulse_interface_prefs", JSON.stringify({terminalFontSize:"large", terminalLauncher:"unknown"}));
@@ -823,6 +909,8 @@ describe("tasks board view preferences", () => {
       first.setTaskDensity("compact");
       first.toggleTaskColumn("done");
       first.setTaskCardFields(["owner", "due"]);
+      // Saves are deferred; leaving the page flushes them, as this does.
+      first.flush();
       vi.resetModules();
       expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({
         taskLayout: "list",

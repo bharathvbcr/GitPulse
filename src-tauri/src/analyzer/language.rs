@@ -41,6 +41,14 @@ const IGNORED_DIR_COMPONENTS: &[&str] = &[
     "target",
     "dist",
     "vendor",
+    "vendored",
+    // Linguist's `(3rd|[Tt]hird)[-_]?[Pp]arty/`; the comparison ignores case.
+    "thirdparty",
+    "third_party",
+    "third-party",
+    "3rdparty",
+    "3rd_party",
+    "3rd-party",
     "__pycache__",
     ".venv",
     "venv",
@@ -74,6 +82,30 @@ const LOCKFILE_NAMES: &[&str] = &[
     "gemfile.lock",
     "flake.lock",
 ];
+
+/// A path's `linguist-vendored` and `linguist-generated` attributes, as
+/// `git check-attr` reports them. `None` is "unspecified": the built-in
+/// directory, lockfile and file-name rules decide. `Some(true)` excludes the
+/// path; `Some(false)` (`-linguist-vendored`, `linguist-vendored=false`)
+/// overrides the built-in rule and counts it, which is how a repository says a
+/// directory the list would skip is its own code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinguistAttrs {
+    pub vendored: Option<bool>,
+    pub generated: Option<bool>,
+}
+
+impl LinguistAttrs {
+    /// Linguist's reading of one `check-attr` value: `set` and `true` are
+    /// true, `unset` and `false` are false, anything else is unspecified.
+    pub fn parse_value(value: &str) -> Option<bool> {
+        match value {
+            "set" | "true" => Some(true),
+            "unset" | "false" => Some(false),
+            _ => None,
+        }
+    }
+}
 
 /// Detects file language and assigns GitHub Linguist color palette.
 pub struct LanguageDetector;
@@ -178,12 +210,28 @@ impl LanguageDetector {
     }
 
     pub fn should_count_for_stats(path: &str, info: &LanguageInfo) -> bool {
-        if Self::is_ignored_source_path(path)
-            || Self::is_lockfile_path(path)
-            || Self::is_generated_path(path)
-        {
-            return false;
-        }
+        Self::should_count_for_stats_with(path, info, LinguistAttrs::default())
+    }
+
+    /// [`Self::should_count_for_stats`] with the path's Linguist attributes,
+    /// which take precedence over the built-in rules in both directions.
+    pub fn should_count_for_stats_with(
+        path: &str,
+        info: &LanguageInfo,
+        attrs: LinguistAttrs,
+    ) -> bool {
+        let vendored = attrs
+            .vendored
+            .unwrap_or_else(|| Self::is_ignored_source_path(path));
+        let generated = attrs
+            .generated
+            .unwrap_or_else(|| Self::is_lockfile_path(path) || Self::is_generated_path(path));
+        !vendored && !generated && Self::is_countable_kind(info)
+    }
+
+    /// Whether a file of this kind holds lines worth counting at all; images,
+    /// PDFs and binaries do not, wherever they live.
+    pub fn is_countable_kind(info: &LanguageInfo) -> bool {
         !matches!(info.name, "Image" | "PDF" | "Binary")
     }
 
@@ -320,8 +368,12 @@ impl LanguageDetector {
         }
     }
 
+    /// Leading bytes [`Self::looks_binary`] examines; nothing past them can
+    /// change its answer, so a reader may stop there.
+    pub const BINARY_PROBE_BYTES: usize = 8192;
+
     pub fn looks_binary(bytes: &[u8]) -> bool {
-        let probe = &bytes[..bytes.len().min(8192)];
+        let probe = &bytes[..bytes.len().min(Self::BINARY_PROBE_BYTES)];
         probe.contains(&0)
     }
 
@@ -1190,6 +1242,31 @@ mod tests {
         ));
         assert!(!LanguageDetector::is_ignored_source_path("src/target.rs"));
         assert!(!LanguageDetector::is_ignored_source_path("lib.rs"));
+    }
+
+    /// Vendored copies are not the repository's own code, under any of the
+    /// directory names Linguist recognises for them. `framework` is not one of
+    /// them: a crate may legitimately be called that, so a vendored framework
+    /// tree is marked `linguist-vendored` in `.gitattributes` instead.
+    #[test]
+    fn ignored_dirs_skip_vendored_and_third_party_but_not_a_framework_crate() {
+        for path in [
+            "src-tauri/vendored/dc-store/src/lib.rs",
+            "third_party/zlib/inflate.c",
+            "third-party/zlib/inflate.c",
+            "ThirdParty/zlib/inflate.c",
+            "3rdparty/zlib/inflate.c",
+        ] {
+            assert!(LanguageDetector::is_ignored_source_path(path), "{path}");
+        }
+        for path in [
+            "crates/framework/src/lib.rs",
+            "src-tauri/framework/tao/src/lib.rs",
+            "src/vendored.rs",
+            "src/third_party.rs",
+        ] {
+            assert!(!LanguageDetector::is_ignored_source_path(path), "{path}");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
   import type { HarnessPermissionMode } from "../harness/availability";
   import type { CatchUp } from "../ingest/types";
   import type { LedgerStatus } from "../ledger/types";
+  import type { MutationTarget } from "../repos/storeTypes";
   import { redactDiagnosticText } from "../diagnostics/diagnostics";
 
   export type StatusTone = "ready" | "warning" | "error" | "neutral";
@@ -226,10 +227,10 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy } from "svelte";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { onDestroy, untrack } from "svelte";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "../ipc/invoke";
   import type { GrantView } from "../grants/types";
@@ -269,6 +270,8 @@
   import { openSetupWizard } from "../tools/onboardingStore";
 
   let branchSuggestion = $state<string>("");
+  /** The repository the suggestion was made for; the branch is created there. */
+  let branchTarget = $state<MutationTarget | null>(null);
   let branchWarnings = $state<string[]>([]);
   let isSuggesting = $state(false);
   let branchError = $state<string | null>(null);
@@ -302,7 +305,6 @@
   let grantsLoading = $state(false);
   let grantsLoadError = $state<string | null>(null);
   let grantClock = $state(Date.now());
-  let grantsRepo: string | null = null;
   const grantRequests = beginGeneration();
   const grantRefreshTimer = createRepositoryRefreshTimer(
     10_000,
@@ -313,10 +315,10 @@
     {
       // Visibility-aware for the same reason the status poll is: this timer
       // re-reads grants every ten seconds, and a hidden window has no grants
-      // display to keep current. `createVisibleInterval` starts, stops and
+      // display to keep current. `createAdaptiveTimer` starts, stops and
       // catches up on its own, so the scheduler seam stays a plain
       // setInterval/clearInterval pair for tests.
-      setInterval: (callback, delayMs) => createVisibleInterval(callback, delayMs),
+      setInterval: (callback, delayMs) => createAdaptiveTimer(callback, delayMs),
       clearInterval: (handle) => (handle as () => void)(),
     },
   );
@@ -346,20 +348,19 @@
     }
   }
 
+  // Keyed on the repository alone, so the ~6s status poll does not reload.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    // Guarded on a genuine repo switch: this effect re-runs on every store
-    // emission, and the ~6s status poll is one.
-    if (repo === grantsRepo) return;
-    grantsRepo = repo;
-    if (!repo) {
-      grantRequests.next();
-      grants = null;
-      grantsLoadError = null;
-      grantsLoading = false;
-      return;
-    }
-    void refreshGrants(repo, true);
+    const repo = $currentRepoPath;
+    untrack(() => {
+      if (!repo) {
+        grantRequests.next();
+        grants = null;
+        grantsLoadError = null;
+        grantsLoading = false;
+        return;
+      }
+      void refreshGrants(repo, true);
+    });
   });
 
   // Grant consumption and expiry can change while this pane remains mounted.
@@ -367,8 +368,8 @@
   // can publish unrelated same-path status changes more frequently than the
   // interval, and resetting on each one would starve this refresh forever.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    grantRefreshTimer.update(repo);
+    const repo = $currentRepoPath;
+    untrack(() => grantRefreshTimer.update(repo));
   });
 
   /** MANVI persists oldest first; retain spent grants as reviewable history. */
@@ -507,6 +508,7 @@
     isSuggesting = true;
     branchError = null;
     branchSuggestion = "";
+    branchTarget = repoStore.captureTarget();
     branchWarnings = [];
     try {
       const result = await harnessStore.suggestBranchName(path);
@@ -521,11 +523,13 @@
 
   async function createSuggestedBranch() {
     if (!branchSuggestion) return;
-    try {
-      await repoStore.createBranch(branchSuggestion);
+    // createBranch resolves { ok: false } on a refusal or a collision; it never
+    // throws, so the suggestion is kept and the reason shown unless it was made.
+    const outcome = await repoStore.createBranch(branchSuggestion, undefined, branchTarget);
+    if (outcome.ok) {
       branchSuggestion = "";
-    } catch (err: unknown) {
-      branchError = formatError(err);
+    } else {
+      branchError = outcome.error ?? "The branch could not be created.";
     }
   }
 </script>

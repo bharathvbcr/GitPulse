@@ -946,6 +946,7 @@
       "rewrites": [
         "FSEvents startup propagation and sticky shutdown source adapted from zed-industries/notify commit 6566ae63331ffd1f2025b18dc00c3049fb8588c9",
         "Preserve existing stream flags; validate stream/source allocation; release callback ownership on failed spawn; remove volume-history purge RPC",
+        "FSEvents callback cannot panic across the extern C boundary: lossless non-UTF-8 paths, unknown flag bits truncated, poisoned handler lock recovered, handler panics caught per batch",
         "Upstream tests retained; GitPulse native_watcher_faults exercises the shipped dependency through process-isolated native faults"
       ],
       "files": {
@@ -955,7 +956,7 @@
         "README.md": "cf2ca593d96e9f7bcb0461c13bad76a62f0565280288b93c2033c11b04b72b9a",
         "src/config.rs": "a1b1cefde56f80aa2853998dd6d8e1ff5d0c072e5e3668226d6992383e072272",
         "src/error.rs": "d5ac4ba74604ab3541c9cf73b872097586dcadf500aa12bb0c314de6c71de201",
-        "src/fsevent.rs": "c749e59b8c2599785067bb4d89ea7c7be54584fdb1cfb93a386d1741c8fd31da",
+        "src/fsevent.rs": "063f71c83d565d784004ee25ba4f8a15485512367c9562f8b043e1d768be5290",
         "src/inotify.rs": "41ba905f19f2c9f1ca80ed5f7d481690a07458e2e3e6280516c57e1e5dd7a228",
         "src/kqueue.rs": "07844f9220d1c79c768df27b2ce40bbacc8467ffcbafe34683dd07661de3eb6c",
         "src/lib.rs": "ce2f43eb5d58780d4f1c0a04a8b12ecc12969cef1b6509cfcd90e4ea66b61d90",
@@ -966,7 +967,7 @@
       "changes": {
         "src/fsevent.rs": {
           "upstream": "6b969f5a18454cfa764e7fd797861dc3495abe739db5fe834de6da57a69c7880",
-          "patched": "c749e59b8c2599785067bb4d89ea7c7be54584fdb1cfb93a386d1741c8fd31da"
+          "patched": "063f71c83d565d784004ee25ba4f8a15485512367c9562f8b043e1d768be5290"
         }
       }
     }

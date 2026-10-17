@@ -2,16 +2,18 @@
   import type { AiGeneration } from "../stores/harnessStore";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
+  import { currentRepoPath, repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
+  import { reportFailure } from "../stores/mutationOutcome";
+  import { offerBranchUndo } from "../repos/branchUndo";
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
   import { formatError } from "../ui/formatError";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
   import MergeBranchDialog from "./MergeBranchDialog.svelte";
-  import { enumerateFocusables } from "../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     branchLeafName,
     countFolder,
@@ -20,6 +22,7 @@
     highlightMatches,
     isStaleBranch,
     localNameFor,
+    checkoutNameFor,
   } from "../branches/groupBranches";
   import {
     flattenRows,
@@ -47,6 +50,7 @@
   import { popover } from "../ui/popover";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
+  import { repoScope } from "../repos/repoScope.svelte";
   import { branchRowHeight, sidebarRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
   import { formatTimestamp, timestampTitle } from "../ui/timestampStyle";
   import { plural } from "../format";
@@ -322,25 +326,35 @@
    * badge is claiming: not that the verified tree changed (it cannot), but how
    * far the mainline has moved past the point where it was checked. Without a
    * default branch we send null and the backend measures against HEAD.
+   *
+   * Both effects read only the repository key and these derived values, never
+   * `$repoStore` itself: reading the store makes an effect re-run on every
+   * emission — a status poll, a diff selection, a loading flag — and each
+   * re-run here was a batch. These notify only when they change, so the batch
+   * is asked again when the branches are re-read (a refresh, which is also
+   * when a new note can have been written) or the repository changes, and not
+   * otherwise. The reset depends on the repository alone.
    */
-  const branchTips = $derived([...new Set($repoStore.branches.map((b) => b.tip_commit_id))]);
+  const freshness = freshnessStore.consumer("branches");
+  const branchInfos = $derived($repoStore.branches);
+  const branchTips = $derived([...new Set(branchInfos.map((b) => b.tip_commit_id))]);
   const defaultBranchName = $derived(
-    $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
+    branchInfos.find((b) => b.is_default && !b.is_remote)?.name ?? null,
   );
 
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     const tips = branchTips;
     const base = defaultBranchName;
     if (!path || tips.length === 0) return;
-    void freshnessStore.load(path, tips, base);
+    void freshness.load(path, tips, base);
   });
 
   $effect(() => {
     // A repository switch must not leave the previous repository's
-    // verifications painted onto this one's branches.
-    void $repoStore.currentPath;
-    freshnessStore.reset();
+    // verifications painted onto this one's branches. Idempotent, so it
+    // cannot drop a load already made for this repository.
+    freshnessStore.forRepo($currentRepoPath);
   });
 
   function selectRef(name: string) {
@@ -386,7 +400,7 @@
           toggle(row.folderId, "local");
         } else if (row.kind === "branch") {
           if (e.metaKey || e.ctrlKey) {
-            checkoutName(localNameFor(row.branch));
+            checkoutName(checkoutNameFor(row.branch));
           } else {
             selectRef(row.branch.name);
           }
@@ -440,20 +454,25 @@
     if (suggesting) return;
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     suggesting = true;
     try {
       const gen = await invoke<AiGeneration>("cmd_ai_suggest_branch_name", {
         repoPath: repo,
       });
-      // The suggestion raced a tab switch: it belongs to another repo now.
-      if ($repoStore.currentPath !== repo) return;
+      // The suggestion raced a tab switch: it belongs to another repo now,
+      // even when the person has since switched back (the epoch counts
+      // switches, the path only compares endpoints).
+      if (!tabScope.isCurrent(epoch)) return;
       const raw = (gen?.text || "").trim().split(/\s+/)[0] || "";
       if (raw) createName = raw.replace(/^[#`]+/, "").replace(/[`]+$/, "");
     } catch (err) {
-      if ($repoStore.currentPath !== repo) return;
+      if (!tabScope.isCurrent(epoch)) return;
       repoStore.setError(formatError(err));
     } finally {
-      suggesting = false;
+      // A switch already cleared the flag; a stale request must not clear the
+      // new repository's own in-flight one.
+      if (tabScope.isCurrent(epoch)) suggesting = false;
     }
   }
 
@@ -498,34 +517,6 @@
   function menuItemEls(): HTMLButtonElement[] {
     if (!menuEl) return [];
     return [...menuEl.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-  }
-
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
   }
 
   function handleMenuKeydown(e: KeyboardEvent) {
@@ -584,6 +575,8 @@
 
   async function runCreateTag(at?: { name: string; commitId: string }) {
     closeMenu();
+    // The repository this was asked about, held across the prompt.
+    const target = repoStore.captureTarget();
     const name = await askText({
       title: at ? `Create tag at ${at.name}` : "Create tag at HEAD",
       message: at
@@ -594,22 +587,26 @@
     });
     const trimmed = name?.trim();
     if (!trimmed) return;
-    await repoStore.createTag(trimmed, at?.commitId);
+    const outcome = await repoStore.createTag(trimmed, at?.commitId, undefined, target);
+    reportFailure(outcome, "Could not create the tag");
   }
 
   async function runDeleteTag(tag: TagInfo) {
     closeMenu();
+    const target = repoStore.captureTarget();
     const ok = await askConfirm({
       title: "Delete tag",
       message: `Delete tag ${tag.name}? The commit it points at is untouched.`,
       confirmLabel: "Delete",
     });
     if (!ok) return;
-    await repoStore.deleteTag(tag.name);
+    const outcome = await repoStore.deleteTag(tag.name, target);
+    reportFailure(outcome, "Could not delete the tag");
   }
 
   async function runRename(branch: BranchInfo) {
     closeMenu();
+    const target = repoStore.captureTarget();
     const next = await askText({
       title: "Rename branch",
       message: branch.name,
@@ -618,11 +615,14 @@
     });
     const trimmed = next?.trim();
     if (!trimmed || trimmed === branch.name) return;
-    await repoStore.renameBranch(branch.name, trimmed);
+    const outcome = await repoStore.renameBranch(branch.name, trimmed, target);
+    reportFailure(outcome, "Could not rename the branch");
   }
 
   async function runDelete(branch: BranchInfo) {
     closeMenu();
+    // Both confirms and the Undo run against the repository this was asked in.
+    const target = repoStore.captureTarget();
     // Two-step escalation (WorktreesPanel's armed remove is the house style):
     // the first confirm runs the SAFE delete. Only an explicit second confirm
     // — shown when git refused because the branch is unmerged — retries with
@@ -636,37 +636,26 @@
     if (!ok) return;
     const branchSha = branch.tip_commit_id;
     const branchName = branch.name;
-    const outcome = await repoStore.deleteBranch(branch.name, false);
+    const tips = branchSha ? [{ name: branchName, tip: branchSha }] : [];
+    const outcome = await repoStore.deleteBranch(branch.name, false, target);
     if (outcome.ok) {
-      if (branchSha) {
-        toastStore.action(`Deleted branch "${branchName}"`, "Undo", async () => {
-          await repoStore.createBranch(branchName, branchSha);
-          toastStore.success(`Restored branch "${branchName}"`);
-        });
-      } else {
-        toastStore.success(`Deleted branch "${branchName}"`);
-      }
+      offerBranchUndo(`Deleted branch "${branchName}"`, tips, target);
       return;
     }
     const decision = escalateDeleteDecision(outcome.error ?? "", branch);
-    if (!decision.canRetryForce || !decision.message) return;
+    if (!decision.canRetryForce || !decision.message) {
+      reportFailure(outcome, "Could not delete the branch");
+      return;
+    }
     const forceOk = await askConfirm({
       title: "Force-delete branch",
       message: decision.message,
       confirmLabel: "Force delete",
     });
     if (!forceOk) return;
-    const forceOutcome = await repoStore.deleteBranch(branch.name, true);
-    if (forceOutcome.ok) {
-      if (branchSha) {
-        toastStore.action(`Force deleted branch "${branchName}"`, "Undo", async () => {
-          await repoStore.createBranch(branchName, branchSha);
-          toastStore.success(`Restored branch "${branchName}"`);
-        });
-      } else {
-        toastStore.success(`Force deleted branch "${branchName}"`);
-      }
-    }
+    const forceOutcome = await repoStore.deleteBranch(branch.name, true, target);
+    if (!reportFailure(forceOutcome, "Could not force-delete the branch")) return;
+    offerBranchUndo(`Force deleted branch "${branchName}"`, tips, target);
   }
 
   async function runCompare(branch: BranchInfo) {
@@ -730,10 +719,42 @@
   });
 
   $effect(() => {
-    if ($repoStore.currentPath) {
-      loadPinned();
-    }
+    if ($currentRepoPath) untrack(loadPinned);
   });
+
+  /**
+   * The list is mounted once per window, so a tab switch re-points the store
+   * and nothing else. Everything below is the repository being left: what was
+   * typed, which folders were opened, the highlighted row, an open context menu
+   * (an open context menu included), a half-typed new branch name, and how far
+   * the list was scrolled. The merge dialog is NOT closed here: it carries the
+   * repository it was opened for and owns this case itself, staying up with
+   * "The repository changed" and refusing to merge (`mergeBlockedReason`,
+   * pinned by the `branches` harness). Closing it from under that contract
+   * would also take away the one place that says why. The pins are re-read for
+   * the new repository here rather than waiting for the effect above, which
+   * runs after the first paint. `freshnessStore` is reset by its own effect.
+   */
+  const tabScope = repoScope(
+    () => $currentRepoPath,
+    () => {
+      applyFilter.cancel();
+      query = "";
+      debouncedQuery = "";
+      activeTab = "all";
+      creating = false;
+      createName = "";
+      suggesting = false;
+      collapsed = {};
+      selectedIndex = -1;
+      locateName = null;
+      closeMenu();
+      scrollTop = 0;
+      if (containerEl) containerEl.scrollTop = 0;
+      pinnedSignature = null;
+      loadPinned();
+    },
+  );
 
   onMount(() => {
     // One-shot eviction sweep: bounds the per-repo pin keys on disk even if
@@ -929,12 +950,12 @@
     <button
       type="button"
       onclick={() => selectRef(branch.name)}
-      ondblclick={() => checkoutName(localNameFor(branch))}
+      ondblclick={() => checkoutName(checkoutNameFor(branch))}
       onkeydown={(event) => {
         if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
           event.preventDefault();
           event.stopPropagation();
-          checkoutName(localNameFor(branch));
+          checkoutName(checkoutNameFor(branch));
         }
       }}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
@@ -1346,7 +1367,7 @@
         {pinnedNames.has(b.name) ? "Unpin branch" : "Pin branch"}
       </button>
       {#if !b.is_current}
-        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = localNameFor(b); closeMenu(); checkoutName(name); }}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = checkoutNameFor(b); closeMenu(); checkoutName(name); }}>
           <GitBranch size={12} /> Checkout
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, "default")}>
@@ -1392,8 +1413,8 @@
       {/if}
     {:else if menu.tag}
       {@const t = menu.tag}
-      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); checkoutName(name); }}>
-        <GitBranch size={12} /> Checkout
+      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); void repoStore.checkoutDetached(name); }}>
+        <GitBranch size={12} /> Checkout (detached)
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); selectRef(name); }}>
         <Tag size={12} /> Filter history

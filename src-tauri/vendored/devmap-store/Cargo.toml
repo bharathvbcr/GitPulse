@@ -2,6 +2,7 @@
 name = "devmap-store"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "SQLite store and schema migrations for the DevCouncil code-intelligence kernel"
@@ -100,4 +101,19 @@ required-features = ["parse"]
 # link.
 [[test]]
 name = "a_damaged_full_text_index_is_named"
+required-features = ["parse"]
+
+# Attack on the parse-budget retry versus the generation fallback of the extraction cache.
+[[test]]
+name = "a_budget_refusal_is_not_reused_from_a_generation"
+required-features = ["parse"]
+
+# A recovered file replaces its stored budget refusal; needs `save_generation`.
+[[test]]
+name = "a_recovered_file_replaces_its_stored_budget_refusal"
+required-features = ["parse"]
+
+# Shared-payload rewrite attack; needs `save_generation`.
+[[test]]
+name = "a_shared_payload_row_does_not_misreport_a_generation"
 required-features = ["parse"]

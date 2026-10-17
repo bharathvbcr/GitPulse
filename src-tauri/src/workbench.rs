@@ -5,15 +5,18 @@
 use dc_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
 mod agent_worktree;
+pub(crate) mod claude_hook;
 pub(crate) mod conversation;
-pub(crate) mod external_changes;
+#[doc(hidden)]
+pub mod external_changes;
 mod in_flight;
 pub(crate) mod intake;
 mod managed_run;
@@ -21,12 +24,24 @@ pub(crate) mod notifications;
 pub(crate) mod process_birth;
 mod receipts;
 mod reconcile;
+pub(crate) mod retention;
 pub mod review;
+mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
-mod terminal_run;
+pub(crate) mod terminal_run;
+pub(crate) mod verification_driver;
+pub(crate) mod verification_gate;
+pub(crate) mod verify_status;
 
 const MAX_IN_FLIGHT: usize = 8;
+/// Requests that may wait for one of the [`MAX_IN_FLIGHT`] slots. Each waits
+/// on a blocking-pool thread, so this bounds the threads a burst can hold.
+const MAX_QUEUED: usize = 32;
+/// How long a request waits for a slot before it is answered `busy`. One
+/// change makes every open surface re-read together; a short queue absorbs
+/// that burst, where refusing on the spot showed "Task storage is busy".
+const ADMIT_WAIT: Duration = Duration::from_secs(3);
 const MAX_INPUT: usize = 1024 * 1024;
 const MAX_MODEL_BASE_URL: usize = 512;
 const MAX_MODEL_ID: usize = 128;
@@ -41,6 +56,27 @@ type WorkerFingerprint = Option<(String, String)>;
 /// An open-file scan of a directory: `Ok` only when nothing is open in it.
 #[cfg(test)]
 type OpenFiles = fn(&std::path::Path) -> Result<(), String>;
+
+/// Longest identifier the host accepts from the renderer.
+pub(crate) const MAX_RECORD_ID_BYTES: usize = 128;
+
+/// Whether `id` is a plain record identifier: non-empty, at most `max_len`
+/// bytes, ASCII letters, digits, `_` and `-` only.
+///
+/// The single owner of the identifier shape every workbench request validates
+/// before it reaches a query or a path.
+pub(crate) fn is_record_id_within(id: &str, max_len: usize) -> bool {
+    !id.is_empty()
+        && id.len() <= max_len
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// [`is_record_id_within`] at the standard [`MAX_RECORD_ID_BYTES`].
+pub(crate) fn is_record_id(id: &str) -> bool {
+    is_record_id_within(id, MAX_RECORD_ID_BYTES)
+}
 
 #[derive(Debug, Serialize)]
 pub struct WorkbenchError {
@@ -67,7 +103,9 @@ impl From<dc_store::workbench::Error> for WorkbenchError {
 struct Inner {
     store: Mutex<Option<Store>>,
     closed: AtomicBool,
-    in_flight: AtomicUsize,
+    admission: Mutex<Admission>,
+    /// Signalled when a slot frees, and on shutdown.
+    admitted: Condvar,
     // Only tests supply a path. IPC cannot select a repository lease database.
     path: Option<PathBuf>,
     notifications: OnceLock<notifications::Coordinator>,
@@ -102,10 +140,24 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct WorkbenchState(Arc<Inner>);
 
+/// Store requests running, and waiting to run.
+#[derive(Default)]
+struct Admission {
+    in_flight: usize,
+    queued: usize,
+}
+
 struct Reservation(Arc<Inner>);
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+        let mut slots = self
+            .0
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        slots.in_flight = slots.in_flight.saturating_sub(1);
+        drop(slots);
+        self.0.admitted.notify_one();
     }
 }
 
@@ -127,6 +179,33 @@ impl WorkbenchState {
             return check(path);
         }
         crate::storage::hygiene::open_files_under(path)
+    }
+
+    /// Refuses to tear down `worktree_path` while anything is working in it:
+    /// a task run (see [`Self::refuse_if_run_working_in`]) or any process at
+    /// all whose working directory is inside it. Run rows know only the
+    /// attempts GitPulse launched; an agent typed into a dock tab, a dev
+    /// server, a shell sitting in the directory has no row, and with no
+    /// workbench profile there are no rows to read. A process table that
+    /// cannot be read refuses: it is not "nobody is there".
+    pub(crate) fn refuse_if_in_use(&self, worktree_path: &str) -> Result<(), String> {
+        self.refuse_if_run_working_in(worktree_path)?;
+        let target = std::path::Path::new(worktree_path);
+        let target = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        match crate::terminal::foreground::working_in(&target) {
+            Ok(pids) if pids.is_empty() => Ok(()),
+            Ok(pids) => Err(format!(
+                "{} still working in this worktree ({}). Close {} before removing the worktree.",
+                if pids.len() == 1 { "A process is" } else { "Processes are" },
+                crate::terminal::foreground::describe_pids(&pids),
+                if pids.len() == 1 { "it" } else { "them" },
+            )),
+            Err(error) => Err(format!(
+                "Could not check whether a process is still working in this worktree, so it was left alone: {error}"
+            )),
+        }
     }
 
     /// Refuses to tear down `worktree_path` while a task run is working in
@@ -190,7 +269,7 @@ impl WorkbenchState {
         if !self.profile_path()?.exists() {
             return Ok(0);
         }
-        let released = reconcile::sweep(self);
+        let released = reconcile::sweep(self).map(|swept| swept.released);
         // Startup only, not every capacity sweep: each candidate costs an
         // open-file scan, and a launch must not wait on that.
         reconcile::reclaim_expired(self);
@@ -205,6 +284,15 @@ impl WorkbenchState {
             ));
         }
         Ok(())
+    }
+    /// The profile this host owns, for naming it in a record, without creating
+    /// anything on disk.
+    fn profile_label(&self) -> PathBuf {
+        self.0
+            .path
+            .clone()
+            .or_else(|| intake::default_profile_path().ok())
+            .unwrap_or_default()
     }
     fn profile_path(&self) -> Result<PathBuf, WorkbenchError> {
         let path = match &self.0.path {
@@ -227,45 +315,105 @@ impl WorkbenchState {
 
     pub(crate) fn shutdown(&self) {
         self.0.closed.store(true, Ordering::Release);
+        // The external-changes loop may be waiting out a hidden window.
+        external_changes::wake();
+        // Waiting requests are refused now rather than at their deadline.
+        // Taking the lock orders this wake after any waiter's check of `closed`.
+        drop(
+            self.0
+                .admission
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        self.0.admitted.notify_all();
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
-        if let Ok(guard) = self.0.worker.lock() {
-            if let Some((_, worker)) = guard.as_ref() {
-                if !worker.shutdown() {
-                    log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
-                }
+        let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+        if let Some((_, worker)) = guard.as_ref() {
+            if !worker.shutdown() {
+                log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
             }
         }
     }
+    /// A slot now, or `busy`.
+    #[cfg(test)]
     fn reserve(&self) -> Result<Reservation, WorkbenchError> {
+        self.reserve_within(Duration::ZERO)
+    }
+
+    /// A slot, waiting at most `limit` for one to free. Blocks: call it on a
+    /// blocking-pool thread ([`Self::admit`]). Refused at once when
+    /// [`MAX_QUEUED`] requests are already waiting, and on shutdown.
+    fn reserve_within(&self, limit: Duration) -> Result<Reservation, WorkbenchError> {
+        let busy = || WorkbenchError::new("busy", "Task storage is busy. Try again shortly.");
+        let deadline = Instant::now() + limit;
+        let mut slots = self
+            .0
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.check_open()?;
-        self.0
-            .in_flight
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_IN_FLIGHT).then_some(n + 1)
-            })
-            .map_err(|_| WorkbenchError::new("busy", "Task storage is busy. Try again shortly."))?;
+        if slots.in_flight >= MAX_IN_FLIGHT {
+            if limit.is_zero() || slots.queued >= MAX_QUEUED {
+                return Err(busy());
+            }
+            slots.queued += 1;
+            while slots.in_flight >= MAX_IN_FLIGHT && self.check_open().is_ok() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                slots = self
+                    .0
+                    .admitted
+                    .wait_timeout(slots, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            slots.queued -= 1;
+            // Shutdown woke every waiter, so none is owed this wake-up.
+            self.check_open()?;
+            if slots.in_flight >= MAX_IN_FLIGHT {
+                return Err(busy());
+            }
+        }
+        slots.in_flight += 1;
         Ok(Reservation(Arc::clone(&self.0)))
+    }
+
+    /// [`Self::reserve_within`] off the async runtime: a queued request holds
+    /// a blocking-pool thread, never an async worker.
+    async fn admit(&self) -> Result<Reservation, WorkbenchError> {
+        // A free slot, or a closed host, is answered here: only a request that
+        // must wait costs a blocking-pool thread.
+        match self.reserve_within(Duration::ZERO) {
+            Err(error) if error.code == "busy" => {}
+            done => return done,
+        }
+        let state = self.clone();
+        tauri::async_runtime::spawn_blocking(move || state.reserve_within(ADMIT_WAIT))
+            .await
+            .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))?
     }
 
     fn with_store<T>(
         &self,
         body: impl FnOnce(&Store) -> Result<T, WorkbenchError>,
     ) -> Result<T, WorkbenchError> {
-        let mut guard = self.0.store.lock().map_err(|_| {
-            WorkbenchError::new(
-                "store_error",
-                "Task storage lock failed; restart the application.",
-            )
-        })?;
+        let mut guard = crate::supervisor::lock_or_recover(&self.0.store);
         self.check_open()?;
         if guard.is_none() {
             let path = self.profile_path()?;
-            *guard = Some(
-                Store::open(&path)
-                    .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?,
-            );
+            let store = Store::open(&path)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            // The desktop app owns the profile: it alone moves the schema
+            // forward, once, with the store's own backup first, and before the
+            // first read (a read never upgrades). A handle is cached only
+            // after that succeeds, so a failure is reported by every request
+            // until it is fixed rather than leaving reads against an old schema.
+            upgrade_owned_profile(&store, &path)?;
+            *guard = Some(store);
         }
         body(
             guard
@@ -281,10 +429,7 @@ impl WorkbenchState {
         &self,
         body: impl FnOnce(&Store) -> Result<T, WorkbenchError>,
     ) -> Result<T, WorkbenchError> {
-        let guard =
-            self.0.store.lock().map_err(|_| {
-                WorkbenchError::new("store_error", "Task receipt storage lock failed.")
-            })?;
+        let guard = crate::supervisor::lock_or_recover(&self.0.store);
         let store = guard.as_ref().ok_or_else(|| {
             WorkbenchError::new("store_error", "No open task store owns this process.")
         })?;
@@ -352,6 +497,9 @@ impl WorkbenchState {
         if method == "runs.release" {
             return reconcile::release(self, input);
         }
+        if method == "runs.checkout_identity" {
+            return terminal_launch::checkout_identity(input);
+        }
         if method == "runs.conversation" {
             return conversation::find(self, input);
         }
@@ -360,6 +508,106 @@ impl WorkbenchState {
         // it is a host method rather than a raw store one.
         if method == "items.merge" {
             return self.with_store(|store| intake::merge_request(store, input));
+        }
+        // Verification is Manvi's: these only name the work to judge and read
+        // the verdict back. Completing a task never needs them (the gate reads
+        // the stored record), so a down sidecar cannot block or fake a verdict.
+        if method == "verifications.start" {
+            let params = verification_gate::start_params(input)?;
+            return self.worker_call_current("work.verify.task", params);
+        }
+        if method == "verifications.get" {
+            let params = verification_gate::get_params(input)?;
+            return self.worker_call_current("work.verify.get", params);
+        }
+        // What the card shows (read from the store, so it works with the
+        // sidecar down) and its Verify action. Both use a connection of their
+        // own: Verify waits on the sidecar and must not hold the board's.
+        if method == "verifications.board" {
+            let parsed: Value = serde_json::from_str(input)
+                .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+            let ids: Vec<String> = parsed["ids"]
+                .as_array()
+                .ok_or_else(|| WorkbenchError::new("invalid_input", "ids is required."))?
+                .iter()
+                .map(|id| id.as_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or_else(|| WorkbenchError::new("invalid_input", "ids are strings."))?;
+            // Read-only: a view the board takes on every refresh runs no DDL
+            // and can never contend for the profile's write lock.
+            let store = Store::open_readonly(&self.profile_path()?)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            return verification_driver::status_batch(
+                &store,
+                &verification_driver::HostBackend(self.clone()),
+                &ids,
+            );
+        }
+        if method == "verifications.status" || method == "verifications.run" {
+            let parsed: Value = serde_json::from_str(input)
+                .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+            let id = parsed["id"].as_str().unwrap_or_default();
+            if id.is_empty() || id.len() > 128 {
+                return Err(WorkbenchError::new(
+                    "invalid_input",
+                    "A task id is required.",
+                ));
+            }
+            // The status read is polled while a verification runs. A
+            // read-write open commits (it re-applies the schema), and each
+            // commit woke every open surface as a change, so it reads only.
+            let path = self.profile_path()?;
+            let store = if method == "verifications.status" {
+                Store::open_readonly(&path)
+            } else {
+                Store::open(&path)
+            }
+            .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            let backend = verification_driver::HostBackend(self.clone());
+            return if method == "verifications.status" {
+                verification_driver::status(&store, &backend, id)
+            } else {
+                verification_driver::run_now(&store, &backend, id)
+            };
+        }
+        // Manvi proposes; these only start, read or stop a scan, and file or
+        // apply what a person accepted. A sidecar that is down is the caller's
+        // error to see, never an empty scan.
+        if method == "scans.start" {
+            let params = intake::scan_start_params(input)?;
+            return self.worker_call_current("work.scan.gaps", params);
+        }
+        if method == "scans.get" {
+            let params = intake::scan_ref_params(input)?;
+            return self.worker_call_current("work.scan.get", params);
+        }
+        if method == "scans.cancel" {
+            let params = intake::scan_ref_params(input)?;
+            return self.worker_call_current("work.scan.cancel", params);
+        }
+        if method == "proposals.file" {
+            return self.with_store(|store| intake::file_proposal(store, input));
+        }
+        if method == "proposals.apply" {
+            return self.with_store(|store| intake::apply_refinement(store, input));
+        }
+        // Refinement is grounded in the repository's code index, so Manvi is
+        // told which root: the host's resolution of the open repository, never
+        // the sidecar's working directory.
+        if method == "enhancements.refine" {
+            let (root, rest) = intake::refine_split(input)?;
+            let HostControl {
+                mut params,
+                selection,
+            } = generation_input(method, &rest)?;
+            params["repo_root"] = json!(root);
+            return self.worker_call("work.enhancements.refine", params, selection);
+        }
+        // Which tasks to start next is Manvi's ranking of the open board; this
+        // only names the ask. It reads and never writes the board.
+        if method == "tasks.suggest" {
+            let params = suggest::params(input)?;
+            return self.worker_call_current("work.tasks.suggest", params);
         }
         if matches!(
             method,
@@ -397,6 +645,8 @@ impl WorkbenchState {
         result
     }
 
+    /// A call that names a model selection (or the default one): the worker is
+    /// rebuilt when the selection's fingerprint differs from the live one.
     fn worker_call(
         &self,
         method: &str,
@@ -404,12 +654,47 @@ impl WorkbenchState {
         selection: Option<crate::harness::sidecar::ModelSelection>,
     ) -> Result<Value, WorkbenchError> {
         let worker = self.worker(selection)?;
+        self.call_worker(worker, method, params)
+    }
+
+    /// A call that has no model of its own (verify, scan, suggest, managed run
+    /// control): it uses whatever worker is live, whatever its fingerprint, and
+    /// builds the default one only when none is. Going through [`Self::worker`]
+    /// with `None` instead would retire a model-selected enhancement worker
+    /// mid-run just to ask a question that does not use the model.
+    fn worker_call_current(&self, method: &str, params: Value) -> Result<Value, WorkbenchError> {
+        let worker = self.current_worker()?;
+        self.call_worker(worker, method, params)
+    }
+
+    fn current_worker(
+        &self,
+    ) -> Result<Arc<crate::harness::sidecar::ProfileConnection>, WorkbenchError> {
+        self.check_open()?;
+        let live = {
+            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
+        };
+        match live {
+            Some(worker) => Ok(worker),
+            None => self.worker(None),
+        }
+    }
+
+    fn call_worker(
+        &self,
+        worker: Arc<crate::harness::sidecar::ProfileConnection>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, WorkbenchError> {
         // Initialization is lazy and can overlap shutdown; never spawn after it.
         if let Err(error) = self.check_open() {
             worker.shutdown();
             return Err(error);
         }
-        worker.call(method, params).map_err(worker_error)
+        worker
+            .call(method, params)
+            .map_err(|error| worker_error(&self.profile_label(), error))
     }
 
     /// What the profile worker's harness declared at handshake.
@@ -424,20 +709,7 @@ impl WorkbenchState {
     /// with `None` would retire a perfectly good enhancement worker mid-flight
     /// to learn something it had already told us.
     fn worker_handshake(&self) -> Result<crate::harness::protocol::HelloResult, WorkbenchError> {
-        self.check_open()?;
-        let live = {
-            let guard = self.0.worker.lock().map_err(|_| {
-                WorkbenchError::new(
-                    "worker_error",
-                    "Task worker lock failed; restart the application.",
-                )
-            })?;
-            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
-        };
-        let worker = match live {
-            Some(worker) => worker,
-            None => self.worker(None)?,
-        };
+        let worker = self.current_worker()?;
         if let Err(error) = self.check_open() {
             worker.shutdown();
             return Err(error);
@@ -445,7 +717,7 @@ impl WorkbenchState {
         worker
             .handshake()
             .map(|(_, hello)| hello)
-            .map_err(worker_error)
+            .map_err(|error| worker_error(&self.profile_label(), error))
     }
 
     /// Resolves (building if needed) the profile worker for a model selection.
@@ -461,12 +733,7 @@ impl WorkbenchState {
             .as_ref()
             .map(|s| (s.base_url.clone(), s.model.clone()));
         let worker = {
-            let mut guard = self.0.worker.lock().map_err(|_| {
-                WorkbenchError::new(
-                    "worker_error",
-                    "Task worker lock failed; restart the application.",
-                )
-            })?;
+            let mut guard = crate::supervisor::lock_or_recover(&self.0.worker);
             let rebuild = match guard.as_ref() {
                 Some((fp, _)) => *fp != fingerprint,
                 None => true,
@@ -477,8 +744,9 @@ impl WorkbenchState {
                         log::warn!(target: "workbench", "profile worker retire could not acquire the active request; prior generation may remain unresolved");
                     }
                 }
-                let connection = crate::harness::sidecar::ProfileConnection::new(path, selection)
-                    .map_err(worker_error)?;
+                let connection =
+                    crate::harness::sidecar::ProfileConnection::new(path.clone(), selection)
+                        .map_err(|error| worker_error(&path, error))?;
                 *guard = Some((fingerprint, Arc::new(connection)));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
@@ -630,15 +898,8 @@ fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchE
         });
     }
     let parsed: GenerationInput = serde_json::from_str(input).map_err(invalid)?;
-    let valid_id = |id: &str| {
-        !id.is_empty()
-            && id.len() <= 128
-            && id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-    };
-    if !valid_id(&parsed.id)
-        || !valid_id(&parsed.request_id)
+    if !is_record_id(&parsed.id)
+        || !is_record_id(&parsed.request_id)
         || parsed.expected_revision == 0
         || parsed.expected_revision > 9_007_199_254_740_991
     {
@@ -658,8 +919,52 @@ fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchE
     })
 }
 
-fn worker_error(error: crate::harness::HarnessError) -> WorkbenchError {
+/// The Diagnostics name of one profile's upgrade. Per profile, because the
+/// record is process-global: a profile that opened cleanly must not clear the
+/// failure of another that did not.
+fn profile_upgrade_subsystem(profile: &Path) -> String {
+    format!("workbench profile upgrade ({})", profile.display())
+}
+
+/// Brings the profile this host owns to the current schema, and says so
+/// loudly when it cannot: the error goes to the caller, the log and the
+/// Diagnostics list, never into a silent fallback to a profile of the wrong
+/// shape.
+fn upgrade_owned_profile(store: &Store, profile: &Path) -> Result<(), WorkbenchError> {
+    let subsystem = profile_upgrade_subsystem(profile);
+    match store.upgrade_workbench_profile() {
+        Ok(report) => {
+            crate::supervisor::note_recovered(&subsystem);
+            if let Some(backup) = report.backup {
+                log::info!(target: "workbench", "profile upgraded from schema {} to {}; backup at {backup}", report.from, report.to);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let reason = format!("{}: {}", error.code, error.message);
+            log::error!(target: "workbench", "profile upgrade failed: {reason}");
+            crate::supervisor::note_degraded(&subsystem, &reason);
+            Err(error.into())
+        }
+    }
+}
+
+/// What a person is told when Manvi's worker refuses because the profile has
+/// not been upgraded: the host owns that step, so the way out is to let it.
+const SCHEMA_UPGRADE_REQUIRED: &str = "The task profile is on an older schema and Manvi's worker does not upgrade a shared profile. GitPulse upgrades it, after a backup, the first time it opens the profile: restart GitPulse, and see Diagnostics if it reports the upgrade failed.";
+
+fn worker_error(profile: &Path, error: crate::harness::HarnessError) -> WorkbenchError {
     match error {
+        crate::harness::HarnessError::Refused(error) if error.code == "schema_upgrade_required" => {
+            crate::supervisor::note_degraded(
+                &profile_upgrade_subsystem(profile),
+                &format!("the profile worker refused: {}", error.message),
+            );
+            WorkbenchError::new(
+                "schema_upgrade_required",
+                format!("{SCHEMA_UPGRADE_REQUIRED} ({})", error.message),
+            )
+        }
         crate::harness::HarnessError::Refused(error) => {
             WorkbenchError::new(&error.code, error.message)
         }
@@ -699,14 +1004,16 @@ pub async fn cmd_workbench_launch_terminal(
     terminals: State<'_, crate::terminal::TerminalSessions>,
     app: tauri::AppHandle,
     input: String,
+    on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, WorkbenchError> {
     let launch = terminal_run::parse(&input)?;
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let terminals = terminals.inner().clone();
+    let output = crate::terminal::OutputSink::channel(on_output);
     tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
-        terminal_run::spawn(&app, &terminals, &state, launch)
+        terminal_run::spawn(&app, &terminals, &state, launch, output)
     })
     .await
     .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))?
@@ -719,7 +1026,7 @@ pub async fn cmd_workbench_request(
     method: String,
     input: String,
 ) -> Result<String, WorkbenchError> {
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
@@ -745,7 +1052,7 @@ pub async fn cmd_workbench_register_repository(
             "Repository request exceeds the size limit.",
         ));
     }
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
@@ -781,7 +1088,7 @@ pub async fn cmd_workbench_relink_repository(
             "Only a registered repository can be relinked.",
         ));
     }
-    let reservation = state.reserve()?;
+    let reservation = state.admit().await?;
     let state = state.inner().clone();
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
@@ -794,8 +1101,26 @@ pub async fn cmd_workbench_relink_repository(
 }
 
 #[cfg(test)]
+#[path = "workbench/profile_owner_tests.rs"]
+mod profile_owner_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT};
+    use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT, MAX_QUEUED};
+
+    #[test]
+    fn record_ids_are_plain_tokens_within_their_length_cap() {
+        use super::{is_record_id, is_record_id_within, MAX_RECORD_ID_BYTES};
+        assert!(is_record_id("run_1-A"));
+        assert!(is_record_id(&"a".repeat(MAX_RECORD_ID_BYTES)));
+        assert!(!is_record_id(&"a".repeat(MAX_RECORD_ID_BYTES + 1)));
+        assert!(!is_record_id(""));
+        assert!(!is_record_id("a/b"));
+        assert!(!is_record_id("a b"));
+        assert!(!is_record_id("é"));
+        assert!(is_record_id_within("abc", 3));
+        assert!(!is_record_id_within("abcd", 3));
+    }
     use crate::procguard::LockedSpawn;
     use serde_json::json;
     use std::sync::Arc;
@@ -881,15 +1206,27 @@ mod tests {
     #[test]
     fn worker_error_preserves_timeout_unavailable_and_protocol_codes() {
         assert_eq!(
-            worker_error(crate::harness::HarnessError::Timeout("slow".into())).code,
+            worker_error(
+                std::path::Path::new("/p"),
+                crate::harness::HarnessError::Timeout("slow".into())
+            )
+            .code,
             "timeout"
         );
         assert_eq!(
-            worker_error(crate::harness::HarnessError::Unavailable("down".into())).code,
+            worker_error(
+                std::path::Path::new("/p"),
+                crate::harness::HarnessError::Unavailable("down".into())
+            )
+            .code,
             "unavailable"
         );
         assert_eq!(
-            worker_error(crate::harness::HarnessError::Protocol("bad".into())).code,
+            worker_error(
+                std::path::Path::new("/p"),
+                crate::harness::HarnessError::Protocol("bad".into())
+            )
+            .code,
             "protocol_error"
         );
     }
@@ -908,7 +1245,7 @@ mod tests {
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
   case "$line" in
-    *'"op":"hello"'*) result='{"protocol":1,"ops":["hello","work.enhancements.configuration"],"posture":"host"}' ;;
+    *'"op":"hello"'*) result='{"protocol":1,"ops":["hello","work.enhancements.configuration","work.tasks.suggest"],"posture":"host"}' ;;
     *) result="{\"ok\":true,\"provider\":\"local\",\"model\":\"${MANVI_MODEL:-none}\",\"model_source\":\"env\",\"providers\":[\"local\"]}" ;;
   esac
   printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$result"
@@ -941,6 +1278,26 @@ done
                 )
                 .unwrap();
             assert_eq!(second["model"], "model-b");
+            // A call with no model of its own must not retire the
+            // model-selected worker: the next enhancement would otherwise find
+            // its worker gone mid-run.
+            let pid_before = host
+                .0
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, w)| Arc::as_ptr(w));
+            host.request("tasks.suggest", "{}").unwrap();
+            let guard = host.0.worker.lock().unwrap();
+            let (fingerprint, live) = guard.as_ref().expect("worker still live");
+            assert_eq!(
+                fingerprint.as_ref().map(|(_, model)| model.as_str()),
+                Some("model-b"),
+                "suggest rebuilt the worker to the default selection"
+            );
+            assert_eq!(Some(Arc::as_ptr(live)), pid_before);
+            drop(guard);
             host.shutdown();
         });
         if let Err(panic) = outcome {
@@ -1222,6 +1579,32 @@ done
         );
     }
 
+    /// The defect: a panic while the store (or worker) lock was held turned
+    /// every later board read, run receipt and worker handshake into "restart
+    /// the application".
+    #[test]
+    fn a_panic_under_the_store_or_worker_lock_does_not_disable_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = state(&dir.path().join("profile/workbench.sqlite"));
+        let repo = json!({"request_id":"r1","id":"r1","expected_revision":0,"name":"Repo","identity_key":"clone-1"});
+        host.request("repositories.put", &repo.to_string()).unwrap();
+        for poisoned in [0, 1] {
+            let inner = Arc::clone(&host.0);
+            let _ = std::thread::spawn(move || {
+                if poisoned == 0 {
+                    let _held = inner.store.lock().unwrap();
+                    panic!("injected panic under the store lock");
+                }
+                let _held = inner.worker.lock().unwrap();
+                panic!("injected panic under the worker lock");
+            })
+            .join();
+        }
+        assert!(host.0.store.is_poisoned() && host.0.worker.is_poisoned());
+        assert_eq!(host.request("items.list", "{}").unwrap()["total"], 0);
+        host.shutdown();
+    }
+
     #[test]
     fn queue_is_bounded_and_releases_on_drop() {
         let host = WorkbenchState::default();
@@ -1232,6 +1615,90 @@ done
         drop(permits);
         assert!(host.reserve().is_ok());
         assert!(host.0.store.lock().unwrap().is_none());
+    }
+
+    /// One change makes every surface re-read at once (board columns, the
+    /// archive, the unread count, verdicts, agents). A burst one past the cap
+    /// used to be refused on the spot as "Task storage is busy"; it waits for
+    /// the first slot that frees instead.
+    #[test]
+    fn a_request_past_the_cap_waits_for_a_slot_instead_of_being_refused() {
+        let host = WorkbenchState::default();
+        let permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| host.reserve().unwrap())
+            .collect();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                host.reserve_within(std::time::Duration::from_secs(10))
+                    .map(drop)
+            });
+            while host.0.admission.lock().unwrap().queued == 0 {
+                std::thread::yield_now();
+            }
+            drop(permits);
+            assert!(waiter.join().unwrap().is_ok());
+        });
+        let slots = host.0.admission.lock().unwrap();
+        assert_eq!((slots.in_flight, slots.queued), (0, 0));
+    }
+
+    /// The wait is bounded twice: in time, and in how many may wait at all,
+    /// so a storm of requests cannot hold every blocking thread.
+    #[test]
+    fn the_wait_for_a_slot_is_bounded_in_time_and_in_waiters() {
+        let host = WorkbenchState::default();
+        let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| host.reserve().unwrap())
+            .collect();
+        let started = std::time::Instant::now();
+        let error = host
+            .reserve_within(std::time::Duration::from_millis(50))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "busy");
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5))
+        );
+        host.0.admission.lock().unwrap().queued = MAX_QUEUED;
+        let started = std::time::Instant::now();
+        let error = host
+            .reserve_within(std::time::Duration::from_secs(10))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "busy");
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(1)),
+            "a full queue refuses at once"
+        );
+        host.0.admission.lock().unwrap().queued = 0;
+    }
+
+    /// Shutdown wakes the waiters; none of them is admitted to a closed host.
+    #[test]
+    fn shutdown_wakes_a_waiting_request_and_refuses_it() {
+        let host = WorkbenchState::default();
+        let permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| host.reserve().unwrap())
+            .collect();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                host.reserve_within(std::time::Duration::from_secs(30))
+                    .map(drop)
+            });
+            while host.0.admission.lock().unwrap().queued == 0 {
+                std::thread::yield_now();
+            }
+            let started = std::time::Instant::now();
+            host.shutdown();
+            assert_eq!(waiter.join().unwrap().err().unwrap().code, "closed");
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5))
+            );
+        });
+        drop(permits);
     }
 
     #[test]

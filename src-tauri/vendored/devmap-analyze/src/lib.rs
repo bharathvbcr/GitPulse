@@ -1,6 +1,7 @@
 pub mod clones;
 pub mod clustering;
 pub mod dead_clusters;
+pub mod dead_tier;
 pub mod graph_intel;
 pub mod liveness;
 pub mod model;
@@ -11,6 +12,7 @@ pub mod pdg;
 // the gate they were four warnings the embedder shape carried for nobody.
 #[cfg(feature = "parse")]
 pub mod pdgsrc;
+pub mod record_identity;
 pub mod resolution_rate;
 pub mod traversal;
 
@@ -28,11 +30,15 @@ pub use graph_intel::{
     IMPORT_CYCLE_CAP,
 };
 pub use liveness::{
-    analyze_liveness, analyze_liveness_with_coverage, exempt_symbol_names, extraction_coverage,
-    extraction_gaps, language_can_reference, DiscoveryCoverage, ExtractionCoverage, ExtractionGap,
-    ExtractionGapEntry, LivenessOutcome, CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP,
-    COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON, GO_VALUE_MENTION_REASON,
-    HIGHEST_DEGRADED_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
+    analyze_liveness, analyze_liveness_with_coverage, confident_tier_eligible,
+    confident_tier_unproven_reason, earned_confident_tier, exempt_symbol_names, exemption_token,
+    extraction_coverage, extraction_gaps, language_can_reference, DiscoveryCoverage,
+    ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome, CALL_BLIND_REASON,
+    CONFIDENT_TIER_ELIGIBLE, CONFIDENT_TIER_UNPROVEN, COVERAGE_LOSS_CONFIDENCE_CAP,
+    COVERAGE_LOSS_REASON, EXPORTED_NOT_EXAMINED_REASON, EXPORTED_UNREFERENCED, EXTERNAL_SUPERTYPE,
+    FILE_EXEMPT_REASON, GO_BUILD_VARIANT_REASON, GO_STD_INTERFACE_REASON, GO_VALUE_MENTION_REASON,
+    HIGHEST_DEGRADED_CONFIDENCE, OBJECT_LITERAL_MEMBER, UNPROVEN_TIER_CONFIDENCE,
+    UNRESOLVED_NAMESAKE_REASON, VISIBILITY_TOKENS,
 };
 pub use model::*;
 pub use pdg::*;
@@ -64,6 +70,8 @@ pub fn analyze_with_discovery(
     resolution: &ResolutionResult,
     discovery: DiscoveryCoverage,
 ) -> AnalysisSummary {
+    let discovery_refused_files = discovery.refused_files();
+    let over_limit_files = discovery.over_limit_files();
     let liveness = analyze_liveness_with_coverage(extractions, resolution, discovery);
     let dead_symbols = liveness.reports;
     let detection = detect_communities(extractions, resolution);
@@ -102,7 +110,11 @@ pub fn analyze_with_discovery(
         // reports what it refused; one that supplied its own corpus reports
         // `None`, and the difference is what lets the daemon carry a real
         // measurement forward without inventing one.
-        discovery_refused_files: discovery.refused_files(),
+        discovery_refused_files,
+        // The whole list, charged or not: which of them cap the dead-code pass
+        // is liveness's decision, while `repo_map.json` names every file the
+        // graph is missing.
+        over_limit_files,
         // Computed here rather than in the CLI so every consumer of a summary
         // reads one number: the CLI renders it, the store persists it, and the
         // Python ratchet fences it. A rate computed at the point of printing is

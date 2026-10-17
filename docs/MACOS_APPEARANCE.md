@@ -99,9 +99,10 @@ the point.
 Overflow cues follow the same rule. `from-background to-transparent` is a
 full-alpha stop, so the fades at the edges of a scroller were opaque bands on a
 translucent pane — and Tailwind's `to-transparent` is `rgb(0 0 0 / 0)`, so the
-ramp travelled through black and fringed on light themes. `.gp-edge-fade` fades
-one colour to its own zero, and on macOS fades a shade rather than a colour,
-because the gutter deliberately stopped painting a colour to fade from.
+ramp travelled through black and fringed on light themes. A painted fade of any
+colour is still a band on glass, so the cue paints nothing at all: `ScrollCue`
+writes a `data-gp-fade` token on the scroller, and `[data-gp-fade]` masks the
+scroller's own edge, fading its content to whatever material is behind it.
 
 ### The two surfaces CSS cannot reach
 

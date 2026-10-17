@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger, createServer, type ViteDevServer } from "vite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +8,9 @@ import { isNestedAgentWorktree } from "./vite-watch.mjs";
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TSCONFIG_RELOAD = "changed tsconfig file detected";
+
+/** Vite and chokidar report every path with `/`, whatever the platform joins with. */
+const posix = (file: string) => file.split(sep).join("/");
 
 /** Polls `seen` until it holds, failing loudly at the deadline. */
 async function waitFor(seen: () => boolean, what: string, budgetMs: number): Promise<number> {
@@ -96,7 +99,7 @@ describe.each(["vite.config.ts", "vite.harness.config.ts"])("%s file watcher", c
     expect(ignored.some(entry => typeof entry === "function")).toBe(true);
     if (configName === "vite.config.ts") expect(ignored).toContain("**/src-tauri/**");
     const reloadsFor = (file: string) =>
-      lines.filter(line => line.includes(TSCONFIG_RELOAD) && line.includes(file)).length;
+      lines.filter(line => line.includes(TSCONFIG_RELOAD) && line.includes(posix(file))).length;
 
     // Positive control: the watcher is live and reaches tsconfig detection.
     // Rewritten until seen, because chokidar's `ready` can fire before
@@ -127,6 +130,6 @@ describe.each(["vite.config.ts", "vite.harness.config.ts"])("%s file watcher", c
 
     expect(reloadsFor(nested), JSON.stringify(lines)).toBe(0);
     const watchedDirs = Object.keys(server.watcher.getWatched());
-    expect(watchedDirs.filter(dir => dir.startsWith(join(root, ".claude", "worktrees")))).toEqual([]);
+    expect(watchedDirs.filter(dir => posix(dir).startsWith(posix(join(root, ".claude", "worktrees"))))).toEqual([]);
   }, 30_000);
 });

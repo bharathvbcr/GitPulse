@@ -98,8 +98,38 @@ export function draftingVerb(kind: DraftingKind, quick: boolean): string {
   return kind === "improve" ? "Improve" : "Draft";
 }
 
-export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
-  proposal !== null && (LIVE_ENHANCEMENT_STATES as readonly string[]).includes(proposal.state);
+/**
+ * Whether a proposal still has a worker on it, as of `now` (Unix seconds).
+ *
+ * The store counts a `pending` proposal as live only until its `expires_at`
+ * (`state='pending' AND expires_at>now`, dc-store `enhancements.rs`): a generate
+ * that was lost leaves one behind, and it stops blocking the next ask on its
+ * own. `running` and `cancel_requested` stay live past their expiry, because
+ * only the recovery that resolves the uncertain attempt ends them.
+ */
+export const liveEnhancement = (proposal: Pick<Enhancement, "state" | "expires_at"> | null, now: number = Date.now() / 1000): boolean =>
+  proposal !== null && (LIVE_ENHANCEMENT_STATES as readonly string[]).includes(proposal.state)
+    && !(proposal.state === "pending" && now >= proposal.expires_at);
+
+/**
+ * Whether a re-read of a proposal says anything the last read did not.
+ *
+ * A live suggestion is polled every second, and each poll used to re-read the
+ * history as well (two more requests) whether or not anything had moved —
+ * about three requests a second for the length of a run. Every write to a
+ * proposal advances its revision and `updated_at`; the state is compared too,
+ * so a store that ever changed state without a write still counts as moved.
+ */
+export function enhancementMoved(
+  previous: Pick<EnhancementSummary, "id" | "revision" | "updated_at" | "state"> | null,
+  next: Pick<EnhancementSummary, "id" | "revision" | "updated_at" | "state">,
+): boolean {
+  return previous === null ||
+    previous.id !== next.id ||
+    previous.revision !== next.revision ||
+    previous.updated_at !== next.updated_at ||
+    previous.state !== next.state;
+}
 
 export interface LoadedHistory {
   entries: EnhancementSummary[];

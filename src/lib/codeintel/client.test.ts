@@ -219,6 +219,16 @@ describe("codeintel client", () => {
     });
   });
 
+  it("names the preview batch so it can be cancelled", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ available: true, files: [], cancelled: false });
+    await previewDevmapEdits("/repo", [["src/a.ts", "x"]], "tok-1");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_preview_many", {
+      repoPath: "/repo",
+      files: [["src/a.ts", "x"]],
+      cancelToken: "tok-1",
+    });
+  });
+
   it("loads ranked code-graph and map-preview canvas payloads", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
       available: true,
@@ -296,7 +306,7 @@ describe("codeintel client", () => {
       name: "b",
     });
 
-    vi.mocked(invoke).mockResolvedValueOnce({ links: [], count: 0, repos_considered: 1 });
+    vi.mocked(invoke).mockResolvedValueOnce({ links: [], coverage_gaps: [], count: 0, repos_considered: 1 });
     await getWorkspaceLinkCandidates("/a");
     expect(invoke).toHaveBeenCalledWith("cmd_workspace_link_candidates", {
       registryRoot: "/a",

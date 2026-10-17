@@ -1,11 +1,11 @@
 <script lang="ts">
+  import { createFrameScheduler } from "../motion/frameScheduler";
   import { crossfade } from "svelte/transition";
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { listen } from "@tauri-apps/api/event";
   import { AlertTriangle, Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
-  import { isMacOS, isTauri } from "../platform";
+  import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
@@ -16,11 +16,13 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
-  import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
+  import { readToEnd, reloadPaged, samePage, sameRecords } from "../workbench/boardPaging";
+  import { createLiveLoader } from "../workbench/liveLoader";
+  import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask,
-    STATUSES, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
-    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type Workspace, type WorkspaceCard,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask, suggestTasks,
+    NAVIGATOR_PAGE_SIZE, STATUSES, subscribeWorkbenchChanges, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
+    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type TaskSuggestions, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
@@ -34,13 +36,20 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
+  import { cardMatchesQuery, parseTaskQuery, queryChips, queryHas, removeQueryTerm, repositoryMatches, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
+  import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
+  import { CANDIDATE_PAGE, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, mergeCandidates, planSearch, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
+  import TaskSearchField from "./TaskSearchField.svelte";
+  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
-  import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
+  import { archiveAction, archivable, archiveControl, archiveRefusal, archiveSkipped, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import TaskSavedViews from "./TaskSavedViews.svelte";
+  import TaskSuggestPanel from "./TaskSuggestPanel.svelte";
+  import { createSuggestWatch, suggestSignature } from "../workbench/suggestFreshness";
+  import WavePanel from "./WavePanel.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns, restoreSummary, restoreTasks } from "../workbench/taskDelete";
@@ -71,6 +80,8 @@
   import ScrollCue from "./ScrollCue.svelte";
   import TaskActionDialog from "./TaskActionDialog.svelte";
   import TaskMergeDialog from "./TaskMergeDialog.svelte";
+  import CardVerdict from "./CardVerdict.svelte";
+  import { getVerdicts, sameVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
   import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
@@ -98,8 +109,11 @@
   let repositoryCursor = $state<string | null>(null), workspaceCursor = $state<string | null>(null);
   let repositoryTotal = $state(0), workspaceTotal = $state(0);
   let columns = $state<Partial<Record<TaskStatus, Page<TaskCard>>>>({});
+  /** Verification verdicts for the cards loaded, read once per board load. */
+  let verdicts = $state<ReadonlyMap<string, Verdict>>(new Map());
+  let verdictError = $state("");
   let search = $state(""); let initialized = $state(false); let loading = $state(false);
-  let error = $state(""); let catalogError = $state(""); let announce = $state("");
+  let error = $state(""); let catalogError = $state(""); let liveNotice = $state(""); let announce = $state("");
   let taskTabs = $state<TaskTabState>(emptyTaskTabs());
   let session = $state<{ tabId: string; pane: string; value: Task | null; status?: TaskStatus; seed?: Partial<TaskDraft> } | null>(null);
   let workspaceEditor = $state<{ value: Workspace | null } | null>(null);
@@ -122,20 +136,89 @@
   /** Deferred deletions being written now; a board writing one is busy. */
   let deletesRunning = $state(0);
   let loadedKey = $state("");
+  /** The scope the loaded columns were read for, whatever the search was. */
+  let loadedScope = $state("");
   let unreadError = $state("");
-  let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
-  const boardKey = $derived(JSON.stringify([scope, search]));
+  let unreadRevision = 0, initializationRevision = 0, openingRevision = 0, catalogRevision = 0;
+  // ---- Search (`taskQuery.ts`, `taskRank.ts`, `taskSearchPlan.ts`) --------
+  /**
+   * The search box read once, by the parser the archive and the navigator
+   * share: filters, words for ranking, and problems to report. Filters never
+   * reach the store, so typing `is:bug` does not search for "is" and "bug".
+   */
+  const parsedQuery = $derived(parseTaskQuery(search));
+  /** The Filters bar's choices: applied with the search's filters by `cardVisible`, kept by saved views. */
+  let facet = $state<TaskFacet>(emptyFacet());
+  /**
+   * A search or a Filters choice switches the board from per-column pages to
+   * one candidate set for the scope, ranked and filtered here. The fetch key
+   * changes only with what the store is asked, so typing re-ranks and
+   * re-filters what is loaded without a request.
+   */
+  const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null));
+  const searching = $derived(plan.mode === "search");
+  let sort = $state<SearchOrder>("relevance");
+  /** How a column is drawn when no search ranks it: the board's own order, or the most urgent first. A view; positions are never written. */
+  let boardSort = $state<"board" | "priority">("board");
+  /** Manvi's ranking of what to start next (`work.tasks.suggest`), asked for on demand. */
+  let showSuggest = $state(false);
+  let suggestion = $state<TaskSuggestions | null>(null);
+  let suggestLoading = $state(false);
+  let suggestError = $state("");
+  let suggestPriority = $state<number | "all">("all");
+  let suggestTicket = 0;
+  /** The search's candidates; null while the board browses columns. */
+  let candidates = $state.raw<CandidateSet | null>(null);
+  const boardKey = $derived(JSON.stringify([scope, plan.key]));
+  /**
+   * A new search on the same scope while its candidates load, or a cleared
+   * one while its columns load: the cards already loaded are real tasks of
+   * this scope, so the board filters and ranks them at once instead of going
+   * blank. Another scope's cards are never shown, and nothing pages, counts
+   * or reports until the load lands.
+   */
+  const provisional = $derived(loadedKey !== "" && loadedKey !== boardKey && loadedScope === JSON.stringify(scope) && (searching || candidates !== null));
   // A deletion waiting out its undo window is already gone from the board:
   // its cards, its counts and anything a selection could act on.
-  const displayColumns = $derived(loadedKey === boardKey ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
-  $effect(() => { boardKey; facet; selected = new Set(); selectionAnchor = null; menu = null; });
+  const displayColumns = $derived(loadedKey === boardKey || provisional ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
+  // `JSON.stringify(facet)`, not `facet`: the Filters selects write a field in
+  // place, which reading the object alone does not track, so a filter change
+  // used to leave a selection it had hidden — for a bulk Delete to act on.
+  $effect(() => { boardKey; JSON.stringify(facet); search; selected = new Set(); selectionAnchor = null; menu = null; });
   // An undo offer belongs to the board it was made on. A pending deletion is
   // not withdrawn by a scope change: it is still the reader's to undo.
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
+  // A suggestion ranks one board's tasks: another scope drops it, and an open panel asks again.
+  $effect(() => { JSON.stringify(scope); untrack(() => { suggestWatch.reset(); suggestTicket++; suggestion = null; suggestError = ""; suggestLoading = false; if (showSuggest) void askSuggest(); }); });
+  // A task whose priority or status changed, or that came or went, is ranked
+  // from its old fields until Manvi is asked again: one debounced re-ask per
+  // burst of changes while the panel is open. A closed panel asks on reopening.
+  const suggestWatch = createSuggestWatch(() => { if (showSuggest && !disposed) void askSuggest(); }, 400);
+  const suggestSig = $derived(suggestSignature(columns));
+  $effect(() => { const key = loadedKey === boardKey ? boardKey : null, signature = suggestSig; untrack(() => suggestWatch.observe(key, signature)); });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
-  let press = $state<{ card: TaskCard; x: number; y: number } | null>(null);
+  /**
+   * A held card, before and during its drag. Owned by one pointer: every
+   * later event for the press is matched on `pointerId`, so a second finger
+   * or pen can neither move nor end it. `target` holds the capture.
+   */
+  let press = $state<{ card: TaskCard; pointerId: number; x: number; y: number; grab: GrabPoint; target: HTMLElement } | null>(null);
   let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; lane: string; local: number; x: number; y: number } | null>(null);
+  /**
+   * Set while a drop or a context-menu press is still being dispatched, so
+   * the click that same gesture produces does not also open the card. The
+   * browser dispatches that click in the same task as the release; a timer
+   * clears the guard in the next one. Not the next animation frame: a hidden
+   * window runs no frames, so the guard stayed up and every card click after
+   * a drop was swallowed until the window showed again.
+   */
   let skipClick = false;
+  let skipClickTimer: ReturnType<typeof setTimeout> | undefined;
+  function swallowGestureClick() {
+    skipClick = true;
+    clearTimeout(skipClickTimer);
+    skipClickTimer = setTimeout(() => { skipClick = false; }, 0);
+  }
   let showInbox = $state(false);
   let showArchive = $state(false);
   let archiveToken = $state(0);
@@ -162,14 +245,28 @@
    * start none.
    */
   let enhanceStart = $state(0);
-  let facet = $state<TaskFacet>(emptyFacet());
   let showFilters = $state(false);
+  let showSearchHelp = $state(false);
+  /** One-click filters; each is a search filter, so a saved view keeps it and a chip removes it. */
+  const QUICK_FILTERS = [
+    { label: "Bugs", filter: "is:bug" },
+    { label: "Features", filter: "is:feature" },
+    { label: "Urgent", filter: "priority:urgent" },
+    { label: "High", filter: "priority:high" },
+    { label: "Overdue", filter: "due:overdue" },
+    { label: "Unassigned", filter: "owner:none" },
+    { label: "Open", filter: "status:open" },
+  ] as const;
   let quickAdding = $state(false);
   let quickAddEl = $state<{ focus: () => void }>();
   let handoff = $state<{ card: TaskCard; settings: HandoffSettings } | null>(null);
   let now = $state(Math.floor(Date.now() / 1000));
   let boardEl: HTMLDivElement | undefined = $state();
-  let revision = 0; let disposed = false; let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let revision = 0; let disposed = false;
+  /** Bumped by each read the reader asks for, so a background read begun before it is not applied over it. */
+  let interactions = 0;
+  /** The banner's error came from a background read, so the next one that succeeds may clear it. */
+  let refreshError = false;
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const openTabRefs = $derived($repoStore.openTabs.map((tab) => ({ path: tab.path, label: tab.label })));
   const catalogIds = $derived(repositories.map((repo) => repo.id));
@@ -224,9 +321,16 @@
     },
     onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
   });
-  const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
+  /**
+   * The repository filter's choices, by name; an id the catalog has not
+   * loaded shows as itself. The chosen one stays listed even when no loaded
+   * card links it, so the select never shows a blank for an active filter.
+   */
+  const facetRepositories = $derived([...new Set([...facetOptions.repositories, ...(facet.repository === "all" ? [] : [facet.repository])])]
+    .map((id) => ({ id, name: repositoryById.get(id)?.name ?? id }))
+    .sort((a, b) => a.name.localeCompare(b.name)));
   const filtering = $derived(facetActive(facet) || search.trim().length > 0);
   // Layout, density, hidden columns and card chips are reader preferences the
   // profile remembers; the header and the View menu write them back.
@@ -238,11 +342,27 @@
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
   /** The navigator's order; moves are computed against this same list. */
   const orderedWorkspaces = $derived(navigatorOrder(visibleWorkspaces));
+  // ---- Navigator search -------------------------------------------------
+  // Narrows the workspace and repository rows by name (and a repository's
+  // identity, its path or remote). The selected scope stays listed, so the
+  // reader never loses sight of which board is open. Only loaded rows are
+  // searched; while more pages exist the navigator says so beside "More".
+  let navFilter = $state("");
+  const navNeedle = $derived(navFilter.trim().toLowerCase());
+  const navFiltering = $derived(navNeedle.length > 0);
+  function navShowsWorkspace(group: WorkspaceCard): boolean {
+    return !navFiltering || (scope.kind === "workspace" && scope.id === group.id) || group.name.toLowerCase().includes(navNeedle);
+  }
+  function navShowsRepository(repo: Repository): boolean {
+    return !navFiltering || (scope.kind === "repository" && scope.id === repo.id) || repositoryMatches(repo, navNeedle);
+  }
+  const navWorkspaceMatches = $derived(orderedWorkspaces.filter(navShowsWorkspace).length);
+  const navRepositoryMatches = $derived(repositories.filter(navShowsRepository).length);
   /** Named groups on the repository tab strip that could become workspaces. */
   const importableGroups = $derived(tabGroups($repoStore.openTabs, $repoStore.groupColors));
   let movingGroup = $state(false);
   let importingGroups = $state(false);
-  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, displayColumns[status]?.total ?? 0])) as Partial<Record<TaskStatus, number>>);
+  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, columnCount(status)])) as Partial<Record<TaskStatus, number>>);
   /**
    * Work a hidden column is keeping off screen.
    *
@@ -289,8 +409,15 @@
    */
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
   const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || mergeDialog !== null || pendingUpdate !== null);
+  /** The selection bar's Archive button: disabled with its reason when nothing would change. */
+  const archiveBar = $derived(archiveControl(selectionArchived, busy));
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
-  const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
+  /**
+   * The scope's in-progress total. A search's candidates only know it when
+   * they are every task of the board's own scope; otherwise the last
+   * browsing total stands rather than a count of whatever loaded.
+   */
+  let inProgressCount = $state(0);
   /** The server's count of archived tasks in this scope, so the badge is not a page size. */
   let archivedCount = $state(0);
   $effect(() => {
@@ -302,6 +429,8 @@
     return visibleBoardStatuses(hiddenColumns, counts, drag !== null);
   });
   const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
+  /** What is on screen per column, in the order it is drawn, for range and select-all. */
+  const drawnColumns = $derived(Object.fromEntries(STATUSES.map((status) => [status, { items: visibleIn(status) }])) as Partial<Record<TaskStatus, { items: TaskCard[] }>>);
   // ---- Saved views, lanes and limits, per board (`taskBoardViews.ts`) -----
   const viewBoard = $derived(viewBoardKey(scope));
   const wipLimits = $derived(boardPrefs($interfaceStore.taskBoards, viewBoard).wip);
@@ -319,9 +448,9 @@
     facet: { ...facet },
     search,
   });
-  /** Against the store's total for the column, never its loaded page. */
+  /** Against the store's total for the column, never its loaded page; a search's counts are matches, not the column's load. */
   function wipOf(status: TaskStatus) {
-    return loadedKey === boardKey ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
+    return loadedKey === boardKey && !searching ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
   }
   function laneAria(group: TaskLane): string {
     const by = swimlane === "label" ? "first label" : swimlane;
@@ -336,32 +465,184 @@
     announce = `Showing the saved view ${view.name}`;
   }
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
-  function visibleIn(status: TaskStatus): TaskCard[] {
-    return (displayColumns[status]?.items ?? []).filter((card) => cardMatchesFacet(card, facet, now));
+  const repositoryById = $derived(new Map(repositories.map((repo) => [repo.id, repo])));
+  const queryContext = $derived<QueryContext>({ repository: (id) => repositoryById.get(id), nowSec: now });
+  /** The Filters bar and the search box's filters: what the words are ranked over. */
+  function filtersHold(card: TaskCard): boolean {
+    return cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext);
   }
+  /** Relevance reorders only a search with words; filters alone keep board order. */
+  const order = $derived<SearchOrder>(searching && parsedQuery.words ? sort : "board");
+  /**
+   * Cards keep their place under Relevance only as a reading order: a drop
+   * or a keyboard nudge there would write a position relative to neighbours
+   * that are not the column's.
+   */
+  const reorderLocked = $derived((searching && order === "relevance") || boardSort === "priority");
+  // Description hits belong to the word they were read for: never credited
+  // to a new word while its own read is in flight.
+  const rankContext = $derived.by<RankContext>(() => {
+    const hits = loadedKey === boardKey ? candidates?.textHits : undefined, word = plan.word;
+    return { repoName, storeMatched: (id, typed) => word !== null && hits !== undefined && hits.has(id) && typed.startsWith(word) };
+  });
+  /** The words ranked over the loaded cards the filters pass; null without words. */
+  const ranking = $derived(searching && parsedQuery.words && (loadedKey === boardKey || provisional)
+    ? searchCards(loadedCards.filter(filtersHold), parsedQuery.words, rankContext, { order })
+    : null);
+  /** The ranked cards by id, and per column in the order the ranking gives. */
+  const ranked = $derived.by(() => {
+    const byId = new Map<string, RankedCard>();
+    const byStatus: Partial<Record<TaskStatus, TaskCard[]>> = {};
+    for (const hit of ranking?.cards ?? []) {
+      byId.set(hit.card.id, hit);
+      (byStatus[hit.card.status] ??= []).push(hit.card);
+    }
+    return { byId, byStatus };
+  });
+  /** The one test for "on screen": the Filters bar, the search box's filters, and its words. */
+  function cardVisible(card: TaskCard): boolean {
+    return filtersHold(card) && (ranking === null || ranked.byId.has(card.id));
+  }
+  /** Cards on screen across every column, hidden ones included; the filter bar's count. */
+  const visibleCount = $derived(loadedCards.filter(cardVisible).length);
+  function visibleIn(status: TaskStatus): TaskCard[] {
+    if (ranking && order === "relevance") return ranked.byStatus[status] ?? [];
+    const items = (displayColumns[status]?.items ?? []).filter(cardVisible);
+    return boardSort === "priority" ? sortByPriority(items) : items;
+  }
+  /** A column's count: the store's total while browsing, the matches while searching. */
+  function columnCount(status: TaskStatus): number {
+    return searching ? visibleIn(status).length : displayColumns[status]?.total ?? 0;
+  }
+  const total = $derived(searching ? visibleCount : STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
+  /** The coverage line: what a search read, matched and ranked, and whether it is partial. */
+  const searchReport = $derived.by(() => {
+    if (!searching) return null;
+    if (provisional) return "Searching every task on this board…";
+    if (!candidates || loadedKey !== boardKey) return null;
+    return describeSearch({ matched: visibleCount, set: candidates, word: plan.word, relaxed: ranking?.relaxed ?? false, ranked: order === "relevance" });
+  });
+  const moreCandidates = $derived(searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
+  /** Completions for the search box: the loaded values, and every registered repository. */
+  const suggestionSources = $derived.by<SuggestionSources>(() => ({
+    kind: facetOptions.kinds,
+    owner: facetOptions.owners,
+    label: facetOptions.labels,
+    severity: [...new Set(loadedCards.map((card) => card.severity?.trim() ?? "").filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    repo: scope.kind === "repository" ? [] : repositories.map((repo) => repo.name),
+  }));
 
+  /**
+   * The navigator's lists, re-read as far as they were paged in. Only the
+   * newest read lands: two overlapping ones (a write's refresh and a
+   * workspace move's) would otherwise leave whichever finished last, which
+   * may be the older answer.
+   */
   async function catalog() {
-    const [repos, groups] = await Promise.all([listRepositories(), listWorkspaces()]);
-    if (disposed) return;
-    repositories = repos.items; repositoryTotal = repos.total; repositoryCursor = repos.next_cursor;
-    workspaces = groups.items; workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
+    const ticket = ++catalogRevision;
+    const [repos, groups] = await Promise.all([
+      reloadPaged((cursor) => listRepositories(cursor), repositories.length, NAVIGATOR_PAGE_SIZE),
+      reloadPaged((cursor) => listWorkspaces(cursor), workspaces.length, NAVIGATOR_PAGE_SIZE),
+    ]);
+    if (disposed || ticket !== catalogRevision) return;
+    // An unchanged list keeps its identity, so the navigator and everything
+    // derived from it (the search plan, completions) are not recomputed.
+    if (!sameRecords(repositories, repos.items)) repositories = repos.items;
+    repositoryTotal = repos.total; repositoryCursor = repos.next_cursor;
+    if (!sameRecords(workspaces, groups.items)) workspaces = groups.items;
+    workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
     catalogError = "";
   }
-  async function loadBoard(target: Scope = scope, query: string = search) {
-    const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
+  /** Each column as read, keeping the column already shown wherever the read found nothing new. */
+  function keepUnchanged(next: Partial<Record<TaskStatus, Page<TaskCard>>>): Partial<Record<TaskStatus, Page<TaskCard>>> {
+    const kept = Object.fromEntries(Object.entries(next).map(([status, page]) => {
+      const shown = columns[status as TaskStatus];
+      return [status, samePage(shown, page) ? shown : page];
+    })) as Partial<Record<TaskStatus, Page<TaskCard>>>;
+    const keys = Object.keys(kept);
+    const same = keys.length === Object.keys(columns).length && keys.every((status) => kept[status as TaskStatus] === columns[status as TaskStatus]);
+    return same ? columns : kept;
+  }
+  /**
+   * Read the board for `target`. Returns whether the answer was applied.
+   *
+   * A `quiet` read is the board keeping itself current after a change made
+   * elsewhere: it shows no loading state (which blanked the count and
+   * disabled every button once a second while the store was busy), leaves an
+   * error the reader caused alone, and is dropped if the reader started
+   * anything meanwhile — a "Load more" or a move would otherwise be
+   * overwritten by an answer read before it.
+   */
+  async function loadBoard(target: Scope = scope, current: SearchPlan = plan, quiet = false): Promise<boolean> {
+    const generation = ++revision, key = JSON.stringify([target, current.key]), touched = interactions;
+    if (!quiet) { loading = true; error = ""; refreshError = false; }
+    const stale = () => generation !== revision || disposed || key !== boardKey || (quiet && (loading || moving || touched !== interactions));
     try {
       // Columns hold what is on the board: an archived task leaves them
       // whatever its status. The badge is the archive's own total for the
       // scope — the board's search does not narrow it; the dock has its own.
+      const archived = listTasks(target, null, "", undefined, 1, { archived: true });
+      if (current.mode === "search") {
+        // One status-less candidate set, filtered and ranked here, and one
+        // full-text read for the word descriptions may hold (`taskSearchPlan.ts`).
+        const [broad, text, archive] = await Promise.all([
+          listTasks(current.scope, null, "", undefined, CANDIDATE_PAGE, BOARD),
+          current.word ? listTasks(current.scope, null, current.word, undefined, CANDIDATE_PAGE, BOARD) : null,
+          archived,
+        ]);
+        if (stale()) return false;
+        const set = mergeCandidates(null, broad, text);
+        const pages = bucketByStatus(set.cards);
+        candidates = set; columns = keepUnchanged(pages); loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+        if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = pages.in_progress?.total ?? 0;
+        keepSelected(pages);
+        settled(quiet);
+        return true;
+      }
+      // Columns are re-read as far as they were paged in (`boardPaging.ts`),
+      // so a refresh after any write keeps "Load more" where the reader left
+      // it. Another scope's columns, or a search's candidates bucketed into
+      // columns, say nothing about this scope's pages.
+      const kept = candidates === null && loadedScope === JSON.stringify(target);
       const [pages, archive] = await Promise.all([
-        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query, undefined, TASK_PAGE_SIZE, BOARD)] as const)),
-        listTasks(target, null, "", undefined, 1, { archived: true }),
+        Promise.all(STATUSES.map(async (status) => [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, TASK_PAGE_SIZE, BOARD), kept ? columns[status]?.items.length ?? 0 : 0, TASK_PAGE_SIZE)] as const)),
+        archived,
       ]);
-      if (generation !== revision || disposed || key !== boardKey) return;
-      columns = Object.fromEntries(pages); loadedKey = key; archivedCount = archive.total;
-      selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
-    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
-    finally { if (generation === revision && !disposed) loading = false; }
+      if (stale()) return false;
+      const read = Object.fromEntries(pages);
+      columns = keepUnchanged(read); candidates = null; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+      inProgressCount = columns.in_progress?.total ?? 0;
+      keepSelected(read);
+      settled(quiet);
+      void loadVerdicts(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
+      return true;
+    } catch (cause) {
+      // A background read that failed says so, and the next one that
+      // succeeds clears what it said; neither touches the reader's own error.
+      if (generation === revision && !disposed && !(quiet && error && !refreshError)) { error = explainError(cause); refreshError = quiet; }
+      return false;
+    }
+    finally { if (!quiet && generation === revision && !disposed) loading = false; }
+  }
+  /** A read landed: a failure only an earlier background read reported is over. */
+  function settled(quiet: boolean) { if (quiet && refreshError) { error = ""; refreshError = false; } }
+  /** Drops from the selection what the read no longer holds; an unchanged selection keeps its identity. */
+  function keepSelected(pages: Partial<Record<TaskStatus, Page<TaskCard>>>) {
+    const kept = [...selected].filter((id) => loadedHas(id, pages));
+    if (kept.length !== selected.size) selected = new Set(kept);
+  }
+  /**
+   * One batched read of the verdicts for every card just loaded. A failure is
+   * shown, never drawn as "no verdicts": a card that was verified and failed
+   * must not look like one nobody checked.
+   */
+  async function loadVerdicts(ids: string[], generation: number) {
+    try {
+      const read = await getVerdicts(ids);
+      if (generation === revision && !disposed) { if (!sameVerdicts(verdicts, read)) verdicts = read; verdictError = ""; }
+    } catch (cause) {
+      if (generation === revision && !disposed) { verdicts = new Map(); verdictError = explainError(cause); }
+    }
   }
   /**
    * A task write finished; tell the archive dock to reload.
@@ -400,17 +681,28 @@
     try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
     if (initialized && active && !disposed) { await loadBoard(); await loadUnread(); }
   }
-  function scheduleRefresh() {
-    if (!active || disposed) return;
-    clearTimeout(refreshTimer);
-    refreshTimer = undefined;
-    if (readBackgroundDocument()) return;
-    refreshTimer = setTimeout(() => {
-      refreshTimer = undefined;
-      if (readBackgroundDocument() || !active || disposed) return;
-      void refresh();
-    }, 200);
-  }
+  /**
+   * Keeping the board current after a change made elsewhere — an agent over
+   * MCP, a background sweep, another window — or the window coming back.
+   * Through the same loader as the archive dock and the inbox: one read at a
+   * time, at most one every `LIVE_MIN_GAP_MS`, and quiet (see `loadBoard`).
+   * A read that had to give way to the reader is asked again afterwards.
+   */
+  const background = createLiveLoader({
+    canRun: () => initialized && active && !disposed && !readBackgroundDocument(),
+    read: async () => {
+      // The agents on the cards follow the same spaced, foreground-only
+      // cadence; on every change they cost a read of runs and one per live run.
+      void boardAgents.refresh();
+      if (loading || moving) { background.schedule(); return; }
+      membershipToken++;
+      try { await catalog(); } catch (cause) { if (!disposed) catalogError = explainError(cause); }
+      if (!(await loadBoard(scope, plan, true)) && !disposed) background.schedule();
+      await loadUnread();
+    },
+    onError: (cause) => { if (!disposed) liveNotice = `Live updates failed: ${explainError(cause)}. Use Refresh.`; },
+  });
+  function scheduleRefresh() { background.schedule(); }
   async function initialize(path: string | null = repositoryPath) {
     const ticket = ++initializationRevision;
     revision++; unreadRevision++; initialized = false; loading = true; catalogError = "";
@@ -470,8 +762,8 @@
   }
   onMount(() => {
     const listeners = createListenerTracker();
-    const changed = () => { scheduleRefresh(); void boardAgents.refresh(); };
-    if (isTauri()) void listen("workbench-changed", changed).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
+    const changed = () => { scheduleRefresh(); };
+    listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Live updates unavailable: ${message}. Use Refresh.`; } }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     const onForeground = () => {
       boardAgents.wake();
@@ -479,8 +771,7 @@
       // window is when that can have happened.
       if (!readBackgroundDocument()) checkoutToken++;
       if (readBackgroundDocument()) {
-        clearTimeout(refreshTimer);
-        refreshTimer = undefined;
+        background.reset();
         return;
       }
       scheduleRefresh();
@@ -488,7 +779,7 @@
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
-      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); listeners.dispose();
+      disposed = true; suggestWatch.reset(); revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); background.dispose(); clearTimeout(undoTimer); clearTimeout(skipClickTimer); dropFrame.cancel(); listeners.dispose();
       // Leaving the board ends the undo window rather than dropping it: the
       // reader saw these tasks go, so they go.
       if (pendingDelete && !pendingDelete.running) void commitPendingDelete();
@@ -496,9 +787,12 @@
   });
   $effect(() => {
     if (!initialized || !active) return;
-    const target = scope, query = search;
+    // Keyed on what the store is asked, not the text: a keystroke that only
+    // changes the ranking or a filter re-reads nothing.
+    boardKey;
+    const target = untrack(() => scope), current = untrack(() => plan);
     loading = true;
-    const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
+    const timer = setTimeout(() => { void loadBoard(target, current); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
   });
   // ---- Where each repository's checkout is -------------------------------
@@ -758,7 +1052,9 @@
    * only partly took is reported with both numbers, never as done.
    */
   async function moveGroup(id: string, delta: -1 | 1) {
-    if (movingGroup || busy) return;
+    // A move swaps with the neighbour in the full order, which a filtered
+    // navigator may be hiding; the row would not visibly move.
+    if (movingGroup || busy || navFiltering) return;
     const writes = moveWrites(orderedWorkspaces, id, delta);
     if (!writes) return;
     const name = workspaces.find((group) => group.id === id)?.name ?? "Workspace";
@@ -811,6 +1107,28 @@
     } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
     finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
+  /** Ask Manvi which open tasks to start next. The newest ask wins; a stale answer never replaces it. */
+  async function askSuggest() {
+    const ticket = ++suggestTicket;
+    suggestLoading = true; suggestError = "";
+    try {
+      const answer = await suggestTasks({
+        limit: 5,
+        ...(suggestPriority === "all" ? {} : { max_priority: suggestPriority }),
+        ...(scope.kind === "repository" ? { repository_id: scope.id } : {}),
+      });
+      if (disposed || ticket !== suggestTicket) return;
+      suggestion = answer;
+    } catch (cause) {
+      if (disposed || ticket !== suggestTicket) return;
+      suggestion = null; suggestError = explainError(cause);
+    } finally { if (!disposed && ticket === suggestTicket) suggestLoading = false; }
+  }
+  function toggleSuggest() {
+    showSuggest = !showSuggest;
+    // Always ask on opening: a kept answer ranks tasks as they were when it was asked.
+    if (showSuggest && !suggestLoading) void askSuggest();
+  }
   async function openTask(id: string) {
     if (session?.tabId === id && session.value) return;
     if (busy) return;
@@ -833,15 +1151,60 @@
     taskTabs = openTaskTab(taskTabs, { id: task.id, title: task.title, status: task.status, draft: false });
     session = { tabId: task.id, pane: task.id, value: task };
   }
-  async function pageColumn(status: TaskStatus, cursor?: string) {
-    if (loading || moving || loadedKey !== boardKey) return;
+  /** The next page of a search's candidates (and of its description hits). */
+  async function loadMoreCandidates() {
+    const set = candidates, current = plan;
+    if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
     const generation = revision, key = boardKey;
-    loading = true; error = "";
+    interactions++; loading = true; error = ""; refreshError = false;
     try {
-      const result = await listTasks(scope, status, search, cursor, TASK_PAGE_SIZE, BOARD);
+      const [broad, text] = await Promise.all([
+        set.broad.cursor ? listTasks(current.scope, null, "", set.broad.cursor, CANDIDATE_PAGE, BOARD) : null,
+        set.text?.cursor && current.word ? listTasks(current.scope, null, current.word, set.text.cursor, CANDIDATE_PAGE, BOARD) : null,
+      ]);
+      if (generation !== revision || disposed || key !== boardKey) return;
+      const next = mergeCandidates(set, broad, text);
+      candidates = next; columns = bucketByStatus(next.cards);
+      announce = `Searched ${next.broad.loaded} of ${next.broad.total} tasks.`;
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    finally { if (generation === revision && !disposed) loading = false; }
+  }
+  /** Whether a column has cards beyond the loaded ones, so the end of what is loaded is not its end. */
+  function tailUnknown(status: TaskStatus): boolean {
+    return Boolean(columns[status]?.next_cursor) || (searching && candidates !== null && !candidatesComplete(candidates));
+  }
+  /**
+   * Read a column to its true end, so a card sent to the bottom is positioned
+   * after the last card and not after page one. False, with the reason on the
+   * banner, when the end could not be reached: the move is then refused
+   * rather than written where it would disappear on the next read.
+   */
+  async function loadColumnRest(status: TaskStatus): Promise<boolean> {
+    if (!tailUnknown(status)) return true;
+    const refusal = `${STATUS_LABELS[status]} has more tasks than are loaded, so the card was not moved to its end. ${searching ? "Load more tasks, or clear the search," : "Retry,"} then move it again.`;
+    const page = columns[status];
+    if (searching || !page || loadedKey !== boardKey) { error = refusal; return false; }
+    const generation = revision, key = boardKey;
+    interactions++; loading = true; error = ""; refreshError = false;
+    try {
+      const all = await readToEnd((cursor) => listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD), page);
+      if (generation !== revision || disposed || key !== boardKey) return false;
+      if (!all) { error = refusal; return false; }
+      columns = { ...columns, [status]: all };
+      return true;
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); return false; }
+    finally { if (generation === revision && !disposed) loading = false; }
+  }
+  async function pageColumn(status: TaskStatus, cursor?: string) {
+    if (searching || loading || moving || loadedKey !== boardKey) return;
+    const generation = revision, key = boardKey;
+    interactions++; loading = true; error = ""; refreshError = false;
+    try {
+      const result = await listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
+      void loadVerdicts(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
@@ -872,30 +1235,71 @@
   function releasePointer(target: EventTarget | null, pointerId: number) {
     if (target instanceof HTMLElement && target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
   }
+  /**
+   * The press and drag end on the window, not the card: a card a refresh or
+   * another writer removes mid-drag takes its capture with it, and the
+   * release then lands on whatever is under the pointer instead.
+   */
+  function ownsPointer(e: PointerEvent): boolean {
+    return press !== null && e.pointerId === press.pointerId;
+  }
+  /** Ends a press or drag without dropping it. */
+  function cancelDrag() {
+    const held = press;
+    dropFrame.cancel();
+    dropMeasure = null;
+    drag = null;
+    press = null;
+    if (held) releasePointer(held.target, held.pointerId);
+  }
+  // A board hidden mid-drag (a surface switch from the keyboard) would leave
+  // the preview on <body>, over whatever is shown instead.
+  $effect(() => { if (!active) untrack(cancelDrag); });
   function onCardPointerDown(e: PointerEvent, card: TaskCard) {
     if (opening) return;
-    if (e.button !== 0 || busy || menu) return;
-    press = { card, x: e.clientX, y: e.clientY };
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    if (e.button !== 0 || busy || menu || press || reorderLocked) return;
+    const target = e.currentTarget as HTMLElement;
+    press = { card, pointerId: e.pointerId, x: e.clientX, y: e.clientY, grab: grabPoint({ x: e.clientX, y: e.clientY }, target.getBoundingClientRect()), target };
+    // Capture keeps the moves coming once the pointer leaves the window. A
+    // pointer the browser has already stopped tracking cannot be captured;
+    // the window listeners still see that press through to its end.
+    try { target.setPointerCapture(e.pointerId); } catch { /* uncaptured press, ended by the window listeners */ }
   }
+  // The preview follows every move; the drop target (an elementFromPoint plus
+  // a rect read per card) is measured once per frame, from the latest point.
+  const dropFrame = createFrameScheduler();
   function onCardPointerMove(e: PointerEvent) {
-    if (!press) return;
+    if (!press || !ownsPointer(e)) return;
+    const first = !drag;
     if (!drag) {
       if (!dragExceeded(e.clientX - press.x, e.clientY - press.y)) return;
       menu = null;
       drag = { card: press.card, over: press.card.status, insertIndex: 0, lane: "", local: 0, x: e.clientX, y: e.clientY };
     }
-    const at = dropAtPoint(e.clientX, e.clientY, drag.card.id);
-    drag = { card: drag.card, over: at.over, insertIndex: at.index, lane: at.lane, local: at.local, x: e.clientX, y: e.clientY };
+    drag = { ...drag, x: e.clientX, y: e.clientY };
+    dropMeasure = { x: e.clientX, y: e.clientY, id: drag.card.id };
+    // The move that starts the drag is measured at once, against the layout the
+    // press was made on; every later one waits for its frame.
+    if (first) measureDrop(); else dropFrame.schedule(measureDrop);
+  }
+  let dropMeasure: { x: number; y: number; id: string } | null = null;
+  /** Measure the drop target for the newest pointer position not yet measured. */
+  function measureDrop() {
+    const at = dropMeasure;
+    dropMeasure = null;
+    if (!at || !drag || drag.card.id !== at.id) return;
+    const target = dropAtPoint(at.x, at.y, at.id);
+    drag = { card: drag.card, over: target.over, insertIndex: target.index, lane: target.lane, local: target.local, x: at.x, y: at.y };
   }
   function onCardPointerUp(e: PointerEvent) {
+    if (!ownsPointer(e)) return;
+    // A frame may not have run since the last move; the drop is where the
+    // preview last pointed, so measure that move now, against the same layout.
+    if (dropFrame.isScheduled()) measureDrop();
     const current = drag;
-    drag = null;
-    press = null;
-    releasePointer(e.currentTarget, e.pointerId);
+    cancelDrag();
     if (!current) return;
-    skipClick = true;
-    requestAnimationFrame(() => { skipClick = false; });
+    swallowGestureClick();
     void dropCard(current.card, current.over, current.insertIndex);
   }
   /**
@@ -905,14 +1309,28 @@
   async function dropCard(card: TaskCard, over: TaskStatus | null, insertIndex: number) {
     const fromIndex = (displayColumns[card.status]?.items ?? []).findIndex((item) => item.id === card.id);
     if (!shouldCommitMove(card.status, over, { moving, fromIndex, insertIndex })) return;
-    const items = displayColumns[over]?.items ?? [];
-    const { before, after } = insertionNeighbors(items, card.id, insertIndex);
-    const position = insertionPosition(before,after);
+    let items = displayColumns[over]?.items ?? [];
+    let { before, after } = insertionNeighbors(items, card.id, insertIndex);
+    let position = insertionPosition(before, after, undefined, tailUnknown(over));
+    if (position === null) {
+      // The slot is the bottom of a column with more behind it: read the rest
+      // first, then the bottom is the real one.
+      if (!(await loadColumnRest(over))) return;
+      items = displayColumns[over]?.items ?? [];
+      ({ before, after } = insertionNeighbors(items, card.id, items.length));
+      position = insertionPosition(before, after);
+    }
     if (after !== null && (position >= after || before !== null && position <= before)) {
       const plan = reorderPlan(items,card,insertIndex);
-      if (columns[over]?.next_cursor || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
+      if (columns[over]?.next_cursor || (candidates && !candidatesComplete(candidates)) || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
       await applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
     } else await moveCard(card, over, position);
+  }
+  /** The keyboard's move to the neighbouring column: to its bottom, which is only known once the column is read to its end. */
+  async function moveToEnd(card: TaskCard, status: TaskStatus) {
+    if (moving || !(await loadColumnRest(status))) return;
+    const last = (columns[status]?.items ?? []).at(-1);
+    await moveCardAcross(card, status, insertionPosition(last?.position ?? null, null));
   }
   function onCardClick(e: MouseEvent, card: TaskCard) {
     // A card is not `disabled` while a task opens: a disabled button loses
@@ -926,7 +1344,7 @@
       return;
     }
     if (e.shiftKey) {
-      const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+      const ids = flattenVisibleIds(drawnColumns, shown, cardVisible);
       selected = rangeSelect(ids, selectionAnchor, card.id);
       return;
     }
@@ -937,9 +1355,7 @@
     void openTask(card.id);
   }
   function onCardPointerCancel(e: PointerEvent) {
-    drag = null;
-    press = null;
-    releasePointer(e.currentTarget, e.pointerId);
+    if (ownsPointer(e)) cancelDrag();
   }
   function openCardMenu(card: TaskCard, status: TaskStatus, x: number, y: number) {
     if (!selected.has(card.id)) {
@@ -952,8 +1368,7 @@
     if (opening) return;
     e.preventDefault();
     e.stopPropagation();
-    skipClick = true;
-    requestAnimationFrame(() => { skipClick = false; });
+    swallowGestureClick();
     openCardMenu(card, status, e.clientX, e.clientY);
   }
   function onColumnContextMenu(e: MouseEvent, status: TaskStatus) {
@@ -1013,7 +1428,7 @@
       next.focus();
       const id = next.dataset.cardId;
       if (id && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
-        const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+        const ids = flattenVisibleIds(drawnColumns, shown, cardVisible);
         if (!selectionAnchor) selectionAnchor = card.id;
         selected = rangeSelect(ids, selectionAnchor, id);
       }
@@ -1023,8 +1438,21 @@
     e.preventDefault();
     const next = neighborStatus(card.status, e.key === "ArrowRight" ? 1 : -1);
     if (!next) return;
-    const last = (columns[next]?.items ?? []).at(-1);
-    void moveCard(card, next, insertionPosition(last?.position ?? null, null));
+    void moveToEnd(card, next);
+  }
+  /**
+   * The keyboard move to a neighbouring column. The write reloads the board
+   * and the pressed card is replaced, which drops focus to <body>; focus goes
+   * back to it and the new column is named, as Alt+Arrow does. Announced only
+   * once the card is drawn in that column, so a refused write says nothing.
+   */
+  async function moveCardAcross(card: TaskCard, status: TaskStatus, position: number) {
+    await moveCard(card, status, position);
+    if (disposed) return;
+    const moved = boardEl?.querySelector<HTMLElement>(`[data-task-column="${status}"] [data-task-card][data-card-id="${CSS.escape(card.id)}"]`);
+    if (!moved) return;
+    announce = `${card.title} moved to ${STATUS_LABELS[status]}`;
+    moved.focus();
   }
   /**
    * The card a vertical key lands on: the next or previous card in the same
@@ -1046,6 +1474,7 @@
    */
   async function nudgeCard(card: TaskCard, delta: -1 | 1) {
     if (busy) return;
+    if (reorderLocked) { announce = boardSort === "priority" ? "Cards are ordered by priority. Switch to Board order to move a card within its column." : "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
     const items = displayColumns[card.status]?.items ?? [];
     const from = items.findIndex((item) => item.id === card.id);
     const to = from + delta;
@@ -1057,6 +1486,13 @@
     boardEl?.querySelector<HTMLElement>(`[data-task-card][data-card-id="${CSS.escape(card.id)}"]`)?.focus();
   }
   function onBoardKeydown(e: KeyboardEvent) {
+    // Before the focus checks: Safari does not focus a pressed button, so
+    // during a drag the focus can be anywhere, or nowhere.
+    if (press && e.key === "Escape") {
+      e.preventDefault();
+      cancelDrag();
+      return;
+    }
     if (!active || !boardEl) return;
     const target = e.target;
     if (!(target instanceof Node) || !boardEl.contains(target)) return;
@@ -1073,7 +1509,7 @@
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
-      selected = new Set(flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now)));
+      selected = new Set(flattenVisibleIds(drawnColumns, shown, cardVisible));
       selectionAnchor = [...selected][0] ?? null;
       return;
     }
@@ -1112,7 +1548,7 @@
   }
   async function applyUpdate(batch: TaskBatch) {
     if (moving || pendingUpdate && pendingUpdate !== batch) return;
-    moving = true; error = ""; pendingUpdate = batch;
+    interactions++; moving = true; error = ""; refreshError = false; pendingUpdate = batch;
     try {
       await batch.run();
       if (disposed) return;
@@ -1245,7 +1681,7 @@
     if (busy || !cards.length) return;
     const wanted = archivable(cards);
     if (!wanted.length) {
-      error = cards.length === 1 ? "That task is already archived." : "Those tasks are already archived.";
+      error = archiveRefusal(cards.length);
       return;
     }
     const already = cards.length - wanted.length;
@@ -1253,7 +1689,8 @@
     // `applyUpdate` announces what it wrote. The skipped tasks are not a
     // failure and not a write, so they are said separately rather than
     // folded into a count that would then not match the receipt.
-    if (already > 0 && !error) announce = `${announce} ${plural(already, "task")} already archived.`;
+    const skipped = archiveSkipped(already);
+    if (skipped && !error) announce = `${announce} ${skipped}`;
   }
   /** Defaults a quick-added task inherits from wherever it was typed. */
   function quickAddDefaults(status: TaskStatus) {
@@ -1650,7 +2087,7 @@
   <span class="column-meta">
     <!-- The store's count for the column, not its loaded page: a column
          showing thirty of forty is over a limit of thirty-five. -->
-    <span data-testid="task-column-count" title={limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status]?.total ?? "—"}{#if limit}<span class="limit">/{limit}</span>{/if}</span>
+    <span data-testid="task-column-count" title={searching ? `${columnCount(status)} matching in ${STATUS_LABELS[status]}` : limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status] && !(provisional && !searching) ? columnCount(status) : "—"}{#if limit && !searching}<span class="limit">/{limit}</span>{/if}</span>
     {#if wip === "over"}<span class="over-badge" data-testid="task-column-over">Over limit<span class="sr-only">: {STATUS_LABELS[status]} holds {columns[status]?.total ?? 0} tasks against a limit of {limit}</span></span>{/if}
     <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
   </span>
@@ -1676,20 +2113,18 @@
     aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
     aria-disabled={opening || undefined}
     onpointerdown={(e) => onCardPointerDown(e, card)}
-    onpointermove={onCardPointerMove}
-    onpointerup={onCardPointerUp}
-    onpointercancel={onCardPointerCancel}
     onclick={(e) => onCardClick(e, card)}
     oncontextmenu={(e) => onCardContextMenu(e, card, status)}
     onkeydown={(e) => onCardKeydown(e, card, status)}
   >
     <div class="card-meta">
-      {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
+      {#if face.pip !== null}<span class="pip" data-priority={face.pip} role="img" aria-label={`${priorityLabel(face.pip)} priority`} title={`${priorityLabel(face.pip)} priority`}></span>{/if}
       <h3>{face.title}{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}</h3>
       {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
     </div>
     {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
     {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}><AlertTriangle size={10} aria-hidden="true" /> {flag.label}</span>{/if}
+    {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
     {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
     {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
       <div class="card-extra">
@@ -1699,6 +2134,7 @@
       </div>
     {/if}
     {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
+    {@render matchHint(card)}
   </button>
 {/snippet}
 {#snippet listRow(card: TaskCard)}
@@ -1727,11 +2163,20 @@
     <span class="row-title">{face.title}</span>{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}
     {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
     {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}>{flag.label}</span>{/if}
+    {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
     {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
     {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
     {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
     {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+    {@render matchHint(card)}
   </button>
+{/snippet}
+{#snippet matchHint(card: TaskCard)}
+  <!-- Why a search matched a card it would not obviously match: a related
+       word, a close spelling, or a description only the store can read. -->
+  {@const hit = ranked.byId.get(card.id)}
+  {@const why = hit ? describeMatch(hit) : ""}
+  {#if why}<span class="match-hint" data-testid="task-match-hint">Matched {why}</span>{/if}
 {/snippet}
 {#snippet columnPaging(status: TaskStatus, named = false)}
   <!-- One control for both layouts. The list used to have none, so a task
@@ -1749,17 +2194,21 @@
 {#snippet scopeSelection(selected: boolean)}
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
-<svelte:window onkeydown={onBoardKeydown} />
+<svelte:window onkeydown={onBoardKeydown} onpointermove={onCardPointerMove} onpointerup={onCardPointerUp} onpointercancel={onCardPointerCancel} onlostpointercapture={onCardPointerCancel} onblur={cancelDrag} />
 <div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
+      <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find workspace or repo" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
       <div class="nav-heading">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="icon gp-icon-btn" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
       <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
       {#each orderedWorkspaces as group, index (group.id)}
         {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
-        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        {#if navShowsWorkspace(group)}
+        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        {/if}
       {/each}
-      {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
+      {#if navFiltering && navWorkspaceMatches === 0}<p class="nav-empty" data-testid="task-nav-no-workspaces">No workspace matches “{navFilter.trim()}”{workspaceCursor ? " in the loaded rows" : ""}.</p>{/if}
+      {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
       {#if workspaces.some((group) => group.archived)}
         <!-- "workspaces", not just "archived": this page also has an Archive
              that holds completed tasks, and two unqualified uses of the word
@@ -1807,11 +2256,14 @@
       {/if}
       {#each repositories as repo (repo.id)}
         {@const health = checkouts.get(repo.id)}
+        {#if navShowsRepository(repo)}
         <div class="nav-row" data-repository-row={repo.id} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
         {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
       </button>{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
+        {/if}
       {/each}
-      {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
+      {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
+      {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
     </nav>
   {/if}
   <main class="board-main">
@@ -1824,7 +2276,9 @@
         {#if repositoryPath}<button type="button" class="link" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       </div>
       <div class="actions">
-        <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
+        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repo:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
+        <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repo:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
+        <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
           <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
           <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
@@ -1842,6 +2296,7 @@
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
+        <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}>Suggest next</button>
         <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
         <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
         <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
@@ -1880,13 +2335,84 @@
           <option value="all">All labels</option>
           {#each facetOptions.labels as label}<option value={label}>{label}</option>{/each}
         </select>
+        <select class="gp-select" aria-label="Filter by severity" bind:value={facet.severity}>
+          <option value="all">Any severity</option>
+          <option value="">No severity</option>
+          {#each facetOptions.severities as severity}<option value={severity}>{severity}</option>{/each}
+        </select>
         <select class="gp-select" aria-label="Filter by due date" bind:value={facet.due}>
           <option value="all">Any due date</option>
           <option value="overdue">Overdue</option>
           <option value="soon">Due soon</option>
           <option value="none">No due date</option>
         </select>
+        <!-- A repository's own board already shows only its tasks, so the
+             select is offered there only while a filter carried over from
+             another board is still on — never as an invisible constraint. -->
+        {#if (scope.kind !== "repository" && facetRepositories.length) || facet.repository !== "all"}
+          <select class="gp-select" aria-label="Filter by repository" data-testid="task-filter-repository" bind:value={facet.repository}>
+            <option value="all">All repositories</option>
+            {#each facetRepositories as repo (repo.id)}<option value={repo.id}>{repo.name}</option>{/each}
+          </select>
+        {/if}
+        <div class="gp-segmented" role="group" aria-label="Order cards">
+          <button type="button" class="gp-seg-btn" data-active={boardSort === "board"} aria-pressed={boardSort === "board"} title="Cards in the board's own order, where they can be moved." onclick={() => { boardSort = "board"; }}>Board order</button>
+          <button type="button" class="gp-seg-btn" data-active={boardSort === "priority"} aria-pressed={boardSort === "priority"} title="Most urgent first, then the earlier due date. Cards cannot be moved within a column in this order." onclick={() => { boardSort = "priority"; }}>Priority first</button>
+        </div>
         {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
+      </div>
+    {/if}
+    {#if initialized && showSuggest}
+      <TaskSuggestPanel
+        result={suggestion} loading={suggestLoading} error={suggestError} priority={suggestPriority}
+        onPriority={(value) => { suggestPriority = value; void askSuggest(); }}
+        onOpen={(id) => void openTask(id)} onRefresh={() => void askSuggest()} onClose={() => { showSuggest = false; }}
+      />
+      <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} />
+    {/if}
+    {#if initialized && (showFilters || filtering || showSearchHelp)}
+      <div class="query-bar" data-testid="task-query-bar">
+        <div class="quick-filters" role="group" aria-label="Quick filters">
+          {#each QUICK_FILTERS as quick (quick.filter)}
+            {@const on = queryHas(parsedQuery, quick.filter)}
+            <button type="button" class="gp-btn quick" aria-pressed={on} data-active={on} title={on ? `Remove ${quick.filter}` : `Add ${quick.filter} to the search`} onclick={() => { search = toggleQueryTerm(search, quick.filter); }}>{quick.label}</button>
+          {/each}
+        </div>
+        {#if parsedQuery.terms.length}
+          <ul class="query-chips" aria-label="Search filters">
+            {#each queryChips(parsedQuery) as term (`${term.start}:${term.raw}`)}
+              <li class="gp-pill query-chip" class:negated={term.negated}><span>{term.raw}</span><button type="button" class="chip-remove" aria-label={`Remove filter ${term.raw}`} onclick={() => { search = removeQueryTerm(search, term); }}><X size={10} /></button></li>
+            {/each}
+          </ul>
+        {/if}
+        {#if searchReport}
+          <!-- What the search read, matched and ranked. A partial answer says
+               it is partial and offers the next page; it never reads as
+               everything that matches. -->
+          <span class="query-coverage" role="status" data-testid="task-query-coverage">{searchReport}</span>
+        {/if}
+        {#if moreCandidates}
+          <button type="button" class="gp-btn quick" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+        {/if}
+        {#if searching && parsedQuery.words}
+          <div class="gp-segmented" role="group" aria-label="Order matches">
+            <button type="button" class="gp-seg-btn" data-active={sort === "relevance"} aria-pressed={sort === "relevance"} title="Best matches first. Cards cannot be moved within a column in this order." onclick={() => { sort = "relevance"; }}>Relevance</button>
+            <button type="button" class="gp-seg-btn" data-active={sort === "board"} aria-pressed={sort === "board"} title="Matches in the board's own order, where cards can be moved." onclick={() => { sort = "board"; }}>Board order</button>
+          </div>
+        {/if}
+        {#if parsedQuery.problems.length}
+          <ul class="query-problems" role="status" aria-live="polite" data-testid="task-query-problems">
+            {#each parsedQuery.problems as problem}<li><AlertTriangle size={11} aria-hidden="true" /> {problem}</li>{/each}
+          </ul>
+        {/if}
+        {#if showSearchHelp}
+          <dl id="task-search-help" class="query-help" data-testid="task-search-help">
+            <div><dt>words</dt><dd>Every word must match: titles, labels, type, owner and repository (word forms, related words, close spellings), and descriptions through the store</dd></div>
+            <div><dt>login OR signin</dt><dd>Either word</dd></div>
+            <div><dt>"sign in"</dt><dd>That phrase in the title or a label</dd></div>
+            {#each QUERY_HELP as row (row.example)}<div><dt><button type="button" class="link" title="Add to the search" onclick={() => { search = toggleQueryTerm(search, row.example); }}>{row.example}</button></dt><dd>{row.meaning}</dd></div>{/each}
+          </dl>
+        {/if}
       </div>
     {/if}
     {#if creation.allowed}
@@ -1965,8 +2491,8 @@
           class="gp-btn"
           data-testid="task-archive-selected"
           onclick={() => void archiveCards(selectedCards)}
-          disabled={busy || selectionArchived === "all"}
-          title={selectionArchived === "all" ? "Already archived" : "Archive — files the tasks away, keeping their status"}
+          disabled={archiveBar.disabled}
+          title={archiveBar.title}
         ><Archive size={12} /> Archive</button>
         <!-- The merge gitpulse_merge_tasks runs, offered only for a
              selection it would not refuse on sight (taskMerge.ts). -->
@@ -1994,14 +2520,17 @@
         onopen={openTask}
         onaction={(cards, action) => void archiveDockAction(cards, action)}
         onrestoredeleted={restoreDeleted}
+        repository={(id) => repositoryById.get(id)}
       />
     {/if}
     {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if issueProgress}<div class="banner" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
+    {#if liveNotice}<div class="banner" role="status" data-testid="task-live-unavailable">{liveNotice}</div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
     <!-- Cards carry no agent marks while this stands: an old reading would
          claim agents nobody checked. -->
+    {#if verdictError}<p class="agents-unread" role="status" data-testid="board-verdicts-error">Verification verdicts could not be read, so cards show none: {verdictError}</p>{/if}
     {#if $boardAgents.error}<p class="agents-unread" role="status" data-testid="board-agents-error">Agents working on these tasks could not be read: {$boardAgents.error}</p>{/if}
     <!-- A check that could not run is said, not shown as a healthy checkout:
          those rows and cards carry no mark either way. -->
@@ -2020,7 +2549,7 @@
            saved, because nothing had linked a repository. -->
       <EmptyState icon={Inbox} title="No tasks yet" hint={creation.blocked ?? creation.caveat ?? "Create a task in this scope. Cards stay on this board until you delete them."} action={creation.allowed ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
     {:else if initialized && !loading && listCards.length === 0 && filtering}
-      <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
+      <EmptyState icon={Search} title="No tasks match" hint={candidates && !candidatesComplete(candidates) ? `Only ${candidates.broad.loaded} of ${candidates.broad.total} tasks on this board were searched. Load more tasks to search the rest, or clear the search.` : "Nothing on this board matches every word and filter. Clear the search or remove a filter to see the rest."} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
       <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={loading || moving} aria-label="Task list">
         {#if laneList}
@@ -2107,7 +2636,12 @@
     {/if}
   </main>
   {#if drag}
-    <div class="ghost gp-glass bg-surface shadow-float" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
+    <!-- Portaled to body: the board's `.gp-pane` contains layout and paint,
+         which makes it the containing block of `position: fixed`, and a
+         preview drawn in it trailed the pointer by the pane's own origin.
+         Drawn at the card's size and held where it was grabbed. -->
+    {@const grab = press?.grab ?? { dx: 0, dy: 0, width: 0, height: 0 }}
+    <div use:portal={"body"} class="ghost gp-glass bg-surface shadow-float" style="width: {grab.width}px; height: {grab.height}px; transform: translate3d({drag.x - grab.dx}px, {drag.y - grab.dy}px, 0)" data-testid="task-drag-ghost">{drag.card.title}</div>
   {/if}
   {#if menu}
     <TaskContextMenu
@@ -2275,7 +2809,24 @@
   button:disabled{opacity:.5}
   .hint{font-size:11px;color:rgb(var(--c-text-muted))}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
-  .search input{width:160px}
+  .match-hint{display:block;margin-top:4px;font-size:10px;line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}
+  .nav-search input{flex:1;min-width:0;font-size:11px}
+  .nav-empty{margin:2px 6px 6px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .query-bar{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:0 14px 8px}
+  .quick-filters{display:flex;flex-wrap:wrap;gap:4px}
+  .quick{font-size:11px;padding:2px 8px}
+  .quick[data-active="true"]{background:rgb(var(--c-accent) / .18);border-color:rgb(var(--c-accent) / .55)}
+  .query-chips{display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
+  .query-chip{display:inline-flex;align-items:center;gap:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
+  .query-chip.negated span{text-decoration:line-through}
+  .chip-remove{display:inline-flex;border:0;background:none;padding:0;color:inherit;cursor:pointer}
+  .query-coverage{font-size:11px;color:rgb(var(--c-text-muted))}
+  .query-problems{flex-basis:100%;margin:0;padding:0;list-style:none;font-size:11px;color:rgb(var(--c-status-amber))}
+  .query-help{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:2px 14px;margin:0;font-size:11px}
+  .query-help div{display:flex;gap:8px}
+  .query-help dt{min-width:130px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .query-help dd{margin:0;color:rgb(var(--c-text-muted))}
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
   .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}
@@ -2348,7 +2899,7 @@
   .list{padding:12px;overflow:auto;flex:1}
   .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);display:flex;align-items:center;justify-content:space-between;gap:10px}
   .error{color:#d15a64}
-  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;font-size:12px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:12px;font-weight:550;overflow:hidden;overflow-wrap:anywhere}
   .pad{padding:16px}
   .quick-add-row{padding:8px 14px 0}
   .quick-add-row.dimmed{opacity:.45;pointer-events:none;transition:opacity .15s ease}

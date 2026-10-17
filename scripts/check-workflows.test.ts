@@ -4,9 +4,12 @@ import { describe, expect, it } from "vitest";
 import { GATES } from "./ci-local.mjs";
 import {
   INSTALL_HINT,
+  checkoutsPersistingCredentials,
   hasWorkflowLevelPermissions,
   interpret,
+  unpinnedActions,
   workflowFiles,
+  workflowPolicyFindings,
   workflowsMissingPermissions,
 } from "./check-workflows.mjs";
 
@@ -57,6 +60,57 @@ describe("check:workflows", () => {
 
     const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
     expect(workflowsMissingPermissions(dir)).toEqual([]);
+  });
+
+  it("refuses a third-party action that is not pinned to a commit", () => {
+    const yaml = [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - uses: ./.github/actions/local",
+      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "      - name: Tagged",
+      "        uses: oven-sh/setup-bun@v2",
+      "      - name: Branch",
+      "        uses: dtolnay/rust-toolchain@stable",
+      "      - uses: docker://alpine:3.20",
+      "      - uses: owner/short@3d3c42e",
+    ].join("\n");
+    // A local action has no ref to move, and a docker image is not an action
+    // ref; a tag, a branch and an abbreviated SHA can all be repointed.
+    expect(unpinnedActions(yaml)).toEqual([
+      "oven-sh/setup-bun@v2",
+      "dtolnay/rust-toolchain@stable",
+      "owner/short@3d3c42e",
+    ]);
+  });
+
+  it("refuses a checkout that leaves the token in .git/config", () => {
+    const yaml = [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - name: Kept",
+      "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "      - name: Dropped",
+      "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "        with:",
+      "          fetch-depth: 0",
+      "          persist-credentials: false",
+      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "        with:",
+      "          persist-credentials: true",
+      "      - name: Next",
+      "        run: echo persist-credentials: false",
+    ].join("\n");
+    // Only the checkout's own `with:` counts: a later step mentioning the key,
+    // or the key set to true, does not drop the credential.
+    expect(checkoutsPersistingCredentials(yaml)).toEqual([0, 2]);
+  });
+
+  it("holds every workflow in this repository to both rules", () => {
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    expect(workflowPolicyFindings(dir)).toEqual([]);
   });
 
   it("prints the rust coverage summary without rerunning the tests", () => {
@@ -111,13 +165,42 @@ describe("check:workflows", () => {
     }
   });
 
+  it("measures Rust branch coverage, on a pinned nightly because the flag is unstable", () => {
+    const coverage = readFileSync(
+      fileURLToPath(new URL("../.github/workflows/coverage.yml", import.meta.url)),
+      "utf8",
+    );
+    for (const line of coverage.split("\n").filter((line) => line.includes("cargo llvm-cov") && line.includes("--manifest-path"))) {
+      expect(line).toContain("--branch");
+    }
+    expect(coverage).toMatch(/toolchain:\s*nightly-\d{4}-\d{2}-\d{2}/);
+  });
+
+  it("keeps the serial gate and also runs the suite in parallel, in its own workflow", () => {
+    const read = (name: string) =>
+      readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
+    // The gate stays serial: the previous test asserts every ci.yml line does.
+    expect(read("ci.yml")).toContain("--test-threads=1");
+    const parallel = read("test-parallel.yml");
+    const lines = parallel.split("\n").filter((line) => line.includes("cargo test --manifest-path"));
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line).toContain("--test-threads=8");
+      expect(line).not.toContain("--test-threads=1");
+    }
+    // Often enough to catch a parallel-only flake the day it lands, not at release.
+    expect(parallel).toMatch(/^\s*push:\s*\n\s*branches:\s*\[main\]/m);
+    expect(parallel).toMatch(/^\s*schedule:/m);
+  });
+
   it("scopes rust-cache to the runner image so native artifacts are not reused across MSVC upgrades", () => {
     for (const name of ["ci.yml", "coverage.yml", "release.yml"]) {
       const source = readFileSync(
         fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)),
         "utf8",
       );
-      const caches = source.split("uses: Swatinem/rust-cache@v2");
+      // Every workflow pins the action to the commit v2 resolved to.
+      const caches = source.split("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6");
       expect(caches.length, name).toBeGreaterThan(1);
       for (const block of caches.slice(1)) {
         // ImageOS is a runner process env var, not a workflow `env` key, so

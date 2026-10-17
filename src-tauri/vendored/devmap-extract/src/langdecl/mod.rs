@@ -51,12 +51,14 @@ use tree_sitter::Node;
 
 use crate::model::{SymbolKind, WiringKind};
 
+pub(crate) mod access;
 pub(crate) mod dart;
 pub(crate) mod erlang;
 pub(crate) mod kotlin;
 pub(crate) mod nix;
 pub(crate) mod pascal;
 pub(crate) mod r;
+pub(crate) mod ruby;
 pub(crate) mod solidity;
 pub(crate) mod swift;
 
@@ -164,6 +166,8 @@ pub(crate) fn is_exported_of(lang: &str, node: Node, source: &str, name: &str, p
         "swift" => swift::is_exported(node, source),
         "kotlin" => kotlin::is_exported(node, source),
         "pascal" => pascal::is_exported(node, source),
+        "java" | "csharp" => access::is_exported(lang, node, source, name),
+        "ruby" => ruby::is_exported(node, source, name),
         // Dart's privacy *is* the leading underscore — `_helper` is
         // library-private and nothing else is — so the generic fallback is the
         // language rule here, not an approximation of it.
@@ -196,6 +200,7 @@ pub(crate) fn exemption(
         "swift" => swift::exemption(node, source, declaration),
         "kotlin" => kotlin::exemption(node, source, declaration),
         "dart" => dart::exemption(node, source, declaration),
+        "java" | "csharp" => access::exemption(lang, node, source, declaration),
         _ => None,
     }
 }

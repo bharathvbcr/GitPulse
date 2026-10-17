@@ -52,7 +52,13 @@ pub fn extract_swift_call(
     let Some(call) = swift_call_identity(node, source) else {
         return;
     };
-    if !is_callee_identity(&call.callee_name) {
+    // An operator's name is punctuation, which `is_callee_identity` refuses by
+    // design for an *expression*. A `custom_operator` node is a declared
+    // operator's own spelling, so it is an identity and passes.
+    if !call.operator
+        && call.name_node.kind() != "custom_operator"
+        && !is_callee_identity(&call.callee_name)
+    {
         return;
     }
     let enclosing = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
@@ -80,6 +86,8 @@ struct SwiftCall<'tree> {
     receiver_expr: Option<String>,
     name_node: Node<'tree>,
     kind: ReferenceKind,
+    /// The name is an operator's spelling, not an identifier.
+    operator: bool,
 }
 
 fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCall<'tree>> {
@@ -110,6 +118,7 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
             // through `if !f(…)` were reported dead at 0.9 confidence, from a
             // call the graph never saw.
             let target = swift_unwrap_prefix(target).unwrap_or(target);
+            let target = swift_call_operand(target);
             if target.kind() == "navigation_expression" {
                 return swift_navigation_call(target, source);
             }
@@ -122,11 +131,19 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
             if callee_name == "defer" {
                 return None;
             }
+            // `Coordinator()` after `typealias Coordinator = Held<Int>` constructs a
+            // `Held`; a qualified or lowercase callee is never read as an alias.
+            let callee_name = if receiver.is_none() {
+                alias_name(target, source, callee_name)
+            } else {
+                callee_name
+            };
             Some(SwiftCall {
                 callee_name,
                 receiver_expr: receiver.as_deref().and_then(clamp_receiver),
                 name_node: target,
                 kind: ReferenceKind::Call,
+                operator: false,
             })
         }
         // `Set<Int>()`, `Box<Int>(value: 1)`. The constructed type is a field,
@@ -134,11 +151,71 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
         "constructor_expression" => {
             let constructed = node.child_by_field_name("constructed_type")?;
             let (callee_name, receiver_expr) = swift_user_type_identity(constructed, source)?;
+            let callee_name = if receiver_expr.is_none() {
+                alias_name(constructed, source, callee_name)
+            } else {
+                callee_name
+            };
             Some(SwiftCall {
                 callee_name,
                 receiver_expr,
                 name_node: constructed,
                 kind: ReferenceKind::Constructor,
+                operator: false,
+            })
+        }
+        // `a <+> b`. A custom operator is a call of the `static func <+>` some
+        // type declares; tree-sitter-swift spells the use as an
+        // `infix_expression` whose `op` is a `custom_operator`, and before this
+        // arm nothing recorded it, so a `fileprivate static func <+>` used only
+        // through its operator was published dead at 0.9 (the audit's Swift
+        // P1). Standard operators (`+`, `==`) parse as their own expression
+        // kinds and are not recorded: every `a + b` on an `Int` would be a
+        // ledger row. Their in-repo overloads are exempt at the declaration
+        // instead — see `swift_operator_declaration_reason`.
+        "infix_expression" => {
+            let op = node.child_by_field_name("op")?;
+            if op.kind() != "custom_operator" {
+                return None;
+            }
+            Some(SwiftCall {
+                callee_name: get_node_text(op, source),
+                receiver_expr: None,
+                name_node: op,
+                kind: ReferenceKind::Call,
+                operator: true,
+            })
+        }
+        // `a + b`, `a == b`, `a < b` on an operand that could be a user type:
+        // the call of the `static func +` that type declares, with the left
+        // operand as its receiver (the type an overload is declared on). A
+        // literal left operand is never one; the operators' use on the standard
+        // library's own types is not worth a ledger row per expression, and an
+        // unindexed receiver type is classified as such, not as a defect.
+        "additive_expression"
+        | "multiplicative_expression"
+        | "comparison_expression"
+        | "equality_expression" => {
+            let lhs = node.child_by_field_name("lhs")?;
+            if !matches!(
+                lhs.kind(),
+                "simple_identifier" | "navigation_expression" | "self_expression"
+            ) {
+                return None;
+            }
+            let rhs = node.child_by_field_name("rhs")?;
+            let mut cursor = node.walk();
+            let op = node.children(&mut cursor).find(|child| {
+                !child.is_named()
+                    && child.start_byte() >= lhs.end_byte()
+                    && child.end_byte() <= rhs.start_byte()
+            })?;
+            Some(SwiftCall {
+                callee_name: get_node_text(op, source),
+                receiver_expr: clamp_receiver(&get_node_text(lhs, source)),
+                name_node: op,
+                kind: ReferenceKind::Call,
+                operator: true,
             })
         }
         _ => None,
@@ -162,6 +239,31 @@ fn swift_unwrap_prefix<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
         return None;
     }
     target.child_by_field_name("target")
+}
+
+/// The operand a call's callee really is, when the grammar bound the operator
+/// too tightly.
+///
+/// tree-sitter-swift parses `"x" + f()` as `call_expression(additive_expression
+/// ("x" + f), call_suffix)`: the argument list attaches to the whole sum, so the
+/// callee text was `"x" + f`, no identity at all, and the call was dropped
+/// (recorded as a bare reference). `1 - q.r()` is the same shape one level down,
+/// with the sum as the *target* of the member access, and `a.bump() + g.bump()`
+/// typed its second call by the receiver `a.bump() + g`. The right operand of
+/// the sum is the callee (or the member target); `+ - * /` are the only
+/// operators the grammar treats this way.
+fn swift_call_operand<'tree>(node: Node<'tree>) -> Node<'tree> {
+    let mut node = node;
+    while matches!(
+        node.kind(),
+        "additive_expression" | "multiplicative_expression"
+    ) {
+        match node.child_by_field_name("rhs") {
+            Some(rhs) => node = rhs,
+            None => break,
+        }
+    }
+    node
 }
 
 /// Whether a `call_expression` is really a subscript: `items[0]`, `dict["k"]`.
@@ -204,7 +306,8 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
     let suffix = nav.child_by_field_name("suffix")?;
     let name_node = suffix.child_by_field_name("suffix")?;
     let (callee_name, _) = split_call_target(name_node, source)?;
-    let target = nav.child_by_field_name("target")?;
+    let raw_target = nav.child_by_field_name("target")?;
+    let target = swift_call_operand(raw_target);
     // `Person.init(name:)` constructs a `Person`; recording `init` as the callee
     // would name a symbol that does not exist, because the generic declaration
     // arm emits nothing for an `init_declaration`. `self.init` and `super.init`
@@ -217,14 +320,177 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
             receiver_expr: qualifier,
             name_node: target,
             kind: ReferenceKind::Constructor,
+            operator: false,
         });
     }
+    // `a + b.c.run()` parses as `((a + b).c).run()`: the sum is the base of the
+    // chain. Member access binds tighter than `+`, so the receiver is `b.c`.
+    let receiver = match swift_sum_tail(raw_target) {
+        Some(tail) => source
+            .get(tail.start_byte()..raw_target.end_byte())
+            .and_then(clamp_receiver),
+        None => swift_receiver(target, source),
+    };
     Some(SwiftCall {
         callee_name,
-        receiver_expr: receiver_from(target, source),
+        receiver_expr: receiver
+            .map(|receiver| member_path_type(nav, source, &receiver).unwrap_or(receiver))
+            .map(|receiver| alias_name(nav, source, receiver)),
         name_node,
         kind: ReferenceKind::Call,
+        operator: false,
     })
+}
+
+/// The right operand of the sum at the base of a member chain: for
+/// `(a + b).c` the node `b`. `None` when the chain does not start from a sum
+/// (the sum directly under the call is [`swift_call_operand`]'s).
+fn swift_sum_tail<'tree>(chain: Node<'tree>) -> Option<Node<'tree>> {
+    let mut node = chain;
+    let mut steps = 0;
+    while matches!(node.kind(), "navigation_expression" | "call_expression") {
+        node = if node.kind() == "navigation_expression" {
+            node.child_by_field_name("target")?
+        } else {
+            swift_callee_target(node)?
+        };
+        steps += 1;
+        if steps > 16 {
+            return None;
+        }
+    }
+    (steps > 0 && node.id() != chain.id())
+        .then(|| swift_call_operand(node))
+        .filter(|tail| tail.id() != node.id())
+}
+
+/// The type of a two-segment member path (`open.transform`) when the scope that
+/// binds its head writes the head's tuple type with that member typed; the
+/// receiver is then that type, the way a typed local's receiver is.
+fn member_path_type(at: Node, source: &str, receiver: &str) -> Option<String> {
+    let word = |segment: &str| {
+        !segment.is_empty() && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    let (head, member) = receiver.split_once('.')?;
+    // A member is a label or a position (`open.0`); the head is a name.
+    if !word(head) || !word(member) || head.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    crate::swiftscope::tuple_member_type(at, source, receiver)
+        .filter(|ty| !ty.contains(['[', ']', '?']))
+}
+
+/// What a bare type name stands for when this file declares it with
+/// `typealias`: `H.duration(…)` after `typealias H = SleepLogHints` is a call on
+/// `SleepLogHints`. Anything that is not one bare capitalised name is returned
+/// as written.
+fn alias_name(at: Node, source: &str, name: String) -> String {
+    let bare = name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if !bare {
+        return name;
+    }
+    crate::swiftscope::alias_of_type_name(at, source, &name).unwrap_or(name)
+}
+
+/// The longest receiver text kept whole; past it, or across lines, a
+/// construction is collapsed to its head (`clamp_receiver` owns the same limit).
+const WHOLE_RECEIVER_BYTES: usize = 96;
+
+/// The receiver text for a member call's target.
+///
+/// Two shapes reach `receiver_from` as text the resolver cannot read:
+///
+/// * `!Probe().snapshot()`: tree-sitter-swift binds the `!` to `Probe`, so the
+///   target is the call `!Probe()` and the text starts with an operator. Swift
+///   applies a prefix operator to the whole member chain, so the receiver of
+///   `.snapshot` is `Probe()`; the operand is read, never the operator.
+/// * `Svc(\n root: "a",\n limit: 2\n).scan()`: `clamp_receiver` keeps the first
+///   line and a `…`, which loses the closing parenthesis the resolver needs to
+///   see one construction. A construction that is multi-line or longer than the
+///   whole-receiver limit is written `Svc(…)`: the callee and a balanced, elided
+///   argument list. Only a bare-name callee with a parenthesised argument list
+///   is collapsed; a trailing-closure call or a chain keeps the old clamp.
+fn swift_receiver(target: Node, source: &str) -> Option<String> {
+    let mut target = swift_unwrap_prefix(target).unwrap_or(target);
+    // `try Svc(…).run()` and `await Svc(…).run()`: the effect keyword wraps the
+    // construction in the target; the receiver is what it wraps.
+    for _ in 0..4 {
+        if !matches!(target.kind(), "try_expression" | "await_expression") {
+            break;
+        }
+        let mut cursor = target.walk();
+        let inner = target
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "try_operator" | "await_operator" | "comment"));
+        match inner {
+            Some(inner) => target = inner,
+            None => break,
+        }
+    }
+    if let Some(cast) = swift_cast_type(target, source) {
+        return Some(cast);
+    }
+    if target.kind() != "call_expression" {
+        return receiver_from(target, source);
+    }
+    let Some(callee) = swift_callee_target(target) else {
+        return receiver_from(target, source);
+    };
+    let head = swift_unwrap_prefix(callee).unwrap_or(callee);
+    if head.kind() != "simple_identifier" || swift_is_subscript(target) {
+        return receiver_from(target, source);
+    }
+    let Some(text) = source.get(head.start_byte()..target.end_byte()) else {
+        return receiver_from(target, source);
+    };
+    let parenthesised = {
+        let mut cursor = target.walk();
+        let found = target
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "call_suffix")
+            .is_some_and(|suffix| {
+                let mut inner = suffix.walk();
+                let first = suffix.named_children(&mut inner).next();
+                first.is_some_and(|args| {
+                    args.kind() == "value_arguments"
+                        && args.child(0).is_some_and(|open| open.kind() == "(")
+                }) && text.ends_with(')')
+            });
+        found
+    };
+    if parenthesised && (text.contains('\n') || text.len() > WHOLE_RECEIVER_BYTES) {
+        return Some(format!("{}(…)", get_node_text(head, source)));
+    }
+    if head.id() != callee.id() {
+        return clamp_receiver(text);
+    }
+    receiver_from(target, source)
+}
+
+/// The type a parenthesised cast is written to: `(x as? AppDelegate)` is an
+/// `AppDelegate`, whatever `x` was, so `(x as? AppDelegate)?.open()` is a call
+/// on that type. Only one bare capitalised type name is read; a qualified,
+/// generic-argument or collection target is left as written text.
+fn swift_cast_type(target: Node, source: &str) -> Option<String> {
+    if target.kind() != "tuple_expression" || target.named_child_count() != 1 {
+        return None;
+    }
+    let cast = target.named_child(0)?;
+    if cast.kind() != "as_expression" {
+        return None;
+    }
+    let written = cast.child_by_field_name("name")?;
+    if written.kind() != "user_type" {
+        return None;
+    }
+    let (name, qualifier) = swift_user_type_identity(written, source)?;
+    if qualifier.is_some()
+        || !starts_capitalised(&name)
+        || crate::swiftscope::is_generic_parameter(target, source, &name)
+    {
+        return None;
+    }
+    Some(alias_name(target, source, name))
 }
 
 /// The type named by a `user_type`, and the type or module qualifying it.
@@ -315,4 +581,257 @@ fn swift_assignment_binding(node: Node, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The receiver text recorded for every call named `callee`, in source order.
+    fn receivers(source: &str, callee: &str) -> Vec<Option<String>> {
+        // Node ids are arena addresses, so every parse starts from a clean cache.
+        crate::swiftscope::reset();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .expect("swift grammar");
+        let tree = parser.parse(source, None).expect("parse");
+        let mut calls = Vec::new();
+        let mut references = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            extract_swift_call(node, source, "a.swift", &mut calls, &mut references);
+            for index in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        calls
+            .into_iter()
+            .filter(|call| call.callee_name == callee)
+            .map(|call| call.receiver_expr)
+            .collect()
+    }
+
+    fn one(source: &str, callee: &str) -> Option<String> {
+        let found = receivers(source, callee);
+        assert_eq!(found.len(), 1, "calls to {callee}: {found:?}");
+        found.into_iter().next().flatten()
+    }
+
+    #[test]
+    fn a_prefix_operator_is_not_part_of_a_constructed_receiver() {
+        assert_eq!(
+            one("func f() -> Bool { !Probe().snapshot().ok }", "snapshot").as_deref(),
+            Some("Probe()")
+        );
+        assert_eq!(
+            one("func f() { _ = -Meter(v: 1).bump() }", "bump").as_deref(),
+            Some("Meter(v: 1)")
+        );
+        assert_eq!(
+            one("func f() { _ = !!Probe().snapshot() }", "snapshot").as_deref(),
+            Some("Probe()")
+        );
+    }
+
+    #[test]
+    fn a_prefix_on_a_plain_name_leaves_the_name() {
+        assert_eq!(
+            one("func f() { _ = !flag.toggled() }", "toggled").as_deref(),
+            Some("flag")
+        );
+    }
+
+    #[test]
+    fn a_construction_receiver_is_whole_on_one_line_and_elided_across_lines() {
+        let one_line = "func f() { Svc(root: \"a\", limit: 2).scan() }";
+        assert_eq!(
+            one(one_line, "scan").as_deref(),
+            Some("Svc(root: \"a\", limit: 2)")
+        );
+        let two = "func f() {\n    Svc(root: \"a\",\n        limit: 2).scan()\n}";
+        assert_eq!(one(two, "scan").as_deref(), Some("Svc(…)"));
+        let many = "func f() {\n    Svc(\n        root: \"a\",\n        limit: 2,\n        deep: 3\n    ).scan()\n}";
+        assert_eq!(one(many, "scan").as_deref(), Some("Svc(…)"));
+        let long = format!("func f() {{ Svc(root: \"{}\").scan() }}", "x".repeat(200));
+        assert_eq!(one(&long, "scan").as_deref(), Some("Svc(…)"));
+    }
+
+    #[test]
+    fn an_effect_keyword_is_not_part_of_a_constructed_receiver() {
+        for keyword in ["try", "await", "try await"] {
+            let source = format!(
+                "func f() async throws {{\n    {keyword} Svc(\n        a: 1\n    ).run()\n}}"
+            );
+            assert_eq!(one(&source, "run").as_deref(), Some("Svc(…)"), "{keyword}");
+        }
+        assert_eq!(
+            one("func f() throws { try Svc(a: 1).run() }", "run").as_deref(),
+            Some("Svc(a: 1)")
+        );
+    }
+
+    #[test]
+    fn a_multi_line_construction_under_a_prefix_operator_is_elided_too() {
+        let source = "func f() -> Bool {\n    !Probe(\n        a: 1\n    ).snapshot().ok\n}";
+        assert_eq!(one(source, "snapshot").as_deref(), Some("Probe(…)"));
+    }
+
+    /// The callee name of every call recorded in `source`, in source order.
+    fn callees(source: &str) -> Vec<String> {
+        crate::swiftscope::reset();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .expect("swift grammar");
+        let tree = parser.parse(source, None).expect("parse");
+        let mut calls = Vec::new();
+        let mut references = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            extract_swift_call(node, source, "a.swift", &mut calls, &mut references);
+            for index in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        calls.into_iter().map(|call| call.callee_name).collect()
+    }
+
+    #[test]
+    fn a_receiver_this_file_declares_with_typealias_is_the_type_it_stands_for() {
+        let source = "private typealias H = SleepLogHints\n\
+                      func f() { _ = H.formatDuration(45) }";
+        assert_eq!(
+            one(source, "formatDuration").as_deref(),
+            Some("SleepLogHints")
+        );
+        // A nested alias is the name's meaning inside its type only.
+        let nested = "struct Host { typealias H = Hints\n func f() { _ = H.go() } }\n\
+                      struct Other { func g() { _ = H.go() } }";
+        assert_eq!(
+            receivers(nested, "go"),
+            vec![Some("Hints".to_string()), Some("H".to_string())]
+        );
+        // Two aliases of the name, or a type of that name, leave it as written.
+        let twice = "typealias H = A\nextension X { typealias H = B }\nfunc f() { _ = H.go() }";
+        assert_eq!(one(twice, "go").as_deref(), Some("H"));
+        let declared = "typealias H = A\nstruct H {}\nfunc f() { _ = H.go() }";
+        assert_eq!(one(declared, "go").as_deref(), Some("H"));
+        // An alias of a generic parameter, of a collection or of another alias is no receiver.
+        let generic = "struct Box<T> { typealias H = T\n func f() { _ = H.go() } }";
+        assert_eq!(one(generic, "go").as_deref(), Some("H"));
+        let collection = "typealias H = [Item]\nfunc f() { _ = H.go() }";
+        assert_eq!(one(collection, "go").as_deref(), Some("H"));
+        let chain = "typealias H = G\ntypealias G = Item\nfunc f() { _ = H.go() }";
+        assert_eq!(one(chain, "go").as_deref(), Some("H"));
+        // A value is never an alias.
+        let value = "typealias h = Item\nfunc f() { _ = h.go() }";
+        assert_eq!(one(value, "go").as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn a_construction_through_a_typealias_constructs_its_target() {
+        let source = "typealias Coordinator = Held<Int>\nfunc f() { let c = Coordinator(); _ = c }";
+        assert_eq!(callees(source), vec!["Held".to_string()]);
+        let qualified = "typealias Coordinator = Held<Int>\nfunc f() { _ = Mod.Coordinator() }";
+        assert_eq!(callees(qualified), vec!["Coordinator".to_string()]);
+    }
+
+    #[test]
+    fn a_member_chain_after_a_sum_is_the_receiver_without_the_sum() {
+        // `a + b.c.run()` is `a + (b.c.run())`: member access binds tighter.
+        assert_eq!(
+            one("func f() { x = a + b.c.run() }", "run").as_deref(),
+            Some("b.c")
+        );
+        assert_eq!(
+            one("func f() { x = a * b.make().run() }", "run").as_deref(),
+            Some("b.make()")
+        );
+        assert_eq!(
+            one("func f() { x = a - b.c.d.run() }", "run").as_deref(),
+            Some("b.c.d")
+        );
+        // A parenthesised sum is a real receiver; the one directly under the call is not.
+        assert_eq!(
+            one("func f() { x = (a + b).c.run() }", "run").as_deref(),
+            Some("(a + b).c")
+        );
+        assert_eq!(
+            one("func f() { x = a + b.run() }", "run").as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn a_tuple_parameters_typed_member_is_a_receiver_of_that_type() {
+        let source =
+            "final class J {\n    func apply(_ open: (transform: Case, start: Int), _ x: Int) {\n\
+                      out = open.transform.apply(x)\n    }\n}";
+        assert_eq!(receivers(source, "apply"), vec![Some("Case".to_string())]);
+        // The same call as the right operand of a sum.
+        let sum =
+            "final class J {\n    func apply(_ open: (transform: Case, start: Int), _ x: Int) {\n\
+                   out = head + open.transform.apply(x)\n    }\n}";
+        assert_eq!(receivers(sum, "apply"), vec![Some("Case".to_string())]);
+        // A positional member, through an alias.
+        let positional = "typealias C = Case\nfunc f(_ open: (C, Int)) { open.0.go() }";
+        assert_eq!(receivers(positional, "go"), vec![Some("Case".to_string())]);
+        // An untyped member, a member of a plain parameter and an inner scope
+        // that rebinds the tuple leave the path as written.
+        let function = "func f(_ h: (run: (Int) -> Void, Int)) { h.run.go() }";
+        assert_eq!(receivers(function, "go"), vec![Some("h.run".to_string())]);
+        let plain = "func f(_ open: Joiner) { open.transform.go() }";
+        assert_eq!(
+            receivers(plain, "go"),
+            vec![Some("open.transform".to_string())]
+        );
+        let shadowed = "func f(_ open: (transform: Case, Int)) {\n\
+                        let g = { (open: Other) in open.transform.go() }\n}";
+        assert_eq!(
+            receivers(shadowed, "go"),
+            vec![Some("open.transform".to_string())]
+        );
+        let unbound = "func f() { open.transform.go() }";
+        assert_eq!(
+            receivers(unbound, "go"),
+            vec![Some("open.transform".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_cast_is_a_call_on_the_type_it_casts_to() {
+        let source = "func f(_ x: AnyObject) { (x as? AppDelegate)?.openIt(nil) }";
+        assert_eq!(one(source, "openIt").as_deref(), Some("AppDelegate"));
+        let forced = "func f(_ x: AnyObject) { (x as! AppDelegate).openIt(nil) }";
+        assert_eq!(one(forced, "openIt").as_deref(), Some("AppDelegate"));
+        // A collection, a qualified type or a lowercase name is left as written.
+        let array = "func f(_ x: Any) { (x as? [Item])?.go() }";
+        assert_eq!(one(array, "go").as_deref(), Some("(x as? [Item])"));
+        let qualified = "func f(_ x: Any) { (x as? Mod.Item)?.go() }";
+        assert_eq!(one(qualified, "go").as_deref(), Some("(x as? Mod.Item)"));
+        // A cast through an alias is the alias's target.
+        let aliased = "typealias Del = AppDelegate\nfunc f(_ x: Any) { (x as? Del)?.go() }";
+        assert_eq!(one(aliased, "go").as_deref(), Some("AppDelegate"));
+    }
+
+    #[test]
+    fn only_a_parenthesised_construction_is_elided() {
+        // A trailing-closure call is not a construction with an argument list.
+        let closure = "func f() {\n    Stack {\n        a()\n    }.run()\n}";
+        let got = one(closure, "run");
+        assert_ne!(got.as_deref(), Some("Stack(…)"), "{got:?}");
+        // A chain keeps the first-line clamp: its head is not a bare name.
+        let chain = "func f() {\n    Svc(\n        a: 1\n    ).make().scan()\n}";
+        let got = one(chain, "scan");
+        assert_ne!(got.as_deref(), Some("Svc(…)"), "{got:?}");
+        // A subscript is not a call of the collection.
+        let subscript = "func f() {\n    items[\n        0\n    ].run()\n}";
+        let got = one(subscript, "run");
+        assert_ne!(got.as_deref(), Some("items(…)"), "{got:?}");
+    }
 }

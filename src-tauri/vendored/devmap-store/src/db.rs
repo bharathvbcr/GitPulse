@@ -177,8 +177,8 @@ pub const MAX_PENDING_ATTEMPTS: u32 = 5;
 fn run_git_head_with_deadline(program: &str, root: &Path) -> anyhow::Result<String> {
     use devmap_extract::subprocess::{git_with_program, run_bounded, Bounds, Failure};
 
-    let mut command = git_with_program(std::ffi::OsStr::new(program), root);
-    command.args(["rev-parse", "HEAD"]);
+    let mut command = git_with_program(std::ffi::OsStr::new(program), root, ["rev-parse", "HEAD"])
+        .map_err(|failure| anyhow::anyhow!("{failure}"))?;
     let bounds = Bounds {
         deadline: GIT_HEAD_DEADLINE,
         stdout_cap: 4096,
@@ -366,14 +366,12 @@ fn classify_pending_entry(
     match devmap_extract::candidate_kind(root, &absolute) {
         // The whole-subtree rescan the drain expands.
         devmap_extract::CandidateKind::Directory => Ok(()),
-        devmap_extract::CandidateKind::File { bytes } => {
-            if bytes > devmap_extract::MAX_SOURCE_BYTES {
-                return Err(devmap_extract::DiscoverySkipReason::Oversized {
-                    bytes,
-                    limit: devmap_extract::MAX_SOURCE_BYTES,
-                }
-                .to_string());
-            }
+        // An over-limit source is processable, in one attempt: the drain drops
+        // its rows and lists it as over the limit, which is the state a cold
+        // build of the tree reaches. Dropping the queue row here instead left a
+        // file that grew past the limit with its stale rows in the graph and
+        // its verdict missing from the inventory `status` compares.
+        devmap_extract::CandidateKind::File { .. } => {
             if !devmap_extract::is_indexable_source(canonical) {
                 return Err(devmap_extract::DiscoverySkipReason::NonSource.to_string());
             }
@@ -702,6 +700,11 @@ pub struct SourceTreeDelta {
     pub added: usize,
     pub changed: usize,
     pub removed: usize,
+    /// Paths skipped for exceeding the source size limit that the generation
+    /// does not record that way: an indexed file that grew past the limit, or
+    /// an over-limit file the generation never listed. Never counted in
+    /// `removed` — see `FileDelta::over_limit`.
+    pub over_limit: usize,
     pub sample_paths: Vec<String>,
 }
 
@@ -854,6 +857,13 @@ pub struct DeadPage {
     /// "66 of 80,000" into "66 of 66", which is the flattering reading of a
     /// list that was cut off.
     pub total_non_exempt: usize,
+    /// Every exempt row of the same generation, counted per language and
+    /// reason token: the population the list above never examined.
+    ///
+    /// Read in the same snapshot as the rows, for the reason `analysis` is: a
+    /// disclosure from one generation beside findings from another describes
+    /// neither.
+    pub excluded: devmap_analyze::model::ExcludedPopulation,
 }
 
 /// One consistent snapshot of a search: the matching rows, the count they were
@@ -1358,6 +1368,13 @@ pub struct GenerationWriteOpts {
     /// own working directory and every span read from elsewhere comes back
     /// empty. `None` stays NULL — "root unknown", never a wrong root.
     pub repo_root: Option<String>,
+    /// Every source file discovery skipped for exceeding the size limit,
+    /// stored under `coverage::GAP_OVER_LIMIT`.
+    ///
+    /// Whole, like `discovery_refusals`, and `None` likewise means "not
+    /// measured". `save_generation_with_metadata` refuses a generation whose
+    /// rows name different paths than the analysis's `over_limit_files`.
+    pub over_limit: Option<Vec<DiscoveryRefusal>>,
     /// Every path discovery refused for this generation, with its verdict.
     ///
     /// The whole inventory, not a delta: the generation stores what it could
@@ -1952,6 +1969,20 @@ fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) ->
         && !matches!(engine, ExtractionEngine::NotApplicable { .. })
 }
 
+/// Whether a stored `parse_outcome_json` is a wall-clock parse-budget refusal,
+/// by the rule `Extraction::is_budget_refusal` applies to a live outcome: a
+/// `Failed` whose reason starts with
+/// [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`]. A value that does not
+/// decode is not one; the payload's own readers refuse it loudly elsewhere.
+#[cfg(feature = "parse")]
+fn is_budget_refusal_json(outcome_json: &str) -> bool {
+    matches!(
+        serde_json::from_str::<ParseOutcome>(outcome_json),
+        Ok(ParseOutcome::Failed { reason })
+            if reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)
+    )
+}
+
 /// The FTS5 `MATCH` expression for a user's search string, or an error naming
 /// why the store cannot express it.
 ///
@@ -2242,6 +2273,9 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "confidence",
             "is_exempt",
             "exemption_reason",
+            "evidence_sites",
+            "evidence_path",
+            "evidence_byte",
         ],
     ),
     (
@@ -2372,6 +2406,10 @@ mod connection_tests;
 #[cfg(test)]
 #[path = "db/tests/bounded_claim_tests.rs"]
 mod bounded_claim_tests;
+
+#[cfg(test)]
+#[path = "db/tests/hostile_store_tests.rs"]
+mod hostile_store_tests;
 
 // Gated `unix` at the module as well as at its test: the positive control that
 // ran everywhere moved to `tests/git_head_validates.rs` (it needs only the

@@ -8,6 +8,7 @@ import {
   rootlessBranches,
   stackBranchFacts,
   stackTreeRows,
+  unresolvedStackNotice,
 } from "./tree";
 
 function node(
@@ -248,5 +249,38 @@ describe("rootlessBranches", () => {
   it("reports every non-default branch when the hierarchy is empty", () => {
     const branches = [branch("main"), branch("a"), branch("b")];
     expect(rootlessBranches([], branches, "main")).toEqual(["a", "b"]);
+  });
+});
+
+describe("unresolvedStackNotice", () => {
+  it("is silent when every branch was settled", () => {
+    expect(unresolvedStackNotice(null)).toBeNull();
+    expect(unresolvedStackNotice({ unresolved_branches: 0, walk_incomplete: false })).toBeNull();
+    expect(unresolvedStackNotice({ unresolved_branches: 0, walk_incomplete: true })).toBeNull();
+  });
+
+  it("names the count and the budget when the walk was cut short", () => {
+    const text = unresolvedStackNotice({ unresolved_branches: 20, walk_incomplete: true });
+    expect(text).toContain("20 branches could not be placed");
+    expect(text).toContain("budget");
+  });
+
+  it("is silent, not NaN, for a payload that carries no count", () => {
+    // A cached or older payload has neither field: `undefined <= 0` is false.
+    expect(unresolvedStackNotice({} as never)).toBeNull();
+  });
+
+  it("does not claim only a budget: the backend also sets walk_incomplete when git failed", () => {
+    const text = unresolvedStackNotice({ unresolved_branches: 2, walk_incomplete: true });
+    expect(text).toContain("git failed");
+    // Unresolved branches are shown as parentless nodes, not as an unplaced list:
+    // one with a child on it is placed as a parent.
+    expect(text).not.toContain("unplaced");
+  });
+
+  it("does not claim a budget when the history could not be read", () => {
+    const text = unresolvedStackNotice({ unresolved_branches: 1, walk_incomplete: false });
+    expect(text).toContain("1 branch could not be placed");
+    expect(text).not.toContain("budget");
   });
 });

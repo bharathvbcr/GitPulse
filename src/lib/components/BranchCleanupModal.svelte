@@ -1,6 +1,10 @@
 <script lang="ts">
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
+  import { reportFailure } from "../stores/mutationOutcome";
+  import type { MutationTarget } from "../repos/storeTypes";
+  import { displayName } from "../repos/paths";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { fade, scale } from "svelte/transition";
@@ -11,9 +15,7 @@
     cardScaleOut,
   } from "../ui/transitions";
   import {
-    deadbranchClean,
     deadbranchListBackups,
-    deadbranchRestore,
     deadbranchScan,
     filterStaleBranches,
     formatBackupTimestamp,
@@ -64,6 +66,38 @@
   let forceDelete = $state(false);
   let actionBanner = $state<{ text: string; kind: "ok" | "err"; backupPath?: string } | null>(null);
 
+  /**
+   * The repository each list on screen was read from, recorded when the list
+   * landed. A clean or restore acts on THAT repository or on none: while a
+   * rescan of the repository now in front is still out, the list is the
+   * previous one's, and `currentPath` at click time is not its owner.
+   */
+  let scanTarget: MutationTarget | null = null;
+  let backupsTarget: MutationTarget | null = null;
+  // Latest request wins: a response that is not the newest is dropped.
+  let scanSeq = 0;
+  let backupsSeq = 0;
+
+  /** `owner` when it is still the repository in front; otherwise says so and returns null. */
+  function liveTarget(owner: MutationTarget | null, what: string): MutationTarget | null {
+    if (owner && repoStore.targetIsActive(owner)) return owner;
+    toastStore.error(`${what}: the repository changed since this list was read. Rescan, then try again.`);
+    return null;
+  }
+
+  /**
+   * Whether the result belongs on screen. One for a repository that is no
+   * longer in front is toasted under that repository's name instead: the
+   * banner (and its Undo, which restores into whatever the backups list is
+   * showing) is for the list on screen, and the list now is another's.
+   * Returns true when the caller should go on and draw the banner.
+   */
+  function showsHere(owner: MutationTarget, message: string, backupPath: string | null | undefined): boolean {
+    if (repoStore.targetIsActive(owner)) return true;
+    toastStore.info(`${displayName(owner.path)}: ${message}${backupPath ? ` Backup: ${backupPath}` : ""}`);
+    return false;
+  }
+
   const displayedBranches = $derived.by(() => {
     if (!scanResult) return [];
     return filterStaleBranches(
@@ -85,17 +119,21 @@
   );
 
   async function runScan() {
-    if (!$repoStore.currentPath) return;
+    const target = repoStore.captureTarget();
+    if (!target) return;
+    const seq = ++scanSeq;
     loading = true;
     actionBanner = null;
     try {
-      const res = await deadbranchScan($repoStore.currentPath, {
+      const res = await deadbranchScan(target.path, {
         days_threshold: minDays,
         merged_only: mergedOnly,
         check_squash: checkSquash,
         include_remote: !localOnly,
       });
+      if (seq !== scanSeq) return;
       scanResult = res;
+      scanTarget = target;
 
       // By default select all un-protected, non-worktree candidate branches that are merged
       const nextSelected = new Set<string>();
@@ -106,28 +144,52 @@
       }
       selectedNames = nextSelected;
     } catch (err: unknown) {
+      if (seq !== scanSeq) return;
       actionBanner = {
         text: `Scan failed: ${err instanceof Error ? err.message : String(err)}`,
         kind: "err",
       };
     } finally {
-      loading = false;
+      if (seq === scanSeq) loading = false;
     }
   }
 
   async function loadBackups() {
-    if (!$repoStore.currentPath) return;
+    const target = repoStore.captureTarget();
+    if (!target) return;
+    const seq = ++backupsSeq;
     try {
-      backups = await deadbranchListBackups($repoStore.currentPath);
+      const listed = await deadbranchListBackups(target.path);
+      if (seq !== backupsSeq) return;
+      backups = listed;
+      backupsTarget = target;
     } catch {
+      if (seq !== backupsSeq) return;
       backups = [];
+      backupsTarget = target;
     }
   }
 
+  /**
+   * Scan when the modal opens, or when the repository under it changes —
+   * and at no other time.
+   *
+   * `$repoStore.currentPath` read here subscribed the effect to the whole
+   * store, which publishes per commit-message keystroke and per ~6s status
+   * poll: every publish rescanned and reset the reader's checkboxes to the
+   * default selection. And `runScan` reads the filter state synchronously
+   * before its first await, so those reads were tracked too — the filter
+   * controls already rescan from their own `onchange`, so that was a second,
+   * per-input scan. The path is a strictly-equal derived and the calls are
+   * untracked, so only `isOpen` and the repository path drive this.
+   */
+  const scanRepoPath = $derived($currentRepoPath);
   $effect(() => {
-    if (isOpen && $repoStore.currentPath) {
-      void runScan();
-      void loadBackups();
+    if (isOpen && scanRepoPath) {
+      untrack(() => {
+        void runScan();
+        void loadBackups();
+      });
     }
   });
 
@@ -154,18 +216,18 @@
   }
 
   async function executeClean() {
-    if (!$repoStore.currentPath || selectedNames.size === 0) return;
+    if (selectedNames.size === 0 || actionInProgress) return;
+    const target = liveTarget(scanTarget, "Could not clean the branches");
+    if (!target) return;
     actionInProgress = true;
     actionBanner = null;
     const branchesToClean = Array.from(selectedNames);
 
     try {
-      const res = await deadbranchClean(
-        $repoStore.currentPath,
-        branchesToClean,
-        forceDelete,
-        createBackup,
-      );
+      const outcome = await repoStore.deadbranchClean(branchesToClean, forceDelete, createBackup, target);
+      const res = outcome.output;
+      if (!reportFailure(outcome, "Could not clean the branches") || !res) return;
+      if (!showsHere(target, res.message, res.backup_path)) return;
 
       actionBanner = {
         text: res.message,
@@ -175,7 +237,6 @@
 
       if (res.deleted.length > 0) {
         toastStore.info(`Cleaned ${res.deleted.length} branch(es) safely.`);
-        await repoStore.refresh();
         await runScan();
         await loadBackups();
       }
@@ -190,18 +251,22 @@
   }
 
   async function executeRestore(backupPath: string) {
-    if (!$repoStore.currentPath) return;
+    if (actionInProgress) return;
+    const target = liveTarget(backupsTarget, "Could not restore the branches");
+    if (!target) return;
     actionInProgress = true;
     actionBanner = null;
     try {
-      const res = await deadbranchRestore($repoStore.currentPath, backupPath);
+      const outcome = await repoStore.deadbranchRestore(backupPath, target);
+      const res = outcome.output;
+      if (!reportFailure(outcome, "Could not restore the branches") || !res) return;
+      if (!showsHere(target, res.message, null)) return;
       actionBanner = {
         text: res.message,
         kind: res.failed.length === 0 ? "ok" : "err",
       };
       if (res.restored.length > 0) {
         toastStore.info(`Restored ${res.restored.length} branch(es).`);
-        await repoStore.refresh();
         await runScan();
       }
     } catch (err: unknown) {

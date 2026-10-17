@@ -42,6 +42,50 @@ pub const MAX_REWRITTEN_PARENTS: usize = 32;
 /// filtered graph — exactly how `git log -- path` shows the oldest commit
 /// touching a path. Missing `keep` entries count as dropped.
 pub fn simplify_history(commits: &[RawCommitNode], keep: &[bool]) -> Vec<RawCommitNode> {
+    simplify_history_reporting(commits, keep).commits
+}
+
+/// What [`simplify_history_reporting`] kept, and what the
+/// [`MAX_REWRITTEN_PARENTS`] cap made it leave out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Simplified {
+    pub commits: Vec<RawCommitNode>,
+    /// Surviving commits whose ancestry lost at least one parent link to the
+    /// cap, directly or by inheriting it from a dropped commit that had.
+    pub capped_commits: usize,
+    /// Parent links the cap discarded while computing those lists: a lower
+    /// bound, since a link dropped from a dropped commit's list is counted
+    /// once however many survivors would have inherited it.
+    pub parents_dropped: usize,
+}
+
+impl Simplified {
+    /// The sentence that tells a reader the filtered graph is missing edges,
+    /// or `None` when nothing was cut.
+    pub fn notice(&self) -> Option<String> {
+        (self.capped_commits > 0).then(|| {
+            format!(
+                "This filter joined more than {MAX_REWRITTEN_PARENTS} ancestors onto {} commit{}; \
+                 at least {} parent link{} beyond that limit {} not drawn, so those rows show \
+                 fewer connections than the history has.",
+                self.capped_commits,
+                if self.capped_commits == 1 { "" } else { "s" },
+                self.parents_dropped,
+                if self.parents_dropped == 1 { "" } else { "s" },
+                if self.parents_dropped == 1 {
+                    "is"
+                } else {
+                    "are"
+                },
+            )
+        })
+    }
+}
+
+/// [`simplify_history`], also saying what the parent cap dropped: the cap
+/// protects the solver's width and the payload size, but it used to cut
+/// ancestry links without a word, so a filtered graph looked complete.
+pub fn simplify_history_reporting(commits: &[RawCommitNode], keep: &[bool]) -> Simplified {
     let n = commits.len();
     let kept = |i: usize| keep.get(i).copied().unwrap_or(false);
     let mut row_of: HashMap<&str, usize> = HashMap::with_capacity(n);
@@ -54,16 +98,21 @@ pub fn simplify_history(commits: &[RawCommitNode], keep: &[bool]) -> Vec<RawComm
     // sits below its child, so a dropped parent's list is final by the time
     // its children ask for it.
     let mut effective: Vec<Vec<String>> = vec![Vec::new(); n];
+    // Rows whose list lost a link to the cap, themselves or by inheritance.
+    let mut capped: Vec<bool> = vec![false; n];
+    let mut dropped_total = 0usize;
     for i in (0..n).rev() {
         let mut parents: Vec<String> = Vec::new();
+        let mut lost = 0usize;
         for parent in &commits[i].parent_ids {
             match row_of.get(parent.as_str()) {
                 Some(&row) if row > i => {
                     if kept(row) {
-                        push_parent(&mut parents, parent);
+                        lost += push_parent(&mut parents, parent);
                     } else {
+                        capped[i] |= capped[row];
                         for inherited in &effective[row] {
-                            push_parent(&mut parents, inherited);
+                            lost += push_parent(&mut parents, inherited);
                         }
                     }
                 }
@@ -72,15 +121,20 @@ pub fn simplify_history(commits: &[RawCommitNode], keep: &[bool]) -> Vec<RawComm
                     // empty or malformed id is the survivor's own stub only.
                     let past_window = !parent.is_empty() && !row_of.contains_key(parent.as_str());
                     if kept(i) || past_window {
-                        push_parent(&mut parents, parent);
+                        lost += push_parent(&mut parents, parent);
                     }
                 }
             }
         }
+        if lost > 0 {
+            capped[i] = true;
+            dropped_total += lost;
+        }
         effective[i] = parents;
     }
 
-    commits
+    let capped_commits = (0..n).filter(|&i| kept(i) && capped[i]).count();
+    let commits = commits
         .iter()
         .enumerate()
         .filter(|(i, _)| kept(*i))
@@ -88,14 +142,25 @@ pub fn simplify_history(commits: &[RawCommitNode], keep: &[bool]) -> Vec<RawComm
             parent_ids: std::mem::take(&mut effective[i]),
             ..commit.clone()
         })
-        .collect()
+        .collect();
+    Simplified {
+        commits,
+        capped_commits,
+        parents_dropped: dropped_total,
+    }
 }
 
-fn push_parent(parents: &mut Vec<String>, id: &str) {
-    if parents.len() >= MAX_REWRITTEN_PARENTS || parents.iter().any(|p| p == id) {
-        return;
+/// Adds `id` unless it is already there; returns 1 when the cap turned a new
+/// parent away.
+fn push_parent(parents: &mut Vec<String>, id: &str) -> usize {
+    if parents.iter().any(|p| p == id) {
+        return 0;
+    }
+    if parents.len() >= MAX_REWRITTEN_PARENTS {
+        return 1;
     }
     parents.push(id.to_string());
+    0
 }
 
 #[cfg(test)]
@@ -265,5 +330,42 @@ mod tests {
             ["c"],
             "the first b (parent c) is the one that counts"
         );
+    }
+
+    /// A survivor whose ancestry exceeds the cap is reported, not silently cut.
+    #[test]
+    fn the_parent_cap_says_what_it_dropped() {
+        let beyond: Vec<String> = (0..MAX_REWRITTEN_PARENTS + 8)
+            .map(|n| format!("beyond{n}"))
+            .collect();
+        let refs: Vec<&str> = beyond.iter().map(String::as_str).collect();
+        let commits = vec![node("k", &refs)];
+
+        let result = simplify_history_reporting(&commits, &[true]);
+        assert_eq!(result.commits[0].parent_ids.len(), MAX_REWRITTEN_PARENTS);
+        assert_eq!(result.capped_commits, 1);
+        assert_eq!(result.parents_dropped, 8);
+        let notice = result.notice().expect("a cut must be said");
+        assert!(notice.contains("8 parent links"), "{notice}");
+
+        // Under the cap, or only duplicates collapsed: nothing to say.
+        let within = simplify_history_reporting(&[node("k", &["a", "a", "b"])], &[true]);
+        assert_eq!(within.notice(), None);
+        assert_eq!(within.parents_dropped, 0);
+    }
+
+    /// A dropped commit's truncated list is inherited by the survivor above it.
+    #[test]
+    fn a_cut_inherited_through_a_dropped_commit_is_reported_on_the_survivor() {
+        let beyond: Vec<String> = (0..MAX_REWRITTEN_PARENTS + 3)
+            .map(|n| format!("beyond{n}"))
+            .collect();
+        let refs: Vec<&str> = beyond.iter().map(String::as_str).collect();
+        let commits = vec![node("top", &["mid"]), node("mid", &refs)];
+
+        let result = simplify_history_reporting(&commits, &[true, false]);
+        assert_eq!(result.commits.len(), 1);
+        assert_eq!(result.capped_commits, 1, "{result:?}");
+        assert!(result.parents_dropped >= 3);
     }
 }

@@ -5,11 +5,13 @@
 mod attention;
 mod automation;
 mod briefs;
+mod compaction;
 mod decisions;
 mod enhancements;
 mod input;
 mod items;
 mod notifications;
+mod refine;
 mod runs;
 
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
@@ -25,7 +27,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 11;
+pub const WORKBENCH_SCHEMA: i64 = 13;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -126,6 +128,20 @@ impl Entity {
 }
 
 impl Store {
+    /// Brings the workbench profile to this build's schema, taking the online
+    /// backup first. The explicit path for the host that owns the profile (the
+    /// desktop app, at startup): a read never upgrades, and a handle that
+    /// called [`Store::refuse_workbench_upgrades`] refuses this too.
+    pub fn upgrade_workbench_profile(&self) -> Result<UpgradeReport> {
+        if !self.workbench_upgrades {
+            return Err(Error {
+                code: "schema_upgrade_required",
+                message: "this host does not upgrade a shared workbench profile".into(),
+            });
+        }
+        ensure_schema(&self.conn, true)
+    }
+
     /// Shared CLI/served boundary for the workbench. The Go host supplies a
     /// distinct profile database; no task operation reads or changes repo leases.
     pub fn workbench_request(&self, method: &str, raw: &str) -> Result<String> {
@@ -166,6 +182,8 @@ impl Store {
                 | "decisions.decide"
                 | "decisions.claim"
                 | "decisions.resolve"
+                | "store.compact"
+                | "store.upgrade"
         );
         if !writing
             && !matches!(
@@ -200,7 +218,9 @@ impl Store {
                 message: format!("unknown workbench method {method}"),
             });
         }
-        ensure_schema(&self.conn)?;
+        // Reads never upgrade a profile; a write upgrades it only when this
+        // handle may, and only after an online backup.
+        let upgraded = ensure_schema(&self.conn, writing && self.workbench_upgrades)?;
         let behavior = if writing {
             TransactionBehavior::Immediate
         } else {
@@ -209,7 +229,20 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, behavior)?;
         let result = if writing {
             let now_ms = self.workbench_now_millis()?;
-            mutate(&input, method, now_ms / 1000, now_ms)?
+            if method == "store.upgrade" {
+                // The upgrade already ran, with its backup, above; this
+                // reports it. It commits no event, like `store.compact`.
+                input.fields(&[])?;
+                self.conn.query_row(
+                    "SELECT json_object('ok',json('true'),'item',json_object('id','schema','revision',?1,'from',?2,'to',?1,'upgraded',json(CASE WHEN ?2>0 AND ?2<?1 THEN 'true' ELSE 'false' END),'backup',?3))",
+                    params![upgraded.to, upgraded.from, upgraded.backup],
+                    |r| r.get(0),
+                )?
+            } else if method == "store.compact" {
+                compaction::compact(&input, now_ms / 1000)?
+            } else {
+                mutate(&input, method, now_ms / 1000, now_ms)?
+            }
         } else {
             let now = if matches!(
                 method,
@@ -248,7 +281,157 @@ impl Store {
     }
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+/// Copies the profile to `<profile>.pre-schema-<version>.bak` with SQLite's
+/// own `VACUUM INTO` before the first migration step, so an upgrade — which
+/// older hosts cannot undo by refusing the profile — can be rolled back by
+/// restoring the copy. An in-memory profile has nothing to lose. A backup that
+/// cannot be made refuses the upgrade; one already made for this version (an
+/// earlier, interrupted upgrade) is kept, not overwritten.
+fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<String>> {
+    let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let backup = std::path::PathBuf::from(format!("{path}.pre-schema-{version}.bak"));
+    if backup.exists() {
+        return Ok(Some(backup.display().to_string()));
+    }
+    let fail = |detail: String| Error {
+        code: "backup_failed",
+        message: format!(
+            "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
+             because its backup {} could not be written: {detail}",
+            backup.display()
+        ),
+    };
+    let partial = backup.with_extension("bak.partial");
+    let _ = std::fs::remove_file(&partial);
+    let target = partial
+        .to_str()
+        .ok_or_else(|| fail("the path is not UTF-8".into()))?;
+    conn.execute("VACUUM INTO ?1", [target])
+        .map_err(|error| fail(error.to_string()))?;
+    std::fs::rename(&partial, &backup).map_err(|error| fail(error.to_string()))?;
+    Ok(Some(backup.display().to_string()))
+}
+
+/// What [`Store::upgrade_workbench_profile`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeReport {
+    /// The schema the profile was at; 0 when this call created it.
+    pub from: i64,
+    pub to: i64,
+    /// The online backup taken before the first step, when there was one.
+    pub backup: Option<String>,
+}
+
+/// The profile's schema version; `None` when the database has no workbench
+/// schema at all (a zero-byte file, an empty database, or one holding only
+/// other components' tables). `work_meta` is the workbench's own marker:
+/// every store handle also creates its non-workbench tables on open, so
+/// "no tables" is not a usable test for a fresh profile.
+fn work_meta_version(conn: &Connection) -> Result<Option<i64>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(Some(current_version(conn)?))
+}
+
+fn current_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?)
+}
+
+/// Builds a profile that does not exist yet and migrates it to
+/// [`WORKBENCH_SCHEMA`] inside one immediate transaction. A second creator
+/// waits on the busy timeout, then finds the finished schema and creates
+/// nothing. Returns whether this call created it.
+fn create_profile(conn: &Connection) -> Result<bool> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if work_meta_version(conn)?.is_some() {
+        tx.commit()?;
+        return Ok(false);
+    }
+    conn.execute_batch(SCHEMA)?;
+    let mut version = current_version(conn)?;
+    while version < WORKBENCH_SCHEMA {
+        migrate_step(conn, version)?;
+        version = current_version(conn)?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// One schema step, `from` to `from + 1`. Runs inside the caller's transaction.
+fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
+    match from {
+        1 => conn.execute_batch(include_str!("enhancements.sql"))?,
+        2 => {
+            conn.execute("UPDATE work_meta SET version=3 WHERE id=1", [])?;
+        }
+        3 => conn.execute_batch(include_str!("automation.sql"))?,
+        4 => conn.execute_batch(include_str!("runs.sql"))?,
+        5 => conn.execute_batch(include_str!("attention.sql"))?,
+        6 => conn.execute_batch(include_str!("notifications.sql"))?,
+        7 => conn.execute_batch(include_str!("decisions.sql"))?,
+        8 => {
+            // New run kinds and claim/protocol invariants require every host to
+            // understand this contract before it may open the profile.
+            conn.execute("UPDATE work_meta SET version=9 WHERE id=1", [])?;
+        }
+        9 => {
+            // Native process identity now precedes provider initialization;
+            // failed initialization has no fabricated thread or configuration.
+            conn.execute("UPDATE work_meta SET version=10 WHERE id=1", [])?;
+        }
+        10 => {
+            // Archive, completion time, checklists and task links. A host that
+            // builds a task body without them would unarchive and unlink every
+            // task it saves, so older hosts must refuse this profile.
+            conn.execute_batch(include_str!("items.sql"))?;
+        }
+        11 => {
+            // Refinement proposals: enhancement bodies gain `kind`, and the
+            // lock vocabulary gains `acceptance_criteria`. No table changes. A
+            // host that does not know them would complete a refinement as a
+            // title/description proposal or ignore a criteria lock, so older
+            // hosts must refuse this profile.
+            conn.execute("UPDATE work_meta SET version=12 WHERE id=1", [])?;
+        }
+        12 => {
+            // A request's receipt keeps its sequence instead of a copy of the
+            // response, and a retry rebuilds the response from the event. A
+            // schema 12 host would replay that short receipt verbatim as the
+            // response, so older hosts must refuse this profile. Receipts
+            // already stored in full keep replaying as written.
+            conn.execute("UPDATE work_meta SET version=13 WHERE id=1", [])?;
+        }
+        other => {
+            return Err(Error {
+                code: "schema_unsupported",
+                message: format!("workbench schema {other} is not supported"),
+            });
+        }
+    }
+    let after = current_version(conn)?;
+    if after != from + 1 {
+        return Err(Error {
+            code: "store_error",
+            message: format!("workbench schema step {from} left the profile at {after}"),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
+    let mut report = UpgradeReport {
+        from: 0,
+        to: WORKBENCH_SCHEMA,
+        backup: None,
+    };
     conn.pragma_update(None, "foreign_keys", true)?;
     let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     if !foreign_keys {
@@ -257,119 +440,43 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             message: "foreign key enforcement is unavailable".into(),
         });
     }
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_meta')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !exists {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_meta')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            conn.execute_batch(SCHEMA)?;
-        }
-        tx.commit()?;
+    // A profile this call creates holds nothing to protect and has nothing to
+    // refuse: it is built and brought to the current schema whoever asked.
+    // `create_profile` does both in one transaction, so no other handle can
+    // observe a half-migrated profile and mistake it for a stale one.
+    let created = if work_meta_version(conn)?.is_none() {
+        create_profile(conn)?
+    } else {
+        false
+    };
+    let mut version = work_meta_version(conn)?.ok_or_else(|| Error {
+        code: "store_error",
+        message: "the workbench profile has no schema version".into(),
+    })?;
+    if !created {
+        report.from = version;
     }
-    let mut version: i64 =
-        conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-    if version == 1 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 1 {
-            conn.execute_batch(include_str!("enhancements.sql"))?;
-            version = 2;
+    if version < WORKBENCH_SCHEMA && !created {
+        if !may_upgrade {
+            return Err(Error {
+                code: "schema_upgrade_required",
+                message: format!(
+                    "workbench schema {version} must be upgraded to {WORKBENCH_SCHEMA} before this request, \
+                     and this host does not upgrade a shared profile; open the desktop app once to upgrade it"
+                ),
+            });
         }
-        tx.commit()?;
+        report.backup = backup_before_upgrade(conn, version)?;
     }
-    if version == 2 {
+    // An existing profile moves one step per transaction, re-reading the
+    // version under the write lock so a concurrent upgrader's step is not
+    // repeated.
+    while version < WORKBENCH_SCHEMA {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 2 {
-            conn.execute("UPDATE work_meta SET version=3 WHERE id=1", [])?;
-            version = 3;
-        }
-        tx.commit()?;
-    }
-    if version == 3 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 3 {
-            conn.execute_batch(include_str!("automation.sql"))?;
-            version = 4;
-        }
-        tx.commit()?;
-    }
-    if version == 4 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 4 {
-            conn.execute_batch(include_str!("runs.sql"))?;
-            version = 5;
-        }
-        tx.commit()?;
-    }
-    if version == 5 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 5 {
-            conn.execute_batch(include_str!("attention.sql"))?;
-            version = 6;
-        }
-        tx.commit()?;
-    }
-    if version == 6 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 6 {
-            conn.execute_batch(include_str!("notifications.sql"))?;
-            version = 7;
-        }
-        tx.commit()?;
-    }
-    if version == 7 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 7 {
-            conn.execute_batch(include_str!("decisions.sql"))?;
-            version = 8;
-        }
-        tx.commit()?;
-    }
-    if version == 8 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 8 {
-            // New run kinds and claim/protocol invariants require every host to
-            // understand this contract before it may open the profile.
-            conn.execute("UPDATE work_meta SET version=9 WHERE id=1", [])?;
-            version = 9;
-        }
-        tx.commit()?;
-    }
-    if version == 9 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 9 {
-            // Native process identity now precedes provider initialization;
-            // failed initialization has no fabricated thread or configuration.
-            conn.execute("UPDATE work_meta SET version=10 WHERE id=1", [])?;
-            version = 10;
-        }
-        tx.commit()?;
-    }
-    if version == 10 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 10 {
-            // Archive, completion time, checklists and task links. A host that
-            // builds a task body without them would unarchive and unlink every
-            // task it saves, so older hosts must refuse this profile.
-            conn.execute_batch(include_str!("items.sql"))?;
-            version = 11;
+        version = current_version(conn)?;
+        if version < WORKBENCH_SCHEMA {
+            migrate_step(conn, version)?;
+            version = current_version(conn)?;
         }
         tx.commit()?;
     }
@@ -380,7 +487,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         });
     }
     ensure_index(conn, MEMBER_INDEX, MEMBER_INDEX_SQL)?;
-    Ok(())
+    Ok(report)
 }
 
 /// Lets a workspace's membership join check `deleted` and read `position`
@@ -440,7 +547,7 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
                 message: "this launch claim was already consumed; inspect the run instead of spawning again".into(),
             });
         }
-        return Ok(response);
+        return replay_response(input.conn, &response);
     }
     let id = input.id("id")?;
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;
@@ -557,9 +664,16 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
             Affected::none()
         }
         _ => {
-            input.fields(&["request_id", "id", "expected_revision"])?;
+            input.fields(&["request_id", "id", "expected_revision", "even_if_running"])?;
             if current.is_none() {
                 return Err(Error::missing());
+            }
+            // Every entry point to a task delete — the board's raw delete, an
+            // agent's tool, a merge — meets the same refusal here, in the
+            // transaction that deletes, rather than each host checking first
+            // and racing a run that prepares in between.
+            if matches!(entity, Entity::Item) && !input.boolean("even_if_running", false)? {
+                refuse_live_runs(input, &id, now)?;
             }
             delete(input, entity, &id, revision, now)?
         }
@@ -572,9 +686,67 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
     };
     input.conn.execute(
         "INSERT INTO work_requests(id,method,input,response,sequence) VALUES(?1,?2,?3,?4,json_extract(?4,'$.sequence'))",
-        params![request, method, normalized, response],
+        params![request, method, normalized, receipt_response(input.conn, &response)?],
     )?;
     Ok(response)
+}
+
+/// What a request's receipt keeps of its response. The response is the event's
+/// payload (the record's body) plus `ok` and `sequence`, and the event is kept
+/// at least as long as any receipt pointing at it, so the receipt keeps only
+/// the sequence and the one field that is not in the event: the body is stored
+/// once there, not a second time here. [`replay_response`] puts it back.
+fn receipt_response(conn: &Connection, response: &str) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT json_object('ok',json('true'),'sequence',json_extract(?1,'$.sequence'),'replay','event','automatic_enhancement_queued',json_extract(?1,'$.automatic_enhancement_queued'))",
+        [response],
+        |r| r.get(0),
+    )?)
+}
+
+/// The response a receipt stands for: the stored one as written by an earlier
+/// build, or one rebuilt from the event it names. A rebuild whose event is gone
+/// fails loudly rather than answering a retry with something else.
+fn replay_response(conn: &Connection, stored: &str) -> Result<String> {
+    let marked: bool = conn.query_row(
+        "SELECT coalesce(json_extract(?1,'$.replay')='event',0)",
+        [stored],
+        |r| r.get(0),
+    )?;
+    if !marked {
+        return Ok(stored.to_string());
+    }
+    conn.query_row(
+        "SELECT CASE WHEN json_extract(?1,'$.automatic_enhancement_queued') IS NULL THEN base ELSE json_set(base,'$.automatic_enhancement_queued',json(CASE WHEN json_extract(?1,'$.automatic_enhancement_queued') THEN 'true' ELSE 'false' END)) END FROM (SELECT json_set(e.payload,'$.ok',json('true'),'$.sequence',e.sequence) AS base FROM work_events e WHERE e.sequence=json_extract(?1,'$.sequence'))",
+        [stored],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| Error {
+        code: "receipt_unreadable",
+        message: "the event this request's receipt names is gone; the original response cannot be replayed".into(),
+    })
+}
+
+/// Refuses to delete a task a run may still be working on: one that is
+/// starting, running or unresolved, or prepared and not yet expired.
+fn refuse_live_runs(input: &Input<'_>, id: &str, now: i64) -> Result<()> {
+    let (live, first): (i64, Option<String>) = input.conn.query_row(
+        "SELECT count(*), min(id) FROM work_runs
+         WHERE task_id=?1 AND (state IN ('starting','running','unresolved') OR (state='prepared' AND expires_at>?2))",
+        params![id, now],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if live > 0 {
+        return Err(Error {
+            code: "task_in_use",
+            message: format!(
+                "task {id} has {live} run(s) that may still be working on it (for example {}); pass even_if_running to delete it anyway",
+                first.unwrap_or_default()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn record_change(
@@ -841,8 +1013,30 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         "archived",
         "checklist",
         "links",
+        "scan_sequence",
     ])?;
-    enhancements::fields(input, "locked_fields", false)?;
+    // Optimistic guard for a host that decided to create this task from a scan
+    // of the board (the related-task check): when it passes the newest event
+    // sequence it scanned at, a creation after the board has changed since is
+    // refused, so the scan and the write are one decision. Other edits of the
+    // same board also trip it; the host rescans and retries.
+    if revision == 1 && input.kind("scan_sequence")?.is_some() {
+        let scanned = input.integer("scan_sequence", Some(0), MAX_INTEGER)?;
+        let moved: i64 = input.conn.query_row(
+            "SELECT count(*) FROM work_events WHERE sequence>?1 AND kind IN ('items.put','items.delete','items.restore')",
+            [scanned],
+            |r| r.get(0),
+        )?;
+        if moved > 0 {
+            return Err(Error {
+                code: "board_changed",
+                message: format!(
+                    "{moved} task change(s) were recorded after sequence {scanned}; scan the board again before creating this task"
+                ),
+            });
+        }
+    }
+    enhancements::locks(input, "locked_fields")?;
     input.text("logs", input::MAX_LOGS_BYTES)?;
     let title = input.required_text("title", 1200)?;
     if title.chars().count() > 300 {
@@ -1007,7 +1201,7 @@ fn read(input: &Input<'_>, method: &str, now: i64) -> Result<String> {
         "decisions.get" => decisions::get(input, now),
         "decisions.list" => decisions::list(input, now),
         "workspaces.get" => get(input, Entity::Workspace),
-        "repositories.get" => get(input, Entity::Repository),
+        "repositories.get" => get_repository(input),
         "items.get" => get(input, Entity::Item),
         "items.brief.get" => briefs::get(input),
         "enhancements.get" => get(input, Entity::Enhancement),
@@ -1038,6 +1232,28 @@ fn get(input: &Input<'_>, entity: Entity) -> Result<String> {
     input.fields(&["id"])?;
     let id = input.id("id")?;
     input.conn.query_row(&format!("SELECT json_object('ok',json('true'),'item',json(body)) FROM {} WHERE id=?1 AND {}",entity.table(),entity.live()),[id],|r|r.get(0)).optional()?.ok_or_else(Error::missing)
+}
+
+/// `repositories.get` by `id`, or by `identity_key` through the UNIQUE index on
+/// it, so a host that knows a repository only by identity asks once instead of
+/// paging the whole registry. Exactly one of the two.
+fn get_repository(input: &Input<'_>) -> Result<String> {
+    input.fields(&["id", "identity_key"])?;
+    let Some(identity) = input.text("identity_key", 4096)? else {
+        return get(input, Entity::Repository);
+    };
+    if input.kind("id")?.is_some() {
+        return Err(Error::invalid("give id or identity_key, not both"));
+    }
+    input
+        .conn
+        .query_row(
+            "SELECT json_object('ok',json('true'),'item',json(body)) FROM work_repositories WHERE identity_key=?1",
+            [identity],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(Error::missing)
 }
 
 struct Page {
@@ -1563,6 +1779,32 @@ mod item_query_tests;
 #[cfg(test)]
 mod logs_tests;
 
+/// The most rows a page's `total` counts past its own. A listing of a log that
+/// only grows must not walk all of it to answer every page.
+const TOTAL_CAP: i64 = 10_000;
+
+/// Rows matching `from_where` beyond a page, counted at most `cap` of them.
+/// `(total, exact)`: a last page needs no count (it is what it shows), and a
+/// count that reached `cap` is a floor, said so by `exact = false`.
+fn bounded_total(
+    conn: &Connection,
+    from_where: &str,
+    args: &[&dyn rusqlite::ToSql],
+    shown: i64,
+    has_more: bool,
+    cap: i64,
+) -> Result<(i64, bool)> {
+    if !has_more {
+        return Ok((shown, true));
+    }
+    let counted: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM (SELECT 1 {from_where} LIMIT {cap})"),
+        args,
+        |r| r.get(0),
+    )?;
+    Ok((counted.max(shown), counted < cap))
+}
+
 fn list_events(input: &Input<'_>) -> Result<String> {
     input.fields(&["limit", "after"])?;
     let limit = input.integer("limit", Some(100), 200)?;
@@ -1570,32 +1812,86 @@ fn list_events(input: &Input<'_>) -> Result<String> {
         return Err(Error::invalid("limit must be at least one"));
     }
     let after = input.integer("after", Some(0), MAX_INTEGER)?;
-    let total: i64 = input.conn.query_row(
-        "SELECT count(*) FROM work_events WHERE sequence>?1",
-        [after],
-        |r| r.get(0),
-    )?;
     let mut stmt=input.conn.prepare("SELECT json_object('sequence',sequence,'kind',kind,'entity_id',entity_id,'revision',revision,'at',at,'payload',json(payload)),sequence,'' FROM work_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
     let rows = collect_page(&mut stmt.query(params![after, limit + 1])?, limit)?;
-    series_response(input.conn, rows, total, after)
+    let shown = i64::try_from(rows.records.len()).map_err(|_| Error::invalid("page too large"))?;
+    let (total, exact) = bounded_total(
+        input.conn,
+        "FROM work_events WHERE sequence>?1",
+        &[&after],
+        shown,
+        rows.has_more,
+        TOTAL_CAP,
+    )?;
+    let page = series_response(input.conn, rows, total, exact, after)?;
+    // The high-water mark, so a host can name "the board as I scanned it".
+    Ok(input.conn.query_row(
+        "SELECT json_set(?1,'$.latest_sequence',(SELECT coalesce(max(sequence),0) FROM work_events))",
+        [page],
+        |r| r.get(0),
+    )?)
 }
 
+/// An item's revisions, oldest first from `after_revision`, or with
+/// `newest_first` the newest first from below `before_revision`: the latest
+/// revision is one request of `limit: 1`, not a walk from revision 0.
 fn history(input: &Input<'_>) -> Result<String> {
-    input.fields(&["id", "limit", "after_revision"])?;
+    input.fields(&[
+        "id",
+        "limit",
+        "after_revision",
+        "newest_first",
+        "before_revision",
+    ])?;
     let id = input.id("id")?;
     require_record(input, Entity::Item, Some(&id), true)?;
     let limit = input.integer("limit", Some(100), 200)?;
     if limit == 0 {
         return Err(Error::invalid("limit must be at least one"));
     }
-    let after = input.integer("after_revision", Some(0), MAX_INTEGER)?;
-    let total:i64=input.conn.query_row("SELECT count(*) FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2",params![id,after],|r|r.get(0))?;
-    let mut stmt=input.conn.prepare("SELECT body,revision,'' FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2 ORDER BY revision LIMIT ?3")?;
-    let rows = collect_page(&mut stmt.query(params![id, after, limit + 1])?, limit)?;
-    series_response(input.conn, rows, total, after)
+    let newest_first = input.boolean("newest_first", false)?;
+    if !newest_first && input.kind("before_revision")?.is_some() {
+        return Err(Error::invalid("before_revision needs newest_first"));
+    }
+    if newest_first && input.kind("after_revision")?.is_some() {
+        return Err(Error::invalid(
+            "newest_first pages with before_revision, not after_revision",
+        ));
+    }
+    let (select, bound, from_where) = if newest_first {
+        (
+            "SELECT body,revision,'' FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision<?2 ORDER BY revision DESC LIMIT ?3",
+            input.integer("before_revision", Some(MAX_INTEGER), MAX_INTEGER)?,
+            "FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision<?2",
+        )
+    } else {
+        (
+            "SELECT body,revision,'' FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2 ORDER BY revision LIMIT ?3",
+            input.integer("after_revision", Some(0), MAX_INTEGER)?,
+            "FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2",
+        )
+    };
+    let mut stmt = input.conn.prepare(select)?;
+    let rows = collect_page(&mut stmt.query(params![id, bound, limit + 1])?, limit)?;
+    let shown = i64::try_from(rows.records.len()).map_err(|_| Error::invalid("page too large"))?;
+    let (total, exact) = bounded_total(
+        input.conn,
+        from_where,
+        &[&id, &bound],
+        shown,
+        rows.has_more,
+        TOTAL_CAP,
+    )?;
+    series_response(input.conn, rows, total, exact, bound)
 }
 
-fn series_response(conn: &Connection, page: PageRows, total: i64, after: i64) -> Result<String> {
+fn series_response(
+    conn: &Connection,
+    page: PageRows,
+    total: i64,
+    exact: bool,
+    after: i64,
+) -> Result<String> {
     let cursor = page
         .records
         .last()
@@ -1610,5 +1906,29 @@ fn series_response(conn: &Connection, page: PageRows, total: i64, after: i64) ->
             .collect::<Vec<_>>()
             .join(",")
     );
-    Ok(conn.query_row("SELECT json_object('ok',json('true'),'items',json(?1),'total',?2,'shown',?3,'next_cursor',?4,'has_more',json(CASE WHEN ?5 THEN 'true' ELSE 'false' END))",params![docs,total,shown,cursor,page.has_more],|r|r.get(0))?)
+    Ok(conn.query_row("SELECT json_object('ok',json('true'),'items',json(?1),'total',?2,'total_exact',json(CASE WHEN ?6 THEN 'true' ELSE 'false' END),'shown',?3,'next_cursor',?4,'has_more',json(CASE WHEN ?5 THEN 'true' ELSE 'false' END))",params![docs,total,shown,cursor,page.has_more,exact],|r|r.get(0))?)
+}
+
+#[cfg(test)]
+mod bounded_total_tests {
+    use super::*;
+
+    #[test]
+    fn a_count_that_reaches_the_cap_is_a_floor_not_a_total() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE n(v INTEGER); INSERT INTO n VALUES (1),(2),(3),(4),(5),(6)",
+        )
+        .unwrap();
+        let after = 0_i64;
+        let (total, exact) =
+            bounded_total(&conn, "FROM n WHERE v>?1", &[&after], 2, true, 4).unwrap();
+        assert_eq!((total, exact), (4, false));
+        let (total, exact) =
+            bounded_total(&conn, "FROM n WHERE v>?1", &[&after], 2, true, 100).unwrap();
+        assert_eq!((total, exact), (6, true));
+        // A last page is exact without a count at all (no table needed).
+        let (total, exact) = bounded_total(&conn, "FROM missing", &[], 2, false, 4).unwrap();
+        assert_eq!((total, exact), (2, true));
+    }
 }

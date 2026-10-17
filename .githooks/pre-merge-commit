@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#
+# A merge commit records an author and committer too, and `git merge` runs this
+# hook instead of pre-commit. Without it, a fixture identity left in this
+# checkout's git config passed every merge clean.
+#
+# Installed with:  git config core.hooksPath .githooks
+# Bypassed with:   git merge --no-verify
+
+exec "$(dirname "$0")/pre-commit" "$@"

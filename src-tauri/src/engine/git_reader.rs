@@ -1,12 +1,14 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
+use crate::engine::commit_signature::{read_walk_signatures, CommitSignature, WalkSignatures};
 use crate::engine::git_cli::{
-    self, git, git_text, git_text_capped, git_text_shared, sandbox_join, sandbox_join_canonical,
-    sandbox_join_entry, validate_repo, Incomplete,
+    self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
+    sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
-use crate::engine::ref_cache::{self, FileIdentity};
+use crate::engine::ref_cache;
+use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
@@ -18,6 +20,17 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_STAT_TARGETS: usize = 96;
+/// How long one `branch_stats` call may spend walking uncached tips. A cold
+/// pass of 96 tips is two git children each; measured at up to 32.7 s in one
+/// call. Past this the call stops starting new tips and reports `capped`, and
+/// the next call resumes (the oid-keyed churn cache is the cursor). The tip in
+/// progress finishes, so a call can overrun by one walk, never by a pass.
+const BRANCH_STATS_CALL_BUDGET: Duration = Duration::from_secs(5);
+/// Most distinct bases a call asks `merge-base --is-ancestor` about when it
+/// carries stored answers over a default-branch advance: one process each. The
+/// bases rows were kept against are normally one (the default branch's previous
+/// tip); rows left against more than this are measured instead.
+const MAX_CARRY_BASES: usize = 4;
 
 /// Sidebar tag ceiling: newest-first via `--sort=-creatordate`, then cut here
 /// so a 10k-tag monorepo cannot ship megabytes over IPC. The payload says
@@ -204,7 +217,9 @@ pub struct BlameLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffPayload {
     pub text: String,
-    /// True when the text is a prefix of the real diff, for any reason.
+    /// True when the text is a prefix of the real diff, for any reason, or when
+    /// a one-file commit diff could not pair every rename because the rename
+    /// list it read was cut (`truncation_reason` says which).
     pub truncated: bool,
     /// Which reason, as a clause the viewer can render after naming its
     /// subject; `None` when the diff is whole. Carried rather than assumed:
@@ -233,7 +248,6 @@ pub struct CommitDetails {
     pub committer_date: String,
     pub summary: String,
     pub body: String,
-    pub gpg_status: String,
     pub co_authors: Vec<String>,
     pub changed_files: Vec<CommitFileChange>,
     pub total_additions: usize,
@@ -246,16 +260,36 @@ pub struct CommitDetails {
     /// frontend interface that has declared both optional all along.
     #[serde(default, skip_serializing_if = "is_false")]
     pub files_list_truncated: bool,
+    /// Why git's output was cut short of the end, as a clause the pane can
+    /// render after naming its subject ("git output exceeded 4 MB"); absent
+    /// when it was read whole. When set the file list, the file count and the
+    /// churn totals all come from a prefix: the totals are a lower bound and
+    /// the true count is unknown, so `files_total_count` stays absent too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numstat_truncation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReflogEntry {
     pub index: usize,
     pub commit_id: String,
+    /// Positional, `HEAD@{3}`: the form `git` takes as a revision.
     pub selector: String,
     pub action: String,
     pub message: String,
+    /// When the ref moved, in Unix seconds: the reflog's own record of the
+    /// move, not the committer date of the commit it moved to. `0` when git's
+    /// output named no readable time.
     pub timestamp: i64,
+}
+
+/// Splits `HEAD@{1785000000}`, a reflog selector rendered with `--date=unix`,
+/// into the ref and the Unix second the ref moved at. `None` for any other
+/// spelling, which a caller then keeps as git printed it.
+fn split_dated_selector(selector: &str) -> Option<(&str, i64)> {
+    let (name, rest) = selector.split_once("@{")?;
+    let seconds = rest.strip_suffix('}')?.parse::<i64>().ok()?;
+    Some((name, seconds))
 }
 
 /// One commit named in a [`ResetPreview`].
@@ -310,6 +344,19 @@ pub struct RepoLanguageStat {
 /// report says so instead of presenting a capped sample as complete coverage.
 pub const LANG_STATS_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Candidates one language scan reads at most; see
+/// [`LanguageDetector::prioritize_for_stats`].
+const LANG_STATS_MAX_FILES: usize = 10_000;
+
+/// Largest file the language scan reads whole.
+const LANG_MAX_FILE_BYTES: u64 = 1_048_576;
+
+/// Threads one language scan reads with, the caller's own included. File
+/// reads spawn no child, so this pool is the whole of the scan's parallelism
+/// and is bounded here rather than borrowed from rayon's global pool, which
+/// the insights and dead-branch scans share.
+const LANG_SCAN_WORKERS: usize = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageStatsReport {
     pub stats: Vec<RepoLanguageStat>,
@@ -332,8 +379,8 @@ pub const MAX_PULSE_COMMITS: usize = 25_000;
 /// this repository alone puts 532 commits in the default 90 days and 216 in
 /// *seven*, so the rate was quoted over the most recent 38% of the window with
 /// nothing saying so. The cap bought nothing — measured over a 25,000-commit
-/// history with every commit in the window, `git log --since --format=%s%x00%ct`
-/// costs 0.01s at `-n 200` and 0.07s uncapped, against the 0.32s the lead-time
+/// history with every commit in the window, a date-bounded
+/// `git log --format=%s%x00%ct` costs 0.01s at `-n 200` and 0.07s uncapped, against the 0.32s the lead-time
 /// loop already spends spawning `git describe --tags --contains` thirty times.
 /// Matching [`MAX_PULSE_COMMITS`] keeps a real bound on pathological histories
 /// while covering every repository anyone is likely to open, and the scan still
@@ -349,7 +396,11 @@ pub struct PulseCommitSummary {
     pub summary: String,
     pub author_name: String,
     pub author_email: String,
-    pub gpg_status: String,
+    /// Whether the commit carries a signature, read from its object: "signed
+    /// (not verified)". Verification runs the user's signing program, which
+    /// a walk over thousands of commits must never do; the selected commit's
+    /// verdict comes from `cmd_verify_commit_signature`.
+    pub signature: CommitSignature,
     pub additions: usize,
     pub deletions: usize,
     pub files_changed: usize,
@@ -498,6 +549,12 @@ pub struct FileBlob {
     pub invalid_utf8_bytes: usize,
     /// The file's line-ending style; `None` for binary files.
     pub eol: Option<LineEnding>,
+    /// The version of the working-tree file these bytes are (see
+    /// `diff::content_token`), which a save hands back as `expected_base`:
+    /// `"absent"` when the working tree has no file and the index supplied the
+    /// content, `None` for a commit read, which is not a file on disk.
+    #[serde(default)]
+    pub disk_base: Option<String>,
 }
 
 pub struct GitReader;
@@ -521,6 +578,7 @@ impl GitReader {
             base: default_base,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         let mut format = String::from(BRANCH_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
@@ -574,20 +632,20 @@ impl GitReader {
             }
             let is_current = parts[0].trim() == "*";
             let refname = parts[1];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let tip = parts[2].to_string();
             let track = parts.get(3).copied().unwrap_or("");
             let (ahead_count, behind_count) = git_cli::parse_ahead_behind(track);
 
-            let is_remote = refname.starts_with("refs/remotes/");
+            let (short, is_remote) = short_branch_name(refname);
             let (name, remote_name) = if is_remote {
-                let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
-                (rest.to_string(), remote)
+                let remote = remotes::split_tracking_ref(&remote_names, short)
+                    .map(|(owner, _)| owner.to_string());
+                (short.to_string(), remote)
             } else {
-                (refname.trim_start_matches("refs/heads/").to_string(), None)
+                (short.to_string(), None)
             };
 
             let upstream = parts
@@ -657,6 +715,12 @@ impl GitReader {
     /// during) list_branches so the list renders immediately, and memoizes
     /// through the oid-keyed churn cache so repeat calls are cheap.
     pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
+        Self::branch_stats_within(repo_path, BRANCH_STATS_CALL_BUDGET)
+    }
+
+    /// [`Self::branch_stats`] with the walking budget named, so a test can
+    /// exhaust it without a repository that takes five seconds to walk.
+    fn branch_stats_within(repo_path: &str, budget: Duration) -> Result<BranchStatsReport, String> {
         let repo = validate_repo(repo_path)?;
         let DefaultBase {
             remote,
@@ -664,6 +728,7 @@ impl GitReader {
             base: probed_default,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         // Cheap listing only: refnames and tips, no history walks here.
         // Refnames and object ids cannot contain NULs, so %00 fields stay
@@ -687,16 +752,16 @@ impl GitReader {
                 continue;
             }
             let refname = parts[0];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
-            let is_remote = refname.starts_with("refs/remotes/");
+            let (short, is_remote) = short_branch_name(refname);
             let (name, remote_name) = if is_remote {
-                let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
-                (rest.to_string(), remote)
+                let remote = remotes::split_tracking_ref(&remote_names, short)
+                    .map(|(owner, _)| owner.to_string());
+                (short.to_string(), remote)
             } else {
-                (refname.trim_start_matches("refs/heads/").to_string(), None)
+                (short.to_string(), None)
             };
             if !is_remote {
                 local_names.push(name.clone());
@@ -754,7 +819,7 @@ impl GitReader {
         }
 
         let (updates, computed, cached, capped, compute_failures) =
-            compute_eligible_churn(&repo, &base_oid, eligible);
+            compute_eligible_churn(&repo, &base_oid, eligible, budget);
 
         Ok(BranchStatsReport {
             compared_to,
@@ -827,10 +892,8 @@ impl GitReader {
         scope: RefScope,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = Self::page_count_limit(max_count).to_string();
-        let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
-        let count_arg = format!("-n{}", count);
-        let skip_arg = format!("--skip={}", skipped);
+        let count = Self::page_count_limit(max_count);
+        let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
         // History reads Git objects, not today's filesystem. A historical
         // file may now be a dangling link or live below a replaced directory.
         // Lexical confinement and a literal pathspec bound the object query.
@@ -841,6 +904,59 @@ impl GitReader {
             }
             None => None,
         };
+        let chunk = history_chunk_size();
+        // Each kept chunk is `chunk` rows plus the first row of the next one.
+        // The graph asks for cap + 1 rows (the has_more probe), and a window
+        // of one chunk plus that probe used to cost a second
+        // `--skip=chunk -n chunk` walk for a single row. With the overlap a
+        // window of n rows needs ceil((n - 1) / chunk) chunks, so chunk + 1
+        // rows is one walk, and the chunks stay aligned (and kept) as before.
+        let wire = chunk.saturating_add(1);
+        let mut commits = if count <= wire {
+            Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
+        } else {
+            // A long window is read as aligned chunks, each kept on its own.
+            // One 100k-commit answer exceeded the cache's per-entry cap and
+            // was never kept, so every "load more" walked and parsed the whole
+            // window again; chunks stay under the cap, and growing the window
+            // reads only the chunks it has not seen. (Git still skips past
+            // the earlier commits for a new chunk: `--skip` has to walk them.)
+            let end = skipped.saturating_add(count);
+            let mut start = skipped - skipped % chunk;
+            let mut taken_to = skipped;
+            let mut commits = Vec::with_capacity(count);
+            while start.saturating_add(1) < end {
+                let rows =
+                    Self::history_chunk(&repo, start, wire, revision, spec.as_deref(), scope)?;
+                let ended = rows.len() < wire;
+                let to = end.min(start + rows.len());
+                if to > taken_to {
+                    commits.extend(rows.into_iter().skip(taken_to - start).take(to - taken_to));
+                    taken_to = to;
+                }
+                if ended {
+                    break;
+                }
+                start += chunk;
+            }
+            commits
+        };
+        mark_shallow_boundary(&repo, &mut commits)?;
+        Ok(commits)
+    }
+
+    /// One `git log` page: `count` commits after `skip`, parsed. Each distinct
+    /// (skip, count) is its own kept answer in [`ref_cache`].
+    fn history_chunk(
+        repo: &Path,
+        skip: usize,
+        count: usize,
+        revision: Option<&str>,
+        spec: Option<&str>,
+        scope: RefScope,
+    ) -> Result<Vec<RawCommitNode>, String> {
+        let count_arg = format!("-n{count}");
+        let skip_arg = format!("--skip={skip}");
         let mut args: Vec<&str> = Vec::new();
         if spec.is_some() {
             // Path bytes reach us raw rather than octal-escaped, matching the
@@ -874,7 +990,7 @@ impl GitReader {
             // decides the set for both sides; see crate::graph::ref_scope.
             args.extend_from_slice(crate::graph::history_rev_args(scope));
         }
-        if let Some(spec) = spec.as_deref() {
+        if let Some(spec) = spec {
             args.push("--");
             args.push(spec);
         }
@@ -889,7 +1005,7 @@ impl GitReader {
         } else {
             &crate::graph::ref_scope::NAMED_REF_PATTERNS
         };
-        let stdout = ref_cache::git_text(&repo, namespaces, &args)?;
+        let stdout = ref_cache::git_text(repo, namespaces, &args)?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -921,47 +1037,65 @@ impl GitReader {
         max_count.clamp(1, Self::MAX_HISTORY_COMMITS.saturating_add(1))
     }
 
-    /// Walks the first-parent chain from `tip_oid` NEWEST-first, stopping at
-    /// (and including) the first commit whose id is in `stop_at`, and returns
-    /// the visited ids OLDEST-first so consecutive pairs are first-parent
-    /// edges. `None` when the walk exhausted `max_commits` without reaching a
-    /// stop id — the caller must treat that as "no discoverable base", never
-    /// as "rooted at the default branch".
+    /// Most branch tips one [`Self::first_parent_pass`] takes on its command
+    /// line. More than this is refused (every branch is then reported
+    /// unresolved), never silently truncated.
+    pub const MAX_PASS_TIPS: usize = 2_048;
+
+    /// One shared first-parent pass over every tip in `tips`: a single
+    /// `rev-list --first-parent --parents`, so the first-parent chains of any
+    /// number of branches cost one process instead of one each.
     ///
     /// This repairs the stack hierarchy on long-lived repositories where the
-    /// global `--all` history window ends before a branch's fork point: one
-    /// bounded subprocess per unresolved branch instead of lifting the global
-    /// cap for every request.
-    pub fn first_parent_chain(
+    /// global history window ends before a branch's fork point. The pass is
+    /// bounded twice: by `max_commits` commits in all (shared between the
+    /// tips, since their chains overlap) and by `deadline`. A pass that hits
+    /// the commit cap says so ([`FirstParentPass::truncated`]) and a chain it
+    /// did not finish is [`FirstParentChain::Unfinished`]; a deadline or a
+    /// failed git is an `Err`. Neither is ever read as "rooted".
+    ///
+    /// The answer is a function of the refs the tips came from, so it goes
+    /// through [`ref_cache`] over `refs/heads`: a tick with no ref movement is
+    /// answered without a process. Nothing is excluded with `--not`: a tip
+    /// that descends from another branch (the default branch, usually) would
+    /// remove the very commits the walk is looking for.
+    pub fn first_parent_pass(
         repo_path: &str,
-        tip_oid: &str,
-        stop_at: &HashSet<String>,
+        tips: &[String],
         max_commits: usize,
-    ) -> Result<Option<Vec<String>>, String> {
-        if stop_at.contains(tip_oid) {
-            // The tip itself is another branch's tip; there is nothing to walk.
-            return Ok(Some(vec![tip_oid.to_string()]));
-        }
+        deadline: Duration,
+    ) -> Result<FirstParentPass, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_commits.clamp(1, Self::MAX_HISTORY_COMMITS).to_string();
-        let count_arg = format!("--max-count={}", count);
-        let stdout = git_text(
-            &repo,
-            &["rev-list", "--first-parent", count_arg.as_str(), tip_oid],
-        )?;
-        let mut walked: Vec<String> = Vec::new();
-        for line in stdout.lines() {
-            let oid = line.trim();
-            if oid.is_empty() {
-                continue;
-            }
-            walked.push(oid.to_string());
-            if stop_at.contains(oid) {
-                walked.reverse();
-                return Ok(Some(walked));
-            }
+        let mut unique: Vec<&str> = tips.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() > Self::MAX_PASS_TIPS {
+            return Err(format!(
+                "{} branch tips exceed the {} one first-parent pass takes",
+                unique.len(),
+                Self::MAX_PASS_TIPS
+            ));
         }
-        Ok(None)
+        for tip in &unique {
+            validate_oid(tip)?;
+        }
+        let cap = max_commits.clamp(1, Self::MAX_HISTORY_COMMITS);
+        let count_arg = format!("--max-count={cap}");
+        let mut args: Vec<&str> = vec!["rev-list", "--first-parent", "--parents", &count_arg];
+        args.extend(unique);
+        let stdout = ref_cache::through(&repo, &["refs/heads"], &args, || {
+            git_text_with_timeout(&repo, &args, deadline).map(|text| (text, true))
+        })?;
+        let mut parents = HashMap::new();
+        for line in stdout.lines() {
+            let mut ids = line.split_whitespace();
+            let Some(commit) = ids.next() else { continue };
+            parents.insert(commit.to_string(), ids.next().map(str::to_string));
+        }
+        Ok(FirstParentPass {
+            truncated: parents.len() >= cap,
+            parents,
+        })
     }
 
     /// Porcelain status. This argv does not set `core.fsmonitor=false`.
@@ -1077,6 +1211,7 @@ impl GitReader {
                 }
             }
 
+            warnings.extend(undecodable_path_warning(&path));
             statuses.push(FileStatus {
                 path,
                 old_path,
@@ -1277,24 +1412,76 @@ impl GitReader {
         Ok(Self::diff_payload(text))
     }
 
+    /// The argv words that make `git show` render a merge as ordinary changes
+    /// against its first parent: the one owner of "how a merge is rendered".
+    /// The default (`--cc`) draws the patch as @@@ hunks the frontend cannot
+    /// number and a clean merge as nothing at all. `--diff-merges=first-parent`
+    /// needs git >= 2.31; an older git gets `-m --first-parent`, which says the
+    /// same but follows `log.diffMerges`, so it is only the fallback.
+    fn merge_render_args(modern: bool) -> &'static [&'static str] {
+        if modern {
+            &["--diff-merges=first-parent"]
+        } else {
+            &["-m", "--first-parent"]
+        }
+    }
+
+    fn merge_render_args_here() -> &'static [&'static str] {
+        Self::merge_render_args(git_cli::git_supports(git_cli::DIFF_MERGES_OPTION))
+    }
+
+    /// The one `git show` argv for a commit's patch, whole or narrowed to
+    /// `pathspecs`. The file list and the details read below take their merge
+    /// rendering from [`Self::merge_render_args`] too, so the list, the counts
+    /// and the hunks cannot disagree about a merge. A narrowed read must carry
+    /// every path a rename or copy pairs (see [`Self::paired_sources`]).
+    fn commit_show_args<'a>(
+        commit_id: &'a str,
+        pathspecs: &'a [String],
+        diff_filter: Option<&'static str>,
+    ) -> Vec<&'a str> {
+        let mut args = vec!["-c", "core.quotepath=off", "show", "--unified=3"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.extend(diff_filter);
+        args.push("--format=");
+        args.push(commit_id);
+        if !pathspecs.is_empty() {
+            args.push("--");
+            args.extend(pathspecs.iter().map(String::as_str));
+        }
+        args
+    }
+
+    /// The source paths of the renames and copies the commit shows for `path`
+    /// (or, for a directory, for anything under it), read with the same merge
+    /// rendering and rename detection as the whole-commit view. Git pairs a
+    /// rename only when both its ends survive the pathspec, so a one-path read
+    /// that leaves the old path out shows the new file as wholly added while
+    /// the file list, which was never narrowed, counts it as the rename it is.
+    ///
+    /// The second value says why the list was cut at the byte cap, when it
+    /// was: a rename whose record fell past the cut stays unpaired and is
+    /// shown as an addition, which the caller must report rather than hide.
+    fn paired_sources(
+        repo: &Path,
+        commit_id: &str,
+        path: &str,
+    ) -> Result<(Vec<String>, Option<String>), String> {
+        let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.push("--format=");
+        args.push(commit_id);
+        let (stdout, cut) = git_text_capped(repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
+        Ok((
+            parse_paired_sources(&stdout, path),
+            cut.map(|reason| reason.describe()),
+        ))
+    }
+
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        // --diff-merges=first-parent renders merge commits as ordinary hunks
-        // against the first parent instead of the combined --cc format whose
-        // @@@ headers the frontend cannot number (git >= 2.31).
-        Self::capped_diff(
-            &repo,
-            &[
-                "-c",
-                "core.quotepath=off",
-                "show",
-                "--unified=3",
-                "--diff-merges=first-parent",
-                "--format=",
-                commit_id,
-            ],
-        )
+        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], None))
     }
 
     pub fn get_commit_file_diff(
@@ -1305,20 +1492,58 @@ impl GitReader {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         sandbox_join(&repo, file_path)?;
-        let spec = literal_pathspec(file_path);
-        Self::capped_diff(
-            &repo,
-            &[
-                "-c",
-                "core.quotepath=off",
-                "show",
-                "--unified=3",
-                "--format=",
-                commit_id,
-                "--",
-                &spec,
-            ],
-        )
+        let mut specs = vec![literal_pathspec(file_path)];
+        let narrowed = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs, None))?;
+        // Only an added file can be the other end of a rename or copy, so a
+        // modified or deleted one costs exactly the one `git show` above, and
+        // no path costs more than three.
+        if !has_new_file_section(&narrowed.text) {
+            return Ok(narrowed);
+        }
+        let (sources, list_cut) = Self::paired_sources(&repo, commit_id, file_path)?;
+        if sources.is_empty() {
+            return Ok(Self::note_pairing_list_cut(narrowed, list_cut));
+        }
+        // A file is read as added, copied or renamed whatever happened to its
+        // source, so the source's own edit is left out of the read; a
+        // directory also holds modified and deleted files, which stay.
+        let diff_filter = has_section_at(&narrowed.text, file_path).then_some("--diff-filter=ACR");
+        // The sources go on the command line, which has a size limit (32 KiB
+        // on Windows); past a bounded few the commit is read whole and cut
+        // down to the path instead.
+        let fits = sources.len() <= MAX_PAIRED_SOURCES
+            && sources
+                .iter()
+                .map(|source| source.len() + 16)
+                .sum::<usize>()
+                <= MAX_PAIRED_SOURCE_BYTES;
+        let read = if fits {
+            specs.extend(sources.iter().map(|source| literal_pathspec(source)));
+            Self::capped_diff(
+                &repo,
+                &Self::commit_show_args(commit_id, &specs, diff_filter),
+            )?
+        } else {
+            Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], diff_filter))?
+        };
+        // The source pathspecs can pull in another file's section (an old path
+        // reused by a new file), and the whole read is every file's.
+        let paired = keep_payload_under(read, file_path).unwrap_or(narrowed);
+        Ok(Self::note_pairing_list_cut(paired, list_cut))
+    }
+
+    /// `payload` marked incomplete when the rename list it was paired from was
+    /// cut: the text is not a prefix, but it may show a rename as an addition,
+    /// and a view that may be wrong must not read as a whole one. The reason is
+    /// a clause the viewer renders after "This diff".
+    fn note_pairing_list_cut(mut payload: DiffPayload, list_cut: Option<String>) -> DiffPayload {
+        if let Some(reason) = list_cut {
+            payload.truncated = true;
+            payload.truncation_reason.get_or_insert(format!(
+                "may show a renamed file as added: the commit's list of renames and copies {reason}"
+            ));
+        }
+        payload
     }
 
     pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
@@ -1338,19 +1563,15 @@ impl GitReader {
     ) -> Result<Vec<CommitFileChange>, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let stdout = git_text(
-            &repo,
-            &["show", "--pretty=format:", "--numstat", "-z", commit_id],
-        )?;
-        // Deliberately NOT capped here. `get_commit_details` calls this and
-        // derives three things from the full list: the churn totals, the true
-        // file count, and `files_list_truncated`. Capping at this level made
-        // all three read off an already-cut slice — the totals silently
-        // understated a huge commit's churn, and the flag's own test
-        // (`files_total > MAX_COMMIT_FILES`) became `5000 > 5000`, so the
-        // "+only first N listed" notice could never fire again. The cap
-        // belongs where the truncation can be reported, which is
-        // `get_commit_details`.
+        let mut args = vec!["show", "--pretty=format:", "--numstat", "-z"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        args.push(commit_id);
+        let stdout = git_text(&repo, &args)?;
+        // Not capped here: this returns a bare `Vec`, which cannot say it is
+        // a prefix, and a cut slice read as the whole list is the failure the
+        // payload budgets exist to prevent. The commit pane no longer comes
+        // through here; `get_commit_details` reads the same records in its
+        // one capped `git show` and reports a cut.
         Ok(parse_numstat_files(&stdout))
     }
 
@@ -1359,7 +1580,7 @@ impl GitReader {
         file_path: &str,
         commit_id: Option<&str>,
     ) -> Result<String, String> {
-        let blob = Self::get_file_blob(repo_path, file_path, commit_id)?;
+        let blob = Self::get_file_blob_view(repo_path, file_path, commit_id)?;
         if let Some(text) = blob.text {
             Ok(text)
         } else {
@@ -1367,13 +1588,37 @@ impl GitReader {
         }
     }
 
+    /// The editor open: the blob carries `disk_base`, the version a save of
+    /// the draft is judged against, so it names the very bytes the user saw
+    /// and is computed eagerly here.
     pub fn get_file_blob(
         repo_path: &str,
         file_path: &str,
         commit_id: Option<&str>,
     ) -> Result<FileBlob, String> {
+        Self::read_file_blob(repo_path, file_path, commit_id, true)
+    }
+
+    /// [`Self::get_file_blob`] for a read that only looks (file text for the
+    /// code graph, `get_file_content`): no draft will be saved from it, so it
+    /// does not pay the digest pass and `disk_base` is `None`.
+    pub fn get_file_blob_view(
+        repo_path: &str,
+        file_path: &str,
+        commit_id: Option<&str>,
+    ) -> Result<FileBlob, String> {
+        Self::read_file_blob(repo_path, file_path, commit_id, false)
+    }
+
+    fn read_file_blob(
+        repo_path: &str,
+        file_path: &str,
+        commit_id: Option<&str>,
+        with_base: bool,
+    ) -> Result<FileBlob, String> {
         let repo = validate_repo(repo_path)?;
         sandbox_join(&repo, file_path)?;
+        let mut disk_base = None;
         let bytes = if let Some(id) = commit_id {
             crate::engine::git_writer::validate_oid_or_revision(id)?;
             if id.contains(':') {
@@ -1382,8 +1627,19 @@ impl GitReader {
             read_commit_blob(&repo, id, file_path)?
         } else {
             match sandbox_join_canonical(&repo, file_path) {
-                Ok(dest) if dest.exists() => read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?,
-                Ok(_) => read_index_blob(&repo, file_path)?,
+                Ok(dest) if dest.exists() => {
+                    let bytes = read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?;
+                    if with_base {
+                        disk_base = Some(crate::diff::content_token(Some(&bytes)));
+                    }
+                    bytes
+                }
+                Ok(_) => {
+                    if with_base {
+                        disk_base = Some(crate::diff::content_token(None));
+                    }
+                    read_index_blob(&repo, file_path)?
+                }
                 Err(err) if git_cli::is_sandbox_symlink_escape(&err) => {
                     // Outbound Git symlink: return the link text, never the
                     // target. Coverage and the file viewer both hit this for
@@ -1428,61 +1684,41 @@ impl GitReader {
                 text_shape::invalid_utf8_bytes(&bytes)
             },
             eol: (!is_binary).then(|| text_shape::line_ending(&bytes)),
+            disk_base,
         })
     }
 
+    /// One commit's metadata and changed files, from a single `git show`.
+    ///
+    /// A commit is immutable by object id, so a complete answer for a full id
+    /// is kept in [`ref_cache`] and re-selecting the commit spawns nothing. An
+    /// abbreviated id is not a stable name (it can become ambiguous as objects
+    /// arrive), so it is read every time rather than keyed.
     pub fn get_commit_details(repo_path: &str, commit_id: &str) -> Result<CommitDetails, String> {
+        Self::commit_details_capped(repo_path, commit_id, budget::MAX_COMMIT_NUMSTAT_BYTES)
+    }
+
+    fn commit_details_capped(
+        repo_path: &str,
+        commit_id: &str,
+        cap: usize,
+    ) -> Result<CommitDetails, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let stdout = git_text(
-            &repo,
-            &[
-                "show",
-                "-s",
-                "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%G?%x00%s%x00%b",
-                commit_id,
-            ],
-        )?;
-        let fields: Vec<&str> = stdout.split('\x00').collect();
-        if fields.len() < 11 {
-            return Err("Failed to parse commit metadata format".into());
-        }
-        let body = fields[10].trim().to_string();
-        // Surface file-list failures instead of reporting a commit with
-        // silently-empty changes.
-        let mut changed_files = Self::get_commit_files(repo_path, commit_id)?;
-        // Summed over the full list, before the cap below cuts it: summing the
-        // truncated slice would understate a huge commit's churn silently.
-        let total_additions = changed_files.iter().map(|f| f.additions).sum();
-        let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
-        let files_total = changed_files.len();
-        let files_list_truncated = files_total > MAX_COMMIT_FILES;
-        if files_list_truncated {
-            changed_files.truncate(MAX_COMMIT_FILES);
-        }
-        Ok(CommitDetails {
-            id: fields[0].to_string(),
-            parent_ids: if fields[1].is_empty() {
-                Vec::new()
-            } else {
-                fields[1].split_whitespace().map(String::from).collect()
-            },
-            author_name: fields[2].to_string(),
-            author_email: fields[3].to_string(),
-            author_date: fields[4].to_string(),
-            committer_name: fields[5].to_string(),
-            committer_email: fields[6].to_string(),
-            committer_date: fields[7].to_string(),
-            gpg_status: fields[8].to_string(),
-            summary: fields[9].to_string(),
-            co_authors: parse_co_authors(&body),
-            body,
-            changed_files,
-            total_additions,
-            total_deletions,
-            files_total_count: files_list_truncated.then_some(files_total),
-            files_list_truncated,
-        })
+        let mut args = vec!["show", "--numstat", "-z"];
+        args.extend_from_slice(Self::merge_render_args_here());
+        // `%ad`/`%cd` follow `log.date`; pin git's default rendering
+        // so a developer's `relative` or `human` does not stale the
+        // dates the panel shows.
+        args.push("--date=default");
+        args.push(COMMIT_SHOW_FORMAT);
+        args.push(commit_id);
+        let (stdout, cut) = if crate::engine::git_writer::is_full_oid(commit_id) {
+            ref_cache::git_text_capped(&repo, &[], &args, cap)?
+        } else {
+            git_text_capped(&repo, &args, cap)?
+        };
+        parse_commit_show(&stdout, cut.as_ref())
     }
 
     pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
@@ -1564,22 +1800,44 @@ impl GitReader {
     }
 
     pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
+        Self::get_reflog_within(repo_path, max_entries, None)
+    }
+
+    /// [`Self::get_reflog`] with the Git child held to `timeout` when one is
+    /// given, so a caller on a deadline is not left behind the default
+    /// ninety-second ceiling.
+    pub fn get_reflog_within(
+        repo_path: &str,
+        max_entries: usize,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<ReflogEntry>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_entries.clamp(1, 10_000).to_string();
-        let stdout = git_text(
-            &repo,
-            &[
-                "reflog",
-                &format!("-n{}", count),
-                "--format=%H%x00%gd%x00%gs%x00%ct",
-            ],
-        )?;
+        let limit = format!("-n{}", max_entries.clamp(1, 10_000));
+        // `%gd` under `--date=unix` is `HEAD@{<seconds the ref moved at>}`:
+        // the reflog's own time. `%ct` is the committer date of the commit
+        // HEAD landed on, which a checkout of an old commit leaves where it was.
+        let args = [
+            "reflog",
+            limit.as_str(),
+            "--date=unix",
+            "--format=%H%x00%gd%x00%gs",
+        ];
+        let stdout = match timeout {
+            Some(timeout) => crate::engine::git_cli::git_text_with_timeout(&repo, &args, timeout)?,
+            None => git_text(&repo, &args)?,
+        };
         let mut entries = Vec::new();
         for (idx, line) in stdout.lines().enumerate() {
             let parts: Vec<&str> = line.split('\x00').collect();
-            if parts.len() < 4 {
+            if parts.len() < 3 {
                 continue;
             }
+            // The selector the pane hands back to git as a revision stays
+            // positional; the time is read out of the dated spelling.
+            let (selector, timestamp) = match split_dated_selector(parts[1]) {
+                Some((name, seconds)) => (format!("{name}@{{{idx}}}"), seconds),
+                None => (parts[1].to_string(), 0),
+            };
             let full_msg = parts[2];
             let (action, message) = if let Some(colon_idx) = full_msg.find(':') {
                 (
@@ -1592,10 +1850,10 @@ impl GitReader {
             entries.push(ReflogEntry {
                 index: idx,
                 commit_id: parts[0].to_string(),
-                selector: parts[1].to_string(),
+                selector,
                 action,
                 message,
-                timestamp: parts[3].parse().unwrap_or(0),
+                timestamp,
             });
         }
         Ok(entries)
@@ -1606,20 +1864,7 @@ impl GitReader {
     /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
     /// that did not happen and is an error, never reported as detached.
     pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
-        let repo = validate_repo(repo_path)?;
-        let run = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        match run.status_code {
-            0 => {
-                let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
-                validate_ref_name(&name)?;
-                Ok(Some(name))
-            }
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read the current branch (git exited {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )),
-        }
+        head_branch(&validate_repo(repo_path)?)
     }
 
     /// Reads what a reset of HEAD's branch to `target` would take off it.
@@ -1671,7 +1916,6 @@ impl GitReader {
             &[
                 "log",
                 limit.as_str(),
-                "--no-show-signature",
                 "--format=%H%x00%ct%x00%an%x00%s",
                 &head,
                 &not_target,
@@ -1705,97 +1949,103 @@ impl GitReader {
         })
     }
 
+    /// Language statistics for the working tree, bounded by
+    /// [`LANG_STATS_DEADLINE`].
+    ///
+    /// Callers asking about one repository while its scan runs share that
+    /// scan: the metric strip, the fleet view and a watcher-driven refresh
+    /// routinely ask at once, and each used to start its own read of the
+    /// whole tree. The key carries the admission class so a reactive caller
+    /// never inherits a refusal that only a background leader could get.
     pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {
-        Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+        type Flights = crate::singleflight::SingleFlight<
+            (std::path::PathBuf, git_cli::Admission),
+            Result<LanguageStatsReport, String>,
+        >;
+        static FLIGHTS: OnceLock<Flights> = OnceLock::new();
+        let repo = validate_repo(repo_path)?;
+        let key = (
+            repo.canonicalize().unwrap_or(repo),
+            git_cli::current_admission(),
+        );
+        FLIGHTS.get_or_init(Flights::default).run(key, || {
+            Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+        })
     }
 
     /// Like [`Self::get_repo_language_stats`] with an explicit budget;
     /// `None` means unbounded (tests).
+    ///
+    /// Each file's result is remembered against its identity (see
+    /// [`lang_cache`]), so a rescan reads only the files that changed since
+    /// the last one; the rest cost one `lstat` each. What does need reading is
+    /// read by up to [`LANG_SCAN_WORKERS`] threads.
     pub fn get_repo_language_stats_bounded(
         repo_path: &str,
         deadline: Option<Duration>,
     ) -> Result<LanguageStatsReport, String> {
         let started = Instant::now();
-        let expired = || match deadline {
-            Some(d) => started.elapsed() >= d,
-            None => false,
-        };
         let repo = validate_repo(repo_path)?;
-        let stdout = git_text(
-            &repo,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-        )?;
-
-        let mut candidates = Vec::new();
-        // Git can list one conflicted path in multiple index stages. Preserve
-        // its exact filename bytes for disk access; normalization is only for
-        // language classification, never for opening the file.
-        for rel_path in parse_ls_files_entries(&stdout) {
-            if rel_path.is_empty() || LanguageDetector::is_ignored_source_path(&rel_path) {
-                continue;
-            }
-            let lang_info = LanguageDetector::detect_from_path(&rel_path);
-            if !LanguageDetector::should_count_for_stats(&rel_path, &lang_info) {
-                continue;
-            }
-            candidates.push((rel_path, lang_info));
-        }
+        #[cfg(test)]
+        lang_probe::note_scan(&repo);
+        let candidates = language_candidates(&repo)?;
         let candidate_files = candidates.len();
-        let selected = LanguageDetector::prioritize_for_stats(candidates, 10_000);
-        let selected_len = selected.len();
+        let selected = LanguageDetector::prioritize_for_stats(candidates, LANG_STATS_MAX_FILES);
+
+        let cache_key = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        let mut previous = lang_cache::take(&cache_key);
+        let outcomes = scan_language_files(&repo, &selected, &previous, started, deadline);
 
         let mut lang_counts: HashMap<&'static str, (usize, usize, &'static str, &'static str)> =
             HashMap::new();
         let mut total_lines = 0usize;
         let mut scanned_files = 0usize;
         let mut deadline_hit = false;
-        let mut incomplete = selected_len < candidate_files;
+        let mut incomplete = selected.len() < candidate_files;
+        let mut remembered = lang_cache::RepoMap::with_capacity(selected.len());
 
-        for (rel_path, path_info) in selected {
-            if expired() {
-                deadline_hit = true;
-                break;
-            }
-            // Resolve through symlinks so a tracked file that is really a link
-            // pointing outside the repo is refused instead of read.
-            let full_path = match git_cli::sandbox_join_canonical(&repo, &rel_path) {
-                Ok(path) => path,
-                Err(_) => {
-                    incomplete = true;
-                    record_lang(&mut lang_counts, path_info, 0);
+        for ((rel_path, path_info), outcome) in selected.into_iter().zip(outcomes) {
+            let tally = match outcome {
+                None => {
+                    deadline_hit = true;
                     continue;
                 }
-            };
-            let bytes = match read_working_tree_file(&full_path, 1_048_576) {
-                Ok(bytes) => bytes,
-                Err(_) => {
+                Some(ScanOutcome::Remembered(tally)) => {
+                    if let Some(entry) = previous.remove(&rel_path) {
+                        remembered.insert(rel_path, entry);
+                    }
+                    tally
+                }
+                Some(ScanOutcome::Read { tally, remember }) => {
+                    previous.remove(&rel_path);
+                    if let Some(entry) = remember {
+                        remembered.insert(rel_path, entry);
+                    }
+                    tally
+                }
+                Some(ScanOutcome::Unreadable) => {
+                    previous.remove(&rel_path);
                     incomplete = true;
                     record_lang(&mut lang_counts, path_info, 0);
                     continue;
                 }
             };
             scanned_files += 1;
-            if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
-                continue;
+            if let FileTally::Counted { lang, code_lines } = tally {
+                record_lang(&mut lang_counts, lang, code_lines);
+                total_lines += code_lines;
             }
-            let lang_info = LanguageDetector::detect_from_bytes(&rel_path, &bytes);
-            if !LanguageDetector::should_count_for_stats(&rel_path, &lang_info) {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&bytes);
-            // Language-aware: block comments, docstrings and string literals
-            // all change what counts as code, and this sum IS the repository's
-            // headline LOC number.
-            let loc = LocCounter::count_for_language(&content, lang_info.name);
-            record_lang(&mut lang_counts, lang_info, loc.code_lines);
-            total_lines += loc.code_lines;
         }
+        // A finished pass saw every selected file, so what it did not see is
+        // gone (deleted, ignored, past the cap) and is not kept. A pass the
+        // deadline cut short keeps what it never reached, which is what lets
+        // the next pass get further instead of starting over.
+        if deadline_hit {
+            for (rel_path, entry) in previous {
+                remembered.entry(rel_path).or_insert(entry);
+            }
+        }
+        lang_cache::put(cache_key, remembered);
 
         let mut stats: Vec<RepoLanguageStat> = lang_counts
             .into_iter()
@@ -1852,7 +2102,7 @@ impl GitReader {
             "--numstat",
             // `%b` is required: Co-authored-by trailers live in the body, never
             // in `%s`. A metric that can only ever be zero is not a metric.
-            "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%G?%x00%s%x00%aN%x00%aE%x00%b%x00",
+            "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%s%x00%aN%x00%aE%x00%b%x00",
         ];
         // The same named ref set the graph walks. Contributor counts and churn
         // are claims about what people did; a `--all` walk credits them with
@@ -1860,33 +2110,53 @@ impl GitReader {
         // which is a metric measuring the tooling rather than the team.
         args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
 
-        let (stdout, payload_incomplete) =
-            match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
-                Ok(out) => out,
-                Err(e) => {
-                    let msg = e.to_lowercase();
-                    if msg.contains("does not have any commits")
-                        || msg.contains("bad default revision 'head'")
-                        || msg.contains("fatal: your current branch")
-                        || msg.contains("fatal: needed a single revision")
-                    {
-                        return Ok(PulseReport {
-                            commits: Vec::new(),
-                            top_files_by_churn: Vec::new(),
-                            extensions: Vec::new(),
-                            has_mailmap,
-                            total_commits_scanned: 0,
-                            truncated: false,
-                            payload_truncated: false,
-                            payload_truncation_reason: None,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                        });
-                    }
-                    return Err(e);
+        // Signature presence comes from the commit objects' own headers, read
+        // by a `rev-list --header` over the same refs that runs beside the log
+        // instead of after it (a `cat-file --batch` fed the log's ids cost a
+        // whole extra process on the critical path). No `%G` placeholder can
+        // say "signed" without running the verifier, and `--pretty=raw` skips
+        // `--use-mailmap`, so the log keeps its own format.
+        let mut header_args = vec!["rev-list", count_arg.as_str(), "--topo-order", "--header"];
+        header_args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
+        let admission = git_cli::current_admission();
+        let (log, signatures) = std::thread::scope(|scope| {
+            let headers = scope.spawn(|| {
+                git_cli::with_admission(admission, || read_walk_signatures(&repo, &header_args))
+            });
+            let log = git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES);
+            // A reader that panicked is a walk with no signatures read: every
+            // commit is `Unknown`, never `None`.
+            let signatures = headers.join().unwrap_or_else(|_| WalkSignatures {
+                signatures: HashMap::new(),
+                failure: Some("the signature reader panicked".into()),
+            });
+            (log, signatures)
+        });
+        if let Some(why) = &signatures.failure {
+            log::warn!(target: "pulse", "pulse signatures for {}: {why}", repo.display());
+        }
+        let (stdout, payload_incomplete) = match log {
+            Ok(out) => out,
+            Err(e) => {
+                if is_unborn_head_error(&e) {
+                    return Ok(PulseReport {
+                        commits: Vec::new(),
+                        top_files_by_churn: Vec::new(),
+                        extensions: Vec::new(),
+                        has_mailmap,
+                        total_commits_scanned: 0,
+                        truncated: false,
+                        payload_truncated: false,
+                        payload_truncation_reason: None,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
                 }
-            };
+                return Err(e);
+            }
+        };
 
-        let captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
+        let mut captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
+        apply_signatures(&mut captured.commits, signatures.signatures);
         Ok(PulseReport {
             commits: captured.commits,
             top_files_by_churn: captured.top_files,
@@ -1924,6 +2194,16 @@ impl GitReader {
         repo_path: &str,
         max_files: Option<usize>,
     ) -> Result<KnowledgeReport, String> {
+        Self::knowledge_report_with(repo_path, max_files, budget::MAX_BLAME_BYTES)
+    }
+
+    /// [`Self::knowledge_report`] with the per-file blame budget injected, so a
+    /// test can cut a blame short without a 16 MiB fixture.
+    fn knowledge_report_with(
+        repo_path: &str,
+        max_files: Option<usize>,
+        blame_cap: usize,
+    ) -> Result<KnowledgeReport, String> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         let has_mailmap = repo.join(".mailmap").is_file();
@@ -1933,12 +2213,7 @@ impl GitReader {
         let stdout = match git_text(&repo, &["ls-files", "-z", "--cached"]) {
             Ok(out) => out,
             Err(e) => {
-                let msg = e.to_lowercase();
-                if msg.contains("does not have any commits")
-                    || msg.contains("bad default revision 'head'")
-                    || msg.contains("fatal: your current branch")
-                    || msg.contains("fatal: needed a single revision")
-                {
+                if is_unborn_head_error(&e) {
                     return Ok(KnowledgeReport {
                         scanned_files: 0,
                         candidate_files: 0,
@@ -2007,6 +2282,9 @@ impl GitReader {
         let mut age_dist = CodeAgeDistribution::default();
         let mut orphaned_files: Vec<OrphanedFile> = Vec::new();
         let mut scanned_files = 0;
+        // A blame cut off at its byte cap or its deadline is a prefix of the
+        // file, so every count built from it is a lower bound.
+        let mut blame_cut_short = false;
         let mut scanned_lines = 0;
 
         for file_path in selected_files {
@@ -2021,8 +2299,11 @@ impl GitReader {
             args.push("--");
             args.push(&file_path);
 
-            let stdout = match git_text_capped(&repo, &args, budget::MAX_BLAME_BYTES) {
-                Ok((out, _)) => out,
+            let stdout = match git_text_capped(&repo, &args, blame_cap) {
+                Ok((out, incomplete)) => {
+                    blame_cut_short |= incomplete.is_some();
+                    out
+                }
                 Err(_) => continue,
             };
 
@@ -2137,34 +2418,47 @@ impl GitReader {
             orphaned_files,
             age_distribution: age_dist,
             half_life_days,
-            truncated: truncated || scanned_files < candidate_files,
+            truncated: truncated || blame_cut_short || scanned_files < candidate_files,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }
 
     pub fn dora_report(repo_path: &str, window_days: Option<u32>) -> Result<DoraReport, String> {
-        Self::dora_report_scanning(repo_path, window_days, MAX_DORA_SCAN_COMMITS)
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Self::dora_report_scanning(
+            repo_path,
+            window_days,
+            MAX_DORA_SCAN_COMMITS,
+            now_secs,
+            DateWalk::from_preflight(),
+        )
     }
 
-    /// [`Self::dora_report`] with the commit-scan cap injected.
+    /// [`Self::dora_report`] with the commit-scan cap, "now" and the date-walk
+    /// strategy injected.
     ///
     /// The cap exists to bound a pathological history, so in production it sits
     /// far above any real window — which would leave the truncation signal
     /// untestable, because no fixture repository can reach 25,000 commits. A
     /// signal whose reporting path never runs in a test is the same unexamined
     /// -reads-as-verified failure it was added to prevent, so the cap is a
-    /// parameter and the tests drive the real scan with a small one.
+    /// parameter and the tests drive the real scan with a small one. `now_secs`
+    /// is one clock for the tag window and the commit window alike (git's own
+    /// `--since=N.days` read a second one), and `walk` lets a test take the
+    /// path an old git would, on a git that has both.
     fn dora_report_scanning(
         repo_path: &str,
         window_days: Option<u32>,
         max_scan_commits: usize,
+        now_secs: i64,
+        walk: DateWalk,
     ) -> Result<DoraReport, String> {
         let repo = validate_repo(repo_path)?;
+        let started = Instant::now();
         let window = window_days.unwrap_or(90).clamp(7, 365);
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         let since_secs = now_secs.saturating_sub((window as i64) * 86400);
 
         let stdout = match git_text(
@@ -2178,12 +2472,7 @@ impl GitReader {
         ) {
             Ok(out) => out,
             Err(e) => {
-                let msg = e.to_lowercase();
-                if msg.contains("does not have any commits")
-                    || msg.contains("bad default revision 'head'")
-                    || msg.contains("fatal: your current branch")
-                    || msg.contains("fatal: needed a single revision")
-                {
+                if is_unborn_head_error(&e) {
                     return Ok(DoraReport {
                         deploy_frequency_per_week: 0.0,
                         deploy_rating: "Low".to_string(),
@@ -2244,33 +2533,49 @@ impl GitReader {
 
         let mut lead_times_hours: Vec<f64> = Vec::new();
         if !release_tags.is_empty() {
-            let commit_stdout =
-                git_text(&repo, &["log", "-n", "30", "--format=%H%x00%ct"]).unwrap_or_default();
-
-            for line in commit_stdout.lines() {
-                let parts: Vec<&str> = line.split('\0').collect();
-                if parts.len() >= 2 {
-                    let commit_sha = parts[0];
-                    let commit_ts: i64 = parts[1].parse().unwrap_or(0);
-
-                    if let Ok(desc) =
-                        git_text(&repo, &["describe", "--tags", "--contains", commit_sha])
+            let commit_stdout = dora_git(
+                &repo,
+                started,
+                &["log", "-n", "30", "--format=%H%x00%ct"],
+                "the recent-commit read",
+            )?;
+            let commits: Vec<(&str, i64)> = commit_stdout
+                .lines()
+                .filter_map(|line| {
+                    let (sha, ts) = line.split_once('\0')?;
+                    Some((sha, ts.parse().unwrap_or(0)))
+                })
+                .collect();
+            if !commits.is_empty() {
+                // One `name-rev` for all of them: this was one `describe
+                // --contains` process per commit, thirty in a row. It prints
+                // one line per argument, in order; `undefined` marks a commit
+                // no tag contains.
+                let mut args = vec!["name-rev", "--tags", "--name-only"];
+                args.extend(commits.iter().map(|(sha, _)| *sha));
+                let names = dora_git(&repo, started, &args, "the tag lookup")?;
+                let names: Vec<&str> = names.lines().collect();
+                if names.len() != commits.len() {
+                    return Err(format!(
+                        "DORA tag lookup answered {} lines for {} commits",
+                        names.len(),
+                        commits.len()
+                    ));
+                }
+                for ((_, commit_ts), name) in commits.iter().zip(names) {
+                    let tag_ref = name
+                        .trim()
+                        .trim_start_matches("tags/")
+                        .split('~')
+                        .next()
+                        .unwrap_or("")
+                        .split('^')
+                        .next()
+                        .unwrap_or("");
+                    if let Some((_, _, tag_ts)) = release_tags.iter().find(|(t, _, _)| t == tag_ref)
                     {
-                        let tag_ref = desc
-                            .trim()
-                            .split('~')
-                            .next()
-                            .unwrap_or("")
-                            .split('^')
-                            .next()
-                            .unwrap_or("");
-                        if let Some((_, _, tag_ts)) =
-                            release_tags.iter().find(|(t, _, _)| t == tag_ref)
-                        {
-                            if *tag_ts >= commit_ts {
-                                let diff_hours = ((*tag_ts - commit_ts) as f64) / 3600.0;
-                                lead_times_hours.push(diff_hours);
-                            }
+                        if *tag_ts >= *commit_ts {
+                            lead_times_hours.push(((*tag_ts - *commit_ts) as f64) / 3600.0);
                         }
                     }
                 }
@@ -2296,42 +2601,33 @@ impl GitReader {
             "Low".to_string()
         };
 
-        let since_arg = format!("--since={window}.days");
-        let scan_limit = max_scan_commits.to_string();
-        let log_stdout = git_text(
-            &repo,
-            &["log", "-n", &scan_limit, &since_arg, "--format=%s%x00%ct"],
-        )
-        .unwrap_or_default();
+        let scan = dora_commit_scan(&repo, started, walk, since_secs, max_scan_commits)?;
 
         let mut total_commits = 0usize;
         let mut revert_or_fix_commits = 0usize;
         let mut restore_times_hours: Vec<f64> = Vec::new();
         let mut prev_time: Option<i64> = None;
 
-        for line in log_stdout.lines() {
-            let parts: Vec<&str> = line.split('\0').collect();
-            if parts.len() >= 2 {
-                total_commits += 1;
-                let subject = parts[0].to_lowercase();
-                let commit_ts: i64 = parts[1].parse().unwrap_or(0);
+        for (subject, commit_ts) in &scan.rows {
+            total_commits += 1;
+            let subject = subject.to_lowercase();
+            let commit_ts = *commit_ts;
 
-                let is_failure_remedy = subject.starts_with("revert")
-                    || subject.contains("hotfix")
-                    || subject.starts_with("fix:")
-                    || subject.starts_with("fix(");
+            let is_failure_remedy = subject.starts_with("revert")
+                || subject.contains("hotfix")
+                || subject.starts_with("fix:")
+                || subject.starts_with("fix(");
 
-                if is_failure_remedy {
-                    revert_or_fix_commits += 1;
-                    if let Some(prev) = prev_time {
-                        let diff_h = ((prev - commit_ts).abs() as f64) / 3600.0;
-                        if diff_h > 0.0 && diff_h < 720.0 {
-                            restore_times_hours.push(diff_h);
-                        }
+            if is_failure_remedy {
+                revert_or_fix_commits += 1;
+                if let Some(prev) = prev_time {
+                    let diff_h = ((prev - commit_ts).abs() as f64) / 3600.0;
+                    if diff_h > 0.0 && diff_h < 720.0 {
+                        restore_times_hours.push(diff_h);
                     }
                 }
-                prev_time = Some(commit_ts);
             }
+            prev_time = Some(commit_ts);
         }
 
         let cfr_pct = if total_commits > 0 {
@@ -2343,25 +2639,8 @@ impl GitReader {
             0.0
         };
 
-        // Only a scan that reached the cap can have been cut, so the second git
-        // call is paid for only then; every repository under the cap — which is
-        // all but the pathological ones — costs nothing. `rev-list --count` and
-        // `log` are given the same `--since`, so they prune the walk the same
-        // way and their counts describe one population; comparing a differently
-        // filtered total against this sample would invent truncation.
-        let reached_cap = total_commits >= max_scan_commits;
-        let window_commits = if reached_cap {
-            git_text(&repo, &["rev-list", "--count", &since_arg, "HEAD"])
-                .ok()
-                .and_then(|out| out.trim().parse::<usize>().ok())
-        } else {
-            None
-        };
-        // A count that could not be read must not report the scan complete:
-        // reaching the cap is itself evidence the walk stopped early.
-        let commit_scan_truncated =
-            window_commits.map_or(reached_cap, |total| total > total_commits);
-        let commit_scan_window_commits = commit_scan_truncated.then_some(window_commits).flatten();
+        let commit_scan_truncated = scan.truncated;
+        let commit_scan_window_commits = scan.window_commits;
 
         restore_times_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mttr_hours = if !restore_times_hours.is_empty() {
@@ -2387,6 +2666,163 @@ impl GitReader {
             is_mttr_approximation: true,
             window_days: window,
         })
+    }
+}
+
+/// True when git's error says the repository has no commit to read yet: an
+/// empty history, which is an answer, not a failed read.
+fn is_unborn_head_error(error: &str) -> bool {
+    let msg = error.to_lowercase();
+    msg.contains("does not have any commits")
+        || msg.contains("bad default revision 'head'")
+        || msg.contains("fatal: your current branch")
+        || msg.contains("fatal: needed a single revision")
+}
+
+/// How the DORA commit scan bounds itself by date.
+///
+/// Plain `--since` is not an option for either: it ends the walk at the first
+/// commit older than the cutoff, so one commit with an inverted committer date
+/// (`--committer-date-is-author-date`, imported or rewritten history, a skewed
+/// clock) hides every in-window commit behind it, and the truncation probe,
+/// given the same flag, prunes identically and reports the short answer as
+/// complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateWalk {
+    /// `--since-as-filter=<epoch>` (git 2.37): the walk continues past old
+    /// commits and only filters them from the output, so `-n` counts in-window
+    /// commits and a separate `rev-list --count` gives the true window size.
+    SinceAsFilter,
+    /// An older git has no such flag. The walk is bounded by count alone
+    /// (`-n cap+1`, no date flag) and the window is applied here, to the
+    /// committer dates git printed. The sample is the in-window rows among the
+    /// first `cap`; any further row is reported as a possibly-cut window (the
+    /// walk has no date bound to say nothing in the window lies behind it); the true window
+    /// size is not known and is not claimed.
+    CountBounded,
+}
+
+impl DateWalk {
+    /// The strategy the git this app drives supports. Fails closed to
+    /// [`Self::CountBounded`]: a git that could not be probed is not assumed
+    /// to know the flag.
+    fn from_preflight() -> Self {
+        if git_cli::git_supports(git_cli::SINCE_AS_FILTER) {
+            Self::SinceAsFilter
+        } else {
+            Self::CountBounded
+        }
+    }
+}
+
+/// The commits of a DORA window as `(subject, committer epoch)` rows, newest
+/// walk-order first, and what is known about the rows the cap cut.
+struct DoraCommitScan {
+    rows: Vec<(String, i64)>,
+    truncated: bool,
+    /// The true count of commits in the window, only when it was read and the
+    /// scan was cut short of it.
+    window_commits: Option<usize>,
+}
+
+/// Reads the commits at or after `since_secs`, at most `cap` of them.
+///
+/// A scan that reached the cap can have been cut, so the second git call (the
+/// window's true size) is paid for only then. The count and the log are given
+/// the same date flag so they describe one population; comparing a
+/// differently filtered total against the sample would invent truncation.
+fn dora_commit_scan(
+    repo: &Path,
+    started: Instant,
+    walk: DateWalk,
+    since_secs: i64,
+    cap: usize,
+) -> Result<DoraCommitScan, String> {
+    let parse = |stdout: &str| -> Vec<(String, i64)> {
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let (subject, ts) = line.split_once('\0')?;
+                Some((subject.to_string(), ts.trim().parse().unwrap_or(0)))
+            })
+            .collect()
+    };
+    match walk {
+        DateWalk::SinceAsFilter => {
+            let since_arg = format!("--since-as-filter={since_secs}");
+            let limit = cap.to_string();
+            let stdout = dora_git(
+                repo,
+                started,
+                &["log", "-n", &limit, &since_arg, "--format=%s%x00%ct"],
+                "the commit scan",
+            )?;
+            let rows = parse(&stdout);
+            let reached_cap = rows.len() >= cap;
+            let window_commits = if reached_cap {
+                git_text(repo, &["rev-list", "--count", &since_arg, "HEAD"])
+                    .ok()
+                    .and_then(|out| out.trim().parse::<usize>().ok())
+            } else {
+                None
+            };
+            // A count that could not be read must not report the scan
+            // complete: reaching the cap is itself evidence the walk stopped
+            // early.
+            let truncated = window_commits.map_or(reached_cap, |total| total > rows.len());
+            Ok(DoraCommitScan {
+                window_commits: truncated.then_some(window_commits).flatten(),
+                truncated,
+                rows,
+            })
+        }
+        DateWalk::CountBounded => {
+            let limit = cap.saturating_add(1).to_string();
+            let stdout = dora_git(
+                repo,
+                started,
+                &["log", "-n", &limit, "--format=%s%x00%ct"],
+                "the commit scan",
+            )?;
+            let mut rows = parse(&stdout);
+            // A row past the cap means the walk stopped before the end of history, and
+            // without a date bound it cannot be said that nothing in the window lies
+            // behind it (an inverted date can put one anywhere): "possibly cut" is
+            // reported as cut, never as complete.
+            let truncated = rows.len() > cap;
+            rows.truncate(cap);
+            rows.retain(|(_, ts)| *ts >= since_secs);
+            Ok(DoraCommitScan {
+                rows,
+                truncated,
+                window_commits: None,
+            })
+        }
+    }
+}
+
+/// Wall-clock budget for one DORA report across all of its git reads.
+const DORA_DEADLINE: Duration = Duration::from_secs(60);
+
+/// One git read of the DORA report, bounded by what is left of
+/// [`DORA_DEADLINE`]. A failed or out-of-time read is an error naming the
+/// step: the report used to swallow it (`unwrap_or_default`), so an empty
+/// answer from a read that never ran looked like a repository with no
+/// commits and published a 0% failure rate and no lead time.
+fn dora_git(repo: &Path, started: Instant, args: &[&str], step: &str) -> Result<String, String> {
+    let left = DORA_DEADLINE
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            format!(
+                "DORA report ran out of its {}s budget before {step}",
+                DORA_DEADLINE.as_secs()
+            )
+        })?;
+    match git_text_with_timeout(repo, args, left) {
+        Ok(text) => Ok(text),
+        Err(error) if is_unborn_head_error(&error) => Ok(String::new()),
+        Err(error) => Err(format!("DORA {step} failed: {error}")),
     }
 }
 
@@ -2428,6 +2864,22 @@ fn extract_extension(path: &str) -> String {
             }
             "other".to_string()
         })
+}
+
+/// Stamps each pulse row with the signature the header read found for it.
+///
+/// The log and the header read are two walks over the same refs, so the refs
+/// can move between them: a row the header read did not see is `Unknown`, never
+/// `None`, and a header entry for a commit the log did not return is ignored.
+fn apply_signatures(
+    commits: &mut [PulseCommitSummary],
+    mut found: HashMap<String, CommitSignature>,
+) {
+    for commit in commits {
+        commit.signature = found
+            .remove(&commit.sha)
+            .unwrap_or(CommitSignature::Unknown);
+    }
 }
 
 #[derive(Debug)]
@@ -2499,7 +2951,7 @@ pub(crate) fn parse_pulse_stream(
             continue;
         }
 
-        let mut fields = chunk.splitn(9, '\0');
+        let mut fields = chunk.splitn(8, '\0');
         let sha = match fields.next().map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
             None => continue,
@@ -2510,7 +2962,6 @@ pub(crate) fn parse_pulse_stream(
             .next()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
-        let gpg_status = fields.next().unwrap_or("N").trim().to_string();
         let summary = fields.next().unwrap_or("").trim().to_string();
         let author_name = fields.next().unwrap_or("").trim().to_string();
         let author_email = fields.next().unwrap_or("").trim().to_string();
@@ -2574,7 +3025,8 @@ pub(crate) fn parse_pulse_stream(
             summary,
             author_name,
             author_email,
-            gpg_status,
+            // Not in the log stream: `pulse_report` fills it from the objects.
+            signature: CommitSignature::Unknown,
             additions: commit_adds,
             deletions: commit_dels,
             files_changed: commit_files,
@@ -2620,30 +3072,44 @@ pub(crate) fn parse_pulse_stream(
 ///
 /// Priority: `checkout.defaultRemote`, the current branch's configured
 /// upstream remote, a lone configured remote, else "origin".
+#[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
+    default_remote_reads(repo, Reads::Cached).0
+}
+
+/// [`resolve_default_remote`] plus the reason, when a read it depends on
+/// produced no answer (config, the current branch, the remote list). The name
+/// is then a guess built from "not set"; a caller guarding a destructive
+/// action refuses on the reason instead of trusting the guess.
+fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<String>) {
+    let mut unread: Option<String> = None;
     // One read of the effective config answers what used to be two
-    // `config --get` processes and, usually, `git remote` too. A failed read
-    // is "not set", as each failed `--get` was; the spawn gate's failure
-    // counter is what marks the answer unclean (see `default_base`).
-    let config = config_snapshot(repo).unwrap_or_default();
+    // `config --get` processes and, usually, `git remote` too.
+    let config = match config_snapshot_with(repo, reads) {
+        Ok(config) => config,
+        Err(error) => {
+            unread = Some(error);
+            HashMap::new()
+        }
+    };
     if let Some(configured) = config.get("checkout.defaultremote") {
         let trimmed = configured.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return (trimmed.to_string(), unread);
         }
     }
-    if let Ok(branch) = ref_cache::git_text(
-        repo,
-        &["refs/heads"],
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    ) {
-        let branch = branch.trim();
-        if !branch.is_empty() {
-            if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
-                let trimmed = upstream.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
+    let branch = match reads.head_branch(repo) {
+        Ok(branch) => branch,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
+            let trimmed = upstream.trim();
+            if !trimmed.is_empty() {
+                return (trimmed.to_string(), unread);
             }
         }
     }
@@ -2658,22 +3124,58 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(error) => {
+                unread.get_or_insert(error);
+                Vec::new()
+            }
         }
     } else {
         configured
     };
     if let [only] = names.as_slice() {
-        return only.clone();
+        return (only.clone(), unread);
     }
-    "origin".to_string()
+    ("origin".to_string(), unread)
 }
 
 /// The effective config as `git config --list -z` prints it, last value of a
 /// key winning as it does for `git config --get`. Section and variable names
 /// arrive lowercased; a subsection keeps its case (`branch.Feature.remote`).
 pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, String> {
-    let text = ref_cache::git_text(repo, &[], &["config", "--list", "-z"])?;
+    config_snapshot_with(repo, Reads::Cached)
+}
+
+/// How the default-base lookup reads the two inputs that live outside the
+/// ref store: the effective config and HEAD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reads {
+    /// Through [`ref_cache`]. Its stamp does not see files pulled in by
+    /// `include.path` or the system config. A recompute reads `config --list`
+    /// through its own cache entry, which can itself be up to a TTL old, so a
+    /// change to such a file is seen within about twice the 60 s TTL: the
+    /// display readers' admitted gap. (Reading config fresh on every cached
+    /// recompute would cost a process each time, so the gap is stated.)
+    Cached,
+    /// Straight from git, every time. For a caller that destroys something on
+    /// the answer.
+    Fresh,
+}
+
+impl Reads {
+    fn head_branch(self, repo: &Path) -> Result<Option<String>, String> {
+        match self {
+            Self::Cached => head_branch_cached(repo),
+            Self::Fresh => head_branch_name(repo),
+        }
+    }
+}
+
+fn config_snapshot_with(repo: &Path, reads: Reads) -> Result<HashMap<String, String>, String> {
+    let args = ["config", "--list", "-z"];
+    let text = match reads {
+        Reads::Cached => ref_cache::git_text(repo, &[], &args)?,
+        Reads::Fresh => git_text(repo, &args)?,
+    };
     Ok(parse_config_list(&text))
 }
 
@@ -2703,6 +3205,33 @@ fn configured_remotes(config: &HashMap<String, String>) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// True for a remote's own HEAD pointer, `refs/remotes/<remote>/HEAD`, which
+/// names the branch the remote considers default rather than being one. Only
+/// that exact shape: a branch *called* `release/HEAD` (`refs/remotes/origin/
+/// release/HEAD`, or a local `refs/heads/release/HEAD`) is a real branch and
+/// was hidden by an "ends in /HEAD" test.
+pub(crate) fn is_remote_head(remote_names: &[String], refname: &str) -> bool {
+    refname
+        .strip_prefix("refs/remotes/")
+        .and_then(|rest| remotes::split_tracking_ref(remote_names, rest))
+        .is_some_and(|(_, branch)| branch == "HEAD")
+}
+
+/// Names of the remotes configured for `repo`, for attributing remote-tracking
+/// refs through [`remotes::split_tracking_ref`].
+pub(crate) fn configured_remote_names(repo: &Path) -> Vec<String> {
+    config_snapshot(repo)
+        .map(|config| configured_remotes(&config))
+        .unwrap_or_default()
+}
+
+/// The configured remote names read straight from git, never from the cache,
+/// and an unreadable config is an error rather than "no remotes". For a caller
+/// that creates or moves a branch on the answer.
+pub(crate) fn configured_remote_names_fresh(repo: &Path) -> Result<Vec<String>, String> {
+    config_snapshot_with(repo, Reads::Fresh).map(|config| configured_remotes(&config))
 }
 
 /// Whether the repository still has pre-config remote definitions, which
@@ -2744,37 +3273,140 @@ impl DefaultBase {
     }
 }
 
+/// The ref-cache key of the default-base answer. It is not a git argv and
+/// cannot become one: the cached closure owns the spawn, and a NUL cannot be
+/// passed to a process, so it never collides with a listing's key.
+const DEFAULT_BASE_KEY: &str = "\0gitpulse:default-base";
+
+/// What the default base is a function of: every head and remote-tracking ref
+/// (the default may be nested, `release/main`), plus the HEAD, config and
+/// packed-ref files [`ref_cache`] always stamps.
+const DEFAULT_BASE_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
+
+/// A complete answer's text, for the ref cache: six NUL-separated fields (the
+/// remote, then the remote HEAD and the base each as a presence flag followed
+/// by its value). Refnames, remote names and oids contain no NUL. An
+/// incomplete answer is never kept, so it has no encoding.
+fn encode_default_base(value: &DefaultBase) -> String {
+    let (head_flag, head) = match &value.remote_head {
+        Some(head) => ("1", head.as_str()),
+        None => ("0", ""),
+    };
+    let (base_flag, short, oid) = match &value.base {
+        Some((short, oid)) => ("1", short.as_str(), oid.as_str()),
+        None => ("0", "", ""),
+    };
+    [
+        value.remote.as_str(),
+        head_flag,
+        head,
+        base_flag,
+        short,
+        oid,
+    ]
+    .join("\0")
+}
+
+fn decode_default_base(text: &str) -> Option<DefaultBase> {
+    let fields: Vec<&str> = text.split('\0').collect();
+    let [remote, head_flag, head, base_flag, short, oid] = fields.as_slice() else {
+        return None;
+    };
+    let flagged = |flag: &str| match flag {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    };
+    Some(DefaultBase {
+        remote: (*remote).to_string(),
+        remote_head: flagged(head_flag)?.then(|| (*head).to_string()),
+        base: flagged(base_flag)?.then(|| ((*short).to_string(), (*oid).to_string())),
+        incomplete: None,
+    })
+}
+
+/// The default base, answered through [`ref_cache::through_stamped`] with the
+/// stamp [`default_base`] read once for the call: the same stamp
+/// as every other ref listing, so a write anywhere under `refs/heads` or
+/// `refs/remotes` is seen at once, a stamp younger than the racy window is not
+/// trusted, and nothing is served past the cache's TTL. Never kept: an answer
+/// computed while any lookup was refused (it reads a refusal as "not set").
+fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> DefaultBase {
+    let mut computed = None;
+    let answered = ref_cache::through_stamped(repo, &[DEFAULT_BASE_KEY], stamp, || {
+        let value = compute_default_base_with(repo, Reads::Cached);
+        let keep = value.incomplete.is_none();
+        let text = if keep {
+            encode_default_base(&value)
+        } else {
+            String::new()
+        };
+        computed = Some(value);
+        Ok((text, keep))
+    });
+    match (answered, computed) {
+        (Err(reason), _) => DefaultBase {
+            remote: "origin".to_string(),
+            remote_head: None,
+            base: None,
+            incomplete: Some(reason),
+        },
+        (Ok(_), Some(value)) => value,
+        (Ok(text), None) => decode_default_base(&text).unwrap_or_else(|| {
+            debug_assert!(false, "an unreadable kept default base: {text:?}");
+            compute_default_base_with(repo, Reads::Fresh)
+        }),
+    }
+}
+
+/// What a leader computed, kept only to hand to the callers that queued behind
+/// it. Coalescing, not caching: [`ref_cache`] owns what is served later.
+#[derive(Clone)]
+struct SharedBase {
+    generation: u64,
+    stamp: ref_cache::Stamp,
+    value: DefaultBase,
+}
+
 /// One `hydrate` asks for the default base three times at once, and each
-/// answer cost five git processes. The answer is a function of a handful of
-/// files, so it is memoized against their identity rather than against time:
-/// a timer would serve the pre-change answer to the very refresh the change
-/// triggered, and nothing would ever ask again.
+/// answer cost five git processes. The answer is a function of the ref store,
+/// HEAD and config, so it is kept in [`ref_cache`] against the same stamp as
+/// every ref listing. That stamp walks `refs/heads` and `refs/remotes`
+/// recursively (a nested default branch is seen), refuses to trust a stamp
+/// younger than the racy window, and expires after the cache's TTL, which
+/// bounds the inputs no stamp sees (files pulled in by `include.path`).
 ///
-/// Every input is stamped *before* the lookup runs, so a write that races the
-/// lookup leaves a stamp that no longer matches and the next call recomputes.
-/// Git replaces config, HEAD, packed-refs and loose refs by lockfile rename,
-/// which gives each write a new inode and moves the containing directory's
-/// mtime.
+/// Two bounds are deliberate. Files pulled in by `include.path` (and the
+/// system config) are not stamped, so a change to one is seen within about
+/// twice the 60 s TTL (the kept answer, then the kept `config --list` it is
+/// recomputed from), not at once; a destructive caller reads
+/// [`compute_default_base`] instead, which asks git directly. The dead-branch
+/// clean's default-branch protection does. And a stamp whose newest mtime is within
+/// the racy window is never trusted, so sequential callers in the 3 s after a
+/// write each recompute (five processes): serving the last answer there is the
+/// staleness this removes. Callers that arrive together still share one
+/// computation below.
 ///
-/// Known blind spots, seen at the next change to any stamped file: files
-/// pulled in by `include.path`/`includeIf`, the system config, and a default
-/// branch nested below `refs/heads/<dir>/` (only its directory's mtime moves).
+/// A repository with more loose refs than the stamp's bound has no stamp, so
+/// every call computes (five processes), as `list_branches` already does.
+///
+/// Callers for one repository take turns and the stamp is re-read after the
+/// wait, so a caller that queued behind a leader shares its answer, refused
+/// or not, when nothing moved: the lookups would repeat the same refusal in
+/// series otherwise. A caller that arrives after the answer was stored asks
+/// the cache.
 pub(crate) fn default_base(repo: &Path) -> DefaultBase {
     const MAX_MEMOIZED_REPOS: usize = 64;
-    static MEMO: OnceLock<Mutex<HashMap<std::path::PathBuf, MemoizedBase>>> = OnceLock::new();
-    // Process-wide, so a cleared memo can never hand out a generation a
+    static LAST: OnceLock<Mutex<HashMap<std::path::PathBuf, SharedBase>>> = OnceLock::new();
+    // Process-wide, so a cleared table can never hand out a generation a
     // waiting caller already saw.
     static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // `hydrate` asks three times at the same instant, so a memo alone still
-    // computed three times on a cold or changed repository. Callers for one
-    // repository take turns; the stamp is re-read after the wait, so the
-    // second caller is served the first one's answer only if nothing moved.
     static TURNS: OnceLock<Mutex<HashMap<std::path::PathBuf, std::sync::Arc<Mutex<()>>>>> =
         OnceLock::new();
-    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
     // What had been computed when this caller arrived. Anything newer was
     // computed while it waited for its turn.
-    let arrived = memo
+    let arrived = last
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(repo)
@@ -2790,109 +3422,79 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         std::sync::Arc::clone(turns.entry(repo.to_path_buf()).or_default())
     };
     let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-    let stamp = DefaultBaseStamp::read(repo);
+    let stamp = ref_cache::stamp(repo, DEFAULT_BASE_NAMESPACES);
     if let Some(stamp) = &stamp {
-        let cached = memo
+        let shared = last
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(repo)
-            .cloned();
-        // A clean answer serves anyone while its stamp holds. A refused one
-        // serves only the callers that queued behind it: they would have
-        // been refused too, and repeating it in turn cost ~2 s apiece. A
-        // caller that arrives after it was stored asks git again.
-        if let Some(entry) = cached {
-            if &entry.stamp == stamp && (entry.clean || entry.generation > arrived) {
-                return entry.value;
-            }
+            .filter(|entry| entry.generation > arrived && &entry.stamp == stamp)
+            .map(|entry| entry.value.clone());
+        if let Some(value) = shared {
+            return value;
         }
     }
-    // The lookups below read a failed spawn as "not set". Under load that is
-    // a refusal, not an answer, so a value computed while any of them failed
-    // is marked unclean: shared with the callers already queued behind it,
-    // never served to one that arrives later.
-    let failures_before = git_cli::process_failures();
-    let remote = resolve_default_remote(repo);
-    let head_ref = remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-    let clean = git_cli::process_failures() == failures_before;
-    let value = DefaultBase {
-        remote,
-        remote_head,
-        base,
-        incomplete: (!clean).then(|| {
-            git_cli::last_process_failure()
-                .unwrap_or_else(|| "a default-branch lookup produced no answer".into())
-        }),
-    };
+    // Stamped before the lookup: a write that races it leaves a stamp that no
+    // longer matches, so a later caller does not take this answer.
+    let value = default_base_cached(repo, stamp.as_ref());
     if let Some(stamp) = stamp {
-        let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
-        if memo.len() >= MAX_MEMOIZED_REPOS && !memo.contains_key(repo) {
-            memo.clear();
+        let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.len() >= MAX_MEMOIZED_REPOS && !last.contains_key(repo) {
+            last.clear();
         }
-        memo.insert(
+        last.insert(
             repo.to_path_buf(),
-            MemoizedBase {
+            SharedBase {
                 generation: GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 stamp,
                 value: value.clone(),
-                clean,
             },
         );
     }
     value
 }
 
-#[derive(Clone)]
-struct MemoizedBase {
-    generation: u64,
-    stamp: DefaultBaseStamp,
-    value: DefaultBase,
-    /// False when any git process in the lookup was refused or failed to
-    /// start: the value then reads a refusal as "not set".
-    clean: bool,
+/// The uncached default-base lookup behind [`default_base`]. A read that gave
+/// no answer (a refused spawn, a deadline, an unreadable ref) sets
+/// `incomplete`; it never reads as "no remote HEAD". Callers that guard a
+/// destructive action use this directly, so a memoized answer from before the
+/// read started failing cannot stand in for the state they are acting on.
+///
+/// Uncached all the way down: the config listing and HEAD are read from git
+/// here too, not through [`ref_cache`], whose stamp cannot see an
+/// `include.path` file.
+pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+    compute_default_base_with(repo, Reads::Fresh)
 }
 
-/// Identity of every file the default-base answer depends on. `None` for a
-/// file that does not exist, which is itself part of the state: creating
-/// `refs/remotes/origin/HEAD` must invalidate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DefaultBaseStamp(Vec<(std::path::PathBuf, Option<FileIdentity>)>);
-
-impl DefaultBaseStamp {
-    /// `None` when the git directories cannot be resolved: no stamp means no
-    /// memo, never a stamp that matches by accident.
-    fn read(repo: &Path) -> Option<Self> {
-        let (private, common) = crate::repository_trust::git_directories(repo).ok()?;
-        let mut paths = vec![
-            private.join("HEAD"),
-            private.join("config.worktree"),
-            common.join("config"),
-            common.join("packed-refs"),
-            common.join("reftable").join("tables.list"),
-            common.join("refs").join("heads"),
-        ];
-        // The primary remote is an output of the lookup, so every remote's
-        // directory is stamped; a repository has a handful.
-        let remotes = common.join("refs").join("remotes");
-        paths.push(remotes.clone());
-        if let Ok(entries) = std::fs::read_dir(&remotes) {
-            let mut dirs: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-            dirs.sort();
-            dirs.truncate(64);
-            paths.extend(dirs);
+/// [`compute_default_base`] with the config and HEAD reads chosen by `reads`.
+/// [`default_base`] computes with [`Reads::Cached`] because its own answer is
+/// already bounded by the ref cache's stamp and TTL.
+fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
+    let failures_before = git_cli::process_failures();
+    let (remote, mut unread) = default_remote_reads(repo, reads);
+    let head_ref = remote_head_ref(&remote);
+    let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
+        Ok(target) => target,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
         }
-        paths.extend(ref_cache::user_config_paths());
-        Some(Self(
-            paths
-                .into_iter()
-                .map(|path| {
-                    let identity = FileIdentity::at(&path);
-                    (path, identity)
-                })
-                .collect(),
-        ))
+    };
+    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
+    let incomplete = if git_cli::process_failures() != failures_before {
+        Some(
+            git_cli::last_process_failure()
+                .unwrap_or_else(|| "a default-branch lookup produced no answer".into()),
+        )
+    } else {
+        unread
+    };
+    DefaultBase {
+        remote,
+        remote_head,
+        base,
+        incomplete,
     }
 }
 
@@ -2936,6 +3538,70 @@ fn pick_default_branch(local_names: &[String], remote_head: Option<&str>, remote
 /// commit.
 const TAG_LIST_FORMAT: &str =
     "%(refname:short)%00%(objectname)%00%(contents:subject)%00%(*objectname)";
+
+/// Where the symbolic ref `refname` points, as the full ref name.
+///
+/// `--quiet` makes exit 1 git's answer "this is not a symbolic ref" (a
+/// detached HEAD, an absent `origin/HEAD`): `Ok(None)`. Any other failure is a
+/// read that did not happen (a refused spawn, a deadline, an unreadable ref
+/// file) and is an `Err`, never "not set": callers that guard a destructive
+/// action on the answer must not take an unreadable ref for an absent one.
+pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<String>, String> {
+    let run = git_cli::git_captured(repo, &["symbolic-ref", "--quiet", refname])?;
+    match run.status_code {
+        0 => {
+            let target = String::from_utf8_lossy(&run.stdout).trim().to_string();
+            Ok((!target.is_empty()).then_some(target))
+        }
+        1 => Ok(None),
+        code => Err(format!(
+            "Could not read {refname} (git exited {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )),
+    }
+}
+
+/// The local branch HEAD is on, as its short name; `None` when detached.
+///
+/// Asks for the full ref and strips `refs/heads/` itself: `--short` shortens
+/// to the shortest *unambiguous* name, which is `heads/main` when a tag is
+/// also called `main`. The canonical owner of the question: a failed read is
+/// an `Err` (see [`symbolic_ref_target`]) and never "detached".
+pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
+    let branch = head_branch_name(repo)?;
+    if let Some(name) = &branch {
+        validate_ref_name(name)?;
+    }
+    Ok(branch)
+}
+
+/// [`head_branch`] without the argv-safety check on the name, for readers that
+/// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
+/// the writers would refuse to name in a command, `fix(ui)` among them, is
+/// still the one HEAD is on.
+fn head_branch_name(repo: &Path) -> Result<Option<String>, String> {
+    symbolic_ref_target(repo, "HEAD")?
+        .map(|target| branch_of_head_target(&target))
+        .transpose()
+}
+
+/// [`head_branch_name`] answered through the ref cache, for the readers that
+/// ask on every refresh. The cached read cannot tell a detached HEAD (exit 1,
+/// an answer) from a refusal, so a failed cached read is asked again, uncached,
+/// and that one decides.
+pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, String> {
+    match ref_cache::git_text(repo, &["refs/heads"], &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok(target) => branch_of_head_target(target.trim()).map(Some),
+        Err(_) => head_branch_name(repo),
+    }
+}
+
+fn branch_of_head_target(target: &str) -> Result<String, String> {
+    target
+        .strip_prefix("refs/heads/")
+        .map(str::to_string)
+        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))
+}
 
 /// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
 const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
@@ -3066,6 +3732,21 @@ pub(crate) fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
     Some((ahead.parse().ok()?, behind.parse().ok()?))
 }
 
+/// The listing name of a `for-each-ref` branch refname and whether it is a
+/// remote-tracking one. The namespace is stripped exactly once: `git branch
+/// refs/heads/x` creates the real ref `refs/heads/refs/heads/x`, whose name is
+/// `refs/heads/x`, and a repeated strip would collapse it onto branch `x`. The
+/// one owner both branch listings go through.
+fn short_branch_name(refname: &str) -> (&str, bool) {
+    match refname.strip_prefix("refs/remotes/") {
+        Some(rest) => (rest, true),
+        None => (
+            refname.strip_prefix("refs/heads/").unwrap_or(refname),
+            false,
+        ),
+    }
+}
+
 /// One listed ref awaiting churn computation in [`GitReader::branch_stats`].
 struct BranchStatTarget {
     name: String,
@@ -3074,16 +3755,18 @@ struct BranchStatTarget {
     remote_name: Option<String>,
 }
 
-/// Looks up the churn store in bulk, computes unique uncached tips (capped),
-/// keeps the results, and returns an update per eligible branch we have a
-/// value for. The fifth tuple element counts attempted walks that FAILED —
-/// branches which will be missing from `updates` through error, not through
-/// capping.
+/// Looks up the churn store in bulk, carries stored answers over a base that
+/// moved when that is provable (see [`churn_store::Kept::carried`]), computes
+/// the unique tips still unanswered (capped), keeps the results, and returns an
+/// update per eligible branch we have a value for. The fifth tuple element
+/// counts attempted walks that FAILED — branches which will be missing from
+/// `updates` through error, not through capping.
 #[allow(clippy::type_complexity)]
 fn compute_eligible_churn(
     repo: &Path,
     base_oid: &str,
     eligible: Vec<BranchStatTarget>,
+    budget: Duration,
 ) -> (Vec<BranchStatsUpdate>, usize, usize, bool, usize) {
     let inputs = churn_store::Inputs::read(repo, base_oid);
     let mut unique_tips: Vec<String> = Vec::new();
@@ -3093,7 +3776,24 @@ fn compute_eligible_churn(
             unique_tips.push(target.tip_commit_id.clone());
         }
     }
-    let cached_hits = churn_store::lookup(&inputs, base_oid, &unique_tips);
+    let kept = churn_store::lookup(&inputs, &unique_tips);
+    let mut cached_hits: HashMap<String, Churn> = kept
+        .iter()
+        .filter(|(_, answer)| answer.base == base_oid)
+        .map(|(tip, answer)| (tip.clone(), answer.churn))
+        .collect();
+
+    // Every unanswered tip's ahead/behind in one listing, where each tip used
+    // to cost its own `rev-list`; a tip the listing does not answer walks. The
+    // same listing is what lets a stored answer survive a base that moved.
+    let counts = if unique_tips.iter().all(|tip| cached_hits.contains_key(tip)) {
+        HashMap::new()
+    } else {
+        tip_counts_against(repo, base_oid).unwrap_or_default()
+    };
+    let carried = carry_over_moved_base(repo, base_oid, &kept, &counts);
+    cached_hits.extend(carried.iter().map(|(tip, churn)| (tip.clone(), *churn)));
+
     let mut unique_uncached: Vec<String> = unique_tips
         .into_iter()
         .filter(|tip| !cached_hits.contains_key(tip))
@@ -3102,39 +3802,49 @@ fn compute_eligible_churn(
     let remaining_after = unique_uncached
         .len()
         .saturating_sub(MAX_BRANCH_STAT_TARGETS);
-    let capped = remaining_after > 0;
+    let mut capped = remaining_after > 0;
     unique_uncached.truncate(MAX_BRANCH_STAT_TARGETS);
-    let attempted = unique_uncached.len();
 
     // One tip at a time. `into_par_iter` started up to 96 tips at once, two
     // `git` processes each, and a concurrency cap of ~16 children that finish
     // in ~200 ms is still ~80 starts a second. It also ran them on rayon
     // workers, which do not inherit the caller's admission class. The gate's
     // rate cap is the backstop; this walk must not spend the burst in one tick.
-    // Every uncached tip's ahead/behind in one listing, where each tip used to
-    // cost its own `rev-list`; a tip the listing does not answer walks.
-    let counts = if unique_uncached.is_empty() {
-        HashMap::new()
-    } else {
-        tip_counts_against(repo, base_oid).unwrap_or_default()
-    };
-    let computed_map: HashMap<String, Churn> = unique_uncached
-        .into_iter()
-        .filter_map(|tip| {
-            let pin = inputs.pin(&tip);
-            compute_branch_churn(
-                repo,
-                base_oid,
-                &tip,
-                counts.get(&tip).copied(),
-                pin.as_deref(),
-            )
-            .map(|churn| (tip, churn))
-        })
-        .collect();
+    // A time budget on top of the target cap: the cap bounds how many tips a
+    // call may start, not how long they take. The first tip always runs so a
+    // call makes progress however small the budget; tips left unstarted are
+    // not failures, they are `capped` and the next call takes them.
+    let started = Instant::now();
+    let mut attempted: usize = 0;
+    let mut computed_map: HashMap<String, Churn> = HashMap::new();
+    for tip in unique_uncached {
+        if attempted > 0 && started.elapsed() >= budget {
+            capped = true;
+            break;
+        }
+        attempted += 1;
+        let pin = inputs.pin(&tip);
+        if let Some(churn) = compute_branch_churn(
+            repo,
+            base_oid,
+            &tip,
+            counts.get(&tip).copied(),
+            pin.as_deref(),
+        ) {
+            computed_map.insert(tip, churn);
+        }
+    }
     let compute_failures = attempted.saturating_sub(computed_map.len());
 
-    churn_store::keep(repo, &inputs, base_oid, &computed_map);
+    // Carried answers are kept against the new base, so the next call finds
+    // them without asking again.
+    let mut to_keep = carried;
+    to_keep.extend(
+        computed_map
+            .iter()
+            .map(|(tip, churn)| (tip.clone(), *churn)),
+    );
+    churn_store::keep(repo, &inputs, base_oid, &to_keep);
 
     let mut updates = Vec::with_capacity(eligible.len());
     let mut computed = 0;
@@ -3165,10 +3875,51 @@ fn compute_eligible_churn(
     (updates, computed, cached, capped, compute_failures)
 }
 
+/// The stored answers that still hold after the default branch moved from the
+/// base they were measured against to `base_oid`, with their counts read fresh
+/// from `counts`. An answer holds when its ahead count is unchanged (checked
+/// first, as it costs nothing) and `base_oid` descends from the base it was
+/// measured against: one `merge-base --is-ancestor` per distinct stored base,
+/// at most [`MAX_CARRY_BASES`] of them. Whatever cannot be proved — a base
+/// rewound, replaced or gone, a tip the listing did not count, a git that gave
+/// no listing — is left out and is measured.
+fn carry_over_moved_base(
+    repo: &Path,
+    base_oid: &str,
+    kept: &HashMap<String, churn_store::Kept>,
+    counts: &HashMap<String, (usize, usize)>,
+) -> HashMap<String, Churn> {
+    let mut descends: HashMap<&str, bool> = HashMap::new();
+    let mut carried = HashMap::new();
+    for (tip, answer) in kept.iter().filter(|(_, answer)| answer.base != base_oid) {
+        let Some(churn) = counts.get(tip).and_then(|now| answer.carried(*now)) else {
+            continue;
+        };
+        let old_base = answer.base.as_str();
+        let holds = match descends.get(old_base) {
+            Some(known) => *known,
+            None if descends.len() >= MAX_CARRY_BASES => false,
+            None => {
+                let held = validate_oid(old_base).is_ok()
+                    && crate::harness::review::contains(repo, base_oid, old_base).unwrap_or(false);
+                descends.insert(old_base, held);
+                held
+            }
+        };
+        if holds {
+            carried.insert(tip.clone(), churn);
+        }
+    }
+    carried
+}
+
 /// Ahead/behind of every branch and remote-tracking tip against `base_oid`,
 /// keyed by tip oid, from one `for-each-ref`. `None` when git cannot answer
 /// (the atom needs 2.42), which leaves each tip to its own walk.
-fn tip_counts_against(repo: &Path, base_oid: &str) -> Option<HashMap<String, (usize, usize)>> {
+pub(crate) fn tip_counts_against(
+    repo: &Path,
+    base_oid: &str,
+) -> Option<HashMap<String, (usize, usize)>> {
     validate_oid(base_oid).ok()?;
     let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
     let text = ref_cache::git_text(
@@ -3523,6 +4274,149 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err("Git object size did not match cat-file".into());
     }
     Ok(bytes)
+}
+
+/// What one [`GitReader::first_parent_pass`] saw: every commit it emitted and
+/// that commit's first parent.
+#[derive(Debug, Default)]
+pub struct FirstParentPass {
+    /// Emitted commit -> its first parent (`None` for a root commit).
+    parents: HashMap<String, Option<String>>,
+    /// The pass stopped at its commit cap, so a commit missing from
+    /// `parents` may still exist below the cut.
+    truncated: bool,
+}
+
+/// How one tip's first-parent chain ended inside a [`FirstParentPass`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum FirstParentChain {
+    /// Oldest-first ids from the first stop id met up to the tip, so
+    /// consecutive pairs are first-parent edges.
+    Reached(Vec<String>),
+    /// The chain ended at a root commit without meeting a stop id: a settled
+    /// "no discoverable base", never a fabricated root.
+    Rooted,
+    /// The pass ended (commit cap) before this chain did: unknown, not rooted.
+    Unfinished,
+}
+
+impl FirstParentPass {
+    /// True when the pass was cut by its commit cap.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Follows `tip` down its first-parent chain, stopping at (and including)
+    /// the first commit whose id is in `stop_at`.
+    pub fn chain(&self, tip: &str, stop_at: &HashSet<String>) -> FirstParentChain {
+        if stop_at.contains(tip) {
+            // The tip itself is another branch's tip; there is nothing to walk.
+            return FirstParentChain::Reached(vec![tip.to_string()]);
+        }
+        let mut walked = vec![tip.to_string()];
+        let mut at = tip;
+        // A chain cannot be longer than the commits the pass emitted.
+        while walked.len() <= self.parents.len() {
+            match self.parents.get(at) {
+                None => return FirstParentChain::Unfinished,
+                Some(None) => return FirstParentChain::Rooted,
+                Some(Some(parent)) => {
+                    walked.push(parent.clone());
+                    if stop_at.contains(parent) {
+                        walked.reverse();
+                        return FirstParentChain::Reached(walked);
+                    }
+                    at = parent;
+                }
+            }
+        }
+        FirstParentChain::Unfinished
+    }
+}
+
+/// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
+const HISTORY_CHUNK: usize = 5_000;
+
+#[cfg(not(test))]
+fn history_chunk_size() -> usize {
+    HISTORY_CHUNK
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn history_chunk_size() -> usize {
+    CHUNK_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(HISTORY_CHUNK)
+}
+
+/// Runs `body` with a small history chunk, so a test can cross chunk
+/// boundaries without a 5,000-commit fixture.
+#[cfg(test)]
+pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHUNK_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    body()
+}
+
+/// The warning a status row carries when its path cannot be trusted to name
+/// the file on disk. Git paths are bytes; the IPC carries UTF-8, so a Linux
+/// path that is not valid UTF-8 arrives with U+FFFD in place of each bad byte
+/// and any action sent back for it would name a file that does not exist. The
+/// row says so instead of looking like any other file.
+pub(crate) fn undecodable_path_warning(path: &str) -> Option<String> {
+    path.contains('\u{FFFD}').then(|| {
+        "This path is not valid UTF-8, so it is shown with replacement characters and \
+         actions sent for it will not find the file. Use git on the command line for it."
+            .to_string()
+    })
+}
+
+/// Commits whose parents exist in the real history but not in this clone, from
+/// the `shallow` file in the common git directory. Git prints no parents for
+/// them (`%P` is empty), which the lane solver reads as a root; a root is a
+/// commit that has no parents, not one whose parents were cut off.
+///
+/// `Ok(empty)` only when there is no such file. A file that exists and cannot
+/// be read fails the page: its commits would be drawn as roots.
+fn shallow_commits(repo: &Path) -> Result<HashSet<String>, String> {
+    let (_private, common) = crate::repository_trust::git_directories(repo)?;
+    match std::fs::read_to_string(common.join("shallow")) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(error) => Err(format!("Could not read the shallow boundary: {error}")),
+    }
+}
+
+/// Gives each shallow-boundary commit the unknown parent it is missing, so it
+/// is drawn as a stub rather than as the root of the history.
+fn mark_shallow_boundary(repo: &Path, commits: &mut [RawCommitNode]) -> Result<(), String> {
+    if !commits.iter().any(|commit| commit.parent_ids.is_empty()) {
+        return Ok(());
+    }
+    let shallow = shallow_commits(repo)?;
+    for commit in commits.iter_mut() {
+        if commit.parent_ids.is_empty() && shallow.contains(&commit.id) {
+            commit
+                .parent_ids
+                .push(crate::graph::UNKNOWN_PARENT.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one `\x01`-separated history record laid out by
@@ -4335,6 +5229,242 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
     files
 }
 
+/// Most source paths a one-path read puts on the command line, and the most
+/// bytes they may take together, so a renamed directory of thousands of files
+/// cannot overrun the argument limit (macOS 1 MiB, Windows 32 KiB).
+const MAX_PAIRED_SOURCES: usize = 256;
+const MAX_PAIRED_SOURCE_BYTES: usize = 16 * 1024;
+
+/// The old paths of the renames and copies in `git show --name-status
+/// --diff-filter=RC -z` output, whose records are all `R100\0old\0new\0` or
+/// `C75\0src\0copy\0`, for the entries whose new path is `path` or under it.
+/// A trailing record cut by the byte cap is ignored.
+fn parse_paired_sources(stdout: &str, path: &str) -> Vec<String> {
+    let under = format!("{}/", path.trim_end_matches('/'));
+    let mut sources: Vec<String> = Vec::new();
+    let mut tokens = stdout.split('\0');
+    while let (Some(_status), Some(old), Some(new)) = (tokens.next(), tokens.next(), tokens.next())
+    {
+        if (new == path || new.starts_with(&under)) && !sources.iter().any(|s| s == old) {
+            sources.push(old.to_string());
+        }
+    }
+    sources
+}
+
+/// Whether a patch has a section that adds a whole file, the only section a
+/// rename or copy can re-pair. Header lines never begin like content lines
+/// (`+`, `-`, space), so a line-start match is exact.
+fn has_new_file_section(patch: &str) -> bool {
+    patch.lines().any(|line| line.starts_with("new file mode "))
+}
+
+/// A path as a patch header prints it: raw, or C-quoted when git had to.
+fn header_path(raw: &str) -> Option<String> {
+    if raw.starts_with('"') {
+        unquote_c_style(raw)
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// The post-image path of one patch section (`diff --git` through its last
+/// line), read from the lines that name it unambiguously: `rename to` /
+/// `copy to`, then `+++ b/` (or `--- a/` for a deletion), and last a
+/// `diff --git` header whose two paths are equal, which is all a binary,
+/// empty or mode-only section has. Each of those may be C-quoted. `None` when
+/// the name is not readable, which the caller treats as "keep".
+fn section_post_path(section: &str) -> Option<String> {
+    let header: Vec<&str> = section
+        .lines()
+        .take_while(|line| !line.starts_with("@@"))
+        .collect();
+    let value = |prefix: &str| header.iter().find_map(|line| line.strip_prefix(prefix));
+    let side = |marker: &str, prefix: &str| {
+        let raw = value(marker)?.trim_end_matches('\t');
+        header_path(raw)?.strip_prefix(prefix).map(str::to_string)
+    };
+    if let Some(raw) = value("rename to ").or_else(|| value("copy to ")) {
+        return header_path(raw);
+    }
+    if value("+++ /dev/null").is_some() {
+        return side("--- ", "a/");
+    }
+    if value("+++ ").is_some() {
+        return side("+++ ", "b/");
+    }
+    let rest = header.first()?.strip_prefix("diff --git ")?;
+    if rest.ends_with('"') {
+        let at = rest.rfind(" \"b/")?;
+        return header_path(&rest[at + 1..])?
+            .strip_prefix("b/")
+            .map(str::to_string);
+    }
+    let rest = rest.strip_prefix("a/")?;
+    let each = rest.len().checked_sub(3)? / 2;
+    if rest.len() != each * 2 + 3 || !rest.is_char_boundary(each) {
+        return None;
+    }
+    let (old, new) = (&rest[..each], rest[each..].strip_prefix(" b/")?);
+    (old == new).then(|| new.to_string())
+}
+
+/// `patch` cut at each `diff --git` line: one slice per file section.
+fn patch_sections(patch: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut offset = 0;
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| &patch[start..starts.get(i + 1).copied().unwrap_or(patch.len())])
+        .collect()
+}
+
+/// Whether a section's post-image path is `path` or under the directory
+/// `dir` (`path` plus a slash). A section whose path cannot be read is kept:
+/// showing one extra file is safer than hiding the requested one.
+fn section_is_under(section: &str, path: &str, dir: &str) -> bool {
+    section_post_path(section).is_none_or(|post| post == path || post.starts_with(dir))
+}
+
+/// Whether some section of `patch` is the file `path` itself.
+fn has_section_at(patch: &str, path: &str) -> bool {
+    patch_sections(patch)
+        .into_iter()
+        .any(|section| section_post_path(section).is_some_and(|post| post == path))
+}
+
+/// A diff read wider than the request, reduced to the request. `None` when
+/// nothing of the request is in it, which for a cut read means the cut fell
+/// before the request, so the caller must not present the empty text as the
+/// answer. A cut read stays cut unless the request is a file whose own
+/// section was read: the output is path-ordered, so a file's section that
+/// precedes the cut is whole, while a directory's later files may be past it.
+fn keep_payload_under(raw: DiffPayload, path: &str) -> Option<DiffPayload> {
+    let dir = format!("{}/", path.trim_end_matches('/'));
+    let sections = patch_sections(&raw.text);
+    if sections.is_empty() {
+        return Some(raw);
+    }
+    let kept: Vec<&str> = sections
+        .iter()
+        .copied()
+        .filter(|section| section_is_under(section, path, &dir))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let tail_kept = sections
+        .last()
+        .is_some_and(|section| section_is_under(section, path, &dir));
+    let text = kept.concat();
+    let truncated = raw.truncated && (tail_kept || !has_section_at(&text, path));
+    Some(DiffPayload {
+        text,
+        truncated,
+        truncation_reason: if truncated {
+            raw.truncation_reason
+        } else {
+            None
+        },
+    })
+}
+
+/// The metadata `git show` prints before a commit's numstat, NUL-separated.
+/// The body is last and free text, but git cannot put a NUL in a message, so
+/// the Nth NUL is always the end of field N.
+const COMMIT_SHOW_FORMAT: &str =
+    "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%s%x00%b";
+
+/// Fields in [`COMMIT_SHOW_FORMAT`].
+const COMMIT_SHOW_FIELDS: usize = 10;
+
+/// Splits `git show --numstat -z` output, metadata then records, into the
+/// commit payload.
+///
+/// `cut` is why git's output stopped short, if it did. The record being
+/// written when it stopped is dropped (it may be a rename missing its second
+/// path, or a count missing a digit), and everything derived from the records
+/// is then a lower bound that the payload says is one.
+fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDetails, String> {
+    let mut parts = stdout.splitn(COMMIT_SHOW_FIELDS + 1, '\0');
+    let fields: Vec<&str> = parts.by_ref().take(COMMIT_SHOW_FIELDS).collect();
+    if fields.len() < COMMIT_SHOW_FIELDS {
+        return Err(match cut {
+            Some(why) => format!(
+                "Commit metadata was cut short: git output {}",
+                why.describe()
+            ),
+            None => "Failed to parse commit metadata format".into(),
+        });
+    }
+    // The terminator after the body is followed by the newline that separates
+    // the message from the diff; it belongs to neither.
+    let records = parts.next().unwrap_or("");
+    let records = records.strip_prefix('\n').unwrap_or(records);
+    let records = if cut.is_some() {
+        drop_partial_numstat_tail(records)
+    } else {
+        records
+    };
+    let body = fields[9].trim().to_string();
+    let mut changed_files = parse_numstat_files(records);
+    // Summed over the full list, before the cap below cuts it: summing the
+    // truncated slice would understate a huge commit's churn silently.
+    let total_additions = changed_files.iter().map(|f| f.additions).sum();
+    let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
+    let files_total = changed_files.len();
+    let over_file_cap = files_total > MAX_COMMIT_FILES;
+    if over_file_cap {
+        changed_files.truncate(MAX_COMMIT_FILES);
+    }
+    Ok(CommitDetails {
+        id: fields[0].to_string(),
+        parent_ids: if fields[1].is_empty() {
+            Vec::new()
+        } else {
+            fields[1].split_whitespace().map(String::from).collect()
+        },
+        author_name: fields[2].to_string(),
+        author_email: fields[3].to_string(),
+        author_date: fields[4].to_string(),
+        committer_name: fields[5].to_string(),
+        committer_email: fields[6].to_string(),
+        committer_date: fields[7].to_string(),
+        summary: fields[8].to_string(),
+        co_authors: parse_co_authors(&body),
+        body,
+        changed_files,
+        total_additions,
+        total_deletions,
+        // A count taken from a cut stream would be a floor presented as the
+        // commit's size, so it is only offered when git was read to the end.
+        files_total_count: (over_file_cap && cut.is_none()).then_some(files_total),
+        files_list_truncated: over_file_cap || cut.is_some(),
+        numstat_truncation_reason: cut.map(|why| format!("git output {}", why.describe())),
+    })
+}
+
+/// `records` up to, not including, the last numstat record: the one a cut
+/// stream may have ended inside. Nothing at all when no record began.
+fn drop_partial_numstat_tail(records: &str) -> &str {
+    let mut offset = 0;
+    let mut last_header = None;
+    for token in records.split('\0') {
+        if is_numstat_header(token) {
+            last_header = Some(offset);
+        }
+        offset += token.len() + 1;
+    }
+    last_header.map_or("", |start| &records[..start])
+}
+
 fn parse_co_authors(body: &str) -> Vec<String> {
     const PREFIX: &str = "co-authored-by:";
     let mut authors = Vec::new();
@@ -4371,6 +5501,568 @@ fn record_lang(
     ));
     entry.0 += code_lines;
     entry.1 += 1;
+}
+
+/// The files a language scan counts: tracked and untracked-not-ignored, minus
+/// vendored, generated and non-text kinds.
+///
+/// Vendored and generated are decided by the path's `linguist-vendored` and
+/// `linguist-generated` attributes where the repository sets them, and by the
+/// built-in directory and file-name rules where it does not, as Linguist does.
+/// Git can list one conflicted path in several index stages; the listing is
+/// deduplicated, and each path keeps its exact bytes for disk access, since
+/// normalization is only for classification.
+fn language_candidates(repo: &Path) -> Result<Vec<(String, LanguageInfo)>, String> {
+    let stdout = git_text(
+        repo,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    let paths = parse_ls_files_entries(&stdout);
+    let attrs = linguist_attributes(repo, &paths)?;
+    let mut candidates = Vec::with_capacity(paths.len());
+    for rel_path in paths {
+        let path_attrs = attrs.get(&rel_path).copied().unwrap_or_default();
+        let lang_info = LanguageDetector::detect_from_path(&rel_path);
+        if LanguageDetector::should_count_for_stats_with(&rel_path, &lang_info, path_attrs) {
+            candidates.push((rel_path, lang_info));
+        }
+    }
+    Ok(candidates)
+}
+
+/// Every path's Linguist attributes from one `git check-attr --stdin` run;
+/// paths with neither attribute specified are left out.
+///
+/// A failure here fails the scan rather than counting without the
+/// attributes: a total that silently includes trees the repository marked as
+/// vendored is a wrong number presented as a right one.
+fn linguist_attributes(
+    repo: &Path,
+    paths: &[String],
+) -> Result<HashMap<String, crate::analyzer::LinguistAttrs>, String> {
+    let mut attrs: HashMap<String, crate::analyzer::LinguistAttrs> = HashMap::new();
+    if paths.is_empty() {
+        return Ok(attrs);
+    }
+    let mut input = Vec::with_capacity(paths.iter().map(|p| p.len() + 1).sum());
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let output = git_cli::git_with_stdin(
+        repo,
+        &[
+            "check-attr",
+            "-z",
+            "--stdin",
+            "linguist-vendored",
+            "linguist-generated",
+        ],
+        &input,
+    )?;
+    // `-z` output is `<path> NUL <attribute> NUL <value> NUL`, per attribute.
+    let mut fields = output.split(|&b| b == 0);
+    while let (Some(path), Some(attribute), Some(value)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let Some(value) =
+            crate::analyzer::LinguistAttrs::parse_value(&String::from_utf8_lossy(value))
+        else {
+            continue;
+        };
+        let entry = attrs
+            .entry(String::from_utf8_lossy(path).into_owned())
+            .or_default();
+        match attribute {
+            b"linguist-vendored" => entry.vendored = Some(value),
+            b"linguist-generated" => entry.generated = Some(value),
+            _ => {}
+        }
+    }
+    Ok(attrs)
+}
+
+/// What one scanned file adds to the language report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTally {
+    /// Read, and not counted: binary, or classified out of the statistics.
+    Skipped,
+    Counted {
+        lang: LanguageInfo,
+        code_lines: usize,
+    },
+}
+
+/// One candidate's fate in a scan.
+enum ScanOutcome {
+    /// Unchanged since the last scan; its remembered tally, unread.
+    Remembered(FileTally),
+    /// Read now. `remember` is set when the file has been still long enough
+    /// that a later change must change its identity.
+    Read {
+        tally: FileTally,
+        remember: Option<lang_cache::Entry>,
+    },
+    /// Could not be read safely: escapes the repository, vanished, is not a
+    /// regular file, or is text past the size cap. The report is incomplete.
+    Unreadable,
+}
+
+/// A file's identity for the language cache: what a write must change.
+///
+/// The ctime is what makes this hold against tools that restore an mtime
+/// (`cp -p`, `rsync -t`, `touch -r`): no user-level call can set it, and any
+/// write, chmod or rename moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanIdentity {
+    len: u64,
+    inode: u64,
+    modified: Option<SystemTime>,
+    changed: Option<SystemTime>,
+}
+
+impl ScanIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (inode, changed) = {
+            use std::os::unix::fs::MetadataExt;
+            let changed = u64::try_from(meta.ctime())
+                .ok()
+                .and_then(|secs| u32::try_from(meta.ctime_nsec()).ok().map(|ns| (secs, ns)))
+                .map(|(secs, ns)| UNIX_EPOCH + Duration::new(secs, ns));
+            (meta.ino(), changed)
+        };
+        // Windows exposes no inode or change time through `std`; size and
+        // mtime still move on every ordinary write.
+        #[cfg(not(unix))]
+        let (inode, changed) = (0, None);
+        Self {
+            len: meta.len(),
+            inode,
+            modified: meta.modified().ok(),
+            changed,
+        }
+    }
+
+    /// The later of the mtime and the ctime; `None` when the mtime is
+    /// unknown, which never lets the file be remembered.
+    fn newest(&self) -> Option<SystemTime> {
+        let modified = self.modified?;
+        Some(
+            self.changed
+                .map_or(modified, |changed| changed.max(modified)),
+        )
+    }
+}
+
+/// Resolves each directory a scan reads from once, through
+/// [`sandbox_join_canonical`], instead of re-resolving every component of
+/// every file's path: one `lstat` + `realpath` per directory per scan, not
+/// per file. A file is then opened as `<resolved dir>/<name>` with
+/// `O_NOFOLLOW`, so the only component left unresolved cannot be a link.
+struct ScanSandbox<'a> {
+    repo: &'a Path,
+    dirs: Mutex<HashMap<String, Option<std::sync::Arc<Path>>>>,
+}
+
+impl<'a> ScanSandbox<'a> {
+    fn new(repo: &'a Path) -> Self {
+        Self {
+            repo,
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `rel_dir` resolved inside the repository, or `None` when it escapes
+    /// it through a link or cannot be resolved. `""` is the root.
+    fn dir(&self, rel_dir: &str) -> Option<std::sync::Arc<Path>> {
+        if let Some(known) = self
+            .dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(rel_dir)
+        {
+            return known.clone();
+        }
+        // Resolved outside the lock: two workers may both resolve one
+        // directory, and they reach the same answer.
+        let resolved = if rel_dir.is_empty() {
+            self.repo.canonicalize().ok()
+        } else {
+            sandbox_join_canonical(self.repo, rel_dir).ok()
+        }
+        .map(std::sync::Arc::<Path>::from);
+        self.dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(rel_dir.to_string(), resolved.clone());
+        resolved
+    }
+}
+
+/// Scans `selected` on up to [`LANG_SCAN_WORKERS`] threads. The result is in
+/// `selected`'s order; `None` marks a file the deadline stopped the scan
+/// before reaching.
+fn scan_language_files(
+    repo: &Path,
+    selected: &[(String, LanguageInfo)],
+    previous: &lang_cache::RepoMap,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> Vec<Option<ScanOutcome>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let sandbox = ScanSandbox::new(repo);
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut done = Vec::new();
+        while !deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some((rel_path, path_info)) = selected.get(index) else {
+                break;
+            };
+            done.push((index, scan_one(&sandbox, rel_path, *path_info, previous)));
+        }
+        done
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(LANG_SCAN_WORKERS)
+        .min(selected.len());
+    let batches: Vec<Vec<(usize, ScanOutcome)>> = std::thread::scope(|scope| {
+        // The caller is one of the workers. A helper the host refuses to
+        // start only means fewer of them: the shared counter hands its share
+        // to the threads that did start.
+        let helpers: Vec<_> = (1..workers)
+            .filter_map(|_| {
+                std::thread::Builder::new()
+                    .name("gitpulse-lang-scan".into())
+                    .spawn_scoped(scope, work)
+                    .ok()
+            })
+            .collect();
+        let mut batches = vec![work()];
+        for helper in helpers {
+            batches.push(
+                helper
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        batches
+    });
+    let mut outcomes: Vec<Option<ScanOutcome>> = std::iter::repeat_with(|| None)
+        .take(selected.len())
+        .collect();
+    for (index, outcome) in batches.into_iter().flatten() {
+        outcomes[index] = Some(outcome);
+    }
+    outcomes
+}
+
+/// One candidate: answered from `previous` when its identity is unchanged,
+/// read otherwise.
+fn scan_one(
+    sandbox: &ScanSandbox<'_>,
+    rel_path: &str,
+    path_info: LanguageInfo,
+    previous: &lang_cache::RepoMap,
+) -> ScanOutcome {
+    // Lexical validation (absolute, `..`, NUL) is owned by sandbox_join.
+    if sandbox_join(sandbox.repo, rel_path).is_err() {
+        return ScanOutcome::Unreadable;
+    }
+    let (rel_dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+    let Some(dir) = sandbox.dir(rel_dir) else {
+        return ScanOutcome::Unreadable;
+    };
+    let path = dir.join(name);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return ScanOutcome::Unreadable;
+    };
+    if meta.file_type().is_symlink() {
+        // A link resolves whole, and one that leaves the repository is
+        // refused. It is never remembered: its target can change while the
+        // link itself does not.
+        let Ok(target) = sandbox_join_canonical(sandbox.repo, rel_path) else {
+            return ScanOutcome::Unreadable;
+        };
+        let Ok(target_meta) = std::fs::symlink_metadata(&target) else {
+            return ScanOutcome::Unreadable;
+        };
+        if !target_meta.is_file() {
+            return ScanOutcome::Unreadable;
+        }
+        #[cfg(test)]
+        lang_probe::note_read(sandbox.repo);
+        return match tally_file(&target, target_meta.len(), rel_path, path_info) {
+            Some(tally) => ScanOutcome::Read {
+                tally,
+                remember: None,
+            },
+            None => ScanOutcome::Unreadable,
+        };
+    }
+    // Checked before opening: a FIFO, socket or device is never opened.
+    if !meta.is_file() {
+        return ScanOutcome::Unreadable;
+    }
+    let identity = ScanIdentity::of(&meta);
+    if let Some(entry) = previous.get(rel_path) {
+        if entry.identity == identity && entry.path_info == path_info {
+            return ScanOutcome::Remembered(entry.tally);
+        }
+    }
+    #[cfg(test)]
+    lang_probe::note_read(sandbox.repo);
+    match tally_file(&path, meta.len(), rel_path, path_info) {
+        Some(tally) => ScanOutcome::Read {
+            tally,
+            remember: lang_cache::settled(&identity).then_some(lang_cache::Entry {
+                identity,
+                path_info,
+                tally,
+            }),
+        },
+        None => ScanOutcome::Unreadable,
+    }
+}
+
+/// Reads and classifies one regular file `len` bytes long. `None` when it
+/// cannot be read, or is text past [`LANG_MAX_FILE_BYTES`] and so cannot be
+/// counted.
+///
+/// A file past the cap is read only as far as [`LanguageDetector::looks_binary`]
+/// looks: a binary one is skipped exactly as a whole read would skip it.
+fn tally_file(path: &Path, len: u64, rel_path: &str, path_info: LanguageInfo) -> Option<FileTally> {
+    let oversized = len > LANG_MAX_FILE_BYTES;
+    let limit = if oversized {
+        LanguageDetector::BINARY_PROBE_BYTES as u64
+    } else {
+        LANG_MAX_FILE_BYTES + 1
+    };
+    let bytes = read_file_prefix(path, limit, len).ok()?;
+    if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
+        return Some(FileTally::Skipped);
+    }
+    // Grown past the cap since it was measured, or past it all along.
+    if oversized || bytes.len() as u64 > LANG_MAX_FILE_BYTES {
+        return None;
+    }
+    let lang_info = LanguageDetector::detect_from_bytes(rel_path, &bytes);
+    // The path rules already admitted this file; only its kind, which the
+    // bytes can change (a PNG named `.txt`), is left to decide.
+    if !LanguageDetector::is_countable_kind(&lang_info) {
+        return Some(FileTally::Skipped);
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    // Language-aware: block comments, docstrings and string literals all
+    // change what counts as code, and this sum IS the repository's headline
+    // LOC number.
+    let loc = LocCounter::count_for_language(&content, lang_info.name);
+    Some(FileTally::Counted {
+        lang: lang_info,
+        code_lines: loc.code_lines,
+    })
+}
+
+/// Up to `limit` bytes of the regular file at `path`, which measured `len`
+/// bytes. Opened without following a final link and without blocking (a FIFO
+/// swapped in after the caller's `lstat` cannot hang the read), and refused
+/// unless the open handle is a regular file. The buffer is sized from `len`
+/// so an unchanged file takes one read and one end-of-file read: `open`,
+/// `fstat`, two `read`s and `close`.
+fn read_file_prefix(path: &Path, limit: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let first = usize::try_from(len.saturating_add(1))
+        .unwrap_or(usize::MAX)
+        .clamp(1, limit.max(1));
+    let mut bytes = vec![0u8; first];
+    let mut filled = 0;
+    loop {
+        if filled == bytes.len() {
+            if bytes.len() >= limit {
+                break;
+            }
+            bytes.resize(bytes.len().saturating_mul(2).min(limit), 0);
+        }
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+/// Per-file results of the language scan, so a rescan reads only what
+/// changed.
+///
+/// Keyed by path and checked against [`ScanIdentity`] rather than keyed by
+/// blob id: an identity answers for tracked, modified and untracked files
+/// alike from one `lstat`, where a blob id needs git to vouch, per scan, that
+/// the working-tree file still matches the index, and a content-keyed entry
+/// poisoned by a write racing the read would be served to every worktree.
+///
+/// Bounded twice over: a repository's map holds at most the files one scan
+/// can select (it is pruned to them after every complete pass, and refused
+/// whole if it ever outgrows twice that), and at most `MAX_REPOS`
+/// repositories are remembered, the least recently scanned going first.
+/// Nothing here is a source of truth: a miss is always recomputed from the
+/// file.
+mod lang_cache {
+    use super::{
+        FileTally, HashMap, LanguageInfo, Mutex, OnceLock, PoisonError, ScanIdentity,
+        LANG_STATS_MAX_FILES,
+    };
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    pub(super) const MAX_REPOS: usize = 8;
+    const MAX_FILES_PER_REPO: usize = 2 * LANG_STATS_MAX_FILES;
+    /// A file changed this recently is not remembered: a second write inside
+    /// one timestamp tick (a second on HFS+, two on FAT) would leave its
+    /// identity unchanged. Git applies the same "racily clean" rule to its
+    /// own index.
+    pub(super) const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+    #[derive(Clone, Debug)]
+    pub(super) struct Entry {
+        pub identity: ScanIdentity,
+        /// The path-based classification the tally was computed under.
+        pub path_info: LanguageInfo,
+        pub tally: FileTally,
+    }
+
+    pub(super) type RepoMap = HashMap<String, Entry>;
+
+    #[derive(Default)]
+    struct Store {
+        /// Least recently scanned first.
+        order: Vec<PathBuf>,
+        repos: HashMap<PathBuf, RepoMap>,
+    }
+
+    fn store() -> &'static Mutex<Store> {
+        static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Store::default()))
+    }
+
+    /// Whether `identity` is old enough that a later write must change it.
+    pub(super) fn settled(identity: &ScanIdentity) -> bool {
+        identity.newest().is_some_and(|newest| {
+            SystemTime::now()
+                .duration_since(newest)
+                .is_ok_and(|age| age >= RACY_WINDOW)
+        })
+    }
+
+    /// Takes `repo`'s map out of the store so the scan holds no lock while it
+    /// reads files. A concurrent scan of the same repository starts empty.
+    pub(super) fn take(repo: &PathBuf) -> RepoMap {
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| key != repo);
+        store.repos.remove(repo).unwrap_or_default()
+    }
+
+    pub(super) fn put(repo: PathBuf, map: RepoMap) {
+        if map.is_empty() || map.len() > MAX_FILES_PER_REPO {
+            return;
+        }
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| *key != repo);
+        store.order.push(repo.clone());
+        store.repos.insert(repo, map);
+        while store.order.len() > MAX_REPOS {
+            let oldest = store.order.remove(0);
+            store.repos.remove(&oldest);
+        }
+    }
+
+    /// Forgets one repository, as a restart would.
+    #[cfg(test)]
+    pub(super) fn forget(repo: &std::path::Path) {
+        let key = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+        take(&key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_repos() -> usize {
+        store()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .repos
+            .len()
+    }
+}
+
+/// What the language scan did, per repository, for the tests that count it.
+/// Keyed by repository rather than by thread because the scan reads on worker
+/// threads and the test harness runs tests side by side in one process.
+#[cfg(test)]
+mod lang_probe {
+    use super::{HashMap, Mutex, Path, PoisonError};
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct Counts {
+        scans: usize,
+        reads: usize,
+    }
+
+    static COUNTS: Mutex<Option<HashMap<PathBuf, Counts>>> = Mutex::new(None);
+
+    fn key(repo: &Path) -> PathBuf {
+        repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())
+    }
+
+    fn with(repo: &Path, f: impl FnOnce(&mut Counts)) {
+        let mut guard = COUNTS.lock().unwrap_or_else(PoisonError::into_inner);
+        f(guard
+            .get_or_insert_with(HashMap::new)
+            .entry(key(repo))
+            .or_default());
+    }
+
+    pub(super) fn note_scan(repo: &Path) {
+        with(repo, |c| c.scans += 1);
+    }
+
+    pub(super) fn note_read(repo: &Path) {
+        with(repo, |c| c.reads += 1);
+    }
+
+    /// Scans started on `repo` so far.
+    pub(super) fn scans_of(repo: &Path) -> usize {
+        let mut n = 0;
+        with(repo, |c| n = c.scans);
+        n
+    }
+
+    /// Files the scan has opened and read in `repo` so far.
+    pub(super) fn reads_of(repo: &Path) -> usize {
+        let mut n = 0;
+        with(repo, |c| n = c.reads);
+        n
+    }
 }
 
 fn mime_from_path(path: &str) -> String {
@@ -4508,6 +6200,378 @@ mod tests {
         assert!(report.truncated, "a scan that read nothing is truncated");
     }
 
+    /// Longer than the window inside which a just-changed file is not
+    /// remembered, so a fixture written before it is eligible for the cache.
+    const SETTLE: Duration = Duration::from_millis(2_200);
+
+    fn run_git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    /// A repository of `files` source files in nested directories, a few
+    /// untracked, binary and markdown ones among them.
+    fn churn_repo(dir: &std::path::Path, files: usize) {
+        init_stats_repo(dir);
+        for i in 0..files {
+            let (name, body) = match i % 5 {
+                0 => (
+                    format!("f{i}.py"),
+                    format!("# c\ndef f{i}():\n    return {i}\n"),
+                ),
+                1 => (format!("f{i}.md"), format!("# title {i}\n\ntext\n")),
+                2 => (format!("f{i}.bin"), "\u{0}\u{1}\u{2}".repeat(10)),
+                _ => (
+                    format!("f{i}.rs"),
+                    format!("/* b */\nfn f{i}() {{\n    let x = {i};\n}}\n"),
+                ),
+            };
+            let path = churn_path(dir, &name, i);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        run_git_in(dir, &["add", "."]);
+        // Untracked, and so counted by the scan's `--others`.
+        std::fs::write(dir.join("untracked.rs"), "fn u() {}\n").unwrap();
+    }
+
+    fn churn_path(dir: &std::path::Path, name: &str, i: usize) -> std::path::PathBuf {
+        dir.join(format!("pkg{}", i % 40))
+            .join(format!("mod{}", i % 7))
+            .join(name)
+    }
+
+    fn churn_rs(dir: &std::path::Path, i: usize) -> std::path::PathBuf {
+        assert!(i % 5 >= 3, "index {i} is not a .rs file in the fixture");
+        churn_path(dir, &format!("f{i}.rs"), i)
+    }
+
+    /// A rescan reads only the files that changed: none for an unchanged
+    /// tree, exactly the edited one after a one-file edit. The old scan read
+    /// every candidate on every call.
+    #[test]
+    fn language_stats_rescan_reads_only_what_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 3000);
+        std::thread::sleep(SETTLE);
+        let root = dir.path();
+        let repo = root.to_str().unwrap();
+
+        let before = lang_probe::reads_of(root);
+        let first = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            first.candidate_files,
+            "a cold scan reads every candidate"
+        );
+        assert!(!first.truncated);
+
+        let before = lang_probe::reads_of(root);
+        let second = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            0,
+            "an unchanged tree must not be read again"
+        );
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+
+        std::fs::write(churn_rs(root, 3), "fn changed() {}\nfn again() {}\n").unwrap();
+        std::thread::sleep(SETTLE);
+        let before = lang_probe::reads_of(root);
+        let third = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            1,
+            "a one-file edit reads that file and nothing else"
+        );
+        assert_ne!(
+            serde_json::to_string(&second).unwrap(),
+            serde_json::to_string(&third).unwrap(),
+            "the edit is reflected"
+        );
+    }
+
+    /// Callers arriving while a scan runs share it instead of each starting
+    /// their own read of the whole tree.
+    #[test]
+    fn concurrent_language_stats_calls_share_one_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 3000);
+        let root = dir.path().to_path_buf();
+        let started = lang_probe::scans_of(&root);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (barrier, root) = (barrier.clone(), root.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    GitReader::get_repo_language_stats(root.to_str().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let reports: Vec<String> = handles
+            .into_iter()
+            .map(|h| serde_json::to_string(&h.join().unwrap()).unwrap())
+            .collect();
+        let scans = lang_probe::scans_of(&root) - started;
+        assert!(reports.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(scans <= 2, "8 simultaneous callers started {scans} scans");
+    }
+
+    /// Vendored trees count for nothing, whether a directory name or a
+    /// `.gitattributes` rule says so; `linguist-generated` is honoured; and an
+    /// explicit `-linguist-vendored` brings a tree back.
+    #[test]
+    fn vendored_trees_and_linguist_attributes_contribute_no_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root); // app.rs: 1 line
+        let files = [
+            ("vendored/dep/src/lib.rs", "fn v() {}\n".repeat(50)),
+            ("third_party/zlib/inflate.c", "int x;\n".repeat(50)),
+            (
+                "src-tauri/framework/tao/src/lib.rs",
+                "fn t() {}\n".repeat(50),
+            ),
+            ("deps/big/lib.rs", "fn d() {}\n".repeat(50)),
+            ("src/schema.rs", "fn g() {}\n".repeat(50)),
+            ("vendor/ours/keep.rs", "fn k() {}\nfn k2() {}\n".to_string()),
+            ("crates/framework/src/lib.rs", "fn f() {}\n".to_string()),
+        ];
+        for (path, body) in &files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        std::fs::write(
+            root.join(".gitattributes"),
+            "src-tauri/framework/** linguist-vendored\n\
+             deps/** linguist-vendored\n\
+             src/schema.rs linguist-generated\n\
+             vendor/ours/** -linguist-vendored\n",
+        )
+        .unwrap();
+        run_git_in(root, &["add", "."]);
+        let report =
+            GitReader::get_repo_language_stats_bounded(root.to_str().unwrap(), None).unwrap();
+        let rust: usize = report
+            .stats
+            .iter()
+            .filter(|s| s.language == "Rust")
+            .map(|s| s.code_lines)
+            .sum();
+        assert_eq!(
+            rust,
+            1 + 2 + 1,
+            "app.rs, vendor/ours/keep.rs, crates/framework"
+        );
+        assert!(
+            report.stats.iter().all(|s| s.language != "C"),
+            "third_party/ is vendored: {:?}",
+            report.stats
+        );
+        assert!(!report.truncated);
+    }
+
+    /// The scan with nothing remembered: what every call used to be.
+    fn fresh_language_stats(repo: &std::path::Path) -> String {
+        lang_cache::forget(repo);
+        let report = GitReader::get_repo_language_stats_bounded(repo.to_str().unwrap(), None)
+            .expect("fresh");
+        serde_json::to_string(&report).unwrap()
+    }
+
+    fn warm_language_stats(repo: &std::path::Path) -> String {
+        let report =
+            GitReader::get_repo_language_stats_bounded(repo.to_str().unwrap(), None).expect("warm");
+        serde_json::to_string(&report).unwrap()
+    }
+
+    /// The remembered answer must be the fresh answer after every kind of
+    /// churn: edits that change size, deletions, additions of tracked and
+    /// untracked files, a source file turned binary, a regular file replaced
+    /// by a symlink out of the repository, a rename, and a same-size rewrite
+    /// that puts the old mtime back.
+    #[test]
+    fn language_stats_rescan_equals_a_fresh_scan_under_churn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 400);
+        let root = dir.path();
+        std::thread::sleep(SETTLE);
+        assert_eq!(warm_language_stats(root), fresh_language_stats(root));
+        assert_eq!(warm_language_stats(root), fresh_language_stats(root));
+
+        let step = |label: &str, mutate: &dyn Fn()| {
+            warm_language_stats(root);
+            mutate();
+            std::thread::sleep(SETTLE);
+            assert_eq!(
+                warm_language_stats(root),
+                fresh_language_stats(root),
+                "{label}"
+            );
+            // And the next warm pass off the rebuilt cache agrees too.
+            assert_eq!(
+                warm_language_stats(root),
+                fresh_language_stats(root),
+                "{label} (again)"
+            );
+        };
+        step("grow a file", &|| {
+            std::fs::write(churn_rs(root, 3), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        });
+        step("shrink a file", &|| {
+            std::fs::write(churn_rs(root, 8), "").unwrap()
+        });
+        step("delete a file", &|| {
+            std::fs::remove_file(churn_rs(root, 13)).unwrap()
+        });
+        step("add untracked files", &|| {
+            std::fs::write(root.join("new1.rs"), "fn n1() {}\n").unwrap();
+            std::fs::write(root.join("new2.py"), "x = 1\ny = 2\n").unwrap();
+        });
+        step("turn a source file binary", &|| {
+            std::fs::write(churn_rs(root, 18), vec![0u8; 64]).unwrap();
+        });
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("o.rs"), "fn outside() {}\n".repeat(50)).unwrap();
+        #[cfg(unix)]
+        step("replace a file with an outside symlink", &|| {
+            let target = churn_rs(root, 23);
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("o.rs"), &target).unwrap();
+        });
+        step("rename a file", &|| {
+            std::fs::rename(churn_rs(root, 28), root.join("renamed.rs")).unwrap();
+        });
+        step("same-size rewrite with the old mtime put back", &|| {
+            let path = churn_rs(root, 33);
+            let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let body = std::fs::read_to_string(&path).unwrap();
+            // A comment line becomes a code line, in the same number of bytes.
+            let same_size = body.replacen("/* b */", "fn b();", 1);
+            assert_ne!(same_size, body);
+            assert_eq!(same_size.len(), body.len());
+            std::fs::write(&path, same_size).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        });
+    }
+
+    /// A file written inside the racy window is never remembered, so a second
+    /// write in the same clock tick cannot be served stale.
+    #[test]
+    fn language_stats_do_not_remember_a_file_written_just_now() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_stats_repo(dir.path());
+        let root = dir.path();
+        let repo = root.to_str().unwrap();
+        let file = root.join("app.rs");
+        let (mut last_lines, mut reads) = (0, 0);
+        for round in 1..=3usize {
+            std::fs::write(&file, "fn x() {}\n".repeat(round)).unwrap();
+            let before = lang_probe::reads_of(root);
+            let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+            reads += lang_probe::reads_of(root) - before;
+            last_lines = report.stats[0].code_lines;
+        }
+        assert_eq!(last_lines, 3, "the newest write is what is counted");
+        assert_eq!(reads, 3, "a just-written file is read on every pass");
+    }
+
+    /// The remembered repositories are bounded and the oldest goes first.
+    #[test]
+    fn language_stats_cache_remembers_a_bounded_number_of_repositories() {
+        let meta = std::fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let entry = || {
+            let mut map = HashMap::new();
+            map.insert(
+                "a.rs".to_string(),
+                lang_cache::Entry {
+                    identity: ScanIdentity::of(&meta),
+                    path_info: LanguageDetector::detect_from_path("a.rs"),
+                    tally: FileTally::Skipped,
+                },
+            );
+            map
+        };
+        let keys: Vec<std::path::PathBuf> = (0..lang_cache::MAX_REPOS + 4)
+            .map(|i| std::path::PathBuf::from(format!("/bounded-cache-probe/{i}")))
+            .collect();
+        for key in &keys {
+            lang_cache::put(key.clone(), entry());
+        }
+        assert!(lang_cache::tracked_repos() <= lang_cache::MAX_REPOS);
+        assert!(
+            lang_cache::take(&keys[0]).is_empty(),
+            "the least recently scanned repository is forgotten first"
+        );
+    }
+
+    /// Directories are resolved once per scan rather than per file, and that
+    /// must not open a way out: a tracked file whose directory has been
+    /// replaced by a link out of the repository is refused, not read.
+    #[cfg(unix)]
+    #[test]
+    fn language_stats_refuse_a_directory_linked_out_of_the_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root);
+        std::fs::create_dir(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/inner.py"), "x = 1\n").unwrap();
+        run_git_in(root, &["add", "."]);
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("inner.py"), "y = 2\n".repeat(40)).unwrap();
+        std::fs::remove_dir_all(root.join("pkg")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("pkg")).unwrap();
+        let report =
+            GitReader::get_repo_language_stats_bounded(root.to_str().unwrap(), None).unwrap();
+        assert!(
+            report
+                .stats
+                .iter()
+                .filter(|s| s.language == "Python")
+                .all(|s| s.code_lines == 0),
+            "{report:?}"
+        );
+        assert!(report.truncated, "a refused candidate is a hole");
+    }
+
+    /// A file over the read cap whose first bytes are binary is not source:
+    /// a full read would have skipped it on the same 8 KiB sniff, so it is
+    /// skipped, not reported as a hole in the scan. This repository's
+    /// `src-tauri/icons/icon.icns` (1.3 MB, an extension no table names) made
+    /// every scan of it report `truncated`. Oversized text is still a hole.
+    #[test]
+    fn an_oversized_binary_is_skipped_but_oversized_text_truncates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root);
+        let mut icon = b"icns\0\0\0\x01".to_vec();
+        icon.resize(1_300_000, 7);
+        std::fs::write(root.join("icon.icns"), icon).unwrap();
+        run_git_in(root, &["add", "."]);
+        let repo = root.to_str().unwrap();
+        let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert!(!report.truncated, "{report:?}");
+        assert_eq!(report.scanned_files, report.candidate_files);
+
+        std::fs::write(root.join("huge.txt"), "line\n".repeat(300_000)).unwrap();
+        let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert!(report.truncated, "uncounted text is a hole: {report:?}");
+    }
+
     #[test]
     fn language_stats_report_is_complete_on_a_small_repo() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4522,6 +6586,76 @@ mod tests {
         assert_eq!(report.candidate_files, 1);
         assert_eq!(report.stats.len(), 1);
         assert_eq!(report.stats[0].language, "Rust");
+    }
+
+    /// `PROFILE_REPO=<repo> cargo test --lib language_stats_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: prints timings over PROFILE_REPO"]
+    fn language_stats_profile() {
+        // A relative PROFILE_REPO is taken from the checkout root, not from
+        // the `src-tauri` directory cargo runs the test in.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(std::env::var("PROFILE_REPO").expect("PROFILE_REPO"))
+            .canonicalize()
+            .expect("PROFILE_REPO exists");
+        let root = root.to_str().expect("UTF-8 path").to_string();
+        crate::test_support::trust_repo(Path::new(&root));
+        let (mut cold, mut warm) = (u128::MAX, u128::MAX);
+        let (mut cold_max, mut warm_max) = (0, 0);
+        for round in 0..5 {
+            // Cold: nothing remembered, as after a restart.
+            lang_cache::forget(Path::new(&root));
+            let reads = lang_probe::reads_of(Path::new(&root));
+            let t = Instant::now();
+            let a = GitReader::get_repo_language_stats(&root).expect("cold");
+            let ms = t.elapsed().as_millis();
+            (cold, cold_max) = (cold.min(ms), cold_max.max(ms));
+            let cold_reads = lang_probe::reads_of(Path::new(&root)) - reads;
+            let reads = lang_probe::reads_of(Path::new(&root));
+            let t = Instant::now();
+            let b = GitReader::get_repo_language_stats(&root).expect("warm");
+            let ms = t.elapsed().as_millis();
+            (warm, warm_max) = (warm.min(ms), warm_max.max(ms));
+            let warm_reads = lang_probe::reads_of(Path::new(&root)) - reads;
+            eprintln!(
+                "round {round}: truncated {}/{} scanned {}/{} candidates {} reads {cold_reads}/{warm_reads}",
+                a.truncated, b.truncated, a.scanned_files, b.scanned_files, a.candidate_files
+            );
+            assert!(!a.truncated && !b.truncated, "{a:?}");
+            assert_eq!(a.scanned_files, a.candidate_files);
+        }
+        eprintln!(
+            "language stats over {root}: cold min {cold} ms (max {cold_max}), warm min {warm} ms (max {warm_max})"
+        );
+    }
+
+    /// No file under this repository's `src-tauri/vendored/` or
+    /// `src-tauri/framework/` is a candidate: the first by its directory
+    /// name, the second by `.gitattributes`.
+    #[test]
+    fn this_repository_counts_no_vendored_or_framework_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("checkout root")
+            .canonicalize()
+            .unwrap();
+        crate::test_support::trust_repo(&root);
+        let candidates = language_candidates(&root).expect("candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|(path, _)| path.starts_with("src-tauri/src/")),
+            "the listing is this repository's"
+        );
+        let leaked: Vec<&String> = candidates
+            .iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                path.starts_with("src-tauri/vendored/") || path.starts_with("src-tauri/framework/")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "{} leaked: {leaked:?}", leaked.len());
     }
 
     #[test]
@@ -5128,6 +7262,70 @@ mod tests {
         dir
     }
 
+    /// `git branch refs/heads/x` succeeds and creates the ref
+    /// `refs/heads/refs/heads/x`. The listings strip the namespace once, so it
+    /// is shown as `refs/heads/x` rather than collapsing onto the real `x`.
+    fn repo_with_doubled_prefix_branch() -> tempfile::TempDir {
+        let dir = init_repo_with_remotes(&[], "main");
+        git_in(dir.path(), &["switch", "-c", "x"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "on x"]);
+        git_in(dir.path(), &["switch", "main"]);
+        git_in(dir.path(), &["switch", "-c", "other"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "on odd"]);
+        git_in(dir.path(), &["branch", "refs/heads/x"]);
+        git_in(dir.path(), &["switch", "main"]);
+        dir
+    }
+
+    #[test]
+    fn list_branches_keeps_a_doubled_refs_heads_name_distinct() {
+        let dir = repo_with_doubled_prefix_branch();
+        let listed = GitReader::list_branches(dir.path().to_str().unwrap()).unwrap();
+        let names: Vec<&str> = listed.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "x").count(),
+            1,
+            "the real branch x is listed once: {names:?}"
+        );
+        assert!(
+            names.contains(&"refs/heads/x"),
+            "refs/heads/refs/heads/x is stripped once: {names:?}"
+        );
+    }
+
+    #[test]
+    fn branch_stats_keeps_a_doubled_refs_heads_name_distinct() {
+        let dir = repo_with_doubled_prefix_branch();
+        let report = GitReader::branch_stats(dir.path().to_str().unwrap()).unwrap();
+        let names: Vec<&str> = report.updates.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "x").count(),
+            1,
+            "the real branch x is reported once: {names:?}"
+        );
+        assert!(
+            names.contains(&"refs/heads/x"),
+            "refs/heads/refs/heads/x is stripped once: {names:?}"
+        );
+    }
+
+    #[test]
+    fn short_branch_name_strips_each_namespace_exactly_once() {
+        assert_eq!(short_branch_name("refs/heads/x"), ("x", false));
+        assert_eq!(
+            short_branch_name("refs/heads/refs/heads/x"),
+            ("refs/heads/x", false)
+        );
+        assert_eq!(
+            short_branch_name("refs/remotes/origin/x"),
+            ("origin/x", true)
+        );
+        assert_eq!(
+            short_branch_name("refs/remotes/refs/remotes/o/x"),
+            ("refs/remotes/o/x", true)
+        );
+    }
+
     #[test]
     fn resolve_default_remote_prefers_checkout_config() {
         let dir = init_repo_with_remotes(&["alpha", "beta"], "release");
@@ -5170,6 +7368,13 @@ mod tests {
     /// served from the memo.
     #[test]
     fn unchanged_state_resolves_the_default_base_once_per_change() {
+        // The ref cache does not trust a stamp younger than its racy window,
+        // and this repository was written a moment ago: run with no window.
+        let _kept = ref_cache::retention();
+        ref_cache::eager(unchanged_state_resolves_once_per_change_body);
+    }
+
+    fn unchanged_state_resolves_once_per_change_body() {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_string_lossy().into_owned();
@@ -5216,6 +7421,13 @@ mod tests {
     /// disk to invalidate the stamp.
     #[test]
     fn a_default_base_computed_while_spawns_failed_is_not_memoized() {
+        // No racy window, as above: a written-a-moment-ago repository is
+        // otherwise never kept, and "a clean answer is memoized" is the claim.
+        let _kept = ref_cache::retention();
+        ref_cache::eager(a_refused_default_base_is_not_memoized_body);
+    }
+
+    fn a_refused_default_base_is_not_memoized_body() {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
         let lookups = || {
@@ -5344,18 +7556,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
         let repo = dir.path().canonicalize().unwrap();
-        let uncached = |repo: &Path| {
-            let remote = resolve_default_remote(repo);
-            let head_ref = remote_head_ref(&remote);
-            let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-            let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-            DefaultBase {
-                remote,
-                remote_head,
-                base,
-                incomplete: None,
-            }
-        };
+        let uncached = compute_default_base;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {
@@ -5396,6 +7597,52 @@ mod tests {
             reader.join().unwrap();
         }
         assert_eq!(default_base(&repo), uncached(&repo));
+    }
+
+    /// The default branch can be nested (`release/main`). Moving it rewrites a
+    /// file two directories below `refs/heads`, and only that subdirectory's
+    /// mtime moves, so a stamp over the `refs/heads` directory alone served the
+    /// old oid until something else changed. The commit is made with
+    /// `commit-tree` so no top-level ref moves and the nested write is the only
+    /// change the stamp can see.
+    #[test]
+    fn a_nested_default_branch_that_moves_is_seen_at_once() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/release/main", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release/main",
+            ],
+        );
+        git_in(&repo, &["update-ref", "refs/heads/release/main", "HEAD"]);
+        ref_cache::eager(|| {
+            let warm = default_base(&repo);
+            assert_eq!(
+                warm.base.as_ref().map(|(name, _)| name.as_str()),
+                Some("release/main")
+            );
+            let moved = git_stdout(
+                &repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moves"],
+            )
+            .trim()
+            .to_string();
+            git_in(&repo, &["update-ref", "refs/heads/release/main", &moved]);
+            assert_eq!(
+                default_base(&repo).base.map(|(_, oid)| oid),
+                Some(moved),
+                "the memo served the oid from before the nested ref moved"
+            );
+            git_in(&repo, &["branch", "-D", "release/main"]);
+            assert_eq!(default_base(&repo), compute_default_base(&repo));
+        });
     }
 
     /// What `hydrate` actually does: the three readers at the same instant on a
@@ -5469,6 +7716,38 @@ mod tests {
         assert_eq!((files[0].additions, files[0].deletions), (2, 0));
         assert_eq!(files[1].path, "img.png");
         assert_eq!(files[1].status_code, "B");
+    }
+
+    #[test]
+    fn parse_paired_sources_matches_the_new_path_or_a_directory_and_drops_a_cut_record() {
+        let out = "R100\0Report.txt\0C.txt\0C75\0src.txt\0pkg/copy.txt\0R90\0a\0pkg/b\0R50\0cut\0";
+        assert_eq!(parse_paired_sources(out, "C.txt"), ["Report.txt"]);
+        assert_eq!(parse_paired_sources(out, "pkg"), ["src.txt", "a"]);
+        assert!(parse_paired_sources(out, "cut").is_empty());
+        assert!(parse_paired_sources("", "x").is_empty());
+    }
+
+    #[test]
+    fn keep_sections_under_reads_the_post_image_path_not_the_ambiguous_header() {
+        let patch = "diff --git a/a b/x b/y z.txt\nsimilarity index 90%\nrename from a b/x\nrename to y z.txt\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git a/other.txt b/other.txt\nnew file mode 100644\n--- /dev/null\n+++ b/other.txt\t\n@@ -0,0 +1 @@\n+x\n\
+diff --git a/pkg/in.bin b/pkg/in.bin\nnew file mode 100644\nBinary files /dev/null and b/pkg/in.bin differ\n\
+diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n\
+diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
+        let only = |path: &str| keep_sections_under(patch, path);
+        assert!(only("y z.txt").starts_with("diff --git a/a b/x b/y z.txt"));
+        assert_eq!(only("y z.txt").matches("diff --git").count(), 1);
+        assert_eq!(only("other.txt").matches("diff --git").count(), 1);
+        assert!(only("pkg").contains("pkg/in.bin"));
+        assert_eq!(only("pkg").matches("diff --git").count(), 1);
+        assert!(only("gone.txt").contains("deleted file mode"));
+        assert!(only("mode.sh").contains("new mode 100755"));
+        assert!(only("nothing.txt").is_empty());
+        assert_eq!(
+            only("pk").matches("diff --git").count(),
+            0,
+            "prefix is not a directory"
+        );
     }
 
     #[test]
@@ -5681,6 +7960,16 @@ mod tests {
             strip_remote_tracking("refs/remotes/upstream/main", "origin"),
             None
         );
+    }
+
+    /// `patch` reduced to the sections under `path`, as one whole read.
+    fn keep_sections_under(patch: &str, path: &str) -> String {
+        let whole = DiffPayload {
+            text: patch.to_string(),
+            truncated: false,
+            truncation_reason: None,
+        };
+        keep_payload_under(whole, path).map_or_else(String::new, |kept| kept.text)
     }
 
     fn rev_parse_at(dir: &Path, rev: &str) -> String {
@@ -6632,6 +8921,10 @@ mod tests {
         assert_eq!(literal_pathspec("0:foo.py"), ":(literal)0:foo.py");
     }
 
+    /// Kept as a stated source contract: the failure is Windows-only (a Git for
+    /// Windows index refuses `0:foo.py`), so no test on another host can
+    /// observe it. The fixtures that must not be reintroduced are the two
+    /// `read-tree` call shapes below.
     #[test]
     fn tests_do_not_seed_drive_shaped_names_through_read_tree() {
         let src = include_str!("git_reader.rs");
@@ -6642,8 +8935,6 @@ mod tests {
             "read-tree cannot install 0:foo.py into a Git for Windows index; use mktree for the commit and git_output if the refusal itself is the assertion"
         );
         assert!(!src.contains(&forbidden_path));
-        assert!(src.contains("commit_index_union_mktree"));
-        assert!(src.contains("index_can_store_path"));
     }
 
     #[test]
@@ -7024,6 +9315,17 @@ mod tests {
         assert!(diff.contains("@@ -0,0 +1"), "{diff}");
         assert!(diff.contains("+from side"), "{diff}");
 
+        // The per-file read of the same merge must agree with the whole-commit
+        // read: a clean merge's file diff used to render as nothing.
+        let file_diff = GitReader::get_commit_file_diff(path, &merge_oid, "side.txt")
+            .expect("clean merge file diff")
+            .text;
+        assert!(!file_diff.is_empty(), "clean merge file diff is empty");
+        assert!(file_diff.contains("@@ -0,0 +1"), "{file_diff}");
+        assert!(file_diff.contains("+from side"), "{file_diff}");
+        assert!(!file_diff.contains("diff --cc"), "{file_diff}");
+        assert!(!file_diff.contains("@@@"), "{file_diff}");
+
         // Conflicted merge resolved by hand: raw `show` renders this as
         // `diff --cc` with @@@ hunk headers; first-parent mode must not.
         git_in(dir.path(), &["checkout", "-q", "-b", "clash", "main"]);
@@ -7059,6 +9361,694 @@ mod tests {
         assert!(!diff.contains("@@@"), "{diff}");
         assert!(diff.contains("diff --git a/main.txt b/main.txt"), "{diff}");
         assert!(diff.contains("@@"), "{diff}");
+
+        let file_diff = GitReader::get_commit_file_diff(path, &merge_oid, "main.txt")
+            .expect("conflicted merge file diff")
+            .text;
+        assert!(!file_diff.contains("diff --cc"), "{file_diff}");
+        assert!(!file_diff.contains("@@@"), "{file_diff}");
+        assert!(file_diff.contains("\n@@ -1 +1 @@"), "{file_diff}");
+        assert!(file_diff.contains("-clash version"), "{file_diff}");
+        assert!(file_diff.contains("+resolved"), "{file_diff}");
+    }
+
+    /// The per-file read must agree with the whole-commit read for every merge
+    /// shape: an octopus merge (three parents) and a file that only the second
+    /// parent touched both render as first-parent hunks, and a hostile path
+    /// (spaces, unicode, leading dash) neither widens nor breaks the pathspec.
+    #[test]
+    fn merge_file_diff_agrees_with_commit_diff_for_unusual_merges() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        for (branch, file) in [("b1", "-dash file.txt"), ("b2", "caf\u{e9} two.txt")] {
+            git_in(dir.path(), &["checkout", "-q", "-b", branch, "main"]);
+            std::fs::write(dir.path().join(file), format!("from {branch}\n")).unwrap();
+            git_in(dir.path(), &["add", "."]);
+            git_in(dir.path(), &["commit", "-m", branch]);
+        }
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("only-main.txt"), "m\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "main moves"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "b1", "b2", "-m", "octopus"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(merge_parents(dir.path(), &oid).len(), 3, "octopus fixture");
+
+        let whole = GitReader::get_commit_diff(path, &oid)
+            .expect("octopus")
+            .text;
+        assert!(
+            !whole.contains("@@@") && !whole.contains("diff --cc"),
+            "{whole}"
+        );
+        for (file, body) in [
+            ("-dash file.txt", "+from b1"),
+            ("caf\u{e9} two.txt", "+from b2"),
+        ] {
+            let one = GitReader::get_commit_file_diff(path, &oid, file)
+                .expect("octopus file diff")
+                .text;
+            assert!(one.contains(body), "{file}: {one}");
+            assert!(!one.contains("@@@") && !one.contains("diff --cc"), "{one}");
+            let header = format!("diff --git a/{file} b/{file}");
+            assert!(whole.contains(&header), "{whole}");
+            assert!(one.contains(&header), "{one}");
+        }
+        // A path the merge did not change against its first parent (only main
+        // touched it) is absent from the whole-commit view, so the per-file
+        // view is empty too: the two agree.
+        assert!(!whole.contains("only-main.txt"), "{whole}");
+        let none = GitReader::get_commit_file_diff(path, &oid, "only-main.txt")
+            .expect("unchanged path")
+            .text;
+        assert!(none.is_empty(), "{none}");
+    }
+
+    /// A root commit has no parent, so the flag must not blank its per-file
+    /// diff; a rename carried through a merge renders against the first parent.
+    #[test]
+    fn commit_file_diff_handles_root_commits_and_renames_through_merges() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["checkout", "-q", "--orphan", "rooted"]);
+        std::fs::write(dir.path().join("root.txt"), "r\n").unwrap();
+        git_in(dir.path(), &["add", "root.txt"]);
+        git_in(dir.path(), &["commit", "-m", "orphan root"]);
+        let root = rev_parse_at(dir.path(), "HEAD");
+        assert!(merge_parents(dir.path(), &root).is_empty(), "root commit");
+        let d = GitReader::get_commit_file_diff(path, &root, "root.txt").expect("root file diff");
+        assert!(d.text.contains("@@ -0,0 +1"), "{}", d.text);
+        assert!(d.text.contains("+r"), "{}", d.text);
+
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("old.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "old"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "ren"]);
+        git_in(dir.path(), &["mv", "old.txt", "new name.txt"]);
+        git_in(dir.path(), &["commit", "-m", "rename"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "ren", "-m", "merge rename"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "new name.txt")
+            .expect("renamed file diff")
+            .text;
+        assert!(!one.contains("@@@") && !one.contains("diff --cc"), "{one}");
+        assert!(one.contains("new name.txt"), "{one}");
+    }
+
+    /// Without `--diff-merges` (git < 2.31) the same first-parent rendering is
+    /// spelled `-m --first-parent`; the modern spelling must not leak into it.
+    #[test]
+    fn merge_rendering_has_a_spelling_for_git_before_diff_merges() {
+        assert_eq!(
+            GitReader::merge_render_args(true),
+            ["--diff-merges=first-parent"]
+        );
+        assert_eq!(
+            GitReader::merge_render_args(false),
+            ["-m", "--first-parent"]
+        );
+    }
+
+    /// Per-file sections of a patch, keyed by the `b/` path (fixtures use
+    /// names without spaces) with the added and removed line counts.
+    fn patch_file_counts(patch: &str) -> std::collections::BTreeMap<String, (usize, usize)> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut current: Option<String> = None;
+        for line in patch.lines() {
+            if let Some(rest) = line.strip_prefix("diff --git ") {
+                let name = rest.rsplit_once(" b/").map(|(_, b)| b.to_string());
+                if let Some(name) = &name {
+                    out.insert(name.clone(), (0, 0));
+                }
+                current = name;
+            } else if let Some(name) = &current {
+                let entry = out.get_mut(name).expect("section");
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    entry.0 += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    entry.1 += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The row list, the details' rows and the hunks are three reads of one
+    /// commit: for any merge, the files listed are the files whose diff is
+    /// non-empty and the counts are the hunks' counts.
+    fn assert_commit_view_agrees(path: &str, oid: &str, label: &str) {
+        let whole = GitReader::get_commit_diff(path, oid).expect(label).text;
+        let hunks = patch_file_counts(&whole);
+        let listed = GitReader::get_commit_files(path, oid).expect(label);
+        let details = GitReader::get_commit_details(path, oid).expect(label);
+        let from_list: std::collections::BTreeMap<String, (usize, usize)> = listed
+            .iter()
+            .map(|f| (f.path.clone(), (f.additions, f.deletions)))
+            .collect();
+        let from_details: std::collections::BTreeMap<String, (usize, usize)> = details
+            .changed_files
+            .iter()
+            .map(|f| (f.path.clone(), (f.additions, f.deletions)))
+            .collect();
+        assert_eq!(from_list, hunks, "{label}: list vs hunks\n{whole}");
+        assert_eq!(from_details, hunks, "{label}: details vs hunks\n{whole}");
+        for file in hunks.keys() {
+            let one = GitReader::get_commit_file_diff(path, oid, file)
+                .expect(label)
+                .text;
+            assert!(!one.is_empty(), "{label}: {file} row opens an empty diff");
+            assert_eq!(
+                patch_file_counts(&one).get(file.as_str()),
+                hunks.get(file),
+                "{label}: {file}: per-file vs whole\n{one}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_view_list_counts_and_hunks_agree_for_every_merge_shape() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let commit = |file: &str, body: &str, msg: &str| {
+            std::fs::write(dir.path().join(file), body).unwrap();
+            git_in(dir.path(), &["add", "."]);
+            git_in(dir.path(), &["commit", "-m", msg]);
+        };
+        let head = || rev_parse_at(dir.path(), "HEAD");
+        commit("shared.txt", "a\nb\nc\nd\ne\n", "shared");
+
+        // Clean merge where only the second parent added files.
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        commit("side1.txt", "s1\n", "side1");
+        commit("side2.txt", "s2\ns2b\n", "side2");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("main1.txt", "m1\n", "main1");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "side", "-m", "clean"],
+        );
+        assert_commit_view_agrees(path, &head(), "clean merge");
+
+        // Conflict resolved by hand, plus a shared edit both sides made.
+        git_in(dir.path(), &["checkout", "-q", "-b", "c1"]);
+        commit("clash.txt", "one\nsame\n", "c1");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("clash.txt", "two\nsame\n", "c2");
+        let _ = std::process::Command::new("git")
+            .args(["merge", "-q", "c1", "-m", "conflict"])
+            .current_dir(dir.path())
+            .output_locked();
+        std::fs::write(dir.path().join("clash.txt"), "resolved\nsame\nextra\n").unwrap();
+        git_in(dir.path(), &["add", "clash.txt"]);
+        git_in(dir.path(), &["commit", "-q", "-m", "resolved"]);
+        assert_commit_view_agrees(path, &head(), "conflict merge");
+
+        // Evil merge: changes a file neither parent changed.
+        git_in(dir.path(), &["checkout", "-q", "-b", "e1"]);
+        commit("e1.txt", "e1\n", "e1");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("m2.txt", "m2\n", "m2");
+        git_in(dir.path(), &["merge", "--no-ff", "--no-commit", "-q", "e1"]);
+        std::fs::write(dir.path().join("shared.txt"), "a\nEVIL\nc\nd\ne\n").unwrap();
+        git_in(dir.path(), &["add", "shared.txt"]);
+        git_in(dir.path(), &["commit", "-q", "-m", "evil"]);
+        assert_commit_view_agrees(path, &head(), "evil merge");
+
+        // Octopus.
+        for b in ["o1", "o2"] {
+            git_in(dir.path(), &["checkout", "-q", "-b", b, "main"]);
+            commit(&format!("{b}.txt"), &format!("{b}\n"), b);
+        }
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        commit("o3.txt", "o3\n", "o3");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "o1", "o2", "-m", "octopus"],
+        );
+        assert_commit_view_agrees(path, &head(), "octopus");
+    }
+
+    /// Pathspec edges through a merge: a directory, a path renamed on the
+    /// second parent, and a submodule gitlink all open the diff the whole
+    /// commit shows for them.
+    #[test]
+    fn merge_file_diff_pathspec_edges() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "old"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "second"]);
+        git_in(dir.path(), &["mv", "old.txt", "renamed.txt"]);
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/inner.txt"), "inner\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "rename and dir"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "second", "-m", "merge"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+
+        let dir_diff = GitReader::get_commit_file_diff(path, &oid, "pkg")
+            .expect("directory")
+            .text;
+        assert!(dir_diff.contains("+inner"), "{dir_diff}");
+        let renamed = GitReader::get_commit_file_diff(path, &oid, "renamed.txt")
+            .expect("renamed")
+            .text;
+        // The row exists and opens a diff, paired as a rename (see
+        // `merge_rename_on_second_parent_pairs_in_the_one_path_view`).
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        assert!(listed.iter().any(|f| f.path == "renamed.txt"), "{listed:?}");
+        assert!(renamed.contains("renamed.txt"), "{renamed}");
+        assert!(!renamed.contains("@@@"), "{renamed}");
+    }
+
+    /// Builds `main` with `base` committed, a `second` branch from it that
+    /// `on_second` edits (it commits itself), then a diverging `main` commit
+    /// and a no-ff merge of `second`. Returns the merge's id.
+    fn merge_with_second_parent(
+        dir: &Path,
+        base: &[(&str, &[u8])],
+        on_second: impl FnOnce(&Path),
+        on_main: impl FnOnce(&Path),
+    ) -> String {
+        for (name, body) in base {
+            if let Some(parent) = dir.join(name).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-m", "base"]);
+        git_in(dir, &["checkout", "-q", "-b", "second"]);
+        on_second(dir);
+        git_in(dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("main-only.txt"), "m\n").unwrap();
+        on_main(dir);
+        commit_all(dir, "main");
+        git_in(dir, &["merge", "--no-ff", "-q", "second", "-m", "merge"]);
+        rev_parse_at(dir, "HEAD")
+    }
+
+    /// [`merge_with_second_parent`] for a repo that already has history.
+    fn merge_with_second_parent_on(
+        dir: &Path,
+        branch: &str,
+        on_second: impl FnOnce(&Path),
+        on_main: impl FnOnce(&Path),
+    ) -> String {
+        git_in(dir, &["checkout", "-q", "-b", branch]);
+        on_second(dir);
+        git_in(dir, &["checkout", "-q", "main"]);
+        on_main(dir);
+        commit_all(dir, "main again");
+        git_in(
+            dir,
+            &["merge", "--no-ff", "-q", branch, "-m", "merge again"],
+        );
+        rev_parse_at(dir, "HEAD")
+    }
+
+    fn commit_all(dir: &Path, msg: &str) {
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-m", msg]);
+    }
+
+    /// The row for a renamed (or copied) path, read every way, must agree and
+    /// the one-path view must pair the rename rather than show an addition.
+    fn assert_rename_pairs(path: &str, oid: &str, new: &str, old: &str, label: &str) {
+        assert_commit_view_agrees(path, oid, label);
+        let one = GitReader::get_commit_file_diff(path, oid, new)
+            .expect(label)
+            .text;
+        assert!(
+            one.contains(&format!("rename from {old}"))
+                || one.contains(&format!("copy from {old}")),
+            "{label}: {new} is not paired with {old}\n{one}"
+        );
+        assert!(!one.contains("new file mode"), "{label}: {one}");
+    }
+
+    const EIGHT: &[u8] = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+
+    /// The reported bug: a path renamed on the second parent is listed as 0/0
+    /// but its one-path diff showed every line added.
+    #[test]
+    fn merge_rename_on_second_parent_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                commit_all(d, "rename");
+            },
+            |_| {},
+        );
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        let row = listed.iter().find(|f| f.path == "new.txt").expect("row");
+        assert_eq!((row.additions, row.deletions), (0, 0), "{listed:?}");
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "rename");
+    }
+
+    #[test]
+    fn merge_rename_plus_edit_on_second_parent_counts_only_the_edit() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                std::fs::write(d.join("new.txt"), "l1\nl2\nEDIT\nl4\nl5\nl6\nl7\nl8\nl9\n")
+                    .unwrap();
+                commit_all(d, "rename and edit");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "rename+edit");
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        let row = listed.iter().find(|f| f.path == "new.txt").expect("row");
+        assert_eq!((row.additions, row.deletions), (2, 1), "{listed:?}");
+    }
+
+    /// A rename made on both parents leaves nothing to show against the first
+    /// parent; a rename made on the first parent only is the same.
+    #[test]
+    fn merge_rename_on_both_parents_and_on_the_first_only_agree() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let both = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                commit_all(d, "rename on second");
+            },
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+            },
+        );
+        assert_commit_view_agrees(path, &both, "rename on both parents");
+        let whole = GitReader::get_commit_diff(path, &both).expect("whole").text;
+        assert!(!whole.contains("new.txt"), "{whole}");
+
+        let first_only = merge_with_second_parent_on(
+            dir.path(),
+            "second2",
+            |d| {
+                std::fs::write(d.join("side.txt"), "s\n").unwrap();
+                commit_all(d, "side");
+            },
+            |d| {
+                git_in(d, &["mv", "new.txt", "newer.txt"]);
+            },
+        );
+        assert_commit_view_agrees(path, &first_only, "rename on first parent only");
+    }
+
+    #[test]
+    fn merge_copy_detection_pairs_the_copy_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("src.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("copy.txt"), EIGHT).unwrap();
+                std::fs::write(d.join("src.txt"), "l1\nCHANGED\nl3\nl4\nl5\nl6\nl7\nl8\n").unwrap();
+                commit_all(d, "copy and touch source");
+            },
+            |_| {},
+        );
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        assert!(whole.contains("copy from src.txt"), "fixture: {whole}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "copy.txt")
+            .expect("copy")
+            .text;
+        assert!(one.contains("copy from src.txt"), "{one}");
+        assert!(!one.contains("new file mode"), "{one}");
+        // The source was edited in the same commit, but it is another file.
+        assert!(whole.contains("diff --git a/src.txt b/src.txt"), "{whole}");
+        assert!(!one.contains("diff --git a/src.txt b/src.txt"), "{one}");
+        assert_eq!(
+            patch_file_counts(&one).keys().collect::<Vec<_>>(),
+            ["copy.txt"],
+            "{one}"
+        );
+    }
+
+    /// The old path holds a different file now and the new path carries the
+    /// old content as a copy: the one-path view of the copy must not drag the
+    /// reused path's own section in.
+    #[test]
+    fn merge_copy_from_a_reused_old_path_shows_only_the_requested_file() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("new.txt"), EIGHT).unwrap();
+                std::fs::write(d.join("old.txt"), "an\nentirely\ndifferent\nfile\n").unwrap();
+                commit_all(d, "old content moves on, old name is reused");
+            },
+            |_| {},
+        );
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        assert!(whole.contains("copy from old.txt"), "fixture: {whole}");
+        assert!(whole.contains("diff --git a/old.txt b/old.txt"), "{whole}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "new.txt")
+            .expect("copy")
+            .text;
+        assert!(one.contains("copy from old.txt"), "{one}");
+        assert!(!one.contains("diff --git a/old.txt b/old.txt"), "{one}");
+        assert_commit_view_agrees(path, &oid, "copy from reused path");
+    }
+
+    /// Only an added file can need its pairing read: a modified file starts
+    /// one `git show`, a renamed one the narrowed read, the pairing read and
+    /// the re-read, and an addition with no source stops after the pairing.
+    #[test]
+    fn one_file_diff_pays_for_pairing_only_when_the_file_is_added() {
+        use crate::engine::git_cli::spawn_log::spawns_in;
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("keep.txt", EIGHT), ("old.txt", EIGHT)],
+            |d| {
+                std::fs::write(d.join("keep.txt"), "l1\nCHANGED\nl3\n").unwrap();
+                git_in(d, &["mv", "old.txt", "renamed.txt"]);
+                std::fs::write(d.join("fresh.txt"), "brand\nnew\n").unwrap();
+                commit_all(d, "edit, rename, add");
+            },
+            |_| {},
+        );
+        let repo = crate::engine::git_cli::canonicalize_plain(dir.path()).unwrap();
+        // (all `show` spawns, those that are the pairing read)
+        let shows = |file: &str| {
+            let before = spawns_in(&repo).len();
+            let diff = GitReader::get_commit_file_diff(path, &oid, file).expect(file);
+            assert!(!diff.text.is_empty(), "{file}");
+            let used: Vec<Vec<String>> = spawns_in(&repo)[before..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "show"))
+                .cloned()
+                .collect();
+            let pairing = used
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "--name-status"))
+                .count();
+            (used.len(), pairing)
+        };
+        assert_eq!(shows("keep.txt"), (1, 0), "modified file");
+        assert_eq!(shows("renamed.txt"), (3, 1), "renamed file");
+        assert_eq!(shows("fresh.txt"), (2, 1), "added file without a source");
+    }
+
+    #[test]
+    fn merge_binary_rename_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let blob: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 255, 254, 0, 1, 2];
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.bin", blob)],
+            |d| {
+                git_in(d, &["mv", "old.bin", "new.bin"]);
+                commit_all(d, "rename binary");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, "new.bin", "old.bin", "binary rename");
+    }
+
+    #[test]
+    fn merge_rename_with_spaces_and_unicode_pairs_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let old = "dir one/old na\u{ef}ve.txt";
+        let new = "d\u{fc}r two/new caf\u{e9}.txt";
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[(old, EIGHT)],
+            |d| {
+                std::fs::create_dir_all(d.join("d\u{fc}r two")).unwrap();
+                git_in(d, &["mv", old, new]);
+                commit_all(d, "rename with odd names");
+            },
+            |_| {},
+        );
+        assert_rename_pairs(path, &oid, new, old, "odd names");
+    }
+
+    /// The old path comes back as a different file: git calls that a modified
+    /// old path and an added new one, so there is no pair to build, and the
+    /// one-path view must say what the whole commit says.
+    #[test]
+    fn merge_rename_whose_old_path_is_reused_matches_the_whole_commit() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                std::fs::write(d.join("old.txt"), "completely\ndifferent\n").unwrap();
+                commit_all(d, "move away and reuse the name");
+            },
+            |_| {},
+        );
+        assert_commit_view_agrees(path, &oid, "reused old path");
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole").text;
+        let one = GitReader::get_commit_file_diff(path, &oid, "new.txt")
+            .expect("new")
+            .text;
+        assert_eq!(
+            whole.contains("rename from old.txt"),
+            one.contains("rename from old.txt"),
+            "one-path view pairs differently from the whole commit\n{whole}\n---\n{one}"
+        );
+    }
+
+    /// The same narrowing hurt an ordinary (non-merge) rename commit.
+    #[test]
+    fn plain_and_first_parent_renames_pair_in_the_one_path_view() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("old.txt"), EIGHT).unwrap();
+        commit_all(dir.path(), "old");
+        git_in(dir.path(), &["mv", "old.txt", "new.txt"]);
+        commit_all(dir.path(), "plain rename");
+        let plain = rev_parse_at(dir.path(), "HEAD");
+        assert_rename_pairs(path, &plain, "new.txt", "old.txt", "plain rename");
+
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "s\n").unwrap();
+        commit_all(dir.path(), "side");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        git_in(dir.path(), &["mv", "new.txt", "newer.txt"]);
+        commit_all(dir.path(), "first-parent rename");
+        let renamed = rev_parse_at(dir.path(), "HEAD");
+        assert_rename_pairs(path, &renamed, "newer.txt", "new.txt", "first-parent");
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "side", "-m", "merge"],
+        );
+        assert_commit_view_agrees(path, &rev_parse_at(dir.path(), "HEAD"), "merge");
+    }
+
+    /// A submodule added on the second parent: the list row and the per-file
+    /// diff both exist for the gitlink.
+    #[test]
+    fn merge_file_diff_covers_a_submodule_added_on_the_second_parent() {
+        let sub = init_repo_with_remotes(&[], "main");
+        std::fs::write(sub.path().join("f.txt"), "f\n").unwrap();
+        git_in(sub.path(), &["add", "."]);
+        git_in(sub.path(), &["commit", "-m", "sub"]);
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["checkout", "-q", "-b", "second"]);
+        git_in(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.path().to_str().unwrap(),
+                "vendored",
+            ],
+        );
+        git_in(dir.path(), &["commit", "-m", "add submodule"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        // The checked-out submodule is untracked on main and would block the merge.
+        std::fs::remove_dir_all(dir.path().join("vendored")).unwrap();
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "second", "-m", "merge"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        assert!(listed.iter().any(|f| f.path == "vendored"), "{listed:?}");
+        let one = GitReader::get_commit_file_diff(path, &oid, "vendored")
+            .expect("gitlink")
+            .text;
+        assert!(one.contains("Subproject commit"), "{one}");
+    }
+
+    /// A merge whose first-parent diff passes the cap: the per-file read says
+    /// it is cut, like the whole-commit read, while the row list is whole.
+    #[test]
+    fn merge_first_parent_diff_over_the_cap_is_reported_truncated() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["checkout", "-q", "-b", "big"]);
+        let line = "0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        let body = line.repeat(budget::MAX_DIFF_BYTES / line.len() + 4096);
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "big"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "big", "-m", "merge"],
+        );
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let whole = GitReader::get_commit_diff(path, &oid).expect("whole");
+        let one = GitReader::get_commit_file_diff(path, &oid, "big.txt").expect("one");
+        assert!(whole.truncated && one.truncated);
+        assert!(one.truncation_reason.is_some());
+        assert!(one.text.len() <= budget::MAX_DIFF_BYTES);
+        let listed = GitReader::get_commit_files(path, &oid).expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
     }
 
     /// Helper for merge_commit_renders_standard_hunks_against_first_parent:
@@ -7386,7 +10376,7 @@ mod tests {
     #[test]
     fn parse_pulse_stream_extracts_commits_and_churn() {
         let sample = "\
-__GP_PULSE__\0abc123\0def456 789012\x001700000000\0G\0feat: initial pulse\0Alice Dev\0alice@example.com\0\
+__GP_PULSE__\0abc123\0def456 789012\x001700000000\0feat: initial pulse\0Alice Dev\0alice@example.com\0\
 Signed-off-by: Alice Dev <alice@example.com>\n\
 Co-authored-by: Bob Coder <bob@example.com>\n\
 Co-authored-by: Cara <cara@example.com>\0\
@@ -7394,11 +10384,11 @@ Co-authored-by: Cara <cara@example.com>\0\
 5\t0\tREADME.md\n\
 -\t-\tlogo.png\n\
 \n\
-__GP_PULSE__\0def456\0\x001699990000\0N\0Revert \"bad commit\"\0Bob Coder\0bob@example.com\0\0\
+__GP_PULSE__\0def456\0\x001699990000\0Revert \"bad commit\"\0Bob Coder\0bob@example.com\0\0\
 3\t8\tsrc/lib/util.ts\n\
 1\t1\tconfig.json => config.dist.json\n\
 \n\
-__GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\0cara@example.com\0\0\
+__GP_PULSE__\0aaa111\0bbb222\x001699980000\0revert(api): drop the flag\0Cara\0cara@example.com\0\0\
 -\t-\tassets/icon.bin\n\
 ";
         let (commits, top_files, extensions) = parse_pulse_stream(sample);
@@ -7411,7 +10401,11 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
         assert!(c1.is_merge);
         assert!(!c1.is_revert);
         assert_eq!(c1.timestamp, 1700000000);
-        assert_eq!(c1.gpg_status, "G");
+        assert_eq!(
+            c1.signature,
+            CommitSignature::Unknown,
+            "the log stream carries no signature field; pulse_report fills it from the objects"
+        );
         assert_eq!(c1.summary, "feat: initial pulse");
         assert_eq!(c1.author_name, "Alice Dev");
         assert_eq!(c1.author_email, "alice@example.com");
@@ -7433,7 +10427,6 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
         assert!(c2.parents.is_empty());
         assert!(!c2.is_merge);
         assert!(c2.is_revert);
-        assert_eq!(c2.gpg_status, "N");
         assert_eq!(c2.additions, 4);
         assert_eq!(c2.deletions, 9);
         assert_eq!(c2.files_changed, 2);
@@ -7483,10 +10476,10 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
 
     fn two_commit_pulse_log() -> String {
         "\
-__GP_PULSE__\0abc123\0\x001700000000\0N\0first\0Ada\0ada@example.com\0\0\
+__GP_PULSE__\0abc123\0\x001700000000\0first\0Ada\0ada@example.com\0\0\
 1\t0\ta.rs\n\
 \n\
-__GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
+__GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 2\t0\tb.rs\n\
 "
         .to_string()
@@ -7590,6 +10583,308 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(report.age_distribution.total_lines, report.scanned_lines);
     }
 
+    /// A blame cut off at its byte budget is a prefix of the file. The report
+    /// built from it used to count as a full scan, with `truncated` false.
+    #[test]
+    fn a_blame_cut_at_its_cap_marks_the_ownership_report_truncated() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let body: String = (0..200)
+            .map(|n| format!("let value_{n} = {n};\n"))
+            .collect();
+        std::fs::write(dir.path().join("code.rs"), body).unwrap();
+        git_in(dir.path(), &["add", "code.rs"]);
+        git_in(dir.path(), &["commit", "-m", "feat: many lines"]);
+
+        let whole = GitReader::knowledge_report(path, Some(10)).expect("whole");
+        assert!(!whole.truncated, "the control must be a whole scan");
+
+        let cut = GitReader::knowledge_report_with(path, Some(10), 8192).expect("cut");
+        assert!(
+            cut.truncated,
+            "a blame cut at its cap reported as a whole scan: {cut:?}"
+        );
+    }
+
+    /// A path git printed as bytes that are not UTF-8 reaches us as U+FFFD.
+    /// (The filesystem here may refuse such a name, so the replacement
+    /// character stands in for what the decoder would have produced.)
+    #[test]
+    fn a_path_with_replacement_characters_carries_a_warning() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("bad\u{FFFD}name.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("fine.txt"), "x").unwrap();
+
+        let statuses = GitReader::get_status(path).expect("status");
+        let bad = statuses
+            .iter()
+            .find(|s| s.path.contains('\u{FFFD}'))
+            .expect("row");
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("not valid UTF-8")),
+            "{:?}",
+            bad.warnings
+        );
+        let fine = statuses.iter().find(|s| s.path == "fine.txt").expect("row");
+        assert!(fine.warnings.is_empty(), "{:?}", fine.warnings);
+    }
+
+    /// Growing the window reads only the chunks it has not seen, and the
+    /// result is the window a single walk would have produced.
+    #[test]
+    fn growing_the_history_window_reads_only_the_new_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..40 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let log_skips = |since: usize| -> Vec<String> {
+            git_cli::spawn_log::spawns_in(&repo)[since..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .filter_map(|argv| argv.iter().find(|a| a.starts_with("--skip=")).cloned())
+                .collect()
+        };
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 30);
+
+        let (first, second, before, middle) = with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                let first =
+                    GitReader::read_commit_history_paged(path, 0, 20, None, None, RefScope::Named)
+                        .unwrap();
+                let before = git_cli::spawn_log::spawns_in(&repo).len();
+                let second =
+                    GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+                        .unwrap();
+                let middle = git_cli::spawn_log::spawns_in(&repo).len();
+                (first, second, before, middle)
+            })
+        });
+        assert_eq!(ids(&first), ids(&whole[..20]));
+        assert_eq!(
+            ids(&second),
+            ids(&whole),
+            "chunked read differs from one walk"
+        );
+        assert_eq!(
+            log_skips(before),
+            vec!["--skip=20".to_string()],
+            "the larger window re-read chunks it already held (spawns {before}..{middle})"
+        );
+        // A page that starts mid-chunk is still exact.
+        let mid = with_history_chunk(10, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let direct = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(ids(&mid), ids(&direct));
+        assert_eq!(mid.len(), 18);
+    }
+
+    /// The graph asks for cap + 1 rows (the has_more probe). A window of one
+    /// chunk plus that row must be ONE `git log`, not a second walk for a
+    /// single row (S4-04): the default page is 5,000 rows plus the probe over a
+    /// 5,000-row chunk.
+    #[test]
+    fn a_window_of_one_chunk_plus_the_probe_row_is_one_log() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..30 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let logs = || -> usize {
+            git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .count()
+        };
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 11, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let before = logs();
+        let rows = with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                GitReader::read_commit_history_paged(path, 0, 11, None, None, RefScope::Named)
+            })
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 11);
+        assert_eq!(
+            rows.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            whole.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            logs() - before,
+            1,
+            "chunk + 1 rows was read as more than one walk"
+        );
+    }
+
+    /// Windows of c, c+1, 2c, 2c+1, 2c+2 and 3c+2 rows, grown one after the
+    /// other: each reads only the chunks it has not held, a chunk covers its
+    /// own rows plus the first of the next, and every window equals one walk.
+    #[test]
+    fn chunk_windows_around_every_boundary_read_the_fewest_walks() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let logs = || -> usize {
+            git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .count()
+        };
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 45);
+        let expected = [
+            (10, 1),
+            (11, 1),
+            (20, 1),
+            (21, 0),
+            (22, 1),
+            (32, 1),
+            (45, 1),
+        ];
+        let mut seen = Vec::new();
+        with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                for (window, _) in expected {
+                    let before = logs();
+                    let rows = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        window,
+                        None,
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    assert_eq!(ids(&rows), ids(&whole[..window]), "window {window}");
+                    seen.push((window, logs() - before));
+                }
+            })
+        });
+        assert_eq!(seen, expected.to_vec(), "(window, new log walks) per step");
+        // A window that ends exactly on a chunk, and one past the end of
+        // history, are both exact.
+        for window in [40, 41, 44, 45, 46, 60] {
+            let rows = with_history_chunk(10, || {
+                GitReader::read_commit_history_paged(path, 0, window, None, None, RefScope::Named)
+            })
+            .unwrap();
+            assert_eq!(ids(&rows), ids(&whole[..window.min(45)]), "window {window}");
+        }
+        // Paging from the middle of a chunk across the overlap row.
+        let mid = with_history_chunk(10, || {
+            GitReader::read_commit_history_paged(path, 9, 13, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(ids(&mid), ids(&whole[9..22]));
+    }
+
+    /// Every (chunk size, history length, skip, count) over a small repository
+    /// reads exactly the rows one unchunked walk holds: no boundary row is
+    /// doubled by the overlap, none dropped, and a history shorter than a
+    /// chunk, or ending on a chunk boundary, is exact. Chunk size 1 makes the
+    /// overlap row the whole of every chunk.
+    #[test]
+    fn chunked_history_equals_one_walk_for_every_window_and_skip() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..7 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        // A branch at three depths: `h{k}` has 8 - k commits of history (the
+        // fixture repository starts with one commit of its own).
+        for k in [0, 3, 5] {
+            git_in(
+                dir.path(),
+                &["branch", &format!("h{k}"), &format!("main~{k}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let ids = |rows: Vec<RawCommitNode>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let mut checked = 0;
+        for k in [0, 3, 5] {
+            let rev = format!("h{k}");
+            let len = 8 - k;
+            let whole = ids(with_history_chunk(usize::MAX, || {
+                GitReader::read_commit_history_paged(
+                    path,
+                    0,
+                    len + 5,
+                    Some(&rev),
+                    None,
+                    RefScope::Named,
+                )
+            })
+            .unwrap());
+            assert_eq!(whole.len(), len);
+            for chunk in [1, 2, 3] {
+                for skip in 0..=len + 1 {
+                    for count in 1..=len + 2 {
+                        let got = ids(with_history_chunk(chunk, || {
+                            GitReader::read_commit_history_paged(
+                                path,
+                                skip,
+                                count,
+                                Some(&rev),
+                                None,
+                                RefScope::Named,
+                            )
+                        })
+                        .unwrap());
+                        let from = skip.min(len);
+                        let to = (skip + count).min(len);
+                        assert_eq!(
+                            got,
+                            whole[from..to].to_vec(),
+                            "chunk {chunk} history {len} skip {skip} count {count}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 400, "{checked}");
+    }
+
     #[test]
     fn dora_report_computes_release_metrics_from_tags() {
         let dir = init_repo_with_remotes(&[], "main");
@@ -7651,6 +10946,44 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(report.commit_scan_window_commits, None);
     }
 
+    /// Lead time asked git once per commit (30 `describe --contains` spawns).
+    /// It must be one `name-rev` for the whole batch, and still find the tag.
+    #[test]
+    fn dora_lead_time_is_one_process_not_one_per_commit() {
+        let dir = repo_with_commits(12);
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
+        let path = dir.path().to_str().unwrap();
+
+        let (report, labels) =
+            git_cli::spawn_labels_during(|| GitReader::dora_report(path, Some(90)));
+        let report = report.expect("report");
+        let count = |label: &str| labels.iter().filter(|l| l.as_str() == label).count();
+        assert_eq!(count("git name-rev"), 1, "{labels:?}");
+        assert_eq!(count("git describe"), 0, "{labels:?}");
+        assert!(
+            labels.len() <= 6,
+            "a DORA report is a handful of spawns, not one per commit: {labels:?}"
+        );
+        assert!(
+            report.median_lead_time_hours >= 0.0 && report.lead_time_rating != "None",
+            "the tag was found: {report:?}"
+        );
+    }
+
+    /// A failed commit read is not an empty history: it used to publish 0%
+    /// change failures and no lead time as if measured.
+    #[test]
+    fn dora_reports_a_failed_git_read_instead_of_an_empty_answer() {
+        let dir = repo_with_commits(3);
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
+        let path = dir.path().to_str().unwrap();
+        let error = git_cli::with_forced_spawn_failure_of("--format=%s%x00%ct", || {
+            GitReader::dora_report(path, Some(90))
+        })
+        .expect_err("a failed commit scan must fail the report");
+        assert!(error.contains("commit scan"), "{error}");
+    }
+
     /// Seeds `count` commits whose subjects alternate so the scan has both
     /// failure remedies and ordinary work to count.
     fn repo_with_commits(count: usize) -> tempfile::TempDir {
@@ -7681,7 +11014,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(12);
         let path = dir.path().to_str().unwrap();
 
-        let report = GitReader::dora_report_scanning(path, Some(90), 4)
+        let report = dora_scanning(path, Some(90), 4)
             .expect("dora_report should succeed on a seeded repository");
 
         assert_eq!(
@@ -7713,7 +11046,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(5);
         let path = dir.path().to_str().unwrap();
 
-        let report = GitReader::dora_report_scanning(path, Some(90), 4_096)
+        let report = dora_scanning(path, Some(90), 4_096)
             .expect("dora_report should succeed on a seeded repository");
 
         assert_eq!(report.cfr_sample_commits, 6, "seed plus five commits");
@@ -7737,7 +11070,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(5);
         let path = dir.path().to_str().unwrap();
 
-        let report = GitReader::dora_report_scanning(path, Some(90), 6)
+        let report = dora_scanning(path, Some(90), 6)
             .expect("dora_report should succeed on a seeded repository");
 
         assert_eq!(report.cfr_sample_commits, 6);
@@ -7758,10 +11091,8 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(12);
         let path = dir.path().to_str().unwrap();
 
-        let capped =
-            GitReader::dora_report_scanning(path, Some(90), 4).expect("capped scan should succeed");
-        let full = GitReader::dora_report_scanning(path, Some(90), 4_096)
-            .expect("full scan should succeed");
+        let capped = dora_scanning(path, Some(90), 4).expect("capped scan should succeed");
+        let full = dora_scanning(path, Some(90), 4_096).expect("full scan should succeed");
 
         assert!(capped.commit_scan_truncated);
         assert!(!full.commit_scan_truncated);
@@ -7964,6 +11295,103 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(summary(&listed), summary(&walked));
     }
 
+    /// A cold pass is bounded by time, not only by the target cap: a call that
+    /// has spent its budget stops starting tips, says `capped`, and the next
+    /// call resumes from the churn cache. Every call still makes progress, and
+    /// the computed / cached / capped counts add up across calls.
+    #[test]
+    fn branch_stats_stops_at_its_time_budget_and_resumes_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "0\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for n in 0..6 {
+            let branch = format!("topic-{n}");
+            crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+            std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+            crate::test_support::git_in(&root, &["add", "."]);
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
+        }
+        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+
+        let path = root.to_str().unwrap();
+        let mut computed_total = 0;
+        for call in 1..=6 {
+            // A zero budget leaves room for exactly the first tip.
+            let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
+            assert_eq!(report.computed, 1, "call {call} makes progress, one tip");
+            assert_eq!(
+                report.cached,
+                call - 1,
+                "call {call} rides the tips already done"
+            );
+            assert_eq!(
+                report.updates.len(),
+                call,
+                "call {call} reports every tip it has"
+            );
+            assert_eq!(
+                report.compute_failures, 0,
+                "unstarted tips are not failures"
+            );
+            assert_eq!(
+                report.capped,
+                call < 6,
+                "call {call}: more remain until the sixth"
+            );
+            computed_total += report.computed;
+        }
+        assert_eq!(computed_total, 6);
+
+        let warm = GitReader::branch_stats(path).unwrap();
+        assert_eq!((warm.computed, warm.cached, warm.capped), (0, 6, false));
+    }
+
+    /// A base that moved leaves every answer standing with a spent budget:
+    /// carrying them costs no walk, so a call with no time left still reports
+    /// every stored branch, measures one new one (the progress guarantee) and
+    /// says `capped` for the rest.
+    #[test]
+    fn a_carried_answer_is_not_spent_against_the_time_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        crate::test_support::git_in(&root, &["config", "user.email", "t@example.invalid"]);
+        crate::test_support::git_in(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("base.txt"), "0\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        let topic = |n: usize| {
+            let branch = format!("topic-{n}");
+            crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+            std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+            crate::test_support::git_in(&root, &["add", "."]);
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
+        };
+        topic(0);
+        topic(1);
+        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+        let path = root.to_str().unwrap();
+        let warm = GitReader::branch_stats(path).unwrap();
+        assert_eq!((warm.computed, warm.capped), (2, false));
+
+        crate::test_support::git_in(&root, &["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+        topic(2);
+        topic(3);
+        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+        let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
+        assert_eq!(report.cached, 2, "the stored answers were carried");
+        assert_eq!(report.computed, 1, "one new tip, for progress");
+        assert!(
+            report.capped,
+            "the second new tip is left for the next call"
+        );
+        assert_eq!(report.updates.len(), 3);
+        assert_eq!(report.compute_failures, 0);
+    }
+
     /// What `git remote` would say, read from one config listing: a legacy
     /// `.git/remotes` file still sends the count through `git remote`, a dotted
     /// remote name is one name, and a branch subsection keeps its case.
@@ -8032,11 +11460,1701 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(remote_listings() - before, 1, "`git remote` was asked");
     }
 
+    /// A repository whose one commit touches `files` files, and that
+    /// commit's full object id.
+    fn repo_with_commit_of(files: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        for n in 0..files {
+            std::fs::write(repo.join(format!("file-{n:04}.txt")), format!("line {n}\n")).unwrap();
+        }
+        git_in(&repo, &["add", "--", "."]);
+        git_in(&repo, &["commit", "-m", "touch files\n\nbody text"]);
+        let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        (dir, repo, head)
+    }
+
+    /// Children started in `repo` since `before`, counted by the spawn gate's
+    /// own log rather than inferred from timing.
+    fn spawned_since(repo: &Path, before: usize) -> Vec<Vec<String>> {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .into_iter()
+            .skip(before)
+            .collect()
+    }
+
+    /// One click on a commit used to cost two sequential `git show` children
+    /// (metadata, then numstat), each waiting on the spawn gate.
+    #[test]
+    fn commit_details_first_load_spawns_one_git_process() {
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(3);
+            let path = repo.to_string_lossy().into_owned();
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let details = GitReader::get_commit_details(&path, &head).expect("details");
+            assert_eq!(details.summary, "touch files");
+            assert_eq!(details.body, "body text");
+            assert_eq!(details.changed_files.len(), 3);
+            let spawned = spawned_since(&repo, before);
+            assert_eq!(
+                spawned.len(),
+                1,
+                "one git process per first load: {spawned:?}"
+            );
+        });
+    }
+
+    /// A commit is immutable by object id, so selecting it again is answered
+    /// without a child.
+    #[test]
+    fn reselecting_a_commit_spawns_nothing() {
+        // The answer must stay in the process-wide table between the two
+        // calls; the test that fills that table's byte budget evicts it.
+        let _held = ref_cache::retention();
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(3);
+            let path = repo.to_string_lossy().into_owned();
+            let first = GitReader::get_commit_details(&path, &head).expect("first");
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let again = GitReader::get_commit_details(&path, &head).expect("again");
+            let spawned = spawned_since(&repo, before);
+            assert!(spawned.is_empty(), "re-selecting spawned {spawned:?}");
+            assert_eq!(again.id, first.id);
+            assert_eq!(again.changed_files.len(), first.changed_files.len());
+            assert_eq!(again.total_additions, first.total_additions);
+        });
+    }
+
+    /// An abbreviation is not a stable name for a commit (it turns ambiguous
+    /// as objects arrive), so it is never a cache key: it is read each time.
+    #[test]
+    fn an_abbreviated_commit_id_is_not_cached() {
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(2);
+            let path = repo.to_string_lossy().into_owned();
+            let short = &head[..12];
+            for round in 0..2 {
+                let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+                let details = GitReader::get_commit_details(&path, short).expect("details");
+                assert_eq!(details.id, head);
+                assert_eq!(
+                    spawned_since(&repo, before).len(),
+                    1,
+                    "round {round}: an abbreviated id costs one process every time"
+                );
+            }
+        });
+    }
+
+    /// The payload is the same one the two-process version built: the single
+    /// stream's metadata/record boundary is exactly where the old pair split
+    /// it, for renames, binaries, an empty commit and a merge.
+    #[test]
+    fn single_show_payload_matches_the_separate_file_listing() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        std::fs::write(repo.join("moved.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(repo.join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+        git_in(&repo, &["add", "--", "."]);
+        git_in(&repo, &["commit", "-m", "seed"]);
+        git_in(&repo, &["mv", "moved.txt", "renamed.txt"]);
+        std::fs::write(repo.join("renamed.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(repo.join("blob.bin"), [9u8, 0, 0, 7]).unwrap();
+        git_in(&repo, &["add", "-A"]);
+        git_in(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "rename and rewrite\n\nCo-authored-by: Pat <pat@example.com>",
+            ],
+        );
+        git_in(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        std::fs::write(repo.join("side.txt"), "side\n").unwrap();
+        git_in(&repo, &["add", "side.txt"]);
+        git_in(&repo, &["commit", "-m", "side work"]);
+        git_in(&repo, &["checkout", "main"]);
+        git_in(&repo, &["merge", "--no-ff", "-m", "merge side", "side"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "nothing changed"]);
+
+        let ids = git_stdout(&repo, &["rev-list", "--reverse", "main"]);
+        let mut checked = 0;
+        let mut by_summary = HashMap::new();
+        for id in ids.lines() {
+            let details = GitReader::get_commit_details(&path, id).expect("details");
+            by_summary.insert(details.summary.clone(), details.clone());
+            let files = GitReader::get_commit_files(&path, id).expect("files");
+            assert_eq!(details.id, id);
+            assert_eq!(
+                serde_json::to_value(&details.changed_files).unwrap(),
+                serde_json::to_value(&files).unwrap(),
+                "commit {id}: the listing must not depend on which command read it"
+            );
+            assert_eq!(
+                details.total_additions,
+                files.iter().map(|f| f.additions).sum::<usize>()
+            );
+            assert!(details.numstat_truncation_reason.is_none());
+            assert!(!details.files_list_truncated);
+            checked += 1;
+        }
+        assert!(
+            checked >= 5,
+            "seed, rename, side, merge and an empty commit: {checked}"
+        );
+        let renamed = &by_summary["rename and rewrite"];
+        assert_eq!(
+            renamed.co_authors,
+            vec!["Pat <pat@example.com>".to_string()]
+        );
+        assert!(renamed
+            .changed_files
+            .iter()
+            .any(|f| f.path == "renamed.txt" && f.status_code == "R"));
+        assert!(renamed
+            .changed_files
+            .iter()
+            .any(|f| f.path == "blob.bin" && f.status_code == "B"));
+        assert_eq!(by_summary["merge side"].parent_ids.len(), 2);
+        let empty = &by_summary["nothing changed"];
+        assert!(empty.changed_files.is_empty());
+        let value = serde_json::to_value(empty).unwrap();
+        assert!(
+            value.get("numstat_truncation_reason").is_none(),
+            "absent, not null, when git was read whole: {value}"
+        );
+    }
+
+    /// Output past the byte budget is a flagged prefix, never a short list
+    /// passing for the whole commit: no half record survives, the count is not
+    /// invented, and the cut answer is not kept.
+    #[test]
+    fn oversized_numstat_is_flagged_and_never_cached() {
+        ref_cache::eager(|| {
+            let (_dir, repo, head) = repo_with_commit_of(200);
+            let path = repo.to_string_lossy().into_owned();
+            let cap = 2048;
+            let details = GitReader::commit_details_capped(&path, &head, cap).expect("cut details");
+            let reason = details
+                .numstat_truncation_reason
+                .as_deref()
+                .expect("a cut stream says so");
+            assert!(reason.starts_with("git output "), "{reason}");
+            assert!(details.files_list_truncated);
+            assert_eq!(details.files_total_count, None, "a floor is not a count");
+            assert!(!details.changed_files.is_empty());
+            assert!(details.changed_files.len() < 200, "the stream was cut");
+            for (n, file) in details.changed_files.iter().enumerate() {
+                assert_eq!(file.path, format!("file-{n:04}.txt"), "only whole records");
+                assert_eq!((file.additions, file.deletions), (1, 0));
+            }
+            assert_eq!(details.total_additions, details.changed_files.len());
+            assert_eq!(details.summary, "touch files");
+
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            GitReader::commit_details_capped(&path, &head, cap).expect("cut again");
+            assert_eq!(
+                spawned_since(&repo, before).len(),
+                1,
+                "a cut answer is read again, not served"
+            );
+            let whole = GitReader::get_commit_details(&path, &head).expect("whole");
+            assert_eq!(whole.changed_files.len(), 200);
+            assert!(whole.numstat_truncation_reason.is_none());
+        });
+    }
+
+    #[test]
+    fn a_cut_stream_drops_the_record_it_ended_inside() {
+        let stream = "1\t0\ta.txt\x002\t1\t\0old name\0new name\x003\t3\tb";
+        assert_eq!(
+            drop_partial_numstat_tail(stream),
+            "1\t0\ta.txt\x002\t1\t\0old name\0new name\0"
+        );
+        let renaming = "1\t0\ta.txt\x002\t1\t\0old name\0";
+        assert_eq!(drop_partial_numstat_tail(renaming), "1\t0\ta.txt\0");
+        assert_eq!(drop_partial_numstat_tail("4\t"), "");
+        assert_eq!(drop_partial_numstat_tail(""), "");
+    }
+
+    #[test]
+    fn metadata_cut_before_the_body_is_an_error_that_names_the_cut() {
+        let cut = Incomplete::OverCap(1024);
+        let err = parse_commit_show("abc\0def\0", Some(&cut)).unwrap_err();
+        assert!(err.contains("cut short"), "{err}");
+        assert!(err.contains("exceeded"), "{err}");
+        assert_eq!(
+            parse_commit_show("abc\0def\0", None).unwrap_err(),
+            "Failed to parse commit metadata format"
+        );
+    }
+
     #[test]
     fn config_listings_parse_last_value_wins_and_valueless_keys() {
         let parsed = parse_config_list("core.bare\nfalse\0checkout.defaultremote\na\0checkout.defaultremote\nb\0flag.only\0remote.a.b.c.url\nx\0");
         assert_eq!(parsed["checkout.defaultremote"], "b");
         assert_eq!(parsed["flag.only"], "");
         assert_eq!(configured_remotes(&parsed), vec!["a.b.c".to_string()]);
+    }
+
+    fn head_of(dir: &Path) -> String {
+        git_text(dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn system_now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// [`GitReader::dora_report_scanning`] at the real clock on the git this
+    /// machine has, for the tests whose commits are made "now".
+    fn dora_scanning(path: &str, window: Option<u32>, cap: usize) -> Result<DoraReport, String> {
+        GitReader::dora_report_scanning(path, window, cap, system_now(), DateWalk::from_preflight())
+    }
+
+    /// The pulse row for `sha`.
+    fn signature_of(report: &PulseReport, sha: &str) -> CommitSignature {
+        report
+            .commits
+            .iter()
+            .find(|c| c.sha == sha)
+            .unwrap_or_else(|| panic!("{sha} is not in the report"))
+            .signature
+    }
+
+    /// Every way a commit can carry (or not carry) a signature header, on one
+    /// history, with a signing program that counts and fails when started.
+    #[cfg(unix)]
+    #[test]
+    fn pulse_report_labels_signature_presence_and_never_starts_a_verifier() {
+        use crate::test_support::{
+            counting_verifier, fake_signature_header as sig, raw_commit, use_verifier,
+            verifier_spawns,
+        };
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path();
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(path, &script);
+        let base = head_of(path);
+
+        let pgp = raw_commit(
+            path,
+            &[&base],
+            &sig("gpgsig", "PGP SIGNATURE"),
+            "pgp",
+            1_700_000_001,
+        );
+        let ssh = raw_commit(
+            path,
+            &[&pgp],
+            &sig("gpgsig", "SSH SIGNATURE"),
+            "ssh",
+            1_700_000_002,
+        );
+        let x509 = raw_commit(
+            path,
+            &[&ssh],
+            &sig("gpgsig", "SIGNED MESSAGE"),
+            "x509",
+            1_700_000_003,
+        );
+        let other = raw_commit(
+            path,
+            &[&x509],
+            &sig("gpgsig", "SOMETHING ELSE"),
+            "other",
+            1_700_000_004,
+        );
+        let sha256 = raw_commit(
+            path,
+            &[&other],
+            &sig("gpgsig-sha256", "PGP SIGNATURE"),
+            "sha256",
+            1_700_000_005,
+        );
+        let unsigned = raw_commit(path, &[&sha256], "", "unsigned", 1_700_000_006);
+        // A merge of a signed tag carries the tag's signature as `mergetag`,
+        // which does not make the merge commit itself signed.
+        let side = raw_commit(path, &[&base], "", "side", 1_700_000_007);
+        let mergetag = "mergetag object 0000000000000000000000000000000000000000\n type commit\n tag v1\n tagger T <t@test.local> 1 +0000\n \n tag message\n -----BEGIN PGP SIGNATURE-----\n \n c2ln\n -----END PGP SIGNATURE-----\n";
+        let tag_merge = raw_commit(
+            path,
+            &[&unsigned, &side],
+            mergetag,
+            "tag merge",
+            1_700_000_008,
+        );
+        let side2 = raw_commit(path, &[&base], "", "side two", 1_700_000_009);
+        let signed_merge = raw_commit(
+            path,
+            &[&tag_merge, &side2],
+            &format!("{mergetag}{}", sig("gpgsig", "SSH SIGNATURE")),
+            "signed merge",
+            1_700_000_010,
+        );
+        git_in(path, &["update-ref", "refs/heads/main", &signed_merge]);
+
+        let report = GitReader::pulse_report(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(report.commits.len(), 11);
+        for (sha, expected) in [
+            (&base, CommitSignature::None),
+            (&pgp, CommitSignature::Pgp),
+            (&ssh, CommitSignature::Ssh),
+            (&x509, CommitSignature::X509),
+            (&other, CommitSignature::Other),
+            // A `gpgsig-sha256` header in a SHA-1 repository is an unknown header to
+            // git, which does not verify it, so it is not signed here either.
+            (&sha256, CommitSignature::None),
+            (&unsigned, CommitSignature::None),
+            (&tag_merge, CommitSignature::None),
+            (&signed_merge, CommitSignature::Ssh),
+        ] {
+            assert_eq!(signature_of(&report, sha), expected, "{sha}");
+        }
+        assert_eq!(
+            verifier_spawns(&stub),
+            0,
+            "a bulk walk must not start any signing program"
+        );
+    }
+
+    /// The log and the header read are two walks over refs that can move
+    /// between them: a row the header read missed is `Unknown` (never `None`),
+    /// and a header entry for a commit the log did not return is ignored.
+    #[test]
+    fn a_pulse_row_the_header_read_missed_is_unknown_and_extra_entries_are_ignored() {
+        let row = |sha: &str| PulseCommitSummary {
+            sha: sha.to_string(),
+            parents: Vec::new(),
+            timestamp: 0,
+            summary: String::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            signature: CommitSignature::Unknown,
+            additions: 0,
+            deletions: 0,
+            files_changed: 0,
+            is_merge: false,
+            is_revert: false,
+            co_authors: Vec::new(),
+            binary_files: 0,
+        };
+        let mut commits = vec![row("aaa"), row("bbb"), row("ccc")];
+        let found = HashMap::from([
+            ("aaa".to_string(), CommitSignature::Ssh),
+            ("ccc".to_string(), CommitSignature::None),
+            // The refs moved: the header read saw a commit the log did not.
+            ("zzz".to_string(), CommitSignature::Pgp),
+        ]);
+        apply_signatures(&mut commits, found);
+        let kinds: Vec<_> = commits.iter().map(|c| c.signature).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CommitSignature::Ssh,
+                CommitSignature::Unknown,
+                CommitSignature::None
+            ]
+        );
+        assert_eq!(commits.len(), 3, "an extra header entry adds no row");
+    }
+
+    /// The pulse walk's own git processes: the log, and one header read for
+    /// every signature however many commits are signed.
+    #[test]
+    fn pulse_report_reads_every_signature_in_one_header_read() {
+        use crate::test_support::{fake_signature_header as sig, raw_commit};
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path();
+        let mut parent = head_of(path);
+        for n in 0..30 {
+            parent = raw_commit(
+                path,
+                &[&parent],
+                &sig("gpgsig", "PGP SIGNATURE"),
+                &format!("c{n}"),
+                1_700_000_000 + n,
+            );
+        }
+        git_in(path, &["update-ref", "refs/heads/main", &parent]);
+        let root = path.canonicalize().unwrap();
+        let before = git_cli::spawn_log::spawns_in(&root).len();
+        let report = GitReader::pulse_report(path.to_str().unwrap(), None).unwrap();
+        let used = git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        assert_eq!(report.commits.len(), 31);
+        assert!(
+            report
+                .commits
+                .iter()
+                .filter(|c| c.signature.is_signed())
+                .count()
+                == 30
+        );
+        let header_reads = used
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "--header"))
+            .count();
+        assert_eq!(header_reads, 1, "{used:?}");
+        assert!(
+            used.iter().all(|argv| !argv.iter().any(|a| a == "--batch")),
+            "no cat-file batch on the walk's critical path: {used:?}"
+        );
+        assert!(
+            used.len() <= 3,
+            "log, one header read and at most the mailmap probe: {used:?}"
+        );
+    }
+
+    /// The first fact the design rests on: asking git for `%G?` of a commit
+    /// with no signature starts no verifier, so the one-commit verify may ask
+    /// about any commit and pays only for signed ones.
+    #[cfg(unix)]
+    #[test]
+    fn git_asks_no_verifier_about_an_unsigned_commit() {
+        use crate::test_support::{counting_verifier, use_verifier, verifier_spawns};
+        let dir = init_repo_with_remotes(&[], "main");
+        let (stub, script) = counting_verifier("exit 2");
+        use_verifier(dir.path(), &script);
+        // Built from parts so the source scan below does not mistake this pin
+        // of git's behaviour for a format string the app runs.
+        let format = format!("--format={}G?", '%');
+        let out = git_text(
+            dir.path(),
+            &["log", "-1", "--no-walk", format.as_str(), "HEAD"],
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "N");
+        assert_eq!(verifier_spawns(&stub), 0);
+    }
+
+    /// `src-tauri/src` files and their non-comment lines, for the source-scan
+    /// tests below.
+    fn source_lines() -> Vec<(String, usize, String)> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut lines = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let name = file.strip_prefix(&root).unwrap().display().to_string();
+            for (at, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") {
+                    lines.push((name.clone(), at + 1, line.to_string()));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Every `%G*` placeholder runs the signature verifier. The single place
+    /// that may is the one-commit verify; a second one in a format string is
+    /// a walk that costs seconds per signed commit.
+    #[test]
+    fn no_format_string_outside_the_one_commit_verify_runs_the_verifier() {
+        let needle = format!("{}G", '%');
+        let found: Vec<_> = source_lines()
+            .into_iter()
+            .filter(|(_, _, line)| line.contains(&needle))
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (file, _, line) = &found[0];
+        assert!(file.ends_with("commit_signature.rs"), "{found:?}");
+        assert!(line.contains("--format="), "{found:?}");
+    }
+
+    /// Plain `--since` ends a walk at the first old committer date. Both DORA
+    /// reads, and anything added later, take a date bound that filters instead.
+    #[test]
+    fn no_git_argument_bounds_a_walk_with_plain_since() {
+        let needle = format!("--since{}", '=');
+        let found: Vec<_> = source_lines()
+            .into_iter()
+            .filter(|(_, _, line)| line.contains(&needle))
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The fixture of `insights`' regression for the same defect: one commit
+    /// with a committer date 200 days old sits among in-window commits.
+    fn inverted_date_repo(anchor: i64) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for (message, age) in [
+            ("d40", 40 * 86_400),
+            ("inverted", 200 * 86_400),
+            ("d30", 30 * 86_400),
+            ("d3", 3 * 86_400),
+            ("today", 100),
+        ] {
+            crate::test_support::commit_at(dir.path(), message, anchor - age, "one@example.com");
+        }
+        dir
+    }
+
+    #[test]
+    fn dora_counts_every_in_window_commit_behind_an_inverted_date_on_both_walks() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let path = dir.path().to_str().unwrap();
+        for walk in [DateWalk::SinceAsFilter, DateWalk::CountBounded] {
+            let report =
+                GitReader::dora_report_scanning(path, Some(90), 4_096, anchor, walk).unwrap();
+            assert_eq!(report.cfr_sample_commits, 4, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+            assert_eq!(report.commit_scan_window_commits, None, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_cap_below_the_window_is_truncated_with_the_true_count_where_one_is_known() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let path = dir.path().to_str().unwrap();
+        let filtered =
+            GitReader::dora_report_scanning(path, Some(90), 2, anchor, DateWalk::SinceAsFilter)
+                .unwrap();
+        assert_eq!(filtered.cfr_sample_commits, 2);
+        assert!(filtered.commit_scan_truncated);
+        assert_eq!(
+            filtered.commit_scan_window_commits,
+            Some(4),
+            "the window's true size, past the inverted commit"
+        );
+        let bounded =
+            GitReader::dora_report_scanning(path, Some(90), 2, anchor, DateWalk::CountBounded)
+                .unwrap();
+        assert_eq!(bounded.cfr_sample_commits, 2);
+        assert!(bounded.commit_scan_truncated);
+        assert_eq!(
+            bounded.commit_scan_window_commits, None,
+            "a count-bounded walk does not know the window's size and says so"
+        );
+    }
+
+    /// At exactly the cap, neither walk claims the window was cut. The cap
+    /// counts what each walk reads: in-window commits for the filtered walk
+    /// (4), every commit it passes for the count-bounded one (5, the inverted
+    /// commit among them), so each is given the cap that is exactly full.
+    #[test]
+    fn dora_does_not_claim_truncation_when_the_cap_equals_the_window() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let path = dir.path().to_str().unwrap();
+        for (walk, cap) in [(DateWalk::SinceAsFilter, 4), (DateWalk::CountBounded, 5)] {
+            let report =
+                GitReader::dora_report_scanning(path, Some(90), cap, anchor, walk).unwrap();
+            assert_eq!(report.cfr_sample_commits, 4, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    /// A committer date in the future is inside any window ending at "now" on
+    /// both walks, so the two cannot disagree about it.
+    #[test]
+    fn both_dora_walks_count_a_commit_dated_in_the_future() {
+        let anchor = 1_800_000_000i64;
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        crate::test_support::commit_at(dir.path(), "past", anchor - 86_400, "a@example.com");
+        crate::test_support::commit_at(dir.path(), "future", anchor + 30 * 86_400, "a@example.com");
+        let path = dir.path().to_str().unwrap();
+        for walk in [DateWalk::SinceAsFilter, DateWalk::CountBounded] {
+            let report =
+                GitReader::dora_report_scanning(path, Some(90), 4_096, anchor, walk).unwrap();
+            assert_eq!(report.cfr_sample_commits, 2, "{walk:?}");
+        }
+    }
+
+    /// The third fact the design rests on: `--since-as-filter` takes a bare
+    /// epoch, which is what lets the walk and the tag window share one clock.
+    #[test]
+    fn since_as_filter_accepts_a_bare_epoch() {
+        let anchor = 1_800_000_000i64;
+        let dir = inverted_date_repo(anchor);
+        let since = format!("--since-as-filter={}", anchor - 90 * 86_400);
+        let counted = git_text(dir.path(), &["rev-list", "--count", &since, "HEAD"]).unwrap();
+        assert_eq!(counted.trim(), "4");
+    }
+
+    // ------------------------------------------------------------------
+    // Adversarial DORA cases (CARD 16): inputs chosen to break the two walks,
+    // each pinning the behavior that held or the fix that closed the break.
+    // ------------------------------------------------------------------
+
+    const ADV_DAY: i64 = 86_400;
+    const ADV_ANCHOR: i64 = 1_800_000_000;
+    const ADV_WALKS: [DateWalk; 2] = [DateWalk::SinceAsFilter, DateWalk::CountBounded];
+
+    /// A linear history, oldest first, one commit per committer date.
+    fn adv_repo_with_dates(dates: &[i64]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for (n, date) in dates.iter().enumerate() {
+            crate::test_support::commit_at(dir.path(), &format!("c{n}"), *date, "a@example.com");
+        }
+        dir
+    }
+
+    fn adv_scan(
+        dir: &tempfile::TempDir,
+        window: Option<u32>,
+        cap: usize,
+        now: i64,
+        walk: DateWalk,
+    ) -> DoraReport {
+        GitReader::dora_report_scanning(dir.path().to_str().unwrap(), window, cap, now, walk)
+            .unwrap()
+    }
+
+    /// A window of 0 days is clamped to 7 and a huge one to 365, the same on
+    /// both walks, with the cutoffs landing where the clamp says.
+    #[test]
+    fn dora_window_zero_and_huge_clamp_identically_on_both_walks() {
+        let dir = adv_repo_with_dates(&[
+            ADV_ANCHOR - 366 * ADV_DAY,
+            ADV_ANCHOR - 364 * ADV_DAY,
+            ADV_ANCHOR - 8 * ADV_DAY,
+            ADV_ANCHOR - 6 * ADV_DAY,
+        ]);
+        for walk in ADV_WALKS {
+            let zero = adv_scan(&dir, Some(0), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(zero.cfr_sample_commits, 1, "0 days reads as 7: {walk:?}");
+            let huge = adv_scan(&dir, Some(u32::MAX), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(
+                huge.cfr_sample_commits, 3,
+                "u32::MAX reads as 365: {walk:?}"
+            );
+            let none = adv_scan(&dir, None, 4_096, ADV_ANCHOR, walk);
+            assert_eq!(none.cfr_sample_commits, 2, "default 90 days: {walk:?}");
+        }
+    }
+
+    /// A commit exactly at the cutoff second is inside, one second older is
+    /// outside, on both walks, so the two can never disagree about it.
+    #[test]
+    fn dora_cutoff_second_is_inclusive_and_identical_on_both_walks() {
+        let since = ADV_ANCHOR - 90 * ADV_DAY;
+        let dir = adv_repo_with_dates(&[since - 1, since, since + 1]);
+        for walk in ADV_WALKS {
+            let report = adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(report.cfr_sample_commits, 2, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_on_an_unborn_head_is_an_empty_answer_on_both_walks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for walk in ADV_WALKS {
+            let report = adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert_eq!(report.cfr_sample_commits, 0, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    #[test]
+    fn dora_on_a_shallow_clone_counts_what_is_there_on_both_walks() {
+        let source = adv_repo_with_dates(&[
+            ADV_ANCHOR - 30 * ADV_DAY,
+            ADV_ANCHOR - 20 * ADV_DAY,
+            ADV_ANCHOR - 10 * ADV_DAY,
+        ]);
+        let parent = tempfile::TempDir::new().unwrap();
+        git_in(
+            parent.path(),
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &format!("file://{}", source.path().display()),
+                "shallow",
+            ],
+        );
+        let shallow = parent.path().join("shallow");
+        crate::test_support::trust_repo(&shallow);
+        assert!(
+            shallow.join(".git/shallow").is_file(),
+            "fixture: a shallow clone"
+        );
+        for walk in ADV_WALKS {
+            let report = GitReader::dora_report_scanning(
+                shallow.to_str().unwrap(),
+                Some(90),
+                4_096,
+                ADV_ANCHOR,
+                walk,
+            )
+            .unwrap();
+            assert_eq!(report.cfr_sample_commits, 1, "{walk:?}");
+            assert!(!report.commit_scan_truncated, "{walk:?}");
+        }
+    }
+
+    /// Cap 1 and cap 0 never panic and always claim the cut when in-window
+    /// commits were left behind; the true count appears only where it is known.
+    #[test]
+    fn dora_caps_of_one_and_zero_report_a_cut_and_do_not_panic() {
+        let dir = adv_repo_with_dates(&[
+            ADV_ANCHOR - 40 * ADV_DAY,
+            ADV_ANCHOR - 30 * ADV_DAY,
+            ADV_ANCHOR - 3 * ADV_DAY,
+            ADV_ANCHOR - 100,
+        ]);
+        for walk in ADV_WALKS {
+            let one = adv_scan(&dir, Some(90), 1, ADV_ANCHOR, walk);
+            assert_eq!(one.cfr_sample_commits, 1, "{walk:?}");
+            assert!(one.commit_scan_truncated, "{walk:?}");
+            let zero = adv_scan(&dir, Some(90), 0, ADV_ANCHOR, walk);
+            assert_eq!(zero.cfr_sample_commits, 0, "{walk:?}");
+            assert!(zero.commit_scan_truncated, "{walk:?}");
+            let exact = adv_scan(&dir, Some(90), 4, ADV_ANCHOR, walk);
+            assert!(
+                !exact.commit_scan_truncated,
+                "cap equal to the window: {walk:?}"
+            );
+        }
+        let known = adv_scan(&dir, Some(90), 1, ADV_ANCHOR, DateWalk::SinceAsFilter);
+        assert_eq!(known.commit_scan_window_commits, Some(4));
+    }
+
+    /// The fallback once judged truncation by the row just past the cap alone.
+    /// When that row is the inverted-date commit (old), in-window commits behind
+    /// it are unread, so any row past the cap is now reported as a cut window.
+    #[test]
+    fn the_count_bounded_walk_reports_a_cut_window_when_the_row_past_the_cap_is_inverted() {
+        let anchor = ADV_ANCHOR;
+        let dir = inverted_date_repo(anchor);
+        // Walk order is today, d3, d30, inverted, d40: cap 3 leaves `inverted`
+        // as the probe row and d40 (in the window) unread.
+        let report = adv_scan(&dir, Some(90), 3, anchor, DateWalk::CountBounded);
+        assert_eq!(report.cfr_sample_commits, 3);
+        assert!(
+            report.commit_scan_truncated,
+            "d40 is in the window and was not read, but the report says the scan was complete"
+        );
+        // The filtered walk gets the same history right.
+        let filtered = adv_scan(&dir, Some(90), 3, anchor, DateWalk::SinceAsFilter);
+        assert!(filtered.commit_scan_truncated);
+    }
+
+    /// `now` close to the epoch makes the cutoff negative: both walks must
+    /// still accept the flag and count the same commits.
+    #[test]
+    fn dora_with_a_negative_cutoff_agrees_on_both_walks() {
+        let dir = adv_repo_with_dates(&[ADV_ANCHOR - 2 * ADV_DAY, ADV_ANCHOR]);
+        let counts: Vec<usize> = ADV_WALKS
+            .iter()
+            .map(|walk| adv_scan(&dir, Some(90), 4_096, 100, *walk).cfr_sample_commits)
+            .collect();
+        assert_eq!(counts, vec![2, 2], "{counts:?}");
+    }
+
+    /// Dates that make the committer clock jump back and forth: both walks see
+    /// the same set.
+    #[test]
+    fn dora_zigzag_committer_dates_give_the_same_sample_on_both_walks() {
+        let since = ADV_ANCHOR - 90 * ADV_DAY;
+        let dates: Vec<i64> = (0..40)
+            .map(|n| {
+                if n % 2 == 0 {
+                    since - 1 - n
+                } else {
+                    since + 1 + n
+                }
+            })
+            .collect();
+        let dir = adv_repo_with_dates(&dates);
+        let samples: Vec<usize> = ADV_WALKS
+            .iter()
+            .map(|walk| adv_scan(&dir, Some(90), 4_096, ADV_ANCHOR, *walk).cfr_sample_commits)
+            .collect();
+        assert_eq!(samples, vec![20, 20], "{samples:?}");
+    }
+
+    // ---- CARD 20 adversarial review ------------------------------------
+
+    fn adv_lookups(repo: &Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
+            .count()
+    }
+
+    /// Attack 1: `include.path` is not stamped. The doc says the 60 s TTL
+    /// bounds it, but a destructive caller's "uncached" compute_default_base
+    /// reads `config --list` and HEAD through the ref cache too.
+    #[test]
+    fn include_file_change_is_seen_by_the_uncached_base_and_bounded_by_the_ttl_on_the_cached() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
+        let include = tempfile::TempDir::new().unwrap();
+        let inc = include.path().join("inc.cfg");
+        std::fs::write(&inc, "[checkout]\n\tdefaultRemote = origin\n").unwrap();
+        git_in(&repo, &["config", "include.path", inc.to_str().unwrap()]);
+        ref_cache::eager(|| {
+            assert_eq!(default_base(&repo).remote, "origin");
+            assert_eq!(compute_default_base(&repo).remote, "origin");
+            std::fs::write(&inc, "[checkout]\n\tdefaultRemote = upstream\n").unwrap();
+            assert_eq!(
+                compute_default_base(&repo).remote,
+                "upstream",
+                "compute_default_base ('uncached', used by the destructive merge) served the pre-include remote"
+            );
+            // Converted by ruling from "the cached path sees the include
+            // change at once": no stamp covers an included file, so the
+            // display path serves the kept answer until its 60 s TTL. That
+            // admitted gap is documented at `default_base`; this pins it, and
+            // the assertion above is what a destructive caller relies on.
+            assert_eq!(
+                default_base(&repo).remote,
+                "origin",
+                "the cached answer is bounded by the TTL, not by the include file"
+            );
+        });
+    }
+
+    /// Attack 1: set-head, local config, packed-refs rewrites and a deleted
+    /// default are each seen while warm.
+    #[test]
+    fn adv_set_head_config_packed_and_delete_are_seen_while_warm() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+        );
+        ref_cache::eager(|| {
+            let name = |r: &Path| default_base(r).base.map(|(n, _)| n);
+            git_in(&repo, &["remote", "set-head", "origin", "main"]);
+            assert_eq!(name(&repo).as_deref(), Some("main"));
+            git_in(&repo, &["remote", "set-head", "origin", "develop"]);
+            assert_eq!(name(&repo).as_deref(), Some("develop"), "set-head not seen");
+            // Packed only, then advanced through packed-refs alone.
+            git_in(&repo, &["pack-refs", "--all"]);
+            assert_eq!(name(&repo).as_deref(), Some("develop"));
+            let moved = git_stdout(
+                &repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "m"],
+            );
+            git_in(&repo, &["update-ref", "refs/heads/develop", &moved]);
+            git_in(&repo, &["pack-refs", "--all"]);
+            assert_eq!(
+                default_base(&repo).base.map(|(_, o)| o),
+                Some(moved.clone()),
+                "packed-refs advance not seen"
+            );
+            git_in(&repo, &["branch", "-D", "develop"]);
+            assert_eq!(
+                default_base(&repo),
+                compute_default_base(&repo),
+                "delete while packed"
+            );
+            git_in(&repo, &["config", "checkout.defaultRemote", "nope"]);
+            assert_eq!(
+                default_base(&repo),
+                compute_default_base(&repo),
+                "config change"
+            );
+        });
+    }
+
+    /// Attack 1: two linked worktrees share a common dir but have private
+    /// HEADs; the answer for one must not be served to the other.
+    #[test]
+    fn adv_linked_worktrees_do_not_share_an_answer() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "develop"]);
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", "HEAD"],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
+        let parent = tempfile::TempDir::new().unwrap();
+        let linked = parent.path().join("wt");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane",
+                linked.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&linked);
+        let linked = linked.canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.lane.remote", "upstream"]);
+        ref_cache::eager(|| {
+            for _ in 0..2 {
+                let a = default_base(&repo);
+                let b = default_base(&linked);
+                assert_eq!(a.remote, "origin");
+                assert_eq!(
+                    b.remote, "upstream",
+                    "linked worktree got the primary's answer"
+                );
+                assert_eq!(a.base.as_ref().map(|x| x.0.as_str()), Some("main"));
+                assert_eq!(b.base.as_ref().map(|x| x.0.as_str()), Some("develop"));
+            }
+            // Re-point the lane's upstream: only the linked answer moves.
+            git_in(&repo, &["config", "branch.lane.remote", "origin"]);
+            assert_eq!(default_base(&linked), compute_default_base(&linked));
+            assert_eq!(default_base(&repo), compute_default_base(&repo));
+        });
+    }
+
+    /// Attack 2: a refusal of any one of the lookups is never kept, and an
+    /// unresolved default ("none") is not served once the default appears.
+    #[test]
+    fn adv_failed_lookups_and_none_are_not_kept() {
+        let _kept = ref_cache::retention();
+        for needle in ["symbolic-ref", "for-each-ref", "config"] {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            ref_cache::eager(|| {
+                let refused = crate::engine::git_cli::with_forced_spawn_failure_of(needle, || {
+                    default_base(&repo)
+                });
+                assert!(
+                    refused.incomplete.is_some(),
+                    "{needle}: refusal not reported: {refused:?}"
+                );
+                let after = default_base(&repo);
+                assert!(after.incomplete.is_none(), "{needle}: {after:?}");
+                assert_eq!(
+                    after.base.as_ref().map(|b| b.0.as_str()),
+                    Some("main"),
+                    "{needle}: a refused answer was kept"
+                );
+            });
+        }
+        let dir = init_repo_with_remotes(&[], "feature");
+        let repo = dir.path().canonicalize().unwrap();
+        ref_cache::eager(|| {
+            assert_eq!(default_base(&repo).base, None);
+            git_in(&repo, &["branch", "main"]);
+            assert_eq!(
+                default_base(&repo).base.map(|b| b.0),
+                Some("main".to_string()),
+                "a 'no default' answer outlived the default appearing"
+            );
+        });
+    }
+
+    /// Attack 2: many threads at once, each with no racy window: one lookup
+    /// and one answer.
+    #[test]
+    fn adv_sixteen_threads_one_computation_no_torn_answer() {
+        let _kept = ref_cache::retention();
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let expected = compute_default_base(&repo);
+        let before = adv_lookups(&repo);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let repo = repo.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ref_cache::eager(|| default_base(&repo))
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), expected, "torn answer");
+        }
+        assert_eq!(adv_lookups(&repo) - before, 1, "more than one computation");
+    }
+
+    /// Attack 5, pinned by ruling as a characterisation (it was asserting one
+    /// lookup): callers that arrive one after another inside the 3 s racy
+    /// window after a write each recompute, because a stamp cannot tell two
+    /// writes in one mtime tick apart and serving the last answer there is the
+    /// staleness the ref cache exists to prevent. The cost is bounded by the
+    /// number of calls, and every answer is correct.
+    #[test]
+    fn sequential_asks_on_a_just_written_repo_recompute_each_time_and_stay_correct() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let expected = compute_default_base(&repo);
+        let before = adv_lookups(&repo);
+        const CALLS: usize = 6;
+        for _ in 0..CALLS {
+            assert_eq!(default_base(&repo), expected);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let recomputed = adv_lookups(&repo) - before;
+        assert!(
+            (1..=CALLS).contains(&recomputed),
+            "{recomputed} computations for {CALLS} sequential asks"
+        );
+    }
+
+    // ---- adversarial tests for the one-path commit diff (bl/ccf03e33-adv) ----
+
+    /// `(additions, deletions)` of every `diff --git` section of a patch, in
+    /// order, counted only below the section's first hunk header so a header
+    /// line can never be mistaken for a content line.
+    fn adv_section_counts(patch: &str) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut in_hunk = false;
+        for line in patch.split_inclusive('\n') {
+            if line.starts_with("diff --git ") {
+                out.push((0, 0));
+                in_hunk = false;
+            } else if line.starts_with("@@") {
+                in_hunk = true;
+            } else if in_hunk {
+                if let Some(last) = out.last_mut() {
+                    if line.starts_with('+') {
+                        last.0 += 1;
+                    } else if line.starts_with('-') {
+                        last.1 += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every row the file list shows, opened one path at a time, must open one
+    /// section with the list's counts, and the multiset of the whole commit's
+    /// section counts must be the list's. Returns the problems found.
+    fn adv_agreement_problems(path: &str, oid: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        let listed = GitReader::get_commit_files(path, oid).expect("list");
+        let whole = GitReader::get_commit_diff(path, oid).expect("whole");
+        let mut from_whole = adv_section_counts(&whole.text);
+        let mut from_list: Vec<(usize, usize)> =
+            listed.iter().map(|f| (f.additions, f.deletions)).collect();
+        from_whole.sort_unstable();
+        from_list.sort_unstable();
+        if from_whole != from_list {
+            problems.push(format!("whole {from_whole:?} vs list {from_list:?}"));
+        }
+        for row in &listed {
+            let one = match GitReader::get_commit_file_diff(path, oid, &row.path) {
+                Ok(one) => one,
+                Err(err) => {
+                    problems.push(format!("{:?}: error {err}", row.path));
+                    continue;
+                }
+            };
+            let sections = adv_section_counts(&one.text);
+            if sections != [(row.additions, row.deletions)] {
+                problems.push(format!(
+                    "{:?}: one-path sections {sections:?} (truncated {}) vs list ({}, {})\n{}",
+                    row.path,
+                    one.truncated,
+                    row.additions,
+                    row.deletions,
+                    one.text
+                        .lines()
+                        .filter(|l| l.starts_with("diff --git")
+                            || l.starts_with("copy ")
+                            || l.starts_with("rename "))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+        problems
+    }
+
+    fn adv_tracked(dir: &Path) -> Vec<String> {
+        let out = git_output(dir, &["ls-files", "-z"]);
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn adv_commit(dir: &Path, msg: &str) {
+        git_output(dir, &["add", "-A"]);
+        git_output(dir, &["commit", "-q", "--allow-empty", "-m", msg]);
+    }
+
+    struct AdvRng(u64);
+    impl AdvRng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn adv_body(family: usize, tweak: usize) -> String {
+        let mut text = String::new();
+        for i in 0..14 {
+            if tweak > 0 && i == tweak % 14 {
+                text.push_str(&format!("tweak {tweak}\n"));
+            } else {
+                text.push_str(&format!(
+                    "family {family} line {i} with some padding text\n"
+                ));
+            }
+        }
+        text
+    }
+
+    const ADV_NAMES: &[&str] = &[
+        "a.txt",
+        "b c.txt",
+        "d b/e.txt",
+        "rename to x.txt",
+        "t\tab.txt",
+        "q\"uote.txt",
+        "back\\slash.txt",
+        "caf\u{e9}.txt",
+        "trail .txt",
+        "\"lead.txt",
+        "new\nline.txt",
+        "copy to y.txt",
+    ];
+
+    fn adv_pick_new(rng: &mut AdvRng, taken: &[String]) -> String {
+        loop {
+            let dirs = ["", "pkg/", "pkg2/"];
+            let name = format!(
+                "{}{}",
+                dirs[rng.below(dirs.len())],
+                ADV_NAMES[rng.below(ADV_NAMES.len())]
+            );
+            if !taken.contains(&name) {
+                return name;
+            }
+            if taken.len() > ADV_NAMES.len() * 3 - 2 {
+                return format!("overflow{}.txt", taken.len());
+            }
+        }
+    }
+
+    fn adv_write(dir: &Path, name: &str, body: &str) {
+        let file = dir.join(name);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(file, body).unwrap();
+    }
+
+    /// One random change to the working tree.
+    fn adv_random_op(dir: &Path, rng: &mut AdvRng) {
+        let tracked: Vec<String> = adv_tracked(dir)
+            .into_iter()
+            .filter(|name| dir.join(name).is_file())
+            .collect();
+        let existing = |rng: &mut AdvRng| tracked[rng.below(tracked.len())].clone();
+        match if tracked.is_empty() { 0 } else { rng.below(8) } {
+            0 => {
+                let name = adv_pick_new(rng, &tracked);
+                adv_write(dir, &name, &adv_body(rng.below(3), 0));
+            }
+            1 => {
+                let name = existing(rng);
+                adv_write(dir, &name, &adv_body(rng.below(3), 1 + rng.below(20)));
+            }
+            2 => {
+                let name = existing(rng);
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+            3 | 4 => {
+                let old = existing(rng);
+                let new = adv_pick_new(rng, &tracked);
+                adv_write(dir, &new, &std::fs::read_to_string(dir.join(&old)).unwrap());
+                std::fs::remove_file(dir.join(&old)).unwrap();
+                if rng.below(3) == 0 {
+                    adv_write(dir, &new, &adv_body(rng.below(3), 1 + rng.below(20)));
+                }
+                if rng.below(4) == 0 {
+                    // the old name comes back as another file
+                    adv_write(dir, &old, &adv_body(rng.below(3), 7));
+                }
+            }
+            5 => {
+                let src = existing(rng);
+                let copy = adv_pick_new(rng, &tracked);
+                adv_write(
+                    dir,
+                    &copy,
+                    &std::fs::read_to_string(dir.join(&src)).unwrap(),
+                );
+                if rng.below(2) == 0 {
+                    adv_write(dir, &src, &adv_body(rng.below(3), 1 + rng.below(20)));
+                }
+            }
+            6 if tracked.len() >= 2 => {
+                let a = existing(rng);
+                let b = existing(rng);
+                if a != b {
+                    let ta = std::fs::read_to_string(dir.join(&a)).unwrap();
+                    let tb = std::fs::read_to_string(dir.join(&b)).unwrap();
+                    std::fs::write(dir.join(&a), tb).unwrap();
+                    std::fs::write(dir.join(&b), ta).unwrap();
+                }
+            }
+            _ => {
+                // move a whole directory
+                let from = if rng.below(2) == 0 { "pkg" } else { "pkg2" };
+                let to = if from == "pkg" { "pkg2" } else { "pkg" };
+                if dir.join(from).is_dir() && !dir.join(to).exists() {
+                    std::fs::rename(dir.join(from), dir.join(to)).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The seeded agreement oracle over renames, copies, edits, deletes, adds,
+    /// swaps, directory moves and merges, with copy detection on or off.
+    fn adv_run_oracle(seed: u64, copies: bool, steps: usize) -> Vec<String> {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        if copies {
+            git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        }
+        let mut rng = AdvRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        for i in 0..6 {
+            adv_write(
+                dir.path(),
+                &format!("{}seed{i}.txt", if i % 2 == 0 { "pkg/" } else { "" }),
+                &adv_body(i % 3, 0),
+            );
+        }
+        adv_commit(dir.path(), "seed files");
+        for step in 0..steps {
+            if rng.below(4) == 0 {
+                let side = format!("side{step}");
+                git_in(dir.path(), &["checkout", "-q", "-b", &side]);
+                for _ in 0..1 + rng.below(2) {
+                    adv_random_op(dir.path(), &mut rng);
+                    adv_commit(dir.path(), "side");
+                }
+                git_in(dir.path(), &["checkout", "-q", "main"]);
+                adv_random_op(dir.path(), &mut rng);
+                adv_commit(dir.path(), "main");
+                let merged = git_output(
+                    dir.path(),
+                    &["merge", "--no-ff", "-q", &side, "-m", "merge"],
+                );
+                if !merged.status.success() {
+                    git_output(dir.path(), &["merge", "--abort"]);
+                }
+            } else {
+                for _ in 0..1 + rng.below(2) {
+                    adv_random_op(dir.path(), &mut rng);
+                }
+                adv_commit(dir.path(), "step");
+            }
+        }
+        let revs = git_output(dir.path(), &["rev-list", "--all"]);
+        let mut problems = Vec::new();
+        for oid in String::from_utf8_lossy(&revs.stdout).lines() {
+            for problem in adv_agreement_problems(path, oid) {
+                problems.push(format!("seed {seed} copies {copies} {oid}: {problem}"));
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn adv_oracle_one_path_view_agrees_with_list_and_whole_commit() {
+        let mut problems = Vec::new();
+        for seed in 1..=14u64 {
+            problems.extend(adv_run_oracle(seed, seed % 2 == 0, 14));
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
+    /// A name git C-quotes (a tab, a newline, a backslash, a double quote, a
+    /// leading quote) must be read, not "kept": a kept unreadable section
+    /// leaks into another file's view and a quoted request must still match.
+    #[test]
+    fn adv_keep_sections_under_reads_c_quoted_names() {
+        let patch = "diff --git \"a/t\\tab.txt\" \"b/t\\tab.txt\"\nindex 1..2 100644\n--- \"a/t\\tab.txt\"\n+++ \"b/t\\tab.txt\"\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git a/other.txt b/other.txt\nnew file mode 100644\n--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1 @@\n+x\n\
+diff --git \"a/q\\\"uote.txt\" \"b/pkg/new\\nline.txt\"\nsimilarity index 90%\ncopy from \"q\\\"uote.txt\"\ncopy to \"pkg/new\\nline.txt\"\n@@ -1 +1 @@\n-1\n+2\n\
+diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0..1\n";
+        let sections = |path: &str| {
+            keep_sections_under(patch, path)
+                .matches("diff --git")
+                .count()
+        };
+        assert_eq!(sections("other.txt"), 1, "a quoted section leaked");
+        assert_eq!(sections("t\tab.txt"), 1);
+        assert_eq!(sections("pkg/new\nline.txt"), 1);
+        assert_eq!(
+            sections("pkg"),
+            1,
+            "a directory request leaks quoted sections"
+        );
+        assert_eq!(sections("\"lead.txt"), 1);
+        assert_eq!(sections("nothing.txt"), 0);
+    }
+
+    /// A binary notice names two paths in one line; a directory called
+    /// `z and b` must not make the file under it read as `y.bin`.
+    #[test]
+    fn adv_keep_sections_under_binary_notice_with_and_b_in_the_name() {
+        let patch = "diff --git a/z and b/y.bin b/z and b/y.bin\nnew file mode 100644\nindex 0..1\nBinary files /dev/null and b/z and b/y.bin differ\n";
+        assert_eq!(keep_sections_under(patch, "y.bin"), "", "misread as y.bin");
+        assert_eq!(keep_sections_under(patch, "z and b/y.bin"), patch);
+    }
+
+    /// Every awkward name, as a rename target and as an edited copy source on
+    /// a merge's second parent, must agree between list, whole and one path.
+    #[test]
+    fn adv_awkward_names_agree_as_rename_target_and_copy_source() {
+        let mut problems = Vec::new();
+        for name in ADV_NAMES {
+            let rename = init_repo_with_remotes(&[], "main");
+            let path = rename.path().to_str().unwrap();
+            let oid = merge_with_second_parent(
+                rename.path(),
+                &[("old.txt", EIGHT)],
+                |d| {
+                    adv_write(d, name, std::str::from_utf8(EIGHT).unwrap());
+                    std::fs::remove_file(d.join("old.txt")).unwrap();
+                    commit_all(d, "rename to the awkward name");
+                },
+                |_| {},
+            );
+            for p in adv_agreement_problems(path, &oid) {
+                problems.push(format!("rename to {name:?}: {p}"));
+            }
+
+            let copy = init_repo_with_remotes(&[], "main");
+            let path = copy.path().to_str().unwrap();
+            git_in(copy.path(), &["config", "diff.renames", "copies"]);
+            let oid = merge_with_second_parent(
+                copy.path(),
+                &[(name, EIGHT)],
+                |d| {
+                    adv_write(d, "a-copy.txt", std::str::from_utf8(EIGHT).unwrap());
+                    adv_write(d, name, "l1\nCHANGED\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                    commit_all(d, "copy from the awkward name, which is also edited");
+                },
+                |_| {},
+            );
+            for p in adv_agreement_problems(path, &oid) {
+                problems.push(format!("copy from {name:?}: {p}"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// `pkg` is not `pkg2`: each directory's request shows its own rows.
+    #[test]
+    fn adv_directory_request_does_not_take_a_prefix_sibling() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("pkg/s.txt", EIGHT), ("pkg2/t.txt", EIGHT)],
+            |d| {
+                adv_write(d, "pkg2/s.txt", std::str::from_utf8(EIGHT).unwrap());
+                adv_write(d, "pkg/s.txt", "l1\nEDIT\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                adv_write(d, "pkg/u.txt", "fresh\nfile\n");
+                commit_all(d, "copy across siblings");
+            },
+            |_| {},
+        );
+        let two = GitReader::get_commit_file_diff(path, &oid, "pkg2").expect("pkg2");
+        let sections = adv_section_counts(&two.text);
+        assert_eq!(sections.len(), 1, "pkg2 request: {}", two.text);
+        assert!(two.text.contains("copy from pkg/s.txt"), "{}", two.text);
+        let one = GitReader::get_commit_file_diff(path, &oid, "pkg").expect("pkg");
+        assert!(
+            !one.text.contains("pkg2/"),
+            "pkg request took pkg2: {}",
+            one.text
+        );
+    }
+
+    /// A directory rename of thousands of files requested as the directory:
+    /// the pairing must not put every source on one command line.
+    #[test]
+    fn adv_directory_rename_of_thousands_of_files_opens() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let long = "n".repeat(200);
+        for i in 0..6000 {
+            adv_write(
+                dir.path(),
+                &format!("pkg/{long}{i:05}.txt"),
+                &format!("file {i}\nbody\nbody\nbody\n"),
+            );
+        }
+        adv_commit(dir.path(), "many files");
+        std::fs::rename(dir.path().join("pkg"), dir.path().join("pkg2")).unwrap();
+        adv_commit(dir.path(), "move the directory");
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "pkg2");
+        let one = one.unwrap_or_else(|err| panic!("directory request failed: {err}"));
+        assert_eq!(
+            adv_section_counts(&one.text).len(),
+            6000,
+            "truncated {}",
+            one.truncated
+        );
+    }
+
+    /// A copy whose source is also rewritten by a huge edit that sorts first:
+    /// the paired read runs out of budget inside the source's section, and the
+    /// requested file must still open.
+    #[test]
+    fn adv_copy_whose_edited_source_eats_the_budget_still_opens() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        git_in(dir.path(), &["config", "diff.renames", "copies"]);
+        adv_write(dir.path(), "a.txt", std::str::from_utf8(EIGHT).unwrap());
+        adv_commit(dir.path(), "base");
+        let mut huge = String::from(std::str::from_utf8(EIGHT).unwrap());
+        for i in 0..400_000 {
+            huge.push_str(&format!("appended line number {i:08} padding padding\n"));
+        }
+        adv_write(dir.path(), "a.txt", &huge);
+        adv_write(dir.path(), "z.txt", std::str::from_utf8(EIGHT).unwrap());
+        adv_commit(dir.path(), "copy z from a while a grows enormous");
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let one = GitReader::get_commit_file_diff(path, &oid, "z.txt").expect("z");
+        assert_eq!(
+            adv_section_counts(&one.text).len(),
+            1,
+            "z.txt opened {} bytes, truncated {}",
+            one.text.len(),
+            one.truncated
+        );
+    }
+
+    /// A rename on the second parent with edits on both sides, and an octopus
+    /// merge with a rename on each of two side branches.
+    #[test]
+    fn adv_conflicting_edit_and_octopus_merges_agree() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let oid = merge_with_second_parent(
+            dir.path(),
+            &[("old.txt", EIGHT), ("c.txt", EIGHT)],
+            |d| {
+                git_in(d, &["mv", "old.txt", "new.txt"]);
+                adv_write(d, "new.txt", "l1\nSIDE\nl3\nl4\nl5\nl6\nl7\nl8\n");
+                commit_all(d, "rename and edit on the side");
+            },
+            |d| {
+                adv_write(d, "old.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nMAIN\n");
+            },
+        );
+        assert_eq!(
+            adv_agreement_problems(path, &oid),
+            Vec::<String>::new(),
+            "rename + edits both sides"
+        );
+        assert_rename_pairs(path, &oid, "new.txt", "old.txt", "conflicting edits");
+
+        git_in(dir.path(), &["checkout", "-q", "-b", "o1"]);
+        git_in(dir.path(), &["mv", "c.txt", "d.txt"]);
+        commit_all(dir.path(), "o1 renames c");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "o2"]);
+        adv_write(dir.path(), "e.txt", std::str::from_utf8(EIGHT).unwrap());
+        git_in(dir.path(), &["mv", "new.txt", "f.txt"]);
+        commit_all(dir.path(), "o2 renames new and adds e");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        adv_write(dir.path(), "m.txt", "m\n");
+        commit_all(dir.path(), "main moves on");
+        git_in(
+            dir.path(),
+            &["merge", "-q", "--no-ff", "o1", "o2", "-m", "octopus"],
+        );
+        let octo = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(
+            adv_agreement_problems(path, &octo),
+            Vec::<String>::new(),
+            "octopus"
+        );
+    }
+
+    /// The viewer prints "This diff " before the reason, so a cut rename list
+    /// must read as a sentence there, and must not replace a reason the read
+    /// itself already gave.
+    #[test]
+    fn a_cut_rename_list_reason_reads_after_this_diff() {
+        let whole = DiffPayload {
+            text: "diff --git a/x b/x\n".to_string(),
+            truncated: false,
+            truncation_reason: None,
+        };
+        let marked = GitReader::note_pairing_list_cut(
+            whole.clone(),
+            Some(git_cli::Incomplete::OverCap(4 * 1024 * 1024).describe()),
+        );
+        assert!(marked.truncated);
+        let reason = marked.truncation_reason.unwrap();
+        assert!(
+            reason.starts_with("may show a renamed file as added: "),
+            "This diff {reason}"
+        );
+        assert_eq!(marked.text, whole.text, "the text is untouched");
+        let already = DiffPayload {
+            truncated: true,
+            truncation_reason: Some("could not be read to the end (eof)".to_string()),
+            ..whole.clone()
+        };
+        let kept = GitReader::note_pairing_list_cut(already, Some("x".to_string()));
+        assert_eq!(
+            kept.truncation_reason.as_deref(),
+            Some("could not be read to the end (eof)")
+        );
+        let untouched = GitReader::note_pairing_list_cut(whole.clone(), None);
+        assert_eq!(
+            (
+                untouched.text,
+                untouched.truncated,
+                untouched.truncation_reason
+            ),
+            (whole.text, false, None)
+        );
+    }
+
+    /// A cut read reduced to a request: empty means "the cut hid it" (None),
+    /// a file read whole stays whole, a directory or a cut inside the
+    /// request's own section stays cut, and a cut pairing list marks the
+    /// payload.
+    #[test]
+    fn adv_keep_payload_under_keeps_the_truncated_flag_honest() {
+        let sec = |name: &str| {
+            format!("diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+x\n")
+        };
+        let cut = |text: String| DiffPayload {
+            text,
+            truncated: true,
+            truncation_reason: Some("exceeded 8 MB".into()),
+        };
+        // Cut inside another file before the request: nothing to show.
+        assert!(keep_payload_under(cut(sec("a.txt")), "z.txt").is_none());
+        // The request's own section precedes the cut inside a source: whole.
+        let whole = keep_payload_under(cut(format!("{}{}", sec("a.txt"), sec("b.txt"))), "a.txt")
+            .expect("kept");
+        assert!(
+            !whole.truncated && whole.truncation_reason.is_none(),
+            "{whole:?}"
+        );
+        // The cut is inside the request itself: still cut.
+        let inside =
+            keep_payload_under(cut(format!("{}{}", sec("b.txt"), sec("pkg/a.txt"))), "pkg")
+                .expect("kept");
+        assert!(inside.truncated, "{inside:?}");
+        // A directory's later files may be past the cut: still cut.
+        let dir = keep_payload_under(cut(format!("{}{}", sec("pkg/a.txt"), sec("zz.txt"))), "pkg")
+            .expect("kept");
+        assert!(dir.truncated, "{dir:?}");
+        let marked = GitReader::note_pairing_list_cut(
+            DiffPayload {
+                text: String::new(),
+                truncated: false,
+                truncation_reason: None,
+            },
+            Some("exceeded 4 MB".into()),
+        );
+        assert!(
+            marked.truncated && marked.truncation_reason.is_some(),
+            "{marked:?}"
+        );
+    }
+
+    /// An evil merge: a rename that exists only in the merge commit's own
+    /// content change (committed with `--amend` after a clean merge).
+    #[test]
+    fn adv_evil_merge_rename_agrees() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        merge_with_second_parent(
+            dir.path(),
+            &[("keep.txt", EIGHT), ("old.txt", EIGHT)],
+            |d| {
+                adv_write(d, "side.txt", "s\n");
+                commit_all(d, "side");
+            },
+            |_| {},
+        );
+        git_in(dir.path(), &["mv", "old.txt", "evil.txt"]);
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-q", "--amend", "--no-edit"]);
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        assert_eq!(
+            adv_agreement_problems(path, &oid),
+            Vec::<String>::new(),
+            "evil merge"
+        );
+        assert_rename_pairs(path, &oid, "evil.txt", "old.txt", "evil merge");
     }
 }

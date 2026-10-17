@@ -44,6 +44,8 @@ export interface LedgerStatus {
   recording: boolean;
   path: string;
   dropped: number;
+  /** Bind/unbind writes whose catch-up failed or was cut short; not a dropped append. */
+  catch_up_failures?: number;
   error: string;
   error_code: string;
 }

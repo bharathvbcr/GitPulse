@@ -4,6 +4,7 @@ import {
   computeWindow,
   ensureNonEmptyWindow,
 } from "./virtualWindow";
+import { mulberry32 } from "../__tests__/prng";
 
 /**
  * Invariants for every cell of the adversarial grid:
@@ -175,17 +176,6 @@ function expectPostClampInvariants(
 }
 
 describe("clampScrollTop stress: shrink/grow cycles under deep scrolls", () => {
-  /** Deterministic mulberry32 — a failure must be exactly reproducible. */
-  function mulberry32(seed: number): () => number {
-    let state = seed | 0;
-    return () => {
-      state = (state + 0x6d2b79f5) | 0;
-      let t = Math.imul(state ^ (state >>> 15), 1 | state);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-  }
-
   it("renders at least one row across 2,000 randomized shrink/grow frames", () => {
     const rand = mulberry32(0x1f2e3d4c);
     const rowHeights = [20, 24.4, 0.5];

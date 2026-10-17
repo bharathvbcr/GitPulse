@@ -64,6 +64,94 @@ pub fn iso8601_utc(ms: u64) -> String {
     )
 }
 
+/// Epoch milliseconds of a strict ISO-8601 instant, the inverse of
+/// [`iso8601_utc`] for the forms an agent or a log writes: `YYYY-MM-DDTHH:MM:SS`,
+/// then an optional `.` and 1 to 9 fraction digits (truncated to milliseconds),
+/// then `Z` or a `±HH:MM` offset, which is converted to UTC.
+///
+/// `None` for anything else: a lowercase `t` or `z`, a missing offset (a local
+/// time names no instant), an impossible date or a leap second, an offset past
+/// 23:59, or an instant before the epoch. A caller that must keep going treats
+/// `None` as "this record's time is not known", never as "now".
+pub fn parse_event_time(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    let number = |from: usize, to: usize| -> Option<i64> {
+        let part = bytes.get(from..to)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| part.iter().fold(0i64, |n, d| n * 10 + i64::from(d - b'0')))
+    };
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if !separators
+        .iter()
+        .all(|(at, sep)| bytes.get(*at) == Some(sep))
+    {
+        return None;
+    }
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let mut at = 19;
+    let mut millis = 0i64;
+    if bytes.get(at) == Some(&b'.') {
+        let fraction = bytes[at + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if !(1..=9).contains(&fraction) {
+            return None;
+        }
+        for place in 0..3 {
+            let digit = bytes.get(at + 1 + place).filter(|_| place < fraction);
+            millis = millis * 10 + digit.map_or(0, |d| i64::from(d - b'0'));
+        }
+        at += 1 + fraction;
+    }
+    let offset_secs = match &bytes[at..] {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (hours, minutes) = (number(at + 1, at + 3)?, number(at + 4, at + 6)?);
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let magnitude = hours * 3600 + minutes * 60;
+            if *sign == b'+' {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+        _ => return None,
+    };
+
+    let local_secs =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    let utc_ms = (local_secs - offset_secs) * 1000 + millis;
+    u64::try_from(utc_ms).ok()
+}
+
+/// A civil (year, month, day) to days since 1970-01-01: the inverse of
+/// [`civil_from_days`], from the same algorithm.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Days since 1970-01-01 to a civil (year, month, day).
 ///
 /// Howard Hinnant's algorithm. It is exact for the whole representable range,
@@ -215,6 +303,70 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "ulids from one process must ascend");
+    }
+
+    #[test]
+    fn parsing_is_the_inverse_of_formatting() {
+        for ms in [
+            0u64,
+            999,
+            951_782_400_000,   // 2000-02-29, a 400-year leap day
+            1_709_164_800_000, // 2024-02-29
+            1_788_957_296_789,
+            4_107_456_000_123,
+        ] {
+            assert_eq!(parse_event_time(&iso8601_utc(ms)), Some(ms), "{ms}");
+        }
+    }
+
+    #[test]
+    fn offsets_are_converted_and_fractions_truncated_to_milliseconds() {
+        let utc = parse_event_time("2026-09-01T12:00:05.250Z").unwrap();
+        assert_eq!(parse_event_time("2026-09-01T14:00:05.250+02:00"), Some(utc));
+        assert_eq!(parse_event_time("2026-09-01T07:30:05.250-04:30"), Some(utc));
+        assert_eq!(parse_event_time("2026-09-01T12:00:05.2509999Z"), Some(utc));
+        assert_eq!(parse_event_time("2026-09-01T12:00:05.25Z"), Some(utc));
+        assert_eq!(
+            parse_event_time("2026-09-01T12:00:05.123456789Z"),
+            Some(utc - 250 + 123)
+        );
+        assert_eq!(parse_event_time("2026-09-01T12:00:05Z"), Some(utc - 250));
+        // A date line shift through the offset.
+        assert_eq!(
+            parse_event_time("2026-01-01T00:30:00+01:00"),
+            parse_event_time("2025-12-31T23:30:00Z")
+        );
+    }
+
+    #[test]
+    fn anything_else_is_not_a_time() {
+        for bad in [
+            "",
+            "yesterday",
+            "2026-09-01",
+            "2026-09-01T12:00:05",             // local time: no instant
+            "2026-09-01 12:00:05Z",            // not the `T` form
+            "2026-09-01t12:00:05z",            // lowercase
+            "2026-09-01T12:00:05.Z",           // a dot with no digits
+            "2026-09-01T12:00:05.1234567890Z", // ten fraction digits
+            "2026-09-01T12:00:05+0200",        // offset without a colon
+            "2026-09-01T12:00:05+24:00",       // offset past a day
+            "2026-09-01T12:00:05+01:60",
+            "2026-02-29T12:00:05Z", // 2026 is no leap year
+            "2026-13-01T12:00:05Z",
+            "2026-00-10T12:00:05Z",
+            "2026-09-31T12:00:05Z",
+            "2026-09-01T24:00:00Z",
+            "2026-09-01T12:60:00Z",
+            "2026-09-01T12:00:60Z", // a leap second names no millisecond
+            "1969-12-31T23:59:59Z", // before the epoch
+            "2026-09-01T12:00:05Z ",
+            "+2026-09-01T12:00:05Z",
+            "2026-09-01T12:00:05\u{2014}01:00",
+            "\u{1F680}026-09-01T12:00:05Z",
+        ] {
+            assert_eq!(parse_event_time(bad), None, "{bad:?} should not parse");
+        }
     }
 
     #[test]

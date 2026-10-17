@@ -41,13 +41,15 @@ use std::path::Path;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::cancel::Cancel;
+
 /// How much of the tree the client scan may read.
 ///
 /// The Python scans every file in the graph, whole, with no cap on count or
 /// size — 2,363 files on this repository, re-read from scratch by `route_map`,
 /// again by `shape_check`, and twice more by `api_impact`, which calls both.
 /// A view that walks the tree needs a bound, and a bound needs to be reported.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct ScanBudget {
     /// Files opened before the scan stops.
     pub max_files: usize,
@@ -56,6 +58,10 @@ pub struct ScanBudget {
     pub max_file_bytes: u64,
     /// Call sites kept.
     pub max_sites: usize,
+    /// The caller's "stop": consulted before each file is opened, so a scan
+    /// whose caller has gone stops reading rather than walking the whole
+    /// file and byte cap for nobody. The default is a flag nobody trips.
+    pub cancel: Cancel,
 }
 
 impl Default for ScanBudget {
@@ -64,7 +70,20 @@ impl Default for ScanBudget {
             max_files: 5_000,
             max_file_bytes: 1 << 20,
             max_sites: 2_000,
+            cancel: Cancel::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for ScanBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScanBudget")
+            .field("max_files", &self.max_files)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("max_sites", &self.max_sites)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .finish()
     }
 }
 
@@ -83,17 +102,34 @@ pub struct ScanReport {
     pub files_over_size: usize,
     pub files_unreadable: usize,
     pub files_skipped_budget: usize,
+    /// Files never opened because the caller cancelled. Counted apart from
+    /// the budget: "you stopped waiting" is a different reason from "the cap
+    /// was reached", and both mean the scan did not finish.
+    pub files_skipped_cancelled: usize,
+    pub cancelled: bool,
     pub sites_found: usize,
     pub sites_dropped_budget: usize,
+    /// Client call sites seen whose URL this scan cannot read: `fetch(url)`,
+    /// `apiClient.get(path)` — a variable or an expression where a literal
+    /// would be. Each could be the consumer of any route, so a scan that met
+    /// one is not complete, whatever it matched elsewhere.
+    pub sites_unreadable_shape: usize,
+    /// The first few of them, `path:line`, so a reader can look.
+    pub unreadable_shape_examples: Vec<String>,
 }
+
+/// How many unreadable call sites are named in a report.
+const UNREADABLE_EXAMPLES: usize = 5;
 
 impl ScanReport {
     fn complete(&self) -> bool {
         self.files_skipped_budget == 0
+            && !self.cancelled
             && self.sites_dropped_budget == 0
             && self.files_unreadable == 0
             && self.files_over_size == 0
             && self.handler_sources_unavailable == 0
+            && self.sites_unreadable_shape == 0
     }
 
     fn to_json(&self) -> Value {
@@ -107,8 +143,12 @@ impl ScanReport {
             "files_over_size": self.files_over_size,
             "files_unreadable": self.files_unreadable,
             "files_skipped_budget": self.files_skipped_budget,
+            "files_skipped_cancelled": self.files_skipped_cancelled,
+            "cancelled": self.cancelled,
             "sites_found": self.sites_found,
             "sites_dropped_budget": self.sites_dropped_budget,
+            "sites_unreadable_shape": self.sites_unreadable_shape,
+            "unreadable_shape_examples": self.unreadable_shape_examples,
             // The one field a caller must branch on: with this false, an empty
             // consumer list means "we stopped looking", not "nothing calls it".
             "complete": self.complete(),
@@ -163,8 +203,14 @@ pub fn normalize_route_path(path: &str) -> String {
     param_re().replace_all(&anchored, "*").into_owned()
 }
 
+/// A request path without its query string or fragment: `/papers?q=${q}` asks
+/// for `/papers`.
+fn without_query(path: &str) -> &str {
+    path.split(['?', '#']).next().unwrap_or(path)
+}
+
 fn segments(path: &str) -> Vec<String> {
-    normalize_route_path(path)
+    normalize_route_path(without_query(path))
         .split('/')
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -194,7 +240,9 @@ pub fn verbs_compatible(route_verb: &str, fetch_verb: &str) -> bool {
     } else {
         fetch_verb.to_ascii_uppercase()
     };
-    if matches!(rv.as_str(), "ANY" | "FILE" | "ROUTE") {
+    // `ANY` on the client side is a verb the call site did not state as a
+    // literal (`method: verb`): it could be any of them.
+    if fv == "ANY" || matches!(rv.as_str(), "ANY" | "FILE" | "ROUTE") {
         return true;
     }
     if fv == "GET" && matches!(rv.as_str(), "GET" | "HEAD") {
@@ -208,9 +256,10 @@ pub fn verbs_compatible(route_verb: &str, fetch_verb: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 struct SitePatterns {
-    fetch_literal: Regex,
-    fetch_template: Regex,
+    fetch_open: Regex,
+    fetch_method: Regex,
     verbed: Regex,
+    wrapper_open: Regex,
     resp_var: Regex,
     json_var: Regex,
     destructure: Regex,
@@ -221,8 +270,19 @@ struct SitePatterns {
 fn patterns() -> &'static SitePatterns {
     static P: std::sync::OnceLock<SitePatterns> = std::sync::OnceLock::new();
     P.get_or_init(|| SitePatterns {
-        fetch_literal: Regex::new(r#"(?i)fetch\s*\(\s*['"]([^'"]+)['"]"#).unwrap(),
-        fetch_template: Regex::new(r"(?i)fetch\s*\(\s*`([^`]+)`").unwrap(),
+        // The open paren of a `fetch(` call, not its argument: the URL and the
+        // `{ method: 'POST' }` that follows it are both read from the call's own
+        // text, which may run over several lines.
+        fetch_open: Regex::new(r"(?i)\bfetch\s*\(").unwrap(),
+        fetch_method: Regex::new(r#"(?i)\bmethod\s*:\s*(?:(['"`])(\w+)['"`])?"#).unwrap(),
+        // `apiClient.get(`, `this.http.post<T>(`, `client.delete(`: a wrapper
+        // over fetch/axios named like an HTTP client. Named, not any receiver:
+        // `router.get('/x', handler)` *declares* a route and `cache.get(key)` is
+        // no request, and both would be read as consumers.
+        wrapper_open: Regex::new(
+            r"(?i)\b([\w$]*(?:client|api|http|fetcher|requester|request|ky|got|superagent)[\w$]*)\s*\.\s*(get|post|put|patch|delete)\s*(?:<[^()]*>)?\s*\(",
+        )
+        .unwrap(),
         // One pattern for axios/requests/httpx rather than three that differ
         // only in the library name.
         verbed: Regex::new(
@@ -301,7 +361,12 @@ fn scan_sites(
     let mut sites: Vec<Site> = Vec::new();
     let mut sources = BTreeMap::new();
 
-    for rel in &files {
+    for (position, rel) in files.iter().enumerate() {
+        if budget.cancel.check().is_err() {
+            report.cancelled = true;
+            report.files_skipped_cancelled = files.len() - position;
+            break;
+        }
         if report.files_attempted >= budget.max_files.min(5_000)
             || report.source_bytes_read >= SOURCE_BYTES_LIMIT
         {
@@ -336,14 +401,45 @@ fn scan_sites(
 
         for (index, line) in lines.iter().enumerate() {
             let mut found: Vec<(String, String)> = Vec::new();
-            for caps in pat.fetch_literal.captures_iter(line) {
-                found.push((caps[1].to_string(), "GET".to_string()));
-            }
-            for caps in pat.fetch_template.captures_iter(line) {
-                found.push((caps[1].to_string(), "GET".to_string()));
+            let mut unreadable = 0usize;
+            for open in pat.fetch_open.find_iter(line) {
+                let call = call_text(&lines, index, open.end());
+                match first_string_argument(&call) {
+                    Some((url, rest)) => {
+                        found.push((url, fetch_verb(&rest)));
+                    }
+                    None => unreadable += 1,
+                }
             }
             for caps in pat.verbed.captures_iter(line) {
                 found.push((caps[2].to_string(), caps[1].to_ascii_uppercase()));
+            }
+            for caps in pat.wrapper_open.captures_iter(line) {
+                let whole = caps.get(0).expect("group 0");
+                if pat.verbed.is_match(&line[whole.start()..]) {
+                    // Already read as axios / requests / httpx above.
+                    continue;
+                }
+                let call = call_text(&lines, index, whole.end());
+                match first_string_argument(&call) {
+                    // Only a URL-shaped literal is a request: `config.get('timeout')`
+                    // on a receiver that merely contains `api` is not one.
+                    Some((url, _))
+                        if url.starts_with('/') || url.contains("://") || url.starts_with("${") =>
+                    {
+                        found.push((url, caps[2].to_ascii_uppercase()));
+                    }
+                    Some(_) => {}
+                    None => unreadable += 1,
+                }
+            }
+            if unreadable > 0 {
+                report.sites_unreadable_shape += unreadable;
+                if report.unreadable_shape_examples.len() < UNREADABLE_EXAMPLES {
+                    report
+                        .unreadable_shape_examples
+                        .push(format!("{rel}:{}", index + 1));
+                }
             }
             for (url, verb) in found {
                 report.sites_found += 1;
@@ -357,6 +453,106 @@ fn scan_sites(
         sources.insert(rel.clone(), text);
     }
     (sites, report, sources)
+}
+
+/// Longest a call's text is followed: lines and bytes. A request's arguments
+/// are a few lines; a runaway paren is a minified bundle or a string with an
+/// unbalanced bracket in it.
+const CALL_TEXT_LINES: usize = 12;
+const CALL_TEXT_BYTES: usize = 2_048;
+
+/// The text of a call from just after its open paren to the matching close,
+/// read across lines. Brackets inside string literals do not count; an
+/// unterminated call is cut at the bounds above, and what was read is returned.
+fn call_text(lines: &[&str], line_index: usize, column: usize) -> String {
+    let mut text = String::new();
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, line) in lines
+        .iter()
+        .enumerate()
+        .skip(line_index)
+        .take(CALL_TEXT_LINES)
+    {
+        let from = if offset == line_index { column } else { 0 };
+        for character in line.get(from..).unwrap_or("").chars() {
+            if text.len() >= CALL_TEXT_BYTES {
+                return text;
+            }
+            match quote {
+                Some(open) => {
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == open {
+                        quote = None;
+                    }
+                }
+                None => match character {
+                    '\'' | '"' | '`' => quote = Some(character),
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return text;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            text.push(character);
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// The leading string literal of a call's arguments and the text after it:
+/// `('/api/papers?q=1', { method: 'POST' })` -> (`/api/papers?q=1`,
+/// `, { method: 'POST' }`). `None` when the first argument is not a literal —
+/// a variable, a call, a concatenation — which is a URL this scan cannot read.
+///
+/// A literal that is only the start of an expression (`'/api/' + id`) is read
+/// as the literal alone: its leading path is what route matching uses, and the
+/// parameter normalisation treats the rest as a wildcard segment.
+fn first_string_argument(call: &str) -> Option<(String, String)> {
+    let trimmed = call.trim_start();
+    let quote = trimmed
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '\'' | '"' | '`'))?;
+    let body = &trimmed[1..];
+    let mut end = None;
+    let mut escaped = false;
+    for (index, character) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            end = Some(index);
+            break;
+        }
+    }
+    let end = end?;
+    let url = body[..end].trim().to_string();
+    (!url.is_empty()).then(|| (url, body[end + 1..].to_string()))
+}
+
+/// The verb a `fetch` options object states: `{ method: 'POST' }` is `POST`,
+/// no `method` key is the default `GET`, and a `method` that is not a literal
+/// (`method: verb`) is `ANY` — it was written and cannot be read, which is not
+/// the same claim as "GET".
+fn fetch_verb(after_url: &str) -> String {
+    match patterns().fetch_method.captures(after_url) {
+        None => "GET".to_string(),
+        Some(caps) => match caps.get(2) {
+            Some(verb) => verb.as_str().to_ascii_uppercase(),
+            None => "ANY".to_string(),
+        },
+    }
 }
 
 fn build_site(path: &str, line: usize, url: &str, verb: &str, lines: &[&str]) -> Site {
@@ -1419,6 +1615,160 @@ mod tests {
         assert_eq!(resolved["id"], "gone");
     }
 
+    /// The audit fixture's shape: a `POST` through `fetch(url, { method })` and
+    /// a `GET` with a query string, each consuming a Go route. Every `fetch` was
+    /// read as `GET` and a query defeated the path match, so both routes reported
+    /// no consumer inside a scan that called itself complete.
+    #[test]
+    fn a_fetch_method_and_a_query_string_still_reach_their_route() {
+        let root = tempdir("fetch_method");
+        write(
+            &root,
+            "web/api.ts",
+            r#"
+export async function postNote(text: string) {
+  return fetch('/api/notes', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  });
+}
+export async function getPapers(q: string) {
+  return fetch(`/api/papers?q=${encodeURIComponent(q)}`);
+}
+"#,
+        );
+        let g = graph(
+            json!([{"id": "web/api.ts", "name": "api", "path": "web/api.ts", "line": 0, "kind": "file"}]),
+            json!([
+                {"kind": "routes_to", "source": "POST /api/notes", "target": "x"},
+                {"kind": "routes_to", "source": "GET /api/papers", "target": "x"},
+            ]),
+        );
+        let mapped = route_map(&root, &g, &ScanBudget::default());
+        let consumers = |path: &str| {
+            mapped["routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["path"] == path)
+                .unwrap()["consumers"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let notes = consumers("/api/notes");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["verb"], "POST");
+        assert_eq!(consumers("/api/papers").len(), 1);
+        // A POST is not a consumer of the GET route beside it.
+        assert!(!verbs_compatible("GET", "POST"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_method_that_is_not_a_literal_is_any_verb_not_get() {
+        let root = tempdir("fetch_any");
+        write(
+            &root,
+            "web/a.ts",
+            "export const send = (verb: string) => fetch('/api/x', { method: verb });
+",
+        );
+        let g = graph(
+            json!([{"id": "web/a.ts", "name": "a", "path": "web/a.ts", "line": 0, "kind": "file"}]),
+            json!([{"kind": "routes_to", "source": "DELETE /api/x", "target": "x"}]),
+        );
+        let mapped = route_map(&root, &g, &ScanBudget::default());
+        assert_eq!(
+            mapped["routes"][0]["consumers"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(mapped["routes"][0]["consumers"][0]["verb"], "ANY");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `apiClient.get('/x')` is a request; `router.get('/x', h)` declares a
+    /// route and `cache.get('k')` is neither.
+    #[test]
+    fn an_http_client_wrapper_is_a_consumer_and_a_router_is_not() {
+        let root = tempdir("wrapper");
+        write(
+            &root,
+            "web/c.ts",
+            "export const load = () => apiClient.get<Paper[]>('/api/papers');
+             export const save = () => this.http.post('/api/notes', body);
+             router.get('/api/papers', handler);
+             const v = cache.get('/api/papers');
+",
+        );
+        let g = graph(
+            json!([{"id": "web/c.ts", "name": "c", "path": "web/c.ts", "line": 0, "kind": "file"}]),
+            json!([
+                {"kind": "routes_to", "source": "GET /api/papers", "target": "x"},
+                {"kind": "routes_to", "source": "POST /api/notes", "target": "x"},
+            ]),
+        );
+        let mapped = route_map(&root, &g, &ScanBudget::default());
+        let papers = mapped["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == "/api/papers")
+            .unwrap();
+        assert_eq!(papers["consumers"].as_array().unwrap().len(), 1, "{papers}");
+        let notes = mapped["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == "/api/notes")
+            .unwrap();
+        assert_eq!(notes["consumers"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A client call whose URL is a variable could be the consumer of any route.
+    /// The scan must say so instead of reporting `none_observed` from a scan
+    /// that called itself complete.
+    #[test]
+    fn a_call_shape_the_scan_cannot_read_makes_it_incomplete() {
+        let root = tempdir("unreadable");
+        write(
+            &root,
+            "web/d.ts",
+            "export const go = (url: string) => fetch(url);
+             export const via = (p: string) => apiClient.get(p);
+",
+        );
+        let g = graph(
+            json!([{"id": "web/d.ts", "name": "d", "path": "web/d.ts", "line": 0, "kind": "file"},
+                   {"id": "h.ts::h", "name": "h", "path": "h.ts", "line": 1, "end_line": 2, "kind": "function"}]),
+            json!([{"kind": "routes_to", "source": "GET /api/z", "target": "h.ts::h"}]),
+        );
+        write(
+            &root,
+            "h.ts",
+            "export function h() { return {}; }
+",
+        );
+        let mapped = route_map(&root, &g, &ScanBudget::default());
+        assert_eq!(mapped["scan"]["complete"], json!(false));
+        assert_eq!(mapped["scan"]["sites_unreadable_shape"], json!(2));
+        assert_eq!(
+            mapped["scan"]["unreadable_shape_examples"],
+            json!(["web/d.ts:1", "web/d.ts:2"])
+        );
+        let impact = api_impact(&root, &g, &ScanBudget::default(), "/api/z");
+        assert_eq!(impact["risk"], "unknown", "{impact}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_query_string_and_a_fragment_do_not_change_the_path() {
+        assert!(paths_match("/api/papers", "/api/papers?q=${q}"));
+        assert!(paths_match("/api/papers/:id", "/api/papers/42#top"));
+        assert!(!paths_match("/api/papers", "/api/papers/extra?x=1"));
+    }
+
     #[test]
     fn a_consumer_is_matched_to_its_route_with_the_keys_it_reads() {
         let root = tempdir("consumer");
@@ -1498,6 +1848,65 @@ async function load() {
         let impact = api_impact(&root, &g, &ScanBudget::default(), "/api/me");
         assert_eq!(impact["found"], json!(true));
         assert_eq!(impact["risk"], "medium");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A caller that stops waiting stops the scan between files, and the
+    /// files it never opened are counted as cancelled — not as read, and not
+    /// as a budget cut — so the answer cannot read as a finished scan.
+    #[test]
+    fn a_cancelled_scan_stops_between_files_and_says_so() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = tempdir("cancel");
+        write(&root, "a.ts", "// nothing here\n");
+        write(&root, "b.ts", "fetch('/api/thing');\n");
+        write(&root, "c.ts", "fetch('/api/thing');\n");
+        let g = graph(
+            json!([
+                {"id": "a.ts", "name": "a", "path": "a.ts", "line": 0, "kind": "file"},
+                {"id": "b.ts", "name": "b", "path": "b.ts", "line": 0, "kind": "file"},
+                {"id": "c.ts", "name": "c", "path": "c.ts", "line": 0, "kind": "file"},
+                {"id": "h", "name": "h", "path": "a.ts", "line": 1, "kind": "function"},
+            ]),
+            json!([{"kind": "routes_to", "source": "GET /api/thing", "target": "h"}]),
+        );
+        // The caller gives up while the scan is on its second file: the check
+        // before b.ts is the second one the scan makes.
+        let cancel = crate::cancel::Cancel::new();
+        let trigger = cancel.clone();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let cancel = cancel.with_check_probe(move || {
+            if observed.fetch_add(1, Ordering::Relaxed) == 1 {
+                trigger.cancel();
+            }
+        });
+        let budget = ScanBudget {
+            cancel,
+            ..ScanBudget::default()
+        };
+        let impact = api_impact(&root, &g, &budget, "/api/thing");
+
+        assert_eq!(impact["scan"]["files_read"], 1, "{impact}");
+        assert_eq!(impact["scan"]["files_skipped_cancelled"], 2, "{impact}");
+        assert_eq!(impact["scan"]["cancelled"], json!(true));
+        assert_eq!(impact["scan"]["complete"], json!(false));
+        // Two real callers were never read; zero consumers here is not "low".
+        assert_eq!(impact["consumers"].as_array().unwrap().len(), 0);
+        assert_eq!(impact["risk"], "unknown");
+        assert_eq!(
+            checks.load(Ordering::Relaxed),
+            2,
+            "the scan must stop at the check that observed cancellation"
+        );
+
+        // An uncancelled budget over the same tree reads every file.
+        let full = api_impact(&root, &g, &ScanBudget::default(), "/api/thing");
+        assert_eq!(full["scan"]["files_read"], 3);
+        assert_eq!(full["scan"]["cancelled"], json!(false));
+        assert_eq!(full["consumers"].as_array().unwrap().len(), 2);
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -65,4 +65,24 @@ describe("docs client", () => {
       to: "b.md",
     });
   });
+
+  it("hands a rename's per-file results and coverage through unchanged", async () => {
+    const output = {
+      from: "a.md",
+      to: "b.md",
+      rewrittenPaths: ["c.md"],
+      linksRewritten: 1,
+      complete: false,
+      skippedConflict: ["d.md"],
+      failed: [{ path: "e.md", error: "disk full" }],
+      leftBroken: [{ source: "f.md", target: "a.md" }],
+      scan: { noteCount: 3, truncated: true, skippedOversized: 0, skippedUnreadable: 0, notScanned: 2 },
+    };
+    invoke.mockResolvedValue({ policy: null, output });
+    const result = await docsRename("/r", "a.md", "b.md");
+    expect(result.output.complete).toBe(false);
+    expect(result.output.skippedConflict).toEqual(["d.md"]);
+    expect(result.output.failed[0].path).toBe("e.md");
+    expect(result.output.scan.notScanned).toBe(2);
+  });
 });

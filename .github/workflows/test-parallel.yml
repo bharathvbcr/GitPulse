@@ -1,0 +1,86 @@
+name: Rust Tests (Parallel)
+
+# The serial suite in ci.yml (`--test-threads=1`) is the gate. This one runs the
+# same Rust tests the way a developer runs plain `cargo test`: many threads in
+# one process. The environment locks (`src-tauri/src/test_support/env.rs`),
+# the hermetic home and the disk-write guard only mean something if they are
+# exercised under contention, and a serial-only CI never does. It is a separate
+# workflow so a flake that only appears in parallel reports as its own red
+# check rather than blocking the gate that must stay deterministic.
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly, off the hour.
+    - cron: "17 3 * * *"
+  # Run by hand on a branch, so a fix is verified before its PR exists.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Fail closed: this job only checks out, builds and tests.
+permissions:
+  contents: read
+
+jobs:
+  rust-parallel:
+    name: Rust tests, 8 threads (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install System Dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # --no-fail-fast: a suite that never ran must not read like one that
+      # passed, so every binary runs even after one fails.
+      - name: Rust Unit & Integration Tests (8 threads)
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --test-threads=8
+          else
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --test-threads=8
+          fi

@@ -66,14 +66,16 @@ describe("PulseView honesty contracts", () => {
     expect(source).toContain("cmd_scan_coverage");
   });
 
-  it("tracks the loaded repository with a plain let so the load effect cannot self-invalidate", () => {
-    expect(source).toMatch(/let loadedPath:\s*string \| null = null;/);
-    expect(source).not.toMatch(/let loadedPath\s*=\s*\$state/);
-    expect(source).toContain("A plain `let`, never $state");
+  it("keys the load effect on the repository alone so it cannot self-invalidate", () => {
+    // The effect reads only the repository path store and does all its work
+    // untracked, so nothing it writes can re-run it — the job a hand-kept
+    // `loadedPath` used to do.
+    expect(source).not.toContain("loadedPath");
+    expect(source).toContain("$effect(() => {\n    const path = $currentRepoPath;\n    untrack(() => {\n      if (!path) {\n        pulseStore.reset();");
   });
 
   it("resets the author filter without tracking that write from the load effect", () => {
-    const start = source.indexOf("$effect(() => {\n    const path = $repoStore.currentPath;");
+    const start = source.indexOf("$effect(() => {\n    const path = $currentRepoPath;");
     expect(start).toBeGreaterThan(-1);
     const effect = source.slice(start, source.indexOf("// LOC now tracks the repository"));
     expect(effect).toContain("untrack(() => {");

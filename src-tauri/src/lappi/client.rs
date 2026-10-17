@@ -8,6 +8,7 @@
 //! fallback (§1): no agent means [`Outcome::Unavailable`], and the caller keeps
 //! its own path.
 
+#[cfg(unix)]
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -203,6 +204,7 @@ pub fn socket_path() -> Option<PathBuf> {
 /// macOS a listener with a full backlog refuses at once rather than blocking.
 #[cfg(unix)]
 pub fn ask(socket: &Path, line: &[u8], timeout: Duration) -> Outcome {
+    use crate::deadline::DeadlineStream;
     use std::io::{BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
@@ -228,7 +230,7 @@ pub fn ask(socket: &Path, line: &[u8], timeout: Duration) -> Outcome {
             }
         }
     };
-    let mut stream = DeadlineStream { stream, deadline };
+    let mut stream = DeadlineStream::new(stream, deadline);
 
     // One write of the framed line: a request and its newline are one message.
     let mut framed = Vec::with_capacity(line.len() + 1);
@@ -258,85 +260,6 @@ pub fn ask(_socket: &Path, _line: &[u8], _timeout: Duration) -> Outcome {
     }
 }
 
-/// A `UnixStream` whose every read and write is bounded by one deadline.
-///
-/// `set_read_timeout` bounds a single `read(2)`; an agent that sends one byte
-/// just inside it resets it each time. Here each operation is given only what
-/// is left of the deadline, and one that would start with nothing left fails
-/// `TimedOut` without touching the socket. The same shape as the reference
-/// client's `DeadlineStream` (Lappi-decision `crates/qd-runtime/src/oneshot.rs`).
-#[cfg(unix)]
-struct DeadlineStream {
-    stream: std::os::unix::net::UnixStream,
-    deadline: std::time::Instant,
-}
-
-#[cfg(unix)]
-impl DeadlineStream {
-    fn remaining(&self) -> io::Result<Duration> {
-        let left = self
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the Lappi exchange ran past its deadline",
-            ));
-        }
-        Ok(left)
-    }
-
-    /// macOS reports an expired socket timeout as `EAGAIN` (`WouldBlock`),
-    /// Linux as `TimedOut`; both mean the deadline passed.
-    fn timed_out(error: io::Error) -> io::Error {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the Lappi exchange ran past its deadline",
-            )
-        } else {
-            error
-        }
-    }
-}
-
-/// Apply a timeout, tolerating the one failure that is not a failure: macOS
-/// refuses `SO_RCVTIMEO`/`SO_SNDTIMEO` with `EINVAL` (`InvalidInput`) on a
-/// socket the peer has already shut down, which is exactly when an agent has
-/// written its reply and closed. On such a socket a read returns the buffered
-/// bytes or EOF at once and a write fails at once, so carrying on cannot block,
-/// and the timeout already set by this exchange is never past the deadline.
-/// Mirrors Lappi-decision `crates/qd-runtime/src/deadline.rs`.
-#[cfg(unix)]
-fn apply_timeout(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
-        other => other,
-    }
-}
-
-#[cfg(unix)]
-impl io::Read for DeadlineStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let left = self.remaining()?;
-        apply_timeout(self.stream.set_read_timeout(Some(left)))?;
-        self.stream.read(buf).map_err(Self::timed_out)
-    }
-}
-
-#[cfg(unix)]
-impl io::Write for DeadlineStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let left = self.remaining()?;
-        apply_timeout(self.stream.set_write_timeout(Some(left)))?;
-        self.stream.write(buf).map_err(Self::timed_out)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
-}
-
 #[cfg(unix)]
 fn connect_reason(error: &io::Error) -> UnavailableReason {
     match error.kind() {
@@ -348,6 +271,7 @@ fn connect_reason(error: &io::Error) -> UnavailableReason {
     }
 }
 
+#[cfg(unix)]
 fn exchange_reason(error: &io::Error) -> UnavailableReason {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => UnavailableReason::Deadline,
@@ -363,6 +287,7 @@ fn exchange_reason(error: &io::Error) -> UnavailableReason {
 /// seen: a connection closed before one is `closed_without_reply` even when
 /// some bytes arrived (`docs/caller-contract.md` §1), never a short reply that
 /// then fails to parse.
+#[cfg(unix)]
 fn read_reply_line<R: BufRead>(reader: R, cap: usize) -> Result<Vec<u8>, UnavailableReason> {
     let mut buf = Vec::new();
     let mut limited = reader.take(cap as u64 + 1);
@@ -561,6 +486,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_close_before_the_newline_is_closed_without_reply_even_with_bytes() {
         let partial: &[u8] = br#"{"status":"ok""#;

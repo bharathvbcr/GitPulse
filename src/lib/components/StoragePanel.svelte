@@ -1,6 +1,8 @@
 <script lang="ts">
   import { keyedList } from "../ui/eachKeys";
-  import { repoStore } from "../stores/repoStore";
+  import { commitGraphHint } from "../health/commitGraph";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { requestManviFocus } from "../ui/manviFocus";
   import {
     HardDrive,
@@ -17,7 +19,7 @@
   import type { StorageReport } from "../storage/types";
   import { storageMetric } from "../metrics/repoMetrics";
   import { describeStaleness, type MetricSnapshot } from "../metrics/freshness";
-  import { copyText } from "../desktop/clipboard";
+  import { createCopyFlash } from "../desktop/clipboard";
   import Skeleton from "./Skeleton.svelte";
   import HygienePanel from "./HygienePanel.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
@@ -67,7 +69,7 @@
   // the measurement time so re-renders of the same scan do not append a
   // duplicate point to the sparkline.
   let recordedAt: number | null = null;
-  let copyTimer: number | null = null;
+  const copyFlash = createCopyFlash((value) => (copied = value));
 
   /** Injected for tests; the app uses localStorage when available. */
   let storageOverride: StorageLike | null | undefined = undefined;
@@ -177,6 +179,7 @@
     ].filter((s) => s.bytes > 0) as Segment[];
   });
 
+  let commitGraph = $derived(commitGraphHint(report?.commit_graph));
   let hygieneGaps = $derived.by(() => {
     const current = report;
     if (!current) return [] as ArtifactDir[];
@@ -290,11 +293,7 @@
   async function copyReport() {
     const text = renderedReport();
     if (!text) return;
-    if (await copyText(text)) {
-      copied = true;
-      if (copyTimer !== null) window.clearTimeout(copyTimer);
-      copyTimer = window.setTimeout(() => (copied = false), 1500);
-    }
+    await copyFlash.copy(text);
   }
 
   function openManviCleanup() {
@@ -306,15 +305,16 @@
 
   $effect(() => {
     return () => {
-      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      copyFlash.dispose();
     };
   });
 
   // One subscription per repository. The metric measures once however many
   // panels are watching, revalidates when the watcher reports a change, and
-  // hands back the last known report immediately on a remount.
+  // hands back the last known report immediately on a remount. Keyed on the
+  // repository alone, so the store's other publishes do not resubscribe.
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       report = null;
       errorMsg = null;
@@ -324,7 +324,7 @@
       return;
     }
     recordedAt = null;
-    return storageMetric.subscribe(path, (snap) => applySnapshot(path, snap));
+    return untrack(() => storageMetric.subscribe(path, (snap) => applySnapshot(path, snap)));
   });
 
 </script>
@@ -543,6 +543,23 @@
             </tbody>
           </table>
         </div>
+        {#if commitGraph}
+          <!-- Display only: GitPulse never runs this command. -->
+          <div
+            class="rounded-2xl border border-border/70 bg-surface p-3 space-y-1"
+            data-testid="commit-graph-hint"
+            data-tone={commitGraph.tone}
+          >
+            <div class="text-[11px] font-semibold {commitGraph.tone === 'advice' ? 'text-amber-300' : 'text-textSecondary'}">
+              {commitGraph.title}
+            </div>
+            <p class="text-[11px] text-textMuted">{commitGraph.detail}</p>
+            {#if commitGraph.command}
+              <p class="text-[11px] text-textMuted">Run this in the repository to build one:</p>
+              <code class="block select-all font-mono text-[11px] text-textPrimary" data-testid="commit-graph-command">{commitGraph.command}</code>
+            {/if}
+          </div>
+        {/if}
       </section>
 
       <!--

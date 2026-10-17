@@ -70,7 +70,6 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   // Optional-tools ladder + codeintel/docs surfaces landed ahead of CONTRACTS rows.
   // Each has a TS mirror; add named contracts before removing from this list.
   ["Backlink", { reason: "MarkDev docs IPC; mirrored in src/lib/docs — pending CONTRACTS row" }],
-  ["BrokenLink", { reason: "MarkDev docs IPC; mirrored in src/lib/docs — pending CONTRACTS row" }],
   ["BuildOutcome", { reason: "devmap build/refresh outcome; pending CONTRACTS row" }],
   ["CliStatus", { reason: "devmap CLI probe; pending CONTRACTS row" }],
   ["CloneSourceOutcome", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
@@ -84,12 +83,12 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["DeadbranchCleanResult", { reason: "deadbranch prune outcome; mirrored in src/lib/branches/types.ts" }],
   ["DeadbranchRestoreResult", { reason: "deadbranch restore outcome; mirrored in src/lib/branches/types.ts" }],
   ["DeadbranchScanResult", { reason: "deadbranch scan result; mirrored in src/lib/branches/types.ts" }],
-  ["DocRenameOutcome", { reason: "MarkDev docs IPC; pending CONTRACTS row" }],
-  ["DocsStatus", { reason: "MarkDev docs IPC; pending CONTRACTS row" }],
   ["Graph", { reason: "MarkDev vault graph JSON; pending CONTRACTS row" }],
   ["InstallOutcome", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["FileWriteError", { reason: "internally tagged enum (`code`) the struct checker does not model; mirrored in src/lib/files/types.ts and read by src/lib/files/fileWrite.ts, pinned by the Rust contract test file_write_error_serializes_to_the_contract_shape" }],
   ["LadderAssessment", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["LiveRefreshOutcome", { reason: "devmap live refresh; pending CONTRACTS row" }],
+  ["MergeTeardownError", { reason: "internally tagged enum (`code`) the struct checker does not model; mirrored in src/lib/branches/types.ts and read by src/lib/branches/mergeTeardown.ts, pinned by the Rust contract test the_result_and_every_error_serialize_to_the_contract_shape" }],
   ["PreflightReport", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["PreviewFileResult", { reason: "devmap preview file envelope; pending CONTRACTS row" }],
   ["PreviewOutcome", { reason: "devmap preview batch; pending CONTRACTS row" }],

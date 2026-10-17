@@ -36,9 +36,16 @@ describe("WorktreesPanel", () => {
 
 describe("WorktreesPanel agent worktree affordances", () => {
   it("exposes lock, unlock, and prune commands", () => {
-    expect(source).toContain("cmd_lock_worktree");
-    expect(source).toContain("cmd_unlock_worktree");
-    expect(source).toContain("cmd_prune_worktree");
+    expect(source).toContain("repoStore.lockWorktree(wt.path, target, true)");
+    expect(source).toContain("repoStore.unlockWorktree(wt.path, target, true)");
+    // Prune, cache sync, lock and unlock are repoStore mutations: the store owns
+    // the command (repoStore.test.ts) and the contract test keeps the panel from sending it.
+    expect(source).not.toContain("cmd_lock_worktree");
+    expect(source).not.toContain("cmd_unlock_worktree");
+    expect(source).toContain("repoStore.pruneWorktrees(target)");
+    expect(source).toContain("repoStore.worktreeCowSync(wt.path, target)");
+    expect(source).not.toContain("cmd_prune_worktree");
+    expect(source).not.toContain("cmd_worktree_cow_sync");
     expect(source).not.toContain("expire:");
   });
 
@@ -115,21 +122,13 @@ describe("WorktreesPanel controls say what they do", () => {
 });
 
 describe("WorktreesPanel removal safety", () => {
-  it("force-removes only a scanned dirty worktree after confirm, never an unscanned one", () => {
-    // dirty_files === null means the scan did not run. Coercing that to 0
-    // and passing --force is how an agent farm past the scan cap lost work.
-    expect(source).toContain(
-      "const force = typeof wt.dirty_files === \"number\" && wt.dirty_files > 0;",
-    );
-    expect(source).not.toContain("const force = (wt.dirty_files ?? 0) === 0;");
-    expect(source).not.toMatch(/cmd_remove_worktree[\s\S]{0,120}?force:\s*true/);
-    expect(source).toMatch(/cmd_remove_worktree[\s\S]{0,120}?force\s*\}/);
-  });
-
-  it("names the discard cost in the armed confirm when files would be lost", () => {
-    expect(source).toContain("`Discard ${wt.dirty_files} changed files? Click again to remove`");
-    expect(source).toContain("`Discard ${wt.dirty_files} changed files?`");
-    expect(source).toContain("Not scanned for changes");
+  // Rendered in harness/branches.html: arming removes nothing; the second
+  // click force-removes a scanned dirty worktree after the armed label named
+  // "Discard 12 changed files?"; an unscanned one (dirty_files null) says
+  // "Not scanned for changes" and is removed without force.
+  it("arms a clean worktree's remove without naming a cost it does not have", () => {
+    // The fixture has no clean linked worktree; the third branch of the label.
+    expect(source).toContain(': "Click again to remove";');
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
@@ -137,9 +136,10 @@ describe("WorktreesPanel removal safety", () => {
     // tab used to stay open on a deleted path, holding a tab slot.
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
     expect(fn).not.toContain("$repoStore.currentPath === targetPath");
-    const removed = fn.indexOf("removeCompleted = true");
+    const removed = fn.indexOf("repoStore.removeWorktree(");
     const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
-    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", removed);
+    const staleReturn = fn.indexOf("repoStore.targetIsActive(target)", removed);
+    expect(removed).toBeGreaterThan(-1);
     expect(closeIdx).toBeGreaterThan(removed);
     expect(closeIdx).toBeLessThan(staleReturn);
   });
@@ -149,55 +149,98 @@ describe("WorktreesPanel removal safety", () => {
     // the same active-only check.
     const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
     expect(fn).not.toContain("$repoStore.currentPath === wt.path");
-    const merged = fn.indexOf("mergeCompleted = true");
+    const merged = fn.indexOf("repoStore.worktreeMergeTeardown(");
     const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
-    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", merged);
+    const staleReturn = fn.indexOf("repoStore.targetIsActive(target)", closeIdx);
+    expect(merged).toBeGreaterThan(-1);
     expect(closeIdx).toBeGreaterThan(merged);
     expect(closeIdx).toBeLessThan(staleReturn);
   });
 
-  it("preserves the concurrent-session currentPath guards after the await", () => {
-    const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
-    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(3);
-    expect(fn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?currentPath !== repo[\s\S]*?cmd_remove_worktree/);
-    expect(fn).toContain("await load()");
+  it("holds the merge to the commit the row showed, and keeps the tab of a worktree that is still there", () => {
+    const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    expect(fn).toMatch(/repoStore\.worktreeMergeTeardown\([\s\S]*?expectedTip: wt\.head/);
+    // The tab goes only with a worktree the teardown removed.
+    expect(fn).toMatch(/merged\.worktree_removed \? \$repoStore\.openTabs\.find/);
+    expect(fn).toContain('worktreeSetupNotices(merged, "merge")');
   });
 
-  it("journals settled create/remove calls before stale UI returns", () => {
-    for (const [start, end, command] of [
-      ["async function create", "function removeArmTitle", "cmd_add_worktree"],
-      ["async function remove", "function open", "cmd_remove_worktree"],
+  it("keeps the concurrent-session guards across the awaits", () => {
+    const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
+    // A fresh read of "the repository in front" after the await is what the old
+    // currentPath comparison was; the target the confirm captured replaces it.
+    expect(fn).not.toContain("$repoStore.currentPath !== repo");
+    expect(fn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?repoStore\.removeWorktree\(targetPath, force, target/);
+    expect(fn).toMatch(/repoStore\.targetIsActive\(target\)\) return;\s*await load\(\)/);
+  });
+
+  it("routes every worktree mutation through repoStore with the target captured before the first await", () => {
+    // The store journals (kind, label, ok), counts the call for the quit guard
+    // and queues it per repository, so the panel keeps none of that itself.
+    expect(source).not.toContain("harnessStore");
+    expect(source).not.toMatch(/invoke(<[^>]*>)?\("cmd_(add|remove|lock|unlock)_worktree"/);
+    expect(source).not.toContain('"cmd_worktree_merge_teardown"');
+    for (const [start, end, wrapper] of [
+      ["async function toggleLock", "async function prune", "repoStore.lockWorktree("],
+      ["async function create", "function removeArmTitle", "repoStore.addWorktree("],
+      ["async function remove", "function open", "repoStore.removeWorktree("],
+      ["async function mergeTeardown", "async function fetchAiSummary", "repoStore.worktreeMergeTeardown("],
     ] as const) {
       const body = source.slice(source.indexOf(start), source.indexOf(end));
-      const settled = body.indexOf(command);
-      const successJournal = body.indexOf("harnessStore.recordAction", settled);
-      const successGuard = body.indexOf("$repoStore.currentPath !== repo", settled);
-      expect(successJournal, `${start} success journal`).toBeGreaterThan(settled);
-      expect(successJournal, `${start} success before stale return`).toBeLessThan(successGuard);
-
-      const caught = body.indexOf("} catch", successGuard);
-      const failureJournal = body.indexOf("harnessStore.recordAction", caught);
-      const failureGuard = body.indexOf("$repoStore.currentPath !== repo", caught);
-      expect(failureJournal, `${start} failure journal`).toBeGreaterThan(caught);
-      expect(failureJournal, `${start} failure before stale return`).toBeLessThan(failureGuard);
+      const captured = body.indexOf("repoStore.captureTarget()");
+      const firstAwait = body.indexOf("await ");
+      expect(captured, `${start} captures a target`).toBeGreaterThan(-1);
+      expect(captured, `${start} captures before it awaits`).toBeLessThan(firstAwait);
+      expect(body, `${start} calls ${wrapper}`).toContain(wrapper);
     }
   });
 
-  it("freezes worktree creation inputs before invoking the backend", () => {
+  it("captures the armed confirm's target on the first click, and refuses to run when it is no longer in front", () => {
+    for (const [start, end, armed] of [
+      ["async function remove", "function open", "removeTarget = armed;"],
+      ["async function mergeTeardown", "async function fetchAiSummary", "mergeTarget = armed;"],
+    ] as const) {
+      const body = source.slice(source.indexOf(start), source.indexOf(end));
+      const arming = body.indexOf(armed);
+      const second = body.indexOf("const target = ", arming);
+      expect(arming, `${start} arms with a target`).toBeGreaterThan(-1);
+      expect(second, `${start} runs on the armed target`).toBeGreaterThan(arming);
+    }
+    // The remove refuses as the merge does: after the trust prompt, before the destructive call.
+    const removeFn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
+    expect(removeFn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?if \(!repoStore\.targetIsActive\(target\)\) \{\s*toastStore\.error\([^)]*repository changed[^)]*\);\s*return;\s*\}\s*const outcome = await repoStore\.removeWorktree\(/);
+    const merge = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    expect(merge).toMatch(/if \(!repoStore\.targetIsActive\(target\)\) \{\s*toastStore\.error\([^)]*repository changed[^)]*\);\s*return;/);
+    expect(merge.indexOf("repoStore.targetIsActive(target)")).toBeLessThan(merge.indexOf("repoStore.worktreeMergeTeardown("));
+  });
+
+  it("says every handled failure: inline for the repository on screen, a toast once it is not, and never a silent merge without a result", () => {
+    // The store is told the panel reports the failure (handled), so a failure
+    // that reaches neither the inline error nor a toast is lost.
+    const show = source.slice(source.indexOf("function showFailure"), source.indexOf("async function toggleLock"));
+    expect(show).toMatch(/if \(tabScope\.isCurrent\(epoch\)\) error = message;\s*else toastStore\.error\(/);
+    const merge = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    // A trust check that throws is said, not left as an unhandled rejection.
+    for (const [fn, trust] of [[merge, "trustRepo(wt.path)"], [source.slice(source.indexOf("async function remove"), source.indexOf("function open")), "trustRepo(targetPath)"]] as const) {
+      expect(fn).toMatch(new RegExp(`try \\{\\s*trusted = await repoStore\\.${trust.replace(/[()]/g, "\\$&").replace(".", "\\.")};?\\s*\\} catch \\(cause\\) \\{\\s*return showFailure\\(`));
+    }
+    expect(merge).toMatch(/if \(!outcome\.ok\) return showFailure\(/);
+    expect(merge).toMatch(/if \(!merged\) \{[\s\S]*?showFailure\([\s\S]*?return;\s*\}/);
+  });
+
+  it("freezes worktree creation inputs before calling the store", () => {
     const body = source.slice(source.indexOf("async function create"), source.indexOf("function removeArmTitle"));
-    const invoke = body.indexOf('("cmd_add_worktree"');
-    expect(invoke, "the create call").toBeGreaterThan(-1);
+    const call = body.indexOf("repoStore.addWorktree(");
+    expect(call, "the create call").toBeGreaterThan(-1);
     for (const declaration of [
       "const targetPath = newPath.trim();",
       "const branch = newBranch.trim();",
       "const base = startPoint.trim();",
-      "const actionLabel = branch ? `${branch} → ${targetPath}` : targetPath;",
     ]) {
       const index = body.indexOf(declaration);
       expect(index, declaration).toBeGreaterThan(-1);
-      expect(index, `${declaration} before invoke`).toBeLessThan(invoke);
+      expect(index, `${declaration} before the call`).toBeLessThan(call);
     }
-    expect(body).toContain("label: actionLabel");
   });
 });
 
@@ -205,30 +248,27 @@ describe("WorktreesPanel store-emission churn guards", () => {
   it("keeps exactly one mount trigger for the worktree list load", () => {
     // The load effect runs on mount; a second onMount(load) double-fetched.
     expect(source).not.toContain("onMount");
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("void load();");
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("untrack(() => void load());");
   });
 
-  it("memo-guards the load effect so unrelated store emissions are no-ops", () => {
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    const guard = effect.match(/if \(([^)]*)\) return;/)?.[1] ?? "";
-    expect(guard, "the load effect must open with a memo guard").not.toBe("");
-    // Derived rather than spelled out: every reactive value the effect reads
-    // has to appear in the memo key. One that is read but not compared makes
-    // the guard a no-op for that value, and the ~6s poll tick publishes on
-    // every repository — which is the churn this guard exists to absorb. A
-    // literal copy of the condition had to be re-typed each time the effect
-    // learned to watch something new, and re-typing it is how a term gets
-    // dropped.
-    const reads = [...effect.matchAll(/const (\w+) = \$[\w.]+;/g)].map((m) => m[1]);
-    expect(reads.length, "the effect must read something").toBeGreaterThan(0);
-    for (const name of reads) {
-      expect(guard, `${name} is read by the effect but absent from the memo key`).toContain(name);
-    }
+  it("depends only on value-compared keys, so unrelated store emissions are no-ops", () => {
+    // The hand-copied memo guard this replaced had to list every value the
+    // effect read, and re-typing it is how a term got dropped. Now the effect
+    // reads only keys that compare by value — the repository path store, a
+    // derived generation, the trust count — and runs the load untracked, so
+    // nothing else it touches can re-run it. The browser harness
+    // (harness/repo-churn.html) proves the armed confirm survives a publish.
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("void $currentRepoPath;");
+    expect(effect).toContain("void generation;");
+    expect(effect).toContain("void $trustExtended;");
+    expect(effect).not.toMatch(/\bprev[A-Z]\w* =/);
+    expect(effect.slice(effect.indexOf("$effect("))).not.toContain("$repoStore.");
   });
 
   it("resets the armed remove confirm only on real repo/generation change or unmount", () => {
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
     expect(effect).toContain("clearTimeout(confirmTimer)");
     // Clearing the timer without disarming would strand a permanently armed confirm.
     expect(effect).toContain("removingPath = null;");
@@ -249,10 +289,9 @@ describe("WorktreesPanel legacy-trust extension", () => {
     // across a grant, so an unconsidered count would return early and leave
     // every row showing the gaps the grant just closed.
     expect(source).toContain('import { trustExtended } from "../repos/trustExtension"');
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("const extended = $trustExtended;");
-    expect(effect).toMatch(/if \(repo === prevRepoPath &&[\s\S]*?extended === prevExtended\) return;/);
-    expect(effect).toContain("prevExtended = extended;");
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("void $trustExtended;");
+    expect(effect).not.toContain("return;");
   });
 
   it("no longer carries a second copy of the offer", () => {
@@ -278,3 +317,12 @@ describe("WorktreesPanel GitPulse task worktrees", () => {
     expect(source).toContain("{lane.task_title || \"Task\"} · {runStateLabel(lane.state)}");
   });
 });
+
+/**
+ * Repository hooks consent is rendered in harness/branches.html: a new
+ * worktree starts with hooks off and cache sharing on and sends that choice;
+ * asking for hooks shows the file's exact text and says nothing runs until it
+ * is approved; approving after the file changed on disk sends the text that
+ * was shown, not the newer file, and leaves it unapproved; approving the text
+ * on screen marks it approved; creating then sends runHooks.
+ */

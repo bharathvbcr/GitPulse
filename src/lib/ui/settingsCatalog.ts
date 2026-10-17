@@ -10,7 +10,7 @@ import {
  * definition, and so the check is made once here instead of as a platform
  * conditional scattered through the modal's markup.
  */
-export type SettingRequirement = "dockHiding" | "appleIntelligence";
+export type SettingRequirement = "dockHiding" | "appleIntelligence" | "macos";
 
 export interface SettingEntry {
   readonly id: string;
@@ -71,6 +71,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   },
   { id: "agent-live-runs", section: "agents", label: "Agents running at once", keywords: "concurrent parallel simultaneous many multiple agents sessions tasks attempts at once limit capacity managed manvi worktree" },
   { id: "terminal-sessions", section: "agents", label: "Terminal sessions open at once", keywords: "terminal sessions shells tabs pty open at once concurrent parallel many limit capacity maximum console agent tabs task terminals" },
+  { id: "keep-terminals", section: "agents", label: "Keep terminals running when GitPulse quits", keywords: "terminal host ptyd keep running survive quit crash restart detach reattach background sessions agents persist outlive" },
   { id: "agent-setting-sources", section: "agents", label: "Claude Code settings files", keywords: "claude settings sources setting-sources project local user settings.json settings.local.json hooks allow list permissions repository trust power advanced" },
   { id: "agent-models", section: "agents", label: "Agent models", keywords: "model models claude antigravity agy codex grok opus sonnet haiku fable opusplan gemini effort reasoning thinking fallback advisor routing --model --effort --fallback-model advisorModel" },
   { id: "hygiene-defaults", section: "hygiene", label: "Hygiene defaults", keywords: "repository hygiene default retention days inherit override per repository shared cache review weekly all repositories scope storage preview" },
@@ -104,6 +105,27 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Terminal screen reader support",
     keywords: "terminal screen reader voiceover accessibility a11y announce assistive shell console",
+  },
+  {
+    id: "terminal-option-as-meta",
+    section: "appearance",
+    label: "Option as Meta in terminals",
+    keywords:
+      "terminal option alt meta mac macos keyboard layout at sign german word motion escape b f shell console",
+    requires: "macos",
+  },
+  {
+    id: "terminal-gpu",
+    section: "appearance",
+    label: "GPU terminal rendering",
+    keywords: "terminal gpu webgl hardware acceleration renderer rendering draw cpu performance glitch shell console",
+  },
+  {
+    id: "terminal-scrollback",
+    section: "appearance",
+    label: "Terminal scrollback",
+    keywords:
+      "terminal scrollback history rows lines buffer memory ram agent shell console output scroll back",
   },
   {
     id: "timestamps",
@@ -265,6 +287,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "agents",
     label: "Lappi",
     keywords: "lappi decision model commit type conventional ambiguous classifier suggest record caller data local held out privacy socket qd",
+  },
+  {
+    id: "host-load",
+    section: "agents",
+    label: "Host load",
+    keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability",
   },
   {
     id: "external-tools",

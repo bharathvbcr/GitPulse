@@ -30,7 +30,9 @@
 import { asAgentProvider, PERMISSION_MODES, PROVIDER_LABELS, supportsManaged, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
-import { MODEL_FIELDS, MODEL_FIELDS_BY_LAUNCHER, isEffortLevel, isModelId, type ModelChoice } from "../terminal/agentDefaults";
+import { writable, type Readable } from "svelte/store";
+import type { RunPreparation } from "./client";
+import { HANDOFF_MODEL_CHOICES, MODEL_FIELDS, MODEL_FIELDS_BY_LAUNCHER, isEffortLevel, isModelId, type ModelChoice } from "../terminal/agentDefaults";
 
 export type { AgentProvider };
 
@@ -50,7 +52,7 @@ export interface CheckoutCandidate {
   source: "open" | "derived";
 }
 
-/** Longest checkout path accepted, matching the workbench's own input cap. */
+/** Longest checkout path accepted: the host's bound on a checkout path, in UTF-8 bytes (`terminal_launch::valid_path`). */
 export const MAX_CHECKOUT_LENGTH = 4_096;
 
 /**
@@ -153,9 +155,18 @@ export function describeHandoff(settings: HandoffSettings): string {
 export function normalizeCheckout(value: unknown): string {
   if (typeof value !== "string") return "";
   const text = value.trim();
-  if (!text || text.length > MAX_CHECKOUT_LENGTH) return "";
+  if (!text || !ABSOLUTE_PATH.test(text) || UTF8.encode(text).length > MAX_CHECKOUT_LENGTH) return "";
   return normalizeRepoPath(text) ? text : "";
 }
+
+/**
+ * The absolute spellings the host can accept: POSIX `/…`, a Windows drive
+ * `C:\…` or `C:/…`, or a UNC `\\server\…`. The host's `Path::is_absolute`
+ * has the last word for its own platform; this only refuses what no
+ * platform takes, so a relative path is caught before Launch, not after.
+ */
+const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\[^\\])/;
+const UTF8 = new TextEncoder();
 
 /**
  * The working checkouts this repository could be launched in, best first.
@@ -282,6 +293,14 @@ export function modelOverrideFields(provider: AgentProvider): (keyof ModelOverri
 }
 
 /**
+ * The names this provider's `field` offers as a choice, or `null` when the
+ * field stays free text. "" (the saved default) is always offered beside them.
+ */
+export function modelOverrideChoices(provider: AgentProvider, field: "model" | "advisor"): readonly string[] | null {
+  return HANDOFF_MODEL_CHOICES[provider]?.[field] ?? null;
+}
+
+/**
  * This launch's model fields, to send as `model_choice` — `undefined` when
  * none is set, so the saved default applies untouched.
  *
@@ -319,6 +338,55 @@ export function launchModelOverride(
     choice.advisor = typed.advisor;
   }
   return { ok: true, choice };
+}
+
+/**
+ * Preparations whose outcome is unknown, one per task, kept outside any form.
+ *
+ * A lost reply leaves a request the store may already have committed, and
+ * only replaying it exactly — same `id`, same `request_id` — can settle that
+ * without risking a second run. Held in a form, it died with the form: the
+ * board sheet closed or the task tab switched, and the next press minted a
+ * new identity. Held here, any form for the task replays it, until the store
+ * answers or the reader discards it deliberately.
+ */
+const pendingPreparations = new Map<string, RunPreparation>();
+/** Far above the tasks one person launches at once; the oldest goes first. */
+export const MAX_PENDING_PREPARATIONS = 64;
+const pendingRevision = writable(0);
+/**
+ * Changes whenever a preparation is held or released. A form that restored a
+ * held copy is not the form the store answers: when the pane remounts mid-call
+ * the answer reaches the form that sent it, which is gone, and releases the
+ * hold there. Watching this is how the restored copy learns it was settled.
+ */
+export const pendingPreparationsChanged: Readable<number> = { subscribe: pendingRevision.subscribe };
+
+/** The unknown-outcome preparation held for `taskId`, as a copy, or null. */
+export function pendingPreparationFor(taskId: string): RunPreparation | null {
+  const held = pendingPreparations.get(taskId);
+  return held ? structuredClone(held) : null;
+}
+
+/** Holds `preparation` for its task until the store answers it. */
+export function holdPendingPreparation(preparation: RunPreparation): void {
+  pendingPreparations.delete(preparation.task_id);
+  pendingPreparations.set(preparation.task_id, structuredClone(preparation));
+  while (pendingPreparations.size > MAX_PENDING_PREPARATIONS) {
+    const oldest = pendingPreparations.keys().next();
+    if (oldest.done) break;
+    pendingPreparations.delete(oldest.value);
+  }
+  pendingRevision.update((n) => n + 1);
+}
+
+/**
+ * Stops holding `taskId`'s preparation — only the one named `id` when given,
+ * so a form settling an older attempt cannot drop a newer one.
+ */
+export function releasePendingPreparation(taskId: string, id?: string): void {
+  if (id !== undefined && pendingPreparations.get(taskId)?.id !== id) return;
+  if (pendingPreparations.delete(taskId)) pendingRevision.update((n) => n + 1);
 }
 
 /** Short, non-repeating state word for a run row. */
@@ -373,19 +441,62 @@ export function runHoldsCheckout(run: { state: string; expires_at: number }, now
  * One checkout holds one agent, so a second task aimed at a busy checkout can
  * only run in a worktree of its own. Knowing that before pressing launch is
  * what turns "already has a prepared, active or unresolved run" into a launch
- * that just works. Compared by path identity, the same rule the checkout list
- * uses, so `/work/Repo` and `/work/repo` on a case-insensitive disk are one.
+ * that just works. Compared by Git directory when both sides know it — the
+ * key the store itself refuses on — and otherwise by the directory, each by
+ * path identity, so `/work/Repo` and `/work/repo` on a case-insensitive disk
+ * are one.
  */
-export function attemptHolding<T extends { state: string; expires_at: number; cwd: string }>(
+export function attemptHolding<T extends { state: string; expires_at: number; cwd: string; git_dir?: string }>(
   runs: readonly T[],
-  checkout: string,
+  target: CheckoutTarget,
   options: PathIdentityOptions,
   now: number = Date.now(),
 ): T | null {
-  const key = identityKey(normalizeCheckout(checkout), options);
+  const key = identityKey(normalizeCheckout(target.path), options);
   if (!key) return null;
-  return runs.find((run) => runHoldsCheckout(run, now) && identityKey(run.cwd, options) === key) ?? null;
+  const gitKey = target.git_dir ? identityKey(target.git_dir, options) : "";
+  return runs.find((run) => {
+    if (!runHoldsCheckout(run, now)) return false;
+    // The store's key where both sides have it: an attempt in a subfolder
+    // holds the checkout, one in a worktree nested inside it does not.
+    if (gitKey && run.git_dir) return identityKey(run.git_dir, options) === gitKey;
+    return identityKey(run.cwd, options) === key;
+  }) ?? null;
 }
+
+/**
+ * Whether anyone holds the checkout, as far as it could be read.
+ *
+ * `unknown` is the read that has not answered yet or failed. It must be
+ * treated as held: calling it "nobody holds this" let a second agent launch
+ * into a checkout that already had one. `reads` is the list of holding runs
+ * as read, or null while it is not known.
+ */
+export type CheckoutHolder<T> =
+  | { kind: "free" }
+  | { kind: "held"; run: T }
+  | { kind: "unknown"; reason: string };
+
+export function checkoutHolder<T extends { state: string; expires_at: number; cwd: string; git_dir?: string }>(
+  reads: readonly T[] | null,
+  readError: string | null,
+  target: CheckoutTarget,
+  options: PathIdentityOptions,
+  now: number = Date.now(),
+): CheckoutHolder<T> {
+  if (reads === null) {
+    return { kind: "unknown", reason: readError ? `reading the checkout's agents failed (${readError})` : "still reading the checkout's agents" };
+  }
+  const run = attemptHolding(reads, target, options, now);
+  return run ? { kind: "held", run } : { kind: "free" };
+}
+
+/**
+ * A checkout as `attemptHolding` asks about it: the chosen path, and its Git
+ * directory once the host has said (`checkoutIdentity`); null or absent while
+ * unknown, when the comparison falls back to the directory itself.
+ */
+export interface CheckoutTarget { path: string; git_dir?: string | null }
 
 /**
  * Whether "Release" applies: the attempt holds its checkout and only the host

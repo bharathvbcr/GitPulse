@@ -214,21 +214,8 @@ export interface TerminalListing {
   launcher: string | null;
   run_id: string | null;
   detached: boolean;
-}
-
-/**
- * Streamed terminal output. Consumed as an anonymous `{ id; data_b64 }` at the
- * listen() call until it was named — events are a wire surface too, and
- * check:types could not see this one at all.
- */
-export interface TerminalOutputPayload {
-  id: string;
-  data_b64: string;
-  /**
-   * Bytes the reader reserved for this chunk. Absent on events from a host
-   * that predates the field. A present value outside one read is ignored.
-   */
-  bytes?: number;
+  /** Its terminal has closed but its process has not been reaped; it can be stopped, not shown. */
+  ending?: boolean;
 }
 
 /**
@@ -240,6 +227,8 @@ export interface TerminalContext {
   process: string | null;
   /** A job other than the session's own process holds the foreground. */
   busy: boolean | null;
+  /** The shell has a job left under it, foreground or not (`cmd &`, a `^Z`'d editor). */
+  jobs?: boolean | null;
   cwd: string | null;
   /** `cwd` relative to the repository root (`""` is the root), or null outside it. */
   repo_dir: string | null;
@@ -253,4 +242,11 @@ export interface TerminalExitPayload {
   error: string | null;
   /** False when the native host could not confirm process termination. */
   reaped: boolean;
+  /**
+   * GitPulse ended it: a Close (from the tab or from Sessions), the app's
+   * shutdown, or the reader stopping a session it could not serve (then
+   * `error` says why). False for the program's own end or a signal from
+   * outside. Mirrors `terminal::TerminalExitPayload::ended_by_gitpulse`.
+   */
+  ended_by_gitpulse: boolean;
 }

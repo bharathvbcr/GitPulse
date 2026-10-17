@@ -15,6 +15,11 @@
 //! `Command::new` outside the allowlist below — naming the file and line, and
 //! reporting how much it actually read.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -28,6 +33,14 @@ const ALLOWED: &[(&str, &str)] = &[
         "src/harness/sidecar.rs",
         "one long-lived sidecar per session; holding a gate permit for its \
          whole life would starve every git call behind it",
+    ),
+    (
+        "src/terminal/host/client.rs",
+        "the terminal host, gitpulse-ptyd: started once, detached in a session \
+         of its own, and meant to outlive this process. A gate permit, a \
+         timeout or an output cap would end the very terminals it exists to \
+         keep; it is spawned under the inheritance lock (`spawn_locked`) and \
+         deliberately not registered with procguard's quit sweep",
     ),
     (
         "src/procguard/mod.rs",
@@ -149,6 +162,40 @@ fn no_production_code_spawns_outside_the_gated_seam() {
     );
 }
 
+/// A git child's environment is decided in one place. `engine::git_cli` builds
+/// a `Command` in exactly two production spots — `git_command_with_env` for git
+/// itself and `build_capture_command_in` for tools that shell out to git — and
+/// both call `pin_git_environment`. A third `Command::new` there would be a
+/// spawn that skips the pinned config, the stripped redirects and the locale,
+/// so the count is asserted, and each builder is asserted to call the owner.
+#[test]
+fn every_git_child_is_built_by_the_two_pinned_builders() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/engine/git_cli.rs");
+    let text = std::fs::read_to_string(&file).expect("read git_cli.rs");
+    let production = strip_test_items(&text);
+    assert!(
+        production.len() > 1000,
+        "read only {} production lines of git_cli.rs",
+        production.len()
+    );
+    let constructions: Vec<usize> = production
+        .iter()
+        .filter(|(_, line)| line.contains("Command::new") && !line.trim_start().starts_with("//"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        constructions.len(),
+        2,
+        "git_cli.rs builds a Command at lines {constructions:?}; every git child must come from \
+         git_command_with_env or build_capture_command_in, which pin the environment"
+    );
+    let calls = production
+        .iter()
+        .filter(|(_, line)| line.contains("pin_git_environment(&mut cmd)"))
+        .count();
+    assert_eq!(calls, 2, "each builder must call pin_git_environment once");
+}
+
 /// Creating a process, or a descriptor that is about to be made `FD_CLOEXEC`,
 /// must happen under `procguard::with_inheritance_lock`.
 ///
@@ -264,6 +311,114 @@ fn pty_creation_runs_under_the_inheritance_lock() {
         "expected the PTY's `openpty` and `spawn_command` and procguard's wake \
          pipe, and nothing else; found {guarded} guarded creation sites"
     );
+}
+
+/// A signal reaches a process only through `procguard::signal`.
+///
+/// One over-broad `kill` — a pattern, `-1`, group 0, a pid that was recycled —
+/// can end processes the app never started. `procguard::signal` refuses those
+/// ids and logs every delivery, so the absence of any other sender is asserted:
+/// no production line calls `libc::kill` or `libc::killpg` with a real signal
+/// (signal 0, an existence probe, delivers nothing), and none names a
+/// pattern-based killer. The Windows tree kill is the one other sender and
+/// lives in `procguard/mod.rs`, behind its own pid check.
+#[test]
+fn no_production_code_signals_a_process_outside_the_guarded_primitive() {
+    const SENDERS: &[&str] = &[
+        "libc::kill(",
+        "libc::killpg(",
+        "pkill",
+        "killall",
+        "taskkill",
+        "TerminateProcess",
+    ];
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "src/procguard/signal.rs",
+            "the primitive: every id is vetted before the one `kill` and `killpg`",
+        ),
+        (
+            "src/procguard/mod.rs",
+            "the Windows tree kill, which refuses pid <= 4 and this process first",
+        ),
+    ];
+    // Files that must name the pattern killers to judge them, and run none.
+    // Only the tool names are excused there: a `libc::kill` or `killpg` in
+    // one is still an offender.
+    const NAMES_THE_KILLERS: &[(&str, &str)] = &[(
+        "src/hooks/signal_guard.rs",
+        "parses agents' pkill/killall/kill command lines to refuse them; spawns nothing",
+    )];
+    const TOOL_NAMES: &[&str] = &["pkill", "killall", "taskkill"];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs(&root, &mut files);
+    assert!(files.len() > 50, "only found {} files", files.len());
+    let test_only = test_only_files(&root, &files);
+    assert!(!test_only.is_empty(), "no test-only module files resolved");
+
+    let mut offenders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if test_only.contains(file) {
+            continue;
+        }
+        let rel = file
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(file).expect("read source");
+        let production = strip_test_items(&text);
+        scanned += production.len();
+        if ALLOWED.iter().any(|(allowed, _)| *allowed == rel) {
+            continue;
+        }
+        for (line_no, line) in &production {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let probe = code.contains("libc::kill(") && code.contains(", 0)");
+            let names_only = NAMES_THE_KILLERS.iter().any(|(named, _)| *named == rel);
+            let sends = SENDERS
+                .iter()
+                .filter(|sender| !(names_only && TOOL_NAMES.contains(sender)))
+                .any(|sender| code.contains(sender));
+            if !probe && sends {
+                offenders.entry(rel.clone()).or_default().push(*line_no);
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these send a signal outside `procguard::signal`, so nothing refuses \
+         pid 0, 1, -1, our own group or a recycled pid, and nothing logs why: \
+         {offenders:?}"
+    );
+    for (allowed, _) in ALLOWED {
+        assert!(
+            root.parent().expect("manifest dir").join(allowed).is_file(),
+            "ALLOWED names {allowed}, which is not a file any more"
+        );
+    }
+    for (named, _) in NAMES_THE_KILLERS {
+        let path = root.parent().expect("manifest dir").join(named);
+        assert!(
+            path.is_file(),
+            "NAMES_THE_KILLERS names {named}, which is not a file any more"
+        );
+        // The excuse covers naming the tools, never running one.
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for (line_no, line) in strip_test_items(&text) {
+            let code = line.trim_start();
+            assert!(
+                !(code.contains("Command::new") || code.contains("process::Command")),
+                "{named}:{line_no} spawns a process, which its exemption does not cover"
+            );
+        }
+    }
+    assert!(scanned > 10_000, "read only {scanned} production lines");
 }
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {

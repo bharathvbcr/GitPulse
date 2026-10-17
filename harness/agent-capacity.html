@@ -18,8 +18,7 @@
       // their requests for good — and a third: a strip bounded by the session
       // limit counted ended tabs, so a repository whose agents had run that many
       // times could start no more.
-      import { mockIPCWithEvents } from "./tauriMocks";
-      import { emit } from "@tauri-apps/api/event";
+      import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
       import "../src/app.css";
       import { holdForeground } from "./foreground";
       holdForeground();
@@ -39,17 +38,18 @@
         cmd_repository_trust: ({ repoPath }) => ({ path: repoPath, git_dir: `${repoPath}/.git`, common_dir: `${familyRoot(repoPath)}/.git`, identity: "fixture", scope: "repository", worktrees: 1 }),
         cmd_list_worktrees: () => [], cmd_get_status: () => [], cmd_list_branches: () => [], cmd_list_remotes: () => [], cmd_list_submodules: () => [],
         cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_list_tags: () => ({ tags: [], truncated: false }), cmd_branch_stats: () => ({}),
-        cmd_terminal_spawn: (args) => { plainSpawns.push(args); return { id: `plain-${++sessions}`, cwd: args.repoPath, shell: "/bin/sh" }; },
-        cmd_terminal_kill: () => null, cmd_terminal_resize: () => null, cmd_terminal_write: () => null, cmd_terminal_ack: () => null,
+        cmd_terminal_spawn: (args) => { plainSpawns.push(args); const id = `plain-${++sessions}`; adoptOutput(id, args); return { id, cwd: args.repoPath, shell: "/bin/sh" }; },
+        cmd_terminal_kill: () => null, cmd_terminal_detach: () => true, cmd_terminal_resize: () => null, cmd_terminal_write: () => null, cmd_terminal_ack: () => null,
         cmd_workspace_sync: () => null, cmd_repo_operation: () => null, cmd_watch_repo: () => null, cmd_set_recent_menu: () => null,
         cmd_last_fetch_at: () => null, cmd_devmap_maybe_refresh: () => null, cmd_devcouncil_init: () => null, cmd_agent_defaults: () => null,
         cmd_session_alerts_visible: () => null, cmd_note_tab_activated: () => null,
-        cmd_workbench_launch_terminal: ({ input }) => {
-          const { id } = JSON.parse(input); const run = runs.get(id);
+        cmd_workbench_launch_terminal: (args) => {
+          const { id } = JSON.parse(args.input); const run = runs.get(id);
           launches.set(id, (launches.get(id) ?? 0) + 1);
           if (!run.session_id) { run.session_id = `agent-${++sessions}`; run.state = "running"; }
           const sid = run.session_id;
-          setTimeout(() => emit("terminal-output", { id: sid, data_b64: btoa("ready\r\n") }), 20);
+          adoptOutput(sid, args);
+          setTimeout(() => pushOutput(sid, "ready\r\n"), 20);
           return { id: sid, cwd: run.cwd, shell: "claude" };
         },
         cmd_workbench_request: ({ method, input }) => {
@@ -126,7 +126,7 @@
 
         // ---- slots free: the waiting starts follow, each once -------------
         const ended = get(terminalSessions).slice(0, 10).map((r) => r.sessionId);
-        for (const id of ended) await emit("terminal-exit", { id, exit_code: 0, signal: "", error: null, reaped: true });
+        for (const id of ended) await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
         await until(() => launches.size === 36 && waiting() === 0);
         check("freeing ten slots starts every waiting agent", () => launches.size === 36);
         check("…with nothing left waiting", () => waiting() === 0);
@@ -145,7 +145,7 @@
         // ---- a resumed conversation runs in its own worktree --------------
         const before = plainSpawns.length;
         const ended2 = get(terminalSessions).slice(0, 1).map((r) => r.sessionId);
-        for (const id of ended2) await emit("terminal-exit", { id, exit_code: 0, signal: "", error: null, reaped: true });
+        for (const id of ended2) await emitExit(id, { exit_code: 0, signal: "", error: null, reaped: true, ended_by_gitpulse: false });
         prepare("old", wt("r1", "old"));
         const resumed = await resumeTaskConversation({ id: "old", task_title: "Old attempt" });
         await until(() => plainSpawns.length > before);

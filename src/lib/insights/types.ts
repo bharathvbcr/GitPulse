@@ -256,10 +256,20 @@ export interface McpInfo {
   binary_found: boolean;
   binary_path: string;
   binary_error: string;
+  /** The bare `gitpulse-mcp` the plugin manifest names resolves on PATH. */
+  binary_on_path: boolean;
+  hook_found: boolean;
+  hook_path: string;
+  hook_error: string;
+  hook_on_path: boolean;
   plugin_found: boolean;
   plugin_path: string;
   plugin_error: string;
   plugin_manifest_json: string;
   plugin_mcp_json: string;
+  /** MCP manifest to install: `command` is the resolved absolute path; empty when not found. */
+  mcp_config_json: string;
+  /** Hooks manifest to install: absolute path, deciding hooks refuse when the binary is missing; empty when not found. */
+  hooks_config_json: string;
   tools: McpToolInfo[];
 }

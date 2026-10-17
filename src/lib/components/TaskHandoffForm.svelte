@@ -20,6 +20,7 @@
   import { FolderOpen } from "@lucide/svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
+  import { admitAnyway, HOST_PRESSURE_REFUSAL } from "../stores/hostLoadStore";
   import { startPreparedAttempt } from "../workbench/taskTerminal";
   import { bounded, WORKTREE_PREPARE_TIMEOUT_MS } from "../workbench/taskActions";
   import {
@@ -27,6 +28,7 @@
     explainError,
     getRepository,
     getTask,
+    checkoutIdentity,
     listHoldingRuns,
     newID,
     prepareTaskRun,
@@ -41,14 +43,19 @@
     PROVIDER_LABELS,
     checkoutCandidates,
     defaultHandoff,
-    attemptHolding,
+    checkoutHolder,
     handoffGate,
+    holdPendingPreparation,
     launchModelOverride,
+    modelOverrideChoices,
     modelOverrideFields,
     NO_MODEL_OVERRIDE,
     normalizeCheckout,
+    pendingPreparationFor,
+    pendingPreparationsChanged,
     preferredCheckout,
     reconcileHandoff,
+    releasePendingPreparation,
     supportsManaged,
     type HandoffGate,
     type HandoffSettings,
@@ -107,14 +114,31 @@
     onPreparing?: (draft: { id: string; provider: AgentProvider; kind: RunKind; worktree: boolean } | null) => void;
   } = $props();
 
+  /** How long the checkout field must stay unchanged before its Git identity is read. */
+  const CHECKOUT_IDENTITY_SETTLE_MS = 250;
   let repositoryId = $state(untrack(() => primaryRepositoryId));
   let checkout = $state("");
   let acknowledged = $state(false);
   let provisionWorktree = $state(false);
   let busy = $state(false);
   let error = $state("");
+  /** The last launch was refused by the load governor: offer Retry and Admit anyway. */
+  let refusedByPressure = $state(false);
   let note = $state("");
-  let pending = $state<RunPreparation | null>(null);
+  /** Restored for this task when an earlier form's preparation is still unanswered: closing a sheet must not forget it. */
+  let pending = $state<RunPreparation | null>(untrack(() => pendingPreparationFor(taskId)));
+  // A restored preparation can be settled by the form that sent it — the one
+  // a remount destroyed while the store was answering. Once the hold no longer
+  // names it, it is not this form's to retry: the attempt is listed (or was
+  // refused) and the checkout's occupancy has changed.
+  $effect(() => {
+    $pendingPreparationsChanged;
+    untrack(() => {
+      if (!pending || busy || pendingPreparationFor(pending.task_id)?.id === pending.id) return;
+      pending = null;
+      void loadHolding(selected);
+    });
+  });
   /** This launch's model, over the saved default. Not remembered: the next launch starts from the default again. */
   let modelOverride = $state<ModelOverride>({ ...NO_MODEL_OVERRIDE });
   let disposed = false;
@@ -140,18 +164,49 @@
    * busy checkout is still caught by the store's own refusal below.
    */
   let holding = $state<TaskRun[] | null>(null);
+  /** Why the holding list is null, when its read failed. */
+  let holdingError = $state<string | null>(null);
   let holdingTicket = 0;
-  const occupant = $derived(holding ? attemptHolding(holding, checkout, pathOpts) : null);
-  /** A checkout that already has an agent can only take this one in a worktree. */
-  const useWorktree = $derived(provisionWorktree || occupant !== null);
+  /**
+   * The chosen checkout's Git directory — the key the store refuses a busy
+   * checkout by — once the host has said. Null while unknown or after a
+   * failed read, when "is it taken" falls back to comparing directories and
+   * the store's own refusal remains the backstop. Launch never waits on it.
+   */
+  let targetGitDir = $state<string | null>(null);
+  let identityTicket = 0;
+  $effect(() => {
+    const path = normalizeCheckout(checkout);
+    const ticket = ++identityTicket;
+    targetGitDir = null;
+    if (!path) return;
+    // Settled typing only: each read runs Git in the checkout.
+    const timer = setTimeout(() => {
+      bounded(checkoutIdentity(path)).then(
+        (identity) => { if (!disposed && ticket === identityTicket) targetGitDir = identity.git_dir; },
+        () => { if (!disposed && ticket === identityTicket) targetGitDir = null; },
+      );
+    }, CHECKOUT_IDENTITY_SETTLE_MS);
+    return () => clearTimeout(timer);
+  });
+  const holder = $derived(checkoutHolder(holding, holdingError, { path: checkout, git_dir: targetGitDir }, pathOpts));
+  const occupant = $derived(holder.kind === "held" ? holder.run : null);
+  /**
+   * A checkout that already has an agent can only take this one in a
+   * worktree, and so can one whose holders could not be read: unknown is
+   * treated as held, never as free.
+   */
+  const useWorktree = $derived(provisionWorktree || holder.kind !== "free");
 
   async function loadHolding(repository: string) {
     const ticket = ++holdingTicket;
+    holding = null;
+    holdingError = null;
     try {
       const runs = await listHoldingRuns(repository);
       if (!disposed && ticket === holdingTicket) holding = runs;
-    } catch {
-      if (!disposed && ticket === holdingTicket) holding = null;
+    } catch (error) {
+      if (!disposed && ticket === holdingTicket) { holding = null; holdingError = explainError(error); }
     }
   }
   $effect(() => { const repository = selected; untrack(() => { void loadHolding(repository); }); });
@@ -176,6 +231,18 @@
   // The checkout follows the repository. A reader who typed one keeps it; an
   // untouched field takes the best candidate for whatever is now selected.
   let touchedCheckout = false;
+  // A restored preparation is shown as what it will replay — its checkout,
+  // agent, connection and mode — since every control is locked while it is.
+  untrack(() => {
+    if (!pending) return;
+    repositoryId = pending.repository_id;
+    checkout = pending.repo_path;
+    touchedCheckout = true;
+    provisionWorktree = pending.worktree === true;
+    acknowledged = pending.acknowledge_bypass;
+    settings = reconcileHandoff({ provider: pending.provider, kind: pending.kind ?? "external_terminal", permission: pending.permission_mode });
+    note = "This attempt's earlier preparation was never answered. Retry it, or discard it to start over.";
+  });
   $effect(() => {
     const best = preferredCheckout(candidates);
     if (!touchedCheckout) checkout = best;
@@ -194,11 +261,41 @@
     note = "";
   }
 
+  /**
+   * Gives up replaying an unanswered preparation, deliberately.
+   *
+   * The only way out of the retry, so it says what it cannot know: if the
+   * store did commit it, that attempt is real. A prepared attempt expires on
+   * its own, and while it lives it is shown as holding its checkout.
+   */
+  function discard() {
+    if (!pending || busy) return;
+    releasePendingPreparation(pending.task_id, pending.id);
+    pending = null;
+    error = "";
+    note = "Discarded. If the store did create that attempt it is listed under this task's Agents, holds its checkout until it expires, and can be cancelled there.";
+    void loadHolding(selected);
+  }
+
   async function browse() {
     try {
       const path = await invoke<string | null>("cmd_pick_folder");
       if (path && !disposed) { checkout = path; touchedCheckout = true; }
     } catch (cause) { error = explainError(cause); }
+  }
+
+  /**
+   * "Admit anyway" after the load governor refused: a system dialog the page
+   * cannot answer, then the launch again. A No leaves the refusal standing.
+   */
+  async function admitAndRetry() {
+    try {
+      await admitAnyway();
+    } catch (cause) {
+      error = explainError(cause);
+      return;
+    }
+    await launch();
   }
 
   /**
@@ -227,7 +324,9 @@
     // acceptance — never a read of the bound prop after an await.
     const chosen: HandoffSettings = { ...settings };
     const preparing = onPreparing;
-    busy = true; error = ""; note = "";
+    /** The request actually sent, once it is: what a settled answer releases. */
+    let sent: RunPreparation | null = null;
+    busy = true; error = ""; note = ""; refusedByPressure = false;
     try {
       if (!pending) {
         const path = normalizeCheckout(checkout);
@@ -244,7 +343,7 @@
         // The host makes the worktree, inside the same step that prepares the
         // attempt, and removes it again if the attempt is refused.
         if (useWorktree) note = "Creating a worktree and running this repository's setup. A dependency install can take several minutes; the attempt appears here when it is ready.";
-        pending = {
+        const prepared: RunPreparation = {
           kind: settings.kind,
           id: newID(),
           request_id: newID(),
@@ -259,12 +358,18 @@
           acknowledge_bypass: acknowledged,
           ...(model.choice ? { model_choice: model.choice } : {}),
         };
+        // Held before it becomes state: `$state` deep-proxies the object, and
+        // a proxy cannot be structuredClone'd into the hold.
+        holdPendingPreparation(prepared);
+        pending = prepared;
       }
       const preparation = pending;
       preparing?.({ id: preparation.id, provider: preparation.provider, kind: preparation.kind ?? "external_terminal", worktree: preparation.worktree === true });
       // A worktree attempt runs the repository's setup inside this call: give
       // it the setup's own bound, not the 30 s a store read gets.
+      sent = preparation;
       const run = await bounded(prepareTaskRun(preparation), preparation.worktree ? WORKTREE_PREPARE_TIMEOUT_MS : undefined);
+      releasePendingPreparation(preparation.task_id, preparation.id);
       pending = null;
       // Accepted: from here on the attempt exists, and its start belongs to
       // the module owner — begun before any check of whether this form still
@@ -286,9 +391,20 @@
       // the form has nothing left to say about an accepted attempt.
       if (!disposed && result.ok) onLaunched(result.run);
     } catch (cause) {
+      // Settled before the disposal check: a refusal that lands after the
+      // sheet closed must not be replayed by the next one as if unanswered.
+      const settled = cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code);
+      if (settled && sent) releasePendingPreparation(sent.task_id, sent.id);
       if (disposed) return;
       error = explainError(cause);
-      if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code)) pending = null;
+      refusedByPressure = cause instanceof WorkbenchError && cause.code === HOST_PRESSURE_REFUSAL;
+      if (settled) pending = null;
+      // The store answered and the reply could not be read: it committed or
+      // refused, and replaying gets the same unreadable answer, so the retry
+      // is dropped — but the attempt may well exist.
+      if (sent && cause instanceof WorkbenchError && cause.code === "protocol_error") {
+        error = `${error} The store did answer, so this attempt may exist: check this task's Agents before launching again.`;
+      }
       // The store saw an agent this form did not (a read that failed, or one
       // that started since). Select the worktree so the next press runs.
       if (cause instanceof WorkbenchError && cause.code === "checkout_busy" && pending === null) {
@@ -377,13 +493,15 @@
     <input
       type="checkbox"
       checked={useWorktree}
-      disabled={locked || occupant !== null}
+      disabled={locked || holder.kind !== "free"}
       onchange={(e) => { provisionWorktree = e.currentTarget.checked; }}
     />
     Run in a new worktree, so other tasks can run at the same time
   </label>
   {#if occupant}
     <p class="meta" data-testid="checkout-occupied">An agent is already working in this checkout ({occupant.task_title || "another task"}, {occupant.state}). This attempt gets its own worktree and branch beside it.</p>
+  {:else if holder.kind === "unknown"}
+    <p class="meta" role="status" data-testid="checkout-holder-unknown">Cannot tell whether an agent already works in this checkout ({holder.reason}), so this attempt runs in its own worktree. Launching in the checkout itself is disabled until that is known.</p>
   {:else if useWorktree}
     <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the attempt is refused.</p>
   {/if}
@@ -399,7 +517,15 @@
       <legend>Model for this launch</legend>
       <div class="pair">
         {#if overrideFields.includes("model")}
-          <input class="gp-field" aria-label="Model" placeholder="Saved default" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.model} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }} />
+          {@const choices = modelOverrideChoices(settings.provider, "model")}
+          {#if choices}
+            <select class="gp-select" aria-label="Model" value={modelOverride.model} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }}>
+              <option value="">Saved model</option>
+              {#each choices as id (id)}<option value={id}>{id}</option>{/each}
+            </select>
+          {:else}
+            <input class="gp-field" aria-label="Model" placeholder="Saved default" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.model} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }} />
+          {/if}
         {/if}
         {#if overrideFields.includes("effort")}
           <select class="gp-select" aria-label="Effort" value={modelOverride.effort} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, effort: e.currentTarget.value }; }}>
@@ -408,7 +534,15 @@
           </select>
         {/if}
         {#if overrideFields.includes("advisor")}
-          <input class="gp-field" aria-label="Advisor model" placeholder="Saved advisor" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.advisor} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }} />
+          {@const choices = modelOverrideChoices(settings.provider, "advisor")}
+          {#if choices}
+            <select class="gp-select" aria-label="Advisor model" value={modelOverride.advisor} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }}>
+              <option value="">Saved advisor</option>
+              {#each choices as id (id)}<option value={id}>{id}</option>{/each}
+            </select>
+          {:else}
+            <input class="gp-field" aria-label="Advisor model" placeholder="Saved advisor" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.advisor} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }} />
+          {/if}
         {/if}
       </div>
       <p class="meta">Blank fields keep the default from Settings. What this attempt runs with is recorded on it.</p>
@@ -422,9 +556,22 @@
     </label>
   {/if}
 
-  {#if pending}<p role="status" class="warn">The preparation result is uncertain. Retry this exact attempt before creating another.</p>{/if}
+  {#if pending}
+    <p role="status" class="warn">
+      The preparation result is uncertain. Retry this exact attempt before creating another.
+      <button type="button" class="gp-btn discard" disabled={busy} onclick={discard}>Discard it</button>
+    </p>
+  {/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
   {#if error}<p role="alert" class="error">{error}</p>{/if}
+  {#if refusedByPressure}
+    <!-- The load governor refused the launch (docs/LOAD_GOVERNOR.md). Retry
+         asks again; Admit anyway asks in a system dialog, then asks again. -->
+    <p class="meta" data-testid="handoff-pressure-actions">
+      <button type="button" class="gp-btn" disabled={locked} onclick={() => void launch()}>Retry</button>
+      <button type="button" class="gp-btn" disabled={locked} onclick={() => void admitAndRetry()}>Admit anyway</button>
+    </p>
+  {/if}
 </div>
 
 <style>
@@ -442,5 +589,6 @@
   .ack input{width:auto}
   .error{margin:0;font-size:11px;color:#dc6565}
   .warn{margin:0;font-size:11px;color:rgb(180 83 9)}
+  .discard{margin-left:6px;font-size:11px;padding:2px 8px}
   button:disabled{opacity:.5}
 </style>

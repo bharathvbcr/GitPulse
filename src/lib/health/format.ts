@@ -1,4 +1,6 @@
+import { safeText } from "../terminal/agentPromptText";
 import type { HealthTone } from "./summary";
+import type { AuditCoverage } from "./types";
 
 export type AuditSeverity = "critical" | "high" | "moderate" | "low" | "info";
 
@@ -137,6 +139,29 @@ export interface AuditCountSummary {
   info?: number;
   unknown?: number;
   total: number;
+}
+
+/** Targets named before the rest are counted; the totals always carry both numbers. */
+const MAX_UNAUDITED_LISTED = 5;
+
+/**
+ * "N of M audited; not audited: a, b" for the audit's own target census, or
+ * null when it found nothing to audit or an older build sent no census.
+ *
+ * Canonical owner of the phrase, so the Health view, its facet and the text
+ * report cannot word the same scan differently. Both numbers always print: a
+ * count of what was audited is never offered without what was found.
+ */
+export function formatAuditCoverage(coverage: AuditCoverage | undefined): string | null {
+  if (!coverage || coverage.found <= 0) return null;
+  const head = `${coverage.audited} of ${coverage.found} audited`;
+  const names = coverage.unaudited.map((name) => safeText(name)).filter((name) => name.length > 0);
+  if (names.length === 0) {
+    return coverage.audited < coverage.found ? `${head}; not audited: unknown` : head;
+  }
+  const shown = names.slice(0, MAX_UNAUDITED_LISTED).join(", ");
+  const more = names.length > MAX_UNAUDITED_LISTED ? ` and ${names.length - MAX_UNAUDITED_LISTED} more` : "";
+  return `${head}; not audited: ${shown}${more}`;
 }
 
 export function formatAuditCounts(

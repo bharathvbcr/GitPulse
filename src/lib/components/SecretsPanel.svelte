@@ -11,7 +11,7 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import {
     KeyRound,
@@ -46,7 +46,7 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import { formatRelativeTime, plural } from "../format";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { revealInFileManager } from "../desktop/openInShell";
   import { toastStore } from "../stores/toastStore";
 
@@ -63,14 +63,14 @@
   let inflight: AsyncGuard | null = null;
 
   // Keeps "scanned 3m ago" true while the panel stays open.
-  const stopTick = createVisibleInterval(() => (nowMs = Date.now()), 30_000);
+  const stopTick = createAdaptiveTimer(() => (nowMs = Date.now()), 30_000);
   onDestroy(stopTick);
 
   // The effect below must re-run when the repository changes and at no other
   // time. Reading `$repoStore.currentPath` inside it subscribes to the whole
   // store, so every status or branch refresh during the first scan re-ran it
   // and started a second full Kingfisher scan.
-  const currentPath = $derived($repoStore.currentPath);
+  const currentPath = $derived($currentRepoPath);
   /** Path of the scan in flight, so a re-run never starts a duplicate. */
   let inflightPath: string | null = null;
 
@@ -214,6 +214,11 @@
           {/if}
           {#if scannedAgo}· scanned {scannedAgo}{/if}
           {#if report.kingfisher_version}· Kingfisher {report.kingfisher_version}{/if}
+          {#if report.kingfisher_version_rejected}<span
+              class="text-amber-300"
+              title="The scan output named a version that was refused as unsafe to display.">
+              · scan-reported version refused</span
+            >{/if}
         </span>
       {/if}
     </div>
@@ -392,7 +397,7 @@
                     >
                   </td>
                   <td class="px-3 py-1.5 font-mono text-textPrimary break-all">
-                    <span title={finding.path}>{finding.path}</span>{#if finding.line > 0}<span
+                    <span title={finding.path}>{finding.path}</span>{#if finding.line !== null}<span
                         class="text-textMuted">:{finding.line}</span
                       >{/if}
                     {#if sameValue > 1}

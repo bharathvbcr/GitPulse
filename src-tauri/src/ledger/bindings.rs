@@ -10,6 +10,12 @@
 //! Resolution is "the most recent bind or unbind for this path wins". An
 //! unbind is recorded rather than deleting the bind, for the same reason: the
 //! work that happened while the binding held really did happen under it.
+//!
+//! That history is read two ways. [`binding_at`] is the live gate's question,
+//! "what holds now". [`binding_as_of`] and [`BindingHistory`] answer "what held
+//! at that moment", which is what a replayed event needs: a transcript call
+//! from before a rebind is stamped with the task that was bound when it ran.
+//! Both order rows by the same `(ts_utc, ulid)` key.
 
 use super::{append, ActorKind, Draft, LedgerError, Outcome};
 
@@ -40,21 +46,23 @@ struct FamilyAddress {
     members: Vec<std::path::PathBuf>,
 }
 
-fn resolve_address(repo_path: &str, worktree_path: &str) -> Result<FamilyAddress, LedgerError> {
-    crate::engine::worktree::resolve_worktree_family(repo_path, worktree_path)
-        .map(|family| FamilyAddress {
+impl From<crate::engine::worktree::WorktreeFamily> for FamilyAddress {
+    fn from(family: crate::engine::worktree::WorktreeFamily) -> Self {
+        FamilyAddress {
             address: BindingAddress {
                 anchor: family.anchor.to_string_lossy().into_owned(),
                 worktree: family.worktree.to_string_lossy().into_owned(),
             },
             members: family.members,
-        })
-        .map_err(|message| classify(repo_path, worktree_path, message))
+        }
+    }
 }
 
-/// The ledger error for a failed family resolution, told apart by *why* it
-/// failed. Each code names a different thing the caller must do, so the order
-/// below is the order of "what could we establish before it failed".
+/// The error code for a family resolution that failed with `message`.
+///
+/// One classifier for both halves of resolution — the metadata admission and
+/// the `git worktree list` authentication — so a failure reads the same
+/// whichever half caught it.
 fn classify(repo_path: &str, worktree_path: &str, message: String) -> LedgerError {
     // A checkout that is no longer on disk is neither untrusted nor
     // broken: it was removed or moved. Named first and on its own,
@@ -93,6 +101,47 @@ fn classify(repo_path: &str, worktree_path: &str, message: String) -> LedgerErro
     LedgerError::new(code, message)
 }
 
+fn resolve_address(repo_path: &str, worktree_path: &str) -> Result<FamilyAddress, LedgerError> {
+    crate::engine::worktree::resolve_worktree_family(repo_path, worktree_path)
+        .map(FamilyAddress::from)
+        .map_err(|message| classify(repo_path, worktree_path, message))
+}
+
+/// Admits the pair from metadata, or `Ok(None)` when no checkout of the
+/// repository holds a ledger — so there is no binding to find, and nothing to
+/// consolidate either.
+///
+/// That answer costs no Git: a binding is a ledger event, and the repository's
+/// own metadata names every checkout a ledger could live in. Anything short
+/// of that — a ledger somewhere, or a family the metadata cannot account for —
+/// goes on to `git worktree list`, which alone authenticates membership. A
+/// hand-written gitfile pointing into a repository with no ledger anywhere is
+/// therefore answered "unbound" rather than "not registered": with no ledger,
+/// no checkout of it is bound.
+fn admit_with_ledger(
+    repo_path: &str,
+    worktree_path: &str,
+) -> Result<Option<crate::engine::worktree::AdmittedPair>, LedgerError> {
+    let pair = crate::engine::worktree::admit_worktree_pair(repo_path, worktree_path)
+        .map_err(|message| classify(repo_path, worktree_path, message))?;
+    let no_ledger = pair.metadata_checkouts().is_some_and(|checkouts| {
+        !checkouts
+            .iter()
+            .any(|checkout| super::is_initialised(&checkout.to_string_lossy()))
+    });
+    Ok((!no_ledger).then_some(pair))
+}
+
+fn authenticate(
+    repo_path: &str,
+    worktree_path: &str,
+    pair: crate::engine::worktree::AdmittedPair,
+) -> Result<FamilyAddress, LedgerError> {
+    pair.authenticate()
+        .map(FamilyAddress::from)
+        .map_err(|message| classify(repo_path, worktree_path, message))
+}
+
 fn address(repo_path: &str, worktree_path: &str) -> Result<BindingAddress, LedgerError> {
     let family = resolve_address(repo_path, worktree_path)?;
     super::consolidate_worktree_ledgers(&family.address.anchor, &family.members)?;
@@ -103,6 +152,15 @@ fn address(repo_path: &str, worktree_path: &str) -> Result<BindingAddress, Ledge
 /// writers and readers cannot choose different databases for sibling paths.
 pub fn repository_address(repo_path: &str) -> Result<BindingAddress, LedgerError> {
     address(repo_path, repo_path)
+}
+
+/// [`repository_address`] for a read-only caller: the same anchor, without the
+/// legacy consolidation, which imports rows into (and so creates) the anchor
+/// database. Rows a sibling still holds are not visible through it, which a
+/// read-only status says; running the migration to make the answer complete
+/// is not a read's call to make.
+pub fn repository_address_readonly(repo_path: &str) -> Result<BindingAddress, LedgerError> {
+    resolve_address(repo_path, repo_path).map(|family| family.address)
 }
 
 /// Status is the one family entrypoint that can still return a useful object
@@ -193,8 +251,24 @@ fn validate_task(anchor: &str, task_id: &str) -> Result<(), LedgerError> {
 
 /// Binds `worktree_path` to `task_id`, recording it as an event.
 pub fn bind(repo_path: &str, worktree_path: &str, task_id: &str) -> Result<i64, LedgerError> {
+    bind_with(repo_path, worktree_path, task_id, |_| None)
+}
+
+/// [`bind`] that runs `before` once the pair is resolved and the task
+/// validated, and records the `detail_json` it returns on the bind row.
+///
+/// For work that must precede the row, such as catching up what happened under
+/// the old binding. `before` runs with no ledger lock held, and whatever it
+/// does, the bind is written.
+pub fn bind_with(
+    repo_path: &str,
+    worktree_path: &str,
+    task_id: &str,
+    before: impl FnOnce(&BindingAddress) -> Option<String>,
+) -> Result<i64, LedgerError> {
     let address = address(repo_path, worktree_path)?;
     validate_task(&address.anchor, task_id)?;
+    let detail_json = before(&address);
     append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
@@ -203,13 +277,24 @@ pub fn bind(repo_path: &str, worktree_path: &str, task_id: &str) -> Result<i64, 
         object: Some(address.worktree),
         actor_kind: Some(ActorKind::Human),
         outcome: Some(Outcome::Ok),
+        detail_json,
         ..Default::default()
     })
 }
 
 /// Clears whatever `worktree_path` was bound to.
 pub fn unbind(repo_path: &str, worktree_path: &str) -> Result<i64, LedgerError> {
+    unbind_with(repo_path, worktree_path, |_| None)
+}
+
+/// [`unbind`] with the same `before` hook as [`bind_with`].
+pub fn unbind_with(
+    repo_path: &str,
+    worktree_path: &str,
+    before: impl FnOnce(&BindingAddress) -> Option<String>,
+) -> Result<i64, LedgerError> {
     let address = address(repo_path, worktree_path)?;
+    let detail_json = before(&address);
     append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
@@ -217,6 +302,7 @@ pub fn unbind(repo_path: &str, worktree_path: &str) -> Result<i64, LedgerError> 
         object: Some(address.worktree),
         actor_kind: Some(ActorKind::Human),
         outcome: Some(Outcome::Ok),
+        detail_json,
         ..Default::default()
     })
 }
@@ -239,11 +325,60 @@ pub(crate) struct ResolvedBinding {
     pub worktree: String,
 }
 
+/// Resolves a binding for a family whose own ledger does not exist yet: the
+/// newest bind or unbind across the siblings' old ledgers, read-only. A legacy
+/// binding must still be enforced after an upgrade, but resolving it is a
+/// read, and a read must not create or migrate the family ledger.
+fn newest_sibling_binding(family: FamilyAddress) -> Result<Option<ResolvedBinding>, LedgerError> {
+    let stored_worktree = super::redact::text(&family.address.worktree);
+    let mut newest: Option<super::NewestBinding> = None;
+    for member in &family.members {
+        let member = member.to_string_lossy();
+        if member.as_ref() == family.address.anchor || !super::is_initialised(&member) {
+            continue;
+        }
+        let found =
+            super::newest_binding_readonly(&member, &family.address.worktree, &stored_worktree)?;
+        if let Some(found) = found {
+            if newest.as_ref().is_none_or(|(key, _)| found.0 > *key) {
+                newest = Some(found);
+            }
+        }
+    }
+    Ok(newest
+        .and_then(|(_, task)| task)
+        .map(|task_id| ResolvedBinding {
+            task_id,
+            anchor: family.address.anchor,
+            worktree: family.address.worktree,
+        }))
+}
+
 pub(crate) fn resolve_binding(
     repo_path: &str,
     worktree_path: &str,
 ) -> Result<Option<ResolvedBinding>, LedgerError> {
-    let address = address(repo_path, worktree_path)?;
+    let Some(pair) = admit_with_ledger(repo_path, worktree_path)? else {
+        return Ok(None);
+    };
+    let family = authenticate(repo_path, worktree_path, pair)?;
+    // A ledger only in a sibling checkout is read where it is: consolidating
+    // would create the anchor database to import it into, and resolving a
+    // binding is a read.
+    if !super::is_initialised(&family.address.anchor) {
+        return newest_sibling_binding(family);
+    }
+    super::consolidate_worktree_ledgers(&family.address.anchor, &family.members)?;
+    binding_at(&family.address)
+}
+
+/// The binding at an address [`repository_address`] already resolved and
+/// consolidated.
+///
+/// The app's gate resolves the family once per gated action and hands that one
+/// answer to both the scope lookup and the ledger row it records, rather than
+/// resolving it again for each.
+pub(crate) fn binding_at(address: &BindingAddress) -> Result<Option<ResolvedBinding>, LedgerError> {
     // A binding *is* a ledger event, so a repository with no ledger has none —
     // and scanning for one would open the database, which creates it. That put
     // `.devcouncil/` into a fresh checkout on a `gitpulse_change_context` call,
@@ -257,6 +392,191 @@ pub(crate) fn resolve_binding(
     // retain their original timestamp and are the ledger's cross-database sort
     // key, so binding precedence uses them rather than import order.
     let newest = super::latest_binding(&address.anchor, &address.worktree, &stored_worktree)?;
+    Ok(newest.flatten().map(|task_id| ResolvedBinding {
+        task_id,
+        anchor: address.anchor.clone(),
+        worktree: address.worktree.clone(),
+    }))
+}
+
+/// What held for a worktree at a moment, as far as the ledger can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskAtTime {
+    /// The newest bind at or before the moment names this task.
+    Bound(String),
+    /// The newest row at or before the moment is an unbind: a decided state
+    /// with no task.
+    Unbound,
+    /// Nothing decides it: no bind or unbind at or before the moment, a
+    /// moment that is not trusted or not exact enough, or a history that could
+    /// not be read. Never the binding that holds now.
+    Unresolved,
+}
+
+impl TaskAtTime {
+    /// The task, for a [`TaskAtTime::Bound`] moment.
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            TaskAtTime::Bound(task) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// The `task_basis` an event records: `bound`, `unbound` or `unresolved`.
+    pub fn basis(&self) -> &'static str {
+        match self {
+            TaskAtTime::Bound(_) => "bound",
+            TaskAtTime::Unbound => "unbound",
+            TaskAtTime::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// The binding at `address` as of `at_ms` (epoch milliseconds): the newest bind
+/// or unbind appended at or before it. A row exactly at `at_ms` counts, and
+/// ties go to the larger ULID, as in [`binding_at`], which this agrees with at
+/// any moment after the last row.
+///
+/// One indexed query for one question. A pass with many calls to answer reads
+/// [`BindingHistory`] once instead.
+pub fn binding_as_of(address: &BindingAddress, at_ms: u64) -> Result<TaskAtTime, LedgerError> {
+    if !super::is_initialised(&address.anchor) {
+        return Ok(TaskAtTime::Unresolved);
+    }
+    let stored_worktree = super::redact::text(&address.worktree);
+    let found = super::binding_as_of(
+        &address.anchor,
+        &address.worktree,
+        &stored_worktree,
+        &super::ids::iso8601_utc(at_ms),
+    )?;
+    Ok(match found {
+        Some(Some(task)) => TaskAtTime::Bound(task),
+        Some(None) => TaskAtTime::Unbound,
+        None => TaskAtTime::Unresolved,
+    })
+}
+
+/// One worktree's bind and unbind rows, read once, answering "what held at
+/// this moment" for any number of moments.
+///
+/// Departed worktrees resolve from their own path's rows with no family
+/// authentication: a bind row exists only for a path that was authenticated
+/// when it was bound, so this widens whose events can be attributed, not
+/// who can act.
+#[derive(Debug, Clone, Default)]
+pub struct BindingHistory {
+    /// Oldest first, in `(ts_utc, ulid)` order.
+    rows: Vec<super::BindingRow>,
+    /// The read failed: every answer is `Unresolved`.
+    unreadable: bool,
+}
+
+impl BindingHistory {
+    /// The history of `worktree` in the ledger at `anchor`. A repository with
+    /// no ledger has none, and is not created by asking.
+    pub fn load(anchor: &str, worktree: &str) -> Result<Self, LedgerError> {
+        if !super::is_initialised(anchor) {
+            return Ok(Self::default());
+        }
+        let stored_worktree = super::redact::text(worktree);
+        Ok(Self {
+            rows: super::binding_history(anchor, worktree, &stored_worktree)?,
+            unreadable: false,
+        })
+    }
+
+    /// A history that could not be read: it decides nothing.
+    pub const fn unreadable() -> Self {
+        Self {
+            rows: Vec::new(),
+            unreadable: true,
+        }
+    }
+
+    /// What held at `at_ms`, exact to the millisecond.
+    pub fn as_of(&self, at_ms: u64) -> TaskAtTime {
+        // Nothing to order against: most worktrees were never bound, and this
+        // runs once per call of a corpus.
+        if self.unreadable || self.rows.is_empty() {
+            return TaskAtTime::Unresolved;
+        }
+        let at = super::ids::iso8601_utc(at_ms);
+        match self
+            .rows
+            .partition_point(|row| row.ts_utc.as_str() <= at.as_str())
+        {
+            0 => TaskAtTime::Unresolved,
+            newest => match &self.rows[newest - 1].task_id {
+                Some(task) => TaskAtTime::Bound(task.clone()),
+                None => TaskAtTime::Unbound,
+            },
+        }
+    }
+
+    /// What held at some moment of the whole second starting at `second_ms`,
+    /// for a source that records only seconds (the reflog). A bind or unbind
+    /// anywhere in `[second_ms, second_ms + 999]` leaves the order of the two
+    /// undecidable, so it is `Unresolved`.
+    pub fn as_of_second(&self, second_ms: u64) -> TaskAtTime {
+        let from = super::ids::iso8601_utc(second_ms);
+        let to = super::ids::iso8601_utc(second_ms.saturating_add(999));
+        let start = self
+            .rows
+            .partition_point(|row| row.ts_utc.as_str() < from.as_str());
+        if self
+            .rows
+            .get(start)
+            .is_some_and(|row| row.ts_utc.as_str() <= to.as_str())
+        {
+            return TaskAtTime::Unresolved;
+        }
+        self.as_of(second_ms)
+    }
+}
+
+/// [`resolve_binding`] for the agent hook, which must not write.
+///
+/// The hook is a fresh process on every Bash call and every file edit an
+/// agent makes, so whatever this costs is paid per tool call. It answers the
+/// same question with the same fail-closed outcomes — missing, untrusted,
+/// unrelated or invalid checkouts, a foreign row, an unreadable ledger — but:
+///
+/// * a repository with no ledger in any checkout costs no Git at all;
+/// * the ledger is read through a read-only connection: no directory or file
+///   chmod, no WAL or synchronous pragma, no schema DDL, no cached handle;
+/// * legacy sibling ledgers are never migrated from here. If one holds rows
+///   the anchor has not imported, the binding cannot be ruled out, so the
+///   lookup refuses (`legacy_ledger_unconsolidated`) until GitPulse — which
+///   consolidates whenever it resolves the repository — has run there.
+pub(crate) fn resolve_binding_readonly(
+    repo_path: &str,
+    worktree_path: &str,
+) -> Result<Option<ResolvedBinding>, LedgerError> {
+    let Some(pair) = admit_with_ledger(repo_path, worktree_path)? else {
+        return Ok(None);
+    };
+    let family = authenticate(repo_path, worktree_path, pair)?;
+    if let Some(source) =
+        super::unconsolidated_legacy_ledger(&family.address.anchor, &family.members)?
+    {
+        return Err(LedgerError::new(
+            "legacy_ledger_unconsolidated",
+            format!(
+                "the worktree ledger at {} holds history not yet consolidated into this \
+                 repository's ledger, so its task binding cannot be ruled out; open this \
+                 repository in GitPulse to consolidate it",
+                source.display()
+            ),
+        ));
+    }
+    let address = family.address;
+    if !super::is_initialised(&address.anchor) {
+        return Ok(None);
+    }
+    let stored_worktree = super::redact::text(&address.worktree);
+    let newest =
+        super::latest_binding_readonly(&address.anchor, &address.worktree, &stored_worktree)?;
     Ok(newest.flatten().map(|task_id| ResolvedBinding {
         task_id,
         anchor: address.anchor,
@@ -386,8 +706,14 @@ mod tests {
     #[test]
     fn the_hooks_scope_lookup_still_sees_a_failure_it_does_not_special_case() {
         let (_dir, path) = repo();
-        let error = crate::engine::git_cli::with_forced_deferral(|| resolve_binding(&path, &path))
-            .expect_err("a shed read must not resolve");
+        // Only a checkout whose repository holds a ledger reaches
+        // `git worktree list`; without one the lookup answers "unbound" from
+        // metadata and never spawns Git, which is not what this pins.
+        bind(&path, &path, "TASK-1").unwrap();
+        let (_linked_parent, linked) = linked_worktree(std::path::Path::new(&path));
+        let error =
+            crate::engine::git_cli::with_forced_deferral(|| resolve_binding(&path, &linked))
+                .expect_err("a shed read must not resolve");
         assert_eq!(error.code, DEFERRED_WORKTREE, "{error}");
         assert_ne!(error.code, "untrusted_worktree");
         assert_ne!(error.code, MISSING_WORKTREE);
@@ -520,7 +846,7 @@ mod tests {
     fn resolution_survives_a_restart() {
         let (_d, repo) = repo();
         bind(&repo, &repo, "TASK-1").unwrap();
-        super::super::tests_support::reset_registry();
+        super::super::tests_support::reset_registry_for(&repo);
         assert_eq!(resolve(&repo, &repo).unwrap(), Some("TASK-1".into()));
     }
 
@@ -586,6 +912,51 @@ mod tests {
         super::super::with_conn(&repo, |conn| {
             conn.execute(
                 "UPDATE events SET repo_path = '/somewhere/else' WHERE id = (SELECT MIN(id) FROM events)",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let error = resolve(&repo, &repo).expect_err("a foreign row refuses the read");
+        assert_eq!(error.code, "repository_mismatch");
+    }
+
+    /// The foreign-row probe must seek the repository index. The `NOT IN` it
+    /// replaced scanned the whole index on every gated mutation.
+    #[test]
+    fn the_foreign_row_probe_seeks_its_index() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        let plan = super::super::with_conn(&repo, |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE {} LIMIT 1",
+                    super::super::foreign_row_sql(3)
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params!["a", "b", "c"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap();
+            Ok(rows.map(Result::unwrap).collect::<Vec<_>>().join(" | "))
+        })
+        .unwrap();
+        assert!(plan.contains("SEARCH"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+    }
+
+    /// The probes cover both sides of the two spellings and the gap between
+    /// them, not only paths that sort below the repository.
+    #[test]
+    fn a_foreign_row_sorting_after_the_repository_still_refuses() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        super::super::with_conn(&repo, |conn| {
+            conn.execute(
+                "UPDATE events SET repo_path = repo_path || '~elsewhere'
+                 WHERE id = (SELECT MIN(id) FROM events)",
                 [],
             )
             .unwrap();
@@ -1042,4 +1413,521 @@ mod tests {
         assert_eq!(status.error_code, "legacy_migration_failed");
         assert!(status.error.contains("legacy_ulid_conflict"));
     }
+
+    #[test]
+    fn resolving_a_binding_never_creates_the_main_ledger_for_a_sibling_that_has_one() {
+        let repo = git_repo();
+        let (_parent, sibling) = linked_worktree(repo.path());
+        append(Draft {
+            repo_path: sibling.clone(),
+            worktree_path: Some(sibling.clone()),
+            action: "git.commit".to_string(),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("sibling ledger row");
+        let main = repo.path().to_str().expect("utf8 repository");
+        assert!(
+            !super::super::is_initialised(main),
+            "fixture: main has no ledger"
+        );
+
+        assert_eq!(resolve(main, main).expect("resolve"), None);
+        assert_eq!(resolve(main, &sibling).expect("resolve sibling"), None);
+        append(Draft {
+            repo_path: sibling.clone(),
+            worktree_path: Some(sibling.clone()),
+            task_id: Some("TASK-OLD".to_string()),
+            action: BIND.to_string(),
+            object: Some(sibling.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy binding");
+        assert_eq!(
+            resolve(main, &sibling).expect("resolve legacy binding"),
+            Some("TASK-OLD".to_string()),
+            "a legacy binding must still be enforced"
+        );
+        assert!(
+            !repo
+                .path()
+                .join(".devcouncil")
+                .join("ledger.sqlite")
+                .exists(),
+            "a read created or migrated the main ledger"
+        );
+    }
 }
+
+/// The agent hook's binding lookup ([`resolve_binding_readonly`]): what it
+/// costs, what it must not touch, and that it still fails closed.
+#[cfg(test)]
+mod readonly_tests {
+    use super::*;
+    use crate::engine::git_cli::spawn_log;
+    use crate::test_support::git_in;
+
+    pub(super) fn fresh_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+        git_in(dir.path(), &["add", "seed.txt"]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+        dir
+    }
+
+    pub(super) fn canonical(dir: &std::path::Path) -> String {
+        dir.canonicalize()
+            .expect("canonical path")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub(super) fn linked(repo: &std::path::Path) -> (tempfile::TempDir, String) {
+        let parent = tempfile::tempdir().expect("worktree parent");
+        let path = parent.path().join("task-worktree");
+        git_in(
+            repo,
+            &["worktree", "add", "--detach", path.to_str().expect("utf8")],
+        );
+        crate::test_support::trust_repo(&path);
+        (parent, canonical(&path))
+    }
+
+    /// Git children spawned in `cwd` by `f`, by argument vector.
+    pub(super) fn spawned_by<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+        let cwd = std::path::Path::new(cwd);
+        let before = spawn_log::spawns_in(cwd).len();
+        let value = f();
+        let spawned = spawn_log::spawns_in(cwd).into_iter().skip(before).collect();
+        (value, spawned)
+    }
+
+    pub(super) fn record(repo: &str) {
+        crate::ledger::append(crate::ledger::Draft {
+            repo_path: repo.to_string(),
+            action: "git.commit".into(),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            outcome: Some(crate::ledger::Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("ledger row");
+    }
+
+    /// An uninitialised ledger has no binding: answering that must cost no
+    /// Git, from the main checkout or a linked worktree, and create nothing.
+    /// Both lookups take the shortcut — the app's too, since with no ledger
+    /// there is nothing for it to consolidate either.
+    #[test]
+    fn an_uninitialised_ledger_costs_zero_git_spawns() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        assert!(!super::super::is_initialised(&repo));
+
+        for path in [&repo, &worktree] {
+            let (readonly, spawned) = spawned_by(path, || resolve_binding_readonly(path, path));
+            assert_eq!(readonly.expect("hook lookup"), None);
+            assert!(
+                spawned.is_empty(),
+                "the hook lookup spawned git: {spawned:?}"
+            );
+
+            let (app, spawned) = spawned_by(path, || resolve_binding(path, path));
+            assert_eq!(app.expect("app lookup"), None);
+            assert!(
+                spawned.is_empty(),
+                "the app lookup spawned git: {spawned:?}"
+            );
+        }
+        assert!(
+            !super::super::is_initialised(&repo) && !super::super::is_initialised(&worktree),
+            "a lookup created a ledger"
+        );
+        assert!(!dir.path().join(".devcouncil").exists());
+    }
+
+    /// The shortcut is a necessary condition, never a verdict on its own: a
+    /// ledger anywhere in the family — here only in a linked sibling — sends
+    /// the lookup on to Git.
+    #[test]
+    fn a_ledger_in_any_checkout_is_not_shortcut() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        record(&worktree);
+
+        let (_, spawned) = spawned_by(&repo, || resolve_binding_readonly(&repo, &repo));
+        assert!(
+            spawned
+                .iter()
+                .any(|argv| argv.iter().any(|arg| arg == "worktree")),
+            "a sibling's ledger must not be answered from metadata: {spawned:?}"
+        );
+    }
+
+    /// A fresh hook process (no cached connection) reads the binding without
+    /// any of the creating path's writes: no read-write open, no chmod, no
+    /// WAL pragma, no schema DDL. Each has an observable proxy, set up before
+    /// the lookup so the creating path would visibly undo it.
+    #[cfg(unix)]
+    #[test]
+    fn the_readonly_lookup_does_not_chmod_pragma_or_ddl() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        bind(&repo, &repo, "TASK-RO").expect("bind");
+        crate::ledger::tests_support::reset_registry_for(&repo);
+
+        let db = crate::ledger::ledger_path(&repo);
+        {
+            let conn = rusqlite::Connection::open(&db).expect("fixture connection");
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+                .expect("leave WAL");
+            assert_eq!(mode, "delete");
+            conn.execute_batch("DROP INDEX idx_events_task")
+                .expect("drop an index the schema DDL recreates");
+        }
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let opens = crate::ledger::tests_support::write_opens();
+
+        let resolved = resolve_binding_readonly(&repo, &repo).expect("hook lookup");
+        assert_eq!(resolved.map(|b| b.task_id).as_deref(), Some("TASK-RO"));
+
+        assert_eq!(
+            crate::ledger::tests_support::write_opens(),
+            opens,
+            "the hook lookup opened the ledger read-write"
+        );
+        let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the hook lookup chmodded the ledger to {mode:o}"
+        );
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            journal, "delete",
+            "the hook lookup switched the journal to WAL"
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_events_task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 0, "the hook lookup ran the schema DDL");
+    }
+
+    /// A ledger file whose creator died before its schema holds no binding;
+    /// the read-only reader cannot add the schema, and must not fail closed
+    /// on every command for want of it.
+    #[test]
+    fn a_ledger_without_a_schema_is_unbound() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let db = crate::ledger::ledger_path(&repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::File::create(&db).unwrap();
+        assert_eq!(resolve_binding_readonly(&repo, &repo).unwrap(), None);
+    }
+
+    /// Legacy sibling history is never migrated from the hook. Until GitPulse
+    /// has consolidated it the binding cannot be ruled out, so the lookup
+    /// refuses; afterwards it reads the consolidated binding. Sources persist
+    /// after import, so "consolidated" is the anchor's marker, not absence.
+    #[test]
+    fn legacy_sibling_history_fails_closed_until_consolidated() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        append(Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            task_id: Some("TASK-LEGACY".to_string()),
+            action: BIND.to_string(),
+            object: Some(worktree.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy binding row");
+
+        let error = resolve_binding_readonly(&worktree, &worktree)
+            .expect_err("unimported legacy history must not read as unbound");
+        assert_eq!(error.code, "legacy_ledger_unconsolidated", "{error}");
+        assert!(
+            !super::super::is_initialised(&repo),
+            "the hook lookup consolidated (created the anchor ledger)"
+        );
+
+        repository_address(&repo).expect("GitPulse consolidates");
+        let resolved = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+        assert_eq!(resolved.map(|b| b.task_id).as_deref(), Some("TASK-LEGACY"));
+
+        // A later legacy row is unimported history again.
+        record(&worktree);
+        let error = resolve_binding_readonly(&worktree, &worktree)
+            .expect_err("a new unimported row refuses again");
+        assert_eq!(error.code, "legacy_ledger_unconsolidated", "{error}");
+    }
+
+    /// The one outcome the zero-spawn shortcut changes, pinned so a later
+    /// tightening meets a test rather than a surprise: a directory claiming a
+    /// repository's git dir without being registered, where *no* checkout has
+    /// a ledger, is answered unbound — membership is never checked, because
+    /// with no ledger no checkout of that repository can be bound. Once a
+    /// ledger exists the same directory is refused (see below).
+    #[test]
+    fn an_unregistered_gitfile_into_a_ledgerless_repository_is_unbound() {
+        let other = fresh_repo();
+        let other_repo = canonical(other.path());
+        let forged_parent = tempfile::tempdir().unwrap();
+        let forged = forged_parent.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::write(forged.join(".git"), format!("gitdir: {other_repo}/.git\n")).unwrap();
+        crate::test_support::trust_repo(&forged);
+        let forged = canonical(&forged);
+        assert_eq!(
+            resolve_binding_readonly(&other_repo, &forged).expect("no ledger, no binding"),
+            None
+        );
+        assert!(!super::super::is_initialised(&other_repo));
+    }
+
+    /// Fail-closed outcomes survive the read-only path, each under the code
+    /// the gate sorts it by: Untrusted, Missing, and Broken (a foreign row,
+    /// an unregistered gitfile into a repository that has a ledger).
+    #[test]
+    fn the_readonly_lookup_keeps_every_fail_closed_outcome() {
+        // Untrusted, with and without a ledger.
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        crate::repository_trust::revoke(&repo).expect("revoke");
+        let error = resolve_binding_readonly(&repo, &repo).expect_err("untrusted");
+        assert_eq!(error.code, "untrusted_worktree", "{error}");
+        crate::test_support::trust_repo(dir.path());
+        bind(&repo, &repo, "TASK-1").expect("bind");
+        crate::repository_trust::revoke(&repo).expect("revoke");
+        let error = resolve_binding_readonly(&repo, &repo).expect_err("untrusted");
+        assert_eq!(error.code, "untrusted_worktree", "{error}");
+        crate::test_support::trust_repo(dir.path());
+
+        // Missing.
+        let (_parent, worktree) = linked(dir.path());
+        std::fs::remove_dir_all(&worktree).expect("delete worktree");
+        let error = resolve_binding_readonly(&worktree, &worktree).expect_err("missing");
+        assert_eq!(error.code, MISSING_WORKTREE, "{error}");
+        assert!(!std::path::Path::new(&worktree).exists());
+
+        // Broken: a row attributed to another repository.
+        super::super::with_conn(&repo, |conn| {
+            conn.execute(
+                "UPDATE events SET repo_path = '/somewhere/else' WHERE id = (SELECT MIN(id) FROM events)",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let error = resolve_binding_readonly(&repo, &repo).expect_err("foreign row");
+        assert_eq!(error.code, "repository_mismatch", "{error}");
+
+        // Broken: a directory claiming the repository's git dir without being
+        // a registered worktree, once a ledger exists to be read.
+        let other = fresh_repo();
+        let other_repo = canonical(other.path());
+        record(&other_repo);
+        let forged_parent = tempfile::tempdir().unwrap();
+        let forged = forged_parent.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::write(
+            forged.join(".git"),
+            format!("gitdir: {}/.git\n", other_repo),
+        )
+        .unwrap();
+        crate::test_support::trust_repo(&forged);
+        let forged = canonical(&forged);
+        let error =
+            resolve_binding_readonly(&other_repo, &forged).expect_err("unregistered checkout");
+        assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+}
+
+/// What a ledger read costs once the family is known: the worktree list and the
+/// sibling-ledger consolidation are paid when something changed, not on every
+/// status, tail and task view.
+#[cfg(test)]
+mod family_cost_tests {
+    use super::readonly_tests::{canonical, fresh_repo, linked, record, spawned_by};
+    use super::*;
+    use crate::ledger::tests_support::sibling_opens;
+
+    /// A repository with `count` linked worktrees that each still hold their own
+    /// pre-family ledger, as an upgraded install does.
+    fn family_with_legacy_ledgers(
+        count: usize,
+    ) -> (tempfile::TempDir, String, Vec<(tempfile::TempDir, String)>) {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let siblings: Vec<_> = (0..count).map(|_| linked(dir.path())).collect();
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        (dir, repo, siblings)
+    }
+
+    /// The audit's slow command: `cmd_ledger_status` reached
+    /// `repository_status`, which ran `git worktree list`, then a
+    /// `git hash-object` and a database open per sibling, every time.
+    #[test]
+    fn a_warm_status_spawns_no_git_and_opens_no_sibling_ledger() {
+        let (_dir, repo, _siblings) = family_with_legacy_ledgers(3);
+
+        let cold = repository_status(&repo).expect("cold status imports the siblings");
+        assert!(cold.recording, "{}", cold.error);
+
+        let opens = sibling_opens();
+        let (warm, spawned) = spawned_by(&repo, || repository_status(&repo));
+        let warm = warm.expect("warm status");
+        assert!(warm.recording, "{}", warm.error);
+        assert!(spawned.is_empty(), "a warm status spawned git: {spawned:?}");
+        assert_eq!(
+            sibling_opens(),
+            opens,
+            "a warm status reopened a sibling ledger"
+        );
+    }
+
+    /// The same for every other read that resolves the family: the ledger tail,
+    /// the task view and the gate's lookups all go through `repository_address`.
+    #[test]
+    fn a_warm_address_and_binding_lookup_cost_no_git_and_no_sibling_open() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        let worktree = &siblings[0].1;
+        repository_address(&repo).expect("cold address imports the siblings");
+        let opens = sibling_opens();
+        let (address, spawned) = spawned_by(&repo, || repository_address(&repo));
+        address.expect("warm address");
+        assert!(
+            spawned.is_empty(),
+            "a warm address spawned git: {spawned:?}"
+        );
+
+        let (resolved, spawned) = spawned_by(&repo, || resolve_binding(&repo, worktree));
+        assert_eq!(resolved.expect("warm binding lookup"), None);
+        assert!(spawned.is_empty(), "a warm lookup spawned git: {spawned:?}");
+        assert_eq!(sibling_opens(), opens, "a warm read reopened a sibling");
+    }
+
+    /// Gating consolidation on change must not turn into never consolidating:
+    /// a row a sibling writes after a warm read is imported by the next one.
+    #[test]
+    fn a_row_a_sibling_writes_after_a_warm_read_is_still_imported() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(2);
+        let before = repository_address(&repo).expect("cold address");
+        let imported = crate::ledger::tail(&before.anchor, 0, 100)
+            .expect("tail")
+            .len();
+        assert_eq!(imported, 2);
+        // Warm, and a no-op.
+        repository_address(&repo).expect("warm address");
+
+        record(&siblings[1].1);
+
+        let after = repository_address(&repo).expect("address after the sibling grew");
+        let rows = crate::ledger::tail(&after.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 3, "the sibling's new row was skipped");
+    }
+
+    /// The data-migration case: a sibling that had no ledger when the verdict
+    /// was cached, and starts one afterwards, is a first-time import.
+    #[test]
+    fn a_sibling_ledger_that_appears_after_a_warm_read_is_imported_once() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        // A warm read over a family with no sibling ledger: nothing to import.
+        record(&repo);
+        repository_address(&repo).expect("first address");
+        repository_address(&repo).expect("second address");
+
+        record(&worktree);
+
+        let address = repository_address(&repo).expect("address after first sibling ledger");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 2, "the first-time sibling import was skipped");
+        repository_address(&repo).expect("and again");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 2, "the import must stay idempotent");
+    }
+
+    /// A worktree added after a warm read joins the family: the cached
+    /// resolution must not freeze the member list.
+    #[test]
+    fn a_worktree_added_after_a_warm_read_joins_the_family() {
+        let (dir, repo, _siblings) = family_with_legacy_ledgers(1);
+        repository_address(&repo).expect("warm address");
+        let (_late_parent, late) = linked(dir.path());
+        record(&late);
+
+        let address = repository_address(&repo).expect("address after a worktree was added");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the new worktree's ledger was never consolidated"
+        );
+        assert_eq!(
+            resolve(&late, &late).expect("a binding lookup from the new worktree"),
+            None
+        );
+    }
+
+    /// Remembering the family must not turn a forged checkout into a member: a
+    /// directory whose gitfile points at the repository's git dir is not in the
+    /// registry, warm cache or not.
+    #[test]
+    fn a_forged_checkout_is_refused_after_a_warm_read() {
+        let (dir, repo, _siblings) = family_with_legacy_ledgers(1);
+        repository_address(&repo).expect("warm address");
+        let impostor = tempfile::tempdir().expect("impostor directory");
+        std::fs::write(
+            impostor.path().join(".git"),
+            format!("gitdir: {}\n", dir.path().join(".git").display()),
+        )
+        .expect("impostor gitfile");
+        crate::test_support::trust_repo(impostor.path());
+
+        let error = bind(&repo, &canonical(impostor.path()), "TASK-1")
+            .expect_err("a forged checkout must not resolve");
+        assert_eq!(error.code, "unrelated_worktree", "{error}");
+    }
+
+    /// A worktree removed after a warm read leaves the family: it can no longer
+    /// be addressed, and the cached member list must not authenticate it.
+    #[test]
+    fn a_worktree_removed_after_a_warm_read_is_no_longer_authenticated() {
+        let (dir, repo, siblings) = family_with_legacy_ledgers(1);
+        let gone = siblings[0].1.clone();
+        repository_address(&gone).expect("warm address from the worktree");
+
+        crate::test_support::git_in(dir.path(), &["worktree", "remove", "--force", &gone]);
+
+        let error = repository_address(&gone).expect_err("a removed worktree must not resolve");
+        assert_eq!(error.code, MISSING_WORKTREE, "{error}");
+        repository_address(&repo).expect("the repository itself still resolves");
+    }
+}
+
+#[cfg(test)]
+mod history_tests;

@@ -2,6 +2,11 @@
 
 #![cfg(unix)]
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::{engine::git_cli, repository_trust};
@@ -394,6 +399,7 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
         Some("/bin/sh".into()),
         Some(vec!["-c".into(), "touch terminal-executed".into()]),
         None,
+        gitpulse_lib::terminal::OutputSink::events(app.handle()),
     );
     assert!(spawn.unwrap_err().contains(repository_trust::REQUIRED));
     assert!(!repo.path().join("terminal-executed").exists());
@@ -949,7 +955,8 @@ fn trust_persistence_repeated_grant_kill_restart_never_loses_an_approval() {
                 );
             }
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(20),
+                started.elapsed()
+                    < hermetic_env::coverage_relaxed(std::time::Duration::from_secs(20)),
                 "round {round} did not finish the grant"
             );
             std::thread::sleep(std::time::Duration::from_millis(20));

@@ -9,7 +9,8 @@
 
 <script lang="ts">
   import type { ReflogEntry, ResetPreview } from "../branches/types";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import { GitBranchPlus, History, RotateCcw } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -19,6 +20,7 @@
   import { reportPanelError } from "../diagnostics/report";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { describeResetPreview } from "../branches/resetPreview";
 
   const REFLOG_ENTRY_LIMIT = 200;
@@ -59,6 +61,8 @@
 
   /** The non-destructive way back: a new branch at the entry's commit. */
   async function branchHere(entry: ReflogEntry) {
+    // The repository this was asked about, held across the prompt.
+    const target = repoStore.captureTarget();
     const name = await askText({
       title: "Create Branch Here",
       message: `New branch at ${shortHash(entry.commit_id, 8)} (${entry.selector}: ${entry.message})`,
@@ -67,11 +71,10 @@
     });
     const trimmed = name?.trim();
     if (!trimmed) return;
-    const outcome = await repoStore.createBranch(trimmed, entry.commit_id);
-    if (outcome.ok) {
-      toastStore.success(`Created branch "${trimmed}" at ${shortHash(entry.commit_id)}`);
-      void load();
-    }
+    const outcome = await repoStore.createBranch(trimmed, entry.commit_id, target);
+    if (!reportFailure(outcome, "Could not create the branch")) return;
+    toastStore.success(`Created branch "${trimmed}" at ${shortHash(entry.commit_id)}`);
+    void load();
   }
 
   /**
@@ -85,6 +88,7 @@
   async function resetHere(entry: ReflogEntry) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const target = repoStore.captureTarget();
     let preview: ResetPreview;
     try {
       preview = await invoke<ResetPreview>("cmd_reset_preview", {
@@ -105,46 +109,44 @@
     });
     if (!confirmed) return;
     // The peeled oid, not the name: what was previewed is what moves.
-    const outcome = await repoStore.resetTo("keep", preview.target);
-    if (outcome.ok) {
-      toastStore.success(
-        `${preview.branch ?? "HEAD"} reset to ${shortHash(preview.target)}` +
-          (preview.leaving_total > 0 ? ` — ${plural(preview.leaving_total, "commit")} left the branch` : ""),
-      );
-      void load();
-    }
+    const outcome = await repoStore.resetTo("keep", preview.target, target);
+    if (!reportFailure(outcome, "Could not reset")) return;
+    toastStore.success(
+      `${preview.branch ?? "HEAD"} reset to ${shortHash(preview.target)}` +
+        (preview.leaving_total > 0 ? ` — ${plural(preview.leaving_total, "commit")} left the branch` : ""),
+    );
+    void load();
   }
 
   $effect(() => {
     return () => inflight?.cancel();
   });
 
-  // Memoized on currentPath: the ~6s status poll and stats drains re-emit the
-  // store object, so an unguarded rerun would cancel and restart the reflog
-  // IPC on every emission.
-  let prevRepo: string | null = null;
+  // Keyed on the repository alone: the ~6s status poll and stats drains
+  // re-emit the store object, and a rerun per emission would cancel and
+  // restart the reflog IPC each time.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === prevRepo) return;
-    prevRepo = repo;
-    if (!repo) {
-      inflight?.cancel();
-      entries = [];
-      errorMsg = null;
-      loading = false;
-      return;
-    }
-    // Hydrate last-known entries synchronously so a revisit renders instantly
-    // and the refresh below updates the table in place.
-    const cached = reflogCache.get(repo);
-    if (cached) entries = cached;
-    void load();
-    const started = inflight;
-    return () => {
-      if (inflight === started) {
-        started?.cancel();
+    const repo = $currentRepoPath;
+    return untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        entries = [];
+        errorMsg = null;
+        loading = false;
+        return undefined;
       }
-    };
+      // Hydrate last-known entries synchronously so a revisit renders
+      // instantly and the refresh below updates the table in place.
+      const cached = reflogCache.get(repo);
+      if (cached) entries = cached;
+      void load();
+      const started = inflight;
+      return () => {
+        if (inflight === started) {
+          started?.cancel();
+        }
+      };
+    });
   });
 </script>
 

@@ -182,7 +182,7 @@ describe("generatePulseSvgCard readability", () => {
     expect(meaning).toContain("Half the live code was last touched within the past 95 days.");
     expect(meaning).toContain("own half the surviving lines. Higher is safer.");
     expect(meaning).toContain("Conventional Commits");
-    expect(meaning).toContain("good signature");
+    expect(meaning).toContain("carry a signature");
   });
 
   it("keeps every wrapped line inside the tile", () => {

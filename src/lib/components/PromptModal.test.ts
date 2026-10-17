@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import PromptModal from "./PromptModal.svelte";
-import { askConfirm, askText, cancelPrompt } from "../stores/modalStore";
+import { get } from "svelte/store";
+import { askChoice, askConfirm, askText, cancelPrompt, completePrompt, promptError, promptState, ALTERNATE_ANSWER } from "../stores/modalStore";
 
 afterEach(() => {
   cancelPrompt();
@@ -47,5 +48,79 @@ describe("PromptModal", () => {
     const { body } = render(PromptModal);
     expect(body).toContain("gp-btn-danger");
     expect(body).toContain("Delete task");
+  });
+
+  describe("validate", () => {
+    const refuseTaken = (value: string) => (value === "taken" ? "That name is taken." : null);
+
+    it("keeps the prompt open and publishes the refusal when the answer is refused", async () => {
+      const answer = askText({ title: "New File", validate: refuseTaken });
+      let settled = false;
+      void answer.then(() => (settled = true));
+      completePrompt("taken");
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(get(promptState)).not.toBeNull();
+      expect(get(promptError)).toBe("That name is taken.");
+      expect(render(PromptModal).body).toContain("That name is taken.");
+
+      completePrompt("free");
+      await expect(answer).resolves.toBe("free");
+      expect(get(promptError)).toBeNull();
+    });
+
+    it("never consults validate when the prompt is cancelled", async () => {
+      let calls = 0;
+      const answer = askText({
+        title: "New File",
+        validate: () => {
+          calls += 1;
+          return "no";
+        },
+      });
+      cancelPrompt();
+      await expect(answer).resolves.toBeNull();
+      expect(calls).toBe(0);
+    });
+
+    it("shows an opening error and the typed name without validating", () => {
+      void askText({ title: "New File", initialValue: "a.txt", error: "a.txt already exists" });
+      const { body } = render(PromptModal);
+      expect(body).toContain("a.txt already exists");
+      expect(body).toContain('role="alert"');
+    });
+
+    it("leaves prompts without validate exactly as they were", async () => {
+      const answer = askText({ title: "Rename" });
+      completePrompt("anything");
+      await expect(answer).resolves.toBe("anything");
+    });
+  });
+
+  it("shows a third, danger answer only when a choice asks for one", async () => {
+    const plain = askConfirm({ title: "Delete?", confirmLabel: "Delete" });
+    expect(render(PromptModal).body).not.toContain("Stop Them and Quit");
+    cancelPrompt();
+    expect(await plain).toBe(false);
+
+    const choice = askChoice({ title: "Leave the Terminals Running?", confirmLabel: "Quit and Leave Running", alternateLabel: "Stop Them and Quit" });
+    const { body } = render(PromptModal);
+    expect(body).toContain("Stop Them and Quit");
+    expect(body).toContain("Quit and Leave Running");
+    completePrompt(ALTERNATE_ANSWER);
+    expect(await choice).toBe("alternate");
+
+    const confirmed = askChoice({ title: "t", alternateLabel: "a" });
+    completePrompt(true);
+    expect(await confirmed).toBe("confirm");
+    const cancelled = askChoice({ title: "t", alternateLabel: "a" });
+    cancelPrompt();
+    expect(await cancelled).toBeNull();
+  });
+
+  it("an alternate answer never confirms a plain confirm", async () => {
+    const plain = askConfirm({ title: "Delete?" });
+    completePrompt(ALTERNATE_ANSWER);
+    expect(await plain).toBe(false);
   });
 });

@@ -17,6 +17,9 @@ function deferred<T>() {
 }
 
 
+/** The verdict for a commit with no signature, for mocks that do not care about signing. */
+const NO_SIGNATURE = { signature: "none", status: "none", key: "", signer: "" } as const;
+
 function grow(id: string, overrides: Partial<VisualCommitRow> = {}): VisualCommitRow {
   return {
     id,
@@ -202,6 +205,7 @@ describe("graphStore generation", () => {
         if (cmd === "cmd_get_commit_graph") return withWarnings as never;
         if (cmd === "cmd_get_commit_details")
           return { id: "x", summary: "d", changed_files: [] } as never;
+        if (cmd === "cmd_verify_commit_signature") return NO_SIGNATURE as never;
         throw new Error(cmd);
       };
       const store = createGraphStore({
@@ -255,6 +259,49 @@ describe("graphStore payload signature", () => {
     // tag ref, which the locally-inferred "local"-only literal type rejects.
     refs: [{ name: "main", kind: "local", commit_id: "a", is_head: true }] as RefDecoration[],
     has_more: true,
+  });
+
+  it("hashes each reload's rows once and never re-walks the cached page", async () => {
+    // ft-0ff882a6: a reload used to hash the new payload AND re-derive the
+    // cached page's signature from its rows — two walks over up to 100k rows
+    // on every watcher refresh. Each row here counts reads of `summary`, which
+    // the signature reads once per row.
+    const ROWS = 50;
+    const counted = (reads: { n: number }) =>
+      Array.from({ length: ROWS }, (_, i) => {
+        const row = grow(`c${i}`);
+        const summary = row.summary;
+        Object.defineProperty(row, "summary", {
+          enumerable: true,
+          get: () => {
+            reads.n += 1;
+            return summary;
+          },
+        });
+        return row;
+      });
+    const first = { n: 0 };
+    const second = { n: 0 };
+    const pages = [counted(first), counted(second)];
+    let call = 0;
+    const invoke: InvokeFn = async (cmd) => {
+      if (cmd === "cmd_get_commit_graph") return { rows: pages[call++], head_id: "c0" } as never;
+      if (cmd === "cmd_get_commit_details") return { id: "c0", summary: "d", changed_files: [] } as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const rowsAfterFirst = get(store).rows;
+
+    first.n = 0;
+    await store.loadGraph("/r/a");
+    // The cached page is compared by its stored signature, not re-hashed.
+    expect(first.n).toBe(0);
+    // The new payload is hashed exactly once.
+    expect(second.n).toBe(ROWS);
+    // And the identical reload still short-circuits, keeping array identity.
+    expect(get(store).rows).toBe(rowsAfterFirst);
   });
 
   it("is equal for structurally identical payloads with fresh identities", () => {
@@ -397,6 +444,45 @@ describe("graphStore background reload stability", () => {
     expect(emissions - baseline).toBe(0);
     expect(get(store).rows).toBe(rowsBefore);
     unsub();
+  });
+
+  it("compares a reload against the signature stored with the cache entry", async () => {
+    // The cached payload's signature is computed once, when the entry is set;
+    // a reload must not re-serialize every cached row to compare against it.
+    // A getter on a field only the signature reads counts serializations of
+    // the FIRST payload's rows.
+    let reads = 0;
+    const counted = grow("a");
+    const email = counted.author_email;
+    Object.defineProperty(counted, "author_email", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return email;
+      },
+    });
+    let graphCalls = 0;
+    const store = createGraphStore({
+      invoke: async (cmd, args) => {
+        if (cmd === "cmd_get_commit_graph") {
+          graphCalls += 1;
+          return (graphCalls === 1 ? { ...payload(), rows: [counted] } : clone(payload())) as never;
+        }
+        return details(cmd, args);
+      },
+    });
+    store.showRepo("/r/sig");
+    await store.loadGraph("/r/sig");
+    const rowsBefore = get(store).rows;
+    const readsAfterFirst = reads;
+    expect(readsAfterFirst).toBeGreaterThan(0);
+
+    await store.loadGraph("/r/sig");
+    await store.loadGraph("/r/sig");
+    // Still recognized as identical (row identity survives) without touching
+    // the cached rows again.
+    expect(get(store).rows).toBe(rowsBefore);
+    expect(reads).toBe(readsAfterFirst);
   });
 
   it("a genuinely changed payload still republishes", async () => {
@@ -633,6 +719,7 @@ describe("graph warning breadcrumbs", () => {
       if (cmd === "cmd_get_commit_details") {
         return { id: args?.commitId, changed_files: [] } as never;
       }
+      if (cmd === "cmd_verify_commit_signature") return NO_SIGNATURE as never;
       throw new Error(cmd);
     };
     const store = createGraphStore({
@@ -696,5 +783,180 @@ describe("graph warning breadcrumbs", () => {
     current = ["flaky degradation"];
     await store.loadGraph("/r/a");
     expect(warned).toEqual(["/r/a: flaky degradation", "/r/a: flaky degradation"]);
+  });
+});
+
+describe("graphStore signature verification", () => {
+  const check = { signature: "ssh", status: "none", key: "", signer: "" } as const;
+
+  async function selecting(verify: (commitId: string) => Promise<unknown>, log: string[] = []) {
+    const invoke: InvokeFn = async (cmd, args) => {
+      log.push(cmd);
+      if (cmd === "cmd_get_commit_graph") return payload("c1") as never;
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, summary: "s", changed_files: [] } as never;
+      }
+      if (cmd === "cmd_verify_commit_signature") return verify(String(args?.commitId)) as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const row = { ...get(store).rows[0], id: "c1" };
+    return { store, row, log };
+  }
+
+  it("shows the details before the verifier answers, then attaches the verdict", async () => {
+    const gate = deferred<typeof check>();
+    const { store, row, log } = await selecting(() => gate.promise);
+    await store.selectCommit(row, "/r/a");
+    // The details are in place while the verification is still running.
+    expect(get(store).selectedCommitDetails?.summary).toBe("s");
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+    gate.resolve(check);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.signature_check).toEqual(check);
+    // One verification per details fetch, never one per render or publish.
+    const count = (name: string) => log.filter((cmd) => cmd === name).length;
+    expect(count("cmd_verify_commit_signature")).toBe(count("cmd_get_commit_details"));
+  });
+
+  it("records a verification that could not run as not checked, never as unsigned", async () => {
+    const { store, row } = await selecting(async () => {
+      throw new Error("signing program timed out");
+    });
+    await store.selectCommit(row, "/r/a");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeNull();
+  });
+
+  it("treats a reply with no verdict in it as a check that did not happen, not as pending", async () => {
+    const { store, row } = await selecting(async () => undefined);
+    await store.selectCommit(row, "/r/a");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeNull();
+  });
+
+  it("drops a verdict that arrives after another commit was selected", async () => {
+    const slow = deferred<typeof check>();
+    const { store, row } = await selecting((id) =>
+      id === "c1" ? slow.promise : new Promise(() => {})
+    );
+    await store.selectCommit(row, "/r/a");
+    await store.selectCommit({ ...row, id: "c2" }, "/r/a");
+    slow.resolve(check);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(store).selectedCommitDetails?.id).toBe("c2");
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+  });
+});
+
+describe("graphStore signature verification, rapid selection", () => {
+  type Check = { signature: string; status: string; key: string; signer: string };
+  const verdict = (status: string): Check => ({ signature: "pgp", status, key: "", signer: "" });
+  const flush = async () => {
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+  };
+
+  async function harness() {
+    const pending: Array<{ id: string; gate: ReturnType<typeof deferred<Check>> }> = [];
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") return payload("c1") as never;
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, summary: "s", changed_files: [] } as never;
+      }
+      if (cmd === "cmd_verify_commit_signature") {
+        const gate = deferred<Check>();
+        pending.push({ id: String(args?.commitId), gate });
+        return gate.promise as never;
+      }
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const row = { ...get(store).rows[0], id: "c1" };
+    // loadGraph may already have selected a commit: start from a clean slate.
+    await flush();
+    pending.splice(0, pending.length);
+    return { store, row, pending };
+  }
+
+  it("A, B, A: only the last selection's own verdict lands, in any resolution order", async () => {
+    const { store, row, pending } = await harness();
+    await store.selectCommit(row, "/r/a");
+    await store.selectCommit({ ...row, id: "c2" }, "/r/a");
+    await store.selectCommit(row, "/r/a");
+    await flush();
+    expect(pending.map((p) => p.id)).toEqual(["c1", "c2", "c1"]);
+
+    // The stale first verification of c1 answers before the current one.
+    pending[0].gate.resolve(verdict("bad"));
+    await flush();
+    expect(get(store).selectedCommitDetails?.id).toBe("c1");
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+
+    pending[1].gate.resolve(verdict("none"));
+    await flush();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+
+    pending[2].gate.resolve(verdict("good"));
+    await flush();
+    expect(get(store).selectedCommitDetails?.signature_check).toEqual(verdict("good"));
+  });
+
+  it("a verification that rejects after the selection moved on does not blank the new commit's verdict", async () => {
+    const { store, row, pending } = await harness();
+    await store.selectCommit(row, "/r/a");
+    await store.selectCommit({ ...row, id: "c2" }, "/r/a");
+    await flush();
+    pending[1].gate.resolve(verdict("good"));
+    await flush();
+    pending[0].gate.promise.catch(() => {});
+    pending[0].gate.resolve(undefined as never);
+    await flush();
+    expect(get(store).selectedCommitDetails?.id).toBe("c2");
+    expect(get(store).selectedCommitDetails?.signature_check).toEqual(verdict("good"));
+  });
+
+  it("deselecting while a verification runs drops its verdict", async () => {
+    const { store, row, pending } = await harness();
+    await store.selectCommit(row, "/r/a");
+    await flush();
+    await store.selectCommit(null as never, "/r/a");
+    pending[0].gate.resolve(verdict("good"));
+    await flush();
+    expect(get(store).selectedCommit).toBeNull();
+    expect(get(store).selectedCommitDetails?.signature_check).toBeUndefined();
+  });
+});
+
+describe("graphStore signature label when the details never load", () => {
+  /**
+   * The pane labels with `signatureLabel(details?.signature_check)`, and when
+   * the details fetch fails `details` stays null, so the label is the one for
+   * "still running" for ever: no verification was ever started.
+   */
+  it("a failed details fetch must not leave the signature label at 'Checking signature…'", async () => {
+    const { signatureLabel } = await import("../../format");
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") return payload("c1") as never;
+      if (cmd === "cmd_get_commit_details") throw new Error(`no details for ${String(args?.commitId)}`);
+      if (cmd === "cmd_verify_commit_signature") throw new Error("never asked");
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const row = { ...get(store).rows[0], id: "c1" };
+    await store.selectCommit(row, "/r/a");
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    const details = get(store).selectedCommitDetails;
+    expect(details?.id === "c1" ? details : null).toBeNull();
+    expect(signatureLabel(details?.signature_check).text).not.toBe("Checking signature…");
   });
 });

@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import type { PersistedLog as PersistedLogShape } from "../diagnostics/types";
+  import type { DaemonStatus, Degraded, PersistedLog as PersistedLogShape } from "../diagnostics/types";
 
   export type BackendDiagnosticStatus =
     | "idle"
@@ -91,6 +91,8 @@
   let backendLines = $state<string[]>([]);
   let persistedLog = $state<PersistedLog | null>(null);
   let memoryReadError = $state<string | null>(null);
+  let daemonNotice = $state<string | null>(null);
+  let degradedSubsystems = $state<{ subsystem: string; reason: string; panics: number; stopped: boolean }[]>([]);
   let backendLoadGeneration = 0;
   let backendLoad: Promise<void> | null = null;
   const diagnosticHealth = diagnostics.health;
@@ -137,10 +139,19 @@
     }
   }
 
+  /** What to say about the attribution daemon, or null when there is nothing to say. */
+  function daemonNoticeFor(status: DaemonStatus): string | null {
+    if (status.error) return `The attribution daemon could not be checked: ${redactDiagnosticText(String(status.error))}`;
+    if (!status.running || !status.mismatch) return null;
+    return `A gitpulsed from another version (${redactDiagnosticText(String(status.version ?? "unknown"))}, this app is ${redactDiagnosticText(String(status.app_version))}) is running${status.pid ? ` as pid ${status.pid}` : ""}. Restart it so it writes with this version's rules.`;
+  }
+
   async function loadBackendContext(generation: number): Promise<void> {
-    const [memoryResult, persistedResult] = await Promise.allSettled([
+    const [memoryResult, persistedResult, degradedResult, daemonResult] = await Promise.allSettled([
       invoke<string[]>("cmd_diagnostic_log_tail", {}),
       invoke<PersistedLog>("cmd_diagnostic_persisted_log", {}),
+      invoke<Degraded[]>("cmd_degraded_subsystems", {}),
+      invoke<DaemonStatus>("cmd_daemon_status", {}),
     ]);
     if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) return;
 
@@ -161,6 +172,20 @@
               : null,
           }
         : unreadablePersistedLog(formatDiagnosticFailure(persistedResult.reason));
+    // A background thread that panicked and is being retried. Best effort: an
+    // unreadable list is not a claim that nothing is degraded, but it must not
+    // hide the logs either.
+    degradedSubsystems =
+      degradedResult.status === "fulfilled" && Array.isArray(degradedResult.value)
+        ? degradedResult.value.map((d) => ({
+            subsystem: redactDiagnosticText(String(d.subsystem)),
+            reason: redactDiagnosticText(String(d.reason)),
+            panics: Number(d.panics) || 1,
+            stopped: d.stopped === true,
+          }))
+        : [];
+    daemonNotice =
+      daemonResult.status === "fulfilled" ? daemonNoticeFor(daemonResult.value) : null;
     backendStatus = classifyBackendDiagnostics(memoryReadError, backendLines, persistedLog);
   }
 
@@ -170,6 +195,8 @@
     backendLines = [];
     persistedLog = null;
     memoryReadError = null;
+    degradedSubsystems = [];
+    daemonNotice = null;
     const request = loadBackendContext(generation);
     backendLoad = request;
     void request.finally(() => {
@@ -334,6 +361,14 @@
           {#if memoryReadError}
             <p class="text-[11px] text-amber-300 wrap-break-word">Current-session log could not be read: {memoryReadError}</p>
           {/if}
+          {#if daemonNotice}
+            <p class="text-[11px] text-amber-300 wrap-break-word">{daemonNotice}</p>
+          {/if}
+          {#each degradedSubsystems as degraded (degraded.subsystem)}
+            <p class="text-[11px] text-amber-300 wrap-break-word">
+              {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and {degraded.stopped ? "has stopped; restart GitPulse to bring it back" : "is retrying"}: {degraded.reason}
+            </p>
+          {/each}
           {#if persistedLog?.degraded}
             <p class="text-[11px] text-amber-300 wrap-break-word">Durable log is incomplete: {persistedLog.degraded}</p>
           {/if}

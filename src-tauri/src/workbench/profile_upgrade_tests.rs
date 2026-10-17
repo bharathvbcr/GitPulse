@@ -1,5 +1,7 @@
-//! Upgrading a real profile to dc-store schema 11, end to end, through the
-//! host GitPulse runs.
+//! Upgrading a real profile to the current dc-store schema (13; the 10 → 11
+//! step archives Done tasks, 11 → 12 adds refinement proposals, 12 → 13 shortens
+//! request receipts), end to end,
+//! through the host GitPulse runs.
 //!
 //! Ignored by default: it needs a profile that was written by real use, which
 //! a fixture cannot stand in for. Point `GITPULSE_PROFILE_COPY` at a COPY of
@@ -158,7 +160,7 @@ fn list_all(host: &WorkbenchState, filter: Value) -> (Vec<Value>, u64) {
 
 #[test]
 #[ignore = "needs GITPULSE_PROFILE_COPY: a copy of a real profile"]
-fn a_real_profile_upgrades_to_schema_11_and_keeps_everything_it_held() {
+fn a_real_profile_upgrades_to_the_current_schema_and_keeps_everything_it_held() {
     let source =
         std::env::var_os(COPY_ENV).expect("set GITPULSE_PROFILE_COPY to a copy of a profile");
     let source = Path::new(&source)
@@ -176,9 +178,9 @@ fn a_real_profile_upgrades_to_schema_11_and_keeps_everything_it_held() {
     let path = dir.path().join("workbench.sqlite");
     std::fs::copy(&source, &path).unwrap();
     let before = read_before(&path);
-    assert_eq!(
-        before.version, 10,
-        "this checks the 10 → 11 upgrade; the copy is at {}",
+    assert!(
+        matches!(before.version, 10 | 11),
+        "this checks the 10 → 13 and 11 → 13 upgrades; the copy is at {}",
         before.version
     );
 
@@ -193,7 +195,8 @@ fn a_real_profile_upgrades_to_schema_11_and_keeps_everything_it_held() {
         .unwrap()
         .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, crate::workbench::WORKBENCH_SCHEMA);
+    assert_eq!(version, 13);
 
     // Every Done task, and only those, is in the archive, most recently
     // completed first, with the completion its own history records.
@@ -353,5 +356,94 @@ fn a_real_profile_upgrades_to_schema_11_and_keeps_everything_it_held() {
         open.len(),
         before.deleted.len(),
         before.runs.len()
+    );
+}
+
+fn profile_version(path: &Path) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn host_on(path: &Path) -> WorkbenchState {
+    WorkbenchState(Arc::new(Inner {
+        path: Some(path.to_path_buf()),
+        ..Inner::default()
+    }))
+}
+
+fn list_inbox(host: &WorkbenchState) -> Result<Value, crate::workbench::WorkbenchError> {
+    host.request(
+        "items.list",
+        &json!({"limit": PAGE, "query": "", "archived": false}).to_string(),
+    )
+}
+
+/// The 11 → 12 and 12 → 13 steps, which a fixture can stand in for: they only
+/// move the version (refinement proposals and short receipts add no table). A
+/// profile Manvi's dc-store left at 13 is what a host built at 12 refuses, which
+/// is why GitPulse vendors schema 13.
+#[test]
+fn a_schema_11_profile_upgrades_to_13_and_keeps_its_tasks() {
+    let (_dir, path) = super::tests::profile();
+    let repo = super::tests::git_repo();
+    let created = {
+        let store = dc_store::Store::open(&path).unwrap();
+        let repository = super::tests::registered(&store, &repo);
+        let placed = crate::workbench::intake::place(
+            &store,
+            &repository,
+            &super::tests::task("gp-keep", "kept across 11 to 12"),
+            false,
+            crate::workbench::intake::now_millis(),
+        )
+        .unwrap();
+        placed.item.unwrap()
+    };
+    assert_eq!(profile_version(&path), 13);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE work_meta SET version=11 WHERE id=1", [])
+        .unwrap();
+    let upgraded = host_on(&path);
+    let listed = list_inbox(&upgraded).unwrap();
+    assert_eq!(profile_version(&path), 13);
+    let titles: Vec<&str> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|card| card["title"].as_str())
+        .collect();
+    assert_eq!(titles, vec!["kept across 11 to 12"]);
+    let after = upgraded
+        .request("items.get", &json!({"id": created["id"]}).to_string())
+        .unwrap();
+    assert_eq!(
+        after["item"]["revision"], created["revision"],
+        "no revision spent"
+    );
+}
+
+/// The hard fence: a profile newer than this build is refused and left as it
+/// was, never opened and never rewritten.
+#[test]
+fn a_profile_newer_than_the_vendored_schema_is_refused_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workbench.sqlite");
+    drop(host_on(&path).request("items.list", &json!({"limit": 1, "query": ""}).to_string()));
+    let newer = crate::workbench::WORKBENCH_SCHEMA + 1;
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE work_meta SET version=?1 WHERE id=1", [newer])
+        .unwrap();
+
+    let error = list_inbox(&host_on(&path)).unwrap_err();
+    assert_eq!(error.code, "schema_unsupported", "{error:?}");
+    assert_eq!(
+        profile_version(&path),
+        newer,
+        "a refused profile is not rewritten"
     );
 }

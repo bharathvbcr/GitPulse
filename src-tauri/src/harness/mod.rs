@@ -14,6 +14,9 @@ pub mod protocol;
 pub(crate) mod review;
 pub mod sidecar;
 
+#[cfg(test)]
+mod concurrent_tests;
+
 use serde::{Deserialize, Serialize};
 
 pub use policy::{
@@ -23,6 +26,7 @@ pub use policy::{
 pub use protocol::{
     HelloResult, PrepareResult, ProbeResult, ScanModel, ScanResult, ScanServer, SettleResult,
 };
+pub(crate) use sidecar::Lane;
 pub use sidecar::{HarnessError, DEFAULT_CALL_TIMEOUT};
 
 /// What the UI shows about the harness.
@@ -95,10 +99,14 @@ pub(crate) fn guard_command_allowing(
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
+    // Resolved once: the scope this action is judged under and the ledger row
+    // that records the judgement are addressed by the same answer.
+    let address = crate::ledger::bindings::repository_address(repo_path);
     if let Err(refused) = review::gate(repo_path, argv) {
         let action = crate::ledger::action_for_argv(argv);
         record_gate(
             repo_path,
+            address.as_ref().ok(),
             &action,
             &command,
             serde_json::to_string(argv).ok(),
@@ -106,7 +114,7 @@ pub(crate) fn guard_command_allowing(
         );
         return gated(*refused);
     }
-    let verdict = match scope_for(repo_path) {
+    let verdict = match scope_at(&address) {
         Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {
             return Err(failure.missing_checkout(&command));
@@ -115,20 +123,32 @@ pub(crate) fn guard_command_allowing(
     };
     let action = crate::ledger::action_for_argv(argv);
     let argv_json = serde_json::to_string(argv).ok();
-    record_gate(repo_path, &action, &command, argv_json, &verdict);
+    record_gate(
+        repo_path,
+        address.as_ref().ok(),
+        &action,
+        &command,
+        argv_json,
+        &verdict,
+    );
     gated(verdict)
 }
 
 /// Judges a command line against this checkout's bound task scope, recording
 /// nothing.
 ///
-/// The agent hook's entry to the gate (`hooks::run_command_gate`). It resolves
-/// the scope through the same [`scope_for`] that [`guard_command`] uses, so an
-/// agent's Bash call and GitPulse's own guarded action are measured against one
-/// declaration — including the fail-closed answer when a binding names a task
-/// whose scope cannot be read. It does not write a ledger row: the hook runs on
-/// every Bash call an agent makes, and the gate rows record GitPulse's own
-/// actions, which an agent's shell is not.
+/// The agent hook's entry to the gate (`hooks::run_command_gate`). It turns a
+/// binding into a scope through the same [`scope_from_binding`] that
+/// [`guard_command`] uses, so an agent's Bash call and GitPulse's own guarded
+/// action are measured against one declaration — including the fail-closed
+/// answer when a binding names a task whose scope cannot be read. The binding
+/// itself is read with [`resolve_binding_readonly`], since the hook is a fresh
+/// process per tool call and must not create, secure or migrate the ledger. It
+/// does not write a ledger row: the hook runs on every Bash call an agent
+/// makes, and the gate rows record GitPulse's own actions, which an agent's
+/// shell is not.
+///
+/// [`resolve_binding_readonly`]: crate::ledger::bindings::resolve_binding_readonly
 ///
 /// One case is not failed closed here, where [`guard_command`] would: a
 /// repository GitPulse is not trusted in. Resolving a binding runs Git, which
@@ -146,24 +166,33 @@ pub(crate) fn guard_command_allowing(
 /// will meet a missing directory on its own.
 ///
 /// Whether a scope was declared comes back beside the verdict, because the
-/// verdict cannot say: the harness stamps every command decision with its
-/// `host-scope` placeholder task, scope or no scope.
-pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> ScopedVerdict {
+/// verdict cannot say: a command decision carries either the declared task's
+/// id or the harness's `host-scope` placeholder (always the placeholder from a
+/// `manvi` older than the scope allowlist fix), so its task id is no evidence of
+/// a binding.
+///
+/// `lane` is the sidecar that answers: the hook process's own one-shot child
+/// ([`Lane::Shared`]) or the app's long-lived hook child ([`Lane::Hook`], via
+/// `hooks::serve_gate`). It is the one body both run, so they cannot disagree
+/// about what a scope is.
+pub(crate) fn check_command_in_scope(lane: Lane, repo_path: &str, command: &str) -> ScopedVerdict {
+    let ask =
+        |scope: Option<&HostScope>| policy::check_command_on(lane, repo_path, command, scope, &[]);
     match hook_scope(repo_path) {
         HookScope::Declared(scope) => ScopedVerdict {
             bound: true,
             unscoped: None,
-            verdict: check_command(repo_path, command, Some(&scope)),
+            verdict: ask(Some(&scope)),
         },
         HookScope::Unbound => ScopedVerdict {
             bound: false,
             unscoped: None,
-            verdict: check_command(repo_path, command, None),
+            verdict: ask(None),
         },
         HookScope::Untrusted => ScopedVerdict {
             bound: false,
             unscoped: Some(UNSCOPED_UNTRUSTED),
-            verdict: check_command(repo_path, command, None),
+            verdict: ask(None),
         },
         HookScope::Unresolved(failure) => ScopedVerdict {
             bound: true,
@@ -219,7 +248,7 @@ pub(crate) enum FileScopeCheck {
 /// Why the hook judged a checkout without a scope it could not rule out.
 pub(crate) const UNSCOPED_UNTRUSTED: &str = "unscoped: repository not trusted";
 
-/// The scope the agent hook measures against, resolved by [`scope_for`] and
+/// The scope the agent hook measures against, resolved by [`hook_scope`] and
 /// sorted by how each outcome degrades on the hook's side of the gate.
 enum HookScope {
     Declared(HostScope),
@@ -233,7 +262,8 @@ enum HookScope {
 }
 
 fn hook_scope(repo_path: &str) -> HookScope {
-    match scope_for(repo_path) {
+    let binding = crate::ledger::bindings::resolve_binding_readonly(repo_path, repo_path);
+    match scope_from_binding(binding) {
         Ok(Some(scope)) => HookScope::Declared(scope),
         Ok(None) => HookScope::Unbound,
         Err(failure) => match failure.kind {
@@ -264,20 +294,263 @@ pub(crate) fn guard_file(
     op: &str,
 ) -> Result<PolicyVerdict, String> {
     let action = format!("file.{}", if op.is_empty() { "write" } else { op });
-    let scope = match scope_for(repo_path) {
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = match scope_at(&address) {
         Ok(scope) => scope,
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {
             return Err(failure.missing_checkout(file_path));
         }
         Err(failure) => {
             let verdict = failure.verdict(file_path);
-            record_gate(repo_path, &action, file_path, None, &verdict);
+            record_gate(
+                repo_path,
+                address.as_ref().ok(),
+                &action,
+                file_path,
+                None,
+                &verdict,
+            );
             return gated(verdict);
         }
     };
     let verdict = check_file(repo_path, file_path, op, scope.as_ref());
-    record_gate(repo_path, &action, file_path, None, &verdict);
+    record_gate(
+        repo_path,
+        address.as_ref().ok(),
+        &action,
+        file_path,
+        None,
+        &verdict,
+    );
     gated(verdict)
+}
+
+/// How many file checks [`guard_files`] keeps in flight at once. The sidecar
+/// correlates replies by id, so overlapping calls proceed side by side; the cap
+/// keeps one rename from queueing thousands of requests behind each other.
+const GUARD_FILES_CONCURRENCY: usize = 8;
+
+/// Evaluates `op` on each of `files`, one verdict per file, in order — exactly
+/// what calling [`guard_file`] on each in turn answers, in less time.
+///
+/// The scope is resolved once instead of once per file, and the checks go to
+/// the sidecar [`GUARD_FILES_CONCURRENCY`] at a time. The verdicts are then
+/// recorded and gated in order: the first file whose verdict refuses (or that
+/// could not be checked) ends the walk with the same `Err` `guard_file` would
+/// have returned for it, and nothing after it is recorded. Workers stop taking
+/// new files once one refuses, so a dead or refusing sidecar costs a handful of
+/// timeouts, not one per file.
+///
+/// A scope that cannot be resolved blocks every file alike; that case hands
+/// the list to [`guard_file`] unchanged so its classification is the one used.
+pub(crate) fn guard_files(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+) -> Result<Vec<PolicyVerdict>, String> {
+    guard_files_with(repo_path, files, op, GUARD_FILES_CONCURRENCY)
+}
+
+/// [`guard_files`] with `workers` checks in flight. Production always runs
+/// [`GUARD_FILES_CONCURRENCY`]; the count is a parameter so a test drives the
+/// same concurrent path, not a one-worker stand-in.
+fn guard_files_with(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<PolicyVerdict>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = match scope_at(&address) {
+        Ok(scope) => scope,
+        Err(_) => return files.iter().map(|f| guard_file(repo_path, f, op)).collect(),
+    };
+    let action = format!("file.{}", if op.is_empty() { "write" } else { op });
+
+    // The test build's one fake sidecar is guarded by a lock that only the
+    // thread that took it may re-enter (see `sidecar::test_serial`). This
+    // thread blocks until every worker is done, so it lends what it holds to
+    // them; without a lend a worker would wait on its own spawner.
+    #[cfg(test)]
+    let lent = sidecar::test_serial_held_here();
+    let judged = judge_in_order(
+        files,
+        workers,
+        |file| {
+            #[cfg(test)]
+            let _lent = sidecar::lend_test_serial(lent);
+            check_file(repo_path, file, op, scope.as_ref())
+        },
+        |verdict| verdict.blocks() || verdict.gate_failed(),
+    );
+
+    let mut verdicts = Vec::with_capacity(files.len());
+    for (file, verdict) in files.iter().zip(judged) {
+        let verdict =
+            verdict.ok_or_else(|| format!("No policy verdict was produced for {file}"))?;
+        record_gate(
+            repo_path,
+            address.as_ref().ok(),
+            &action,
+            file,
+            None,
+            &verdict,
+        );
+        verdicts.push(gated(verdict)?);
+    }
+    Ok(verdicts)
+}
+
+/// Runs `check` on every file with up to `workers` in flight, claiming files in
+/// order, and stops claiming once a result satisfies `refuses`.
+///
+/// Slot `i` holds the result for `files[i]`, or `None` if it was never
+/// claimed. Because files are claimed in order and every worker finishes
+/// before this returns, every slot before the first refusing one is `Some`.
+fn judge_in_order<V: Send>(
+    files: &[&str],
+    workers: usize,
+    check: impl Fn(&str) -> V + Sync,
+    refuses: impl Fn(&V) -> bool + Sync,
+) -> Vec<Option<V>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<V>>> = files.iter().map(|_| Mutex::new(None)).collect();
+    let work = || loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let index = next.fetch_add(1, Ordering::AcqRel);
+        let Some(file) = files.get(index) else {
+            return;
+        };
+        let result = check(file);
+        if refuses(&result) {
+            stop.store(true, Ordering::Release);
+        }
+        *slots[index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+    };
+    let workers = workers.clamp(1, files.len().max(1));
+    if workers == 1 {
+        work();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
+    }
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect()
+}
+
+/// Test-only door to [`judge_in_order`] and [`GUARD_FILES_CONCURRENCY`], so the
+/// hub-rename benchmark drives the fan-out production uses for rewrites with
+/// its own counting check instead of a copy of it. Never refuses early.
+#[cfg(test)]
+pub(crate) fn judge_files_for_bench<V: Send>(
+    files: &[&str],
+    workers: usize,
+    check: impl Fn(&str) -> V + Sync,
+) -> Vec<Option<V>> {
+    judge_in_order(files, workers, check, |_| false)
+}
+
+/// The worker count [`guard_files`] runs in production.
+#[cfg(test)]
+pub(crate) const fn production_guard_workers() -> usize {
+    GUARD_FILES_CONCURRENCY
+}
+
+/// Test-only door to [`guard_files_with`], so the live-sidecar benchmark runs
+/// the production walk (scope once, judge, record, gate) at a chosen worker
+/// count.
+#[cfg(test)]
+pub(crate) fn guard_files_with_workers_for_bench(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<PolicyVerdict>, String> {
+    guard_files_with(repo_path, files, op, workers)
+}
+
+/// Test-only: the sidecar round trip alone. Resolves the scope once, then
+/// times every [`check_file`] call (no ledger record, no gating) on `workers`
+/// threads, returning each file's duration and verdict in order, and the byte
+/// size of the declared scope every request carries (0 when unbound). A check
+/// that could not run is an `Err`, never a duration.
+#[cfg(test)]
+pub(crate) fn time_file_checks_for_bench(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<(Vec<(std::time::Duration, PolicyVerdict)>, usize), String> {
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = scope_at(&address).map_err(|failure| failure.reason)?;
+    let scope_bytes = scope.as_ref().map_or(0, |scope| {
+        serde_json::to_vec(scope).map_or(0, |bytes| bytes.len())
+    });
+    let lent = sidecar::test_serial_held_here();
+    let timed = judge_in_order(
+        files,
+        workers,
+        |file| {
+            let _lent = sidecar::lend_test_serial(lent);
+            let started = std::time::Instant::now();
+            let verdict = check_file(repo_path, file, op, scope.as_ref());
+            (started.elapsed(), verdict)
+        },
+        |_| false,
+    );
+    let each = timed
+        .into_iter()
+        .zip(files)
+        .map(|(slot, file)| match slot {
+            Some((_, verdict)) if verdict.gate_failed() => {
+                Err(format!("the sidecar could not judge {file}"))
+            }
+            Some(judged) => Ok(judged),
+            None => Err(format!("{file} was never judged")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((each, scope_bytes))
+}
+
+/// Test-only: a sidecar counted from outside. A `manvi` wrapper that appends
+/// one line to `log` every time the sidecar process starts, then becomes the
+/// real binary (`exec`, so the pid is the sidecar's). Returns the script path.
+#[cfg(all(test, unix))]
+pub(crate) fn counting_manvi_wrapper(
+    dir: &std::path::Path,
+    real: &str,
+    log: &std::path::Path,
+) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("counting-manvi");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec '{}' \"$@\"\n",
+        log.display(),
+        real
+    );
+    std::fs::write(&script, body).expect("write the counting wrapper");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make the counting wrapper executable");
+    script.to_string_lossy().into_owned()
 }
 
 /// The task scope this checkout is working under, if it is bound to one.
@@ -365,20 +638,40 @@ impl ScopeFailure {
     }
 }
 
-fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
-    let binding =
-        crate::ledger::bindings::resolve_binding(repo_path, repo_path).map_err(|error| {
-            let kind = match error.code {
-                "untrusted_worktree" => ScopeFailureKind::Untrusted,
-                crate::ledger::bindings::MISSING_WORKTREE => ScopeFailureKind::Missing,
-                _ => ScopeFailureKind::Broken,
-            };
-            ScopeFailure {
-                task_id: String::new(),
-                kind,
-                reason: format!("could not resolve this worktree's task binding: {error}"),
-            }
-        })?;
+/// The scope at a family address the app's gate resolved for this action.
+///
+/// A failed resolution is classified exactly as a failed binding lookup, which
+/// is what it was: the address is the first half of every binding lookup.
+fn scope_at(
+    address: &Result<crate::ledger::bindings::BindingAddress, crate::ledger::LedgerError>,
+) -> Result<Option<HostScope>, ScopeFailure> {
+    scope_from_binding(
+        address
+            .clone()
+            .and_then(|address| crate::ledger::bindings::binding_at(&address)),
+    )
+}
+
+/// Turns a binding lookup into the scope it declares.
+///
+/// The one owner of that step for both callers: the app's gate, which looks
+/// the binding up at the address it resolved ([`scope_at`]), and the agent
+/// hook, which looks it up read-only ([`hook_scope`]).
+fn scope_from_binding(
+    binding: Result<Option<crate::ledger::bindings::ResolvedBinding>, crate::ledger::LedgerError>,
+) -> Result<Option<HostScope>, ScopeFailure> {
+    let binding = binding.map_err(|error| {
+        let kind = match error.code {
+            "untrusted_worktree" => ScopeFailureKind::Untrusted,
+            crate::ledger::bindings::MISSING_WORKTREE => ScopeFailureKind::Missing,
+            _ => ScopeFailureKind::Broken,
+        };
+        ScopeFailure {
+            task_id: String::new(),
+            kind,
+            reason: format!("could not resolve this worktree's task binding: {error}"),
+        }
+    })?;
     let Some(binding) = binding else {
         return Ok(None);
     };
@@ -436,8 +729,12 @@ fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
 /// carry the operation's own outcome, are written by the callers that observe
 /// it and are absent from this build — the distinction is recorded here rather
 /// than left for a reader to infer.
+///
+/// `address` is the family address the caller resolved for this action, or
+/// `None` when it could not be resolved; the row then goes to `repo_path`.
 fn record_gate(
     repo_path: &str,
+    address: Option<&crate::ledger::bindings::BindingAddress>,
     action: &str,
     target: &str,
     argv_json: Option<String>,
@@ -450,13 +747,11 @@ fn record_gate(
     // otherwise the history would show an authorised action the app refused.
     let blocked = verdict.blocks() || verdict.gate_failed();
 
-    let address = crate::ledger::bindings::repository_address(repo_path).ok();
     let ledger_repo = address
-        .as_ref()
         .map(|address| address.anchor.clone())
         .unwrap_or_else(|| repo_path.to_string());
     let worktree_path = address
-        .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+        .and_then(|address| (address.worktree != address.anchor).then(|| address.worktree.clone()));
 
     crate::ledger::record(Draft {
         repo_path: ledger_repo,
@@ -664,6 +959,147 @@ mod scope_tests {
         (main, parent, worktree)
     }
 
+    /// The scope the app's gate computes for `repo`: one family resolution,
+    /// then the binding at that address.
+    fn scope_for(repo: &str) -> Result<Option<HostScope>, ScopeFailure> {
+        scope_at(&crate::ledger::bindings::repository_address(repo))
+    }
+
+    /// `git worktree list` children spawned in `cwd` while `f` ran.
+    fn family_resolutions<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, usize) {
+        let cwd = std::path::Path::new(cwd);
+        let before = crate::engine::git_cli::spawn_log::spawns_in(cwd).len();
+        let value = f();
+        let count = crate::engine::git_cli::spawn_log::spawns_in(cwd)
+            .into_iter()
+            .skip(before)
+            .filter(|argv| {
+                argv.windows(2)
+                    .any(|w| w[0] == "worktree" && w[1] == "list")
+            })
+            .count();
+        (value, count)
+    }
+
+    /// One gated action resolves its worktree family once. The scope lookup
+    /// and the ledger row each used to resolve it — a `git worktree list` and
+    /// a consolidation pass apiece — so every guarded command or write paid
+    /// two.
+    #[cfg(unix)]
+    #[test]
+    fn a_gated_action_resolves_its_family_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (main, _parent, worktree) = linked_repo();
+        let main_path_buf = main.path().canonicalize().expect("canonical repository");
+        let main_path = main_path_buf.to_str().expect("utf8 repository");
+        let script = main.path().join("allowing-manvi");
+        std::fs::write(&script, FAKE_ALLOW).expect("write fake sidecar");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
+
+        let before = crate::ledger::latest_cursor(main_path).expect("family cursor");
+        let (written, resolutions) = family_resolutions(&worktree, || {
+            guard_file(&worktree, "src/planned.rs", "modify")
+        });
+        written.expect("allowed write");
+        assert_eq!(
+            resolutions, 1,
+            "a guarded write resolved its family {resolutions} times"
+        );
+
+        // The first action authenticated this family with Git and it is
+        // remembered while the registry is unchanged, so the second asks Git
+        // no more: "at most once", never twice.
+        let (ran, resolutions) =
+            family_resolutions(&worktree, || guard_command(&worktree, &["git", "status"]));
+        ran.expect("allowed command");
+        assert!(
+            resolutions <= 1,
+            "a guarded command resolved its family {resolutions} times"
+        );
+
+        // Still recorded once each, in the family ledger, under the checkout.
+        let events = crate::ledger::tail(main_path, before, 10).expect("family tail");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events
+            .iter()
+            .all(|event| event.worktree_path.as_deref() == Some(worktree.as_str())));
+    }
+
+    /// The hook's scope comes from the read-only binding lookup: a bound
+    /// checkout still declares its scope, and no read-write ledger open — the
+    /// chmod pass, WAL pragmas and schema DDL — happens to find it.
+    #[test]
+    fn the_hook_scope_is_read_without_opening_the_ledger_for_writing() {
+        let dir = git_repo();
+        let repo_path = dir.path().canonicalize().expect("canonical repository");
+        let repo = repo_path.to_str().expect("utf8");
+        let db = crate::tasks::store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                 VALUES ('TASK-HOOK', 'Hook', '',
+                     '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        crate::ledger::bindings::bind(repo, repo, "TASK-HOOK").expect("bind");
+        // A hook is a fresh process: nothing cached.
+        crate::ledger::tests_support::reset_registry_for(repo);
+        let opens = crate::ledger::tests_support::write_opens();
+
+        let HookScope::Declared(scope) = hook_scope(repo) else {
+            panic!("a bound checkout must declare its scope to the hook");
+        };
+        assert_eq!(scope.task_id, "TASK-HOOK");
+        assert_eq!(scope.planned_files, ["src/planned.rs"]);
+        assert_eq!(
+            crate::ledger::tests_support::write_opens(),
+            opens,
+            "the hook opened the ledger read-write to read a binding"
+        );
+    }
+
+    /// The hook sorts the read-only lookup's failures exactly as before:
+    /// untrusted is judged unscoped (and says so), a missing checkout has no
+    /// binding, and history it cannot rule out fails closed.
+    #[test]
+    fn the_hook_scope_sorts_each_failure_as_before() {
+        let (main, _parent, worktree) = linked_repo();
+        let main_path_buf = main.path().canonicalize().expect("canonical repository");
+        let main_path = main_path_buf.to_str().expect("utf8 repository");
+
+        // Legacy sibling history the anchor has not imported: Broken.
+        crate::ledger::append(crate::ledger::Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            action: "git.commit".to_string(),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            outcome: Some(crate::ledger::Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy sibling row");
+        assert!(matches!(hook_scope(&worktree), HookScope::Unresolved(_)));
+
+        // Consolidated by GitPulse: unbound again.
+        crate::ledger::bindings::repository_address(main_path).expect("consolidate");
+        assert!(matches!(hook_scope(&worktree), HookScope::Unbound));
+
+        // Untrusted.
+        crate::repository_trust::revoke(main_path).expect("revoke");
+        assert!(matches!(hook_scope(&worktree), HookScope::Untrusted));
+        crate::test_support::trust_repo(main.path());
+
+        // Missing.
+        std::fs::remove_dir_all(&worktree).expect("delete worktree");
+        assert!(matches!(hook_scope(&worktree), HookScope::Unbound));
+    }
+
     /// A `manvi serve` stand-in that answers the handshake, records every
     /// later request, and refuses with a scope verdict.
     #[cfg(unix)]
@@ -751,9 +1187,9 @@ done
         let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         // The hook learns the binding from here, never from the verdict's
-        // task id (the harness stamps `host-scope` on every command decision).
+        // task id, which may be the harness's `host-scope` placeholder.
         assert!(
-            check_command_in_scope(repo, "ls").bound,
+            check_command_in_scope(Lane::Shared, repo, "ls").bound,
             "a bound checkout must report that it is bound"
         );
         std::fs::remove_file(&requests).ok();
@@ -955,7 +1391,7 @@ done
         );
         assert!(!verdict.gate_failed(), "a refusal, not a gate outage");
         // And the agent hook, which judges through the same owner, refuses too.
-        let judged = check_command_in_scope(&worktree, "echo x > src/planned.rs");
+        let judged = check_command_in_scope(Lane::Shared, &worktree, "echo x > src/planned.rs");
         assert!(judged.verdict.blocks() && judged.bound, "{judged:?}");
     }
 
@@ -1014,8 +1450,87 @@ done
 
         // The agent hook path: no binding to read, so judged unscoped rather
         // than refused for want of one.
-        let ScopedVerdict { verdict, bound, .. } = check_command_in_scope(&worktree, "ls");
+        let ScopedVerdict { verdict, bound, .. } =
+            check_command_in_scope(Lane::Shared, &worktree, "ls");
         assert!(!bound, "a missing checkout declares no scope");
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
+    }
+}
+
+#[cfg(test)]
+mod judge_in_order_tests {
+    use super::judge_in_order;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn names(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("f{i}.md")).collect()
+    }
+
+    #[test]
+    fn every_file_is_checked_once_with_a_bounded_number_in_flight() {
+        let names = names(64);
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (in_flight, peak, checks) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let judged = judge_in_order(
+            &files,
+            8,
+            |file| {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                checks.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(3));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                file.to_string()
+            },
+            |_| false,
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 64);
+        assert!(peak.load(Ordering::SeqCst) <= 8, "{peak:?}");
+        assert!(peak.load(Ordering::SeqCst) >= 2, "no overlap: {peak:?}");
+        let answered: Vec<_> = judged.into_iter().collect::<Option<Vec<_>>>().unwrap();
+        assert_eq!(answered, names, "results stay in input order");
+    }
+
+    #[test]
+    fn a_refusal_stops_new_checks_and_leaves_every_earlier_file_judged() {
+        let names = names(2_000);
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let checks = AtomicUsize::new(0);
+        for workers in [1, 8] {
+            checks.store(0, Ordering::SeqCst);
+            let judged = judge_in_order(
+                &files,
+                workers,
+                |file| {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_micros(200));
+                    file == "f40.md"
+                },
+                |refused| *refused,
+            );
+            let first = judged
+                .iter()
+                .position(|r| *r == Some(true))
+                .expect("the refusal is recorded");
+            assert_eq!(first, 40);
+            assert!(judged[..first].iter().all(Option::is_some), "{workers}");
+            assert!(
+                checks.load(Ordering::SeqCst) < 40 + 1 + 2 * workers + 8,
+                "{workers} workers checked {} of 2000",
+                checks.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    #[test]
+    fn no_files_and_one_file() {
+        assert!(judge_in_order(&[], 8, |_| 0u8, |_| false).is_empty());
+        let one = judge_in_order(&["a.md"], 8, |_| 7u8, |_| false);
+        assert_eq!(one, vec![Some(7)]);
     }
 }

@@ -69,6 +69,14 @@ impl<'a> InputFeed<'a> {
         }
     }
 
+    /// Closes the child's stdin now, so a child that reads stdin to EOF sees
+    /// it. Undelivered bytes stay counted as pending: [`Self::finish`] still
+    /// reports them, and the run only turns that into an error for a
+    /// successful, uncancelled exit, which a close at the ask never is.
+    pub(super) fn close(&mut self) {
+        self.pipe = None;
+    }
+
     pub(super) fn finish(self) -> Result<(), String> {
         if self.pending.is_empty() {
             return Ok(());
@@ -159,7 +167,7 @@ pub(super) struct OutputDrains {
 
 impl OutputDrains {
     pub(super) fn observe(
-        &self,
+        &mut self,
         observer: &mut dyn super::ProcessObserver,
         cursors: &mut [usize; 2],
     ) {
@@ -169,6 +177,10 @@ impl OutputDrains {
             &self.stdout.captured.bytes,
             &self.stderr.captured.bytes,
         );
+        if observer.drains_stdout() {
+            self.stdout.captured.discard_observed();
+            cursors[0] = 0;
+        }
     }
     pub(super) fn new(
         stdout: Option<ChildStdout>,

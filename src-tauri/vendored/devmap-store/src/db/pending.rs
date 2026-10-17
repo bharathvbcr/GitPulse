@@ -8,6 +8,18 @@ use rusqlite::{params, Connection, Result, TransactionBehavior};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// The recorded owner of a store relative to one requesting root.
+enum RepoRootOwner {
+    /// No worktree has bound the store yet.
+    Unbound,
+    /// The requesting root is the owner.
+    Same,
+    /// A different worktree owns it and still exists on disk.
+    Live(String),
+    /// The recorded owner is definitely absent from disk.
+    Gone(String),
+}
+
 impl Store {
     pub fn get_or_create_path_id(&self, path: &str) -> Result<u32> {
         let mut conn = lock_conn(&self.conn)?;
@@ -213,39 +225,106 @@ impl Store {
             .ok_or_else(|| refusal("worktree root is not valid UTF-8"))
     }
 
-    fn check_repo_root_in(conn: &Connection, root: &str) -> Result<()> {
+    /// Who the store answers to, as seen from a request at `root`.
+    ///
+    /// A repo-local store travels with `mv`, a backup restore or a drive
+    /// change still stamped with the absolute root it was built at, and this
+    /// very repository moved once (see K1 on
+    /// `enqueue_pending_paths_under_root`). A recorded owner that no longer
+    /// exists names nobody, so it is told apart from one that does — a
+    /// `cp -R`, or two worktrees sharing one `--db` — which is the only case
+    /// the refusal was ever for.
+    fn repo_root_owner_in(conn: &Connection, root: &str) -> Result<RepoRootOwner> {
         let owner: Option<String> = conn.query_row(
             "SELECT repo_root FROM pending_state WHERE singleton = 1",
             [],
             |row| row.get(0),
         )?;
-        if let Some(owner) = owner {
-            let owner = Self::normalized_repo_root(Path::new(&owner))?;
-            if owner != root {
-                return Err(refusal(format!(
-                    "DevMap store belongs to worktree {owner:?}, not {root:?}; use a separate --db or DEVMAP_HOME for each worktree")));
-            }
+        let Some(owner) = owner else {
+            return Ok(RepoRootOwner::Unbound);
+        };
+        let owner = Self::normalized_repo_root(Path::new(&owner))?;
+        if owner == root {
+            return Ok(RepoRootOwner::Same);
         }
-        Ok(())
+        // Fail closed: only a definite NotFound means the owner is gone. A
+        // permission error or an unmounted volume is "could not tell", and a
+        // store that might still serve a live worktree is never taken over.
+        match std::fs::symlink_metadata(&owner) {
+            Ok(_) => Ok(RepoRootOwner::Live(owner)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(RepoRootOwner::Gone(owner))
+            }
+            Err(error) => Err(refusal(format!(
+                "DevMap store belongs to worktree {owner:?}, not {root:?}, and whether that \
+                 worktree still exists could not be checked ({error}); the store is left bound \
+                 to it"
+            ))),
+        }
     }
 
-    pub(super) fn bind_repo_root_in(conn: &Connection, root: &str) -> Result<()> {
-        Self::check_repo_root_in(conn, root)?;
+    fn live_owner_refusal(owner: &str, root: &str) -> rusqlite::Error {
+        refusal(format!(
+            "DevMap store belongs to worktree {owner:?}, not {root:?}, and that worktree still \
+             exists; one store cannot serve two live worktrees — give each its own store with \
+             --db or DEVMAP_HOME, or, if this tree is a copy that carried the other's state \
+             directory, delete that copied state directory here and run `devmap build`"
+        ))
+    }
+
+    fn check_repo_root_in(conn: &Connection, root: &str) -> Result<()> {
+        match Self::repo_root_owner_in(conn, root)? {
+            RepoRootOwner::Unbound | RepoRootOwner::Same => Ok(()),
+            RepoRootOwner::Live(owner) => Err(Self::live_owner_refusal(&owner, root)),
+            // A reader cannot rebind, so it names the writer that will.
+            RepoRootOwner::Gone(owner) => Err(refusal(format!(
+                "DevMap store was built for worktree {owner:?}, which no longer exists (the \
+                 repository moved or was restored elsewhere); run `devmap build` in {root:?} \
+                 to rebind the store to this worktree"
+            ))),
+        }
+    }
+
+    /// Bind `root` as the store's owner inside the caller's writer
+    /// transaction. Returns the previous owner when this call took the store
+    /// over from a worktree that no longer exists, `None` when nothing moved.
+    pub(super) fn bind_repo_root_in(conn: &Connection, root: &str) -> Result<Option<String>> {
+        let previous = match Self::repo_root_owner_in(conn, root)? {
+            RepoRootOwner::Same => return Ok(None),
+            RepoRootOwner::Unbound => None,
+            RepoRootOwner::Live(owner) => return Err(Self::live_owner_refusal(&owner, root)),
+            RepoRootOwner::Gone(owner) => {
+                // The new root has to be a real directory: a rebind onto a
+                // path that does not exist would only move the problem.
+                if !std::fs::metadata(root).is_ok_and(|meta| meta.is_dir()) {
+                    return Err(refusal(format!(
+                        "DevMap store was built for worktree {owner:?}, which no longer \
+                         exists, and {root:?} is not an existing directory to rebind it to"
+                    )));
+                }
+                Some(owner)
+            }
+        };
         conn.execute(
             "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
             [root],
         )?;
-        Ok(())
+        Ok(previous)
     }
 
     /// Bind writes to one canonical worktree, including before its first build.
-    pub fn bind_repo_root(&self, root: &Path) -> Result<()> {
+    ///
+    /// Returns `Some(previous_root)` when the store was rebound from a
+    /// worktree that no longer exists on disk (the repository moved), so the
+    /// caller can say so; `None` when the binding was new or unchanged.
+    pub fn bind_repo_root(&self, root: &Path) -> Result<Option<String>> {
         self.refuse_if_read_only()?;
         let root = Self::normalized_repo_root(root)?;
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::bind_repo_root_in(&tx, &root)?;
-        tx.commit()
+        let previous = Self::bind_repo_root_in(&tx, &root)?;
+        tx.commit()?;
+        Ok(previous)
     }
 
     /// Enqueue changed paths in the queue's canonical form: repo-relative,

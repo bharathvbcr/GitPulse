@@ -10,10 +10,11 @@
 //! It also means no new dependency: `std::net` is enough for JSON over
 //! loopback, including the chunked responses llama.cpp-family servers send.
 
-use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
+
+use crate::deadline::DeadlineStream;
 
 /// Hard ceiling on a response body. A model server answering a completion in
 /// gigabytes is a malfunction, and reading it into memory would make the
@@ -42,40 +43,6 @@ fn read_line_capped<R: Read>(reader: &mut BufReader<R>) -> Result<String, String
         ));
     }
     String::from_utf8(bytes).map_err(|_| "non-UTF-8 byte in response framing".to_string())
-}
-
-/// Enforces one wall-clock deadline across every socket read and write. The
-/// per-operation timeouts it installs shrink as the deadline approaches, so a
-/// peer dribbling single bytes can no longer keep a transfer alive forever.
-struct DeadlineStream {
-    inner: TcpStream,
-    deadline: Instant,
-}
-
-impl DeadlineStream {
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "overall deadline exceeded"))
-    }
-}
-
-impl Read for DeadlineStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.set_read_timeout(Some(self.remaining()?))?;
-        self.inner.read(buf)
-    }
-}
-
-impl Write for DeadlineStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.set_write_timeout(Some(self.remaining()?))?;
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +196,32 @@ fn ensure_loopback(addr: SocketAddr) -> Result<(), String> {
     all_loopback(&[addr])
 }
 
+/// Connects to the first candidate that accepts, in resolver order, within
+/// one overall `deadline`.
+///
+/// `localhost` commonly resolves to `::1` first while a model server such as
+/// Ollama listens on IPv4 only; trying just the first address would refuse a
+/// server that is running. Every candidate was already checked loopback, so
+/// falling through widens nothing. A failure names each address tried.
+fn connect_any(candidates: &[SocketAddr], deadline: Instant) -> Result<TcpStream, String> {
+    if candidates.is_empty() {
+        return Err("the name resolved to no address".into());
+    }
+    let mut failures = Vec::new();
+    for addr in candidates {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            failures.push(format!("{addr}: timed out before it was tried"));
+            break;
+        }
+        match TcpStream::connect_timeout(addr, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => failures.push(format!("{addr}: {e}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
 /// One request/response round trip. `body` is JSON for a POST, `None` for GET.
 pub fn request(
     endpoint: &Endpoint,
@@ -245,19 +238,11 @@ pub fn request(
     // resolver that answers "localhost" with 8.8.8.8 second in line is just
     // as much an exfiltration route as first.
     all_loopback(&candidates)?;
-    let addr = candidates
-        .first()
-        .copied()
-        .ok_or_else(|| format!("no address for {}:{}", endpoint.host, endpoint.port))?;
-
     let started = Instant::now();
-    let stream = TcpStream::connect_timeout(&addr, timeout)
+    let stream = connect_any(&candidates, started + timeout)
         .map_err(|e| format!("cannot reach {}: {}", endpoint.base_url(), e))?;
     let _ = stream.set_nodelay(true);
-    let mut bounded = DeadlineStream {
-        inner: stream,
-        deadline: started + timeout,
-    };
+    let mut bounded = DeadlineStream::new(stream, started + timeout);
 
     let full_path = format!("{}{}", endpoint.prefix, path);
     let mut head = format!(
@@ -367,6 +352,11 @@ fn read_chunked<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, String> {
     loop {
         let size_line =
             read_line_capped(reader).map_err(|e| format!("malformed chunk size: {e}"))?;
+        // EOF before the terminal `0` chunk is a cut-off stream, not the end of
+        // a body: accepting it would hand a prefix to the caller as complete.
+        if size_line.is_empty() {
+            return Err("chunked body ended before its terminating chunk".into());
+        }
         let size_token = size_line
             .trim()
             .split(';')
@@ -374,9 +364,6 @@ fn read_chunked<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, String> {
             .unwrap_or("")
             .trim()
             .to_string();
-        if size_token.is_empty() {
-            break;
-        }
         let size = usize::from_str_radix(&size_token, 16)
             .map_err(|_| format!("malformed chunk size '{}'", size_token))?;
         if size == 0 {
@@ -459,6 +446,58 @@ mod tests {
         let res = read_response(BufReader::new(Cursor::new(raw.as_bytes().to_vec()))).unwrap();
         assert_eq!(res.status, 200);
         assert_eq!(res.body, "{\"a\":1,\"b\":2}");
+    }
+
+    #[test]
+    fn a_chunked_body_cut_off_before_its_last_chunk_is_an_error() {
+        for raw in [
+            // Cut at a chunk boundary: nothing says the body is over.
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1,\r\n",
+            // Cut before the first chunk.
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            // A blank line is not a terminating chunk.
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1,\r\n\r\n",
+        ] {
+            let result = read_response(BufReader::new(Cursor::new(raw.as_bytes().to_vec())));
+            assert!(
+                result.is_err(),
+                "accepted a truncated body from {raw:?}: {result:?}"
+            );
+        }
+    }
+
+    /// `localhost` resolving `::1` first must not hide a server bound to IPv4.
+    #[test]
+    fn connect_any_falls_through_a_refused_first_address_to_a_listening_one() {
+        let closed = std::net::TcpListener::bind("[::1]:0")
+            .or_else(|_| std::net::TcpListener::bind("127.0.0.2:0"))
+            .expect("bind a throwaway port");
+        let dead = closed.local_addr().unwrap();
+        drop(closed);
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let live_addr = live.local_addr().unwrap();
+
+        let stream = connect_any(&[dead, live_addr], Instant::now() + Duration::from_secs(5))
+            .expect("the second address accepts");
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
+    }
+
+    #[test]
+    fn connect_any_names_every_address_it_tried_when_all_refuse() {
+        let bind = || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let (a, b) = (bind(), bind());
+        let error = connect_any(&[a, b], Instant::now() + Duration::from_secs(5))
+            .expect_err("nothing listens");
+        assert!(
+            error.contains(&a.to_string()) && error.contains(&b.to_string()),
+            "{error}"
+        );
+        assert!(connect_any(&[], Instant::now() + Duration::from_secs(1)).is_err());
     }
 
     #[test]
@@ -598,7 +637,7 @@ mod tests {
         });
         match rx.recv_timeout(Duration::from_secs(3)) {
             Ok((_, elapsed)) => assert!(
-                elapsed < Duration::from_secs(2),
+                elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
                 "round trip took {:?}; the deadline did not bound it",
                 elapsed
             ),

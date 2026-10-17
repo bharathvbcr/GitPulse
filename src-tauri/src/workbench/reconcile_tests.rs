@@ -1,7 +1,10 @@
-use super::{judge, manvi_owner, native_owner, Verdict};
+use super::{judge, manvi_owner, native_owner, sweep, sweep_pages, Verdict};
 use crate::engine::git_cli::{git_global, git_text};
+#[cfg(unix)]
 use crate::procguard::LockedSpawn;
-use crate::workbench::process_birth::{self, Liveness};
+#[cfg(unix)]
+use crate::workbench::process_birth;
+use crate::workbench::process_birth::Liveness;
 use crate::workbench::{query, Inner, WorkbenchState};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -199,6 +202,7 @@ fn prepare(
 
 /// What a crashed host leaves: claimed and started under an owner whose
 /// process is `owner`, recording `child` as the agent.
+#[cfg(unix)]
 fn strand(state: &WorkbenchState, id: &str, owner: &str, child: Option<(u32, String)>) {
     let store = |method: &str, input: Value| {
         state
@@ -226,6 +230,7 @@ fn strand(state: &WorkbenchState, id: &str, owner: &str, child: Option<(u32, Str
 /// the file: without it, these fixture processes read as production code
 /// spawning outside the gated seam.
 #[cfg(test)]
+#[cfg(unix)]
 fn reaped() -> (u32, String) {
     let mut child = std::process::Command::new("sh")
         .args(["-c", "read line"])
@@ -363,9 +368,11 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     let removal =
         crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate)
             .expect_err("a worktree was removed under a running agent");
-    let merge =
-        crate::commands::merge_teardown_guarded(&state, repo_path, lane_path, None, false, &gate)
-            .expect_err("a worktree was merged away under a running agent");
+    let merge = crate::commands::merge_teardown_guarded(
+        &state, repo_path, lane_path, None, false, None, &gate,
+    )
+    .expect_err("a worktree was merged away under a running agent")
+    .to_string();
     for refusal in [&removal, &merge] {
         assert!(
             refusal.contains("still working in this worktree")
@@ -379,6 +386,59 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     assert!(git_text(&root, &["rev-parse", "--verify", "refs/heads/feature"]).is_ok());
     drop(agent.stdin.take());
     agent.wait().unwrap();
+    crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate).unwrap();
+    assert!(!lane.exists());
+}
+
+/// The defect: removal asked only the run rows, so an agent typed into a plain
+/// dock tab (no row, and with no workbench profile no rows to read at all) had
+/// its worktree deleted out from under it.
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn a_worktree_with_any_process_in_it_is_not_removed_even_without_a_profile() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let lane = dir.path().join("lane");
+    git_text(
+        &root,
+        &["worktree", "add", "-b", "dock", lane.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&lane);
+    // A profile file that was never created: there are no run rows to read.
+    let state = host(&dir.path().join("never-created.sqlite"));
+    let mut tab = std::process::Command::new("sh")
+        .args(["-c", "read line"])
+        .current_dir(&lane)
+        .stdin(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn_locked()
+        .unwrap();
+    let pid = tab.id();
+    let (repo_path, lane_path) = (root.to_str().unwrap(), lane.to_str().unwrap());
+    let gate = |repo: &str, argv: &[&str]| crate::harness::guard_command(repo, argv);
+    let wait_seen = |expect: bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let refused =
+                crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate);
+            if refused.is_err() == expect || std::time::Instant::now() > deadline {
+                return refused;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let refusal = match wait_seen(true) {
+        Err(error) => error,
+        Ok(_) => panic!("a worktree was removed under a live process"),
+    };
+    assert!(refusal.contains(&format!("pid {pid}")), "{refusal}");
+    assert!(lane.is_dir());
+    drop(tab.stdin.take());
+    tab.wait().unwrap();
     crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate).unwrap();
     assert!(!lane.exists());
 }
@@ -818,5 +878,20 @@ fn an_escaped_descendant_in_the_worktree_holds_the_checkout() {
     assert!(
         matches!(&verdict, Verdict::Keep(r) if r.contains(&child.id().to_string())),
         "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_sweep_that_stopped_at_its_page_cap_says_it_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("profile.sqlite");
+    let state = host(&path);
+    state.with_store(|_| Ok(())).expect("create the profile");
+    let full = sweep(&state).expect("sweep");
+    assert!(full.complete, "an empty profile is fully examined");
+    let capped = sweep_pages(&state, 0).expect("capped sweep");
+    assert!(
+        !capped.complete,
+        "no page was read, so nothing was examined"
     );
 }

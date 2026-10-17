@@ -18,9 +18,12 @@
     rootlessBranches,
     stackBranchFacts,
     stackTreeRows,
+    unresolvedStackNotice,
     type RestackStep,
   } from "../stack/tree";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { reportFailure } from "../stores/mutationOutcome";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
   import { invoke } from "../ipc/invoke";
@@ -75,6 +78,7 @@
   const stackBreadcrumb = $derived(payload?.breadcrumb ?? null);
   const stackDefaultBranch = $derived(payload?.default_branch ?? null);
   const rows = $derived(stackTreeRows(stackNodes));
+  const unresolvedNotice = $derived(unresolvedStackNotice(payload));
   const unplaced = $derived(
     rootlessBranches(stackNodes, $repoStore.branches, stackDefaultBranch ?? ""),
   );
@@ -137,6 +141,11 @@
    * exactly — and does, rather than reporting a partial cascade as a failure
    * that touched nothing.
    */
+  async function checkout(branch: string) {
+    const outcome = await repoStore.checkoutBranch(branch);
+    reportFailure(outcome, `Could not check out ${branch}`);
+  }
+
   async function restack(node: StackedBranchNode) {
     const repoPath = $repoStore.currentPath;
     if (!repoPath || !node.parent_branch_name) return;
@@ -235,40 +244,36 @@
     }
   }
 
-  // Memo guard so unrelated store emissions do not refetch: the stack
-  // reloads when the repository changes or its generation bumps (watcher
-  // refreshes, branch mutations) — nothing else.
-  let prevRepoPath: string | null = null;
-  let prevGeneration = -1;
+  // The stack reloads when the repository changes or its generation bumps
+  // (watcher refreshes, branch mutations) — nothing else. Both keys compare
+  // by value, so the store's unrelated emissions do not refetch.
+  const generation = $derived($repoStore.generation);
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const generation = $repoStore.generation;
-    if (!repo) {
-      prevRepoPath = null;
-      prevGeneration = -1;
-      inflight?.cancel();
-      restackGuard?.cancel();
-      payload = null;
-      loadError = null;
-      restackError = null;
-      isLoading = false;
-      return;
-    }
-    if (repo === prevRepoPath && generation === prevGeneration) return;
-    prevRepoPath = repo;
-    prevGeneration = generation;
-    // Hydrate the last-known hierarchy synchronously so a revisit renders
-    // instantly; the fetch below then refreshes it in place.
-    const cached = stackCache.get(repo);
-    if (cached) payload = cached;
-    void loadStack(repo);
-    const started = inflight;
-    return () => {
-      if (inflight === started) {
-        started?.cancel();
+    const repo = $currentRepoPath;
+    void generation;
+    return untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        restackGuard?.cancel();
+        payload = null;
+        loadError = null;
+        restackError = null;
+        isLoading = false;
+        return undefined;
       }
-    };
+      // Hydrate the last-known hierarchy synchronously so a revisit renders
+      // instantly; the fetch below then refreshes it in place.
+      const cached = stackCache.get(repo);
+      if (cached) payload = cached;
+      void loadStack(repo);
+      const started = inflight;
+      return () => {
+        if (inflight === started) {
+          started?.cancel();
+        }
+      };
+    });
   });
 
   $effect(() => {
@@ -326,6 +331,13 @@
         <RefreshCw size={12} class={isLoading ? "animate-spin" : ""} />
         <span>Retry</span>
       </button>
+    </div>
+  {/if}
+
+  {#if unresolvedNotice}
+    <div data-testid="stack-unresolved" class="mb-3 max-w-3xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300">
+      <CircleAlert size={14} class="shrink-0 mt-px" />
+      <span>{unresolvedNotice}</span>
     </div>
   {/if}
 
@@ -453,7 +465,7 @@
                 {/if}
                 {#if !isCurrent}
                   <button
-                    onclick={() => repoStore.checkoutBranch(node.branch_name)}
+                    onclick={() => void checkout(node.branch_name)}
                     disabled={restackingKey !== null}
                     class="gp-btn py-1! px-2.5! text-[11px]!"
                   >
@@ -509,7 +521,7 @@
             type="button"
             class="gp-pill text-[10px]! font-mono hover:text-accent"
             disabled={restackingKey !== null}
-            onclick={() => repoStore.checkoutBranch(name)}
+            onclick={() => void checkout(name)}
             title="Checkout {name}"
           >
             {name}

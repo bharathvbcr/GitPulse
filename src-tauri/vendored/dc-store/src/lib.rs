@@ -29,8 +29,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+pub mod commit_wire;
 pub mod json;
 pub mod records;
 pub mod schema;
@@ -232,6 +233,16 @@ pub struct Lease {
     pub released_at: Option<String>,
 }
 
+/// How [`Store::observe_leases`] judged one active row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseState {
+    Live,
+    /// Past its expiry; a writing call would mark it stale.
+    Expired,
+    /// The stored `expires_at` is not a timestamp; carries it as stored.
+    BadExpiry(String),
+}
+
 /// What a caller supplies when acquiring.
 #[derive(Debug, Clone, Default)]
 pub struct AcquireRequest {
@@ -248,12 +259,42 @@ pub struct AcquireRequest {
     pub force: bool,
 }
 
+/// How many times one lazy-expiry read re-reads a lease that changed under it
+/// before it gives up. A change means a renewal, release or force landed in the
+/// gap, each of which is a distinct event; many in a row is not a lease anyone
+/// can reason about, so the read fails closed instead of spinning.
+const MAX_EXPIRY_PASSES: usize = 8;
+
+/// A lease whose `expires_at` could not be read, retired by a forced acquire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredLease {
+    pub lease_id: String,
+    pub owner: String,
+    /// The unreadable expiry exactly as it was stored.
+    pub expires_at: String,
+}
+
+/// What lazy expiry found across every lease still marked active.
+#[derive(Debug, Clone, Default)]
+pub struct Sweep {
+    /// Leases that are live.
+    pub live: Vec<Lease>,
+    /// Leases whose `expires_at` is not a timestamp. Each fails closed for its
+    /// own task alone: nothing is offered or acquired over it without force.
+    pub unreadable: Vec<Lease>,
+}
+
 /// The store handle.
 pub struct Store {
     conn: Connection,
     /// Injected clock, in whole seconds since the epoch. Tests drive expiry
     /// without sleeping.
     now_fn: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
+    /// Whether a workbench request may upgrade an older profile's schema.
+    /// True by default; a host that must never be the one to move a shared
+    /// profile forward (a read-only server, a daemon) clears it with
+    /// [`Store::refuse_workbench_upgrades`].
+    workbench_upgrades: bool,
 }
 
 impl std::fmt::Debug for Store {
@@ -303,6 +344,53 @@ impl Store {
         Self::prepare(conn)
     }
 
+    /// Opens a store that must already exist, for reading only.
+    ///
+    /// `SQLITE_OPEN_READ_ONLY`: no DDL, no WAL switch, no column additions and
+    /// no lease sweep, so a view of the store can never change it or contend
+    /// for its write lock. The schema is checked by reading, not repaired: a
+    /// store this build cannot read reports that rather than being migrated by
+    /// a reader. Writing methods fail with `SQLITE_READONLY`.
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(StoreError::MissingDatabase {
+                path: path.display().to_string(),
+            });
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen => {
+                StoreError::MissingDatabase {
+                    path: path.display().to_string(),
+                }
+            }
+            other => StoreError::Sql(other),
+        })?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let known: Option<u32> = conn
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 'singleton'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = known.filter(|found| *found > SCHEMA_VERSION) {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                known: SCHEMA_VERSION,
+            });
+        }
+        Ok(Store {
+            conn,
+            now_fn: None,
+            workbench_upgrades: false,
+        })
+    }
+
     /// Opens an in-memory store, for tests.
     pub fn open_in_memory() -> Result<Self> {
         Self::prepare(Connection::open_in_memory()?)
@@ -313,9 +401,13 @@ impl Store {
         // busy timeout absorbs the contention two builders produce. Both are
         // set before any statement runs.
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Before the first table: a database created here can give back the
+        // pages retention frees (`store.compact` runs the incremental vacuum).
+        // SQLite ignores it on a file that already holds tables, so an older
+        // profile keeps its mode until someone runs a full VACUUM on it.
+        conn.pragma_update(None, "auto_vacuum", 2)?;
         ensure_wal(&conn)?;
         conn.execute_batch(schema::SCHEMA)?;
-        schema::ensure_gap_output_columns(&conn)?;
         // Applying the DDL is not evidence that it took: every statement in it
         // is `IF NOT EXISTS`, and for the exclusion index that match is on the
         // name alone. Reading back what the file actually holds is what turns
@@ -323,7 +415,7 @@ impl Store {
         // comment into a precondition.
         schema::verify_exclusion_index(&conn)
             .map_err(|detail| StoreError::ExclusionIndex { detail })?;
-        schema::ensure_schema_version(&conn, SCHEMA_VERSION).map_err(|detail| {
+        schema::migrate(&conn, SCHEMA_VERSION).map_err(|detail| {
             if let Some(rest) = detail.strip_prefix("unsupported DevCouncil schema version ") {
                 let found = rest
                     .split(';')
@@ -338,7 +430,20 @@ impl Store {
                 StoreError::SchemaVersion { detail }
             }
         })?;
-        Ok(Store { conn, now_fn: None })
+        Ok(Store {
+            conn,
+            now_fn: None,
+            workbench_upgrades: true,
+        })
+    }
+
+    /// Stops this handle from upgrading an older workbench profile. A request
+    /// that would need the upgrade fails with `schema_upgrade_required` and
+    /// leaves the profile untouched, so only the host that owns the profile
+    /// (the desktop app) ever moves its schema forward — and an older app,
+    /// MCP server or sidecar that shares it is never locked out by a reader.
+    pub fn refuse_workbench_upgrades(&mut self) {
+        self.workbench_upgrades = false;
     }
 
     /// Replaces the clock. Tests use this to move past a TTL instantly.
@@ -369,20 +474,34 @@ impl Store {
     /// before the call returns None. That matches the incumbent, and it is why
     /// expiry needs no background sweeper.
     pub fn active_lease(&self, task_id: &str) -> Result<Option<Lease>> {
-        let lease = self.select_active(task_id)?;
-        let Some(lease) = lease else {
-            return Ok(None);
-        };
-        if let Some(expires) = lease.expires_at.as_deref() {
+        // Each pass observes a row, and retiring it is one conditional UPDATE
+        // naming the expiry that was observed. A pass that loses — the holder
+        // renewed, released, or was forced out between the read and the write —
+        // changed nothing, and the next pass reads what is true now. The old
+        // read, compare, then unconditional write let a stale reader mark a
+        // lease that had just been renewed (the renewal reported success and the
+        // very next diagnose said expired) or rewrite `released` as `stale`.
+        for _ in 0..MAX_EXPIRY_PASSES {
+            let Some(lease) = self.select_active(task_id)? else {
+                return Ok(None);
+            };
+            let Some(expires) = lease.expires_at.as_deref() else {
+                return Ok(Some(lease));
+            };
             let expires_epoch = parse_iso_utc(expires).ok_or_else(|| StoreError::BadTimestamp {
                 value: expires.to_string(),
             })?;
-            if self.now_epoch() > expires_epoch {
-                self.mark(&lease.id, "stale")?;
+            if self.now_epoch() <= expires_epoch {
+                return Ok(Some(lease));
+            }
+            if self.retire(&lease)? {
                 return Ok(None);
             }
         }
-        Ok(Some(lease))
+        Err(StoreError::LeaseHeld {
+            task_id: task_id.to_string(),
+            holder: "a concurrent renewal; the lease changed on every read".to_string(),
+        })
     }
 
     /// Acquires a lease.
@@ -392,6 +511,31 @@ impl Store {
     /// gets a constraint violation, which is translated into the same
     /// `LeaseHeld` a caller would have seen from the check.
     pub fn acquire(&self, req: &AcquireRequest) -> Result<Lease> {
+        self.acquire_outcome(req).map(|(lease, _)| lease)
+    }
+
+    /// [`Store::acquire`] that also reports an unreadable-expiry lease a forced
+    /// acquire retired, so the caller can record that the incumbent was not
+    /// stolen from but cleared.
+    pub fn acquire_outcome(&self, req: &AcquireRequest) -> Result<(Lease, Option<RetiredLease>)> {
+        // One write transaction for the whole decision. Retiring the incumbent
+        // and inserting the replacement were two autocommits, so a failure
+        // between them left the task with neither: the holder had lost its
+        // lease and nobody held the task. IMMEDIATE for the reason
+        // [`write_transaction`] documents. Only success commits:
+        // every refusal (held, unreadable expiry, bad ttl) happens before this
+        // call writes anything the next read would not redo, so rolling back
+        // loses nothing and a failure at any step leaves the store as found.
+        if let Some(ttl) = req.ttl_seconds {
+            validate_ttl(ttl)?;
+        }
+        write_transaction(&self.conn, |_| self.acquire_in_transaction(req))
+    }
+
+    fn acquire_in_transaction(
+        &self,
+        req: &AcquireRequest,
+    ) -> Result<(Lease, Option<RetiredLease>)> {
         // Validated before anything is written, and that ordering is the whole
         // of the guarantee: an unvalidated TTL used to overflow the epoch
         // arithmetic (panic in debug, absurd expiry in release) and a
@@ -408,14 +552,41 @@ impl Store {
             validate_ttl(ttl)?;
         }
 
-        if let Some(active) = self.active_lease(&req.task_id)? {
-            if !req.force {
-                return Err(StoreError::LeaseHeld {
-                    task_id: req.task_id.clone(),
-                    holder: holder_of(&active),
+        let mut retired = None;
+        match self.active_lease(&req.task_id) {
+            Ok(Some(active)) => {
+                if !req.force {
+                    return Err(StoreError::LeaseHeld {
+                        task_id: req.task_id.clone(),
+                        holder: holder_of(&active),
+                    });
+                }
+                self.retire_active(&active.id)?;
+            }
+            Ok(None) => {}
+            // The one unreadable row is this task's, and only a forced acquire
+            // may clear it: it is retired (status stale, released_at stamped,
+            // the bad expiry left in the row as evidence) and reported, rather
+            // than guessed to be expired.
+            Err(StoreError::BadTimestamp { value }) if req.force => {
+                if let Some(bad) = self.select_active(&req.task_id)? {
+                    self.retire_active(&bad.id)?;
+                    retired = Some(RetiredLease {
+                        lease_id: bad.id,
+                        owner: bad.owner,
+                        expires_at: bad.expires_at.unwrap_or(value),
+                    });
+                }
+            }
+            Err(StoreError::BadTimestamp { value }) => {
+                return Err(StoreError::BadTimestamp {
+                    value: format!(
+                        "{value} (task {}'s lease has an unreadable expiry; a forced acquire retires it)",
+                        req.task_id
+                    ),
                 });
             }
-            self.mark(&active.id, "stale")?;
+            Err(e) => return Err(e),
         }
 
         let now = self.now_epoch();
@@ -455,7 +626,7 @@ impl Store {
         );
 
         match inserted {
-            Ok(_) => Ok(lease),
+            Ok(_) => Ok((lease, retired)),
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
@@ -516,8 +687,16 @@ impl Store {
         if active.token != token {
             return Ok(false);
         }
-        self.mark(&active.id, "released")?;
-        Ok(true)
+        // Only a row still active and still carrying this token is released:
+        // a concurrent expiry or force that got there first leaves its own
+        // status, and a released lease is never rewritten.
+        let released = self.iso(self.now_epoch());
+        let changed = self.conn.execute(
+            "UPDATE task_leases SET status = 'released', released_at = ?1
+             WHERE id = ?2 AND lease_token = ?3 AND status = 'active'",
+            params![released, active.id, token],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Pushes the expiry out from now. Returns None when the token does not
@@ -560,15 +739,55 @@ impl Store {
             .optional()?)
     }
 
+    /// Every row still marked active, with its expiry judged in memory.
+    ///
+    /// Unlike [`Store::active_leases`] this never writes: a lapsed lease is
+    /// reported as [`LeaseState::Expired`] and left as it is, and a lease whose
+    /// `expires_at` cannot be read is [`LeaseState::BadExpiry`] for that row
+    /// alone instead of failing the whole listing. Safe on a read-only handle.
+    pub fn observe_leases(&self) -> Result<Vec<(Lease, LeaseState)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, owner, agent, client_id, run_id, branch,
+                    lease_token, status, created_at, expires_at, released_at
+             FROM task_leases WHERE status = 'active' ORDER BY task_id",
+        )?;
+        let leases = stmt
+            .query_map([], row_to_lease)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let now = self.now_epoch();
+        Ok(leases
+            .into_iter()
+            .map(|lease| {
+                let state = match lease.expires_at.as_deref() {
+                    None => LeaseState::Live,
+                    Some(expires) => match parse_iso_utc(expires) {
+                        Some(epoch) if now > epoch => LeaseState::Expired,
+                        Some(_) => LeaseState::Live,
+                        None => LeaseState::BadExpiry(expires.to_string()),
+                    },
+                };
+                (lease, state)
+            })
+            .collect())
+    }
+
     /// Every currently-live lease, with expiry applied.
     pub fn active_leases(&self) -> Result<Vec<Lease>> {
-        let mut out = self.sweep_expired()?;
+        let mut out = self.sweep_expired()?.live;
         out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
         Ok(out)
     }
 
-    /// Applies lazy expiry across every row still marked active, and returns
-    /// the ones that survived it.
+    /// Leases whose `expires_at` cannot be read, one per affected task. They are
+    /// never offered as ready and never counted as live; surfacing them is how a
+    /// store with one planted row reports itself degraded instead of failing.
+    pub fn unreadable_leases(&self) -> Result<Vec<Lease>> {
+        let mut out = self.sweep_expired()?.unreadable;
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(out)
+    }
+
+    /// Applies lazy expiry across every row still marked active.
     ///
     /// This is the single owner of "which leases are actually live", because
     /// the alternative is what was here before: `active_leases` applied expiry
@@ -577,17 +796,28 @@ impl Store {
     /// read and there is no sweeper, so a lease nothing has touched keeps its
     /// stale `active` row indefinitely — and a task whose builder crashed was
     /// never re-offered until some *other* call happened to look at it.
-    fn sweep_expired(&self) -> Result<Vec<Lease>> {
+    ///
+    /// One unreadable expiry fails closed for its own task only. The sweep used
+    /// to propagate it, so a single planted row took `ready`, `health` and every
+    /// forced acquire down for the whole store.
+    fn sweep_expired(&self) -> Result<Sweep> {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT task_id FROM task_leases WHERE status = 'active'")?;
         let task_ids: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<_, _>>()?;
-        let mut out = Vec::new();
+        let mut out = Sweep::default();
         for task_id in task_ids {
-            if let Some(lease) = self.active_lease(&task_id)? {
-                out.push(lease);
+            match self.active_lease(&task_id) {
+                Ok(Some(lease)) => out.live.push(lease),
+                Ok(None) => {}
+                Err(StoreError::BadTimestamp { .. }) => {
+                    if let Some(lease) = self.select_active(&task_id)? {
+                        out.unreadable.push(lease);
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
@@ -607,11 +837,29 @@ impl Store {
         Ok(lease)
     }
 
-    fn mark(&self, lease_id: &str, status: &str) -> Result<()> {
-        let released = self.iso(self.now_epoch());
+    /// Marks a lease stale because its observed expiry passed. One conditional
+    /// UPDATE: the row must still be active *and* still carry the expiry that
+    /// was judged, so a renewal that landed in between wins. True when this
+    /// call retired it.
+    fn retire(&self, lease: &Lease) -> Result<bool> {
+        let at = self.iso(self.now_epoch());
+        let changed = self.conn.execute(
+            "UPDATE task_leases SET status = 'stale', released_at = ?1
+             WHERE id = ?2 AND status = 'active' AND expires_at IS ?3",
+            params![at, lease.id, lease.expires_at],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Marks an active lease stale because a forced acquire is replacing it.
+    /// A lease that stopped being active in the meantime (released, expired by
+    /// someone else) is left exactly as it is.
+    fn retire_active(&self, lease_id: &str) -> Result<()> {
+        let at = self.iso(self.now_epoch());
         self.conn.execute(
-            "UPDATE task_leases SET status = ?1, released_at = ?2 WHERE id = ?3",
-            params![status, released, lease_id],
+            "UPDATE task_leases SET status = 'stale', released_at = ?1
+             WHERE id = ?2 AND status = 'active'",
+            params![at, lease_id],
         )?;
         Ok(())
     }
@@ -682,7 +930,7 @@ impl Store {
         // file with DevCouncil and with anything else holding the path, so the
         // read asserts it too rather than trusting that every writer did.
         for (column, value) in COLUMNS.iter().zip(scope.iter()) {
-            if let Err(why) = json::check_array(value.trim()) {
+            if let Err(why) = json::check_array(value) {
                 return Err(StoreError::BadScope {
                     reason: format!("task {task_id}'s {column} is not a JSON array: {why}"),
                 });
@@ -733,7 +981,13 @@ impl Store {
         expected: &str,
         replacement: &str,
     ) -> Result<ScopeWrite> {
-        let trimmed = replacement.trim();
+        // Trimmed of JSON whitespace only, and the trimmed text is what is
+        // stored. `trim()` stripped every Unicode space for the check while the
+        // untrimmed text was stored, so `"\x0c[]"` was accepted and then made
+        // every read of the task invalid JSON; and a value padded with a
+        // character SQLite's `trim()` does not strip could never be swapped.
+        let replacement = json::trim_ws(replacement);
+        let expected = json::trim_ws(expected);
         if replacement.len() > MAX_AGENT_APPENDED_SCOPE_BYTES {
             return Err(StoreError::BadScope {
                 reason: format!(
@@ -755,9 +1009,9 @@ impl Store {
         // compares stored text, so a value normalised on the way in would no
         // longer match what its caller holds and every widening would report as
         // a conflict with itself.
-        if let Err(why) = json::check_array(trimmed) {
+        if let Err(why) = json::check_planned_files(replacement) {
             return Err(StoreError::BadScope {
-                reason: format!("{replacement:?} is not a JSON array: {why}"),
+                reason: format!("{replacement:?} is not a list of planned files: {why}"),
             });
         }
 
@@ -765,28 +1019,15 @@ impl Store {
         // could lapse between being read and being relied on, and the widening
         // would be written on an authority that had already gone.
         //
-        // IMMEDIATE, not the deferred transaction rusqlite hands out by
-        // default. A deferred transaction takes a read lock on its first
-        // statement — the task lookup below — and then has to upgrade to a
-        // write lock for the swap, and SQLite refuses that upgrade with
-        // SQLITE_BUSY *without consulting the busy handler*, because no amount
-        // of waiting resolves two readers that both want to become writers. The
-        // connection's five-second busy timeout therefore never applies, and
-        // two builders widening one task at the same moment surface it as
-        // "database is locked" rather than as the contention it is. Taking the
-        // write lock up front is what lets the timeout do its job.
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let outcome = self.swap_agent_appended(task_id, token, expected, replacement);
-        match &outcome {
-            // Committed on every path that returns an answer, refusals
-            // included: diagnose marks a lapsed lease stale as it reads, and
-            // that observation is exactly the fact worth keeping.
-            Ok(_) => self.conn.execute_batch("COMMIT")?,
-            Err(_) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
-        }
-        outcome
+        // IMMEDIATE, through [`write_transaction`]: the task lookup below is a
+        // read, and a deferred transaction could not then upgrade for the swap
+        // without failing two builders widening one task at the same moment as
+        // "database is locked". Committed on every path that returns an
+        // answer, refusals included: diagnose marks a lapsed lease stale as it
+        // reads, and that observation is exactly the fact worth keeping.
+        write_transaction(&self.conn, |_| {
+            self.swap_agent_appended(task_id, token, expected, replacement)
+        })
     }
 
     /// The body of the swap, inside a transaction its caller owns.
@@ -813,13 +1054,16 @@ impl Store {
         }
 
         let updated = self.conn.execute(
-            // Compared trimmed. The caller's `expected` reaches it through a
-            // JSON decoder that reports a value's own bytes and not the
-            // whitespace around it, so a column stored with padding would never
-            // compare equal to what any caller can send back — the swap would
-            // refuse forever and the widening could never be written.
+            // Compared trimmed of JSON whitespace — the same four characters
+            // `json::trim_ws` strips, spelled out because SQLite's one-argument
+            // `trim()` removes only U+0020. The caller's `expected` reaches it
+            // through a JSON decoder that reports a value's own bytes and not
+            // the whitespace around it, so a column stored with padding would
+            // never compare equal to what any caller can send back — the swap
+            // would refuse forever and the widening could never be written.
             "UPDATE tasks SET agent_appended_planned_files_json = ?1
-             WHERE id = ?2 AND trim(agent_appended_planned_files_json) = trim(?3)",
+             WHERE id = ?2
+               AND trim(agent_appended_planned_files_json, char(32, 9, 10, 13)) = ?3",
             params![replacement, task_id, expected],
         )?;
         if updated == 0 {
@@ -832,7 +1076,7 @@ impl Store {
             // obligation as anything else this store emits unquoted: a column
             // some other writer left malformed must not be spliced into a reply
             // as though it were a value.
-            if let Err(why) = json::check_array(current.trim()) {
+            if let Err(why) = json::check_array(&current) {
                 return Err(StoreError::BadScope {
                     reason: format!(
                         "task {task_id}'s stored appended scope is not a JSON array: {why}"
@@ -935,6 +1179,17 @@ impl Store {
         records::gaps_replace(&self.conn, task_id, gaps)
     }
 
+    /// Commits a verification run and its gaps as one transaction. See
+    /// [`records::verification_commit`].
+    pub fn verification_commit(
+        &self,
+        run: Option<&records::VerificationRun>,
+        task_id: &str,
+        gaps: &[records::GapRow],
+    ) -> Result<()> {
+        records::verification_commit(&self.conn, run, task_id, gaps)
+    }
+
     /// Records a verification run. See [`records::run_record`].
     pub fn run_record(&self, run: &records::VerificationRun) -> Result<()> {
         records::run_record(&self.conn, run)
@@ -1000,6 +1255,31 @@ fn holder_of(lease: &Lease) -> String {
 /// It is both the connection's `busy_timeout` and the budget `ensure_wal`
 /// spends, so a caller waits the same bounded time whichever lock it lands on.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `body` inside one write transaction that holds the write lock from its
+/// first statement, committing when it returns `Ok` and rolling back when it
+/// returns `Err` (or panics, or the commit itself fails).
+///
+/// IMMEDIATE, not the deferred transaction rusqlite hands out by default. A
+/// deferred transaction takes a read lock on its first statement and has to
+/// upgrade to a write lock for its first write, and SQLite refuses that
+/// upgrade *without consulting the busy handler*: a writer holding the lock at
+/// that moment is SQLITE_BUSY, and one that committed since the read is
+/// SQLITE_BUSY_SNAPSHOT, because no amount of waiting makes a stale snapshot
+/// current. The connection's five-second busy timeout therefore never applies,
+/// and two writers meeting surface as "database is locked" rather than as the
+/// contention they are. Taking the write lock up front is what lets the
+/// timeout do its job. Every write path that reads before it writes goes
+/// through here.
+pub(crate) fn write_transaction<T>(
+    conn: &Connection,
+    body: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let out = body(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
 
 /// Puts the connection in WAL mode, tolerating another process converting the
 /// same database at the same moment.
@@ -1156,13 +1436,13 @@ pub struct Task {
 /// replacement that is not one. Splicing text that had only been *shaped* like
 /// an array is what let an injected `"planned_files"` key ride into the reply.
 fn merge_json_arrays(base: &str, appended: &str) -> String {
-    let a = base.trim();
-    let b = appended.trim();
+    let a = json::trim_ws(base);
+    let b = json::trim_ws(appended);
     let inner = |s: &str| -> String {
         s.strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or("")
-            .trim()
+            .trim_matches(json::JSON_WS)
             .to_string()
     };
     let (ai, bi) = (inner(a), inner(b));
@@ -1768,21 +2048,28 @@ mod tests {
         Store::prepare(conn).expect("the incumbent's own index was refused");
     }
 
-    /// The gap output-path upgrade forgives exactly one failure — another
-    /// process having added the column first — and re-reads the table to tell
-    /// that apart. Any other failure to add a column must surface, or a store
-    /// that cannot hold the paths would open as if it could and fail later on
-    /// the first gap-upsert instead.
+    /// A column the migration cannot add must surface as an error that names
+    /// its table, and must leave the store unstamped: a store that cannot hold
+    /// a column would otherwise open as current and fail later on first use.
     #[test]
-    fn a_gap_column_that_cannot_be_added_is_an_error_not_skipped() {
+    fn a_column_that_cannot_be_added_is_an_error_and_is_not_stamped() {
         let conn = Connection::open_in_memory().expect("open");
-        // No `gaps` table at all: every ALTER fails, and the column is still
-        // absent when re-read.
-        let err = schema::ensure_gap_output_columns(&conn)
-            .expect_err("an ALTER that failed for a reason other than the race was swallowed");
+        conn.execute_batch(schema::SCHEMA).expect("schema");
+        conn.execute_batch("DROP TABLE gaps; CREATE TABLE gaps (x INTEGER);")
+            .expect("replace gaps with a table missing its primary key");
+        let err = schema::migrate(&conn, SCHEMA_VERSION)
+            .expect_err("a column that cannot be added was swallowed");
         assert!(
-            err.to_string().contains("gaps"),
+            err.contains("gaps"),
             "the error does not name the table: {err}"
+        );
+        let stamped: Option<i64> = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .optional()
+            .expect("read version");
+        assert_eq!(
+            stamped, None,
+            "a failed migration still stamped the version"
         );
     }
 

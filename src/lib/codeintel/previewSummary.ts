@@ -215,6 +215,16 @@ export function markerForHonesty(h: PreviewFileHonesty): PreviewMarker {
 }
 
 /**
+ * One formatter for the counts in a glance. `Number.prototype.toLocaleString`
+ * builds a new `Intl.NumberFormat` on every call, which dominated a sidebar of
+ * twenty thousand rows; the formatter is built once and gives the same text.
+ */
+const COUNT_FORMAT = new Intl.NumberFormat();
+function formatCount(value: number): string {
+  return COUNT_FORMAT.format(value);
+}
+
+/**
  * One short phrase saying what this file's preview actually found.
  *
  * The commit composer used to render the report struct field by field —
@@ -250,7 +260,7 @@ export function fileGlance(h: PreviewFileHonesty): string {
   }
   if (!h.delta_available) return "no before/after to compare";
   if (h.broken_total > 0) {
-    const n = h.broken_total.toLocaleString();
+    const n = formatCount(h.broken_total);
     const caller = h.broken_total === 1 ? "caller" : "callers";
     return h.broken_truncated
       ? `at least ${n} ${caller} would break`
@@ -258,11 +268,11 @@ export function fileGlance(h: PreviewFileHonesty): string {
   }
   if (h.walk_incomplete) return "search did not finish — cannot say it is clean";
   if (h.bodies_not_compared > 0) {
-    const n = h.bodies_not_compared.toLocaleString();
+    const n = formatCount(h.bodies_not_compared);
     return `${n} ${h.bodies_not_compared === 1 ? "body" : "bodies"} not compared`;
   }
   if (h.ambiguous_callers > 0) {
-    const n = h.ambiguous_callers.toLocaleString();
+    const n = formatCount(h.ambiguous_callers);
     return `${n} ambiguous ${h.ambiguous_callers === 1 ? "caller" : "callers"}`;
   }
   if (h.claim_clean) return "no callers break";

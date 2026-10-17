@@ -1,11 +1,15 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { isDeferredUnderLoad } from "../async/deferral";
 
 export type ToastKind = "success" | "info" | "warning" | "error";
 
 export interface ToastAction {
   label: string;
-  onClick: () => void | Promise<void>;
+  /**
+   * Resolving `false` says the action did not complete: the toast stays so the
+   * user can try again. Anything else dismisses it.
+   */
+  onClick: () => void | boolean | Promise<void | boolean>;
 }
 
 export interface ToastItem {
@@ -91,15 +95,16 @@ function createToastStore() {
     update((toasts) => {
       const next = [...toasts, item];
       if (next.length > MAX_TOASTS) {
-        const oldest = next[0];
-        if (oldest) {
-          const t = timers.get(oldest.id);
-          if (t) {
-            clearTimeout(t);
-            timers.delete(oldest.id);
-          }
+        // An error is sticky and the reader has not dismissed it: it is the
+        // last thing evicted, only when nothing else is left to drop.
+        const evicted = next.find((t) => t.kind !== "error") ?? next[0];
+        const t = timers.get(evicted.id);
+        if (t) {
+          clearTimeout(t);
+          timers.delete(evicted.id);
         }
-        return next.slice(next.length - MAX_TOASTS);
+        paused.delete(evicted.id);
+        return next.filter((candidate) => candidate !== evicted);
       }
       return next;
     });
@@ -112,6 +117,21 @@ function createToastStore() {
     }
 
     return id;
+  }
+
+  /**
+   * Gives a toast its full duration again, counted from now. An offer whose
+   * action failed (an Undo that could not restore) has to stay reachable for
+   * as long as a fresh one would, not for whatever was left of its clock.
+   */
+  function restart(id: string) {
+    const duration = get({ subscribe }).find((t) => t.id === id)?.duration ?? 0;
+    if (duration <= 0) return;
+    const timer = timers.get(id);
+    if (timer) clearTimeout(timer);
+    // Frozen while the user is on the stack: resumeAll restarts it.
+    if (paused.has(id)) return;
+    timers.set(id, setTimeout(() => dismiss(id), duration));
   }
 
   function clear() {
@@ -160,10 +180,11 @@ function createToastStore() {
     subscribe,
     add,
     dismiss,
+    restart,
     clear,
     pauseAll,
     resumeAll,
-    action: (message: string, actionLabel: string, onClick: () => void | Promise<void>, duration?: number) =>
+    action: (message: string, actionLabel: string, onClick: ToastAction["onClick"], duration?: number) =>
       add({ kind: "info", message, action: { label: actionLabel, onClick }, duration }),
     success: (message: string, action?: ToastAction, duration?: number) =>
       add({ kind: "success", message, action, duration }),

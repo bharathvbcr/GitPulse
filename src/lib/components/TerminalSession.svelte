@@ -69,6 +69,7 @@
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
+  import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
   import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
   import { get } from "svelte/store";
@@ -77,18 +78,20 @@
   import { themeStore } from "../stores/themeStore";
   import { formatError } from "../ui/formatError";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
-  import { terminalDeadline } from "../terminal/inputQueue";
-  import { parseTerminalContext, type TerminalContext } from "../terminal/sessionContext";
+  import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
+  import { isProvablyIdle, parseTerminalContext, readSessionContext, type ContextRead } from "../terminal/sessionContext";
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
-  import { createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs } from "../terminal/launchRequests";
+  import { conversationForStart, hostedClaude, resumers, settleConversation, type ExitFacts, type ResumeOutcome } from "../terminal/hostedClaude";
+  import { checkTranscripts } from "../terminal/transcripts";
   import {
     effectiveMode,
     PERMISSION_LABELS,
@@ -96,8 +99,18 @@
     type PermissionMode,
   } from "../terminal/agentDefaults";
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
-  import { terminalAttendance } from "../stores/sessionAlertsStore";
+  import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
   import { sessionActivity } from "../terminal/sessionActivity";
+  import { createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
+  import { createFrameProbe, FRAME_PROBE_OSC, handleFrameProbeCommand } from "../diagnostics/frameProbe";
+  import {
+    clipEndedTail,
+    endedTail,
+    forgetEndedTail,
+    releaseEndedScrollback,
+    rememberEndedTail,
+    shouldReleaseEndedBuffer,
+  } from "../terminal/endedBuffer";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -108,8 +121,10 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
+  import { keepDetached, listingFamily, parseListing } from "../terminal/detachedSessions";
   import {
-    clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
+    clampTerminalFontSize, hasRenderedBox, macLineEditing, macOptionOptions, spawnGridSize, terminalScrollbackFor,
+    terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
     SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
   } from "../terminal/viewControls";
@@ -230,6 +245,8 @@
   let awaitingAcknowledgement = $state(false);
   let container = $state<HTMLDivElement | null>(null);
   let warning = $state<string | null>(null);
+  /** Typing is queued behind a send the host has not answered; retracts itself, separate from `warning`. */
+  let slowInput = $state<string | null>(null);
   let shellPath = $state("");
   /** Absolute directory the current process started in, as the backend reported it. */
   let startedIn = $state("");
@@ -247,9 +264,16 @@
   /** What the pointer is currently over, shown in the footer so the target is
    * readable before the click rather than only after it. */
   let hoveredLink = $state<string | null>(null);
+  /** Set once xterm is open in its container; a renderer can only attach after. */
+  let opened = $state(false);
+  /** How this session draws now; on the container as `data-renderer`. */
+  let renderer = $state<GpuState>("dom");
 
   /** Non-reactive handles: observers and the emulator must not tear down with runes. */
   let term: XTerm | null = null;
+  let gpu: GpuRenderer | null = null;
+  /** Frame pacing on request from the program in this terminal (OSC 7700). */
+  const frameProbe = createFrameProbe();
   let fitAddon: FitAddon | null = null;
   let searchAddon: SearchAddon | null = null;
   let searchKey: string | null = null;
@@ -379,6 +403,11 @@
     return action.reason;
   }
 
+  /** Rows of history this session keeps: its kind's setting, see `terminalScrollbackFor`. */
+  function sessionScrollback(): number {
+    return terminalScrollbackFor({ launcher, taskRunId }, get(interfaceStore));
+  }
+
   function ensureTerm(): XTerm | null {
     if (term) return term;
     const created = new XTerm({
@@ -386,17 +415,19 @@
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
       fontSize,
       lineHeight: 1.15,
+      ...macOptionOptions(get(hostPlatform).os, get(interfaceStore).terminalOptionAsMeta),
       // The official search addon uses xterm's proposed decoration API.
       allowProposedApi: true,
       cursorBlink: true,
       convertEol: false,
       theme: termTheme(),
       // Required before `open()` for a non-opaque background, and not
-      // changeable afterwards. Its documented cost is the texture-atlas
-      // renderers; this terminal loads fit/search addons, so the DOM renderer
-      // draws the background as a plain CSS colour.
+      // changeable afterwards. Its documented cost falls on the texture-atlas
+      // renderer, which an on-screen session now uses (`gpuRenderer.ts`); the
+      // DOM renderer a hidden or lost session falls back to draws the
+      // background as a plain CSS colour.
       allowTransparency: true,
-      scrollback: 5000,
+      scrollback: sessionScrollback(),
       screenReaderMode: get(interfaceStore).terminalScreenReader,
       /**
        * OSC 8 hyperlinks — the ones a program embeds in its own output.
@@ -462,11 +493,21 @@
         else console.debug("[gitpulse-terminal]", line);
       }
       // The reader answering whatever the agent last asked; xterm's own
-      // replies (focus, cursor reports) are told apart inside.
-      if (nativeSessionId) sessionActivity.input(nativeSessionId, data);
+      // replies (focus, cursor reports) are told apart inside. When something
+      // stood, the notifier is told too, or it would replay the question and
+      // leave its banner up.
+      if (nativeSessionId && sessionActivity.input(nativeSessionId, data)) reportAttentionAnswered(nativeSessionId);
       lifecycle?.write(data);
     });
     created.onBinary((data) => { lifecycle?.write(data, true); });
+    // The renderer benches (scripts/tui-redraw-bench.mjs) ask for frame
+    // pacing from inside the session. The answer goes back as the terminal's
+    // own reply, not as typing; see diagnostics/frameProbe.ts.
+    created.parser.registerOscHandler(FRAME_PROBE_OSC, (payload) => {
+      const reply = handleFrameProbeCommand(frameProbe, payload);
+      if (reply) created.input(reply, false);
+      return true;
+    });
     created.onResize(({ cols, rows }) => {
       lifecycle?.resize(rows, cols);
     });
@@ -491,11 +532,20 @@
     return term;
   }
 
-  function acknowledgeOutput(sessionId: string, bytes: number) {
-    if (bytes <= 0) return;
+  /**
+   * Released credit is owed here and sent once per frame (or at once past
+   * `ACK_FLUSH_THRESHOLD`), not as one IPC call per 4 KiB chunk. Teardown
+   * flushes it synchronously.
+   */
+  const acks = createAckCoalescer((sessionId, bytes) => {
     void invoke("cmd_terminal_ack", { sessionId, bytes }).catch((err: unknown) => {
       if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`, true);
     });
+  });
+
+  function acknowledgeOutput(sessionId: string, bytes: number) {
+    if (bytes <= 0) return;
+    acks.add(sessionId, bytes);
   }
 
   function paintOutput(token: PaintToken) {
@@ -561,8 +611,100 @@
     return effectiveMode(view.defaults, launcher, view.launchers);
   }
 
+  /**
+   * The Claude Code conversation this tab's process runs, when it is one
+   * GitPulse can name: a fresh launch carries a `--session-id` GitPulse chose,
+   * a resumed one the id it resumes. Null for a shell, a task attempt (whose
+   * id the backend assigns) and a `--continue` launch.
+   */
+  let hostedId: string | null = null;
+  /**
+   * The process running `hostedId` has started and not been seen to end. A
+   * view going away while it runs leaves the record (the process is kept, and
+   * the next tab to show it finds the record by its PTY).
+   */
+  let hostedLive = false;
+  /**
+   * Why a conversation a signal ended is not offered: its transcript is not
+   * there, or could not be checked. Shown in place of Resume.
+   */
+  let transcriptNote = $state<string | null>(null);
+  /** Set to relaunch the conversation a signal ended; consumed by the next spawn. */
+  let resumeOverride: string | null = null;
+  /** The conversation a signal ended in this tab, which Resume relaunches. */
+  let resumeOffer = $state<string | null>(null);
+  /** The dead PTY the offer was registered under for an incident's "Resume N". */
+  let offerTerminal: string | null = null;
+
+  function withdrawOffer() {
+    if (offerTerminal) resumers.unregister(offerTerminal);
+    offerTerminal = null;
+    resumeOffer = null;
+    transcriptNote = null;
+  }
+
+  /**
+   * What the end of this tab's process does to its conversation's record
+   * (`settleConversation`, the one decision every place that sees the end
+   * shares). An end from outside keeps the record and, once Claude Code's
+   * transcript of it is found, offers Resume here and to an incident's
+   * "Resume N". Absent offers nothing; Unknown says it could not check.
+   */
+  function settleHosted(end: ExitFacts | "closed", terminalId: string | null) {
+    const conversation = hostedId;
+    hostedLive = false;
+    if (!conversation) return;
+    if (!settleConversation(hostedClaude, conversation, end) || !terminalId) return;
+    void checkTranscripts([conversation]).then((answers) => {
+      // A restart, a new process or this view going away while the check ran:
+      // the offer belongs to a session that is no longer this tab's.
+      if (disposed || hostedId !== conversation || nativeSessionId !== terminalId || hostedLive) return;
+      const answer = answers.get(conversation) ?? { state: "unknown" as const, reason: "no answer" };
+      if (answer.state === "found") {
+        resumeOffer = conversation;
+        offerTerminal = terminalId;
+        resumers.register(terminalId, resumeEnded);
+      } else if (answer.state === "absent") {
+        transcriptNote = "Claude Code saved no conversation for this session, so there is nothing to resume.";
+        hostedClaude.forget(conversation);
+      } else {
+        transcriptNote = `Could not check whether Claude Code saved this conversation: ${answer.reason ?? "unknown"}`;
+      }
+    });
+  }
+
+  /**
+   * Relaunches the conversation a signal ended, in this tab: the same
+   * directory and permission mode (this tab's own, read once at mount), by
+   * the same `--resume <id>` launch a resumed attempt uses.
+   */
+  async function resumeEnded(): Promise<ResumeOutcome> {
+    const id = resumeOffer;
+    if (!id || disposed || !lifecycle) return "failed";
+    withdrawOffer();
+    resumeOverride = id;
+    return lifecycle.restart();
+  }
+
   /** The session this tab is still to take over, until its first start. */
   let attachPending: string | null = untrack(() => attachSessionId ?? null);
+
+  /**
+   * Runs a command that starts or takes over a session with that session's
+   * own output channel, opened first so nothing it prints before the id comes
+   * back is missed, and tells the bus whose channel it is once the id is known.
+   */
+  async function withOutput(run: (channel: object) => Promise<TerminalSpawned>): Promise<TerminalSpawned> {
+    const output = ptyBus.openOutput();
+    try {
+      const spawned = await run(output.channel);
+      output.bind(spawned.id);
+      return spawned;
+    } catch (error) {
+      output.release();
+      throw error;
+    }
+  }
 
   function createLifecycle() {
     return createSessionLifecycle({
@@ -581,15 +723,32 @@
           const cfg = launcherConfig(launcher);
           // Once: a later restart of this tab starts a fresh process the
           // ordinary way, because the session it took over has ended.
-          if (attachPending) {
-            const sessionId = attachPending;
-            attachPending = null;
-            return invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols });
+          const attachTo = attachPending;
+          attachPending = null;
+          const resumeId = resumeOverride;
+          resumeOverride = null;
+          hostedId = null;
+          // A conversation GitPulse can name is one it can resume. A fresh
+          // Claude launch is given an id and a resumed one keeps its own; a
+          // takeover keeps whatever is on record for its PTY and records
+          // nothing (`conversationForStart`). A task attempt's run id is its
+          // session id, assigned by the backend.
+          if (launcher === "claude" && !taskRunId) {
+            const decided = conversationForStart(hostedClaude, {
+              attach: attachTo, resumeId, args: cfg.args,
+              record: { repoPath: workPath, startDir: startDir ?? null, mode: permissionMode, startedAt: Date.now() },
+            });
+            cfg.args = decided.args;
+            hostedId = decided.sessionId;
           }
-          if (taskRunId) return invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
+          if (attachTo) {
+            return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId: attachTo, rows, cols, onOutput }));
+          }
+          if (taskRunId) return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
             input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),
-          });
-          return invoke<TerminalSpawned>("cmd_terminal_spawn", {
+            onOutput,
+          }));
+          return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_spawn", {
             repoPath: workPath, rows, cols,
             program: cfg.program, args: cfg.args,
             startDir: startDir ?? null,
@@ -599,15 +758,35 @@
             // this unconditionally would fail on the next ordinary launch
             // rather than wait to matter.
             acknowledged: requiresAcknowledgement(permissionMode) ? acknowledgedBypass : false,
-          });
+            onOutput,
+          }));
         },
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
         resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
         kill: (sessionId) => invoke("cmd_terminal_kill", { sessionId }),
+        detach: (sessionId) => invoke<boolean>("cmd_terminal_detach", { sessionId }),
+      },
+      // Only a plain shell positively at its prompt may end with its view.
+      // An agent, a running job, or a context that cannot be read is kept.
+      idle: async (sessionId) => {
+        if (launcher !== "shell") return false;
+        const context = parseTerminalContext(await invoke<unknown>("cmd_terminal_context", { sessionId }));
+        // `busy` is only the foreground; a `cmd &` or a `^Z`'d editor is a job too.
+        return context !== null && isProvablyIdle(context);
+      },
+      // Listed in Sessions, where it can be shown again or stopped. Looked up
+      // while this tab still holds the slot, which it then hands over.
+      keep: async (sessionId) => {
+        const raw = await invoke<unknown>("cmd_terminal_sessions");
+        const listing = Array.isArray(raw) ? raw.map(parseListing).find((row) => row?.id === sessionId) ?? null : null;
+        if (!listing) return null;
+        const family = await listingFamily(listing, (repo) => repoStore.familyOf(repo));
+        return (slot) => keepDetached({ ...listing, detached: true }, slot, { family });
       },
       hooks: {
         state(status, message) {
           spawning = status === "starting";
+          if (spawning) withdrawOffer();
           exited = status === "exited";
           error = status === "error" ? message ?? "Terminal failed" : null;
           onStatus(status);
@@ -622,6 +801,10 @@
           // left behind it pushes the live one out of the bounded report.
           if (nativeSessionId && nativeSessionId !== spawned.id) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
           nativeSessionId = spawned.id;
+          if (hostedId) {
+            hostedClaude.bind(hostedId, spawned.id);
+            hostedLive = true;
+          }
           terminalAttendance.report(nativeSessionId, onscreen);
           startedIn = spawned.cwd;
           // A session taken over after a reload was already recorded as
@@ -636,8 +819,8 @@
           // search box. The shell can wait for focus; their word cannot.
           if (active && !isEditingElsewhere(document.activeElement, container)) reveal();
         },
-        output(b64, sessionId, reserved) {
-          const decision = planTerminalOutput(credit, b64, sessionId, reserved ?? null, {
+        output(bytes, sessionId) {
+          const decision = planTerminalOutput(credit, bytes, sessionId, {
             terminal: term !== null && !disposed,
             disposed,
           });
@@ -648,18 +831,23 @@
           } else if (decision.action === "overflow") {
             for (const owed of decision.owed) acknowledgeOutput(owed.sessionId, owed.bytes);
             lifecycle?.fail(decision.failure, true);
-          } else if (decision.action === "stop") {
-            void lifecycle?.stop(decision.failure);
           }
-          if (decision.action !== "stop" && !disposed) {
+          if (!disposed) {
             sessionActivity.output(sessionId);
             if (!active) onActivity();
           }
         },
         exit(event) {
+          // GitPulse's own Close does reach here when its exit event lands
+          // before the close is acknowledged, and it says so
+          // (`ended_by_gitpulse`): only a signal from outside leaves a
+          // conversation to offer back, and only one Claude Code saved.
+          settleHosted(event, event.id);
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
           term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
         },
+        // The close was acknowledged; its exit event may not come at all.
+        closed() { settleHosted("closed", null); },
         reset() {
           return new Promise<void>((resolve) => {
             if (!term || disposed) { resolve(); return; }
@@ -670,6 +858,11 @@
           });
         },
         warning(message) { warning = message; },
+        slow(message) { slowInput = message; },
+        // CAN aborts any escape, OSC or DCS sequence the gap cut short, and
+        // does nothing at all on the ground state. Queued behind what was
+        // painted, ahead of what the resumed stream sends.
+        skipped() { if (term && !disposed) term.write("\x18"); },
         admitted() { onAdmitted?.(); },
         refused(message) { return onRefused?.(message) ?? false; },
       },
@@ -729,6 +922,13 @@
   }
 
   export function restart() { void lifecycle?.restart(); }
+
+  /**
+   * The user's Close: ends the process. Called before the tab is dropped, so
+   * the unmount that follows has nothing left to keep. Rejects when the
+   * process could not be stopped; the tab then stays, with its retry.
+   */
+  export async function close(): Promise<void> { await lifecycle?.close(); }
 
   /**
    * The attempt this tab belongs to: its own, or the one a resumed
@@ -835,19 +1035,18 @@
   }
 
   /**
-   * What this session is running and where, or null when it has no live
-   * process or the answer is malformed. Bounded: a stuck query must not hold
-   * up the close or the new tab that asked.
+   * What this session is running and where. Bounded (CONTEXT_READ_MS, whose
+   * reason is in `inputQueue.ts`): a stuck query must not hold up the close or
+   * the new tab that asked. The answer keeps "could not tell" apart from
+   * "nothing is running" (see `ContextRead`); the decision logic is in
+   * `readSessionContext`, which this only feeds the tab's own state.
    */
-  export async function readContext(): Promise<TerminalContext | null> {
+  export function readContext(): Promise<ContextRead> {
     const sessionId = nativeSessionId;
-    if (!sessionId || !lifecycle?.isCurrent(sessionId)) return null;
-    try {
-      const raw = await terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId }), 1500, "Reading terminal context");
-      return parseTerminalContext(raw);
-    } catch {
-      return null;
-    }
+    return readSessionContext(
+      { sessionId, current: Boolean(sessionId && lifecycle?.isCurrent(sessionId)), spawning, exited },
+      (id) => terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId: id }), CONTEXT_READ_MS, "Reading terminal context"),
+    );
   }
 
   function setFontSize(size: number) {
@@ -928,6 +1127,13 @@
     const onHelperBlur = () => eraseGuard.reset();
     let observedHelper: HTMLTextAreaElement | null = null;
     /**
+     * The canvas reports a lost context the moment it happens. The addon's own
+     * `onContextLoss` waits three seconds for a restore first, with a blank
+     * canvas on screen meanwhile; this falls back to the DOM renderer at once.
+     * Captured on the host because the event does not bubble.
+     */
+    const onContextLost = () => gpu?.lose();
+    /**
      * Every paste goes through `planPaste`: bracketed-paste markers inside the
      * clipboard are removed, and a paste that would run before it is read asks
      * first. Ahead of xterm's own listeners, which never strip the markers.
@@ -1002,8 +1208,20 @@
       // reaches xterm, including the keyCode 229 path that resends the textarea.
       for (const type of ERASE_CAPTURE_EVENTS) host.addEventListener(type, onEraseCapture, true);
       host.addEventListener("paste", onPasteCapture, true);
+      host.addEventListener("webglcontextlost", onContextLost, true);
       const t = ensureTerm();
       t?.open(host);
+      if (t) {
+        gpu = createGpuRenderer({
+          attach: () => {
+            const addon = new WebglAddon();
+            t.loadAddon(addon);
+            return addon;
+          },
+          onChange: (state) => (renderer = state),
+        });
+        opened = true;
+      }
       host.querySelectorAll("textarea.xterm-helper-textarea").forEach((node) => {
         if (node instanceof HTMLTextAreaElement) hardenHelper(node);
       });
@@ -1048,6 +1266,7 @@
       if (host) {
         for (const type of ERASE_CAPTURE_EVENTS) host.removeEventListener(type, onEraseCapture, true);
         host.removeEventListener("paste", onPasteCapture, true);
+        host.removeEventListener("webglcontextlost", onContextLost, true);
       }
       observedHelper?.removeEventListener("keydown", onXtermKeydown, true);
       observedHelper?.removeEventListener("blur", onHelperBlur);
@@ -1055,7 +1274,15 @@
       for (const timer of armTimers) clearTimeout(timer);
       armTimers.clear();
       disposed = true;
+      // Closing the tab is the reader's own end of it, not an incident. A
+      // process still running is kept (`lifecycle.dispose`), and so is its
+      // conversation's record: the tab that shows it next finds it there.
+      withdrawOffer();
+      if (hostedId && !hostedLive) hostedClaude.forget(hostedId);
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
+      // Before `lifecycle` goes: nothing owed waits for a frame this view
+      // will not see, and a failure is still reported against the session.
+      acks.flush();
       if (nativeSessionId) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
       lifecycle?.dispose();
       lifecycle = null;
@@ -1065,6 +1292,10 @@
       stopResize = null;
       themeObserver?.disconnect();
       themeObserver = null;
+      // Before the terminal: the addon gives its slot back to the shared pool.
+      gpu?.dispose();
+      gpu = null;
+      frameProbe.stop();
       term?.dispose();
       term = null;
       fitAddon = null;
@@ -1080,6 +1311,66 @@
   $effect(() => {
     const on = $interfaceStore.terminalScreenReader;
     if (term) term.options.screenReaderMode = on;
+  });
+
+  /** Option as Meta follows its setting on live sessions too (macOS only). */
+  $effect(() => {
+    const options = macOptionOptions(get(hostPlatform).os, $interfaceStore.terminalOptionAsMeta);
+    if (!term) return;
+    term.options.macOptionIsMeta = options.macOptionIsMeta;
+    term.options.macOptionClickForcesSelection = options.macOptionClickForcesSelection;
+  });
+
+  /**
+   * Scrollback follows its setting on live sessions too. Lowering it trims the
+   * oldest rows at once, which is the point of lowering it. A released ended
+   * session sits at this same value (`releaseEndedScrollback`), and raising
+   * it does not bring trimmed rows back.
+   */
+  $effect(() => {
+    const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
+    if (term && term.options.scrollback !== rows) term.options.scrollback = rows;
+  });
+
+  /**
+   * An ended session nobody is looking at does not keep its scrollback.
+   * The last screen stays in the viewport. A plain-text tail is written back
+   * only when that viewport is empty, so it is not appended onto the screen
+   * the trim already kept. A live session, hidden or not, is not touched.
+   * The release restores the scrollback setting once the trim is done; it is
+   * read untracked, so a settings change does not re-run the release.
+   */
+  let endedReleased = false;
+  let endedReplayed = false;
+  $effect(() => {
+    const release = shouldReleaseEndedBuffer(exited ? "exited" : "running", onscreen);
+    const current = term;
+    const id = tabId;
+    if (!current) return;
+    untrack(() => {
+      if (release) {
+        // Once per release. Each call is a real trim, and one made after the
+        // hidden dock was fitted to a sliver would discard the wrapped rows
+        // above that sliver, which reflow back onto the last screen.
+        if (endedReleased) return;
+        const tail = clipEndedTail(retainedOutput());
+        if (tail) rememberEndedTail(id, tail);
+        endedReleased = true;
+        endedReplayed = false;
+        releaseEndedScrollback(current, terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore));
+        return;
+      }
+      if (!endedReleased || endedReplayed) return;
+      endedReplayed = true;
+      endedReleased = false;
+      // A restart or resume cleared the screen on purpose; the old tail is not
+      // this session's output.
+      if (!exited) { forgetEndedTail(id); return; }
+      if (retainedOutput().trim()) return;
+      const tail = endedTail(id);
+      // convertEol is off, and retainedOutput joins lines with a bare \n.
+      if (tail) current.write(tail.replace(/\r?\n/g, "\r\n"));
+    });
   });
 
   /**
@@ -1135,6 +1426,16 @@
     if (!nativeSessionId) return;
     terminalAttendance.report(nativeSessionId, visible);
   });
+
+  /**
+   * WebGL only while attended: the same `onscreen` the notifier is told, so a
+   * hidden tab, a collapsed dock or another repository's dock holds no
+   * context. See `terminal/gpuRenderer.ts` for the cap and the loss rule.
+   */
+  $effect(() => {
+    const want = opened && onscreen && $interfaceStore.terminalGpu;
+    untrack(() => gpu?.sync(want));
+  });
 </script>
 
 <div class="h-full w-full flex flex-col min-h-0 min-w-0">
@@ -1143,6 +1444,9 @@
       <span class="flex-1 min-w-0 truncate" title={warning}>{warning}</span>
       <button type="button" aria-label="Dismiss terminal message" class="gp-icon-btn" onclick={() => (warning = null)}><X size={12} /></button>
     </div>
+  {/if}
+  {#if slowInput}
+    <div role="status" class="shrink-0 text-[11px] text-amber-300 px-3 py-1 border-b border-border/60 truncate" title={slowInput}>{slowInput}</div>
   {/if}
   {#if findOpen}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -1158,10 +1462,15 @@
     </div>
   {/if}
   <div class="flex-1 min-h-0 relative p-2">
+    <!-- `isolate`: xterm stacks its own layers with z-indexes (WebGL's
+         full-size link canvas is z-index 2). Contained here, none of them can
+         rise above the overlays below; uncontained, that canvas took every
+         click meant for "Start this session". -->
     <div
       bind:this={container}
-      class="h-full w-full bg-surface overflow-hidden"
+      class="h-full w-full bg-surface overflow-hidden isolate"
       data-terminal-session
+      data-renderer={renderer}
     ></div>
     {#if scrolledBack}
       <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
@@ -1224,12 +1533,20 @@
           <RotateCw size={12} /> {taskRunId ? "Reconnect attempt" : "Retry"}
         </button>
       {:else if exited}
-        <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
+        <span class="text-textMuted flex-1 text-[11px]">{resumeOffer ? "This session was ended by a signal." : "This session ended."}</span>
         {#if linkedRunId}
           <!-- The task details are where a new attempt starts, so the way
                there is here rather than only named in a tooltip. -->
           <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
             Open task
+          </button>
+        {/if}
+        {#if transcriptNote}
+          <span class="text-textMuted text-[11px]" data-testid="terminal-resume-unavailable">{transcriptNote}</span>
+        {/if}
+        {#if resumeOffer}
+          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title="Relaunch this Claude Code conversation with --resume, in the same directory and permission mode">
+            <RotateCw size={12} /> Resume
           </button>
         {/if}
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Launch a new attempt from the task details." : "Restart this terminal"}>

@@ -20,6 +20,22 @@ const sources = readFileSync(join(here, "AgentSettingSourcesSetting.svelte"), "u
 const session = readFileSync(join(here, "TerminalSession.svelte"), "utf8");
 const modal = readFileSync(join(here, "SettingsModal.svelte"), "utf8");
 
+/**
+ * Markup and script comments removed, repeated until nothing changes: one
+ * pass over `<!<!---->--` leaves a fresh `<!--` behind.
+ */
+function withoutComments(text: string): string {
+  for (let previous = ""; previous !== text; ) {
+    previous = text;
+    text = text.replace(/<!--[\s\S]*?-->|\/\*[\s\S]*?\*\//g, "");
+  }
+  return text;
+}
+
+it("strips a comment whose removal exposes another opener", () => {
+  expect(withoutComments("<!<!---->-- 8 -->a//**/* 8 */b")).toBe("ab");
+});
+
 describe("the two limits: agents running at once, terminal sessions open at once", () => {
   /** The modal's usage of the shared control for one field, attributes and note. */
   const usage = (field: string) => {
@@ -52,7 +68,7 @@ describe("the two limits: agents running at once, terminal sessions open at once
     expect(block).toContain(`fallback={${fallback}}`);
     expect(block).toMatch(new RegExp(`\\{${max}\\}.*\\{${fallback}\\}`, "s"));
     expect(block).not.toMatch(literal);
-    expect(limit.replace(/<!--[\s\S]*?-->|\/\*[\s\S]*?\*\//g, "")).not.toMatch(/\b(128|64|32|8)\b(?![\d.])/);
+    expect(withoutComments(limit)).not.toMatch(/\b(128|64|32|8)\b(?![\d.])/);
   });
 
   it("stores the default as absence and carries every other default through", () => {

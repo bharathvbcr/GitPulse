@@ -188,3 +188,134 @@ fn a_row_from_a_different_extractor_is_replaced_not_carried() {
              not carried forward under an identity nothing checked"
     );
 }
+
+/// Every path the latest generation holds a row for.
+fn latest_paths(store: &Store) -> Vec<String> {
+    let generation = store
+        .latest_generation_id()
+        .expect("latest generation")
+        .expect("a committed generation");
+    store
+        .list_generation_paths(generation)
+        .expect("generation paths")
+}
+
+/// An affected path the write holds no extraction for, and was not told is
+/// deleted, is refused by name rather than committed as a silent delete.
+///
+/// The carry set skips every affected path, and fresh rows are written only
+/// for the extractions in hand, so a path that is affected, absent from the
+/// slice and absent from `deleted_paths` gets neither row: the transaction
+/// used to commit `Ok` and the next generation simply lacked the file, its
+/// symbols gone without a deletion anyone declared. The daemon reached it
+/// through a symlinked directory; `devmap build --affected` reaches it with
+/// any path the scan did not extract.
+#[test]
+fn an_affected_path_with_no_extraction_and_no_deletion_is_refused() {
+    let store = Store::open_in_memory().expect("store");
+    let cold = vec![
+        extract_file("gone.py", "def gone():\n    return 1\n"),
+        extract_file("b.py", "def beta():\n    return 2\n"),
+    ];
+    let first = commit(&store, &cold, GenerationWriteOpts::default()).expect("cold");
+    assert!(
+        latest_paths(&store).contains(&"gone.py".to_string()),
+        "fixture precondition: the previous generation holds gone.py"
+    );
+
+    // gone.py is declared affected, is not in the slice, and is not deleted.
+    let warm = vec![extract_file("b.py", "def beta():\n    return 2\n")];
+    let outcome = commit(
+        &store,
+        &warm,
+        GenerationWriteOpts {
+            affected_paths: vec!["gone.py".into()],
+            deleted_paths: Vec::new(),
+            ..GenerationWriteOpts::default()
+        },
+    );
+    let error = match outcome {
+        Err(error) => error.to_string(),
+        Ok(generation) => panic!(
+            "generation {generation} was committed without gone.py, which was declared \
+             affected but neither extracted nor deleted: {:?}",
+            latest_paths(&store)
+        ),
+    };
+    assert!(
+        error.contains("gone.py") && error.contains("deleted"),
+        "the refusal must name the path and the two ways to account for it: {error}"
+    );
+    assert_eq!(
+        store.latest_generation_id().expect("latest"),
+        Some(first),
+        "the refused write must leave the previous generation as the latest"
+    );
+    assert!(latest_paths(&store).contains(&"gone.py".to_string()));
+
+    // Positive control: the same write, with the deletion declared, commits and
+    // drops exactly that file.
+    commit(
+        &store,
+        &warm,
+        GenerationWriteOpts {
+            affected_paths: vec!["gone.py".into()],
+            deleted_paths: vec!["gone.py".into()],
+            ..GenerationWriteOpts::default()
+        },
+    )
+    .expect("a declared deletion commits");
+    assert_eq!(latest_paths(&store), vec!["b.py".to_string()]);
+}
+
+/// A differential write that would have to carry a stale payload it was not
+/// handed a re-extraction for is still refused.
+///
+/// The refusal above is about affected paths; this one is about unaffected
+/// paths whose stored identity this build cannot reuse. Both exist so a file
+/// never vanishes from the generation without a declared deletion, and the
+/// newer guard must not have displaced the older one.
+#[test]
+fn a_stale_payload_the_caller_did_not_re_extract_is_still_refused() {
+    let store = Store::open_in_memory().expect("store");
+    let first = commit(
+        &store,
+        &tree("def alpha():\n    return 1\n"),
+        GenerationWriteOpts::default(),
+    )
+    .expect("cold");
+    {
+        let conn = lock_conn(&store.conn).expect("connection");
+        let aged = conn
+            .execute(
+                "UPDATE file_payloads SET analyzer_version = 'analyzer-from-another-era'
+                  WHERE payload_id = (
+                        SELECT r.payload_id
+                          FROM generation_file_rows r
+                          JOIN paths p ON p.id = r.file_id
+                         WHERE r.generation_id = 1 AND p.path = 'b.py')",
+                [],
+            )
+            .expect("age the row");
+        assert_eq!(aged, 1, "the aging UPDATE must match exactly one payload");
+    }
+
+    // The daemon's partial shape: only the re-read file is handed over, so the
+    // aged b.py has nothing to replace it.
+    let partial = vec![extract_file("a.py", "def alpha():\n    return 11\n")];
+    let error = commit(
+        &store,
+        &partial,
+        GenerationWriteOpts {
+            affected_paths: vec!["a.py".into()],
+            ..GenerationWriteOpts::default()
+        },
+    )
+    .expect_err("a stale payload with no replacement must be refused, not dropped")
+    .to_string();
+    assert!(
+        error.contains("cannot carry forward") && error.contains("b.py"),
+        "refused for the stale identity, naming the path: {error}"
+    );
+    assert_eq!(store.latest_generation_id().expect("latest"), Some(first));
+}

@@ -29,6 +29,7 @@
 //!   be indistinguishable from one that ran and found nothing.
 
 use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_reader::symbolic_ref_target;
 use crate::engine::git_writer::repo_mutation_lock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -50,6 +51,10 @@ const MAX_LISTED_CONFLICTS: usize = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationKind {
     Merge,
+    /// `git merge --squash` that has staged its changes and not yet committed
+    /// them: git records no `MERGE_HEAD`, only `SQUASH_MSG`. Its only escape
+    /// is `git reset --merge`, because `merge --abort` needs a `MERGE_HEAD`.
+    SquashMerge,
     /// `git rebase` on the merge backend, including every `rebase -i`.
     Rebase,
     /// `git rebase` on the apply backend (`--apply` / older git defaults).
@@ -67,6 +72,7 @@ impl OperationKind {
     pub fn label(self) -> &'static str {
         match self {
             OperationKind::Merge => "merge",
+            OperationKind::SquashMerge => "squash merge",
             OperationKind::Rebase | OperationKind::RebaseApply => "rebase",
             OperationKind::ApplyMailbox => "patch application",
             OperationKind::CherryPick => "cherry-pick",
@@ -78,7 +84,7 @@ impl OperationKind {
     /// The `git` subcommand that owns this operation's recovery verbs.
     fn recovery_subcommand(self) -> &'static str {
         match self {
-            OperationKind::Merge => "merge",
+            OperationKind::Merge | OperationKind::SquashMerge => "merge",
             OperationKind::Rebase | OperationKind::RebaseApply => "rebase",
             OperationKind::ApplyMailbox => "am",
             OperationKind::CherryPick => "cherry-pick",
@@ -121,7 +127,8 @@ pub struct RepoOperation {
     /// Total steps in this operation, when it is a sequence.
     pub total_steps: Option<usize>,
     /// The branch the operation is being applied *to* — the rebased branch's
-    /// own name, or the checked-out branch for a merge. `None` on detached HEAD.
+    /// own name, or the checked-out branch for a merge. `None` on detached HEAD,
+    /// or when reading it failed (`warnings` says so).
     pub head_ref: Option<String>,
     /// What is coming in: the merged branch, the commit being replayed, or the
     /// new base of a rebase. Short and human-facing, never used as argv.
@@ -161,8 +168,14 @@ const PROBE_ORDER: &[&str] = &[
     "rebase-merge",
     "rebase-apply",
     "MERGE_HEAD",
+    "SQUASH_MSG",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
+    // A multi-commit cherry-pick/revert keeps its remaining steps here after a
+    // step is committed, when `CHERRY_PICK_HEAD`/`REVERT_HEAD` are already
+    // gone. It follows them, as in git's own status, and it follows the rebase
+    // and merge probes, so a rebase never reads as a cherry-pick.
+    "sequencer",
     "BISECT_LOG",
 ];
 
@@ -173,8 +186,10 @@ const PROBE_ORDER: &[&str] = &[
 const IDX_REBASE_MERGE: usize = 0;
 const IDX_REBASE_APPLY: usize = 1;
 const IDX_MERGE_HEAD: usize = 2;
-const IDX_CHERRY_PICK_HEAD: usize = 3;
-const IDX_REVERT_HEAD: usize = 4;
+const IDX_SQUASH_MSG: usize = 3;
+const IDX_CHERRY_PICK_HEAD: usize = 4;
+const IDX_REVERT_HEAD: usize = 5;
+const IDX_SEQUENCER: usize = 6;
 
 /// Reports the operation `repo`'s worktree is parked in, or `None` when it is
 /// idle.
@@ -207,6 +222,21 @@ pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
     }))
 }
 
+/// Which operation `repo`'s worktree is parked in, and nothing else about it.
+///
+/// A look at the control files and no more: no process is started, except one
+/// `git diff --cached` when `SQUASH_MSG` is present (a leftover message file
+/// alone is not a parked squash), and none for any other kind. [`detect`] goes
+/// on to name the branch, describe the incoming
+/// commit and list the conflicts, which costs a child each; a caller that
+/// reports only the kind (the insights snapshot, once per worktree) should not
+/// pay for the rest. Same precedence, same classification.
+pub fn detect_kind(repo: &Path) -> Result<Option<OperationKind>, String> {
+    let paths = resolve_control_paths(repo)?;
+    let mut warnings: Vec<String> = Vec::new();
+    Ok(classify(repo, &paths, &mut warnings)?.map(|(kind, _)| kind))
+}
+
 /// Resolves every probe path without starting git.
 ///
 /// This used to be one `git rev-parse --git-path` per probe set — a spawn on
@@ -231,7 +261,7 @@ fn resolve_control_paths(repo: &Path) -> Result<Vec<PathBuf>, String> {
 /// Returns the kind together with the marker directory/file it was found
 /// through, so progress and ref lookups do not re-derive it.
 fn classify<'a>(
-    _repo: &Path,
+    repo: &Path,
     paths: &'a [PathBuf],
     warnings: &mut Vec<String>,
 ) -> Result<Option<(OperationKind, &'a Path)>, String> {
@@ -264,8 +294,21 @@ fn classify<'a>(
                 }
             }
             "MERGE_HEAD" => OperationKind::Merge,
+            // `SQUASH_MSG` outlives a squash that was committed with `-m` or
+            // that staged nothing. It is a parked squash only while the index
+            // still differs from HEAD (staged changes or unmerged entries).
+            "SQUASH_MSG" => {
+                if !squash_is_staged(repo, warnings) {
+                    continue;
+                }
+                OperationKind::SquashMerge
+            }
             "CHERRY_PICK_HEAD" => OperationKind::CherryPick,
             "REVERT_HEAD" => OperationKind::Revert,
+            "sequencer" => match sequencer_kind(path, warnings) {
+                Some(kind) => kind,
+                None => continue,
+            },
             "BISECT_LOG" => OperationKind::Bisect,
             other => {
                 return Err(format!("unhandled operation probe '{other}'"));
@@ -274,6 +317,76 @@ fn classify<'a>(
         return Ok(Some((kind, path)));
     }
     Ok(None)
+}
+
+/// What a `sequencer/` directory is running, from the first step of its
+/// `todo`, as git's own status reads it. `None` when no step is left (no
+/// `todo`, or only comments): git reports nothing in progress then either. A
+/// `todo` that cannot be read, or whose first verb is not one this reader
+/// knows, is still a sequencer git will resume, so it is reported as a
+/// cherry-pick with a warning: a probe that could not tell must not look idle.
+fn sequencer_kind(sequencer: &Path, warnings: &mut Vec<String>) -> Option<OperationKind> {
+    let before = warnings.len();
+    let todo = read_control_head(&sequencer.join("todo"), SEQUENCER_HEAD_BYTES, warnings);
+    let Some((todo, truncated)) = todo else {
+        if warnings.len() > before {
+            warnings.push("sequencer/todo is unreadable; assuming a cherry-pick".into());
+            return Some(OperationKind::CherryPick);
+        }
+        return None;
+    };
+    let first = todo
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(first) = first else {
+        // Nothing but comments in the part that was read: only a todo that was
+        // read whole can be called finished.
+        if truncated {
+            warnings.push(
+                "sequencer/todo has no step in its first 64 KiB; assuming a cherry-pick".into(),
+            );
+            return Some(OperationKind::CherryPick);
+        }
+        return None;
+    };
+    match first.split_whitespace().next() {
+        Some("pick" | "p") => Some(OperationKind::CherryPick),
+        Some("revert") => Some(OperationKind::Revert),
+        other => {
+            warnings.push(format!(
+                "sequencer/todo starts with an unrecognised step ({}); assuming a cherry-pick",
+                other.unwrap_or("")
+            ));
+            Some(OperationKind::CherryPick)
+        }
+    }
+}
+
+/// The warning a squash probe leaves when it could not read the index, so a
+/// caller can tell "a squash is parked" from "could not tell".
+pub(crate) const SQUASH_READ_FAILURE: &str = "could not tell whether a squash is staged";
+
+/// Whether the index differs from HEAD, which is what makes a `SQUASH_MSG` a
+/// squash waiting to be committed. A read that could not be made counts as
+/// staged, with a warning: an unreadable index must not read as idle.
+fn squash_is_staged(repo: &Path, warnings: &mut Vec<String>) -> bool {
+    match crate::engine::git_cli::git_captured(repo, &["diff", "--cached", "--quiet"]) {
+        Ok(run) if run.success => false,
+        Ok(run) if run.status_code == 1 => true,
+        Ok(run) => {
+            warnings.push(format!(
+                "{SQUASH_READ_FAILURE} (git exit {}): {}",
+                run.status_code,
+                String::from_utf8_lossy(&run.stderr).trim()
+            ));
+            true
+        }
+        Err(err) => {
+            warnings.push(format!("{SQUASH_READ_FAILURE}: {err}"));
+            true
+        }
+    }
 }
 
 /// Reads a bounded control file, folding "absent" into `None` and a genuine
@@ -302,6 +415,42 @@ fn read_control(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             warnings.push(format!("cannot stat {}: {err}", path.display()));
+            None
+        }
+    }
+}
+
+/// How much of a sequencer `todo` is read to name the operation. The first
+/// step is at the head of the file, so a todo past
+/// [`MAX_CONTROL_FILE_BYTES`] still says what it is without being read whole.
+const SEQUENCER_HEAD_BYTES: u64 = 64 * 1024;
+
+/// Reads at most the first `limit` bytes of a control file. Absent is `None`
+/// without a warning; any other failure is `None` with one. A file longer than
+/// `limit` is truncated, which is the point: the caller wants its head.
+fn read_control_head(
+    path: &Path,
+    limit: u64,
+    warnings: &mut Vec<String>,
+) -> Option<(String, bool)> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warnings.push(format!("cannot read {}: {err}", path.display()));
+            return None;
+        }
+    };
+    let mut bytes = Vec::new();
+    match file.take(limit + 1).read_to_end(&mut bytes) {
+        Ok(_) => {
+            let truncated = bytes.len() as u64 > limit;
+            bytes.truncate(limit as usize);
+            Some((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+        }
+        Err(err) => {
+            warnings.push(format!("cannot read {}: {err}", path.display()));
             None
         }
     }
@@ -371,18 +520,14 @@ fn progress(
             }
             (Some(done + 1), Some(total))
         }
-        OperationKind::Merge | OperationKind::Bisect => (None, None),
+        OperationKind::Merge | OperationKind::SquashMerge | OperationKind::Bisect => (None, None),
     }
 }
 
-/// The sequencer lives beside the other control files in the same git dir.
-/// Derived from a probe path rather than re-invoking `rev-parse`.
+/// The sequencer lives beside the other control files in the same git dir; its
+/// path is one of the probe paths, so nothing re-invokes `rev-parse`.
 fn sequencer_dir(paths: &[PathBuf]) -> PathBuf {
-    let cherry_pick_head = &paths[IDX_CHERRY_PICK_HEAD];
-    cherry_pick_head
-        .parent()
-        .map(|dir| dir.join("sequencer"))
-        .unwrap_or_else(|| PathBuf::from("sequencer"))
+    paths[IDX_SEQUENCER].clone()
 }
 
 /// Strips a full ref name down to what a person would call it.
@@ -421,11 +566,18 @@ fn head_ref_for(
         }
     }
     // Not a rebase (or head-name unreadable): ask for the live branch.
-    // `symbolic-ref --quiet` exits non-zero on a detached HEAD, which is a
-    // legitimate answer of "no branch", not a failure worth warning about.
-    let raw = git_text(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok()?;
-    let name = short_ref(&raw);
-    (!name.is_empty()).then_some(name)
+    // A detached HEAD is a legitimate answer of "no branch" (`Ok(None)`); a
+    // read that failed is a degraded field and is reported in `warnings`, so
+    // the label never presents an unreadable HEAD as a detached one.
+    match symbolic_ref_target(repo, "HEAD") {
+        Ok(target) => target
+            .map(|raw| short_ref(&raw))
+            .filter(|name| !name.is_empty()),
+        Err(err) => {
+            warnings.push(format!("cannot read the checked-out branch: {err}"));
+            None
+        }
+    }
 }
 
 /// What is being brought in by the parked step.
@@ -464,6 +616,15 @@ fn incoming_ref_for(
             .and_then(|raw| describe_oid(repo, raw.trim())),
         OperationKind::Revert => read_control(&paths[IDX_REVERT_HEAD], warnings)
             .and_then(|raw| describe_oid(repo, raw.trim())),
+        // SQUASH_MSG lists the squashed commits, newest first; the first
+        // names what was brought in.
+        OperationKind::SquashMerge => {
+            read_control(&paths[IDX_SQUASH_MSG], warnings).and_then(|raw| {
+                raw.lines()
+                    .find_map(|line| line.strip_prefix("commit "))
+                    .and_then(|oid| describe_oid(repo, oid))
+            })
+        }
         OperationKind::Bisect => None,
     }
 }
@@ -484,19 +645,26 @@ fn describe_oid(repo: &Path, oid: &str) -> Option<String> {
         .or_else(|| Some(oid.chars().take(7).collect()))
 }
 
-/// Unmerged index entries, bounded.
+/// Unmerged index entries, capped at [`MAX_LISTED_CONFLICTS`], with the true
+/// total beside them. A listing that could not be read is an error, never an
+/// empty list. A rename-only conflict has stage entries and no markers, so
+/// the index is read rather than the working tree.
+pub(crate) fn conflicted_paths(repo: &Path) -> Result<(Vec<String>, usize), String> {
+    let raw = git_text(repo, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
+    let all: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
+    let total = all.len();
+    let listed = all
+        .into_iter()
+        .take(MAX_LISTED_CONFLICTS)
+        .map(str::to_string)
+        .collect();
+    Ok((listed, total))
+}
+
+/// [`conflicted_paths`], with a failed listing recorded as a warning.
 fn conflicted_files(repo: &Path, warnings: &mut Vec<String>) -> (Vec<String>, usize) {
-    match git_text(repo, &["diff", "--name-only", "--diff-filter=U", "-z"]) {
-        Ok(raw) => {
-            let all: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
-            let total = all.len();
-            let listed = all
-                .into_iter()
-                .take(MAX_LISTED_CONFLICTS)
-                .map(str::to_string)
-                .collect();
-            (listed, total)
-        }
+    match conflicted_paths(repo) {
+        Ok(found) => found,
         Err(err) => {
             // An unreadable conflict list must not render as "no conflicts",
             // which would offer `continue` on an unresolved tree.
@@ -511,7 +679,7 @@ fn available_actions(kind: OperationKind, conflicted_total: usize) -> Vec<Operat
     match kind {
         // `git merge --continue` refuses while the index has conflicts, and
         // there is no such thing as skipping a merge's single step.
-        OperationKind::Merge => {
+        OperationKind::Merge | OperationKind::SquashMerge => {
             let mut actions = vec![OperationAction::Abort];
             if conflicted_total == 0 {
                 actions.push(OperationAction::Continue);
@@ -545,6 +713,17 @@ pub fn action_argv(kind: OperationKind, action: OperationAction) -> Vec<&'static
     // long-flag form.
     if kind == OperationKind::Bisect {
         return vec!["git", "bisect", "reset"];
+    }
+    // A squash merge records no `MERGE_HEAD`, so `merge --abort` refuses it;
+    // `reset --merge` is what restores the pre-merge tree. Concluding it is a
+    // plain commit, which git takes the message of from `SQUASH_MSG`. It has
+    // no step to skip, so `available_actions` never offers `Skip` and
+    // `run_action_with` refuses it before this is rendered.
+    if kind == OperationKind::SquashMerge {
+        return match action {
+            OperationAction::Continue => vec!["git", "commit", "--no-edit"],
+            OperationAction::Abort | OperationAction::Skip => vec!["git", "reset", "--merge"],
+        };
     }
     let sub = kind.recovery_subcommand();
     match action {
@@ -670,8 +849,203 @@ mod tests {
         assert_eq!(PROBE_ORDER[IDX_REBASE_MERGE], "rebase-merge");
         assert_eq!(PROBE_ORDER[IDX_REBASE_APPLY], "rebase-apply");
         assert_eq!(PROBE_ORDER[IDX_MERGE_HEAD], "MERGE_HEAD");
+        assert_eq!(PROBE_ORDER[IDX_SQUASH_MSG], "SQUASH_MSG");
         assert_eq!(PROBE_ORDER[IDX_CHERRY_PICK_HEAD], "CHERRY_PICK_HEAD");
         assert_eq!(PROBE_ORDER[IDX_REVERT_HEAD], "REVERT_HEAD");
+        assert_eq!(PROBE_ORDER[IDX_SEQUENCER], "sequencer");
+    }
+
+    #[test]
+    fn a_bare_squash_merge_is_a_parked_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| crate::test_support::git_in(repo, args);
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "t@gitpulse.local"]);
+        git(&["config", "user.name", "Tester"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "side"]);
+        std::fs::write(repo.join("b.txt"), "side\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "side"]);
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "--squash", "side"]);
+        crate::test_support::trust_repo(repo);
+        let parked = detect(repo)
+            .unwrap()
+            .expect("a staged squash read as an idle repository");
+        assert_eq!(parked.kind, OperationKind::SquashMerge);
+        assert_eq!(parked.kind.label(), "squash merge");
+        assert_eq!(
+            parked.available,
+            [OperationAction::Abort, OperationAction::Continue]
+        );
+        assert_eq!(
+            action_argv(OperationKind::SquashMerge, OperationAction::Abort),
+            ["git", "reset", "--merge"]
+        );
+
+        // Continuing is a bare commit, and git writes the squash's own message.
+        let continued = action_argv(OperationKind::SquashMerge, OperationAction::Continue);
+        assert_eq!(continued, ["git", "commit", "--no-edit"]);
+        git(&continued[1..]);
+        assert_eq!(detect(repo).unwrap(), None);
+        assert!(
+            git_text(repo, &["log", "-1", "--format=%B"])
+                .unwrap()
+                .contains("Squashed commit"),
+            "the commit did not take SQUASH_MSG"
+        );
+    }
+
+    /// `SQUASH_MSG` outlives a squash committed with `-m`: with the index equal
+    /// to HEAD that is a leftover file, not a parked squash.
+    #[test]
+    fn a_leftover_squash_message_with_a_clean_index_is_idle() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        std::fs::write(
+            root.join(".git/SQUASH_MSG"),
+            "Squashed commit of the following:\n",
+        )
+        .unwrap();
+        assert_eq!(detect_kind(&root).unwrap(), None);
+        assert!(detect(&root).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_parked_squash_is_undone_by_reset_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| crate::test_support::git_in(repo, args);
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "t@gitpulse.local"]);
+        git(&["config", "user.name", "Tester"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "side"]);
+        std::fs::write(repo.join("b.txt"), "side\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "side"]);
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "--squash", "side"]);
+        crate::test_support::trust_repo(repo);
+        let abort = action_argv(OperationKind::SquashMerge, OperationAction::Abort);
+        git(&abort[1..]);
+        assert_eq!(detect(repo).unwrap(), None);
+        assert!(git_text(repo, &["status", "--porcelain"])
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `git cherry-pick A B` that conflicted on A and was resolved with
+    /// `git commit` has no `CHERRY_PICK_HEAD`, but `.git/sequencer` still holds
+    /// B and git still reports the operation as in progress.
+    #[test]
+    fn a_multi_commit_cherry_pick_between_steps_is_still_parked() {
+        let dir = crate::test_support::repo_parked_in_a_sequence(false);
+        let repo = dir.path();
+        assert!(!repo.join(".git/CHERRY_PICK_HEAD").exists());
+        assert_eq!(detect_kind(repo).unwrap(), Some(OperationKind::CherryPick));
+        let parked = detect(repo)
+            .unwrap()
+            .expect("a parked sequence read as idle");
+        assert_eq!(parked.kind, OperationKind::CherryPick);
+        assert!(parked.allows(OperationAction::Continue));
+        assert!(parked.allows(OperationAction::Abort));
+        assert_eq!(parked.total_steps, Some(2));
+
+        let abort = action_argv(OperationKind::CherryPick, OperationAction::Abort);
+        crate::test_support::git_in(repo, &abort[1..]);
+        assert_eq!(detect(repo).unwrap(), None);
+    }
+
+    #[test]
+    fn a_multi_commit_revert_between_steps_is_still_parked() {
+        let dir = crate::test_support::repo_parked_in_a_sequence(true);
+        let repo = dir.path();
+        assert!(!repo.join(".git/REVERT_HEAD").exists());
+        assert_eq!(detect_kind(repo).unwrap(), Some(OperationKind::Revert));
+        let parked = detect(repo)
+            .unwrap()
+            .expect("a parked sequence read as idle");
+        assert_eq!(parked.kind, OperationKind::Revert);
+        assert!(parked.allows(OperationAction::Continue));
+        assert!(parked.allows(OperationAction::Abort));
+
+        let r#continue = action_argv(OperationKind::Revert, OperationAction::Continue);
+        crate::test_support::git_in(repo, &r#continue[1..]);
+        assert_eq!(detect(repo).unwrap(), None, "the sequence finished");
+    }
+
+    #[test]
+    fn an_idle_repository_with_no_sequencer_is_idle() {
+        let dir = crate::test_support::git_repo();
+        crate::test_support::git_in(dir.path(), &["commit", "--allow-empty", "-q", "-m", "base"]);
+        assert_eq!(detect(dir.path()).unwrap(), None);
+        // An empty sequencer directory (no todo) is not an operation: git
+        // itself reports nothing in progress.
+        std::fs::create_dir(dir.path().join(".git/sequencer")).unwrap();
+        assert_eq!(detect(dir.path()).unwrap(), None);
+    }
+
+    /// A rebase keeps the lead even when a sequencer directory sits beside it.
+    #[test]
+    fn a_rebase_outranks_a_sequencer_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = PROBE_ORDER
+            .iter()
+            .map(|probe| dir.path().join(probe))
+            .collect();
+        std::fs::create_dir_all(&paths[IDX_REBASE_MERGE]).unwrap();
+        std::fs::create_dir_all(&paths[IDX_SEQUENCER]).unwrap();
+        std::fs::write(paths[IDX_SEQUENCER].join("todo"), "pick abc one\n").unwrap();
+        let mut warnings = Vec::new();
+        let (kind, _) = classify(dir.path(), &paths, &mut warnings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, OperationKind::Rebase);
+    }
+
+    #[test]
+    fn the_sequencer_todo_names_the_operation_and_an_unreadable_one_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = PROBE_ORDER
+            .iter()
+            .map(|probe| dir.path().join(probe))
+            .collect();
+        let sequencer = &paths[IDX_SEQUENCER];
+        std::fs::create_dir_all(sequencer).unwrap();
+        let todo = sequencer.join("todo");
+        let kind_for = |paths: &[PathBuf]| {
+            let mut warnings = Vec::new();
+            let found = classify(dir.path(), paths, &mut warnings)
+                .unwrap()
+                .map(|(kind, _)| kind);
+            (found, warnings)
+        };
+
+        std::fs::write(&todo, "# comment\n\nrevert abc one\npick def two\n").unwrap();
+        assert_eq!(kind_for(&paths).0, Some(OperationKind::Revert));
+        std::fs::write(&todo, "pick abc one\n").unwrap();
+        assert_eq!(kind_for(&paths).0, Some(OperationKind::CherryPick));
+
+        // Nothing left to run: not an operation.
+        std::fs::write(&todo, "# only comments\n").unwrap();
+        assert_eq!(kind_for(&paths).0, None);
+        std::fs::remove_file(&todo).unwrap();
+        assert_eq!(kind_for(&paths).0, None);
+
+        // A verb this reader does not know is still a sequencer git will
+        // resume: reported, with a warning, never as idle.
+        std::fs::write(&todo, "frobnicate abc one\n").unwrap();
+        let (found, warnings) = kind_for(&paths);
+        assert_eq!(found, Some(OperationKind::CherryPick));
+        assert!(!warnings.is_empty());
     }
 
     #[test]
@@ -922,10 +1296,14 @@ mod tests {
     fn control_paths_match_git_rev_parse() {
         use crate::test_support::git_in;
         let main = crate::test_support::git_repo();
-        let root = main.path().canonicalize().unwrap();
+        // Plain, not `canonicalize`: `linked` is handed to git as an argument,
+        // and git cannot create a worktree at a `\\?\` path.
+        let plain =
+            |path: &std::path::Path| crate::engine::git_cli::canonicalize_plain(path).unwrap();
+        let root = plain(main.path());
         git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
         let holder = tempfile::tempdir().unwrap();
-        let linked = holder.path().canonicalize().unwrap().join("linked");
+        let linked = plain(holder.path()).join("linked");
         git_in(
             &root,
             &[
@@ -938,7 +1316,7 @@ mod tests {
             ],
         );
         let bare_dir = tempfile::tempdir().unwrap();
-        let bare = bare_dir.path().canonicalize().unwrap();
+        let bare = plain(bare_dir.path());
         git_in(&bare, &["init", "--bare", "-q"]);
 
         // Probe files mostly do not exist, so compare through their parent.
@@ -995,4 +1373,93 @@ mod tests {
         let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
         assert!(spawned.is_empty(), "spawned: {spawned:?}");
     }
+
+    /// The kind alone is the kind the full report names, for every probe, and
+    /// is read without starting a process even when an operation is parked.
+    #[test]
+    fn detect_kind_names_what_detect_names_without_a_process() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        assert_eq!(detect_kind(&root).unwrap(), None);
+        let git_dir = root.join(".git");
+        let head = "deadbeef\n";
+        for probe in PROBE_ORDER {
+            let path = git_dir.join(probe);
+            if *probe == "rebase-merge" || *probe == "rebase-apply" {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::write(&path, head).unwrap();
+            }
+            // A leftover SQUASH_MSG is a parked squash only while something is
+            // staged, which is the one answer that costs a process.
+            let allowed = if *probe == "SQUASH_MSG" {
+                std::fs::write(root.join("staged.txt"), "x\n").unwrap();
+                crate::test_support::git_in(&root, &["add", "staged.txt"]);
+                1
+            } else {
+                0
+            };
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let kind = detect_kind(&root).unwrap();
+            assert_eq!(
+                crate::engine::git_cli::spawn_log::spawns_in(&root).len(),
+                before + allowed,
+                "{probe}: reading the kind started the wrong number of processes"
+            );
+            let full = detect(&root).unwrap().map(|op| op.kind);
+            assert!(kind.is_some(), "{probe} was not classified");
+            assert_eq!(kind, full, "{probe}");
+            if *probe == "SQUASH_MSG" {
+                crate::test_support::git_in(&root, &["reset", "-q", "--", "staged.txt"]);
+                std::fs::remove_file(root.join("staged.txt")).unwrap();
+            }
+            std::fs::remove_dir_all(&path)
+                .or_else(|_| std::fs::remove_file(&path))
+                .unwrap();
+        }
+        assert_eq!(detect_kind(&root).unwrap(), None);
+    }
+
+    fn head_ref_of(repo: &Path) -> (Option<String>, Vec<String>) {
+        // A merge reads no control file, so no path is consulted.
+        let paths: Vec<PathBuf> = Vec::new();
+        let mut warnings = Vec::new();
+        let head = head_ref_for(repo, OperationKind::Merge, &paths, &mut warnings);
+        (head, warnings)
+    }
+
+    #[test]
+    fn head_ref_names_the_checked_out_branch_without_warning() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        assert_eq!(head_ref_of(&root), (Some("main".to_string()), Vec::new()));
+    }
+
+    #[test]
+    fn a_detached_head_is_no_branch_and_no_warning() {
+        use crate::test_support::git_in;
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        git_in(&root, &["checkout", "-q", "--detach"]);
+        assert_eq!(head_ref_of(&root), (None, Vec::new()));
+    }
+
+    /// A HEAD that could not be read is not a detached HEAD: the label stays
+    /// empty but the report says the read failed.
+    #[test]
+    fn a_failed_head_read_is_reported_not_taken_for_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (head, warnings) = head_ref_of(dir.path());
+        assert_eq!(head, None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cannot read the checked-out branch"),
+            "{warnings:?}"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "repo_op_adv_tests.rs"]
+mod adv_tests;

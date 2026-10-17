@@ -46,10 +46,11 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import TerminalSession from "./TerminalSession.svelte";
-  import { closeQuestion, startDirFrom } from "../terminal/sessionContext";
+  import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm } from "../stores/modalStore";
   import { openTaskForRun } from "../workbench/taskOpen";
   import { sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
+  import { forgetEndedTail } from "../terminal/endedBuffer";
   import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
@@ -80,11 +81,7 @@
     filterTerminalTabs,
     stepSearchIndex,
   } from "../terminal/tabSearch";
-  import {
-    applyHorizontalScrollDelta,
-    scrollChildIntoHorizontalView,
-    verticalWheelToHorizontalDelta,
-  } from "../dom/overflowHint";
+  import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
@@ -344,15 +341,7 @@
   $effect(() => {
     const scroller = tabScroller;
     if (!scroller) return;
-    const onWheel = (event: WheelEvent) => {
-      const delta = verticalWheelToHorizontalDelta(event);
-      if (delta === null) return;
-      if (scroller.scrollWidth <= scroller.clientWidth + 0.5) return;
-      event.preventDefault();
-      scroller.scrollLeft = applyHorizontalScrollDelta(scroller, delta);
-    };
-    scroller.addEventListener("wheel", onWheel, { passive: false });
-    return () => scroller.removeEventListener("wheel", onWheel);
+    return bindHorizontalWheel(scroller);
   });
 
   /**
@@ -511,8 +500,9 @@
    */
   async function openBeside(launcher: LauncherKind): Promise<boolean> {
     const fromId = tabState.activeId;
-    const context = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : null;
-    const dir = startDirFrom(context ?? null);
+    // An unreadable context offers no directory, so the tab starts at the root.
+    const read = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : undefined;
+    const dir = startDirFrom(read ?? CONTEXT_UNKNOWN);
     if (!newTab(launcher)) return false;
     if (dir && tabState.activeId) tabState = setTabStartDir(tabState, tabState.activeId, dir);
     return true;
@@ -533,8 +523,8 @@
   /**
    * Close, asking first when a job is running in the foreground or the tab's
    * own process is a running agent (see `closeQuestion`). A shell whose
-   * foreground cannot be read closes as it always has: an unknown is not a
-   * reason to interrupt.
+   * foreground cannot be read asks too, and says it could not tell: an
+   * unknown is never read as idle.
    *
    * The tab's × and the chord come through here; the Sessions list asks the
    * same question through the registry's `confirmClose`, so a session in
@@ -545,6 +535,14 @@
     closing.add(id);
     try {
       if (!(await confirmClose(id))) return;
+      // Close ends the process here, explicitly. Dropping the tab only
+      // unmounts it, and an unmount keeps whatever is still running.
+      try {
+        await sessions[id]?.close();
+      } catch (error: unknown) {
+        validationError = formatError(error);
+        return;
+      }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
     } finally {
       closing.delete(id);
@@ -561,7 +559,8 @@
       running: status === "starting" || status === "running",
       taskAttempt: Boolean(tab.taskRunId),
     };
-    const question = closeQuestion((await sessions[id]?.readContext()) ?? null, tabLabel(tab), agent);
+    // A tab with no mounted session to ask is unknown, not idle.
+    const question = closeQuestion((await sessions[id]?.readContext()) ?? CONTEXT_UNKNOWN, tabLabel(tab), agent);
     return !question || (await askConfirm({ ...question, confirmLabel: "Close", destructive: true }));
   }
 
@@ -594,7 +593,10 @@
   });
 
   onDestroy(() => {
-    for (const tab of tabState.tabs) terminalLaunchRequests.forget(tab.id);
+    for (const tab of tabState.tabs) {
+      terminalLaunchRequests.forget(tab.id);
+      forgetEndedTail(tab.id);
+    }
     releaseTaskTerminal(holder);
   });
 
@@ -606,13 +608,16 @@
   }
 
   /**
-   * Closing drops the component, whose teardown kills the shell. Emptying the
+   * Drops the tab. A Close has already ended its process (`requestClose`);
+   * any other teardown leaves a running one detached and listed in Sessions
+   * (`sessionLifecycle` `dispose`). Emptying the
    * strip is allowed and leaves the empty state, which offers a new tab — a
    * terminal that silently respawns what you just closed is worse than one
    * that waits to be asked.
    */
   function dropTab(id: string, keepRequest = false) {
     terminalLaunchRequests.forget(id);
+    forgetEndedTail(id);
     // A tab closed before it took a slot no longer counts against the room
     // this panel leaves for queued starts, and gives up its hold. Closed by
     // the reader, its request goes too — it was still queued, and would

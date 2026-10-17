@@ -96,7 +96,25 @@ OPTIONS:
 OUTPUT:
     One NDJSON object per repository per cycle on stdout:
       {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"skipped_lines\":0,
+       \"rehosted_calls\":0,\"departed_overflow\":0,\"family_unresolved\":false,
+       \"family_unresolved_cycles\":0,
        \"reflog_entries\":7,\"recording\":true,\"error\":\"\",\"elapsed_ms\":42}
+
+    `rehosted_calls` and `departed_overflow` count transcript calls that needed
+    another worktree's transaction (past the per-pass worktree cap, or from
+    removed worktrees past the per-pass bound).
+
+    `family_unresolved` is true when the worktree family could not be listed.
+    For a git checkout the transcript pass is then SKIPPED for the cycle (no row
+    written, no cursor moved; `error` says why) and the next cycle catches up;
+    a directory that is not a git checkout still gets its pass.
+    `family_unresolved_cycles` counts consecutive skipped cycles in this daemon
+    and returns to 0 once the family resolves: a number that only grows is a
+    family that never will.
+
+    `reanchored_from` appears only on the one cycle that took over the ledger of
+    a repository that was moved or renamed: the earlier locations its rows named.
+    The takeover is also a `ledger.reanchor` row in the ledger itself.
 
     `recording` is the ledger's own status. A cycle that recorded nothing
     because the ledger could not be opened is not the same as one that
@@ -104,8 +122,10 @@ OUTPUT:
 
 EXIT:
     0  every cycle completed (or --once completed)
-    1  stdout could not receive a complete report
+    1  stdout could not receive a complete report, or the daemon lock could
+       not be taken
     2  the arguments could not be understood
+    3  another gitpulsed already runs for this profile
 ";
 
 #[derive(Debug, PartialEq)]
@@ -206,7 +226,25 @@ struct CycleReport {
     recorded: i64,
     transcripts: i64,
     skipped_lines: i64,
+    /// Calls hosted past the participant cap, calls from removed worktrees past
+    /// the per-pass bound, and whether the worktree family could not be
+    /// resolved: each says a row may sit differently than a clean pass would
+    /// have put it, so none reads as a clean cycle.
+    rehosted_calls: i64,
+    departed_overflow: i64,
+    family_unresolved: bool,
+    family_unresolved_cycles: i64,
+    /// Earlier locations of this repository a moved or renamed checkout's ledger
+    /// named, taken over by this cycle. Present only on the one cycle that did it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reanchored_from: Vec<String>,
     reflog_entries: i64,
+    /// True when the catch-up deadline stopped the pass early: the counts are
+    /// a floor, and what was not reached is the next cycle's. Carried as its
+    /// own field so a partial pass is not only a substring of `error`.
+    truncated: bool,
+    /// Ledger events the retention policy deleted at the end of this cycle.
+    pruned: i64,
     /// The ledger's own status. A cycle that recorded nothing because the
     /// ledger could not be opened must never read like one that recorded
     /// nothing because nothing happened.
@@ -215,6 +253,48 @@ struct CycleReport {
     /// ledger's error when the ledger is the thing that failed.
     error: String,
     elapsed_ms: u64,
+}
+
+/// Runs one repository's cycle so that a panic in it costs that repository's
+/// cycle, not the daemon. Without this a fault in one of up to 32 repositories
+/// exited the process with 101 and stopped catch-up for all of them, and a
+/// restarted daemon met the same unmoved watermark and the same panic.
+fn guarded_cycle(
+    repo: &str,
+    cycle: u64,
+    run: impl FnOnce(&str, u64) -> CycleReport,
+) -> CycleReport {
+    let started = Instant::now();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(repo, cycle))) {
+        Ok(report) => report,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-text panic".to_string());
+            log::error!(target: "gitpulsed", "catch-up for {repo} panicked: {what}");
+            CycleReport {
+                repo: repo.to_string(),
+                cycle,
+                recorded: 0,
+                transcripts: 0,
+                skipped_lines: 0,
+                rehosted_calls: 0,
+                departed_overflow: 0,
+                family_unresolved: false,
+                family_unresolved_cycles: 0,
+                reanchored_from: Vec::new(),
+                reflog_entries: 0,
+                truncated: false,
+                pruned: 0,
+                // Unknown, so not claimed: the panic may have hit the ledger.
+                recording: false,
+                error: format!("catch-up panicked: {what}"),
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            }
+        }
+    }
 }
 
 fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
@@ -239,7 +319,14 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                rehosted_calls: 0,
+                departed_overflow: 0,
+                family_unresolved: false,
+                family_unresolved_cycles: 0,
+                reanchored_from: Vec::new(),
                 reflog_entries: 0,
+                truncated: false,
+                pruned: 0,
                 recording: false,
                 error: reason,
                 elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -247,15 +334,25 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         }
     };
 
-    let status = ledger::status(&address.anchor);
+    // After the catch-up, not before: catching up is what opens (and so can
+    // create or fail to open) the ledger, so a status read first described the
+    // state the cycle was about to change.
     let caught = ingest::catch_up_into(&address.anchor, &address.worktree);
+    let status = ledger::status(&address.anchor);
     CycleReport {
         repo: repo.to_string(),
         cycle,
         recorded: caught.recorded,
         transcripts: caught.transcripts,
         skipped_lines: caught.skipped_lines,
+        rehosted_calls: caught.rehosted_calls,
+        departed_overflow: caught.departed_overflow,
+        family_unresolved: caught.family_unresolved,
+        family_unresolved_cycles: caught.family_unresolved_cycles,
+        reanchored_from: caught.reanchored_from,
         reflog_entries: caught.reflog_entries,
+        truncated: caught.truncated,
+        pruned: caught.pruned,
         recording: status.recording,
         error: if caught.error.is_empty() {
             status.error
@@ -300,11 +397,40 @@ fn main() {
             gitpulse_lib::procguard::exit(2);
         }
         Parsed::Run(config) => {
+            // One daemon per profile. Held for the process's life; the kernel
+            // drops it when we end, however we end. Refused loudly: two
+            // writers on one ledger duplicate transcript rows, and an old
+            // daemon left over from before an upgrade writes with the old
+            // build's cursors.
+            let _daemon = match gitpulse_lib::daemon_lock::default_dir() {
+                None => {
+                    log::error!(target: "gitpulsed", "application config directory unavailable; cannot take the daemon lock");
+                    gitpulse_lib::procguard::exit(1);
+                }
+                Some(dir) => {
+                    match gitpulse_lib::daemon_lock::acquire(&dir, env!("CARGO_PKG_VERSION")) {
+                        gitpulse_lib::daemon_lock::Acquire::Held(lock) => lock,
+                        gitpulse_lib::daemon_lock::Acquire::Occupied(owner) => {
+                            log::error!(
+                                target: "gitpulsed",
+                                "another gitpulsed already runs for this profile (pid {}, version {}); not starting a second",
+                                owner.pid.map_or("unknown".into(), |pid| pid.to_string()),
+                                owner.version.as_deref().unwrap_or("unknown"),
+                            );
+                            gitpulse_lib::procguard::exit(3);
+                        }
+                        gitpulse_lib::daemon_lock::Acquire::Unavailable(reason) => {
+                            log::error!(target: "gitpulsed", "the daemon lock could not be taken, so nothing runs: {reason}");
+                            gitpulse_lib::procguard::exit(1);
+                        }
+                    }
+                }
+            };
             let mut cycle = 0u64;
             loop {
                 cycle += 1;
                 for repo in &config.repos {
-                    let report = run_cycle(repo, cycle);
+                    let report = guarded_cycle(repo, cycle, run_cycle);
                     match serde_json::to_string(&report) {
                         Ok(line) => write_output(format!("{line}\n").as_bytes()),
                         // Serialising our own struct cannot fail, but a panic
@@ -359,6 +485,53 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    #[test]
+    fn a_panicking_repository_fails_its_own_cycle_and_the_rest_still_run() {
+        let repos = ["/r/first", "/r/broken", "/r/last"];
+        let reports: Vec<CycleReport> = repos
+            .iter()
+            .map(|repo| {
+                guarded_cycle(repo, 3, |repo, cycle| {
+                    if repo.ends_with("broken") {
+                        panic!("index out of bounds in {repo}");
+                    }
+                    CycleReport {
+                        repo: repo.to_string(),
+                        cycle,
+                        recorded: 1,
+                        transcripts: 0,
+                        skipped_lines: 0,
+                        rehosted_calls: 0,
+                        departed_overflow: 0,
+                        family_unresolved: false,
+                        family_unresolved_cycles: 0,
+                        reanchored_from: Vec::new(),
+                        reflog_entries: 0,
+                        truncated: false,
+                        pruned: 0,
+                        recording: true,
+                        error: String::new(),
+                        elapsed_ms: 0,
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(reports.len(), 3, "every repository is reported");
+        assert!(reports[0].error.is_empty() && reports[2].error.is_empty());
+        let broken = &reports[1];
+        assert_eq!((broken.repo.as_str(), broken.cycle), ("/r/broken", 3));
+        assert!(
+            broken.error.contains("panicked") && broken.error.contains("index out of bounds"),
+            "{}",
+            broken.error
+        );
+        assert!(
+            !broken.recording,
+            "a panicked cycle claims nothing about the ledger"
+        );
+        assert_eq!(broken.recorded, 0);
+    }
+
     /// An absolute repository path for the host platform.
     ///
     /// `/a` is absolute on Unix but merely *drive-relative* on Windows, where
@@ -375,18 +548,9 @@ mod tests {
         format!("/{tail}")
     }
 
-    /// Serialises the tests that override the transcript root.
-    ///
-    /// The override is an environment variable, which is process-global: two
-    /// tests setting and clearing it in parallel let one of them run against
-    /// the developer's real `~/.claude/projects`.
-    static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Restores the root even when `f` panics — see `test_env` for the class.
     fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let serial = ROOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serial = crate::test_env::env_serial();
         let _env = crate::test_env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root);
         f()
     }
@@ -684,6 +848,10 @@ mod tests {
             "recorded",
             "transcripts",
             "skipped_lines",
+            "rehosted_calls",
+            "departed_overflow",
+            "family_unresolved",
+            "family_unresolved_cycles",
             "reflog_entries",
             "recording",
             "error",

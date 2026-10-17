@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { RepoChangedPayload, RepoGonePayload } from "./lib/repos/events";
+  import type { RepoChange, RepoChangedPayload, RepoGonePayload } from "./lib/repos/events";
   import { readRepoChange, routeRepoChange } from "./lib/repos/changeScope";
   import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { invoke } from "./lib/ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
-  import { repoStore, pathsTrustedForBackground } from "./lib/stores/repoStore";
+  import { currentRepoPath, repoStore, pathsTrustedForBackground } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";
   import { liveIndex } from "./lib/codeintel/liveIndex";
   import { autoInit } from "./lib/codeintel/autoInit";
@@ -17,6 +17,7 @@
   import { filterStore } from "./lib/stores/filterStore";
   import { interfaceStore } from "./lib/stores/interfaceStore";
   import { toastStore } from "./lib/stores/toastStore";
+  import { watchIncidents } from "./lib/terminal/incidentWatch";
   import { preflightProblem } from "./lib/repos/gitPreflight";
   import { harnessStore } from "./lib/stores/harnessStore";
   import { applyPlatformClass, isMacOS, isTauri } from "./lib/platform";
@@ -36,7 +37,7 @@
   } from "./lib/desktop/nativeShell";
   import { gitActionCount, waitForGitIdle } from "./lib/desktop/exitGuard";
   import { nativeMenuState } from "./lib/desktop/menuStateStore";
-  import { canDispatchMenuEvent } from "./lib/desktop/menuState";
+  import { blockedWhilePrompting, canDispatchMenuEvent } from "./lib/desktop/menuState";
   import { createMenuSync } from "./lib/desktop/menuSync";
   import { createMenuCommands, checkUpdatesFromMenu } from "./lib/desktop/menuCommands";
   import { repoWindowTitle, syncWindowChrome } from "./lib/desktop/windowChrome";
@@ -44,6 +45,7 @@
   import ScrollCue from "./lib/components/ScrollCue.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
+  import RepoPaneRecovery from "./lib/components/RepoPaneRecovery.svelte";
   import InsightsView from "./lib/components/InsightsView.svelte";
   import {
     FOCUS_COMMIT_SEARCH_EVENT,
@@ -164,13 +166,19 @@
   import { applyTabWidth } from "./lib/ui/codeDisplay";
   import { applyReduceMotion } from "./lib/motion/motionPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
-  import { askConfirm } from "./lib/stores/modalStore";
+  import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
+  import { terminalSessions } from "./lib/terminal/sessionRegistry";
+  import { quitRisks } from "./lib/terminal/quitGuard";
+  import { decideQuitTerminals, type QuitTerminals } from "./lib/terminal/quitChoice";
   import {
     hasUnsavedEditorDrafts,
     unsavedEditorDrafts,
   } from "./lib/files/editorDraftRegistry";
   import { editorFileSaveQueue } from "./lib/files/serialSave";
-  import { conflictSessions } from "./lib/diff/conflictSession";
+  // Loaded at startup: it restores recovered conflict drafts into the
+  // unsaved-drafts registry, and registers its own quit flush.
+  import "./lib/diff/conflictSession";
+  import { flushPendingWrites } from "./lib/async/deferredWrite";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
@@ -215,8 +223,6 @@
   });
   let dropActive = $state(false);
   let headerScroller: HTMLDivElement | undefined = $state();
-  /** Repo path the modal-close effect last saw; poll-tick emissions skip. */
-  let lastModalRepoPath: string | null = null;
   const macos = isMacOS();
 
   // --- terminal dock --------------------------------------------------------
@@ -224,9 +230,11 @@
   // PTY has to survive a view switch, so this pane was already mounted once
   // and hidden thereafter — a page you could never leave without closing.
   // TerminalDock owns the mount-once-keep-mounted rule, including across
-  // repository tabs (one panel per visited tab). The {#key currentPath}
-  // around the git UI remounts Sidebar/views/StatusBar; the dock sits
-  // outside that key so a tab switch cannot kill the shell.
+  // repository tabs (one panel per visited tab). Sidebar and StatusBar are
+  // not remounted on a tab switch (they reset their per-repository state in
+  // place, see repoScope) and the view panels are keyed per repository inside
+  // ViewSectionPanel; the dock sits outside every such key so a tab switch
+  // cannot kill the shell.
   // Per repository tab, not per workspace: opening a shell in one repository
   // used to open the dock over every other repository the user switched to,
   // and — because hosting a panel starts a shell — spawn a process in each.
@@ -256,8 +264,9 @@
   // looked away had nothing to report and nothing to copy. Diagnostics already
   // captures uncaught errors, rejections and console output; a store error is
   // the same class of event and belongs in the same log.
+  const repoError = $derived($repoStore.error);
   $effect(() => {
-    const err = $repoStore.error;
+    const err = repoError;
     if (err) {
       untrack(() => {
         diagnostics.error("repo:operation", err);
@@ -306,12 +315,15 @@
     };
   });
 
+  const activeView = $derived($repoStore.activeTab);
+  const activeSection = $derived(activeSectionFor($repoStore.activeTab, $repoStore.viewSections));
+  const selectedFilePath = $derived($repoStore.selectedFilePath);
   $effect(() => {
     paneCrashes.observe({
-      view: $repoStore.activeTab,
-      section: activeSectionFor($repoStore.activeTab, $repoStore.viewSections),
-      repo: $repoStore.currentPath,
-      file: $repoStore.selectedFilePath,
+      view: activeView,
+      section: activeSection,
+      repo: $currentRepoPath,
+      file: selectedFilePath,
     });
   });
 
@@ -337,17 +349,56 @@
   let exitRequestPending = false;
   let exitApproved = false;
 
+  // The native side holds a quit until this page answers it: "seen" at once,
+  // so a page that is alive is never mistaken for a dead one, then either
+  // `cmd_exit_app` or "cancel". A request that is never cancelled holds a
+  // macOS logout open, so every way out of the confirmation below says so.
+  function cancelNativeExitRequest() {
+    exitRequestPending = false;
+    void invoke("cmd_exit_request_answer", { answer: "cancel" }).catch((error) =>
+      diagnostics.warn("desktop:exit-cancel", error),
+    );
+  }
+
   async function answerNativeExitRequest() {
+    // A repeat while one is open: the native side holds it without a second
+    // request, so this answers nothing and must not cancel the first.
     if (exitRequestPending) return;
     exitRequestPending = true;
+    // With the terminal host, sessions can outlive this app: a quit with any
+    // running asks whether to leave them or stop them. In-process, quitting
+    // ends every PTY, and an agent's work in progress with it; every other way
+    // an agent's tab goes away leaves it running, so that quit asks too.
+    const decision = await decideQuitTerminals({
+      ask: askChoice,
+      displayName,
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+    });
+    if ("cancelled" in decision) { cancelNativeExitRequest(); return; }
+    const terminals: QuitTerminals | undefined = decision.backend === "host" ? decision.terminals : undefined;
+    const agents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+    });
+    if (agents.length > 0) {
+      const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
+      const omitted = agents.length > 5 ? `\n…and ${agents.length - 5} more` : "";
+      const quit = await askConfirm({
+        title: agents.length === 1 ? "Quit While an Agent Is Running?" : `Quit While ${agents.length} Agents Are Running?`,
+        message: `${listed}${omitted}\nQuitting GitPulse ends ${agents.length === 1 ? "this agent" : "these agents"} and whatever ${agents.length === 1 ? "it is" : "they are"} in the middle of.`,
+        confirmLabel: agents.length === 1 ? "Quit and End Agent" : "Quit and End Agents",
+        cancelLabel: "Keep Working",
+        destructive: true,
+      });
+      if (!quit) { cancelNativeExitRequest(); return; }
+    }
     const gitActions = gitActionCount(get(repoStore.mutationActivity));
     if (gitActions > 0) {
       const wait = await askConfirm({ title: "Finish Git Actions Before Quit?",
         message: `${gitActions} Git action${gitActions === 1 ? " is" : "s are"} still running. Wait for them before quitting.`,
         confirmLabel: "Wait and Quit", cancelLabel: "Keep Working" });
-      if (!wait) { exitRequestPending = false; return; }
+      if (!wait) { cancelNativeExitRequest(); return; }
       try { await waitForGitIdle(repoStore.mutationActivity); }
-      catch (error) { toastStore.error(formatError(error)); exitRequestPending = false; return; }
+      catch (error) { toastStore.error(formatError(error)); cancelNativeExitRequest(); return; }
     }
 
     if (editorFileSaveQueue.pending > 0) {
@@ -359,7 +410,7 @@
         cancelLabel: "Keep Editing",
       });
       if (!waitForSaves) {
-        exitRequestPending = false;
+        cancelNativeExitRequest();
         return;
       }
       toastStore.info("Finishing editor saves before quitting…");
@@ -382,27 +433,38 @@
         cancelLabel: "Keep Editing",
       });
       if (!confirmed) {
-        exitRequestPending = false;
+        cancelNativeExitRequest();
         return;
       }
     }
 
     if (gitActionCount(get(repoStore.mutationActivity)) > 0) {
       toastStore.info("A Git action started while confirming quit. Try again when it finishes.");
-      exitRequestPending = false;
+      cancelNativeExitRequest();
       return;
     }
-    conflictSessions.flush();
-    repoStore.flushPersistedWorkspace();
+    flushBeforeExit();
     exitApproved = true;
     try {
-      await invoke("cmd_exit_app");
+      await invoke("cmd_exit_app", terminals ? { terminals } : {});
     } catch (error) {
       exitApproved = false;
-      exitRequestPending = false;
+      cancelNativeExitRequest();
       diagnostics.error("desktop:exit", error);
       toastStore.error(`Could not quit GitPulse: ${formatError(error)}`);
     }
+  }
+
+  /**
+   * Saves everything still waiting on a timer — the workspace, conflict
+   * drafts, diagnostics, interface preferences. A native quit may end the
+   * process without `pagehide`, so it cannot be left to the page-hide flush.
+   * A failed save is reported and the quit goes ahead.
+   */
+  function flushBeforeExit() {
+    for (const failure of flushPendingWrites()) diagnostics.error("desktop:exit-flush", failure);
+    // Reporting a failure scheduled one more diagnostics save.
+    diagnostics.flush();
   }
 
   onMount(() => {
@@ -434,7 +496,7 @@
     }));
 
     const guardBrowserUnload = (event: BeforeUnloadEvent) => {
-      repoStore.flushPersistedWorkspace();
+      flushBeforeExit();
       if (exitApproved || !hasUnsavedEditorDrafts()) return;
       event.preventDefault();
       // Browsers intentionally ignore custom text but require a value to show
@@ -447,6 +509,10 @@
     // Arm the native side only after its listener exists. This prevents a
     // startup failure from trapping an exit request with nobody to answer it.
     void listen<void>("gitpulse-exit-requested", () => {
+      // Before any await: this is what tells the native side the page lives.
+      void invoke("cmd_exit_request_answer", { answer: "seen" }).catch((error) =>
+        diagnostics.warn("desktop:exit-seen", error),
+      );
       void answerNativeExitRequest();
     }).then(
       (unlisten) => {
@@ -617,7 +683,10 @@
     const shellHandlers: NativeShellHandlers = {
       ...createMenuCommands(),
       checkUpdates: () => void checkUpdatesFromMenu(),
-      canDispatch: (event) => !exitRequestPending && canDispatchMenuEvent(event, get(nativeMenuState), get(repoStore)),
+      canDispatch: (event) =>
+        !exitRequestPending &&
+        !(isPromptOpen() && blockedWhilePrompting(event.id)) &&
+        canDispatchMenuEvent(event, get(nativeMenuState), get(repoStore)),
       open: () => void repoStore.pickAndOpenRepo(),
       clone: openCloneDialog,
       settings: () => {
@@ -666,6 +735,25 @@
     // not take down, say, the repo-changed listener registration with it.
     // Boot errors surface between renders, so unlike pane crash reports they
     // need no setTimeout deferral.
+    // Views derived from the checkout's files. Shared by watcher events and by
+    // the status poll, which sees the nested edits the non-recursive worktree
+    // watch cannot.
+    const fileDerivedTargets = {
+      metrics: (repo: string, touched: RepoChange | null) => repoMetrics.invalidate(repo, touched),
+      // Live index: gated incremental `devmap build` when the map is stale
+      // (or the watcher dirty signal forces it) and no build is in flight.
+      codeIndex: (repo: string) => liveIndex.onRepoChanged(repo),
+      docs: (repo: string) => onDocsRepoChanged(repo),
+    };
+    track(
+      repoStore.onPolledChange((repo, polled) => {
+        const blocked = get(repoStore).openTabs.some(
+          (tab) => tab.trustRequired === true && tab.path === repo,
+        );
+        // Repository state is the poll's own result, already applied.
+        routeRepoChange(repo, polled, blocked, { ...fileDerivedTargets, repoState: () => {} });
+      }),
+    );
     void runBootSequence(
       {
         subscribeNativeShell,
@@ -679,12 +767,8 @@
             ? get(repoStore).openTabs.some((tab) => tab.trustRequired === true && tab.path === path)
             : false;
           routeRepoChange(path, change ?? null, blocked, {
+            ...fileDerivedTargets,
             repoState: (repo) => void repoStore.handleRepoChanged(repo),
-            metrics: (repo, touched) => repoMetrics.invalidate(repo, touched),
-            // Live index: gated incremental `devmap build` when the map is stale
-            // (or the watcher dirty signal forces it) and no build is in flight.
-            codeIndex: (repo) => liveIndex.onRepoChanged(repo),
-            docs: (repo) => onDocsRepoChanged(repo),
           });
         },
         listenRepoChanged: (changed) =>
@@ -696,6 +780,13 @@
       },
       [...$repoStore.recentRepos],
       shellHandlers,
+    );
+
+    // Sessions ended together by one external signal: say what ended them and
+    // offer to resume their Claude conversations.
+    void watchIncidents(listen).then(
+      (unlisten) => track(unlisten),
+      (error) => diagnostics.warn("boot:terminal-incident", error),
     );
 
     // Build progress. A cold index of a large repository is several minutes of
@@ -842,10 +933,10 @@
   });
   onDestroy(() => graphScheduler.reset());
 
+  const trustRequired = $derived($repoStore.trustRequired);
   $effect(() => {
-    const refused = $repoStore.trustRequired;
     graphScheduler.sync({
-      path: refused ? null : $repoStore.currentPath,
+      path: trustRequired ? null : $currentRepoPath,
       query: $filterStore.searchQuery,
       revision: $filterStore.selectedBranch,
       // Which refs the graph walks is part of WHICH GRAPH this is, so a
@@ -862,8 +953,14 @@
   let zoomSetter: ((scale: number) => Promise<void>) | null = null;
   let zoomSetterResolved = false;
 
+  // A strictly-equal derived, not `$interfaceStore.uiFontScale` in the
+  // effect: interfaceStore publishes a fresh object for every preference
+  // write (a dock resize, a surface switch), and each re-run here is a
+  // webview setZoom IPC round-trip for a scale that did not change.
+  const uiFontScale = $derived($interfaceStore.uiFontScale);
+
   $effect(() => {
-    const scale = $interfaceStore.uiFontScale;
+    const scale = uiFontScale;
     void (async () => {
       if (!zoomSetterResolved) {
         zoomSetter = await nativeZoomSetter(isTauri());
@@ -893,30 +990,24 @@
     applyTabWidth($interfaceStore.tabWidth);
   });
 
+  const currentBranch = $derived($repoStore.currentBranch);
   $effect(() => {
-    void syncWindowChrome(
-      repoWindowTitle($repoStore.currentPath, $repoStore.currentBranch),
-      conflictedCount,
-    );
+    void syncWindowChrome(repoWindowTitle($currentRepoPath, currentBranch), conflictedCount);
   });
 
   // Catching up on a newly-opened repository.
   //
   // Correctness never depends on GitPulse having been running: git's reflog and
   // the agent transcripts both recorded what happened while it was closed, and
-  // this replays them into the ledger. Guarded on a genuine repo switch because
-  // the effect re-runs on every store emission — the ~6s status poll included.
-  let lastCaughtUpPath: string | null = null;
+  // this replays them into the ledger. Keyed on the repository and its trust,
+  // both compared by value: activating the journal on every status poll
+  // republished harnessStore synchronously, a second reactive clock on the
+  // same tick as every $harnessStore subscriber — the shape that becomes
+  // effect_update_depth_exceeded once any of those writes repoStore. Only a
+  // genuine path change, or trust arriving for it, may switch.
   $effect(() => {
-    const path = $repoStore.currentPath;
-    if ($repoStore.trustRequired) return;
-    // Status polls rebuild repoStore and re-run this effect. Activating the
-    // journal on every emission republishes harnessStore synchronously, which
-    // is a second reactive clock on the same tick as every $harnessStore
-    // subscriber — the shape that becomes effect_update_depth_exceeded once
-    // any of those writes repoStore. Only a genuine path change may switch.
-    if (path === lastCaughtUpPath) return;
-    lastCaughtUpPath = path;
+    const path = $currentRepoPath;
+    if (trustRequired) return;
     untrack(() => {
       harnessStore.activateRepository(path);
       if (path) void harnessStore.catchUp(path);
@@ -924,12 +1015,9 @@
   });
 
   $effect(() => {
-    // Only a genuine repo switch closes the Rebase modal: this effect re-runs
-    // on every repoStore emission (status poll, stats batches) and must not
-    // dismiss a modal the user is working in.
-    const path = $repoStore.currentPath;
-    if (path === lastModalRepoPath) return;
-    lastModalRepoPath = path;
+    // Only a genuine repo switch closes the Rebase modal; a status poll or a
+    // stats batch must not dismiss a modal the user is working in.
+    void $currentRepoPath;
     untrack(() => {
       isRebaseModalOpen = false;
       isBranchCleanupOpen = false;
@@ -944,6 +1032,14 @@
       <span class="text-[11px] text-textMuted">See Diagnostics for crash details</span>
       <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
     </div>
+  {/snippet}
+
+  <!-- The sidebar is not rebuilt on a repository switch, so a crash caused by
+       one repository's data would stay until Reset is pressed. This failure
+       view also resets itself when the repository changes. -->
+  {#snippet sidebarFailed(error: unknown, reset: () => void)}
+    <RepoPaneRecovery {reset} />
+    {@render paneFailed(error, reset)}
   {/snippet}
 
 <div
@@ -970,7 +1066,12 @@
 
     <div class="relative min-w-0 flex-1 h-full">
     <div bind:this={headerScroller} class="gp-header-scroll min-w-0 h-full">
-      <div class="flex items-center gap-2 min-w-full w-max px-2 h-full">
+      <!-- Everything in this row is measured as overflow, so nothing may sit
+           after the last control: a drag spacer (and the gap before it) or
+           trailing padding put the overflow cue over empty space. The row is
+           the drag region instead -- a bare attribute drags only on direct
+           hits, so the controls inside it still take their own clicks. -->
+      <div class="flex items-center gap-2 min-w-full w-max pl-2 h-full" data-tauri-drag-region>
         <HeaderRepoMenu
           onOpen={() => void repoStore.pickAndOpenRepo()}
           onClone={openCloneDialog}
@@ -980,7 +1081,6 @@
           <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
           <ViewTabBar {conflictedCount} />
         {/if}
-        <div class="flex-1 min-w-4 h-full" data-tauri-drag-region></div>
       </div>
     </div>
     <ScrollCue target={headerScroller} axis="x" />
@@ -1087,18 +1187,18 @@
     </div>
   {:else}
       <div class="flex-1 flex overflow-hidden">
-        {#key $repoStore.currentPath}
-        <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
+        <svelte:boundary failed={sidebarFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
           <Sidebar />
         </svelte:boundary>
-        {/key}
         <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("workspace", error)}>
           <main id={VIEW_PANE_ID} class="gp-workspace flex-1 flex flex-col min-w-0 bg-background gp-pane">
-            <!-- No {#key activeTab}: keying here destroyed and rebuilt the
-                 entire pane on every view switch and replayed the .gp-view
-                 entrance fade — a full-screen flicker per tab. The {#if}
-                 chain alone swaps panes; state lives in stores. -->
-            {#key $repoStore.currentPath}
+            <!-- No {#key activeTab} and no {#key currentPath}: keying here
+                 destroyed and rebuilt the entire pane on every view switch
+                 (and, for currentPath, on every repository switch) and
+                 replayed the .gp-view entrance fade — a full-screen flicker
+                 per tab. The {#if} chain alone swaps panes; state lives in
+                 stores. The per-repository leaves are keyed where they live,
+                 inside ViewSectionPanel. -->
             <div class="gp-view flex-1 flex flex-col min-h-0">
               {#if $repoStore.activeTab === "work"}
                 <WorkspaceView
@@ -1129,12 +1229,12 @@
                 />
               {/if}
             </div>
-            {/key}
             <!-- The terminal sits under the view rather than replacing it, so
                  a command's output can be read against the thing that
                  prompted it. A crash in the shell must not take the view with
-                 it, hence its own boundary. Outside the {#key} so a repository
-                 tab switch cannot unmount the PTY. -->
+                 it, hence its own boundary. Outside every per-repository key
+                 (ViewSectionPanel's), so a repository tab switch cannot
+                 unmount the PTY. -->
             <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("terminal", error)}>
               <TerminalDock
                 open={terminalDockOpen}
@@ -1148,9 +1248,7 @@
 
       <!-- Bottom Ambient Status Bar -->
       <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("status", error)}>
-      {#key $repoStore.currentPath}
       <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} />
-      {/key}
       </svelte:boundary>
 
     <!-- First-run coach mark onboarding tip -->

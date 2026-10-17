@@ -5,6 +5,8 @@ pub mod ci_local;
 pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
+pub mod daemon_lock;
+pub(crate) mod deadline;
 pub mod desktop;
 pub mod devmap;
 pub mod diff;
@@ -23,19 +25,27 @@ pub mod insights;
 pub mod lappi;
 pub mod ledger;
 pub mod limits;
+#[cfg(unix)]
+pub mod local_socket;
 pub mod logging;
+pub mod lru_map;
 pub mod markdown;
 pub mod mcp;
 pub mod ndjson;
 pub mod ops;
 pub mod output;
+mod pools;
 pub mod procguard;
 pub mod repository_trust;
 pub mod secrets;
+pub mod singleflight;
 pub mod stack;
 pub mod storage;
+pub mod supervisor;
 pub mod syntax;
+pub mod sysload;
 pub mod tasks;
+pub mod teardown;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -50,8 +60,8 @@ pub mod workspace_registry;
 use commands::*;
 use desktop::shell::{cmd_open_worktree_path, cmd_reveal_worktree_path};
 use desktop::{
-    cmd_exit_app, cmd_resolve_git_root, cmd_set_exit_guard_ready, cmd_set_recent_menu,
-    cmd_take_pending_open,
+    cmd_exit_app, cmd_exit_request_answer, cmd_resolve_git_root, cmd_set_exit_guard_ready,
+    cmd_set_recent_menu, cmd_take_pending_open,
 };
 use logging::{cmd_diagnostic_log_tail, cmd_diagnostic_persisted_log};
 
@@ -66,14 +76,55 @@ pub fn context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::generate_context!()
 }
 
+/// Starts the app's host-load sampler, emitting each tick's pulse as
+/// `host-load-pulse`. A platform with no sensor, or no config directory,
+/// logs why and runs without one; Health then reports the sensor dead.
+fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Emitter as _;
+    let Some(dir) = tool_config::default_config_dir() else {
+        log::warn!(target: "host_load", "no per-user config directory; the host-load sampler is not running");
+        return;
+    };
+    let mut options = sysload::SamplerOptions::new(dir);
+    options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
+    options.govern_launches = Box::new(|| tool_config::host_load_settings().govern_launches);
+    let emitter = app.clone();
+    options.on_tick = Some(Box::new(move |pulse| {
+        if let Err(error) = emitter.emit("host-load-pulse", pulse) {
+            log::debug!(target: "host_load", "pulse not delivered: {error}");
+        }
+    }));
+    match sysload::start_app(options) {
+        // Runs for the life of the process; the handle is not needed to stop
+        // it, because the process exiting is what stops it.
+        Ok(handle) => std::mem::forget(handle),
+        Err(error) => log::warn!(target: "host_load", "host-load sampler not started: {error}"),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First: tauri builds its default async runtime on the first use of any
+    // `async_runtime` function, after which this cannot replace it.
+    let pool_notes = [pools::install_async_runtime(), pools::install_rayon_pool()];
     // Only the app keeps branch churn on disk; agent servers, hooks and test
     // processes, which never reach `run()`, keep it in memory.
     engine::churn_store::persist_in_this_process();
     logging::init();
+    for note in pool_notes.into_iter().flatten() {
+        log::warn!(target: "setup", "{note}");
+    }
     #[cfg(not(test))]
     logging::install_panic_hook();
+    // Before anything else is built. LaunchServices starts a second copy of
+    // GitPulse whenever it prefers another bundle of the same identifier —
+    // which is what a banner click does once the running copy's bundle was
+    // rebuilt or deleted. That launch hands its request to the running one and
+    // leaves here, without a window, watchers or a code-intelligence build.
+    #[cfg(target_os = "macos")]
+    if let desktop::launch::Launch::Exit = desktop::launch::establish() {
+        return;
+    }
     // Before anything opens a descriptor. A GUI launch inherits launchd's soft
     // limit of 256, which this app exhausts on a busy workspace -- and past it
     // every git spawn fails with EMFILE until restart. Reported either way, so
@@ -84,8 +135,9 @@ pub fn run() {
     } else {
         log::warn!(target: "setup", "{}", limits.describe());
     }
-    // Quitting the app, logging out, or a `kill` from a terminal all arrive as
-    // a signal whose default action ends this process and leaves whatever git
+    // Logging out, a `kill` from a terminal or a supervisor's stop arrives as a
+    // signal (Cmd-Q does not: it ends the event loop and reaches the same
+    // teardown through `RunEvent::Exit`, below), and a signal's default action ends this process and leaves whatever git
     // commands the UI had in flight running against the user's repository.
     let signals = procguard::install_signal_handlers();
     if signals.is_armed() {
@@ -96,28 +148,44 @@ pub fn run() {
     let builder = tauri::Builder::default();
     // Registered before every other plugin, as this one requires: it decides
     // whether this process is the app or a message to the app, and nothing
-    // should have started initialising by the time it answers that.
+    // should have started initialising by the time it answers that. macOS
+    // answers the same question with `desktop::launch` above, which also
+    // carries banner responses and Apple-event opens the plugin cannot see.
     #[cfg(not(target_os = "macos"))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-        desktop::handle_second_instance(app, &argv);
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        desktop::handle_second_instance(app, &argv, &cwd);
     }));
+    // Replaces Tauri's silent, unbounded reload of a crashed page.
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(desktop::webcrash::on_terminated);
     builder
+        .plugin(desktop::navigation_guard())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--background"]),
         ))
         .manage(crate::watcher::WatcherState::default())
-        .manage(crate::terminal::TerminalSessions::default())
+        // In the app, or in the terminal host when the user chose to keep
+        // terminals running across quits (Settings → Agents).
+        .manage(crate::terminal::TerminalSessions::from_settings())
         .manage(desktop::DesktopState::default())
         .manage(workbench::WorkbenchState::default())
         .setup(|app| {
+            // A signal exit stops what procguard does not own; the normal exit
+            // reaches the same teardown from `RunEvent::Exit`.
+            {
+                use tauri::Manager;
+                let terminals = app.state::<terminal::TerminalSessions>().inner().clone();
+                procguard::set_shutdown_hook(move || teardown::run(&terminals));
+            }
             // Once, off this thread. Dual-read still finds a record this has
             // not renamed yet, so a failed migration does not block startup.
             // MCP and gitpulsed do not run this path and stay read-only.
-            if let Err(error) = std::thread::Builder::new()
-                .name("repository-trust-migrate".into())
-                .spawn(|| match repository_trust::persistent_root() {
+            if let Err(error) = supervisor::spawn_once(
+                "repository-trust-migrate",
+                "trust migration",
+                || match repository_trust::persistent_root() {
                     Ok(root) => {
                         if let Err(error) = repository_trust::migrate_store(&root) {
                             log::warn!(target: "trust", "repository trust migration failed: {error}");
@@ -130,6 +198,35 @@ pub fn run() {
             {
                 log::warn!(target: "trust", "repository trust migration did not start: {error}");
             }
+            // The cleaner and launch-at-login agents each record one fixed
+            // executable path, rewritten only on a Settings save. Compare them
+            // with the running app so a moved, translocated or older copy is
+            // not started every minute; off this thread, since it may run
+            // launchctl.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_autostart::ManagerExt as _;
+                let handle = app.handle().clone();
+                let name = app.package_info().name.clone();
+                if let Err(error) = crate::supervisor::spawn_once(
+                    "launch-agent-check",
+                    "launch agent check",
+                    move || {
+                        match storage::hygiene::background::refresh_if_stale() {
+                            Ok(desktop::launch_agent::Registration::Stale { registered }) => {
+                                log::warn!(target: "setup", "the cleaner LaunchAgent started {registered:?}; it now starts this app");
+                            }
+                            Ok(_) => {}
+                            Err(error) => log::warn!(target: "setup", "cleaner LaunchAgent check: {error}"),
+                        }
+                        desktop::launch_agent::refresh_autostart(&name, || {
+                            handle.autolaunch().enable().map_err(|e| e.to_string())
+                        });
+                    },
+                ) {
+                    log::warn!(target: "setup", "launch agent check did not start: {error}");
+                }
+            }
             // Installed before anything can mutate, so the first guarded action
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());
@@ -137,6 +234,14 @@ pub fn run() {
             // Tasks other processes file (an agent over MCP) reach the board
             // without waiting for the window to lose and regain focus.
             workbench::external_changes::install(app.handle());
+            // An agent's `done` is held in review until Manvi verifies it;
+            // this starts that verification and settles the card.
+            {
+                use tauri::Manager as _;
+                workbench::verification_driver::install(
+                    app.state::<workbench::WorkbenchState>().inner().clone(),
+                );
+            }
             // A crash or force-quit leaves its task runs holding their
             // checkouts with no owner left to end them. Release the ones whose
             // processes are provably gone, off the startup path.
@@ -144,12 +249,37 @@ pub fn run() {
                 use tauri::Manager as _;
                 // The user's terminal session limit, before any window can
                 // open a session. A file this cannot read keeps the default.
-                app.state::<terminal::TerminalSessions>().apply_stored_limit();
+                let terminals = app.state::<terminal::TerminalSessions>().inner().clone();
+                terminals.apply_stored_limit();
                 let state = app.state::<workbench::WorkbenchState>().inner().clone();
-                state.attach_terminals(app.state::<terminal::TerminalSessions>().inner().clone());
-                if let Err(error) = std::thread::Builder::new()
-                    .name("task-run-reconcile".into())
-                    .spawn(move || match state.reconcile_stale_runs() {
+                state.attach_terminals(terminals.clone());
+                // Sessions a terminal host kept from an earlier app report
+                // here, and a task run among them is observed again.
+                terminals.bind_app(app.handle());
+                #[cfg(unix)]
+                {
+                    let (handle, runs) = (app.handle().clone(), state.clone());
+                    terminals.set_adopter(std::sync::Arc::new(move |run_id: &str| {
+                        workbench::terminal_run::adopted_observer(&handle, &runs, run_id)
+                    }));
+                }
+                log::info!(target: "terminal", "terminal sessions are held {}", match terminals.backend() {
+                    "host" => "by the terminal host and survive a quit",
+                    _ => "in the app",
+                });
+                if let Err(error) = supervisor::spawn_once(
+                    "task-run-reconcile",
+                    "task run reconcile",
+                    move || {
+                        // First: what the host holds is adopted and what ended
+                        // while no app was there is recorded, so no run whose
+                        // agent is still alive in the host is released, and an
+                        // agent that finished gets its real exit. A host that
+                        // cannot be reached answers every run as held.
+                        if let Err(error) = terminals.connect_host() {
+                            log::error!(target: "terminal", "the terminal host could not be reached at startup; its runs are left alone: {error}");
+                        }
+                        match state.reconcile_stale_runs() {
                         Ok(0) => {}
                         Ok(released) => {
                             log::info!(target: "workbench", "released {released} task run(s) left behind by an earlier session");
@@ -157,6 +287,7 @@ pub fn run() {
                         Err(error) => {
                             log::warn!(target: "workbench", "task run reconciliation failed: {}: {}", error.code, error.message);
                         }
+                    }
                     })
                 {
                     log::warn!(target: "workbench", "task run reconciliation did not start: {error}");
@@ -167,6 +298,11 @@ pub fn run() {
             // centre that failed to install is a fault the status readout has
             // to be able to report rather than a reason to have no worker.
             alerts::start(workbench::notifications::session_host(app.handle()));
+            // The host-load sampler: here and nowhere else, so only the app
+            // process ever samples (`tests/host_load_sampler_scope.rs` pins
+            // that). A second GitPulse beside this one loses the snapshot's
+            // writer election and reads instead.
+            start_host_load_sampler(app.handle());
             alerts::bridge::apply(tool_config::session_alerts().hook_bridge);
             crate::tool_install::set_app_handle(app.handle().clone());
             crate::devmap::set_build_progress_handle(app.handle().clone());
@@ -177,6 +313,12 @@ pub fn run() {
                 log::error!(target: "setup", "menu installation failed: {e}");
                 return Err(e.into());
             }
+            // Cmd-Q, Dock → Quit and a Quit Apple event reach the exit guard
+            // only through this; without it AppKit terminates unasked.
+            #[cfg(target_os = "macos")]
+            if let Err(error) = desktop::terminate::install(app.handle()) {
+                log::error!(target: "setup", "quit guard not installed; AppKit quits bypass it: {error}");
+            }
             // Login-item / LaunchAgent starts with --background: stay in the
             // menu bar until the frontend projects showStatusIcon. If the icon
             // is off, menu sync reveals the main window as usual.
@@ -184,6 +326,7 @@ pub fn run() {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
+                    workbench::external_changes::note_main_window_on_screen(false);
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -202,6 +345,11 @@ pub fn run() {
                     desktop::queue_and_emit_open(app.handle(), std::path::Path::new(path));
                 }
             }
+            // Last, so a request another launch sent while this one started is
+            // answered after the `--background` hide above rather than undone
+            // by it, and after the notification worker it may need exists.
+            #[cfg(target_os = "macos")]
+            desktop::launch::attach(app.handle());
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -213,18 +361,7 @@ pub fn run() {
         // A reload replaces the page that acknowledged terminal output while
         // the processes it started keep running here. Detached before the new
         // page's script runs, so nothing it spawns is caught up in it.
-        .on_page_load(|webview, payload| {
-            if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
-            {
-                use tauri::Manager as _;
-                let sessions = webview.state::<terminal::TerminalSessions>();
-                let detached = terminal::detach_all(&sessions);
-                if detached > 0 {
-                    log::info!(target: "terminal", "page reloaded; {detached} terminal session(s) detached and still running");
-                }
-            }
-        })
+        .on_page_load(desktop::handle_page_load)
         .invoke_handler(tauri::generate_handler![
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
@@ -242,10 +379,12 @@ pub fn run() {
             cmd_get_range_diff,
             cmd_get_commit_files,
             cmd_get_commit_details,
+            cmd_verify_commit_signature,
             cmd_get_head_id,
             cmd_get_file_content,
             cmd_get_file_blob,
             cmd_write_file_content,
+            cmd_create_file,
             cmd_compute_word_diff,
             cmd_syntax_highlight,
             cmd_stage_file,
@@ -256,6 +395,7 @@ pub fn run() {
             cmd_commit,
             cmd_quick_commit,
             cmd_checkout_branch,
+            cmd_checkout_detached,
             cmd_create_branch,
             cmd_delete_branch,
             cmd_rename_branch,
@@ -355,6 +495,8 @@ pub fn run() {
             cmd_revoke_repository_trust,
             cmd_list_worktrees,
             cmd_add_worktree,
+            cmd_preview_worktree_hooks,
+            cmd_approve_worktree_hooks,
             cmd_remove_worktree,
             cmd_lock_worktree,
             cmd_unlock_worktree,
@@ -383,9 +525,13 @@ pub fn run() {
             cmd_terminal_export,
             cmd_terminal_resize,
             cmd_terminal_kill,
+            cmd_terminal_incidents,
+            cmd_terminal_conversations,
+            cmd_terminal_backend,
             cmd_terminal_context,
             cmd_terminal_sessions,
             cmd_terminal_attach,
+            cmd_terminal_detach,
             cmd_terminal_run,
             cmd_manvi_run_action,
             cmd_take_pending_open,
@@ -400,6 +546,7 @@ pub fn run() {
             desktop::shell::cmd_reveal_repository,
             cmd_set_exit_guard_ready,
             cmd_exit_app,
+            cmd_exit_request_answer,
             cmd_diagnostic_log_tail,
             cmd_diagnostic_persisted_log,
             cmd_ledger_tail,
@@ -482,28 +629,32 @@ pub fn run() {
             cmd_session_attention_answered,
             cmd_lappi_settings,
             cmd_lappi_settings_save,
+            cmd_host_load_status,
+            cmd_host_load_terminate_orphan,
+            cmd_host_load_admit_anyway,
+            cmd_host_load_settings,
+            cmd_host_load_settings_save,
             cmd_attempt_review,
             cmd_attempt_review_record,
             cmd_review_gate_save,
+            cmd_verify_status_enabled,
+            cmd_verify_status_save,
+            cmd_verify_status_post,
             cmd_tool_ladder,
             cmd_tool_preflight,
             cmd_tool_verify,
             cmd_onboarding_clone_source,
             cmd_tool_capability_refresh,
             cmd_check_app_update,
+            supervisor::cmd_degraded_subsystems,
+            daemon_lock::cmd_daemon_status,
         ])
         .build(context())
         .expect("error while building GitPulse")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
-                // First, so a terminal shutdown that stalls cannot lose it.
-                logging::performance::flush();
-                if let Err(error) =
-                    terminal::shutdown_sessions(&app.state::<terminal::TerminalSessions>())
-                {
-                    log::warn!(target: "terminal", "terminal shutdown incomplete: {error}");
-                }
+                teardown::run(&app.state::<terminal::TerminalSessions>());
             }
             desktop::handle_run_event(app, &event);
         });

@@ -9,7 +9,7 @@ export interface ObserveResizeOptions {
 }
 
 export interface ResizeObservation {
-  observe(target: Element): void;
+  observe(target: Element, options?: ResizeObserverOptions): void;
   unobserve(target: Element): void;
   disconnect(): void;
 }
@@ -47,8 +47,8 @@ export function createResizeObservation(
     });
   });
   return {
-    observe(target) {
-      observer.observe(target);
+    observe(target, observeOptions) {
+      observer.observe(target, observeOptions);
     },
     unobserve(target) {
       observer.unobserve(target);

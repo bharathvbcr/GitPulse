@@ -515,7 +515,11 @@ fn rounds(
             let logs = item["logs"].as_str().unwrap_or_default();
             let recorded = ends_with_block(logs, &marker, reason);
             let block = format!("{marker}{}) ---\n{reason}", timestamp(now_millis()));
-            match record_and_delete(store, &source.id, item, &block, recorded, "merge")? {
+            let options = DeleteOptions {
+                even_if_running,
+                request_id: None,
+            };
+            match record_and_delete(store, &source.id, item, &block, recorded, "merge", options)? {
                 Removal::Deleted(receipt) => {
                     progress.wrote = true;
                     progress.sequence = receipt["sequence"].as_u64().or(progress.sequence);
@@ -694,15 +698,9 @@ fn merge_core(
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
     let (target_id, original) = find_live_task(store, &repository_id, &into.task)?;
     let target_revision = original["revision"].as_i64().unwrap_or_default();
-    if into
-        .expected_revision
-        .is_some_and(|expected| expected != target_revision)
-    {
-        return Err(WorkbenchError::new(
-            "revision_conflict",
-            format!("{target_id} is at revision {target_revision}, not {}; someone changed it. Re-read it before merging into it.", into.expected_revision.unwrap_or_default()),
-        ));
-    }
+    // What an earlier run of this very merge leaves on a source it was
+    // interrupted on: its reason block as the last block.
+    let merge_marker = format!("{MERGE_MARKER}{target_id} (");
 
     let mut resolved: Vec<Source> = Vec::new();
     for source in sources {
@@ -710,9 +708,20 @@ fn merge_core(
         let (id, state) = match find_task(store, &repository_id, &requested) {
             Ok((id, item)) => {
                 let revision = item["revision"].as_i64().unwrap_or_default();
+                // The block write of an interrupted earlier run moved this
+                // source by exactly one revision. Its answer says "re-run the
+                // same call", and the same call carries the revision it first
+                // read, so that one step is its own and not a conflict.
+                let finishing_own_merge = source.expected_revision == Some(revision - 1)
+                    && ends_with_block(
+                        item["logs"].as_str().unwrap_or_default(),
+                        &merge_marker,
+                        reason,
+                    );
                 if source
                     .expected_revision
                     .is_some_and(|expected| expected != revision)
+                    && !finishing_own_merge
                 {
                     return Err(WorkbenchError::new(
                         "revision_conflict",
@@ -763,6 +772,28 @@ fn merge_core(
             id,
             state,
         });
+    }
+
+    // The target moves under a merge's own writes (a section per source), so a
+    // retry carrying the revision the first call read is a conflict only when
+    // nothing shows an earlier run of this merge: a source already merged into
+    // this target, or a source whose section the target already holds.
+    let target_moved = into
+        .expected_revision
+        .is_some_and(|expected| expected != target_revision);
+    if target_moved {
+        let description = original["description"].as_str().unwrap_or_default();
+        let resumed = resolved.iter().any(|source| match &source.state {
+            State::AlreadyMerged { .. } => true,
+            State::Pending(item) => description.contains(&section(&source.id, item)),
+            _ => false,
+        });
+        if !resumed {
+            return Err(WorkbenchError::new(
+                "revision_conflict",
+                format!("{target_id} is at revision {target_revision}, not {}; someone changed it. Re-read it before merging into it.", into.expected_revision.unwrap_or_default()),
+            ));
+        }
     }
 
     let mut progress = Progress {

@@ -5,9 +5,10 @@ import {
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
   getEnhancement, listEnhancements, latestEnhancement, LIVE_ENHANCEMENT_STATES, ACTIVE_ENHANCEMENT_STATES, changeEnhancement, enhancementConfiguration,
-  generateEnhancement, deleteTask, deleteWorkspace, mergeTasks, restoreDeletedTask,
+  deleteTask, deleteWorkspace, mergeTasks, restoreDeletedTask,
 } from "./client";
 import type { Task, Workspace } from "./client";
+import { selectionWire } from "./taskModel";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -165,10 +166,10 @@ describe("native workbench boundary", () => {
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...proposal, state: "accepted", revision: 4, accepted_fields: ["title"] } }));
     expect(await changeEnhancement("enhancements.accept", input)).toMatchObject({ state: "accepted", accepted_fields: ["title"] });
     expect(native.mock.calls[3]).toEqual(native.mock.calls[4]);
-    // The newest attempt in given states is one filtered read, whatever page it is on.
+    // The newest attempt in given states is one filtered read, whatever page it is on. It reads a page, not one row: a stored refinement newer than the text proposal is skipped, not mistaken for it.
     native.mockResolvedValueOnce(reply([{ ...proposal, state: "running", worker_id: "w" }], 1));
     expect(await latestEnhancement(item.id, LIVE_ENHANCEMENT_STATES)).toMatchObject({ state: "running" });
-    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", { method: "enhancements.list", input: JSON.stringify({ task_id: item.id, newest: true, limit: 1, states: ["pending", "running", "cancel_requested"] }) });
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", { method: "enhancements.list", input: JSON.stringify({ task_id: item.id, newest: true, limit: 30, states: ["pending", "running", "cancel_requested"] }) });
     native.mockResolvedValueOnce(reply([], 0));
     expect(await latestEnhancement(item.id, ACTIVE_ENHANCEMENT_STATES)).toBeNull();
   });
@@ -199,7 +200,7 @@ describe("native workbench boundary", () => {
       rationale: "",
     };
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: proposal }));
-    await generateEnhancement({ id: "e", request_id: "r", expected_revision: 1 }, selection);
+    await changeEnhancement("enhancements.generate", { id: "e", request_id: "r", expected_revision: 1, ...selectionWire(selection) });
     expect(JSON.parse(String((native.mock.calls[1]?.[1] as { input: string }).input))).toMatchObject({
       id: "e", request_id: "r", expected_revision: 1, model: selection,
     });

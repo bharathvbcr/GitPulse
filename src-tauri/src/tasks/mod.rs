@@ -69,6 +69,11 @@ pub struct TaskLease {
     /// computing "safe to reclaim" from expiry must treat null as never
     /// reclaimable on that basis.
     pub expires_at: Option<String>,
+    /// Set when the stored `expires_at` is not a timestamp: the lease is still
+    /// marked active and this row alone cannot say whether it has lapsed, so it
+    /// is listed with the stored text rather than dropped or called live. A
+    /// readable lease carries null.
+    pub expiry_error: Option<String>,
 }
 
 /// One evidence row from `dc-store`.
@@ -110,7 +115,7 @@ pub struct TaskGap {
 
 /// One verification run from `dc-store`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TaskRun {
+pub struct DevCouncilRun {
     pub id: String,
     pub task_id: String,
     pub sandbox: String,
@@ -133,7 +138,7 @@ pub struct TaskView {
     pub evidence_truncated: bool,
     pub gaps: Vec<TaskGap>,
     pub gaps_truncated: bool,
-    pub runs: Vec<TaskRun>,
+    pub runs: Vec<DevCouncilRun>,
     pub runs_truncated: bool,
     /// Empty when the store could be read; otherwise why it could not.
     ///
@@ -157,35 +162,67 @@ fn empty_view(path: String, available: bool, error: String) -> TaskView {
     }
 }
 
-fn parse_paths(json: &str) -> Vec<String> {
+/// Reads one scope column, or says which part of it cannot be read.
+///
+/// A column that cannot be read is an error, never an empty list: an empty
+/// `forbidden_changes` means "nothing is forbidden" and an empty
+/// `allowed_commands` drops the task's allowlist, so reading damage as empty
+/// would widen what the gate permits. Callers surface the error as a broken
+/// scope (see `harness::scope_for`).
+fn parse_paths(column: &str, json: &str) -> Result<Vec<String>, String> {
     // planned_files_json is an array of objects carrying `path`; the other
-    // columns are arrays of plain strings. Accept both rather than assuming,
-    // because a shape this code guessed wrong would silently yield an empty
-    // scope — and an empty scope authorises nothing, so every write would be
-    // refused with no hint why.
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    let Some(items) = value.as_array() else {
-        return Vec::new();
-    };
+    // columns are arrays of plain strings. Accept both.
+    let value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|e| format!("task scope column {column} is not valid JSON: {e}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("task scope column {column} is not a JSON array"))?;
     items
         .iter()
-        .filter_map(|item| match item {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => o.get("path")?.as_str().map(str::to_string),
-            _ => None,
+        .enumerate()
+        .map(|(i, item)| match item {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Object(o) => o
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!("task scope column {column} entry {i} has no string `path`")
+                }),
+            _ => Err(format!(
+                "task scope column {column} entry {i} is neither a string nor an object"
+            )),
         })
         .collect()
 }
 
-/// Opens the store for `repo_path`, or reports why not.
+/// [`parse_paths`] for a planned-files column, which also carries each file's
+/// `allowed_change`.
+///
+/// DevCouncil's Go decoder refuses a planned file whose `allowed_change` is not
+/// one of `create`, `modify`, `delete`, `read_only`, and with it the whole task
+/// row. GitPulse reads the same row, so it applies the store's own check
+/// (`dc_store::json::check_planned_files`) rather than reading the path out of
+/// an entry the other reader would have rejected: a scope no DevCouncil host can
+/// load must not look like a scope GitPulse enforces.
+fn parse_planned(column: &str, json: &str) -> Result<Vec<String>, String> {
+    let paths = parse_paths(column, json)?;
+    dc_store::json::check_planned_files(json).map_err(|e| {
+        format!("task scope column {column} is not a readable planned-file list: {e}")
+    })?;
+    Ok(paths)
+}
+
+/// Opens the store for `repo_path` for reading only, or reports why not.
+///
+/// `SQLITE_OPEN_READ_ONLY`: a view can never migrate the store, sweep a lease
+/// or contend for its write lock, whatever the agent that owns it is doing.
 fn open(repo_path: &str) -> Result<Option<dc_store::Store>, String> {
     let path = store_path(repo_path);
     if !path.exists() {
         return Ok(None);
     }
-    dc_store::Store::open_existing(&path)
+    dc_store::Store::open_readonly(&path)
         .map(Some)
         .map_err(|e| format!("{e}"))
 }
@@ -213,11 +250,16 @@ fn read_view(
     path: String,
     task_id: Option<&str>,
 ) -> Result<TaskView, String> {
+    // `observe_leases` judges expiry in memory and never writes, which a
+    // read-only handle requires. A lapsed lease is left as it is and not
+    // listed (it is no longer held); one whose expiry cannot be read is listed
+    // with that text, for its row alone.
     let leases = store
-        .active_leases()
+        .observe_leases()
         .map_err(|e| format!("{e}"))?
         .into_iter()
-        .map(|l| TaskLease {
+        .filter(|(_, state)| *state != dc_store::LeaseState::Expired)
+        .map(|(l, state)| TaskLease {
             task_id: l.task_id,
             owner: l.owner,
             agent: l.agent,
@@ -225,6 +267,10 @@ fn read_view(
             status: l.status,
             created_at: l.created_at,
             expires_at: l.expires_at,
+            expiry_error: match state {
+                dc_store::LeaseState::BadExpiry(stored) => Some(stored),
+                _ => None,
+            },
         })
         .collect();
 
@@ -291,7 +337,7 @@ fn read_view(
     let (run_rows, runs_truncated) = store.runs_list(task_id).map_err(|e| format!("runs: {e}"))?;
     let runs = run_rows
         .into_iter()
-        .map(|row| TaskRun {
+        .map(|row| DevCouncilRun {
             id: row.id,
             task_id: row.task_id,
             sandbox: row.sandbox,
@@ -366,10 +412,13 @@ fn scope_in(store: &dc_store::Store, task_id: &str) -> Result<Option<TaskScope>,
         id: task.id,
         title: task.title,
         status: task.status,
-        planned_files: parse_paths(&task.planned_files_json),
-        agent_appended_files: parse_paths(&task.agent_appended_planned_files_json),
-        forbidden_changes: parse_paths(&task.forbidden_changes_json),
-        allowed_commands: parse_paths(&task.allowed_commands_json),
+        planned_files: parse_planned("planned_files_json", &task.planned_files_json)?,
+        agent_appended_files: parse_planned(
+            "agent_appended_planned_files_json",
+            &task.agent_appended_planned_files_json,
+        )?,
+        forbidden_changes: parse_paths("forbidden_changes_json", &task.forbidden_changes_json)?,
+        allowed_commands: parse_paths("allowed_commands_json", &task.allowed_commands_json)?,
     }))
 }
 
@@ -484,6 +533,104 @@ mod tests {
         assert!(v.leases.is_empty());
     }
 
+    /// The gap types a configuration fault raises, and the run records that carry
+    /// command objects, read as themselves.
+    ///
+    /// `gate_config_invalid` and `verify_env_config_invalid` are blocking gaps
+    /// DevCouncil raises when its gate or verify-environment configuration
+    /// cannot be read; their remedy is the `fix_config` next action. This view
+    /// passes `gap_type` through as text and must keep doing so: a closed list
+    /// here would drop exactly the gaps that say verification never ran. A run's
+    /// `commands_json` is handed on verbatim whether its entries are bare strings
+    /// or `CommandRecord` objects.
+    #[test]
+    fn configuration_gaps_and_command_record_runs_are_shown_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        for gap_type in ["gate_config_invalid", "verify_env_config_invalid"] {
+            store
+                .gap_upsert(&dc_store::records::GapRow {
+                    id: format!("g-{gap_type}"),
+                    severity: "high".into(),
+                    gap_type: gap_type.into(),
+                    requirement_id: None,
+                    task_id: Some("TASK-1".into()),
+                    description: "config unreadable".into(),
+                    evidence_json: "[]".into(),
+                    recommended_fix: "fix the configuration".into(),
+                    blocking: true,
+                    file: None,
+                    line: None,
+                    suggested_command: None,
+                    acceptance_criterion_id: None,
+                    expected_verification_method: None,
+                    stdout_path: None,
+                    stderr_path: None,
+                })
+                .unwrap();
+        }
+        let commands = r#"[{"command":"cargo test","exit_code":0,"status":"passed"}]"#;
+        store
+            .connection()
+            .execute(
+                "INSERT INTO verification_runs (id, task_id, sandbox, status, started_at, commands_json)
+                 VALUES ('run-1', 'TASK-1', 'host', 'degraded', '2026-01-01T00:00:00Z', ?1)",
+                [commands],
+            )
+            .unwrap();
+        drop(store);
+
+        let v = view_filtered(repo, Some("TASK-1"));
+        assert!(v.available, "{}", v.error);
+        let mut kinds: Vec<_> = v.gaps.iter().map(|g| g.gap_type.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["gate_config_invalid", "verify_env_config_invalid"]);
+        assert!(v.gaps.iter().all(|g| g.blocking));
+        assert_eq!(v.runs.len(), 1);
+        assert_eq!(v.runs[0].status, "degraded");
+        assert_eq!(v.runs[0].commands_json, commands);
+    }
+
+    #[test]
+    fn a_store_from_before_the_gap_output_columns_still_reads_its_gaps() {
+        // `stdout_path` / `stderr_path` were added to `gaps` after schema 9
+        // shipped, without a schema bump, so a long-lived store can lack them
+        // while claiming the current version. The view opens the store read-only
+        // and so cannot add them; what makes that safe is dc-store's `gaps_list`
+        // reading a missing column as absent. Without it this view reads "no such
+        // column" and reports the store unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "ALTER TABLE gaps DROP COLUMN stdout_path;
+                 ALTER TABLE gaps DROP COLUMN stderr_path;
+                 INSERT INTO gaps (id, severity, gap_type, description, evidence_json,
+                     recommended_fix, blocking, task_id)
+                 VALUES ('g-old', 'high', 'coverage', 'missing test', '{}', 'add test', 1, 'TASK-1');",
+            )
+            .unwrap();
+        drop(store);
+
+        let v = view_filtered(repo, Some("TASK-1"));
+        assert!(
+            v.available,
+            "a pre-column store must still read: {}",
+            v.error
+        );
+        assert_eq!(v.gaps.len(), 1);
+        assert_eq!(v.gaps[0].id, "g-old");
+        assert_eq!(v.gaps[0].stdout_path, None);
+        assert_eq!(v.gaps[0].stderr_path, None);
+    }
+
     #[test]
     fn every_gap_field_dc_store_keeps_reaches_the_view() {
         // Three rounds of the same bug: dc-store learned to keep a gap field
@@ -503,7 +650,7 @@ mod tests {
                 requirement_id: Some("REQ-7".into()),
                 task_id: Some("TASK-1".into()),
                 description: "cargo test failed".into(),
-                evidence_json: r#"{"exit":101}"#.into(),
+                evidence_json: r#"[{"exit":101}]"#.into(),
                 recommended_fix: "fix the failing test".into(),
                 blocking: true,
                 file: Some("src/a.rs".into()),
@@ -523,7 +670,7 @@ mod tests {
                 requirement_id: None,
                 task_id: Some("TASK-1".into()),
                 description: "missing test".into(),
-                evidence_json: "{}".into(),
+                evidence_json: "[]".into(),
                 recommended_fix: "add a test".into(),
                 blocking: false,
                 file: None,
@@ -556,7 +703,7 @@ mod tests {
                 requirement_id: Some("REQ-7".into()),
                 task_id: Some("TASK-1".into()),
                 description: "cargo test failed".into(),
-                evidence_json: r#"{"exit":101}"#.into(),
+                evidence_json: r#"[{"exit":101}]"#.into(),
                 recommended_fix: "fix the failing test".into(),
                 blocking: true,
                 file: Some("src/a.rs".into()),
@@ -602,21 +749,102 @@ mod tests {
         // Objects carrying `path` (planned_files_json) and plain strings
         // (forbidden_changes_json) both occur in the real schema.
         assert_eq!(
-            parse_paths(r#"[{"path":"a.rs"},{"path":"b.rs"}]"#),
+            parse_paths("c", r#"[{"path":"a.rs"},{"path":"b.rs"}]"#).unwrap(),
             ["a.rs", "b.rs"]
         );
-        assert_eq!(parse_paths(r#"["a.rs","b.rs"]"#), ["a.rs", "b.rs"]);
-        assert_eq!(parse_paths("[]"), Vec::<String>::new());
+        assert_eq!(
+            parse_paths("c", r#"["a.rs","b.rs"]"#).unwrap(),
+            ["a.rs", "b.rs"]
+        );
+        assert_eq!(parse_paths("c", "[]").unwrap(), Vec::<String>::new());
     }
 
     #[test]
-    fn unreadable_scope_json_yields_no_paths_rather_than_a_guess() {
-        // An empty scope authorises nothing, so this fails closed. The
-        // alternative — inventing a path list — would authorise writes nobody
-        // planned.
-        assert_eq!(parse_paths("not json"), Vec::<String>::new());
-        assert_eq!(parse_paths(r#"{"path":"a.rs"}"#), Vec::<String>::new());
-        assert_eq!(parse_paths(r#"[1,2,3]"#), Vec::<String>::new());
+    fn unreadable_scope_json_is_an_error_not_an_empty_list() {
+        // Reason this test changed: it used to assert these parse to an empty
+        // list "because an empty scope authorises nothing". That holds for
+        // planned_files but is backwards for forbidden_changes ("nothing
+        // forbidden") and allowed_commands (allowlist dropped), so every
+        // unreadable column must be reported and the gate must treat the scope
+        // as broken.
+        for bad in [
+            "not json",
+            r#"["secrets/**""#,
+            r#"{"path":"a.rs"}"#,
+            "[1,2,3]",
+            r#"["ok",{"nopath":1}]"#,
+            "",
+        ] {
+            let err = parse_paths("forbidden_changes_json", bad).unwrap_err();
+            assert!(err.contains("forbidden_changes_json"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_task_with_a_damaged_scope_column_has_no_readable_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json,
+                     forbidden_changes_json, allowed_commands_json, status)
+                 VALUES ('TASK-2', 'Damaged', '', '[]', '[\"secrets/**\"', '[]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        let err = scope(repo, "TASK-2").unwrap_err();
+        assert!(err.contains("forbidden_changes_json"), "{err}");
+        let err = scopes(repo, &["TASK-2".to_string()]).unwrap_err();
+        assert!(err.contains("forbidden_changes_json"), "{err}");
+    }
+
+    #[test]
+    fn a_task_whose_planned_file_has_an_unknown_allowed_change_has_no_readable_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        for (id, column, value) in [
+            (
+                "TASK-A",
+                "planned_files_json",
+                r#"[{"path":"a.rs","allowed_change":"rewrite"}]"#,
+            ),
+            (
+                "TASK-B",
+                "agent_appended_planned_files_json",
+                r#"[{"path":"a.rs","allowed_change":7}]"#,
+            ),
+        ] {
+            store
+                .connection()
+                .execute(
+                    &format!("INSERT INTO tasks (id, title, description, {column}, status) VALUES (?1, 't', '', ?2, 'in_progress')"),
+                    rusqlite::params![id, value],
+                )
+                .unwrap();
+            // The store hands back the union of the planned and agent-appended
+            // columns as `planned_files_json`, so that is the column named.
+            let err = scope(repo, id).unwrap_err();
+            assert!(err.contains("planned_files_json"), "{column}: {err}");
+        }
+        // The four names the Go decoder accepts, and a task with none, still read.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json, status) VALUES ('TASK-C', 't', '', ?1, 'in_progress')",
+                [r#"[{"path":"a","allowed_change":"create"},{"path":"b","allowed_change":"read_only"},{"path":"c"},"d"]"#],
+            )
+            .unwrap();
+        assert_eq!(
+            scope(repo, "TASK-C").unwrap().unwrap().planned_files,
+            ["a", "b", "c", "d"]
+        );
     }
 
     #[test]
@@ -673,5 +901,103 @@ mod tests {
         );
         assert!(real_view.error.is_empty());
         assert!(real_view.leases.is_empty(), "nothing was leased");
+    }
+
+    /// A lease row as a writer would have left it.
+    fn lease_row(db: &Path, task: &str, expires_at: Option<&str>) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO task_leases (id, task_id, owner, lease_token, status, created_at, expires_at)
+             VALUES (?1, ?1, 'agent', 'token', 'active', '2026-01-01T00:00:00Z', ?2)",
+            rusqlite::params![task, expires_at],
+        )
+        .unwrap();
+    }
+
+    fn lease_status(db: &Path, task: &str) -> String {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM task_leases WHERE id = ?1",
+                [task],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The view is a read. It used to open the store read-write and sweep every
+    /// lapsed lease to `stale` on the way, so looking at a repository changed
+    /// the file an agent was working against; and one lease with an unreadable
+    /// expiry failed the whole listing.
+    #[test]
+    fn a_view_writes_nothing_and_judges_each_lease_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        drop(dc_store::Store::open(&db).unwrap());
+        lease_row(&db, "live", Some("2999-01-01T00:00:00Z"));
+        lease_row(&db, "lapsed", Some("2001-01-01T00:00:00Z"));
+        lease_row(&db, "garbled", Some("sometime next week"));
+        lease_row(&db, "forever", None);
+
+        let v = view(repo);
+        assert!(v.available, "{}", v.error);
+        assert!(
+            v.error.is_empty(),
+            "one bad row does not fail the view: {}",
+            v.error
+        );
+        let listed: Vec<(&str, Option<&str>)> = v
+            .leases
+            .iter()
+            .map(|l| (l.task_id.as_str(), l.expiry_error.as_deref()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("forever", None),
+                ("garbled", Some("sometime next week")),
+                ("live", None),
+            ],
+            "a lapsed lease is not held; an unreadable one is shown, not hidden"
+        );
+
+        // Nothing was swept: the lapsed row is still marked active.
+        assert_eq!(lease_status(&db, "lapsed"), "active");
+        // And reading again says the same thing.
+        assert_eq!(view(repo).leases.len(), 3);
+    }
+
+    /// Scopes are read through the same read-only handle.
+    #[test]
+    fn scope_reads_a_store_it_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json,
+                     forbidden_changes_json, allowed_commands_json, status)
+                 VALUES ('TASK-7', 'Read only', '', '[\"a.rs\"]', '[]', '[]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&db, permissions).unwrap();
+
+        let found = scopes(repo, &["TASK-7".to_owned()]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].planned_files, vec!["a.rs"]);
+        assert_eq!(scope(repo, "TASK-7").unwrap().unwrap().id, "TASK-7");
+        let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&db, permissions).unwrap();
     }
 }

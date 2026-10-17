@@ -4,6 +4,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { isCaseInsensitiveFs, displayName, identityKey, isPathAmong } from "../repos/paths";
   import { portal } from "../dom/portal";
+  import { bindHorizontalWheel } from "../dom/overflowHint";
   import { isTauri } from "../platform";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
@@ -11,7 +12,7 @@
   import { LAYERS } from "../ui/layers";
   import { popover } from "../ui/popover";
   import { copyText } from "../desktop/clipboard";
-  import { enumerateFocusables } from "../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     ChevronDown,
     ChevronRight,
@@ -27,7 +28,7 @@
     ListChecks,
     SquareTerminal,
   } from "@lucide/svelte";
-  import { askConfirm, askText } from "../stores/modalStore";
+  import { askConfirm, askText, isPromptOpen } from "../stores/modalStore";
   import {
     computeTabLayout,
     normalizeGroupName,
@@ -384,8 +385,9 @@
 
   // A tab closed while its menu was open leaves zombie state that only
   // Escape could dismiss; drop the menu the moment its tab vanishes.
+  const menuTabOpen = $derived(!menu || $repoStore.openTabs.some((tab) => tab.id === menu?.id));
   $effect(() => {
-    if (menu && !$repoStore.openTabs.some((tab) => tab.id === menu?.id)) {
+    if (!menuTabOpen) {
       untrack(() => { menu = null; });
     }
   });
@@ -494,34 +496,6 @@
     }, 0);
   }
 
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
-  }
-
   $effect(() => {
     if (menu && menuEl) focusPopup(menuEl);
   });
@@ -589,6 +563,10 @@
       return;
     }
     if (shouldSkipWebviewShortcut(e, isTauri())) return;
+    // A confirm or name prompt belongs to the tab it was raised on. Switching,
+    // closing and opening tabs wait until it is answered (the native menu
+    // accelerators are held by the same rule in App's canDispatch).
+    if (isPromptOpen()) return;
     switch (classifyShortcut(e)) {
       case "closeActiveTab":
         if (isTypingTarget(e.target)) return;
@@ -625,6 +603,14 @@
     // window listener for the component's whole life, not a popover's.
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
+  });
+
+  // The strip hides its track (a classic scrollbar was a blank band under the
+  // tabs whenever the system shows scroll bars), so a mouse wheel pans it.
+  $effect(() => {
+    const el = scroller;
+    if (!el) return;
+    return bindHorizontalWheel(el);
   });
 
   function endDrag() {
@@ -917,12 +903,13 @@
     endDrag();
   }
 
+  const activeRepoTabId = $derived($repoStore.activeTabId);
   $effect(() => {
     // Re-run on activation changes, not just on element binding — otherwise
-    // the newly active tab never scrolls into view (mirrors ViewTabBar).
-    const tabs = $repoStore.openTabs;
-    const activeId = tabs.find((tab) => tab.isActive)?.id ?? null;
-    void activeId;
+    // the newly active tab never scrolls into view (mirrors ViewTabBar). Keyed
+    // on the id by value, so a status poll does not yank the strip back to
+    // the active tab while someone is scrolling it.
+    void activeRepoTabId;
     const active = scroller?.querySelector("[data-active-repo='true']");
     if (active instanceof HTMLElement) {
       active.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -1332,7 +1319,7 @@
       <div class="relative min-w-0 max-w-full shrink self-stretch">
       <div
         bind:this={scroller}
-        class="h-full flex items-center gap-1 overflow-x-auto min-w-0 py-1"
+        class="gp-header-scroll h-full flex items-center gap-1 min-w-0 py-1"
         role="tablist"
         tabindex="-1"
         aria-label="Open repositories"

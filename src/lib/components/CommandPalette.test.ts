@@ -9,25 +9,24 @@ const source = ["CommandPalette.svelte", "../palette/catalog.ts", "../palette/mo
   .map(path => readFileSync(join(dirname(fileURLToPath(import.meta.url)), path), "utf8")).join("\n");
 
 describe("CommandPalette", () => {
-  it("lists Quick Commit as a command that prompts then commits all", () => {
-    expect(source).toContain('id: "quick_commit"');
-    expect(source).toContain("Quick Commit…");
-    expect(source).toContain("promptQuickCommit");
-    expect(source).toContain("GitCommit");
-  });
-
-  it("supports mode prefixes for commits, branches, and code symbols", () => {
-    expect(source).toContain('mode = $derived.by');
-    expect(source).toContain('trimmed.startsWith("#")');
-    expect(source).toContain('trimmed.startsWith("@")');
-    expect(source).toContain('trimmed.startsWith(":")');
-    expect(source).toContain('trimmed.startsWith("?")');
-  });
-
+  // Rendered in harness/paletteChecks.js: "fuzzy aliases find Quick Commit",
+  // "clean-tree Quick Commit explains why it cannot run", "follow-on prompts
+  // receive focus after the palette closes"; the ? help, : symbol, :: workspace,
+  // @ branch and # commit modes are each typed and driven there.
   it("supports match highlighting and frecency tracking", () => {
     expect(source).toContain("highlightMatches");
     expect(source).toContain("readFrecency");
     expect(source).toContain("recordFrecency");
+  });
+
+  // Behaviour is driven in harness/paletteChecks.js ("a remote branch row
+  // keeps its remote"): a remote row carries `origin/x`, and the palette
+  // sends `origin/x` as BranchList does; the backend maps it to the local
+  // tracking branch. Sending `x` would answer with any local `x`, even one
+  // tracking a different remote.
+  it("checks out a remote branch row by its remote-qualified name", () => {
+    expect(source).toContain("repoStore.checkoutBranch(checkoutNameFor(branch))");
+    expect(source).not.toContain("repoStore.checkoutBranch(branch.name)");
   });
 
   it("exposes Settings and MCP setup as commands", () => {

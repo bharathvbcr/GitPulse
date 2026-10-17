@@ -10,7 +10,6 @@ use crate::engine::git_cli::{self, validate_repo, BoundedRun};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -41,14 +40,10 @@ const PREVIEW_SKIP_DEBOUNCED: &str =
 /// carry coverage gaps. 8 MiB is a hard ceiling, not a typical size.
 pub const STDOUT_CAP: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
-struct PreviewDebounceEntry {
-    until: Instant,
-    content_fingerprint: u64,
-}
+type DebounceKey = (String, String);
 
-fn preview_debounces() -> &'static Mutex<HashMap<(String, String), PreviewDebounceEntry>> {
-    static MAP: OnceLock<Mutex<HashMap<(String, String), PreviewDebounceEntry>>> = OnceLock::new();
+fn preview_debounces() -> &'static Mutex<HashMap<DebounceKey, Instant>> {
+    static MAP: OnceLock<Mutex<HashMap<DebounceKey, Instant>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -59,10 +54,24 @@ pub(crate) fn clear_preview_debounces() {
     }
 }
 
-fn content_fingerprint(content: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
+/// Claims the debounce slot for `key`, or says it is still held.
+///
+/// Check and insert happen under the one `&mut` borrow of the map, so two
+/// callers racing on the same file cannot both be admitted. Expired slots are
+/// evicted on every call: a window lasts [`PREVIEW_DEBOUNCE`], so the map
+/// holds at most the files touched within one window rather than every file
+/// ever previewed.
+fn admit_preview_slot(
+    map: &mut HashMap<DebounceKey, Instant>,
+    key: DebounceKey,
+    now: Instant,
+) -> bool {
+    map.retain(|_, until| *until > now);
+    if map.contains_key(&key) {
+        return false;
+    }
+    map.insert(key, now + PREVIEW_DEBOUNCE);
+    true
 }
 
 /// Whether `devmap preview` should run for this relative path.
@@ -195,27 +204,17 @@ static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(test)]
 static TEST_STATUS: Mutex<Option<CliStatus>> = Mutex::new(None);
 
-/// Serializes every test that installs a global `devmap` override.
+/// Every test that installs a global `devmap` override takes
+/// [`crate::test_support::env::env_serial`], the process's one environment lock.
 ///
 /// `TEST_BINARY` is process-wide, so two tests that bind their own stub at the
 /// same time resolve each other's binary. The symptom is not a clean failure:
 /// each stub appends argv to a log inside *its own* fixture, so one test
 /// asserts against a log that is missing a spawn while another test's log
-/// quietly holds it — and which test fails moves from run to run. Latent for as
-/// long as the override has existed; anything that lengthens the window between
-/// binding and unbinding makes it likelier.
-///
-/// Poison-tolerant, following [`crate::harness::sidecar::test_serial`]: a
-/// panicking test must not wedge every later one, and the data behind this lock
-/// is the emptiness of `()`.
-#[cfg(test)]
-pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
+/// quietly holds it — and which test fails moves from run to run. A private
+/// lock here was also a lock that readers of `GITPULSE_TOOL_CONFIG` under a
+/// different one never took, which is how `resolve_binary` could observe a
+/// concurrently bound config.
 #[cfg(test)]
 fn set_test_binary(path: Option<String>) {
     *TEST_BINARY
@@ -240,7 +239,7 @@ fn set_test_status(status: Option<CliStatus>) {
 pub(crate) struct TestBinaryBinding(
     /// Held, never read: the serial's whole job is to be released on drop.
     #[allow(dead_code)]
-    std::sync::MutexGuard<'static, ()>,
+    crate::test_support::env::EnvGuard,
 );
 
 #[cfg(test)]
@@ -273,7 +272,7 @@ impl TestBinaryBinding {
 /// binding is dropped.
 #[cfg(test)]
 pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
-    let serial = test_serial();
+    let serial = crate::test_support::env::env_serial();
     set_test_binary(Some(path.into()));
     TestBinaryBinding(serial)
 }
@@ -556,6 +555,24 @@ fn parse_json_stdout(stdout: &str) -> Option<Value> {
     serde_json::from_str(trimmed).ok()
 }
 
+/// Why a failed `--json` devmap run failed.
+///
+/// Under `--json` DevMap answers a refusal on stdout as one `{"error": ...}`
+/// document and keeps its human lines off stderr, so stderr alone is empty for
+/// exactly the failures that have a reason. The envelope's text is DevMap's own
+/// and names the file or argument at fault; stderr is the fallback for a run
+/// that wrote no envelope (an older binary, a crash), and `fallback` the last
+/// resort. Never empty.
+pub(super) fn failure_detail(stdout: &str, stderr: &str, fallback: String) -> String {
+    let envelope = parse_json_stdout(stdout)
+        .and_then(|doc| doc.get("error").and_then(Value::as_str).map(str::to_string))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    envelope
+        .or_else(|| Some(stderr.trim().to_string()).filter(|text| !text.is_empty()))
+        .unwrap_or(fallback)
+}
+
 fn timed_out(err: &str) -> bool {
     err.contains("timed out") || err.contains("timeout")
 }
@@ -594,32 +611,153 @@ fn build_outcome_from_run(binary: &ResolvedDevmap, run: BoundedRun) -> BuildOutc
 /// with an unusual ignore setup must not silently lose its code intelligence
 /// over a cosmetic concern. It is logged rather than swallowed, and
 /// initialization surfaces the same refusal in the UI for the active tab.
-fn spawn_build(repo_path: &str, args: &[&str]) -> Result<BuildOutcome, String> {
-    let repo = validate_repo(repo_path)?;
-    let _guard = BuildGuard::try_acquire(&repo)?;
-    let binary = resolve_binary()?;
-    if let super::init::ExcludeOutcome::Refused { reason } =
-        super::init::ensure_state_dir_excluded(&repo)
-    {
-        log::warn!(
-            target: "devmap",
-            "{}: building an index whose state directory git will show as untracked — {reason}",
-            repo.display()
-        );
+fn spawn_build(repo_path: &str, args: &'static [&'static str]) -> Result<BuildOutcome, String> {
+    prepare_args(repo_path, args)?.run_then(|outcome| outcome)
+}
+
+const MANIFEST_BUILD_ARGS: &[&str] = &["build", "--manifest", "--json"];
+const INCREMENTAL_BUILD_ARGS: &[&str] = &["build", "--json"];
+
+/// A build whose writer slot is already claimed and whose child has not run.
+///
+/// Everything that must be settled before a caller can answer happens in
+/// [`prepare`]: the repository is validated, the per-repository
+/// [`BuildGuard`] is held and the binary is resolved. A caller that hands the
+/// run to another thread therefore cannot race a second build in between —
+/// [`is_build_in_flight`] is already true when `prepare` returns.
+pub struct PreparedBuild {
+    repo: PathBuf,
+    binary: ResolvedDevmap,
+    args: &'static [&'static str],
+    guard: BuildGuard,
+}
+
+/// Claim the writer slot for a build of `repo_path` without running it.
+///
+/// `manifest` selects `devmap build --manifest --json` (see [`build`]) over the
+/// incremental `devmap build --json` (see [`refresh`]).
+pub fn prepare(repo_path: &str, manifest: bool) -> Result<PreparedBuild, String> {
+    prepare_args(
+        repo_path,
+        if manifest {
+            MANIFEST_BUILD_ARGS
+        } else {
+            INCREMENTAL_BUILD_ARGS
+        },
+    )
+}
+
+fn prepare_args(repo_path: &str, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
+    claim_build(repo_path)
+        .map_err(ClaimRefusal::into_message)?
+        .prepare_args(args)
+}
+
+/// Why [`claim_build`] could not hand out a permit.
+#[derive(Debug)]
+pub enum ClaimRefusal {
+    /// Another probe or build already holds the repository's writer slot.
+    Busy(String),
+    /// The path is not a repository this app may index; the message says why.
+    Invalid(String),
+}
+
+impl ClaimRefusal {
+    fn into_message(self) -> String {
+        match self {
+            ClaimRefusal::Busy(message) | ClaimRefusal::Invalid(message) => message,
+        }
     }
-    match run_devmap(&binary, &repo, args, None, BUILD_DEADLINE) {
-        Ok(run) => Ok(build_outcome_from_run(&binary, run)),
-        Err(e) if timed_out(&e) => Ok(BuildOutcome {
-            ok: false,
-            binary: binary.path,
-            lookup: binary.lookup,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: e,
-            timed_out: true,
-            report: None,
-        }),
-        Err(e) => Err(e),
+}
+
+/// The exclusive right to probe and build one repository's index.
+///
+/// The live gate used to take the per-repository [`BuildGuard`] only when its
+/// build was about to spawn, so every caller that arrived while the first was
+/// still asking `devmap status` ran a status child of its own, and one that
+/// probed just before the first build finished then built a second time behind
+/// it. A permit is the guard claimed *early*: held from the first question to
+/// the last answer, it makes the probe and the build one operation per
+/// repository. A concurrent caller is refused at once ([`ClaimRefusal::Busy`]),
+/// which the live gate maps to `skip_building`; the frontend retries on its own
+/// backoff, and that retry is the coalesced follow-up. It is the same guard
+/// [`PreparedBuild`] holds, handed on by [`BuildPermit::prepare`], not a second
+/// lock beside it.
+#[derive(Debug)]
+pub struct BuildPermit {
+    repo: PathBuf,
+    guard: BuildGuard,
+}
+
+/// Claim `repo_path`'s writer slot, refusing (never queueing) when it is held.
+pub fn claim_build(repo_path: &str) -> Result<BuildPermit, ClaimRefusal> {
+    let repo = validate_repo(repo_path).map_err(ClaimRefusal::Invalid)?;
+    let guard = BuildGuard::try_acquire(&repo).map_err(ClaimRefusal::Busy)?;
+    Ok(BuildPermit { repo, guard })
+}
+
+impl BuildPermit {
+    /// [`prepare`] under this permit: the writer slot stays held, unbroken,
+    /// from the claim to the end of the build.
+    pub fn prepare(self, manifest: bool) -> Result<PreparedBuild, String> {
+        self.prepare_args(if manifest {
+            MANIFEST_BUILD_ARGS
+        } else {
+            INCREMENTAL_BUILD_ARGS
+        })
+    }
+
+    fn prepare_args(self, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
+        let binary = resolve_binary()?;
+        Ok(PreparedBuild {
+            repo: self.repo,
+            binary,
+            args,
+            guard: self.guard,
+        })
+    }
+}
+
+impl PreparedBuild {
+    /// Run the child, then hand its outcome to `settle` while the writer slot
+    /// is still held.
+    ///
+    /// Settling first is what lets a caller record what the build meant before
+    /// anyone can observe the repository as idle: between the child exiting and
+    /// the guard dropping, [`is_build_in_flight`] still answers true.
+    pub fn run_then<R>(self, settle: impl FnOnce(Result<BuildOutcome, String>) -> R) -> R {
+        let PreparedBuild {
+            repo,
+            binary,
+            args,
+            guard,
+        } = self;
+        if let super::init::ExcludeOutcome::Refused { reason } =
+            super::init::ensure_state_dir_excluded(&repo)
+        {
+            log::warn!(
+                target: "devmap",
+                "{}: building an index whose state directory git will show as untracked — {reason}",
+                repo.display()
+            );
+        }
+        let outcome = match run_devmap(&binary, &repo, args, None, BUILD_DEADLINE) {
+            Ok(run) => Ok(build_outcome_from_run(&binary, run)),
+            Err(e) if timed_out(&e) => Ok(BuildOutcome {
+                ok: false,
+                binary: binary.path,
+                lookup: binary.lookup,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: e,
+                timed_out: true,
+                report: None,
+            }),
+            Err(e) => Err(e),
+        };
+        let settled = settle(outcome);
+        drop(guard);
+        settled
     }
 }
 
@@ -628,12 +766,12 @@ fn spawn_build(repo_path: &str, args: &[&str]) -> Result<BuildOutcome, String> {
 /// The manifest flag is what writes the consumer artifacts `repo_map.json` and
 /// `code_graph.json`; a plain build updates the database only.
 pub fn build(repo_path: &str) -> Result<BuildOutcome, String> {
-    spawn_build(repo_path, &["build", "--manifest", "--json"])
+    spawn_build(repo_path, MANIFEST_BUILD_ARGS)
 }
 
 /// Incremental rebuild (`devmap build --json` without `--full`).
 pub fn refresh(repo_path: &str) -> Result<BuildOutcome, String> {
-    spawn_build(repo_path, &["build", "--json"])
+    spawn_build(repo_path, INCREMENTAL_BUILD_ARGS)
 }
 
 /// Installation health `devmap doctor --json` already measures and GitPulse
@@ -768,11 +906,11 @@ pub fn doctor(repo_path: &str) -> DoctorReport {
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
     if !run.success {
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap doctor exited {}", run.status_code)
-        } else {
-            stderr.trim().to_string()
-        };
+        let detail = failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap doctor exited {}", run.status_code),
+        );
         return unavailable(detail, Some(binary.path));
     }
     let Some(payload) = parse_json_stdout(&stdout) else {
@@ -928,11 +1066,11 @@ pub fn status(repo_path: &str) -> CliStatus {
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
     if !run.success {
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap status exited {}", run.status_code)
-        } else {
-            stderr.trim().to_string()
-        };
+        let detail = failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap status exited {}", run.status_code),
+        );
         return CliStatus {
             available: false,
             binary: Some(binary.path),
@@ -984,18 +1122,6 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
         }
     };
     let repo_key = repo.to_string_lossy().into_owned();
-    let fingerprint = content_fingerprint(content);
-    let now = Instant::now();
-    if let Ok(map) = preview_debounces().lock() {
-        if let Some(entry) = map.get(&(repo_key.clone(), file_path.to_string())) {
-            if entry.until > now {
-                // Content changes inside the window still coalesce: a fixture
-                // rewrite storm must not spawn one child per FS event.
-                let _ = fingerprint == entry.content_fingerprint;
-                return skipped_preview_file(file_path, PREVIEW_SKIP_DEBOUNCED);
-            }
-        }
-    }
     // Refuse while a build holds the writer lock — preview reads the store.
     {
         let guards = build_guards()
@@ -1023,16 +1149,22 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             }
         }
     };
-    // Admit the debounce slot before spawn so concurrent callers for the same
-    // file see SkipDebounced rather than racing a second child.
-    if let Ok(mut map) = preview_debounces().lock() {
-        map.insert(
+    // Claim the debounce slot before spawn so concurrent callers for the same
+    // file see SkipDebounced rather than racing a second child. Content
+    // changes inside the window coalesce too: a fixture rewrite storm must not
+    // spawn one child per FS event.
+    let admitted = {
+        let mut map = preview_debounces()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admit_preview_slot(
+            &mut map,
             (repo_key.clone(), file_path.to_string()),
-            PreviewDebounceEntry {
-                until: Instant::now() + PREVIEW_DEBOUNCE,
-                content_fingerprint: fingerprint,
-            },
-        );
+            Instant::now(),
+        )
+    };
+    if !admitted {
+        return skipped_preview_file(file_path, PREVIEW_SKIP_DEBOUNCED);
     }
     let run = match run_devmap(
         &binary,
@@ -1054,11 +1186,11 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
     if !run.success {
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap preview exited {}", run.status_code)
-        } else {
-            stderr.trim().to_string()
-        };
+        let detail = failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap preview exited {}", run.status_code),
+        );
         return PreviewFileResult {
             file_path: file_path.to_string(),
             available: false,
@@ -1180,6 +1312,40 @@ fn omitted_preview_file(path: &str) -> PreviewFileResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_json_refusal_is_read_from_the_envelope_not_from_stderr() {
+        let envelope = r#"{"error":"refusing to rewrite /w/.mcp.json: not a JSON object"}"#;
+        // Under --json DevMap prints the envelope on stdout and nothing on stderr.
+        assert_eq!(
+            failure_detail(envelope, "", "devmap integrate exited 1".into()),
+            "refusing to rewrite /w/.mcp.json: not a JSON object"
+        );
+        // The envelope is DevMap's own text; a progress line on stderr does not replace it.
+        assert_eq!(
+            failure_detail(envelope, "indexing...\n", "x".into()),
+            "refusing to rewrite /w/.mcp.json: not a JSON object"
+        );
+    }
+
+    #[test]
+    fn a_failure_without_an_envelope_keeps_stderr_then_the_exit_fallback() {
+        assert_eq!(failure_detail("", " boom \n", "exited 2".into()), "boom");
+        for stdout in [
+            "",
+            "not json",
+            r#"{"error":""}"#,
+            r#"{"error":7}"#,
+            r#"{"files":3}"#,
+            "[]",
+        ] {
+            assert_eq!(
+                failure_detail(stdout, "  ", "exited 2".into()),
+                "exited 2",
+                "{stdout}"
+            );
+        }
+    }
+
     use super::*;
     use crate::procguard::LockedSpawn;
 
@@ -1651,7 +1817,7 @@ exit 2
         // under test would never happen. Acquired after the sidecar's, which is
         // the order every binding site uses; reversing it anywhere would be a
         // lock-order inversion.
-        let _no_override = test_serial();
+        let _no_override = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&_lock)
             .set("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary");
         let err = resolve_binary().expect_err("must refuse");
@@ -1822,6 +1988,34 @@ exit 2
     }
 
     #[test]
+    fn racing_callers_claim_one_debounce_slot_and_expired_slots_are_evicted() {
+        let map = Mutex::new(HashMap::new());
+        let key = ("/repo".to_string(), "src/lib.rs".to_string());
+        let now = Instant::now();
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    let mut guard = map.lock().unwrap();
+                    if admit_preview_slot(&mut guard, key.clone(), now) {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut map = map.into_inner().unwrap();
+        for i in 0..100 {
+            admit_preview_slot(&mut map, ("/repo".into(), format!("f{i}.rs")), now);
+        }
+        assert_eq!(map.len(), 101);
+        let later = now + PREVIEW_DEBOUNCE + Duration::from_millis(1);
+        assert!(admit_preview_slot(&mut map, key, later));
+        assert_eq!(map.len(), 1, "expired slots must be evicted");
+    }
+
+    #[test]
     fn second_build_for_same_repo_is_refused() {
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
@@ -1927,6 +2121,9 @@ exit 2
             "source freshness unverified: this generation has no repository root",
         ] {
             let _ = fs::remove_file(repo.path().join("argv.log"));
+            // Each reason is its own case. The rest the previous iteration's
+            // build earned belongs to the governor's tests in live.rs.
+            crate::devmap::clear_live_echo_cooldown(canonical.to_str().unwrap());
             devmap.set_status(available_status(&format!(
                 r#"{{"is_fresh":false,"schema_outdated":false,"degraded_reason":{reason:?}}}"#
             )));
@@ -1957,6 +2154,9 @@ exit 2
             r#"{"is_fresh":false,"schema_outdated":false,"message":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
         ] {
             let _ = fs::remove_file(repo.path().join("argv.log"));
+            // Each payload is its own case. The rest the previous iteration's
+            // build earned belongs to the governor's tests in live.rs.
+            crate::devmap::clear_live_echo_cooldown(canonical.to_str().unwrap());
             devmap.set_status(available_status(payload));
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
             assert_eq!(
@@ -2062,7 +2262,7 @@ exit 2
         // here is a concurrently installed `TEST_STATUS`, and that is the serial
         // guarding it. Holding the sidecar's instead would exclude today's
         // setters only because all of them happen to take both.
-        let _lock = test_serial();
+        let _lock = crate::test_support::env::env_serial();
         for path in [
             "",
             "relative/path",
@@ -2212,6 +2412,176 @@ exit 2
                 "{command} accepted an explicit failure with exit 0"
             );
         }
+    }
+    /// Install one stub that serves every repository and records, in a shared
+    /// directory, how many stub children are alive at the same moment.
+    ///
+    /// Each repository's own `argv.log` (the stub runs with the repository as
+    /// its working directory) says how many `status` and `build` children that
+    /// repository was charged. `status` and `build` both linger long enough
+    /// that callers released together genuinely overlap.
+    #[cfg(unix)]
+    fn write_overlap_devmap(dir: &Path, gate: &Path) -> PathBuf {
+        let path = dir.join("devmap");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> argv.log
+touch "{gate}/alive.$$"
+ls "{gate}" | grep -c '^alive\.' >> "{gate}/peak.log"
+if [ "$1" = "status" ]; then
+  sleep 0.3
+  rm -f "{gate}/alive.$$"
+  printf '%s\n' '{{"is_fresh":false,"schema_outdated":false}}'
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  sleep 0.6
+  rm -f "{gate}/alive.$$"
+  printf '%s\n' '{{"ok":true}}'
+  exit 0
+fi
+rm -f "{gate}/alive.$$"
+exit 2
+"#,
+            gate = gate.display()
+        );
+        fs::write(&path, script).expect("write overlap devmap");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    fn count_argv(repo: &Path, verb: &str) -> usize {
+        argv_log(repo)
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some(verb))
+            .count()
+    }
+
+    /// A watcher storm that reaches `maybe_refresh` from many threads at once,
+    /// for several repositories, costs each repository one probe and at most
+    /// one build, and never more live children than the background class may
+    /// hold.
+    ///
+    /// The per-repo guard used to be taken only when the build spawned, so every
+    /// caller that arrived while the first was still probing ran its own
+    /// `devmap status` child, and a caller that probed before the first build
+    /// finished then ran a second, redundant build behind it.
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_live_refreshes_cost_one_probe_and_one_build_per_repo() {
+        const REPOS: usize = 4;
+        const CALLERS: usize = 6;
+        let _lock = crate::harness::sidecar::test_serial();
+        let repos: Vec<_> = (0..REPOS).map(|_| git_repo()).collect();
+        let canonical: Vec<String> = repos
+            .iter()
+            .map(|repo| {
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let gate = tempfile::TempDir::new().expect("gate dir");
+        let bin_dir = tempfile::TempDir::new().expect("bin dir");
+        let bin = write_overlap_devmap(bin_dir.path(), gate.path());
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(REPOS * CALLERS));
+        let mut handles = Vec::new();
+        for path in &canonical {
+            for _ in 0..CALLERS {
+                let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    crate::engine::git_cli::with_background_processes(|| {
+                        crate::devmap::maybe_refresh(&path, true)
+                    })
+                }));
+            }
+        }
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("refresh thread"))
+            .collect();
+
+        let mut total_builds = 0;
+        for repo in &repos {
+            let statuses = count_argv(repo.path(), "status");
+            let builds = count_argv(repo.path(), "build");
+            assert!(
+                statuses <= 1,
+                "{statuses} probes for one repo:\n{}",
+                argv_log(repo.path())
+            );
+            assert!(
+                builds <= 1,
+                "{builds} builds for one repo:\n{}",
+                argv_log(repo.path())
+            );
+            total_builds += builds;
+        }
+        assert!(
+            total_builds >= 1,
+            "the storm never produced a build: {outcomes:?}"
+        );
+        let refreshed = outcomes
+            .iter()
+            .filter(|outcome| outcome.decision == crate::devmap::LiveRefreshDecision::Refresh)
+            .count();
+        assert_eq!(
+            refreshed, total_builds,
+            "a refresh decision without a build: {outcomes:?}"
+        );
+        let peak = fs::read_to_string(gate.path().join("peak.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (1..=4).contains(&peak),
+            "background devmap children alive at once: {peak}"
+        );
+    }
+
+    /// A caller turned away by a held permit spawns nothing and is told the
+    /// writer is busy; the same call is admitted the moment the permit drops.
+    #[test]
+    #[cfg(unix)]
+    fn a_held_permit_turns_a_live_refresh_away_without_a_probe() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let path = canonical.to_str().unwrap();
+        let _devmap = bind_recording_devmap(repo.path());
+        let permit = claim_build(path).expect("first claim");
+        assert!(claim_build(path).is_err(), "a second claim must be refused");
+        let busy = crate::devmap::maybe_refresh(path, true);
+        assert_eq!(
+            busy.decision,
+            crate::devmap::LiveRefreshDecision::SkipBuilding
+        );
+        assert!(busy.facts.already_building, "{busy:?}");
+        assert_eq!(
+            argv_log(repo.path()),
+            "",
+            "a refused caller spawned a child"
+        );
+        drop(permit);
+        assert!(!is_build_in_flight(path));
+        let admitted = crate::devmap::maybe_refresh(path, true);
+        assert_ne!(
+            admitted.decision,
+            crate::devmap::LiveRefreshDecision::SkipBuilding,
+            "{admitted:?}"
+        );
+        assert!(count_argv(repo.path(), "status") >= 1);
     }
     /// A repository is indexed by the live gate whenever it is a retained tab,
     /// but initialization runs only for the *active* one. So the build path

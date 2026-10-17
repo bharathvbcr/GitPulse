@@ -58,6 +58,18 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         "function_declaration" => {
             Some((SymbolKind::Function, get_child_text(node, "name", source)?))
         }
+        // `val Task.label: String get() = …` is an extension property: a
+        // callable keyed by its receiver exactly like an extension function, and
+        // the only kind of Kotlin property that is a symbol here. An ordinary
+        // property is a field or a local, which the typed-binding reader owns.
+        "property_declaration" => {
+            let _ = extension_property_receiver(node)?;
+            let declaration = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "variable_declaration")?;
+            let name = declaration.named_child(0)?;
+            Some((SymbolKind::Function, get_node_text(name, source)))
+        }
         // `FAST` in `enum class Mode { FAST, SLOW }`. Emitted for the same
         // reason as the Swift case: a `Mode.FAST` reference is already recorded
         // and had no node it could resolve to.
@@ -95,20 +107,24 @@ fn class_kind(node: Node, source: &str) -> SymbolKind {
 /// after the name is a return type or a parameter list, so position is what
 /// separates them — the grammar gives the receiver no field of its own.
 fn extension_receiver(node: Node, source: &str) -> Option<String> {
-    if node.kind() != "function_declaration" {
-        return None;
-    }
-    let name = node.child_by_field_name("name")?;
-    let mut cursor = node.walk();
-    let mut receiver = None;
-    for child in node.children(&mut cursor) {
-        if child.id() == name.id() {
-            break;
+    let receiver = if node.kind() == "property_declaration" {
+        extension_property_receiver(node)
+    } else if node.kind() == "function_declaration" {
+        let name = node.child_by_field_name("name")?;
+        let mut cursor = node.walk();
+        let mut receiver = None;
+        for child in node.children(&mut cursor) {
+            if child.id() == name.id() {
+                break;
+            }
+            if child.kind() == "user_type" {
+                receiver = Some(child);
+            }
         }
-        if child.kind() == "user_type" {
-            receiver = Some(child);
-        }
-    }
+        receiver
+    } else {
+        None
+    };
     // `fun Map<String, Int>.pairs()` extends a specialised type; the identity a
     // call can join to is the bare type name, since that is what a declaration
     // of `Map` would be called.
@@ -123,6 +139,20 @@ fn extension_receiver(node: Node, source: &str) -> Option<String> {
         .trim()
         .to_string();
     (!bare.is_empty()).then_some(bare)
+}
+
+/// The receiver `user_type` of an extension property: the type written before
+/// the `variable_declaration` that names it.
+fn extension_property_receiver(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "user_type" => return Some(child),
+            "variable_declaration" => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Kotlin's four visibilities, read from the declaration's own modifier list.
@@ -249,5 +279,48 @@ pub(crate) fn exemption(
     if declaration.declared_kind == SymbolKind::Function && declaration.name == "main" {
         return Some((WiringKind::RuntimeEntryPoint, "Program entry point"));
     }
-    None
+    // An Android component is instantiated by the framework from its
+    // registration — the manifest, a layout, WorkManager — and no call in the
+    // corpus constructs it. Read from what the class extends, because
+    // `AndroidManifest.xml` is not indexed.
+    supertype_names(node, source)
+        .iter()
+        .find_map(|name| crate::wiring::android_component_supertype_reason(name))
+        .map(|reason| (WiringKind::RuntimeEntryPoint, reason))
+}
+
+/// The bare names a class declaration's supertype list writes:
+/// `class BootReceiver : BroadcastReceiver()` gives `BroadcastReceiver`.
+fn supertype_names(node: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !child.kind().starts_with("delegation_specifier") {
+            continue;
+        }
+        let mut specifiers = vec![child];
+        if child.kind() == "delegation_specifiers" {
+            let mut inner = child.walk();
+            specifiers = child
+                .named_children(&mut inner)
+                .filter(|specifier| specifier.kind() == "delegation_specifier")
+                .collect();
+        }
+        for specifier in specifiers {
+            let text = get_node_text(specifier, source);
+            let head = text
+                .split(['(', '<', ' '])
+                .next()
+                .unwrap_or("")
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !head.is_empty() {
+                names.push(head);
+            }
+        }
+    }
+    names
 }

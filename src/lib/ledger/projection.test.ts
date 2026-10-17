@@ -100,6 +100,33 @@ describe("eventToAction", () => {
     expect(a.ts).toBe(Date.parse("2026-09-01T12:00:00.000Z"));
   });
 
+  it("shows a row at the time it happened, not the time it was appended", () => {
+    const a = eventToAction(
+      event({
+        ts_utc: "2026-09-04T09:00:00.000Z",
+        detail_json: JSON.stringify({
+          source: "transcript",
+          occurred_at: "2026-09-01T12:00:05.250Z",
+          occurred_at_basis: "transcript",
+        }),
+      }),
+    );
+    expect(a.ts).toBe(Date.parse("2026-09-01T12:00:05.250Z"));
+  });
+
+  it("falls back to the append time when the row carries no event time", () => {
+    const appended = Date.parse("2026-09-01T12:00:00.000Z");
+    for (const detail_json of [
+      null,
+      "{}",
+      "not json",
+      JSON.stringify({ occurred_at: 12 }),
+      JSON.stringify({ occurred_at: "last tuesday" }),
+    ]) {
+      expect(eventToAction(event({ detail_json })).ts).toBe(appended);
+    }
+  });
+
   it("marks a blocked action as not ok", () => {
     expect(eventToAction(event({ outcome: "blocked" })).ok).toBe(false);
   });

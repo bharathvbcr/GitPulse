@@ -414,6 +414,11 @@ pub fn clean_commit_message(raw: &str) -> String {
 }
 
 /// Reads a model reply back into a branch name.
+///
+/// Empty when nothing usable is left. The result is checked against the same
+/// ref-name validator every branch the app creates passes through, so a
+/// suggestion the app would then refuse (`a..b`, `x.lock`) is repaired where
+/// it can be and dropped where it cannot.
 pub fn clean_branch_name(raw: &str) -> String {
     let text = strip_think_tags(raw);
     let text = strip_code_fence(text.trim());
@@ -431,41 +436,94 @@ pub fn clean_branch_name(raw: &str) -> String {
             ' ' | '\t' => '-',
             _ => continue,
         };
-        // Collapse runs of separators rather than emitting `feat//a--b`.
-        if (mapped == '-' || mapped == '/') && cleaned.ends_with(mapped) {
+        // Collapse runs of separators rather than emitting `feat//a--b`, and
+        // runs of dots, which git refuses as `..`.
+        if matches!(mapped, '-' | '/' | '.') && cleaned.ends_with(mapped) {
             continue;
         }
         cleaned.push(mapped);
     }
-    cleaned
-        .trim_matches(|c| c == '-' || c == '/' || c == '.')
-        .chars()
-        .take(60)
-        .collect()
+    let name = clean_branch_components(&cleaned);
+    // Truncation can expose a new trailing separator or `.lock`; clean again.
+    let name = clean_branch_components(&name.chars().take(60).collect::<String>());
+    match crate::engine::git_writer::validate_ref_name(&name) {
+        Ok(()) => name,
+        Err(_) => String::new(),
+    }
 }
 
-/// Removes `<think>…</think>` blocks, including one left unclosed by a
-/// truncated reply.
-pub fn strip_think_tags(raw: &str) -> String {
+/// Each `/`-separated component without edge dots or dashes and without a
+/// `.lock` suffix; empty components vanish.
+fn clean_branch_components(name: &str) -> String {
+    name.split('/')
+        .filter_map(|component| {
+            let mut component = component.trim_matches(|c| c == '-' || c == '.');
+            while let Some(stem) = component.strip_suffix(".lock") {
+                component = stem.trim_matches(|c| c == '-' || c == '.');
+            }
+            (!component.is_empty()).then_some(component)
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A reply with its reasoning removed.
+pub struct VisibleReply {
+    pub text: String,
+    /// The reply opened a `<think>` it never closed and nothing answerable
+    /// came before it: the model ran out inside its reasoning.
+    pub ended_in_reasoning: bool,
+}
+
+/// Removes reasoning from a reply.
+///
+/// Closed `<think>…</think>` blocks go. Text before an unclosed `<think>` is
+/// kept and the remainder dropped as reasoning. An orphan `</think>` with no
+/// opener (templates that put `<think>` in the prompt) ends reasoning that
+/// began before the reply, so everything up to it goes and the answer after it
+/// stays.
+pub fn split_think(raw: &str) -> VisibleReply {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     loop {
-        match rest.find("<think>") {
-            Some(start) => {
+        let open = rest.find(OPEN);
+        let close = rest.find(CLOSE);
+        match (open, close) {
+            (open, Some(close)) if open.is_none_or(|o| close < o) => {
+                out.clear();
+                rest = &rest[close + CLOSE.len()..];
+            }
+            (Some(start), _) => {
                 out.push_str(&rest[..start]);
-                let after = &rest[start + "<think>".len()..];
-                match after.find("</think>") {
-                    Some(end) => rest = &after[end + "</think>".len()..],
-                    // Unclosed: the whole remainder is thinking.
-                    None => return out.trim().to_string(),
+                let after = &rest[start + OPEN.len()..];
+                match after.find(CLOSE) {
+                    Some(end) => rest = &after[end + CLOSE.len()..],
+                    None => {
+                        let text = out.trim().to_string();
+                        let ended_in_reasoning = text.is_empty();
+                        return VisibleReply {
+                            text,
+                            ended_in_reasoning,
+                        };
+                    }
                 }
             }
-            None => {
+            (None, _) => {
                 out.push_str(rest);
-                return out.trim().to_string();
+                return VisibleReply {
+                    text: out.trim().to_string(),
+                    ended_in_reasoning: false,
+                };
             }
         }
     }
+}
+
+/// [`split_think`]'s text alone.
+pub fn strip_think_tags(raw: &str) -> String {
+    split_think(raw).text
 }
 
 fn strip_code_fence(text: &str) -> String {
@@ -554,6 +612,30 @@ mod tests {
     }
 
     #[test]
+    fn an_orphan_close_tag_drops_the_reasoning_before_it() {
+        assert_eq!(
+            strip_think_tags("plan the message</think>\n\nfeat: x"),
+            "feat: x"
+        );
+        // A closed block followed by an orphan close: the answer still wins.
+        assert_eq!(
+            strip_think_tags("<think>a</think>b</think>feat: y"),
+            "feat: y"
+        );
+        assert!(!split_think("reasoning</think>").ended_in_reasoning);
+        assert_eq!(strip_think_tags("reasoning</think>"), "");
+    }
+
+    #[test]
+    fn a_reply_that_ends_inside_its_reasoning_is_flagged() {
+        assert!(split_think("<think>still going").ended_in_reasoning);
+        assert!(split_think("  <think>").ended_in_reasoning);
+        // Text before the opener is an answer, not a lost one.
+        assert!(!split_think("answer <think>tail").ended_in_reasoning);
+        assert!(!split_think("").ended_in_reasoning);
+    }
+
+    #[test]
     fn commit_messages_are_read_out_of_fenced_chatty_replies() {
         let raw = "Here is the commit message:\n```\nfeat(auth): add token refresh\n\n- rotate on 401\n```";
         assert_eq!(
@@ -578,6 +660,49 @@ mod tests {
         assert_eq!(clean_branch_name("`fix/nil-guard`"), "fix/nil-guard");
         assert_eq!(clean_branch_name("feat//a  b"), "feat/a-b");
         assert_eq!(clean_branch_name("-- trailing --"), "trailing");
+    }
+
+    /// Every suggestion must survive `git check-ref-format --branch`, the rule
+    /// the app's own branch creation applies; names with no valid repair come
+    /// back empty rather than as something git would refuse.
+    #[test]
+    fn suggested_branch_names_pass_git_check_ref_format() {
+        use crate::procguard::LockedSpawn;
+        let sixty = format!("{}.lock", "a".repeat(57));
+        let replies = [
+            "a..b",
+            "feat/a...b",
+            "x.lock",
+            "feat/x.lock/y",
+            "fix/a.lock.lock",
+            "feat/.hidden/y",
+            "feat/a./b",
+            sixty.as_str(),
+            "..",
+            ".lock",
+            "///",
+            "feat/add-token-refresh",
+        ];
+        for reply in replies {
+            let name = clean_branch_name(reply);
+            if name.is_empty() {
+                continue;
+            }
+            let status = std::process::Command::new("git")
+                .args(["check-ref-format", "--branch", &name])
+                .output_locked()
+                .expect("git runs")
+                .status;
+            assert!(
+                status.success(),
+                "{reply:?} became {name:?}, which git refuses"
+            );
+            assert!(!name.contains("..") && !name.ends_with(".lock"), "{name:?}");
+        }
+        assert_eq!(clean_branch_name("a..b"), "a.b");
+        assert_eq!(clean_branch_name("x.lock"), "x");
+        assert_eq!(clean_branch_name("feat/x.lock/y"), "feat/x/y");
+        assert_eq!(clean_branch_name("..."), "");
     }
 
     #[test]

@@ -22,7 +22,7 @@ function createMockCommit(overrides: Partial<PulseCommitSummary> = {}): PulseCom
     summary: "feat(core): implement pulse metrics",
     author_name: "Alice Dev",
     author_email: "alice@example.com",
-    gpg_status: "G",
+    signature: "pgp",
     additions: 20,
     deletions: 5,
     files_changed: 3,
@@ -224,21 +224,21 @@ describe("computeHygiene", () => {
     const commits = [
       createMockCommit({
         summary: "feat: add feature\n\nCo-authored-by: Bob <bob@example.com>",
-        gpg_status: "G",
+        signature: "pgp",
         additions: 10,
         deletions: 0,
         is_merge: false,
       }),
       createMockCommit({
         summary: "Merge branch 'main'",
-        gpg_status: "N",
+        signature: "none",
         additions: 0,
         deletions: 0,
         is_merge: true,
       }),
       createMockCommit({
         summary: "revert: fix bug",
-        gpg_status: "U",
+        signature: "ssh",
         additions: 5,
         deletions: 5,
         is_revert: true,
@@ -248,13 +248,46 @@ describe("computeHygiene", () => {
     const hygiene = computeHygiene(commits);
     expect(hygiene.totalCommits).toBe(3);
     expect(hygiene.conventionalCount).toBe(2); // "feat:" and "revert:"
-    expect(hygiene.signedCount).toBe(2); // "G" and "U"
+    expect(hygiene.signedCount).toBe(2); // "pgp" and "ssh"
     expect(hygiene.signedPercentage).toBe(67);
     expect(hygiene.mergeCount).toBe(1);
     expect(hygiene.mergePercentage).toBe(33);
     expect(hygiene.revertCount).toBe(1);
     expect(hygiene.coAuthorCount).toBe(0);
     expect(hygiene.medianChurn).toBe(10);
+  });
+
+  it("counts every signature format as signed and never reads one as unsigned", () => {
+    const commits = (["pgp", "ssh", "x509", "other", "none"] as const).map((signature) =>
+      createMockCommit({ signature })
+    );
+    const hygiene = computeHygiene(commits);
+    expect(hygiene.signedCount).toBe(4);
+    expect(hygiene.signedPercentage).toBe(80);
+    expect(hygiene.signatureUnknownCount).toBe(0);
+  });
+
+  it("leaves commits whose signature could not be read out of the share and reports them", () => {
+    // 2 signed, 1 unsigned, 2 unread: the share is over the 3 that are known,
+    // not 2 of 5 (which would call the unread ones unsigned).
+    const commits = (["pgp", "ssh", "none", "unknown", "unknown"] as const).map((signature) =>
+      createMockCommit({ signature })
+    );
+    const hygiene = computeHygiene(commits);
+    expect(hygiene.totalCommits).toBe(5);
+    expect(hygiene.signedCount).toBe(2);
+    expect(hygiene.signedPercentage).toBe(67);
+    expect(hygiene.signatureUnknownCount).toBe(2);
+  });
+
+  it("states no share when no commit's signature could be read", () => {
+    const hygiene = computeHygiene([
+      createMockCommit({ signature: "unknown" }),
+      createMockCommit({ signature: "unknown" }),
+    ]);
+    expect(hygiene.signedCount).toBe(0);
+    expect(hygiene.signedPercentage).toBeNull();
+    expect(hygiene.signatureUnknownCount).toBe(2);
   });
 
   it("counts co-authors from the trailer field, never the subject", () => {
@@ -393,3 +426,53 @@ describe("computeCommitWindow", () => {
   });
 });
 
+
+describe("computeHygiene signature adversarial cases", () => {
+  it("never produces NaN or Infinity for any all-one-kind repo", () => {
+    for (const signature of ["none", "pgp", "ssh", "x509", "other", "unknown"] as const) {
+      const hygiene = computeHygiene([createMockCommit({ signature })]);
+      const share = hygiene.signedPercentage;
+      if (signature === "unknown") {
+        // Nothing was read, so there is no share: null, not a measured 0%.
+        expect(share, signature).toBeNull();
+      } else {
+        expect(Number.isFinite(share), signature).toBe(true);
+        expect(share).toBeGreaterThanOrEqual(0);
+        expect(share).toBeLessThanOrEqual(100);
+      }
+    }
+  });
+
+  it("a single commit is 100 or 0, and an unread single commit has no share and one unread", () => {
+    expect(computeHygiene([createMockCommit({ signature: "ssh" })]).signedPercentage).toBe(100);
+    expect(computeHygiene([createMockCommit({ signature: "none" })]).signedPercentage).toBe(0);
+    const unread = computeHygiene([createMockCommit({ signature: "unknown" })]);
+    expect(unread.signedPercentage).toBeNull();
+    expect(unread.signatureUnknownCount).toBe(1);
+  });
+
+  it("counts signed + unsigned + unread to the total, across a large mixed walk", () => {
+    const kinds = ["pgp", "none", "unknown", "x509", "other", "none", "ssh"] as const;
+    const commits = Array.from({ length: 25_000 }, (_, n) =>
+      createMockCommit({ signature: kinds[n % kinds.length] })
+    );
+    const hygiene = computeHygiene(commits);
+    const unsigned = commits.filter((c) => c.signature === "none").length;
+    expect(hygiene.signedCount + unsigned + hygiene.signatureUnknownCount).toBe(25_000);
+  });
+
+  /**
+   * A payload from a backend that predates the rename still carries `gpg_status`
+   * and no `signature`; a value outside the closed set is as much a version
+   * skew. Neither is a statement that the commit is signed.
+   */
+  it("a missing or unrecognised signature value is not counted as signed", () => {
+    const skewed = [
+      createMockCommit({ signature: undefined as never }),
+      createMockCommit({ signature: "G" as never }),
+      createMockCommit({ signature: "" as never }),
+    ];
+    const hygiene = computeHygiene(skewed);
+    expect(hygiene.signedCount).toBe(0);
+  });
+});

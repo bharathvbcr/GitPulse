@@ -8,6 +8,10 @@ describe("PulseHygiene component", () => {
     expect(source).toContain("computeHygiene");
   });
 
+  it("shows a dash, never 0%, when no commit's signature could be read", () => {
+    expect(source).toContain('hygiene.signedPercentage === null ? "—"');
+  });
+
   it("does not re-implement conventional-commit matching in the view", () => {
     // The grammar has exactly one frontend owner (pulse/metrics.ts), which is
     // itself contract-tested against analyzer/conventional.rs.

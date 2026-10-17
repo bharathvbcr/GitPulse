@@ -75,6 +75,8 @@ fn regression_lcov_checksum_records_are_kept() {
 fn regression_go_cover_expansion_is_bounded() {
     let repo = git_repo();
     write(repo.path(), "src/main.go", "package main\n");
+    // Larger than the end-of-file check reads, so the reported ranges stand.
+    write(repo.path(), "pkg/big.go", &"x\n".repeat(1_100_000));
     let mut text = String::from("mode: set\n");
     for i in 0..400usize {
         let start = i * 10_000 + 1;
@@ -399,6 +401,7 @@ fn file_cap_trims_merged_set_and_flags_truncation() {
     write(repo.path(), "src/lib.rs", "fn a() {}\n");
     let mut text = String::new();
     for i in 0..50usize {
+        write(repo.path(), &format!("src/gen/mod_{i}.rs"), "fn a() {}\n");
         text.push_str(&format!("SF:src/gen/mod_{i}.rs\nDA:1,1\nend_of_record\n"));
     }
     write(repo.path(), "lcov.info", &text);
@@ -415,7 +418,7 @@ fn file_cap_trims_merged_set_and_flags_truncation() {
 #[test]
 fn concurrent_scans_agree() {
     let repo = git_repo();
-    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    write(repo.path(), "src/lib.rs", "fn a() {}\nfn b() {}\n");
     write(
         repo.path(),
         "lcov.info",
@@ -474,7 +477,11 @@ fn xml_parsers_handle_newline_formatted_tags_and_spaced_attributes() {
 #[test]
 fn istanbul_parser_handles_float_hit_counts_in_line_map() {
     let repo = git_repo();
-    write(repo.path(), "src/index.ts", "export const x = 1;\n");
+    write(
+        repo.path(),
+        "src/index.ts",
+        "export const x = 1;\nexport const y = 2;\n",
+    );
     let istanbul_json = r#"{
       "src/index.ts": {
         "path": "src/index.ts",
@@ -504,6 +511,7 @@ fn istanbul_parser_handles_float_hit_counts_in_line_map() {
 fn regression_go_cover_allowance_exhaustion_sets_truncated() {
     let repo = git_repo();
     write(repo.path(), "src/main.go", "package main\n");
+    write(repo.path(), "pkg/big.go", &"x\n".repeat(260_000));
     // Each block range expands to at most 10_001 lines (per-range policy),
     // so 25 ranges over one file exhaust the 200_000-line allowance without
     // a huge fixture: drops happen mid-file well before the input ends.

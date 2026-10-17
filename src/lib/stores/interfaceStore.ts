@@ -1,5 +1,12 @@
 import { writable } from "svelte/store";
-import { clampTerminalFontSize, TERMINAL_FONT_DEFAULT } from "../terminal/viewControls";
+import { createDeferredWrite, flushOnPageHide } from "../async/deferredWrite";
+import {
+  clampTerminalFontSize,
+  clampTerminalScrollback,
+  TERMINAL_AGENT_SCROLLBACK_DEFAULT,
+  TERMINAL_FONT_DEFAULT,
+  TERMINAL_SCROLLBACK_DEFAULT,
+} from "../terminal/viewControls";
 import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
 import {
   isGraphWidthMode,
@@ -240,6 +247,15 @@ export interface InterfacePrefs {
   terminalDockHeight: number;
   terminalFontSize: number;
   /**
+   * Rows of history a shell terminal keeps, and the (smaller) amount an agent
+   * CLI or task-run terminal keeps. xterm allocates `cols * 12` bytes per row
+   * whether or not it holds text, and every visited repository tab keeps its
+   * terminals mounted; see `TERMINAL_SCROLLBACK_MIN`. Read when a terminal is
+   * created, and applied to live ones when changed.
+   */
+  terminalScrollback: number;
+  terminalAgentScrollback: number;
+  /**
    * Builds xterm's accessibility tree — a row list plus a live region that
    * announces new output — so VoiceOver and other assistive technology can
    * read the terminal at all. Without it the grid is a canvas of glyphs with
@@ -253,6 +269,20 @@ export interface InterfacePrefs {
    * by reading and rewriting the focused field still cannot act here.
    */
   terminalScreenReader: boolean;
+  /**
+   * macOS only: treat Option as Meta in terminals, so Option+B / Option+F send
+   * ESC b / ESC f (word motion) instead of composing a glyph. On by default.
+   * Turn off to type characters your layout puts on Option, such as `@` on a
+   * German keyboard. Applied to live terminals.
+   */
+  terminalOptionAsMeta: boolean;
+  /**
+   * Draw terminals on screen through WebGL rather than the DOM (see
+   * `terminal/gpuRenderer.ts`). On by default; turning it off returns every
+   * live session to the DOM renderer at once, for a GPU or driver that draws
+   * it wrong. Hidden sessions never hold a context either way.
+   */
+  terminalGpu: boolean;
   terminalLauncher: LauncherKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
@@ -327,7 +357,11 @@ const DEFAULTS: InterfacePrefs = {
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
+  terminalScrollback: TERMINAL_SCROLLBACK_DEFAULT,
+  terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
   terminalScreenReader: false,
+  terminalOptionAsMeta: true,
+  terminalGpu: true,
   terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
@@ -476,7 +510,14 @@ function readPrefs(): InterfacePrefs {
       taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
       taskHandoff: sanitizeHandoff(parsed.taskHandoff),
       terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
+      terminalScrollback: clampTerminalScrollback(parsed.terminalScrollback, TERMINAL_SCROLLBACK_DEFAULT),
+      terminalAgentScrollback: clampTerminalScrollback(
+        parsed.terminalAgentScrollback,
+        TERMINAL_AGENT_SCROLLBACK_DEFAULT,
+      ),
       terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
+      terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
+      terminalGpu: bool(parsed.terminalGpu, DEFAULTS.terminalGpu),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -528,11 +569,24 @@ function persist(prefs: InterfacePrefs) {
   }
 }
 
+/**
+ * How long a changed preference may wait before it is saved. A dock drag or a
+ * settings slider changes a preference on every pointer move; each save
+ * serializes every preference and writes it synchronously. Moves inside one
+ * window share one save, and the page-hide flush covers the window the app
+ * is closed in.
+ */
+export const INTERFACE_PERSIST_DELAY_MS = 250;
+
 function createInterfaceStore() {
-  const initial = readPrefs();
-  const { subscribe, set, update } = writable<InterfacePrefs>(initial);
+  let current = readPrefs();
+  const { subscribe, set } = writable<InterfacePrefs>(current);
+  const pendingSave = createDeferredWrite(() => persist(current), INTERFACE_PERSIST_DELAY_MS);
+  flushOnPageHide(() => pendingSave.flush());
 
   function commit(next: InterfacePrefs) {
+    pendingSave.cancel();
+    current = next;
     persist(next);
     set(next);
   }
@@ -541,20 +595,23 @@ function createInterfaceStore() {
    * Every setter is "merge these fields, then write through", so it lives in
    * one place: a setter that forgot to persist used to be a one-word typo
    * away, and each new preference no longer copies the pattern again.
+   *
+   * A patch that changes nothing is dropped before it reaches the store: a
+   * writable notifies on every object it is given, equal or not, so a drag
+   * held still — or clamped at its limit — republished the preferences to
+   * every subscriber on each pointer move.
    */
   function patch(
     changes:
       | Partial<InterfacePrefs>
       | ((prefs: InterfacePrefs) => Partial<InterfacePrefs>),
   ) {
-    update((prefs) => {
-      const next = {
-        ...prefs,
-        ...(typeof changes === "function" ? changes(prefs) : changes),
-      };
-      persist(next);
-      return next;
-    });
+    const partial = typeof changes === "function" ? changes(current) : changes;
+    const keys = Object.keys(partial) as (keyof InterfacePrefs)[];
+    if (keys.every((key) => Object.is(current[key], partial[key]))) return;
+    current = { ...current, ...partial };
+    set(current);
+    pendingSave.schedule();
   }
 
   const clampScale = (scale: number) =>
@@ -562,6 +619,8 @@ function createInterfaceStore() {
 
   return {
     subscribe,
+    /** Saves a pending change now; the page-hide handler does the same. */
+    flush: () => pendingSave.flush(),
     setAccent: (accent: AccentId) => patch({ accent }),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
     setTimestampStyle: (style: TimestampStyle) => patch({ timestampStyle: style }),
@@ -698,7 +757,13 @@ function createInterfaceStore() {
         taskHandoff: defaultHandoff(),
       }),
     setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),
+    setTerminalScrollback: (rows: number) =>
+      patch({ terminalScrollback: clampTerminalScrollback(rows, TERMINAL_SCROLLBACK_DEFAULT) }),
+    setTerminalAgentScrollback: (rows: number) =>
+      patch({ terminalAgentScrollback: clampTerminalScrollback(rows, TERMINAL_AGENT_SCROLLBACK_DEFAULT) }),
     setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
+    setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
+    setTerminalGpu: (on: boolean) => patch({ terminalGpu: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),

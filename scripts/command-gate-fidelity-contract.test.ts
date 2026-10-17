@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
 /**
  * The command gate must judge the command that actually runs.
@@ -24,10 +25,7 @@ import { describe, expect, it } from "vitest";
  * their own mirror tests instead, and are listed below rather than silently
  * skipped: a skip nobody can see is how this rots into decoration.
  */
-const COMMANDS = readFileSync(
-  new URL("../src-tauri/src/commands/mod.rs", import.meta.url),
-  "utf8",
-);
+const COMMANDS = readCommandsSource();
 const WRITER = readFileSync(
   new URL("../src-tauri/src/engine/git_writer.rs", import.meta.url),
   "utf8",
@@ -42,6 +40,8 @@ const DERIVED_ARGV = Object.freeze({
   cmd_unstage_file: "change_index_with shares the path-limited reset plan with the gate; native tests cover unborn branches and preservation of working files",
   cmd_change_index: "change_index_with judges every bounded chunk before the first write; native stress tests inspect exact argv and late gate denial",
   cmd_stash_save: "handler and writer both use StashSaveOptions::argv; native option tests verify staged and untracked behavior",
+  cmd_checkout_branch: "GitWriter::checkout_branch_argv builds the line the gate judges; checkout_branch_judged re-derives it under the repository lock and refuses to run if it differs",
+  cmd_checkout_detached: "GitWriter::checkout_detached_argv builds the line the gate judges, and checkout_detached runs that same function's argv",
   cmd_hygiene_execute: "hygiene::execute owns the backend plan and gives its exact argv or file boundary to the command gate; native hygiene tests cover denial, changed plans, exact scope and single use",
   cmd_rebase_interactive: "derives the planned sequence; rebase_planned_commands_* mirror tests cover it",
   cmd_stash_action: "argv built from the selected stash OID at runtime",
@@ -71,8 +71,12 @@ const DERIVED_ARGV = Object.freeze({
   cmd_deadbranch_clean: "clean_mutation_argv in engine::deadbranch builds each git branch -d/-D and git push --delete; clean_branches_with_gate authorizes every line before the first delete",
   cmd_deadbranch_restore: "restore_backup_with_gate authorizes each git branch <name> <sha> from the backup file before the first restore",
   cmd_write_file_content: "writes through the sandbox, gated by path not command",
+  cmd_create_file: "creates through the sandbox, gated by path not command",
   cmd_discard_changes: "gated by path not command; covered by file-gate-fidelity-contract",
   cmd_save_conflict: "conflict_session::mutation builds argv once for judging and execution; native conflict gate regressions cover hash-object, update-index and denial",
+  cmd_move_path: "GitWriter::move_path hands the gate its MovePlan (the git mv argv, or the untracked delete and write) before executing it, so the judged lines are the lines that run",
+  cmd_docs_rename: "docs::rename_doc hands the gate the same MovePlan GitWriter::move_path does, through guard_move, plus every path it will rewrite, each judged with guard_file, before it touches the filesystem",
+  cmd_delete_path: "GitWriter::delete_path hands the gate every planned git rm / git clean argv before the first runs",
 });
 
 function production(source: string): string {
@@ -153,7 +157,8 @@ describe("the command gate judges the command that actually runs", () => {
   it("compares a real share of the guarded commands", () => {
     // Vacuity guard: a parser that silently stopped matching would make every
     // comparison below pass while examining nothing.
-    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(15);
+    // 14 since cmd_checkout_branch moved to a writer-built argv (DERIVED_ARGV).
+    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(14);
     for (const anchor of ["cmd_push", "cmd_commit", "cmd_delete_branch", "cmd_fetch"]) {
       expect(compared.map((c) => c.name), `${anchor} must be compared`).toContain(anchor);
     }
@@ -184,17 +189,24 @@ describe("the command gate judges the command that actually runs", () => {
     for (const [command, executor] of Object.entries(executors)) {
       const body = fnBody(PRODUCTION_COMMANDS, command);
       expect(body, `${command} must exist`).not.toBeNull();
-      const built = body!.indexOf("let argv_owned =");
+      // The builder's result is whatever name the handler binds it to; what
+      // matters is that the gate and the executor receive that one binding.
+      const binding = /let (\w+) =\s*(?:crate::firebase::apphosting::)?\w+_argv\(/.exec(body!);
+      expect(binding, `${command} must build its argv through one builder`).not.toBeNull();
+      const argv = binding![1];
+      const built = binding!.index;
       const gated = body!.indexOf("guard(&repo_path, &refs)?");
       const spawned = body!.indexOf(executor);
-      expect(built, `${command} must build its argv through one builder`).toBeGreaterThan(-1);
       expect(gated, `${command} must hand that argv to the write gate`).toBeGreaterThan(-1);
       expect(spawned, `${command} must call ${executor}`).toBeGreaterThan(-1);
       expect(built, `${command} must build argv before gating it`).toBeLessThan(gated);
       expect(gated, `${command} must gate before it spawns`).toBeLessThan(spawned);
-      // The executor receives the same value that was gated, not a rebuild.
-      expect(body).toContain("&argv_owned");
-      expect(body).toContain("argv_owned.iter().map(String::as_str)");
+      // The gate judges the builder's value and the executor receives that same
+      // value, not a rebuild.
+      expect(body, `${command} must derive the judged refs from the built argv`).toMatch(
+        new RegExp(`let refs[^=]*=\\s*${argv}\\.iter\\(\\)\\.map\\(String::as_str\\)`),
+      );
+      expect(body!.slice(spawned), `${command} must run ${executor} on the built argv`).toContain(`&${argv}`);
     }
   });
 
@@ -217,9 +229,16 @@ describe("the command gate judges the command that actually runs", () => {
   it("conflict transactions gate the argv built by their canonical mutation owner", () => {
     const body = fnBody(PRODUCTION_COMMANDS, "cmd_save_conflict");
     expect(body).not.toBeNull();
+    expect(body).toContain("save_conflict_folded(");
     expect(body).toContain("guard_file(&repo_path, file, op)");
-    expect(body).toContain("conflict_session::save_with_gate");
-    expect(body).toContain("guard(&repo_path, argv)?");
+    expect(body).toContain("guard(&repo_path, argv)");
+    // The folded owner hands both judges to the native transaction and
+    // propagates a refusal from either before it records a verdict.
+    const folded = fnBody(PRODUCTION_COMMANDS, "save_conflict_folded");
+    expect(folded).not.toBeNull();
+    expect(folded).toContain("conflict_session::save_with_gate");
+    expect(folded).toContain("fold.record(judge_file(file, op)?)");
+    expect(folded).toContain("fold.record(judge_command(argv)?)");
     const session = readFileSync(new URL("../src-tauri/src/diff/conflict_session.rs", import.meta.url), "utf8");
     const mutation = fnBody(session, "mutation");
     expect(mutation).not.toBeNull();
@@ -242,9 +261,22 @@ describe("the command gate judges the command that actually runs", () => {
       expect(body).toContain("guard(&repo_path, argv)");
     }
     const executor = fnBody(PRODUCTION_WRITER, "change_index_with")!;
+    // One git process applies the whole selection with its paths on stdin, so
+    // what runs is not the judged argv verbatim; it is the same pathspec set.
+    // Both the judged lines and the stdin are built from the one `paths` list,
+    // and every line is judged before git is started.
     expect(executor).toContain("judge(&args)?");
-    expect(executor).toContain("git_text(&repo, &args)");
+    expect(executor).toContain("git_with_stdin(&repo, &args, &input)");
+    expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_with_stdin(&repo, &args, &input)"));
     expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_text(&repo, &args)"));
+    // The judged lines are the bounded chunks of `paths`; the stdin and the
+    // argument-form chunks are the two halves of that same list.
+    expect(executor).toContain("index_chunks(&prefix, &paths)");
+    expect(executor).toContain("paths.iter().partition(");
+    expect(executor).toContain("for path in &plain {");
+    expect(executor).toContain("input.extend_from_slice(path.as_bytes())");
+    expect(executor).toContain("index_chunks(&prefix, &accented)");
+    expect(fnBody(PRODUCTION_WRITER, "index_chunks")).toContain("argv.push(path.clone())");
   });
 
   it("stash save shares its options with the gate", () => {

@@ -242,6 +242,13 @@ impl<'a> StoreQueryEngine<'a> {
             ranked_over_a_sample,
             devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
         );
+        if total == 0 {
+            if let Some(reason) =
+                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
+            {
+                response.resolution = ResolutionAvailability::Unavailable { reason };
+            }
+        }
         response.scope = scope;
         Ok(self.finish(response))
     }
@@ -1183,6 +1190,55 @@ impl<'a> StoreQueryEngine<'a> {
                     None => coverage_gap,
                 }
             };
+            // An indexed symbol with no edge on this side is a leaf, not a
+            // miss. `neighbors seed_for_repeat` answered its callees
+            // `Unavailable: no indexed traversal start` for a function the
+            // store holds and that calls nothing — "I could not look" where the
+            // honest answer is "I looked: nothing" — while its callers, found
+            // through the containment edge on the other side, answered fine.
+            // The other side of the index is the existence check: a symbol it
+            // names is indexed.
+            //
+            // "I looked: nothing" is only true where the looking was whole, so
+            // the refusal below stands for a call-blind target (nothing looked
+            // for its calls), for a file-shaped target, and for a symbol whose
+            // file did not parse `Clean` — a call inside an error region is
+            // one extraction never saw.
+            let is_symbol = !matches!(
+                crate::query_match::classify(target),
+                crate::query_match::StartQuery::Path(_) | crate::query_match::StartQuery::Nothing
+            );
+            let indexed_in = if is_symbol && call_blind.reason().is_none() {
+                indexed_traversal_starts(index, target, !reverse, 0.0, &self.cancel)?
+            } else {
+                Vec::new()
+            };
+            let files: BTreeSet<&str> = indexed_in.iter().map(|(_, file)| file.as_str()).collect();
+            // The files `call_blind` already read, when the target named its
+            // file; a bare name is resolved to files only now, and read once.
+            let checked = if files.iter().all(|file| call_blind.clean.contains(*file)) {
+                call_blind.clean.clone()
+            } else {
+                self.call_blind_starts(files.iter().copied())?.clean
+            };
+            let read_whole = !files.is_empty() && files.iter().all(|file| checked.contains(*file));
+            if read_whole {
+                let (edges, rungs) = crate::rung::narrow(Vec::new(), min_rung);
+                let mut response = budget_take(edges, req.token_budget, |_| EDGE_TOKENS);
+                response.rungs = Some(rungs);
+                response.walk_incomplete = coverage_gap.clone();
+                let bands = band_budget.map(|budget| {
+                    blast_radius_from_edges(
+                        &[],
+                        &[],
+                        reverse,
+                        req.max_depth.min(MAX_TRAVERSAL_DEPTH),
+                        budget,
+                        coverage_gap.clone(),
+                    )
+                });
+                return Ok((response, bands));
+            }
             let reason = match call_blind.reason() {
                 Some(blind) => format!("{target} has no indexed traversal start: {blind}"),
                 None => format!("{target} has no indexed traversal start"),
@@ -1335,6 +1391,12 @@ impl<'a> StoreQueryEngine<'a> {
             let Some(file) = self.store.latest_file(path)? else {
                 continue;
             };
+            if matches!(
+                file.parse_outcome,
+                devmap_extract::model::ParseOutcome::Clean
+            ) {
+                starts.clean.insert(file.path.clone());
+            }
             if devmap_extract::model::is_call_blind(
                 &file.language,
                 &file.engine,
@@ -1456,6 +1518,18 @@ impl<'a> StoreQueryEngine<'a> {
             .narrowing
             .as_ref()
             .map(|narrowing| scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref()));
+        // No definition, over a generation with holes in it: the name may be
+        // declared where nothing was indexed. See `outside_index_reason`.
+        if total == 0 {
+            if let Some(reason) =
+                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
+            {
+                return Ok(ExploreReport {
+                    scope,
+                    ..empty(reason)
+                });
+            }
+        }
         let coverage_gap = devmap_analyze::combine_reasons(
             search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
             ranking_coverage_gap(total, pool),
@@ -1508,6 +1582,7 @@ impl<'a> StoreQueryEngine<'a> {
                 source: hit.source_span,
                 source_unavailable_reason: hit.source_unavailable_reason,
                 source_omitted_bytes: hit.source_span_omitted_bytes,
+                withheld: hit.withheld,
                 score: hit.score,
                 callers: budget_take(Vec::new(), 0, |_| EDGE_TOKENS),
                 callees: budget_take(Vec::new(), 0, |_| EDGE_TOKENS),
@@ -1885,12 +1960,16 @@ impl<'a> StoreQueryEngine<'a> {
         // read on purpose, so `budget_take` still sees something it cannot fit
         // and reports `truncated` for the right reason.
         let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
+        self.cancel.check()?;
         let Some(page) = self.store.dead_page(limit)? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
-        let mut response = budget_take(page.rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+        let mut rows = page.rows;
+        self.locate_dead_evidence(&mut rows)?;
+        let mut response = budget_take(rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+        response.excluded = Some(page.excluded);
         // `budget_take` counts the page it was handed, and the page is now a
         // bounded read — so the generation-wide count has to be restored as the
         // denominator, exactly as `explore` does for definitions. Without this
@@ -1925,6 +2004,51 @@ impl<'a> StoreQueryEngine<'a> {
         Ok(self.finish(response))
     }
 
+    /// Turn each unconfirmed row's first-site byte into a line, so a reader
+    /// can jump to it.
+    ///
+    /// Against the file on disk, the way `skeleton` converts spans: the index
+    /// keeps no line table. Bounded by the page — each distinct path is read
+    /// once — and a file that cannot be read leaves `first_line` empty rather
+    /// than guessing, while `first_path` and `first_byte` still say where.
+    fn locate_dead_evidence(
+        &self,
+        rows: &mut [devmap_analyze::DeadSymbolReport],
+    ) -> anyhow::Result<()> {
+        if rows
+            .iter()
+            .all(|row| row.evidence.as_ref().and_then(|e| e.first_byte).is_none())
+        {
+            return Ok(());
+        }
+        let source_root = self.store.latest_repo_root()?;
+        let mut indexes: BTreeMap<String, Option<LineIndex>> = BTreeMap::new();
+        for evidence in rows.iter_mut().filter_map(|row| row.evidence.as_mut()) {
+            let (Some(path), Some(byte)) = (evidence.first_path.as_ref(), evidence.first_byte)
+            else {
+                continue;
+            };
+            if !indexes.contains_key(path) {
+                // One source read per distinct path, each up to
+                // `MAX_SOURCE_BYTES`; a caller that has gone is asked first.
+                self.cancel.check()?;
+                let index = devmap_extract::safe_fs::read_repo_source(
+                    source_root.as_deref().map(Path::new),
+                    path,
+                    devmap_extract::MAX_SOURCE_BYTES,
+                )
+                .ok()
+                .map(|source| LineIndex::new(&source));
+                indexes.insert(path.clone(), index);
+            }
+            evidence.first_line = indexes
+                .get(path)
+                .and_then(Option::as_ref)
+                .map(|index| index.line_at(byte as usize));
+        }
+        Ok(())
+    }
+
     /// Duplicate bodies in the latest generation.
     ///
     /// Grouping runs here rather than at build time. The signatures are stored
@@ -1955,7 +2079,11 @@ impl<'a> StoreQueryEngine<'a> {
                 unsigned_symbols: 0,
             });
         }
+        // Both the candidate read and the grouping cover every signed symbol of
+        // the generation before the budget cuts anything.
+        self.cancel.check()?;
         let (candidates, unsigned) = self.store.latest_clone_candidates()?;
+        self.cancel.check()?;
         let summary = group_clones(&candidates, unsigned);
         let matching: Vec<_> = summary
             .groups
@@ -2035,6 +2163,10 @@ impl<'a> StoreQueryEngine<'a> {
         .ok();
         let line_index = on_disk.as_deref().map(LineIndex::new);
         let lines_from_bytes = line_index.is_none();
+        // A secret file's declarations are its own text, so a skeleton of one
+        // gives the spans and withholds the signatures.
+        let withheld = devmap_extract::secret::is_secret_path(&path)
+            .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
 
         let mut items: Vec<SkeletonSymbol> = extraction
             .symbols
@@ -2048,6 +2180,13 @@ impl<'a> StoreQueryEngine<'a> {
                     ),
                 };
                 let (signature, signature_note) = match &sym.signature {
+                    _ if withheld.is_some() => (
+                        None,
+                        Some(format!(
+                            "withheld: {}",
+                            devmap_extract::secret::WITHHELD_SECRET_PATH
+                        )),
+                    ),
                     Some(text) if !text.is_empty() => (Some(text.clone()), None),
                     _ => (None, Some("not extracted".to_string())),
                 };
@@ -2061,6 +2200,7 @@ impl<'a> StoreQueryEngine<'a> {
                     lines_from_bytes,
                     signature,
                     signature_note,
+                    withheld: withheld.clone(),
                 }
             })
             .collect();
@@ -2247,12 +2387,20 @@ impl<'a> StoreQueryEngine<'a> {
         let mut items = Vec::new();
         let mut tokens_used = 0u32;
         for row in page.rows {
+            // The extractor stores what `literal_value_for` keeps; asked again
+            // here because a store written before that rule still holds the
+            // values until it is rebuilt.
+            let withheld = devmap_extract::secret::is_secret_path(&row.file_path)
+                .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
+            let value =
+                devmap_extract::secret::literal_value_for(&row.file_path, &row.value).into_owned();
             let site = LiteralSite {
                 file_path: row.file_path,
                 line: row.line,
-                value: row.value,
+                value,
                 qualified_name: row.qualified_name,
                 symbol_name: row.symbol_name,
+                withheld,
             };
             let cost = literal_site_tokens(&site);
             if cost > token_budget.saturating_sub(tokens_used) {
@@ -2667,7 +2815,14 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok((self.finish(response), Vec::new()));
         }
 
-        let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
+        // The docstring read decodes every payload of the generation while
+        // holding the store's connection, so a caller that has already gone is
+        // asked first, and again between rows.
+        self.cancel.check()?;
+        let docstrings = crate::ask::docstring_by_qualified_name(&latest_extractions_cancellable(
+            self.store,
+            &self.cancel,
+        )?);
         let texts: Vec<String> = symbols
             .iter()
             .map(|symbol| {
@@ -2987,6 +3142,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            excluded: None,
             unresolved_namesakes: None,
             scope: None,
         };
@@ -3476,18 +3632,39 @@ pub fn resolved_edge_from_stored(edge: StoredEdge) -> anyhow::Result<ResolvedEdg
 /// is read (`min_confidence` 0): the views report each edge's own confidence
 /// rather than pre-filtering it away.
 pub fn graph_core_for_store(store: &Store) -> anyhow::Result<serde_json::Value> {
+    graph_core_for_store_cancellable(store, &Cancel::new())
+}
+
+/// [`graph_core_for_store`], stopped when `cancel` is tripped.
+///
+/// Every read here is the whole generation — every extraction payload decoded,
+/// every edge converted — so a caller that has stopped waiting is consulted
+/// before each read, between decoded rows, and through the edge conversion,
+/// rather than after all of it.
+pub fn graph_core_for_store_cancellable(
+    store: &Store,
+    cancel: &Cancel,
+) -> anyhow::Result<serde_json::Value> {
+    cancel.check()?;
     store
         .latest_generation_id()?
         .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
-    let extractions = store.latest_extractions()?;
+    let extractions = latest_extractions_cancellable(store, cancel)?;
+    cancel.check()?;
     let analysis = store
         .latest_analysis()?
         .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    cancel.check()?;
     let edges = store
         .latest_edges(0.0)?
         .into_iter()
-        .map(resolved_edge_from_stored)
+        .enumerate()
+        .map(|(index, edge)| {
+            cancel.check_every(index + 1)?;
+            resolved_edge_from_stored(edge)
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    cancel.check()?;
     let repo_root = store.latest_repo_root()?;
     Ok(crate::build_graph_core_value(
         &extractions,
@@ -3495,6 +3672,18 @@ pub fn graph_core_for_store(store: &Store) -> anyhow::Result<serde_json::Value> 
         &edges,
         repo_root.as_deref(),
     ))
+}
+
+/// Every extraction of the latest generation, abandoned between rows once
+/// `cancel` is tripped. The decode holds the store's connection, so stopping
+/// between rows is what hands it back to the next query.
+fn latest_extractions_cancellable(
+    store: &Store,
+    cancel: &Cancel,
+) -> anyhow::Result<Vec<Extraction>> {
+    store
+        .latest_extractions_until(&mut || cancel.check().is_err())?
+        .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))
 }
 
 fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
@@ -3546,3 +3735,7 @@ mod search_bounds_tests;
 #[cfg(all(test, feature = "parse"))]
 #[path = "engine/tests/composition_cancellation_tests.rs"]
 mod composition_cancellation_tests;
+
+#[cfg(all(test, feature = "parse"))]
+#[path = "engine/tests/corpus_read_cancellation_tests.rs"]
+mod corpus_read_cancellation_tests;

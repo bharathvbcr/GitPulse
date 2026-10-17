@@ -29,7 +29,7 @@
  *    told; an unavailable report with no reason says "reason not reported".
  */
 
-import { formatAuditCounts, normalizeSeverity } from "./format";
+import { formatAuditCounts, formatAuditCoverage, normalizeSeverity } from "./format";
 import { coverageGap, inventoryOnlyTruncation, observedTotal } from "./report";
 import type {
   CodeScanningReport,
@@ -159,6 +159,7 @@ function vulnerabilityFacet(report: DepsHealthReport): HealthFacet {
   const gap = coverageGap(report);
   const ran = (report.scanners_ran ?? []).length > 0;
   const complete = report.audit_complete === true;
+  const census = formatAuditCoverage(report.audit_coverage);
 
   if (!ran) {
     return {
@@ -166,7 +167,7 @@ function vulnerabilityFacet(report: DepsHealthReport): HealthFacet {
       label,
       value: "did not run",
       tone: "unknown",
-      caveat: `No local audit ran${gap ? ` (${gap})` : ""}, so no finding count exists.`,
+      caveat: `No local audit ran${gap ? ` (${gap})` : ""}, so no finding count exists.${census ? ` ${census}.` : ""}`,
     };
   }
 
@@ -180,7 +181,7 @@ function vulnerabilityFacet(report: DepsHealthReport): HealthFacet {
       label,
       value: `${counts}, partial`,
       tone: worstTone([found, "unknown"]),
-      caveat: `The local audit did not cover every discovered target${gap ? ` (${gap})` : ""}; these counts are a floor.`,
+      caveat: `The local audit did not cover every discovered target${gap ? ` (${gap})` : ""}; these counts are a floor.${census ? ` ${census}.` : ""}`,
     };
   }
 
@@ -229,7 +230,18 @@ function githubFacet(
       caveat: `${label} could not be checked: ${why}.`,
     };
   }
+  const missing = report.partial_tiers ?? [];
   if (report.alerts.length === 0) {
+    // A result missing severity tiers has not shown that nothing is open.
+    if (missing.length > 0) {
+      return {
+        id,
+        label,
+        value: "incomplete",
+        tone: "unknown",
+        caveat: `${label} alerts could not be read for the ${missing.join(", ")} severity: none are shown, which is not the same as none being open.`,
+      };
+    }
     return { id, label, value: "0 open", tone: "clear" };
   }
   const tone = worstTone(report.alerts.map((alert) => severityTone(alert.severity)));
@@ -238,9 +250,12 @@ function githubFacet(
     label,
     value: `${report.alerts.length}${report.truncated ? "+" : ""} open`,
     tone,
-    caveat: report.truncated
-      ? `Only the first ${report.alerts.length} ${label.toLowerCase()} alerts were returned; more remain.`
-      : `${report.alerts.length} open ${label.toLowerCase()} alerts.`,
+    caveat:
+      missing.length > 0
+        ? `The ${missing.join(", ")} severity of ${label.toLowerCase()} alerts could not be read; ${report.alerts.length} are shown and more may be open.`
+        : report.truncated
+          ? `Only the first ${report.alerts.length} ${label.toLowerCase()} alerts were returned; more remain.`
+          : `${report.alerts.length} open ${label.toLowerCase()} alerts.`,
   };
 }
 
