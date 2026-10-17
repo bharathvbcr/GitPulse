@@ -1323,14 +1323,12 @@
 
   /**
    * Scrollback follows its setting on live sessions too. Lowering it trims the
-   * oldest rows at once, which is the point of lowering it. An ended session
-   * that is off screen is left at the released value; raising it here would
-   * only undo that release.
+   * oldest rows at once, which is the point of lowering it. A released ended
+   * session sits at this same value (`releaseEndedScrollback`), and raising
+   * it does not bring trimmed rows back.
    */
   $effect(() => {
     const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
-    const release = shouldReleaseEndedBuffer(exited ? "exited" : "running", onscreen);
-    if (release) return;
     if (term && term.options.scrollback !== rows) term.options.scrollback = rows;
   });
 
@@ -1339,30 +1337,30 @@
    * The last screen stays in the viewport. A plain-text tail is written back
    * only when that viewport is empty, so it is not appended onto the screen
    * the trim already kept. A live session, hidden or not, is not touched.
-   * The scrollback setting is read here so a later change cannot raise the
-   * option back while the session stays ended and off screen.
+   * The release restores the scrollback setting once the trim is done; it is
+   * read untracked, so a settings change does not re-run the release.
    */
   let endedReleased = false;
   let endedReplayed = false;
   $effect(() => {
     const release = shouldReleaseEndedBuffer(exited ? "exited" : "running", onscreen);
-    const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
     const current = term;
     const id = tabId;
     if (!current) return;
     untrack(() => {
       if (release) {
-        if (!endedReleased) {
-          const tail = clipEndedTail(retainedOutput());
-          if (tail) rememberEndedTail(id, tail);
-          endedReleased = true;
-          endedReplayed = false;
-        }
-        releaseEndedScrollback(current);
+        // Once per release. Each call is a real trim, and one made after the
+        // hidden dock was fitted to a sliver would discard the wrapped rows
+        // above that sliver, which reflow back onto the last screen.
+        if (endedReleased) return;
+        const tail = clipEndedTail(retainedOutput());
+        if (tail) rememberEndedTail(id, tail);
+        endedReleased = true;
+        endedReplayed = false;
+        releaseEndedScrollback(current, terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore));
         return;
       }
       if (!endedReleased || endedReplayed) return;
-      if (current.options.scrollback !== rows) current.options.scrollback = rows;
       endedReplayed = true;
       endedReleased = false;
       // A restart or resume cleared the screen on purpose; the old tail is not

@@ -17,9 +17,11 @@ const require = createRequire(import.meta.url);
 const { Terminal } = require("@xterm/xterm") as {
   Terminal: new (options: { cols: number; rows: number; scrollback: number; allowProposedApi: boolean }) => {
     options: { scrollback?: number };
+    rows: number;
     write(data: string, callback: () => void): void;
+    resize(cols: number, rows: number): void;
     dispose(): void;
-    _core: { _bufferService: { buffer: { lines: { length: number; get(i: number): { _data: { byteLength: number } } | undefined } } } };
+    _core: { _bufferService: { buffer: { ydisp: number; ybase: number; lines: { length: number; get(i: number): { _data: { byteLength: number } } | undefined } } } };
   };
 };
 
@@ -67,13 +69,40 @@ describe("ended terminal scrollback", () => {
       expect(shouldReleaseEndedBuffer("running", false)).toBe(false);
       expect(bytes()).toBe(full);
       expect(shouldReleaseEndedBuffer("exited", false)).toBe(true);
-      releaseEndedScrollback(term);
-      expect(term.options.scrollback).toBe(0);
+      releaseEndedScrollback(term, 5000);
+      // The limit is back, and putting it back did not allocate the rows
+      // again. An ended session receives no further output.
+      expect(term.options.scrollback).toBe(5000);
       expect(bytes()).toBeLessThan(200 * 1024);
-      // Raising the option, as the live scrollback setting does, must not
-      // allocate the rows back. An ended session receives no further output.
-      term.options.scrollback = 5000;
-      expect(bytes()).toBeLessThan(200 * 1024);
+    } finally {
+      term.dispose();
+    }
+  });
+
+  // A hidden dock is still fitted, to a sliver. The sequence is the one the
+  // WKWebView coverage harness recorded: released at 190x7 with the cursor
+  // on row 3, fitted to 13x5 while hidden, then back to 180x7. With
+  // scrollback left at 0 the narrowing reflow has no room above the viewport
+  // and leaves ybase at 1 over a 5-line buffer; growing back then scrolls
+  // into that phantom row instead of adding one, so 7 rows sit on 6 lines.
+  // The DOM renderer skips a missing row; the WebGL renderer reads it
+  // (`loadCell` of undefined).
+  it("leaves a released terminal that is refitted with a buffer as tall as its screen", async () => {
+    const term = new Terminal({ cols: 190, rows: 7, scrollback: 1000, allowProposedApi: true });
+    try {
+      const line = "Simulated agent session ready. No commands execute.\r\n";
+      await new Promise<void>((resolve) => term.write(line.repeat(3), () => resolve()));
+      releaseEndedScrollback(term, 1000);
+      const buffer = () => term._core._bufferService.buffer;
+      for (const [cols, rows] of [[13, 5], [180, 7], [190, 7], [11, 5], [178, 7]]) {
+        term.resize(cols, rows);
+        // `lines.get` wraps around instead of failing, so the bounds are
+        // asserted on the indices, not on what `get` returns. 13x5 at 0 was
+        // already broken (ybase 1 over 5 lines) with as many lines as rows.
+        const at = `${cols}x${rows}`;
+        expect(buffer().ybase + term.rows, at).toBeLessThanOrEqual(buffer().lines.length);
+        expect(buffer().ydisp + term.rows, at).toBeLessThanOrEqual(buffer().lines.length);
+      }
     } finally {
       term.dispose();
     }

@@ -104,7 +104,15 @@ describe("TerminalSession PTY contracts", () => {
 
   it("releases scrollback only for an ended session that is off screen", () => {
     expect(source).toContain("shouldReleaseEndedBuffer(exited ? \"exited\" : \"running\", onscreen)");
-    expect(source).toContain("releaseEndedScrollback(current)");
+    // The release puts the configured limit back once the trim is done; a
+    // terminal left at 0 reflows into a buffer shorter than its screen.
+    const releaseCall = "releaseEndedScrollback(current, terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore))";
+    expect(source).toContain(releaseCall);
+    // Once per release: a second trim after the hidden dock was fitted to a
+    // sliver discards the rows that reflow back onto the last screen.
+    const onceGuard = source.indexOf("if (endedReleased) return;");
+    expect(onceGuard).toBeGreaterThan(-1);
+    expect(onceGuard).toBeLessThan(source.indexOf(releaseCall));
     // The trim keeps the last screen. Replaying the tail on top of it would
     // duplicate the transcript, so the write is gated on an empty viewport.
     expect(source).toContain("if (retainedOutput().trim()) return;");

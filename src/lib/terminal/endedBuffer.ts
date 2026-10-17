@@ -80,10 +80,19 @@ export interface ScrollbackTerminal {
 }
 
 /**
- * Drops retained rows. xterm trims the moment scrollback is lowered, and
- * raising it afterwards does not allocate the rows back until new output
- * arrives — which an ended session does not produce.
+ * Drops retained rows, then puts the configured `limit` back. xterm trims the
+ * moment scrollback is lowered, and raising it afterwards does not allocate
+ * the rows back until new output arrives — which an ended session does not
+ * produce.
+ *
+ * The limit goes back at once because a terminal left at 0 has no room above
+ * its screen. A hidden dock is still fitted (to a sliver), and xterm's
+ * narrowing reflow at 0 leaves `ybase` past the buffer; growing back then
+ * scrolls into that phantom row instead of adding one, so the screen has
+ * more rows than the buffer has lines and the WebGL renderer reads a line
+ * that is not there.
  */
-export function releaseEndedScrollback(term: ScrollbackTerminal): void {
+export function releaseEndedScrollback(term: ScrollbackTerminal, limit: number): void {
   term.options.scrollback = 0;
+  term.options.scrollback = limit;
 }
