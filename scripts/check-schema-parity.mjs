@@ -2,8 +2,10 @@
 /**
  * Does every installed reader agree with the schemas DevCouncil writes?
  *
- * DevCouncil owns three schemas: the devmap store (`CURRENT_SCHEMA_VERSION`),
- * dc-store (`SCHEMA_VERSION`) and the workbench (`WORKBENCH_SCHEMA`). Every
+ * DevCouncil owns four schemas: the devmap store (`CURRENT_SCHEMA_VERSION`),
+ * dc-store (`SCHEMA_VERSION`), the workbench (`WORKBENCH_SCHEMA`) and the
+ * extraction payload (devmap-extract's `EXTRACTION_SCHEMA_VERSION`, a string
+ * constant, which a reader below is told its stored graph is obsolete). Every
  * other app reads at least one of them, and each reads it through something
  * that can fall behind on its own:
  *
@@ -58,6 +60,7 @@ export const SCHEMAS = Object.freeze({
   store: { label: "devmap store", constant: "CURRENT_SCHEMA_VERSION", file: "devmap-store/src/schema.rs" },
   dcStore: { label: "dc-store", constant: "SCHEMA_VERSION", file: "dc-store/src/lib.rs" },
   workbench: { label: "workbench", constant: "WORKBENCH_SCHEMA", file: "dc-store/src/workbench/mod.rs" },
+  extract: { label: "devmap-extract", constant: "EXTRACTION_SCHEMA_VERSION", file: "devmap-extract/src/cache.rs" },
 });
 
 /** @typedef {keyof typeof SCHEMAS} SchemaKey */
@@ -73,15 +76,21 @@ const VENDORED_PREFIX = path.join("src-tauri", "vendored");
 const ALL_KEYS = /** @type {SchemaKey[]} */ (Object.keys(SCHEMAS));
 
 /**
- * One `pub const NAME: <int type> = N;` from a Rust source file.
+ * One `pub const NAME: <int type> = N;` from a Rust source file, or the
+ * `pub const NAME: &str = "N";` form devmap-extract declares its version in.
+ * A string that is not a whole number is not found, and so is a constant
+ * declared twice with different values: either would be a guess.
  *
  * @param {string} text
  * @param {string} constant
  * @returns {number | null}
  */
 export function rustConstant(text, constant) {
-  const match = new RegExp(`pub const ${constant}:\\s*[iu](?:8|16|32|64|size)\\s*=\\s*(\\d+)\\s*;`).exec(text);
-  return match ? Number(match[1]) : null;
+  const integer = String.raw`[iu](?:8|16|32|64|size)\s*=\s*(\d+)`;
+  const string = String.raw`&(?:'static\s+)?str\s*=\s*"(\d+)"`;
+  const found = [...text.matchAll(new RegExp(String.raw`pub const ${constant}:\s*(?:${integer}|${string})\s*;`, "g"))].map((match) => Number(match[1] ?? match[2]));
+  if (found.length === 0 || found.some((value) => value !== found[0] || !Number.isSafeInteger(value))) return null;
+  return found[0];
 }
 
 /**
@@ -281,16 +290,33 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   if (probe.storeSchema !== null) schemas.store = probe.storeSchema;
   if (probe.dcStoreSchema !== null) schemas.dcStore = probe.dcStoreSchema;
   if (probe.workbenchSchema !== null) schemas.workbench = probe.workbenchSchema;
+  if (probe.extractSchema !== null) schemas.extract = probe.extractSchema;
   return { reader, keys: ALL_KEYS, schemas };
 }
 
-/** @returns {Reading} */
-function devmapReading() {
+/**
+ * `devmap` on PATH. Its `--version` line names the store schema, and names the
+ * extraction schema only once DevCouncil prints one (`extract schema N`); a
+ * build that does not is unverifiable for it, never assumed to match.
+ *
+ * @param {ReturnType<typeof readCliSchema>} [cli]
+ * @returns {Reading}
+ */
+export function devmapReading(cli = resolveOnPath("devmap") === null ? null : readCliSchema()) {
   const reader = "devmap (PATH)";
-  if (resolveOnPath("devmap") === null) return { reader, keys: ["store"], absent: "not on PATH" };
-  const cli = readCliSchema();
-  if (!cli.available) return { reader, keys: ["store"], error: cli.reason };
-  return { reader, keys: ["store"], schemas: { store: cli.expected } };
+  /** @type {SchemaKey[]} */
+  const keys = ["store", "extract"];
+  if (cli === null) return { reader, keys, absent: "not on PATH" };
+  if (!cli.available) return { reader, keys, error: cli.reason };
+  /** @type {Schemas} */
+  const schemas = { store: cli.expected };
+  if (typeof cli.extract === "number") schemas.extract = cli.extract;
+  return {
+    reader,
+    keys,
+    schemas,
+    ...(schemas.extract === undefined ? { note: "devmap --version does not print the extraction schema; DevCouncil must add it" } : {}),
+  };
 }
 
 /**

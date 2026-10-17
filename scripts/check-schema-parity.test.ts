@@ -7,6 +7,7 @@ import {
   SCHEMAS,
   SERVE_CONTRACT,
   contractRow,
+  devmapReading,
   jarvisPin,
   judge,
   manviPin,
@@ -18,8 +19,8 @@ import {
   summarize,
 } from "./check-schema-parity.mjs";
 
-const owner = { store: 27, dcStore: 9, workbench: 13 };
-const ALL = ["store", "dcStore", "workbench"] as const;
+const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94 };
+const ALL = ["store", "dcStore", "workbench", "extract"] as const;
 
 const tempDirs: string[] = [];
 afterAll(() => {
@@ -33,11 +34,12 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 /** Writes DevCouncil's three schema files at these numbers under `rust/`. */
-function writeOwner(root: string, schemas: { store: number; dcStore: number; workbench: number }) {
+function writeOwner(root: string, schemas: { store: number; dcStore: number; workbench: number; extract: number }) {
   const files: Record<string, string> = {
     [SCHEMAS.store.file]: `pub const CURRENT_SCHEMA_VERSION: i32 = ${schemas.store};\npub const MIN_READER_SCHEMA_VERSION: i32 = 25;\n`,
     [SCHEMAS.dcStore.file]: `pub const SCHEMA_VERSION: u32 = ${schemas.dcStore};\n`,
     [SCHEMAS.workbench.file]: `pub const WORKBENCH_SCHEMA: i64 = ${schemas.workbench};\n`,
+    [SCHEMAS.extract.file]: `pub const EXTRACTION_SCHEMA_VERSION: &str = "${schemas.extract}";\n`,
   };
   for (const [file, text] of Object.entries(files)) {
     const full = path.join(root, "rust", file);
@@ -54,7 +56,7 @@ function devcouncilFixture() {
   git(root, "config", "user.email", "fixture@example.invalid");
   git(root, "config", "user.name", "fixture");
   git(root, "config", "commit.gpgsign", "false");
-  writeOwner(root, { store: 26, dcStore: 9, workbench: 13 });
+  writeOwner(root, { ...owner, store: 26 });
   git(root, "add", "-A");
   git(root, "commit", "-q", "-m", "store 26");
   const old = git(root, "rev-parse", "HEAD");
@@ -81,6 +83,25 @@ describe("rustConstant", () => {
     expect(rustConstant("pub const DC_SCHEMA_VERSION: u32 = 4;", "SCHEMA_VERSION")).toBeNull();
   });
 
+  it("reads devmap-extract's string constant as the number it names", () => {
+    expect(rustConstant('pub const EXTRACTION_SCHEMA_VERSION: &str = "94";', "EXTRACTION_SCHEMA_VERSION")).toBe(94);
+    expect(rustConstant("pub const EXTRACTION_SCHEMA_VERSION: &'static str = \"7\" ;", "EXTRACTION_SCHEMA_VERSION")).toBe(7);
+  });
+
+  it("does not find a string constant that is not a whole number", () => {
+    for (const bad of ['"94a"', '""', '"-1"', '"9.4"', '" 94"', '"0x5e"']) {
+      expect(rustConstant(`pub const EXTRACTION_SCHEMA_VERSION: &str = ${bad};`, "EXTRACTION_SCHEMA_VERSION")).toBeNull();
+    }
+  });
+
+  it("refuses an owner whose extract constant is not a number rather than leaving it undefined", () => {
+    const read = (file: string) =>
+      file === SCHEMAS.extract.file
+        ? 'pub const EXTRACTION_SCHEMA_VERSION: &str = "94a";'
+        : "pub const CURRENT_SCHEMA_VERSION: i32 = 1;\npub const SCHEMA_VERSION: u32 = 1;\npub const WORKBENCH_SCHEMA: i64 = 1;";
+    expect(() => readSchemas(read)).toThrow(/EXTRACTION_SCHEMA_VERSION not found/);
+  });
+
   it("refuses an owner file without the constant rather than leaving it undefined", () => {
     expect(() => readSchemas(() => "// nothing here")).toThrow(/CURRENT_SCHEMA_VERSION not found/);
   });
@@ -104,7 +125,7 @@ describe("judge", () => {
   it("never reads a schema the reader did not report as a match", () => {
     const row = judge(owner, { reader: "old gitpulse-mcp", keys: [...ALL], schemas: { store: 27 } });
     expect(row.verdict).toBe("unverifiable");
-    expect(row.detail).toContain("dc-store, workbench");
+    expect(row.detail).toContain("dc-store, workbench, devmap-extract");
   });
 
   it("calls a reader stale when one schema is behind even if another went unreported", () => {
@@ -114,6 +135,21 @@ describe("judge", () => {
     expect(row.detail).toContain("does not report workbench");
   });
 
+  it("calls a vendored extractor at 87 stale against DevCouncil's 94, and a match at 94", () => {
+    const stale = judge(owner, { reader: "GitPulse vendored crates", keys: [...ALL], schemas: { ...owner, extract: 87 } });
+    expect(stale.verdict).toBe("stale");
+    expect(stale.detail).toContain("devmap-extract 87, DevCouncil writes 94");
+    expect(judge(owner, { reader: "GitPulse vendored crates", keys: [...ALL], schemas: { ...owner } }).verdict).toBe("match");
+  });
+
+  it("calls a consumer that cannot report its extract version unverifiable, and the summary fails", () => {
+    const { extract: _omitted, ...withoutExtract } = owner;
+    const row = judge(owner, { reader: "old gitpulse-mcp", keys: [...ALL], schemas: withoutExtract });
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("does not report devmap-extract");
+    expect(summarize([judge(owner, { reader: "ok", keys: [...ALL], schemas: { ...owner } }), row]).ok).toBe(false);
+  });
+
   it("keeps a probe that failed apart from one that is not installed", () => {
     expect(judge(owner, { reader: "r", keys: [...ALL], error: "no handshake" }).verdict).toBe("unverifiable");
     expect(judge(owner, { reader: "r", keys: [...ALL], absent: "not on PATH" }).verdict).toBe("absent");
@@ -121,6 +157,22 @@ describe("judge", () => {
 
   it("compares only the keys a reader is asked for", () => {
     expect(judge(owner, { reader: "dcstore", keys: ["workbench"], schemas: { workbench: 13 } }).verdict).toBe("match");
+  });
+});
+
+describe("devmapReading", () => {
+  const cli = (extract: number | null) => ({ available: true as const, expected: 27, versionLine: "devmap 0.2.4", source: "version", extract });
+
+  it("is unverifiable for extract while devmap --version does not print it, and says what to change", () => {
+    const row = judge(owner, devmapReading(cli(null)));
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("does not report devmap-extract");
+    expect(row.detail).toContain("DevCouncil must add it");
+  });
+
+  it("matches once devmap prints the extraction schema, and is stale when it is behind", () => {
+    expect(judge(owner, devmapReading(cli(94))).verdict).toBe("match");
+    expect(judge(owner, devmapReading(cli(93))).verdict).toBe("stale");
   });
 });
 
@@ -158,7 +210,7 @@ describe("pins", () => {
 
   it("reads the constants at the pinned commit, not at HEAD", () => {
     const { root, old, bump } = devcouncilFixture();
-    expect(schemasAt(root, old)).toEqual({ store: 26, dcStore: 9, workbench: 13 });
+    expect(schemasAt(root, old)).toEqual({ ...owner, store: 26 });
     expect(schemasAt(root, bump)).toEqual(owner);
   });
 
@@ -192,6 +244,16 @@ describe("pins", () => {
     expect(row.detail).toMatch(/fetch it/);
   });
 
+  it("reads a pin from before the extract constant existed as unverifiable for it, not a crash", () => {
+    const { root, old } = devcouncilFixture();
+    writeFileSync(path.join(root, "rust", SCHEMAS.extract.file), "// no constant yet\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-q", "-m", "drop extract");
+    const row = judge(owner, { reader: "Manvi pin", keys: [...ALL], schemas: schemasAt(root, git(root, "rev-parse", "HEAD")) });
+    expect(row.verdict).toBe("unverifiable");
+    expect(schemasAt(root, old)).toHaveProperty("extract", 94);
+  });
+
   it("reads a pin from before a schema was versioned as stale on what it did declare", () => {
     const root = mkdtempSync(path.join(tmpdir(), "gitpulse-schema-early-"));
     tempDirs.push(root);
@@ -199,13 +261,13 @@ describe("pins", () => {
     git(root, "config", "user.email", "fixture@example.invalid");
     git(root, "config", "user.name", "fixture");
     git(root, "config", "commit.gpgsign", "false");
-    writeOwner(root, { store: 23, dcStore: 9, workbench: 0 });
+    writeOwner(root, { store: 23, dcStore: 9, workbench: 0, extract: 94 });
     // Before the workbench schema existed: no constant in its file.
     writeFileSync(path.join(root, "rust", SCHEMAS.workbench.file), "const SCHEMA: &str = \"\";\n");
     git(root, "add", "-A");
     git(root, "commit", "-q", "-m", "early");
     const early = git(root, "rev-parse", "HEAD");
-    expect(schemasAt(root, early)).toEqual({ store: 23, dcStore: 9 });
+    expect(schemasAt(root, early)).toEqual({ store: 23, dcStore: 9, extract: 94 });
     const row = judge(owner, { reader: "Jarvis pin", keys: [...ALL], schemas: schemasAt(root, early) });
     expect(row.verdict).toBe("stale");
   });

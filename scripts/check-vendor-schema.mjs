@@ -64,8 +64,12 @@ export function readCliSchema() {
     try {
       const parsed = JSON.parse((doctor.stdout || "").trim().split("\n").pop() || "");
       if (typeof parsed.expected_schema_version === "number") {
+        // doctor does not name the extraction schema; the --version line may.
+        const line = spawnSync("devmap", ["--version"], { encoding: "utf8", timeout: 15_000 });
+        const extract = line.status === 0 ? /extract schema (\d+)/i.exec(line.stdout || "") : null;
         return {
           available: true,
+          extract: extract ? Number(extract[1]) : null,
           expected: parsed.expected_schema_version,
           versionLine: `doctor expected_schema_version ${parsed.expected_schema_version} (code_graph ${parsed.code_graph_schema_version ?? "?"}, version ${parsed.version ?? "?"})`,
           source: "doctor",
@@ -85,6 +89,8 @@ export function readCliSchema() {
   }
   const versionLine = (which.stdout || "").trim();
   const fromVersion = /store schema (\d+)/i.exec(versionLine);
+  // Optional: printed only by a devmap that names its extraction schema.
+  const extract = /extract schema (\d+)/i.exec(versionLine);
   let expected = fromVersion ? Number(fromVersion[1]) : null;
   try {
     const status = execFileSync("devmap", ["status", "--json", "--progress", "never"], {
@@ -104,7 +110,7 @@ export function readCliSchema() {
   if (expected == null) {
     return { available: false, reason: `could not parse schema from: ${versionLine}` };
   }
-  return { available: true, expected, versionLine, source: "version" };
+  return { available: true, expected, versionLine, source: "version", extract: extract ? Number(extract[1]) : null };
 }
 
 /** @param {string[]} argv */
