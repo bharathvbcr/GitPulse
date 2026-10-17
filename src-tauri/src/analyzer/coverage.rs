@@ -6909,6 +6909,124 @@ src/main.go:4.1,4.8 1 0
         assert_eq!(decode_xml_entities("&a&amp;b;"), "&a&b;");
     }
 
+    /// Verbatim copy of `decode_xml_entities` at 5fca9364 (the quadratic
+    /// original), kept as the reference oracle for the differential tests.
+    fn decode_xml_entities_reference(value: &str) -> String {
+        if !value.contains('&') {
+            return value.to_string();
+        }
+        let mut out = String::with_capacity(value.len());
+        let mut rest = value;
+        while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            let tail = &rest[amp..];
+            let semi = tail.find(';');
+            let decode = semi.and_then(|s| {
+                let body = &tail[1..s];
+                match body {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ => {
+                        if let Some(hex) =
+                            body.strip_prefix("#x").or_else(|| body.strip_prefix("#X"))
+                        {
+                            u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                        } else if let Some(dec) = body.strip_prefix('#') {
+                            dec.parse::<u32>().ok().and_then(char::from_u32)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            });
+            match (semi, decode) {
+                (Some(s), Some(ch)) => {
+                    out.push(ch);
+                    rest = &tail[s + 1..];
+                }
+                _ => {
+                    out.push('&');
+                    rest = &rest[amp + 1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Adversarial review: crafted inputs, old and new agree byte for byte.
+    #[test]
+    fn decode_xml_entities_matches_reference_on_crafted_inputs() {
+        for input in [
+            "&amp&lt;", "&#38;", "&#x26;", "&#X26;", "&&amp;", "&#;", "&;", "&&;", "&;&;",
+            "&#x;", "&#+65;", "&#x+41;", "&#-1;", "&#x-1;", "&amp;amp;", "&#38;amp;", "&#38;lt;",
+            "&#x26;#x26;", "&#x26;#38;", "&a&b;", "&&&amp;", "&amp;&", "&", "", ";", ";&",
+            "&\u{e9};", "&\u{1F600};", "&#\u{e9};", "&#0;", "&#x0;", "&#x00000041;", "& ;",
+            "&AMP;", "&Amp;", "&amp ;", "&#65 ;", "&#6\u{0035};", "x&#x41;y&#66;z&bogus;&lt",
+        ] {
+            assert_eq!(
+                decode_xml_entities(input),
+                decode_xml_entities_reference(input),
+                "input {input:?}"
+            );
+        }
+        // A decoded '&' is emitted, never rescanned.
+        assert_eq!(decode_xml_entities("&#38;amp;"), "&amp;");
+        assert_eq!(decode_xml_entities("&#x26;lt;"), "&lt;");
+    }
+
+    /// Adversarial review: fixed-seed differential against the old function.
+    #[test]
+    fn decode_xml_entities_matches_reference_on_random_inputs() {
+        let alphabet: Vec<char> = "&&&&;;;#xX0123456789abcdefAMPltgqouaps<>\u{e9}\u{1F600}"
+            .chars()
+            .collect();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut decoded_something, mut cases) = (0usize, 0usize);
+        for _ in 0..60_000 {
+            let len = (next() % 201) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(alphabet[(next() % alphabet.len() as u64) as usize]);
+            }
+            let want = decode_xml_entities_reference(&s);
+            assert_eq!(decode_xml_entities(&s), want, "input {s:?}");
+            cases += 1;
+            if want.len() != s.len() || want != s {
+                decoded_something += 1;
+            }
+        }
+        // Random strings built from entity pieces, so valid references occur.
+        let pieces = [
+            "&amp;", "&lt;", "&gt;", "&quot;", "&apos;", "&#65;", "&#x42;", "&#X43;", "&", ";",
+            "&#", "&#x", "a", "\u{e9}", "&#x0000041;", "&#38;", "&#x26;", "&#+66;",
+        ];
+        for _ in 0..60_000 {
+            let n = (next() % 40) as usize;
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            let want = decode_xml_entities_reference(&s);
+            assert_eq!(decode_xml_entities(&s), want, "input {s:?}");
+            cases += 1;
+            if want != s {
+                decoded_something += 1;
+            }
+        }
+        assert_eq!(cases, 120_000);
+        assert!(decoded_something > 20_000, "generator rarely decodes: {decoded_something}");
+    }
+
     /// Detail payloads are capped per file; totals still reflect every line.
     #[test]
     fn detail_lines_are_capped_with_flag() {

@@ -5096,6 +5096,233 @@ mod tests {
         assert_eq!(sections.get("x").map(String::as_str), Some("dependencies"));
     }
 
+    /// Adversarial review: `body` padded with spaces to exactly `len` bytes.
+    #[cfg(unix)]
+    fn padded_manifest(len: usize) -> Vec<u8> {
+        let mut bytes = br#"{"name":"pad"}"#.to_vec();
+        bytes.resize(len, b' ');
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adv_manifest_size_boundary_is_exact() {
+        let (_guard, repo) = canonical_repo();
+        let cap = MAX_MANIFEST_BYTES as usize;
+        fs::write(repo.join("package.json"), padded_manifest(cap)).expect("write");
+        assert!(read_npm_manifest(&repo, "package.json")
+            .expect("exactly the cap is readable")
+            .is_some());
+        fs::write(repo.join("package.json"), padded_manifest(cap + 1)).expect("write");
+        let err = read_npm_manifest(&repo, "package.json").expect_err("cap + 1");
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adv_symlink_chain_inside_the_repo_resolves() {
+        let (_guard, repo) = canonical_repo();
+        fs::write(repo.join("real.json"), br#"{"name":"chain"}"#).expect("write");
+        std::os::unix::fs::symlink("real.json", repo.join("b.json")).expect("b");
+        std::os::unix::fs::symlink("b.json", repo.join("a.json")).expect("a");
+        std::os::unix::fs::symlink("a.json", repo.join("package.json")).expect("p");
+        let manifest = read_npm_manifest(&repo, "package.json")
+            .expect("chain is readable")
+            .expect("present");
+        assert_eq!(manifest.name, "chain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adv_symlinked_parent_directory_escape_is_refused_everywhere() {
+        let (_guard, repo) = canonical_repo();
+        let (_outside_guard, outside) = canonical_repo();
+        fs::write(
+            outside.join("package.json"),
+            br#"{"name":"out","workspaces":["x"],"dependencies":{"d":"1"}}"#,
+        )
+        .expect("write");
+        std::os::unix::fs::symlink(&outside, repo.join("sub")).expect("symlink dir");
+        let err = read_npm_manifest(&repo, "sub/package.json").expect_err("escape");
+        assert!(err.contains("escape"), "{err}");
+        assert!(!declares_workspaces(&repo, "sub"));
+        let err = declared_dependency_sections(&repo, &repo.join("sub/package.json"))
+            .expect_err("escape");
+        assert!(err.contains("escape"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adv_socket_named_package_json_is_refused() {
+        let (_guard, repo) = canonical_repo();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(repo.join("package.json")).expect("bind");
+        read_npm_manifest(&repo, "package.json").expect_err("a socket is refused");
+        assert!(!declares_workspaces(&repo, ""));
+    }
+
+    /// Break (wording): open(2) on a socket fails with EOPNOTSUPP before the
+    /// descriptor can be classified, so the issue says "Operation not
+    /// supported on socket" instead of "not a regular file".
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "break: a socket named package.json is refused with an I/O message, not 'not a regular file'"]
+    fn adv_socket_refusal_names_the_file_kind() {
+        let (_guard, repo) = canonical_repo();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(repo.join("package.json")).expect("bind");
+        let err = read_npm_manifest(&repo, "package.json").expect_err("socket");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adv_dangling_and_looping_links_are_errors_not_empty() {
+        let (_guard, repo) = canonical_repo();
+        std::os::unix::fs::symlink("nowhere.json", repo.join("package.json")).expect("dangling");
+        assert!(read_npm_manifest(&repo, "package.json").is_err());
+        fs::remove_file(repo.join("package.json")).expect("unlink");
+        std::os::unix::fs::symlink("package.json", repo.join("package.json")).expect("loop");
+        assert!(read_npm_manifest(&repo, "package.json").is_err());
+    }
+
+    /// A file appended to while it is read never yields more than the cap.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_growing_manifest_never_returns_more_than_the_cap() {
+        use std::io::Write;
+        let (_guard, repo) = canonical_repo();
+        let cap = MAX_MANIFEST_BYTES as usize;
+        let path = repo.join("package.json");
+        fs::write(&path, padded_manifest(cap - 64)).expect("write");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let grow_path = path.clone();
+        let grower = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&grow_path) {
+                    let _ = f.write_all(&[b' '; 4096]);
+                }
+            }
+        });
+        for _ in 0..200 {
+            match read_manifest_bytes(&repo, "package.json") {
+                Ok(Some(bytes)) => assert!(bytes.len() <= cap, "{} bytes", bytes.len()),
+                Ok(None) => panic!("file exists"),
+                Err(message) => assert!(message.contains("exceeds"), "{message}"),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        grower.join().expect("grower");
+    }
+
+    /// Break: a hardlink is a regular file with a second name, so it is read
+    /// even when its other name is outside the repository.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "break: a hardlink to a file outside the repository is read (not detectable by path; nlink > 1 is the only signal)"]
+    fn adv_hardlink_to_an_outside_file_is_refused() {
+        let (_guard, repo) = canonical_repo();
+        let (_outside_guard, outside) = canonical_repo();
+        fs::write(outside.join("secret.json"), br#"{"name":"secret"}"#).expect("write");
+        fs::hard_link(outside.join("secret.json"), repo.join("package.json")).expect("hardlink");
+        assert!(read_npm_manifest(&repo, "package.json").is_err());
+    }
+
+    /// Non-UTF-8 bodies: `read_npm_manifest` decodes lossily (as before);
+    /// the other two readers treat them as unparsable, never as an error.
+    #[cfg(unix)]
+    #[test]
+    fn adv_non_utf8_body_degrades_without_error() {
+        let (_guard, repo) = canonical_repo();
+        fs::write(
+            repo.join("package.json"),
+            b"{\"name\":\"caf\xe9\",\"workspaces\":[\"a\"]}",
+        )
+        .expect("write");
+        assert!(read_npm_manifest(&repo, "package.json")
+            .expect("lossy read")
+            .is_some());
+        assert!(!declares_workspaces(&repo, ""));
+        assert!(declared_dependency_sections(&repo, &repo.join("package.json"))
+            .expect("not an error")
+            .is_empty());
+    }
+
+    /// APFS is case- and normalization-insensitive by default; the read must
+    /// neither fail nor be judged an escape because the on-disk spelling
+    /// differs from the requested one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adv_case_and_normalization_variants_are_not_escapes() {
+        let (_guard, repo) = canonical_repo();
+        fs::write(repo.join("Package.json"), br#"{"name":"case"}"#).expect("write");
+        if repo.join("package.json").exists() {
+            assert!(read_npm_manifest(&repo, "package.json")
+                .expect("case-insensitive read")
+                .is_some());
+        }
+        let nfc = "caf\u{e9}";
+        let nfd = "cafe\u{301}";
+        fs::create_dir(repo.join(nfc)).expect("mkdir");
+        fs::write(repo.join(nfc).join("package.json"), br#"{"name":"u"}"#).expect("write");
+        if repo.join(nfd).exists() {
+            let rel = format!("{nfd}/package.json");
+            assert!(read_npm_manifest(&repo, &rel)
+                .expect("normalization-insensitive read")
+                .is_some());
+        }
+    }
+
+    /// The refusal reaches the report as `manifest_unreadable`, once per
+    /// dispatcher that needed the sections, and an unreadable manifest leaves
+    /// the map empty.
+    #[cfg(unix)]
+    #[test]
+    fn adv_declared_sections_refusal_becomes_a_report_issue() {
+        let repo = git_repo();
+        let root = repo.path().canonicalize().expect("canonical");
+        fs::write(root.join("big.json"), vec![b' '; 5 * 1024 * 1024]).expect("write big");
+        std::os::unix::fs::symlink("big.json", root.join("package.json")).expect("symlink");
+        let env = ScanEnv::from_options(&ScanOptions {
+            run_cli: false,
+            path_var: None,
+            home: None,
+        });
+        let (mut report, _) = local_scan(&root, &env).unwrap();
+        let before = report.issues.len();
+        let sections = declared_sections_or_issue(&root, &root, &mut report, "root");
+        assert!(sections.is_empty());
+        let added = &report.issues[before..];
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].code, "manifest_unreadable");
+        assert!(added[0].message.contains("exceeds"), "{}", added[0].message);
+    }
+
+    /// Break (hypothesis under test): `pnpm-workspace.yaml` is still probed
+    /// with the lexical `sandbox_join(..).is_file()`, which follows a symlink
+    /// out of the repository, so an outside file decides workspace coverage.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "break: a pnpm-workspace.yaml symlink outside the repo still makes a member 'covered' by the root lockfile"]
+    fn adv_pnpm_workspace_symlink_outside_the_repo_does_not_change_the_scan() {
+        let (_guard, repo) = canonical_repo();
+        let (_outside_guard, outside) = canonical_repo();
+        fs::write(outside.join("ws.yaml"), "packages: ['packages/*']\n").expect("outside");
+        fs::write(repo.join("package.json"), br#"{"name":"root"}"#).expect("root");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: 9\n").expect("lock");
+        fs::create_dir_all(repo.join("packages/a")).expect("mkdir");
+        fs::write(repo.join("packages/a/package.json"), br#"{"name":"a"}"#).expect("member");
+        assert_eq!(resolve_lockfile(&repo, "packages/a"), None, "control: no workspace");
+        std::os::unix::fs::symlink(outside.join("ws.yaml"), repo.join("pnpm-workspace.yaml"))
+            .expect("symlink");
+        assert_eq!(
+            resolve_lockfile(&repo, "packages/a"),
+            None,
+            "an out-of-repo pnpm-workspace.yaml must not be consulted"
+        );
+    }
+
     /// The `.cargo/config.toml` read shared the same size-gate bypass.
     #[cfg(unix)]
     #[test]
