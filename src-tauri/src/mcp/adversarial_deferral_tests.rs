@@ -1,6 +1,5 @@
-//! Adversarial review of ft-9cfa5374 (deferred_worktree). Tests marked
-//! `#[should_panic]` pin a KNOWN BREAK: they assert the correct behaviour and
-//! currently fail, so they flip red (and must be un-marked) once it is fixed.
+//! Adversarial review of ft-9cfa5374 (deferred_worktree). Each test asserts
+//! the correct behaviour for a break the review found; all are fixed.
 
 use super::*;
 
@@ -19,7 +18,6 @@ fn hostile_dir() -> tempfile::TempDir {
 /// "Not a Git repository: <path>" whose path contains the marker is classified
 /// `deferred_worktree`. Expected `invalid_worktree`.
 #[test]
-#[should_panic(expected = "deferred_worktree")]
 fn a_hostile_path_cannot_make_an_invalid_worktree_read_as_deferred() {
     let parent = hostile_dir();
     let path = parent.path().join(MARKER_DIR);
@@ -32,7 +30,6 @@ fn a_hostile_path_cannot_make_an_invalid_worktree_read_as_deferred() {
 /// non-repository are marked `deferred: true` with `retry_after_ms`, telling
 /// an agent to retry something that can never succeed.
 #[test]
-#[should_panic(expected = "can never succeed")]
 fn a_hostile_path_is_not_marked_deferred_in_an_insights_payload() {
     let parent = hostile_dir();
     let path = parent.path().join(MARKER_DIR);
@@ -47,7 +44,6 @@ fn a_hostile_path_is_not_marked_deferred_in_an_insights_payload() {
 /// BREAK 2 (medium): a facet that merely QUOTES the marker inside a real error
 /// (a path) is marked deferred.
 #[test]
-#[should_panic(expected = "was marked")]
 fn a_facet_that_only_quotes_a_deferral_is_not_marked() {
     let mut payload = json!({ "changes": { "ok": false,
         "error": format!("fatal: cannot chdir to '/tmp/{MARKER_DIR}': No such file") } });
@@ -60,7 +56,6 @@ fn a_facet_that_only_quotes_a_deferral_is_not_marked() {
 /// BREAK 3 (low): `mark_deferrals` marks an `ok: true` facet that carries a
 /// deferral-worded `error` (the `own` arm ignores `ok`).
 #[test]
-#[should_panic(expected = "ok:true facet was marked")]
 fn an_ok_true_facet_is_never_marked() {
     let mut payload = json!({ "worktrees": { "ok": true,
         "error": "git status deferred under load after 0.000s: x" } });
@@ -74,7 +69,6 @@ fn an_ok_true_facet_is_never_marked() {
 /// BREAK 4 (low): a facet that failed for a REAL reason is marked deferred when
 /// any descendant deferred (`found && failed`), overstating "retryable".
 #[test]
-#[should_panic(expected = "parent with a real error")]
 fn a_real_failure_with_a_deferred_child_is_not_itself_deferred() {
     let mut payload = json!({ "agents": { "ok": false, "error": "real failure",
         "live": { "kinds": [ { "ok": false,
@@ -189,7 +183,6 @@ fn every_wrapped_tool_under_forced_deferral_meets_its_output_schema() {
 /// `gitpulse_change_context` top levels do not declare it, yet all can emit it.
 /// Not a validation failure (schemas are open).
 #[test]
-#[should_panic(expected = "undeclared deferred fields")]
 fn every_emitted_deferred_field_is_declared_in_the_advertised_schema() {
     let repo = crate::test_support::git_repo();
     let path = repo.path().to_str().unwrap();

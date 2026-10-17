@@ -493,9 +493,10 @@ fn is_deferral_text(value: &serde_json::Value) -> bool {
 /// that ran, or that failed for any other reason, is left exactly as it was,
 /// and a facet that failed for a *real* reason is never marked.
 ///
-/// A failed object is marked when it carries a deferral error of its own or
-/// any object beneath it does, so `agents`, `agents.live` and each kind that
-/// could not be observed are all marked, not only the leaves.
+/// An object is marked only when its own failure is a deferral (an `error`
+/// field the gate wrote, or the `deferred_worktree` code) and it does not say
+/// `ok: true`. A parent is never marked on a descendant's account. The return
+/// value is true when anything beneath, or here, was marked.
 pub fn mark_deferrals(payload: &mut serde_json::Value) -> bool {
     use serde_json::Value;
     match payload {
@@ -504,14 +505,15 @@ pub fn mark_deferrals(payload: &mut serde_json::Value) -> bool {
             for child in map.values_mut() {
                 found |= mark_deferrals(child);
             }
-            let own = map
-                .iter()
-                .any(|(key, value)| key.ends_with("error") && is_deferral_text(value))
-                || map.get("error_code").is_some_and(is_deferral_text);
-            let failed = map.get("ok") == Some(&Value::Bool(false))
-                || map.get("recording") == Some(&Value::Bool(false))
-                || own;
-            if own || (found && failed) {
+            // A facet is deferred only by its OWN failure: one that says it
+            // succeeded is never marked, and a real failure is not made
+            // retryable because something beneath it deferred.
+            let own = map.get("ok") != Some(&Value::Bool(true))
+                && (map
+                    .iter()
+                    .any(|(key, value)| key.ends_with("error") && is_deferral_text(value))
+                    || map.get("error_code").is_some_and(is_deferral_text));
+            if own {
                 map.insert(DEFERRED_FIELD.to_string(), Value::Bool(true));
                 map.insert(
                     RETRY_AFTER_FIELD.to_string(),

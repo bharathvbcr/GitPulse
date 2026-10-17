@@ -631,13 +631,12 @@ mod tests {
         (dir, path)
     }
 
-    /// KNOWN BREAK (ft-9cfa5374 adversarial review, medium): the `does not
+    /// Regression (ft-9cfa5374 adversarial review, medium): the `does not
     /// belong` verdict quotes the worktree path, and the deferral arm of
     /// `classify` is tested before the unrelated arm with a bare substring
     /// match, so a worktree whose path contains the gate's marker reads as a
     /// deferral. Expected `unrelated_worktree`; actual `deferred_worktree`.
     #[test]
-    #[should_panic(expected = "deferred_worktree")]
     fn a_hostile_worktree_path_cannot_make_an_unrelated_verdict_read_as_deferred() {
         let (_dir, path) = repo();
         let message = format!(
@@ -739,6 +738,31 @@ mod tests {
                 .contains("git worktree deferred under load"),
             "the text the hook shows still carries the gate's own sentence: {error}"
         );
+
+        // The hook's own reading of that failure, end to end: the deferred
+        // code reaches it unchanged and it still refuses exactly as before
+        // (hard `task.scope_unavailable`, rendered as Deny). CARD 13's hook
+        // half changes this; until it lands, this is the pinned behavior.
+        let judged = crate::engine::git_cli::with_forced_deferral(|| {
+            crate::harness::check_command_in_scope(
+                crate::harness::sidecar::Lane::Shared,
+                &linked,
+                "ls",
+            )
+        });
+        assert_eq!(judged.verdict.rule, "task.scope_unavailable", "{judged:?}");
+        assert_eq!(judged.verdict.severity, "hard", "{judged:?}");
+        let output = crate::hooks::command_gate_decision(&judged);
+        let hook = output
+            .hook_specific_output
+            .expect("a decision, not silence");
+        assert_eq!(
+            hook.permission_decision,
+            Some(crate::hooks::PermissionDecision::Deny)
+        );
+        let reason = hook.permission_decision_reason.expect("a reason");
+        assert!(reason.contains("task.scope_unavailable"), "{reason}");
+        assert!(reason.contains("[deferred_worktree]"), "{reason}");
     }
 
     /// A checkout nobody let us open is not a broken checkout.

@@ -661,6 +661,28 @@ fn codeintel_output() -> Value {
     })
 }
 
+/// `deferred`: present and true only on a facet whose own Git read the spawn
+/// gate deferred (and that stayed deferred after one retry).
+fn deferred_property() -> Value {
+    json!({ "type": "boolean", "description": "Present and true only when a Git read was deferred under load (and stayed deferred after one retry); nothing was examined, so ask again after retry_after_ms." })
+}
+
+/// `retry_after_ms`: what accompanies [`deferred_property`].
+fn retry_after_property() -> Value {
+    json!({ "type": "integer", "minimum": 0, "description": "With deferred: the soonest worth asking again, one refill interval of the spawn rate budget." })
+}
+
+/// An open object facet that can carry the deferral fields.
+fn deferrable_object() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "deferred": deferred_property(),
+            "retry_after_ms": retry_after_property()
+        }
+    })
+}
+
 /// The shape of a facet that reports its own scan failure.
 fn ok_error_output(extra: Value, required: &[&str]) -> Value {
     let mut properties = json!({
@@ -695,8 +717,8 @@ fn collision_risk_output() -> Value {
             "shared_worktrees": { "type": "array" },
             "sessions_ok": { "type": "boolean" },
             "sessions_error": { "type": "string" },
-            "deferred": { "type": "boolean", "description": "Present and true only when a Git read was deferred under load (and stayed deferred after one retry); nothing was examined, so ask again after retry_after_ms." },
-            "retry_after_ms": { "type": "integer", "minimum": 0, "description": "With deferred: the soonest worth asking again, one refill interval of the spawn rate budget." }
+            "deferred": deferred_property(),
+            "retry_after_ms": retry_after_property()
         }),
         &[
             "overlapping_files",
@@ -740,11 +762,11 @@ fn build_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
-                    "worktrees": { "type": "object" },
-                    "agents": { "type": "object" },
-                    "changes": { "type": "object" },
+                    "worktrees": deferrable_object(),
+                    "agents": deferrable_object(),
+                    "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
-                    "ledger": { "type": "object" },
+                    "ledger": deferrable_object(),
                     "codeintel": { "type": "object" }
                 },
                 "required": ["repo_path", "worktrees", "agents", "changes", "collisions", "ledger", "codeintel"]
@@ -780,7 +802,9 @@ fn build_tools() -> Vec<Value> {
                     "files": { "type": "array" },
                     "total": { "type": "integer" },
                     "shown": { "type": "integer" },
-                    "truncated": { "type": "boolean" }
+                    "truncated": { "type": "boolean" },
+                    "deferred": deferred_property(),
+                    "retry_after_ms": retry_after_property()
                 }),
                 &["repo_path", "files", "total", "shown", "truncated"],
             ),
@@ -803,17 +827,19 @@ fn build_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
-                    "worktree": { "type": "object" },
+                    "worktree": deferrable_object(),
                     "worktree_ok": { "type": "boolean" },
                     "worktree_error": { "type": "string" },
                     "task_id": { "type": "string" },
                     "task_ok": { "type": "boolean" },
                     "task_error": { "type": "string" },
-                    "changes": { "type": "object" },
+                    "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
                     "operation": { "type": ["object", "null"] },
                     "operation_ok": { "type": "boolean" },
-                    "operation_error": { "type": "string" }
+                    "operation_error": { "type": "string" },
+                    "deferred": deferred_property(),
+                    "retry_after_ms": retry_after_property()
                 },
                 "required": ["repo_path", "worktree", "worktree_ok", "task_id", "task_ok", "changes", "collisions", "operation", "operation_ok"]
             }),
