@@ -44,19 +44,28 @@ pub struct SessionEpisodeNote {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvenanceFreshness {
     pub commit_sha: String,
-    /// Commits between this one and the base, or `None` when it could not be
-    /// measured.
+    /// How many commits the base has that this one does not: `rev-list
+    /// --count <commit>..<base>`, or `None` when it could not be measured.
     ///
-    /// `None` is not zero. Zero means "nothing has moved since this was
-    /// verified", which is the strongest possible statement; a failed
-    /// measurement means nothing at all, and the two must never render the
-    /// same. This field was a bare `u32` defaulting to 0 on failure, so an
-    /// unreachable base branch — or a commit that is not an ancestor of it —
-    /// reported maximum freshness.
+    /// This measures how far the *base has moved past* the commit, nothing
+    /// else. It is zero both for the base tip itself and for a commit that is
+    /// *ahead of* the base (the range `A..B` is empty whenever `B` is an
+    /// ancestor of `A`), so a zero does not say the commit is on the base:
+    /// [`BaseRelation::on_base`] and [`BaseRelation::ahead`] say that.
+    ///
+    /// `None` is not zero. Zero means "the base has nothing this commit
+    /// lacks", the strongest possible statement; a failed measurement means
+    /// nothing at all, and the two must never render the same. This field was
+    /// a bare `u32` defaulting to 0 on failure, so an unreachable base branch
+    /// reported maximum freshness. A commit that merely is not an ancestor of
+    /// the base is *measured* (how far the base moved since they forked) and
+    /// reports a number, not `None`.
     pub distance: Option<u32>,
     /// Decays with distance. `None` when distance could not be measured.
     pub confidence: Option<f32>,
-    /// True only when the distance was measured *and* is zero.
+    /// True only when the distance was measured *and* is zero. As `distance`,
+    /// it does not mean the commit is on the base: a commit ahead of the base
+    /// is also "fresh" here.
     pub is_fresh: bool,
     /// Empty when the distance was measured; otherwise why it was not.
     pub unmeasured_reason: String,
@@ -70,6 +79,52 @@ pub struct ProvenanceFreshness {
     pub notes_readable: bool,
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
+    /// Where the commit sits relative to the base, additive to `distance`.
+    #[serde(flatten)]
+    pub relation: BaseRelation,
+}
+
+/// Where a commit sits relative to the base it was measured against.
+///
+/// Every field is `None` when the relation could not be established, with
+/// `base_relation_reason` saying why; a `false` is only ever a measured
+/// answer. One `merge-base --is-ancestor` and one `rev-list --left-right
+/// --count` produce it, plus a `merge-base` when the commit is not an
+/// ancestor, to name the fork point.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BaseRelation {
+    /// True when the commit is reachable from the base: it landed there by
+    /// fast-forward or merge. False means measured and not reachable (ahead
+    /// of, or diverged from, the base); a squash or rebase landing is also
+    /// false here because those create new commits (`gitpulse_landed` tells
+    /// them apart). `None` when unmeasurable, including a shallow clone where
+    /// "not reachable" could just be missing history.
+    pub landed_on_base: Option<bool>,
+    /// Reachability of the commit from the base, under the name the
+    /// freshness fields are read against. Always equal to `landed_on_base`.
+    pub on_base: Option<bool>,
+    /// The commit the base resolved to.
+    pub base_oid: Option<String>,
+    /// The common ancestor of the commit and the base; the commit itself when
+    /// it is on the base. `None` when the two share no history.
+    pub merge_base: Option<String>,
+    /// Commits reachable from this one and not from the base.
+    pub ahead: Option<u32>,
+    /// Commits reachable from the base and not from this one; equals
+    /// `distance` when both were measured.
+    pub behind: Option<u32>,
+    /// Empty when the relation was measured; otherwise why it was not.
+    pub base_relation_reason: String,
+}
+
+impl BaseRelation {
+    /// The answer when nothing could be established, with the reason.
+    pub fn unmeasured(reason: impl Into<String>) -> Self {
+        Self {
+            base_relation_reason: reason.into(),
+            ..Self::default()
+        }
+    }
 }
 
 /// One `--ref=` argument, so the two note refs cannot drift into being spelled
@@ -216,12 +271,14 @@ impl ProvenanceFreshness {
     /// struct out again, so none of them can quietly ship a `distance: 0` or
     /// a `notes_readable: true` that the failure did not earn.
     fn unexamined(commit_sha: impl Into<String>, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         Self {
             commit_sha: commit_sha.into(),
             distance: None,
             confidence: None,
             is_fresh: false,
-            unmeasured_reason: reason.into(),
+            relation: BaseRelation::unmeasured(reason.clone()),
+            unmeasured_reason: reason,
             notes_readable: false,
             verification: None,
             session: None,
@@ -729,6 +786,452 @@ fn measure_distance(repo: &Path, commit_sha: &str, base: &str) -> (Option<u32>, 
     }
 }
 
+/// The complete stdout of a git command that must exit zero, or why not.
+///
+/// A prefix of a stream cut at the output cap is an error here, never a
+/// shorter answer: every caller below interprets the whole text.
+fn git_complete_text(repo: &Path, args: &[&str], label: &str) -> Result<String, String> {
+    let run = git_captured(repo, args)?.require_complete(label)?;
+    if !run.success {
+        return Err(format!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+}
+
+/// `(ahead, behind)` of `commit` against `base`: one
+/// `rev-list --left-right --count commit...base`.
+fn left_right_count(repo: &Path, commit: &str, base: &str) -> Result<(u32, u32), String> {
+    let range = format!("{commit}...{base}");
+    let text = git_complete_text(
+        repo,
+        &["rev-list", "--left-right", "--count", &range, "--"],
+        "git rev-list --left-right --count",
+    )?;
+    let mut fields = text.split_whitespace().map(str::parse::<u32>);
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(Ok(ahead)), Some(Ok(behind)), None) => Ok((ahead, behind)),
+        _ => Err(format!(
+            "git rev-list --left-right --count returned {:?}, not two counts",
+            text.trim()
+        )),
+    }
+}
+
+fn is_shallow(repo: &Path) -> Result<bool, String> {
+    git_complete_text(
+        repo,
+        &["rev-parse", "--is-shallow-repository"],
+        "git rev-parse --is-shallow-repository",
+    )
+    .map(|text| text.trim() == "true")
+}
+
+/// Where `commit` sits relative to `base` (both object names git produced).
+///
+/// Reachability is `merge-base --is-ancestor`, the same check the review gate
+/// uses ([`crate::harness::review::contains`]), where exit 1 is the answer
+/// "no" and any other failure is an error rather than a "no". The counts come
+/// from one `rev-list --left-right --count`. The two must agree (`ahead == 0`
+/// exactly when the commit is reachable); a disagreement is reported
+/// unmeasured rather than picking a side.
+fn base_relation(repo: &Path, commit: &str, base: &str) -> BaseRelation {
+    let unmeasured = |reason: String| BaseRelation {
+        base_oid: Some(base.to_string()),
+        ..BaseRelation::unmeasured(reason)
+    };
+    let reachable = match crate::harness::review::contains(repo, base, commit) {
+        Ok(reachable) => reachable,
+        Err(reason) => return unmeasured(format!("not measured: {reason}")),
+    };
+    let (ahead, behind) = match left_right_count(repo, commit, base) {
+        Ok(counts) => counts,
+        Err(reason) => return unmeasured(format!("not measured: {reason}")),
+    };
+    if reachable != (ahead == 0) {
+        return unmeasured(format!(
+            "not measured: git disagrees with itself (is-ancestor {reachable}, {ahead} commits ahead)"
+        ));
+    }
+    if !reachable {
+        // Not reachable in a shallow clone may only be history that was never
+        // fetched, so no "no" is given there.
+        match is_shallow(repo) {
+            Ok(false) => {}
+            Ok(true) => {
+                return unmeasured(
+                    "not measured: this is a shallow clone, so a commit that is not reachable \
+                     from the base may only be missing history"
+                        .to_string(),
+                )
+            }
+            Err(reason) => return unmeasured(format!("not measured: {reason}")),
+        }
+    }
+    let merge_base = if reachable {
+        Some(commit.to_string())
+    } else {
+        match git_captured(repo, &["merge-base", commit, base]) {
+            Ok(run) if run.success && run.incomplete.is_none() => {
+                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
+            }
+            // Exit 1 with nothing on stderr is "no common ancestor".
+            Ok(run) if run.status_code == 1 && run.stderr.is_empty() && !run.cancelled => None,
+            Ok(run) => {
+                return unmeasured(format!(
+                    "not measured: git merge-base failed: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                ))
+            }
+            Err(reason) => return unmeasured(format!("not measured: {reason}")),
+        }
+    };
+    BaseRelation {
+        landed_on_base: Some(reachable),
+        on_base: Some(reachable),
+        base_oid: Some(base.to_string()),
+        merge_base,
+        ahead: Some(ahead),
+        behind: Some(behind),
+        base_relation_reason: String::new(),
+    }
+}
+
+/// How a commit reached the base.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LandedVia {
+    /// Reachable from the base through its own first-parent line: the base
+    /// moved forward over it.
+    Ff,
+    /// Reachable through a merge commit that joined it to the base.
+    Merge,
+    /// Not reachable, but one base commit carries the same patch as the
+    /// whole of the commit's work since the fork (a squash merge).
+    Squash,
+    /// Not reachable, but every commit's patch is already on the base under a
+    /// different id (a rebase merge or cherry-picks).
+    Rebase,
+    /// Not reachable and no matching patch found, but merging it into the base
+    /// would change nothing: the content is on the base.
+    Tree,
+}
+
+/// The answer of [`landed`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Landed {
+    /// The commit asked about, as the caller spelled it.
+    pub commit: String,
+    /// The base commit it was judged against, when the base resolved.
+    pub base_oid: Option<String>,
+    /// True when the commit's work is on the base, false when measured not,
+    /// `None` when it could not be told (see `error`).
+    pub landed: Option<bool>,
+    pub via: Option<LandedVia>,
+    /// The base commit that brought it in: the merge commit for `merge`, the
+    /// squash commit for `squash`. `None` for the other routes.
+    pub merge_commit: Option<String>,
+    /// Unix seconds of the first base reflog entry whose tip contained the
+    /// landing; `None` with `landed_at_reason` when the reflog cannot say.
+    pub landed_at: Option<i64>,
+    pub landed_at_reason: String,
+    /// Empty when everything asked was established. With `landed: null` it is
+    /// why; with `landed: true` it is why `via` is missing.
+    pub error: String,
+}
+
+/// Newest reflog entries read to place a landing in time.
+const REFLOG_WINDOW: usize = 1_000;
+
+/// Patches of this many base commits past the fork are searched for a squash.
+const SQUASH_SEARCH_COMMITS: usize = 1_000;
+
+/// Unix seconds at which the base first contained `target`, by binary search
+/// over the base's reflog (which assumes the base only moved forward).
+fn reflog_landed_at(repo: &Path, base_name: &str, target: &str) -> (Option<i64>, String) {
+    let window = format!("--max-count={REFLOG_WINDOW}");
+    let text = match git_complete_text(
+        repo,
+        &[
+            "reflog",
+            "show",
+            "--date=unix",
+            "--format=%H%x09%gd",
+            &window,
+            base_name,
+            "--",
+        ],
+        "git reflog show",
+    ) {
+        Ok(text) => text,
+        Err(reason) => return (None, format!("no reflog for {base_name:?}: {reason}")),
+    };
+    // Oldest first.
+    let entries: Vec<(&str, i64)> = text
+        .lines()
+        .rev()
+        .filter_map(|line| {
+            let (oid, selector) = line.split_once('\t')?;
+            let seconds = selector.split_once("@{")?.1.strip_suffix('}')?;
+            Some((oid, seconds.parse().ok()?))
+        })
+        .collect();
+    if entries.is_empty() {
+        return (None, format!("the reflog of {base_name:?} is empty"));
+    }
+    let truncated = text.lines().count() >= REFLOG_WINDOW;
+    let contains_at =
+        |index: usize| crate::harness::review::contains(repo, entries[index].0, target);
+    let (mut low, mut high) = (0, entries.len() - 1);
+    match contains_at(high) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                None,
+                format!("the newest reflog entry of {base_name:?} does not contain the landing"),
+            )
+        }
+        Err(reason) => return (None, reason),
+    }
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match contains_at(middle) {
+            Ok(true) => high = middle,
+            Ok(false) => low = middle + 1,
+            Err(reason) => return (None, reason),
+        }
+    }
+    if low == 0 && truncated {
+        return (
+            None,
+            format!("the landing is older than the {REFLOG_WINDOW} newest reflog entries read"),
+        );
+    }
+    (Some(entries[low].1), String::new())
+}
+
+/// The base commit whose patch equals the whole of `commit`'s work since
+/// `merge_base`: the commit a squash merge made.
+fn squash_commit(
+    repo: &Path,
+    merge_base: &str,
+    commit: &str,
+    base: &str,
+) -> Result<Option<String>, String> {
+    let patch_id = |bytes: &[u8]| -> Result<Vec<(String, String)>, String> {
+        let run = git_captured_with_stdin(repo, &["patch-id", "--stable"], bytes)?
+            .require_complete("git patch-id")?;
+        if !run.success {
+            return Err(format!(
+                "git patch-id failed: {}",
+                String::from_utf8_lossy(&run.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.to_string(), fields.next()?.to_string()))
+            })
+            .collect())
+    };
+    let own = git_captured(
+        repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            merge_base,
+            commit,
+            "--",
+        ],
+    )?
+    .require_complete("git diff")?;
+    if !own.success || own.stdout.is_empty() {
+        return Ok(None);
+    }
+    let Some((wanted, _)) = patch_id(&own.stdout)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let range = format!("{merge_base}..{base}");
+    let max = format!("--max-count={SQUASH_SEARCH_COMMITS}");
+    let log = git_captured(
+        repo,
+        &[
+            "log",
+            "-p",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-merges",
+            "--reverse",
+            &max,
+            &range,
+            "--",
+        ],
+    )?
+    .require_complete("git log -p")?;
+    if !log.success {
+        return Ok(None);
+    }
+    Ok(patch_id(&log.stdout)?
+        .into_iter()
+        .find(|(id, _)| *id == wanted)
+        .map(|(_, commit)| commit))
+}
+
+/// Has `commit`'s work reached `base`, and how?
+///
+/// Reachability (`ff`, `merge`) comes from [`base_relation`]. A commit that is
+/// not reachable may still have landed under new ids: a rebase merge puts the
+/// same patches on the base (`git cherry`, all marked `-`), a squash merge puts
+/// their sum in one commit (its patch id equals the diff since the fork), and
+/// anything else whose merge into the base changes nothing is `tree`, by
+/// [`crate::engine::deadbranch::is_branch_merged_by_tree`]. A shallow clone, an
+/// unresolvable commit or base, or a comparison that cannot run answers
+/// `landed: null` with the reason, never `false`.
+///
+/// Read-only for refs, index and working tree. `merge-tree --write-tree` may
+/// leave unreferenced tree objects in the object database, as the dead-branch
+/// scan does.
+pub fn landed(repo_path: &str, commit: &str, base_branch: Option<&str>) -> Landed {
+    let base_name = base_branch.unwrap_or(DEFAULT_BASE);
+    let unknown = |base_oid: Option<String>, error: String| Landed {
+        commit: commit.to_string(),
+        base_oid,
+        landed: None,
+        via: None,
+        merge_commit: None,
+        landed_at: None,
+        landed_at_reason: String::new(),
+        error,
+    };
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(error) => return unknown(None, error),
+    };
+    // Both ends are peeled to commits and resolved over stdin, so nothing the
+    // caller passed reaches an argument list.
+    let asked = [
+        format!("{commit}^{{commit}}"),
+        format!("{base_name}^{{commit}}"),
+    ];
+    let mut resolved = resolve_revisions(&repo, &asked, MAX_RESOLVED_PER_BATCH).into_iter();
+    let sha = match resolved.next() {
+        Some(Ok(sha)) => sha,
+        Some(Err(reason)) => return unknown(None, format!("commit {commit:?}: {reason}")),
+        None => return unknown(None, "git cat-file answered nothing".to_string()),
+    };
+    let base = match resolved.next() {
+        Some(Ok(base)) => base,
+        Some(Err(reason)) => return unknown(None, format!("base {base_name:?}: {reason}")),
+        None => return unknown(None, "git cat-file answered nothing".to_string()),
+    };
+    let relation = base_relation(&repo, &sha, &base);
+    let mut answer = Landed {
+        base_oid: Some(base.clone()),
+        ..unknown(None, String::new())
+    };
+    answer.landed = relation.landed_on_base;
+    let Some(reachable) = relation.landed_on_base else {
+        answer.error = relation.base_relation_reason;
+        return answer;
+    };
+
+    let mut landing = sha.clone();
+    if reachable {
+        // The oldest commit on the base's first-parent line that descends
+        // from `sha`: its child when the base moved forward over it, or the
+        // merge that joined it (whose first parent is then not `sha`).
+        let range = format!("{sha}..{base}");
+        match git_complete_text(
+            &repo,
+            &[
+                "rev-list",
+                "--first-parent",
+                "--ancestry-path",
+                "--parents",
+                "--reverse",
+                &range,
+                "--",
+            ],
+            "git rev-list --ancestry-path",
+        ) {
+            Ok(text) => {
+                let mut first = text.lines().next().unwrap_or_default().split_whitespace();
+                let joined = first.next().map(str::to_string);
+                let first_parent = first.next();
+                match joined {
+                    Some(merge) if first_parent != Some(sha.as_str()) => {
+                        answer.via = Some(LandedVia::Merge);
+                        answer.merge_commit = Some(merge);
+                    }
+                    _ => answer.via = Some(LandedVia::Ff),
+                }
+            }
+            Err(reason) => answer.error = format!("landed, but how was not determined: {reason}"),
+        }
+    } else {
+        let squash = relation
+            .merge_base
+            .as_deref()
+            .and_then(|fork| squash_commit(&repo, fork, &sha, &base).ok().flatten());
+        let cherry = git_complete_text(&repo, &["cherry", &base, &sha], "git cherry").ok();
+        let rebased = cherry.as_deref().is_some_and(|text| {
+            let mut lines = text.lines().peekable();
+            lines.peek().is_some() && lines.all(|line| line.starts_with('-'))
+        });
+        if rebased {
+            answer.landed = Some(true);
+            answer.via = Some(LandedVia::Rebase);
+        } else if let Some(commit) = squash {
+            landing = commit.clone();
+            answer.landed = Some(true);
+            answer.via = Some(LandedVia::Squash);
+            answer.merge_commit = Some(commit);
+        } else {
+            let tree = git_complete_text(
+                &repo,
+                &["rev-parse", &format!("{base}^{{tree}}")],
+                "git rev-parse",
+            );
+            let merged = tree.as_ref().ok().and_then(|tree| {
+                crate::engine::deadbranch::is_branch_merged_by_tree(&repo, tree.trim(), &base, &sha)
+            });
+            match merged {
+                Some(true) => {
+                    answer.landed = Some(true);
+                    answer.via = Some(LandedVia::Tree);
+                }
+                Some(false) => answer.landed = Some(false),
+                None => {
+                    answer.landed = None;
+                    answer.error = "could not tell whether the base already holds this \
+                         work: the content comparison (git merge-tree --write-tree) did not \
+                         produce a tree, which is also what conflicting changes look like"
+                        .to_string();
+                }
+            }
+        }
+    }
+    if answer.landed == Some(true) {
+        match answer.via {
+            Some(LandedVia::Rebase | LandedVia::Tree) => {
+                answer.landed_at_reason =
+                    "not determined: a rebase or tree landing has no single base commit to place in the reflog"
+                        .to_string();
+            }
+            _ => {
+                let (at, reason) = reflog_landed_at(&repo, base_name, &landing);
+                answer.landed_at = at;
+                answer.landed_at_reason = reason;
+            }
+        }
+    }
+    answer
+}
+
 /// Freshness for many revisions, in one pass.
 ///
 /// Answers one entry per input, in input order, so a caller can zip the result
@@ -935,6 +1438,13 @@ fn freshness_rows(
                 (Ok(base), None) => measure_distance(repo, &sha, base),
                 (Err(reason), _) => (None, reason.clone()),
             };
+            let relation = match (&base, unnoted) {
+                (Ok(base), Unnoted::Measure) => base_relation(repo, &sha, base),
+                (Ok(_), Unnoted::Skip) => BaseRelation::unmeasured(
+                    "not measured: a batch row does not compute its relation to the base",
+                ),
+                (Err(reason), _) => BaseRelation::unmeasured(reason.clone()),
+            };
             // The listing says these notes are there. A read that fails now is
             // a note we could not get at, so the entry says the notes were not
             // readable rather than handing back a `None` that reads as "this
@@ -962,6 +1472,7 @@ fn freshness_rows(
                     is_fresh: distance == Some(0),
                     verification,
                     session,
+                    relation,
                     ..ProvenanceFreshness::unexamined(sha, reason)
                 };
             }
@@ -974,6 +1485,7 @@ fn freshness_rows(
                 notes_readable: true,
                 verification: verification.unwrap_or(None),
                 session: session.unwrap_or(None),
+                relation,
                 commit_sha: sha,
             }
         })

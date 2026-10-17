@@ -306,30 +306,36 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
 /// that fits [`crate::ledger::PAGE_MAX_BYTES`], so a thousand heavy rows come
 /// back as several pages whose `next_cursor` continues without a gap.
 pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, String> {
-    match crate::ledger::tail_readonly_page(anchor, cursor, limit, crate::ledger::PAGE_MAX_BYTES)
+    ledger_query_page(
+        anchor,
+        &crate::ledger::EventQuery {
+            after: cursor,
+            limit,
+            ..crate::ledger::EventQuery::default()
+        },
+    )
+}
+
+/// [`ledger_page`] for a filtered, ordered query: the same bounds and the same
+/// `truncated` / `next_cursor` contract, in the query's own order. In newest
+/// first order `next_cursor` is the lowest id returned, to be passed back as
+/// the next query's `before`.
+pub fn ledger_query_page(anchor: &str, query: &crate::ledger::EventQuery) -> Result<Value, String> {
+    match crate::ledger::query_readonly_page(anchor, query, crate::ledger::PAGE_MAX_BYTES)
         .map_err(|e| e.to_string())?
     {
-        Some((events, byte_capped)) => {
-            let next_cursor = events.last().map(|event| event.id);
-            // A page cut for its size always has more behind it. Otherwise a
-            // full page might be the last one: one more row of lookahead
-            // settles it, and only a full page pays for it.
-            let truncated = byte_capped
-                || match next_cursor {
-                    Some(last) if events.len() as u32 >= limit => {
-                        !crate::ledger::tail_readonly(anchor, last, 1)
-                            .map_err(|e| e.to_string())?
-                            .unwrap_or_default()
-                            .is_empty()
-                    }
-                    _ => false,
-                };
+        Some(page) => {
+            let next_cursor = page.events.last().map(|event| event.id);
+            // The read took one row past the limit to settle this, so a full
+            // final page is not truncated, and a page cut for its size always
+            // has more behind it.
+            let truncated = page.byte_capped || page.more;
             Ok(json!({
                 "ok": true,
-                "returned": events.len(),
+                "returned": page.events.len(),
                 "truncated": truncated,
                 "next_cursor": next_cursor,
-                "events": events,
+                "events": page.events,
             }))
         }
         // No ledger is not an empty ledger, and must not read as one.
