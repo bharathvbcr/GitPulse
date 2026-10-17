@@ -175,7 +175,7 @@ describe("parseServerManifest", () => {
   }
 
   it("requires the requested resource and response id", () => {
-    expect(parseServerManifest(response(20), 2)).toEqual({ storeSchema: 20, dcStoreSchema: null, workbenchSchema: null, error: null });
+    expect(parseServerManifest(response(20), 2)).toEqual({ storeSchema: 20, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: null });
     expect(parseServerManifest(response(20, "application/json", 3), 2)).toBeNull();
     expect(parseServerManifest(response(20).replace("server/manifest", "server/health"), 2)?.storeSchema).toBeNull();
   });
@@ -187,13 +187,19 @@ describe("parseServerManifest", () => {
   });
 
   it("reads the dc-store and workbench schemas a newer server declares", () => {
-    const declared = response(27, "application/json", 2, { dcStoreSchemaVersion: 9, workbenchSchemaVersion: 13 });
-    expect(parseServerManifest(declared, 2)).toEqual({ storeSchema: 27, dcStoreSchema: 9, workbenchSchema: 13, error: null });
+    const declared = response(27, "application/json", 2, { dcStoreSchemaVersion: 9, workbenchSchemaVersion: 13, extractionSchemaVersion: 94 });
+    expect(parseServerManifest(declared, 2)).toEqual({ storeSchema: 27, dcStoreSchema: 9, workbenchSchema: 13, extractSchema: 94, error: null });
   });
 
   it("reports an older server's missing or invalid dc-store schemas as unknown, never as a number", () => {
-    const invalid = response(27, "application/json", 2, { dcStoreSchemaVersion: 0, workbenchSchemaVersion: "13" });
-    expect(parseServerManifest(invalid, 2)).toEqual({ storeSchema: 27, dcStoreSchema: null, workbenchSchema: null, error: null });
+    const invalid = response(27, "application/json", 2, { dcStoreSchemaVersion: 0, workbenchSchemaVersion: "13", extractionSchemaVersion: "94" });
+    expect(parseServerManifest(invalid, 2)).toEqual({ storeSchema: 27, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: null });
+  });
+
+  it.each([-1, 0, 94.5, "94", null, true, Number.MAX_SAFE_INTEGER + 1])("reports extractionSchemaVersion %j as unknown, never as a number", extract => {
+    const result = parseServerManifest(response(27, "application/json", 2, { extractionSchemaVersion: extract }), 2);
+    expect(result?.extractSchema).toBeNull();
+    expect(result?.storeSchema).toBe(27);
   });
 
   it("distinguishes missing replies, failed replies, and truncated content", () => {
@@ -214,14 +220,14 @@ const onPosix = it.runIf(process.platform !== "win32");
 
 describe("probeServer", () => {
   onPosix("reads version and schema through the handshake and manifest", async () => {
-    const server = await identityServer("ok", 20, { dcStoreSchemaVersion: 9, workbenchSchemaVersion: 13 });
+    const server = await identityServer("ok", 20, { dcStoreSchemaVersion: 9, workbenchSchemaVersion: 13, extractionSchemaVersion: 94 });
     const result = await probeServer(server, 8000);
-    expect(result).toEqual({ version: "1.2.3", storeSchema: 20, dcStoreSchema: 9, workbenchSchema: 13, error: null });
+    expect(result).toEqual({ version: "1.2.3", storeSchema: 20, dcStoreSchema: 9, workbenchSchema: 13, extractSchema: 94, error: null });
   });
 
   onPosix("observes an older schema instead of inferring it from the version", async () => {
     const result = await probeServer(await identityServer("older", 19), 8000);
-    expect(result).toEqual({ version: "1.2.3", storeSchema: 19, dcStoreSchema: null, workbenchSchema: null, error: null });
+    expect(result).toEqual({ version: "1.2.3", storeSchema: 19, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: null });
   });
 
   onPosix("bounds a server that floods stdout without a response", async () => {

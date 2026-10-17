@@ -223,6 +223,16 @@ fn text_content(target_uri: &str, payload: Value) -> Value {
     })
 }
 
+/// devmap-extract declares its schema as a string (it forms the payload
+/// identity `{ANALYZER_VERSION}:extract-v{N}`); the manifest reports it as the
+/// number it names. A constant that is not a whole number reports `null`, which
+/// the parity check reads as "did not say" rather than a match.
+fn extraction_schema_version() -> Option<u64> {
+    devmap_extract::cache::EXTRACTION_SCHEMA_VERSION
+        .parse()
+        .ok()
+}
+
 fn server_document(name: &str) -> Result<Value, ReadError> {
     match name {
         "manifest" => Ok(json!({
@@ -234,6 +244,7 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             // might not have been built from (scripts/check-schema-parity.mjs).
             "dcStoreSchemaVersion": dc_store::SCHEMA_VERSION,
             "workbenchSchemaVersion": dc_store::workbench::WORKBENCH_SCHEMA,
+            "extractionSchemaVersion": extraction_schema_version(),
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
             // Derived from the tool annotations, so it cannot claim "read-only"
@@ -673,6 +684,11 @@ mod tests {
             parsed["workbenchSchemaVersion"],
             dc_store::workbench::WORKBENCH_SCHEMA
         );
+        // The number the linked extractor's string constant names, not a copy.
+        let extract: u64 = devmap_extract::cache::EXTRACTION_SCHEMA_VERSION
+            .parse()
+            .expect("the extraction schema is a whole number");
+        assert_eq!(parsed["extractionSchemaVersion"], json!(extract));
     }
 
     #[test]

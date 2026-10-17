@@ -2,8 +2,10 @@
 /**
  * Does every installed reader agree with the schemas DevCouncil writes?
  *
- * DevCouncil owns three schemas: the devmap store (`CURRENT_SCHEMA_VERSION`),
- * dc-store (`SCHEMA_VERSION`) and the workbench (`WORKBENCH_SCHEMA`). Every
+ * DevCouncil owns four schemas: the devmap store (`CURRENT_SCHEMA_VERSION`),
+ * dc-store (`SCHEMA_VERSION`), the workbench (`WORKBENCH_SCHEMA`) and the
+ * extraction payload (devmap-extract's `EXTRACTION_SCHEMA_VERSION`, a string
+ * constant; a stored graph written at another version is reported obsolete). Every
  * other app reads at least one of them, and each reads it through something
  * that can fall behind on its own:
  *
@@ -58,6 +60,7 @@ export const SCHEMAS = Object.freeze({
   store: { label: "devmap store", constant: "CURRENT_SCHEMA_VERSION", file: "devmap-store/src/schema.rs" },
   dcStore: { label: "dc-store", constant: "SCHEMA_VERSION", file: "dc-store/src/lib.rs" },
   workbench: { label: "workbench", constant: "WORKBENCH_SCHEMA", file: "dc-store/src/workbench/mod.rs" },
+  extract: { label: "devmap-extract", constant: "EXTRACTION_SCHEMA_VERSION", file: "devmap-extract/src/cache.rs" },
 });
 
 /** @typedef {keyof typeof SCHEMAS} SchemaKey */
@@ -73,15 +76,71 @@ const VENDORED_PREFIX = path.join("src-tauri", "vendored");
 const ALL_KEYS = /** @type {SchemaKey[]} */ (Object.keys(SCHEMAS));
 
 /**
- * One `pub const NAME: <int type> = N;` from a Rust source file.
+ * Rust source with its comments blanked: line comments (including doc
+ * comments) to end of line, and block comments (which nest in Rust) to their
+ * close, each replaced by one space with
+ * newlines kept. String and char literals are copied through untouched, so a
+ * `//` inside a string is not a comment. Only live declarations remain.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function withoutComments(text) {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const two = text.slice(i, i + 2);
+    if (two === "//") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += " ";
+    } else if (two === "/*") {
+      let depth = 0;
+      do {
+        const pair = text.slice(i, i + 2);
+        if (pair === "/*") { depth++; i += 2; }
+        else if (pair === "*/") { depth--; i += 2; }
+        else { if (text[i] === "\n") out += "\n"; i++; }
+      } while (depth > 0 && i < text.length);
+      out += " ";
+    } else if (text[i] === "r" && /^r(#*)"/.test(text.slice(i, i + 40)) && !/[A-Za-z0-9_]/.test(text[i - 1] ?? "")) {
+      const hashes = /^r(#*)"/.exec(text.slice(i, i + 40))?.[1] ?? "";
+      const close = text.indexOf(`"${hashes}`, i + 2 + hashes.length);
+      const end = close === -1 ? text.length : close + 1 + hashes.length;
+      out += text.slice(i, end);
+      i = end;
+    } else if (text[i] === '"') {
+      let end = i + 1;
+      while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+      out += text.slice(i, end + 1);
+      i = end + 1;
+    } else if (text[i] === "'" && /^'(?:\\.[^']*|[^\\'])'/.test(text.slice(i, i + 12))) {
+      const literal = /^'(?:\\.[^']*|[^\\'])'/.exec(text.slice(i, i + 12))?.[0] ?? "'";
+      out += literal;
+      i += literal.length;
+    } else {
+      out += text[i++];
+    }
+  }
+  return out;
+}
+
+/**
+ * One `pub const NAME: <int type> = N;` from a Rust source file, or the
+ * `pub const NAME: &str = "N";` form devmap-extract declares its version in.
+ * A string that is not a whole number is not found, and so is a constant
+ * declared twice with different values: either would be a guess.
  *
  * @param {string} text
  * @param {string} constant
  * @returns {number | null}
  */
 export function rustConstant(text, constant) {
-  const match = new RegExp(`pub const ${constant}:\\s*[iu](?:8|16|32|64|size)\\s*=\\s*(\\d+)\\s*;`).exec(text);
-  return match ? Number(match[1]) : null;
+  text = withoutComments(text);
+  const integer = String.raw`[iu](?:8|16|32|64|size)\s*=\s*(\d+)`;
+  const string = String.raw`&(?:'static\s+)?str\s*=\s*"(\d+)"`;
+  const found = [...text.matchAll(new RegExp(String.raw`pub const ${constant}:\s*(?:${integer}|${string})\s*;`, "g"))].map((match) => Number(match[1] ?? match[2]));
+  if (found.length === 0 || found.some((value) => value !== found[0] || !Number.isSafeInteger(value))) return null;
+  return found[0];
 }
 
 /**
@@ -158,11 +217,14 @@ export function judge(owner, reading) {
   if (reading.absent) return { reader, verdict: "absent", detail: reading.absent };
   if (reading.error) return { reader, verdict: "unverifiable", detail: reading.error };
   const schemas = reading.schemas ?? {};
-  const missing = reading.keys.filter((key) => typeof schemas[key] !== "number");
+  // A reading that is not a safe integer (NaN, a float) did not say; it is
+  // never compared, so it cannot read as stale or as a match.
+  const reported = (/** @type {SchemaKey} */ key) => Number.isSafeInteger(schemas[key]);
+  const missing = reading.keys.filter((key) => !reported(key));
   const unreported = missing.length > 0 ? `does not report ${missing.map((key) => SCHEMAS[key].label).join(", ")}` : "";
   // A known mismatch outranks an unknown: a reader that is provably behind on
   // one schema is stale whatever it failed to say about another.
-  const differs = reading.keys.filter((key) => typeof schemas[key] === "number" && schemas[key] !== owner[key]);
+  const differs = reading.keys.filter((key) => reported(key) && schemas[key] !== owner[key]);
   if (differs.length > 0) {
     const why = [
       ...differs.map((key) => `${SCHEMAS[key].label} ${schemas[key]}, DevCouncil writes ${owner[key]}`),
@@ -281,16 +343,33 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   if (probe.storeSchema !== null) schemas.store = probe.storeSchema;
   if (probe.dcStoreSchema !== null) schemas.dcStore = probe.dcStoreSchema;
   if (probe.workbenchSchema !== null) schemas.workbench = probe.workbenchSchema;
+  if (probe.extractSchema !== null) schemas.extract = probe.extractSchema;
   return { reader, keys: ALL_KEYS, schemas };
 }
 
-/** @returns {Reading} */
-function devmapReading() {
+/**
+ * `devmap` on PATH. Its `--version` line names the store schema, and names the
+ * extraction schema only once DevCouncil prints one (`extract schema N`); a
+ * build that does not is unverifiable for it, never assumed to match.
+ *
+ * @param {ReturnType<typeof readCliSchema>} [cli]
+ * @returns {Reading}
+ */
+export function devmapReading(cli = resolveOnPath("devmap") === null ? null : readCliSchema()) {
   const reader = "devmap (PATH)";
-  if (resolveOnPath("devmap") === null) return { reader, keys: ["store"], absent: "not on PATH" };
-  const cli = readCliSchema();
-  if (!cli.available) return { reader, keys: ["store"], error: cli.reason };
-  return { reader, keys: ["store"], schemas: { store: cli.expected } };
+  /** @type {SchemaKey[]} */
+  const keys = ["store", "extract"];
+  if (cli === null) return { reader, keys, absent: "not on PATH" };
+  if (!cli.available) return { reader, keys, error: cli.reason };
+  /** @type {Schemas} */
+  const schemas = { store: cli.expected };
+  if (typeof cli.extract === "number") schemas.extract = cli.extract;
+  return {
+    reader,
+    keys,
+    schemas,
+    ...(schemas.extract === undefined ? { note: "devmap --version does not print the extraction schema; DevCouncil must add it" } : {}),
+  };
 }
 
 /**
