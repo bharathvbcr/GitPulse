@@ -352,7 +352,7 @@ async function serverReading(reader, bin, absent, timeoutMs) {
  * extraction schema only once DevCouncil prints one (`extract schema N`); a
  * build that does not is unverifiable for it, never assumed to match.
  *
- * @param {ReturnType<typeof readCliSchema>} [cli]
+ * @param {ReturnType<typeof readCliSchema> | null} [cli]
  * @returns {Reading}
  */
 export function devmapReading(cli = resolveOnPath("devmap") === null ? null : readCliSchema()) {
