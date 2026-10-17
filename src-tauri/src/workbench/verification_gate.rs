@@ -168,9 +168,17 @@ pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> 
 }
 
 /// HEAD of the worktree a verification was taken in, as it is now.
+///
+/// Asked through the ref-state cache: the verification driver reads this for
+/// every held card on every sweep, and a worktree nobody has committed in
+/// answers the same each time. HEAD, the branch refs and the config git reads
+/// are what the answer is a function of, and the cache stamps exactly those,
+/// so a commit, a checkout or a reset is read again. A refusal (trust, a
+/// deferral under load, a missing worktree) is never kept.
 pub(crate) fn current_head(worktree: &str) -> Result<String, String> {
-    crate::engine::git_cli::git_text(
+    crate::engine::ref_cache::git_text(
         Path::new(worktree),
+        &["refs/heads"],
         &["rev-parse", "--verify", "HEAD^{commit}"],
     )
     .map(|head| head.trim().to_owned())

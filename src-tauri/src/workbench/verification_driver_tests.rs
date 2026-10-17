@@ -926,3 +926,139 @@ fn a_manual_verify_of_a_squash_merged_claim_is_refused_rather_than_guessed() {
     assert!(run_now(&store, &fake, &id).is_err());
     assert!(fake.starts.borrow().is_empty());
 }
+
+/// Children `git rev-parse --verify HEAD^{commit}` has started in `worktree`.
+fn head_reads(worktree: &std::path::Path) -> usize {
+    crate::engine::git_cli::spawn_log::spawns_in(worktree)
+        .iter()
+        .filter(|argv| argv.iter().any(|arg| arg == "HEAD^{commit}"))
+        .count()
+}
+
+/// The defect: every sweep read the head of every held card's worktree with a
+/// fresh git child, so three cards on one unmoving worktree cost three
+/// children every 3 s for as long as they stayed in review (71 of 109 children
+/// in a 45 s sample of the running app). A head that no ref, HEAD or config
+/// write has moved is answered from the ref-state cache instead.
+#[test]
+fn sweeping_held_cards_on_an_unmoved_worktree_spawns_at_most_one_head_read() {
+    const CARDS: usize = 3;
+    const SWEEPS: usize = 10;
+    let _held = crate::engine::ref_cache::retention();
+    crate::engine::ref_cache::eager(|| {
+        let (_d, store, repo, first) = setup();
+        let mut ids = vec![first];
+        for n in 1..CARDS {
+            ids.push(filed(
+                &store,
+                &repo,
+                &format!("gp-drv-{n}"),
+                &format!("Ship the exporter {n}"),
+            ));
+        }
+        for id in &ids {
+            claim(&store, &repo, id);
+        }
+        // The spelling the driver itself reads the head under.
+        let worktree = target_of(&live(&store, &ids[0]).unwrap())
+            .expect("the claim names its worktree")
+            .worktree;
+        let worktree = std::path::Path::new(&worktree);
+        let claimed = head_reads(worktree);
+        assert!(
+            claimed >= 1,
+            "the claims read the head, so this is the spelling the log files them under"
+        );
+
+        let fake = Fake::new();
+        let mut driver = Driver::default();
+        for _ in 0..SWEEPS {
+            driver.sweep(&store, &fake);
+        }
+        assert_eq!(
+            fake.starts.borrow().len(),
+            MAX_ACTIVE,
+            "the sweeps ran: {MAX_ACTIVE} verifications started, the rest wait"
+        );
+        let reads = head_reads(worktree) - claimed;
+        assert!(
+            reads <= 1,
+            "{CARDS} cards x {SWEEPS} sweeps on a worktree that never moved spawned {reads} head reads"
+        );
+    });
+}
+
+/// What makes the cache safe to put in front of the driver: a head that moves
+/// is read again, whether a branch moved (a commit) or only HEAD did.
+#[test]
+fn a_moved_head_is_never_served_from_the_cache() {
+    let _held = crate::engine::ref_cache::retention();
+    crate::engine::ref_cache::eager(|| {
+        let (_d, _store, repo, _id) = setup();
+        let path = repo.path().to_str().unwrap();
+        let truth = || {
+            crate::engine::git_cli::git_text(repo.path(), &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        let first = gate::current_head(path).unwrap();
+        assert_eq!(first, truth());
+        assert_eq!(gate::current_head(path).unwrap(), first, "served again");
+
+        crate::test_support::git_in(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "second"],
+        );
+        let second = truth();
+        assert_ne!(second, first);
+        assert_eq!(gate::current_head(path).unwrap(), second, "a new commit");
+
+        crate::test_support::git_in(repo.path(), &["checkout", "-q", "--detach", &first]);
+        assert_eq!(gate::current_head(path).unwrap(), first, "a detached HEAD");
+        crate::test_support::git_in(repo.path(), &["checkout", "-q", "main"]);
+        assert_eq!(
+            gate::current_head(path).unwrap(),
+            second,
+            "back on a branch"
+        );
+    });
+}
+
+/// A head read the spawn gate declined is not an answer: it is not kept, and
+/// the driver still recognises it as a question it did not get to ask, so it
+/// writes no `could_not_run` and asks again on the next sweep.
+#[test]
+fn a_head_read_the_gate_declined_stays_a_retryable_deferral_and_is_not_kept() {
+    use crate::sysload::{inject_governor, GovernorInput, Level};
+    let _held = crate::engine::ref_cache::retention();
+    crate::engine::ref_cache::eager(|| {
+        let (_d, _store, repo, _id) = setup();
+        let path = repo.path().to_str().unwrap();
+        let pressure = inject_governor(GovernorInput::test_pressure(Level::Critical));
+        let declined = gate::current_head(path).unwrap_err();
+        assert!(
+            crate::workbench::verification_driver::git_question_unasked(&declined),
+            "{declined}"
+        );
+        let target = Target {
+            worktree: path.into(),
+            head: "h1".into(),
+        };
+        let step = decide(&Facts {
+            revision: 3,
+            logs: "",
+            target: &target,
+            current_head: Err(declined),
+            latest: Ok(None),
+            attempt: None,
+            item_id: "i",
+        });
+        assert_eq!(step, Step::Skip);
+        drop(pressure);
+        assert!(
+            gate::current_head(path).is_ok(),
+            "the refusal was not kept as the answer"
+        );
+    });
+}
