@@ -1025,7 +1025,13 @@ fn claimed_named_attempt(
     );
     crate::test_support::git_in(
         &linked,
-        &["commit", "-q", "--allow-empty", "-m", &format!("work of {name}")],
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("work of {name}"),
+        ],
     );
     let claimed = complete_task(store, &linked_str, id, "done", None, Some("done"), None).unwrap();
     assert_eq!(claimed["status"], "review", "{claimed}");
@@ -1073,7 +1079,11 @@ fn a_short_uppercase_or_padded_base_resolves_to_the_full_commit_id() {
         run_now(&store, &fake, &id, Some(form)).unwrap_or_else(|e| panic!("{form:?}: {e:?}"));
     }
     for sent in fake.starts.borrow().iter() {
-        assert_eq!(sent["base"], first.as_str(), "the full id is what is started");
+        assert_eq!(
+            sent["base"],
+            first.as_str(),
+            "the full id is what is started"
+        );
     }
 }
 
@@ -1101,10 +1111,16 @@ fn a_target_force_moved_after_the_merge_refuses_the_recorded_base() {
     let (_d, store, repo, id) = setup();
     let before = head_of(&repo);
     crate::test_support::git_in(repo.path(), &["switch", "-q", "-c", "side"]);
-    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "side"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "side"],
+    );
     let side = head_of(&repo);
     crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
-    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "merge"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "merge"],
+    );
     let merged = head_of(&repo);
     // Force-moved onto an unrelated line: the recorded base is no ancestor of the head.
     crate::test_support::git_in(repo.path(), &["reset", "-q", "--hard", &side]);
@@ -1119,11 +1135,13 @@ fn a_target_force_moved_after_the_merge_refuses_the_recorded_base() {
 }
 
 #[test]
-#[ignore = "break: a hex-looking base that is also a branch name resolves to the branch, not the commit id; named_base passes the caller's text to rev-parse instead of checking it is an object id"]
 fn a_hex_base_that_is_also_a_branch_name_is_not_read_as_the_branch() {
     let (_d, store, repo, id) = setup();
     let root = head_of(&repo);
-    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "before"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "before"],
+    );
     let before = head_of(&repo);
     crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
     // A branch named like the abbreviated id of `before`, pointing at the root commit.

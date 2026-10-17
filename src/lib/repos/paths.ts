@@ -36,7 +36,33 @@ export function normalizeRepoPath(raw: string): string | null {
     value = value.replace(/\/+$/, "");
   }
   if (!value || value === "/" || value === "//") return null;
-  return value;
+  const collapsed = collapseDotSegments(value);
+  return collapsed === "/" || collapsed === "//" || collapsed === "." ? null : collapsed;
+}
+
+/**
+ * Drops `.` segments and folds `name/..` pairs, so two spellings of one path
+ * are one identity. The collapse is lexical (a symlinked directory before a
+ * `..` is not followed). A `..` that has nothing to fold stays in a relative
+ * path and is dropped at the root of an absolute one, as the OS does.
+ */
+function collapseDotSegments(value: string): string {
+  const unc = value.startsWith("//");
+  const absolute = !unc && value.startsWith("/");
+  const lead = unc ? "//" : absolute ? "/" : "";
+  const kept: string[] = [];
+  for (const segment of value.slice(lead.length).split("/")) {
+    if (segment === "." || segment === "") continue;
+    if (segment === "..") {
+      const last = kept[kept.length - 1];
+      if (last !== undefined && last !== ".." && !/^[A-Za-z]:$/.test(last)) kept.pop();
+      else if (!lead && !/^[A-Za-z]:$/.test(last ?? "")) kept.push("..");
+      continue;
+    }
+    kept.push(segment);
+  }
+  const joined = kept.join("/");
+  return joined ? `${lead}${joined}` : lead ? lead : ".";
 }
 
 export function identityKey(path: string, options: PathIdentityOptions): string {

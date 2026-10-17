@@ -675,6 +675,13 @@ fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, Workben
     }
     let full = resolve_commit(Path::new(checkout), named)
         .map_err(|why| WorkbenchError::new("repository_unavailable", why))?;
+    // rev-parse reads a name before an abbreviated id, so text that is also a branch or tag would resolve to
+    // that ref. An id names the commit it is a prefix of; anything else it resolved to was not asked for.
+    if !full.starts_with(&named.to_ascii_lowercase()) {
+        return Err(invalid(
+            "The verification base names something other than the commit with that id.",
+        ));
+    }
     if full == head {
         return Err(invalid(
             "The verification base is the head itself, an empty range that would judge nothing.",

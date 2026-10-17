@@ -44,7 +44,7 @@ describe("mergeVerifiedAttempt", () => {
   it("merges the verified head without asking, into the main checkout's branch, and never pushes", async () => {
     setup();
     const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
-    expect(result).toEqual({ head: "1234567890abcdef", message: "Merged 1 commit from gitpulse/fix into main. The worktree was removed." });
+    expect(result).toEqual({ head: "1234567890abcdef", message: "Merged 1 commit from gitpulse/fix into main. The worktree was removed.", beforeOid: "a", afterOid: "1234567890abcdef" });
     // The head the verdict was reached for is the tip the host holds the merge to.
     expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false, expectedTip: "1234567890abcdef" });
     expect(invoke.mock.calls.map((c) => String(c[0])).filter((c) => /push|remote/.test(c))).toEqual([]);

@@ -85,25 +85,51 @@ describe("merged-set re-verify is bounded", () => {
 });
 
 describe("the gate outcome is durable before the wave can go on", () => {
-  // BREAK: `merged` is written (gateMerge) before the halt is. A process that dies between the two leaves a
-  // running record in which the landed member is `merged` with no halt, and a resume merges the next member
-  // over a regression the gate had found.
-  it.fails("a crash between the failing member's `merged` write and the halt does not let a resume merge the next member", async () => {
+  // The landed member is `verifying_merge` (with its oids) until ONE write moves it to `merged` together with the
+  // gate outcome and, on a fault, the halt. A process that dies at any point therefore leaves a record whose resume
+  // runs the gate again, never one in which the next member merges over a regression the gate had found.
+  it("a crash around the failing gate does not let a resume merge the next member, and no running record holds `merged` without its outcome", async () => {
+    const failA = (w: ReturnType<typeof world>) => {
+      const verify = w.deps.verify;
+      w.deps.verify = async (id, signal, post) => (id === "a" && post?.head === "t2" ? { state: "failed", stale: false, head: post.head } : verify(id, signal, post));
+    };
     const w = world(["a", "b", "c"]);
-    const verify = w.deps.verify;
-    w.deps.verify = async (id, signal, post) => (id === "a" && post?.head === "t2" ? { state: "failed", stale: false, head: post.head } : verify(id, signal, post));
+    failA(w);
     let crashed = false;
     const first: WaveDeps = { ...w.deps, persist: async (record) => {
       await w.deps.persist(record);
-      const bMerged = record.members.find((m) => m.taskId === "b")?.phase === "merged";
-      if (bMerged && record.state === "running" && !crashed) { crashed = true; throw new Error("process died"); }
+      const b = record.members.find((m) => m.taskId === "b")?.phase;
+      if (b === "verifying_merge" && !crashed) { crashed = true; throw new Error("process died"); }
     } };
     await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, first)).finished;
     const saved = w.persisted.findLast((r) => r.state === "running")!;
-    expect(saved.members.find((m) => m.taskId === "b")!.phase).toBe("merged");
+    expect(saved.members.find((m) => m.taskId === "b")!.phase).toBe("verifying_merge");
+    // No record of a still-running wave ever holds b as merged: that write is the halt's.
+    expect(w.persisted.some((r) => r.state === "running" && r.members.find((m) => m.taskId === "b")?.phase === "merged")).toBe(false);
     const again = world(["a", "b", "c"]);
-    await (await resumeWave(structuredClone(saved), again.deps)).finished;
+    failA(again);
+    const done = await (await resumeWave(structuredClone(saved), again.deps)).finished;
     expect(again.merged, "c must not merge over a regression the gate found in a").toEqual([]);
+    expect(done.state).toBe("halted");
+  });
+
+  it("a merge conflict is written as the refused member and the halt in one write", async () => {
+    const w = world(["a", "b"], { merge: async () => { throw { code: "conflict", message: "conflicted", total: 1, rolled_back: true, rollback_error: null }; } });
+    await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    // No running record holds a held member beside a ready or merging one: the hold and the halt are one write.
+    expect(w.persisted.some((r) => r.state === "running" && r.members.some((m) => m.phase === "held"))).toBe(false);
+  });
+
+  it("a member merged by a record from before the gate has no pre-merge tip: the gate halts rather than count it as judged", async () => {
+    const w = world(["a", "b"]);
+    const old = { taskId: "a", title: "Task a", phase: "merged" as const, runId: "ra", requestId: "qa", cwd: "/wt/a", head: "h1", detail: "Merged a", startedAt: 1 };
+    const landed = { ...old, taskId: "b", title: "Task b", phase: "verifying_merge" as const, runId: "rb", requestId: "qb", cwd: "/wt/b", mergeBefore: "t0", mergeAfter: "t1" };
+    const record: WaveRecord = { v: 1, id: "w", repositoryId: "r", n: 2, batchesLeft: 0, batch: 1, state: "running", members: [old, landed], attempted: ["a", "b"], note: "", seq: 4 };
+    const done = await (await resumeWave(record, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(done.note).toMatch(/could not cover "Task a"/);
+    expect(phases(done)).toEqual({ a: "merged", b: "held" });
+    expect(w.posts).toEqual([]);
   });
 });
 
@@ -201,10 +227,9 @@ describe("record decoding across versions", () => {
     expect(decodeWave(line({ ...base, extra: 1, members: [{ ...member, extra: 2 }] }))).not.toBeNull();
   });
 
-  // BREAK: an unknown member phase decodes to null, which `findActiveWave` skips as "not a running wave".
-  // A wave a newer build left running is then invisible and `complete` stays true, so `beginWave` starts a
-  // second wave beside it.
-  it.fails("a running wave with a phase this build does not know is not reported as no wave with a complete look", async () => {
+  // An unknown member phase decodes to null; a labelled card whose record cannot be read may be a running wave, so
+  // the look is incomplete and `beginWave` refuses rather than starting a second wave beside it.
+  it("a running wave with a phase this build does not know is not reported as no wave with a complete look", async () => {
     const stored = line({ ...base, members: [{ ...member, phase: "from_the_future" }] });
     const api: WaveTaskApi = {
       getTask: async () => ({ id: "a", revision: 1, labels: [waveLabel("w")], logs: stored }) as never,
@@ -236,9 +261,8 @@ describe("S5-12 scope identity", () => {
     expect(planBatch([task("a"), task("b")], new Map([["a", ["Src/A.ts/"]], ["b", ["./src/a.ts"]]]), 2, new Set(), ci).chosen.map((c) => c.id)).toEqual(["a"]);
   });
 
-  // BREAK: only a leading `./` is dropped, so an inner `.` segment (src/./a.ts) or a `..` segment keeps two
-  // spellings of one file apart and two tasks on the same file launch together.
-  it.fails("src/./a.ts and src/x/../a.ts are the same file as src/a.ts", () => {
+  // `identityKey` folds inner `.` and `..` segments, so two spellings of one file are one scope.
+  it("src/./a.ts and src/x/../a.ts are the same file as src/a.ts", () => {
     expect(scopesOverlap(["src/./a.ts"], ["src/a.ts"], ci)).toBe(true);
     expect(scopesOverlap(["src/x/../a.ts"], ["src/a.ts"], ci)).toBe(true);
   });

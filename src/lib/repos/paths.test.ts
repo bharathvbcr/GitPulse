@@ -204,3 +204,17 @@ describe("repo identity is a well-behaved equivalence relation", () => {
     }
   });
 });
+
+describe("dot segments", () => {
+  it("folds inner . and .. segments so two spellings of one path are one identity", () => {
+    expect(normalizeRepoPath("src/./a.ts")).toBe("src/a.ts");
+    expect(normalizeRepoPath("src/x/../a.ts")).toBe("src/a.ts");
+    expect(normalizeRepoPath("/work/repo/./sub/../file")).toBe("/work/repo/file");
+    expect(normalizeRepoPath("../a")).toBe("../a");
+    expect(normalizeRepoPath("/../a")).toBe("/a");
+    expect(normalizeRepoPath("C:/work/../x")).toBe("C:/x");
+    expect(normalizeRepoPath("//host/share/./x")).toBe("//host/share/x");
+    expect(normalizeRepoPath("a/..")).toBeNull();
+    expect(normalizeRepoPath("/x/..")).toBeNull();
+  });
+});

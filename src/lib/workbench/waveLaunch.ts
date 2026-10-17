@@ -166,9 +166,9 @@ export function clampWaves(value: unknown): number {
   return Math.min(MAX_WAVES, Math.max(1, n));
 }
 
-/** A path as the filesystem tells files apart: `identityKey` (separators, repeated and trailing slashes, case on a case-insensitive filesystem) once a leading `./` is dropped. */
+/** A path as the filesystem tells files apart: `identityKey` (separators, repeated and trailing slashes, `.` and `..` segments, case on a case-insensitive filesystem). */
 function normalizePath(path: string, options: PathIdentityOptions): string {
-  return identityKey(path.replace(/\\/g, "/").replace(/^(\.\/)+/, ""), options);
+  return identityKey(path, options);
 }
 
 const hostOptions = (): PathIdentityOptions => ({ caseInsensitive: isCaseInsensitiveFs() });
@@ -297,10 +297,15 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     writing = turn.then(() => undefined, () => undefined);
     await turn;
   };
-  const stopTerminal = async (state: WaveState, note: string) => {
-    const members = record.members.map((m) => (TERMINAL.has(m.phase) ? m : { ...m, phase: "stopped" as MemberPhase, detail: m.detail || note }));
+  /** Ends the wave in ONE write: `change` is applied to every member, and any left unfinished is stopped. */
+  const settle = async (change: (m: WaveMember) => WaveMember, state: WaveState, note: string) => {
+    const members = record.members.map((m) => {
+      const next = change(m);
+      return TERMINAL.has(next.phase) ? next : { ...next, phase: "stopped" as MemberPhase, detail: next.detail || note };
+    });
     await save({ state, note, members });
   };
+  const stopTerminal = (state: WaveState, note: string) => settle((m) => m, state, note);
 
   const launchBatch = async (): Promise<boolean> => {
     // A parked merge or a person's uncommitted work in the main checkout is not
@@ -407,34 +412,45 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   const gateMerge = async () => {
     const landed = record.members.find((m) => m.phase === "verifying_merge");
     if (!landed) return;
+    const held = (why: string) => (m: WaveMember): WaveMember => (m.taskId === landed.taskId ? { ...m, phase: "held", detail: `${landed.detail} ${why}`.trim() } : m);
+    // Every exit below is ONE write that carries the gate outcome with the member's move out of
+    // `verifying_merge`, so no record ever holds a terminal member without it, or a halt without its member.
     if (cancelled) {
-      await update(landed.taskId, { phase: "held", detail: `${landed.detail} The wave was stopped before the merge was re-verified; check the main checkout.`.trim() });
+      await settle(held("The wave was stopped before the merge was re-verified; check the main checkout."), "cancelled", "Stopped by the person; no further task was launched or merged.");
       return;
     }
     const tip = landed.mergeAfter, base = landed.mergeBefore;
     if (!tip || !base) {
       // Fail closed: without where the merge landed there is no range to judge, and nothing may read as verified.
-      await update(landed.taskId, { phase: "held", detail: `${landed.detail} Where the merge landed was not recorded, so it was not re-verified; check the main checkout.`.trim() });
-      await stopTerminal("halted", `Re-verification after merging "${landed.title}" could not run (where the merge landed was not recorded); no further merge was made.`);
+      await settle(held("Where the merge landed was not recorded, so it was not re-verified; check the main checkout."), "halted", `Re-verification after merging "${landed.title}" could not run (where the merge landed was not recorded); no further merge was made.`);
       return;
     }
-    const judged = record.members.flatMap((m) => ((m.phase === "merged" || m.phase === "verifying_merge") && m.mergeBefore ? [{ m, base: m.mergeBefore }] : []));
+    const merged = record.members.filter((m) => m.phase === "merged" || m.phase === "verifying_merge");
+    const unjudged = merged.filter((m) => !m.mergeBefore);
+    if (unjudged.length > 0) {
+      // A member merged by a record from before the gate has no pre-merge tip to judge it over; it is never counted as judged.
+      await settle(held("An earlier member of this batch has no recorded pre-merge tip, so the merged set was not re-verified; check the main checkout."), "halted", `Re-verification after merging "${landed.title}" could not cover ${unjudged.map((m) => `"${m.title}"`).join(", ")} (merged by a record that kept no pre-merge tip); no further merge was made.`);
+      return;
+    }
+    const judged = merged.flatMap((m) => (m.mergeBefore ? [{ m, base: m.mergeBefore }] : []));
     const results = await Promise.all(judged.map(async ({ m, base: from }) => {
       try { return { m, verdict: await limiter.run(() => deps.verify(m.taskId, abort.signal, { base: from, head: tip }), abort.signal), why: "" }; }
       catch (cause) { return { m, verdict: null, why: message(cause) }; }
     }));
     if (cancelled) {
-      await update(landed.taskId, { phase: "held", detail: `${landed.detail} The wave was stopped before the merge was re-verified; check the main checkout.`.trim() });
+      await settle(held("The wave was stopped before the merge was re-verified; check the main checkout."), "cancelled", "Stopped by the person; no further task was launched or merged.");
       return;
     }
     const faults = results.flatMap((r) => { const fault = gateFault(r.verdict, r.why, tip); return fault ? [{ m: r.m, fault }] : []; });
     const own = faults.find((f) => f.m.taskId === landed.taskId);
-    await update(landed.taskId, { phase: "merged", detail: own ? `${landed.detail} Re-verification after the merge ${own.fault}.` : landed.detail });
-    for (const f of faults) {
-      if (f.m.taskId !== landed.taskId) await update(f.m.taskId, { detail: `${f.m.detail} Re-verification after merging "${landed.title}" ${f.fault}.`.trim() });
-    }
     const first = own ?? faults[0];
-    if (first) await stopTerminal("halted", `Re-verification after merging "${landed.title}" ${first === own ? first.fault : `found "${first.m.title}" ${first.fault}`}; no further merge was made.`);
+    const outcome = (m: WaveMember): WaveMember => {
+      if (m.taskId === landed.taskId) return { ...m, phase: "merged", detail: own ? `${landed.detail} Re-verification after the merge ${own.fault}.` : landed.detail };
+      const f = faults.find((entry) => entry.m.taskId === m.taskId);
+      return f ? { ...m, detail: `${m.detail} Re-verification after merging "${landed.title}" ${f.fault}.`.trim() } : m;
+    };
+    if (!first) { await save({ members: record.members.map(outcome) }); return; }
+    await settle(outcome, "halted", `Re-verification after merging "${landed.title}" ${first === own ? first.fault : `found "${first.m.title}" ${first.fault}`}; no further merge was made.`);
   };
 
   /** One merge at a time, in launch order; the merge is recorded as `verifying_merge`, and the gate runs on the loop's next turn. */
@@ -458,9 +474,11 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         // Nothing after a conflict may merge: the next member's branch was cut
         // from the same base, and a squash left parked is still in the checkout.
         const pending = halting === "conflict" ? `conflict in ${next.title}` : `squash parked in main (${next.title})`;
-        await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
-        await save({ members: record.members.map((m) => (m.phase === "ready" ? { ...m, phase: "held" as MemberPhase, detail: `not merged: ${pending} pending` } : m)) });
-        await stopTerminal("halted", `Merging "${next.title}" ended in a ${halting === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`);
+        // One write: the refused member, the ones waiting behind it and the halt, so a restart cannot find the member held and the wave still going.
+        await settle(
+          (m) => (m.taskId === next.taskId ? { ...m, phase: "held", detail: `Not merged: ${message(cause)}` } : m.phase === "ready" ? { ...m, phase: "held", detail: `not merged: ${pending} pending` } : m),
+          "halted", `Merging "${next.title}" ended in a ${halting === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`,
+        );
         return true;
       }
       await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });

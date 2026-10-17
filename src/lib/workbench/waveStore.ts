@@ -153,7 +153,9 @@ export async function findActiveWave(api: WaveTaskApi): Promise<ActiveWave> {
         const label = card.labels.find((entry) => entry.startsWith(WAVE_LABEL_PREFIX));
         if (!label) continue;
         const record = decodeWave((await api.getTask(card.id)).logs);
-        if (!record || record.state !== "running" || waveLabel(record.id) !== label) continue;
+        // The label is only on a card of a running wave. A record this build cannot read (a phase from a newer build, a damaged line) may be that wave: it is never "no wave".
+        if (!record) { complete = false; continue; }
+        if (record.state !== "running" || waveLabel(record.id) !== label) continue;
         const best = found.get(record.id);
         if (!best || record.seq > best.seq) found.set(record.id, record);
       }

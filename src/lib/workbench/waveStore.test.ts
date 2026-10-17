@@ -136,13 +136,18 @@ describe("finding the wave a restart should continue", () => {
     expect(found!.complete).toBe(true);
   });
 
-  it("ignores finished waves, undecodable lines and a label that disagrees with its record", async () => {
+  it("ignores finished waves and a label that disagrees with its record", async () => {
     const b = board();
     b.add("done", { labels: [waveLabel("w1")], logs: encodeWave(record({ state: "done" })) });
-    b.add("junk", { labels: [waveLabel("w2")], logs: `${WAVE_MARK}{oops` });
     b.add("liar", { labels: [waveLabel("w9")], logs: encodeWave(record({ id: "w1" })) });
     b.add("plain");
     expect(await findActiveWave(b.api)).toEqual({ record: null, complete: true });
+  });
+
+  it("never reads a labelled card whose record cannot be decoded as no wave: the look is incomplete", async () => {
+    const b = board();
+    b.add("junk", { labels: [waveLabel("w2")], logs: `${WAVE_MARK}{oops` });
+    expect(await findActiveWave(b.api)).toEqual({ record: null, complete: false });
   });
 
   it("says it looked at only part of the board when a status runs past its page cap", async () => {
