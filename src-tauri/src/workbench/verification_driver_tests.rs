@@ -467,7 +467,9 @@ fn sweeps_over_a_deleted_worktree_write_one_could_not_run() {
     }
     assert_eq!(total, 1, "an unreadable head was recorded {total} times");
     assert_eq!(
-        logs(&store, &id).matches("Verification could not run").count(),
+        logs(&store, &id)
+            .matches("Verification could not run")
+            .count(),
         1
     );
     assert_eq!(status_of(&store, &id), "review");
@@ -486,7 +488,13 @@ fn the_batched_verdict_read_agrees_with_the_per_card_read() {
     store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
     store_record(&store, &other, &record(&other, "", "running", &repo, &head));
     store
-        .evidence_append("other.kind", Some(&other), None, None, "{\"not\":\"a verdict\"}")
+        .evidence_append(
+            "other.kind",
+            Some(&other),
+            None,
+            None,
+            "{\"not\":\"a verdict\"}",
+        )
         .unwrap();
     let ids = [id.clone(), other.clone(), never.clone()];
     let batch = gate::latest_many(&store, &ids).unwrap();
@@ -515,7 +523,11 @@ fn the_host_verdict_read_leaves_the_profile_unchanged() {
         &["commit", "-q", "--allow-empty", "-m", "init"],
     );
     let id = filed(&store, &repo, "gp-ro", "Read me");
-    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head_of(&repo)));
+    store_record(
+        &store,
+        &id,
+        &record(&id, "passed", "settled", &repo, &head_of(&repo)),
+    );
     let observer = rusqlite::Connection::open(&path).unwrap();
     let version = || -> i64 {
         observer
@@ -527,13 +539,21 @@ fn the_host_verdict_read_leaves_the_profile_unchanged() {
         .request("verifications.board", &json!({"ids": [id]}).to_string())
         .unwrap();
     assert_eq!(out["items"][&id]["state"], "passed", "{out}");
-    assert_eq!(version(), before, "the verdict read committed to the profile");
+    assert_eq!(
+        version(),
+        before,
+        "the verdict read committed to the profile"
+    );
     // The task sheet polls this one every few seconds while a run is open.
     let out = host
         .request("verifications.status", &json!({"id": id}).to_string())
         .unwrap();
     assert_eq!(out["state"], "passed", "{out}");
-    assert_eq!(version(), before, "the status read committed to the profile");
+    assert_eq!(
+        version(),
+        before,
+        "the status read committed to the profile"
+    );
     drop(dir);
 }
 

@@ -1627,18 +1627,17 @@ done
         let permits: Vec<_> = (0..MAX_IN_FLIGHT)
             .map(|_| host.reserve().unwrap())
             .collect();
-        let waiter = {
-            let host = host.clone();
-            std::thread::spawn(move || {
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
                 host.reserve_within(std::time::Duration::from_secs(10))
                     .map(drop)
-            })
-        };
-        while host.0.admission.lock().unwrap().queued == 0 {
-            std::thread::yield_now();
-        }
-        drop(permits);
-        assert!(waiter.join().unwrap().is_ok());
+            });
+            while host.0.admission.lock().unwrap().queued == 0 {
+                std::thread::yield_now();
+            }
+            drop(permits);
+            assert!(waiter.join().unwrap().is_ok());
+        });
         let slots = host.0.admission.lock().unwrap();
         assert_eq!((slots.in_flight, slots.queued), (0, 0));
     }
@@ -1657,7 +1656,10 @@ done
             .err()
             .unwrap();
         assert_eq!(error.code, "busy");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5))
+        );
         host.0.admission.lock().unwrap().queued = MAX_QUEUED;
         let started = std::time::Instant::now();
         let error = host
@@ -1666,7 +1668,8 @@ done
             .unwrap();
         assert_eq!(error.code, "busy");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(1)),
             "a full queue refuses at once"
         );
         host.0.admission.lock().unwrap().queued = 0;
@@ -1679,20 +1682,22 @@ done
         let permits: Vec<_> = (0..MAX_IN_FLIGHT)
             .map(|_| host.reserve().unwrap())
             .collect();
-        let waiter = {
-            let host = host.clone();
-            std::thread::spawn(move || {
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
                 host.reserve_within(std::time::Duration::from_secs(30))
                     .map(drop)
-            })
-        };
-        while host.0.admission.lock().unwrap().queued == 0 {
-            std::thread::yield_now();
-        }
-        let started = std::time::Instant::now();
-        host.shutdown();
-        assert_eq!(waiter.join().unwrap().err().unwrap().code, "closed");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            });
+            while host.0.admission.lock().unwrap().queued == 0 {
+                std::thread::yield_now();
+            }
+            let started = std::time::Instant::now();
+            host.shutdown();
+            assert_eq!(waiter.join().unwrap().err().unwrap().code, "closed");
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5))
+            );
+        });
         drop(permits);
     }
 

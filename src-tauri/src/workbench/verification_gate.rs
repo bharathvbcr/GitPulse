@@ -128,7 +128,8 @@ pub(crate) fn latest_many(
     if item_ids.is_empty() {
         return Ok(found);
     }
-    let unreadable = |e: rusqlite::Error| format!("the verification evidence could not be read: {e}");
+    let unreadable =
+        |e: rusqlite::Error| format!("the verification evidence could not be read: {e}");
     let ids = serde_json::to_string(item_ids).map_err(|e| e.to_string())?;
     let mut statement = store
         .connection()

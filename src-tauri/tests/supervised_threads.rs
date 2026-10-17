@@ -27,7 +27,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("commands/mod.rs", 1, "per-IPC-call off-thread work whose JoinError reaches the caller"),
     ("desktop/mod.rs", 1, "per-call off-thread work whose JoinError reaches the caller"),
     ("logging.rs", 1, "per-call log read whose JoinError reaches the caller"),
-    ("workbench.rs", 4, "per-IPC-call off-thread work whose JoinError reaches the caller"),
+    ("workbench.rs", 5, "per-IPC-call off-thread work, and admit's wait for a storage slot, whose JoinError reaches the caller"),
     ("terminal/executor.rs", 1, "an on-demand lane worker that runs every job under catch_unwind; a job that panics drops its reply, which its caller reports as an error, and the next submission starts a replacement if the pool is short"),
     ("terminal/mod.rs", 1, "hold_master, a #[doc(hidden)] hook for tests that holds a master lock until its MasterHold is released and joins the thread"),
 ];

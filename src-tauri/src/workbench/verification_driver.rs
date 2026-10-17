@@ -502,7 +502,10 @@ pub(crate) fn status_batch(
         gate::latest_many(store, ids).map_err(|m| WorkbenchError::new("store_error", m))?;
     for id in ids {
         if let Some(record) = records.remove(id) {
-            items.insert(id.clone(), describe(Some(record), backend, &mut heads, false));
+            items.insert(
+                id.clone(),
+                describe(Some(record), backend, &mut heads, false),
+            );
         }
     }
     Ok(json!({"ok": true, "items": items}))
