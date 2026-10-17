@@ -579,10 +579,16 @@ fn describe(
 /// judging the checkout then would pass work that never landed, so it is
 /// refused. Each press is its own request, so it can re-run a verdict the
 /// automatic one already reached.
+///
+/// `base_override` names the revision to diff against: a wave re-verifying a
+/// member after a merge passes the target's tip from before that merge, so the
+/// range is what the merge brought in. It is judged in the checkout, and only
+/// a commit id that is a strict ancestor of the checkout's head is accepted.
 pub(crate) fn run_now(
     store: &Store,
     backend: &dyn Backend,
     id: &str,
+    base_override: Option<&str>,
 ) -> Result<Value, WorkbenchError> {
     let card = intake::get_item(store, id)?
         .ok_or_else(|| WorkbenchError::new("not_found", "The task does not exist."))?;
@@ -600,33 +606,35 @@ pub(crate) fn run_now(
                 )
             })
     };
-    let worktree = match target_of(&card) {
-        None => checkout()?,
-        Some(target) if Path::new(&target.worktree).is_dir() => target.worktree,
-        // The claimed worktree is gone. Its work is judged in the checkout
-        // only once the checkout holds the claimed commit; otherwise the
-        // checkout would stand in for work that never reached it.
-        Some(target) => {
-            let path = checkout()?;
-            let merged = crate::harness::review::contains(Path::new(&path), "HEAD", &target.head)
-                .map_err(|why| {
-                    WorkbenchError::new(
-                        "repository_unavailable",
-                        format!("The claimed worktree is gone and whether its work reached the checkout could not be read: {why}"),
-                    )
-                })?;
-            if !merged {
-                return Err(WorkbenchError::new(
+    // The checkout stands in for a claimed worktree only once it holds the
+    // claimed commit; otherwise it would stand in for work that never reached it.
+    let merged_checkout = |target: &Target| {
+        let path = checkout()?;
+        let merged = crate::harness::review::contains(Path::new(&path), "HEAD", &target.head)
+            .map_err(|why| {
+                WorkbenchError::new(
                     "repository_unavailable",
-                    format!(
-                        "The claimed worktree {} is gone and its commit {} is not merged into the checkout, so there is no copy of the work to verify.",
-                        target.worktree,
-                        target.head.get(..12).unwrap_or(&target.head)
-                    ),
-                ));
-            }
-            path
+                    format!("The claimed worktree is gone and whether its work reached the checkout could not be read: {why}"),
+                )
+            })?;
+        if !merged {
+            return Err(WorkbenchError::new(
+                "repository_unavailable",
+                format!(
+                    "The claimed worktree {} is gone and its commit {} is not merged into the checkout, so there is no copy of the work to verify.",
+                    target.worktree,
+                    target.head.get(..12).unwrap_or(&target.head)
+                ),
+            ));
         }
+        Ok(path)
+    };
+    let worktree = match (base_override, target_of(&card)) {
+        (None, None) | (Some(_), None) => checkout()?,
+        (None, Some(target)) if Path::new(&target.worktree).is_dir() => target.worktree,
+        // A named base is a range in the merged checkout: it is judged there
+        // even while a leftover worktree still exists.
+        (_, Some(target)) => merged_checkout(&target)?,
     };
     let local = intake::resolve(&worktree)?;
     if local.identity != identity {
@@ -638,9 +646,12 @@ pub(crate) fn run_now(
     let head = backend
         .head_of(&local.path)
         .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
-    let base = backend
-        .base_of(&local.path, &head)
-        .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
+    let base = match base_override {
+        Some(named) => named_base(&local.path, named, &head)?,
+        None => backend
+            .base_of(&local.path, &head)
+            .map_err(|e| WorkbenchError::new("repository_unavailable", e))?,
+    };
     let request = format!(
         "manual-{id}-{}-{}",
         head.get(..12).unwrap_or(&head),
@@ -651,6 +662,32 @@ pub(crate) fn run_now(
     });
     let params = gate::start_params(&input.to_string())?;
     backend.start(params)
+}
+
+/// A base the caller named, accepted only as a commit id that is a strict
+/// ancestor of `head`: an empty range (base == head), or a base the checkout
+/// does not hold, would let a verification pass without judging anything.
+fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, WorkbenchError> {
+    let invalid = |why: &str| WorkbenchError::new("invalid_input", why.to_owned());
+    let named = named.trim();
+    if !(7..=64).contains(&named.len()) || !named.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid("A verification base must be a commit id."));
+    }
+    let full = resolve_commit(Path::new(checkout), named)
+        .map_err(|why| WorkbenchError::new("repository_unavailable", why))?;
+    if full == head {
+        return Err(invalid(
+            "The verification base is the head itself, an empty range that would judge nothing.",
+        ));
+    }
+    let ancestor = crate::harness::review::contains(Path::new(checkout), head, &full)
+        .map_err(|why| WorkbenchError::new("repository_unavailable", why))?;
+    if !ancestor {
+        return Err(invalid(
+            "The verification base is not an ancestor of the checkout's head.",
+        ));
+    }
+    Ok(full)
 }
 
 /// True when `err` is a git question that was not asked: the spawn gate

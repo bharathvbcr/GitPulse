@@ -835,7 +835,7 @@ fn a_manual_verify_after_the_claimed_worktree_was_torn_down_judges_the_repositor
     let fake = Fake::new();
     let canon = |p: &str| std::fs::canonicalize(p).unwrap();
     // While the worktree exists it is the one judged.
-    run_now(&store, &fake, &id).unwrap();
+    run_now(&store, &fake, &id, None).unwrap();
     assert_eq!(
         canon(fake.starts.borrow()[0]["worktree"].as_str().unwrap()),
         canon(linked_str)
@@ -843,7 +843,7 @@ fn a_manual_verify_after_the_claimed_worktree_was_torn_down_judges_the_repositor
     // Merge-and-teardown removes it; the re-verify must follow the work to the checkout.
     crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", linked_str]);
     assert!(!linked.exists());
-    run_now(&store, &fake, &id).expect("the re-verify falls back to the repository checkout");
+    run_now(&store, &fake, &id, None).expect("the re-verify falls back to the repository checkout");
     let sent = fake.starts.borrow();
     assert_eq!(
         canon(sent[1]["worktree"].as_str().unwrap()),
@@ -882,7 +882,7 @@ fn a_manual_verify_of_a_claim_whose_worktree_was_removed_unmerged_is_refused() {
     crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
     let fake = Fake::new();
     let error =
-        run_now(&store, &fake, &id).expect_err("the checkout does not hold the claimed work");
+        run_now(&store, &fake, &id, None).expect_err("the checkout does not hold the claimed work");
     assert_eq!(error.code, "repository_unavailable", "{}", error.message);
     assert!(error.message.contains("not merged"), "{}", error.message);
     assert!(
@@ -902,7 +902,7 @@ fn a_manual_verify_of_a_claim_merged_and_torn_down_judges_the_checkout_that_hold
     );
     crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
     let fake = Fake::new();
-    run_now(&store, &fake, &id).expect("the merged work is judged where it landed");
+    run_now(&store, &fake, &id, None).expect("the merged work is judged where it landed");
     let sent = fake.starts.borrow();
     assert_eq!(
         std::fs::canonicalize(sent[0]["worktree"].as_str().unwrap()).unwrap(),
@@ -923,6 +923,80 @@ fn a_manual_verify_of_a_squash_merged_claim_is_refused_rather_than_guessed() {
     );
     crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
     let fake = Fake::new();
-    assert!(run_now(&store, &fake, &id).is_err());
+    assert!(run_now(&store, &fake, &id, None).is_err());
     assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn the_base_after_a_teardown_merge_is_the_pre_merge_target_tip_not_head() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    let before = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge", "attempt"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let after = head_of(&repo);
+    assert_ne!(before, after);
+    // What `HostBackend::base_of` answers in the primary checkout after the merge.
+    let base = verification_base(repo.path(), &after).expect("a merge commit has a first parent");
+    assert_eq!(base, before, "the base is the target's tip before the merge");
+    assert_ne!(base, after, "an empty range judges nothing");
+}
+
+#[test]
+fn a_named_base_is_diffed_against_in_the_merged_checkout() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    let before = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge", "attempt"],
+    );
+    // A later merge lands on top: the earlier member is judged against everything since its own merge.
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "a later member"],
+    );
+    // The leftover worktree still exists: the named base still means the checkout.
+    let fake = Fake::new();
+    run_now(&store, &fake, &id, Some(&before)).expect("a pre-merge tip is a valid base");
+    let sent = fake.starts.borrow();
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap();
+    assert_eq!(sent[0]["base"], before.as_str());
+    assert_eq!(sent[0]["head"], head_of(&repo).as_str());
+    assert_eq!(
+        canon(sent[0]["worktree"].as_str().unwrap()),
+        canon(repo.path().to_str().unwrap())
+    );
+    drop(sent);
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+}
+
+#[test]
+fn a_named_base_that_judges_nothing_or_is_not_a_commit_is_refused_without_starting() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "-c", "side"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "side"]);
+    let side = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    let tip = head_of(&repo);
+    let fake = Fake::new();
+    for (named, code) in [
+        (tip.as_str(), "invalid_input"),
+        (side.as_str(), "invalid_input"),
+        ("not-a-commit", "invalid_input"),
+        ("abcdef0", "repository_unavailable"),
+    ] {
+        let error = run_now(&store, &fake, &id, Some(named)).expect_err(named);
+        assert_eq!(error.code, code, "{named}: {}", error.message);
+    }
+    assert!(
+        fake.starts.borrow().is_empty(),
+        "nothing may be started for a refused base"
+    );
 }

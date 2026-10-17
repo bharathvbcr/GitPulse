@@ -19,9 +19,19 @@
  *   recorded before the preparation is sent, so a resume adopts the run if it
  *   exists and repeats the same idempotent preparation if it does not.
  * - push. The merge dependency merges and tears down; nothing here has a push.
+ * - call a member `merged` before the gate after its merge has an outcome. The
+ *   merge is recorded as `verifying_merge` first, with where the target's tip
+ *   was before and after it; a restart in that phase runs the gate again. The
+ *   gate re-verifies every member merged so far in this batch against the range
+ *   from the tip before its own merge to the checkout's tip now, so a later
+ *   merge that breaks an earlier member's criteria halts the wave. A batch is at
+ *   most MAX_WAVE_SIZE members, so the gate is at most MAX_WAVE_SIZE
+ *   verifications per merge, under the same concurrency limit as the first
+ *   verifications.
  */
 
 import { MergeTeardownFailure } from "../branches/mergeTeardown";
+import { identityKey, isCaseInsensitiveFs, type PathIdentityOptions } from "../repos/paths";
 import { formatError } from "../ui/formatError";
 
 export const DEFAULT_WAVE_SIZE = 3;
@@ -33,7 +43,7 @@ export const MEMBER_DEADLINE_MS = 6 * 60 * 60_000;
 /** Most task ids a wave remembers having attempted. */
 export const MAX_ATTEMPTED = 200;
 
-export type MemberPhase = "launching" | "running" | "verifying" | "ready" | "merging" | "merged" | "held" | "stopped";
+export type MemberPhase = "launching" | "running" | "verifying" | "ready" | "merging" | "verifying_merge" | "merged" | "held" | "stopped";
 export type WaveState = "running" | "done" | "cancelled" | "halted" | "failed" | "refused";
 
 export interface WaveMember {
@@ -49,6 +59,9 @@ export interface WaveMember {
   /** What to tell the person: why it is held, what was merged. */
   detail: string;
   startedAt: number;
+  /** The target branch's tip before this member's merge and after it, recorded with `verifying_merge`. A record from before the gate existed has neither. */
+  mergeBefore?: string | null;
+  mergeAfter?: string | null;
 }
 
 export interface WaveRecord {
@@ -70,6 +83,8 @@ export interface WaveRecord {
   seq: number;
   /** The person allowed launching from a ranking with unchecked verification; kept so a restart honours the same choice. Absent is not allowed. */
   acceptUnchecked?: boolean;
+  /** The Suggest next panel's priority filter the wave asks with, kept so a restart asks the same. Absent is any priority. */
+  maxPriority?: number;
 }
 
 export interface Candidate { id: string; title: string }
@@ -82,6 +97,10 @@ export interface Candidate { id: string; title: string }
 export interface Suggestion { candidates: Candidate[]; unread: string; unchecked: number }
 export interface VerdictRead { state: string; stale: boolean; head: string | null }
 export interface RunRead { state: string; exitCode: number | null; cwd: string; reason: string }
+/** What a merge did: the line to show, and the target's tip before it and after it (null when git could not say). */
+export interface MergeRead { message: string; beforeOid: string; afterOid: string | null }
+/** A verification of the merged checkout: the range from `base` (a tip before a merge) to `head` (the tip now). */
+export interface PostMerge { base: string; head: string }
 /** `dirty` null: the count could not be read. `operation`: what is parked in the checkout ("merge", "squash merge", ...), or null when nothing is. */
 export interface MainState { dirty: number | null; operation: string | null }
 
@@ -112,8 +131,11 @@ export interface WaveDeps {
   launch(taskId: string, ids: { runId: string; requestId: string }, signal: AbortSignal): Promise<RunRead>;
   /** The run, or null when the store has no such run. */
   getRun(runId: string, signal: AbortSignal): Promise<RunRead | null>;
-  /** Runs `work.verify.task` for the task and waits for a verdict that is not `running`; rejects once `signal` aborts. */
-  verify(taskId: string, signal: AbortSignal): Promise<VerdictRead>;
+  /**
+   * Runs `work.verify.task` for the task and waits for a verdict that is not `running`; rejects once `signal` aborts.
+   * With `post`, the merged checkout is judged over that range, and the answer is a verdict for `post.head` only.
+   */
+  verify(taskId: string, signal: AbortSignal, post?: PostMerge): Promise<VerdictRead>;
   /** The commit the run's worktree is at now. */
   headOf(cwd: string, signal: AbortSignal): Promise<string>;
   /**
@@ -121,7 +143,7 @@ export interface WaveDeps {
    * A conflict or a parked squash is thrown as a `MergeTeardownFailure`, which is what halts the wave. A merge that
    * landed with its cleanup unfinished returns, saying so: it counts as merged.
    */
-  merge(target: { taskId: string; runId: string; cwd: string; head: string }): Promise<string>;
+  merge(target: { taskId: string; runId: string; cwd: string; head: string }): Promise<MergeRead>;
   /** The main checkout now: its uncommitted file count (null when it could not be counted) and the parked operation, if any. Throws when it cannot be read. */
   mainState(signal: AbortSignal): Promise<MainState>;
   /** Writes the record durably; a failure stops the wave. */
@@ -130,6 +152,8 @@ export interface WaveDeps {
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   id(): string;
   pollMs: number;
+  /** Verifications the host runs at once (its `MAX_ACTIVE`): more members than this wait their turn instead of all starting. */
+  verifyLimit: number;
 }
 
 export function clampWaveSize(value: unknown): number {
@@ -142,13 +166,16 @@ export function clampWaves(value: unknown): number {
   return Math.min(MAX_WAVES, Math.max(1, n));
 }
 
-function normalizePath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+/** A path as the filesystem tells files apart: `identityKey` (separators, repeated and trailing slashes, case on a case-insensitive filesystem) once a leading `./` is dropped. */
+function normalizePath(path: string, options: PathIdentityOptions): string {
+  return identityKey(path.replace(/\\/g, "/").replace(/^(\.\/)+/, ""), options);
 }
 
+const hostOptions = (): PathIdentityOptions => ({ caseInsensitive: isCaseInsensitiveFs() });
+
 /** Whether two path sets touch the same file: equal paths, or one inside a directory the other names. */
-export function scopesOverlap(a: readonly string[], b: readonly string[]): boolean {
-  const left = a.map(normalizePath).filter(Boolean), right = b.map(normalizePath).filter(Boolean);
+export function scopesOverlap(a: readonly string[], b: readonly string[], options: PathIdentityOptions = hostOptions()): boolean {
+  const left = a.map((p) => normalizePath(p, options)).filter(Boolean), right = b.map((p) => normalizePath(p, options)).filter(Boolean);
   for (const x of left) for (const y of right) {
     if (x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
   }
@@ -162,16 +189,16 @@ export interface BatchPlan { chosen: Candidate[]; skipped: { id: string; title: 
  * candidate with no readable scope is admitted only first, and then nothing
  * else is admitted beside it, so unknown never reads as disjoint.
  */
-export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>): BatchPlan {
+export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions()): BatchPlan {
   const chosen: Candidate[] = [], skipped: BatchPlan["skipped"] = [];
-  const known = (id: string) => (scopes.get(id) ?? []).map(normalizePath).filter(Boolean);
+  const known = (id: string) => (scopes.get(id) ?? []).map((p) => normalizePath(p, options)).filter(Boolean);
   for (const candidate of candidates) {
     if (chosen.length >= n) break;
     if (excluded.has(candidate.id) || chosen.some((c) => c.id === candidate.id)) continue;
     const mine = known(candidate.id);
     const clash = chosen.find((other) => {
       const theirs = known(other.id);
-      return mine.length === 0 || theirs.length === 0 || scopesOverlap(mine, theirs);
+      return mine.length === 0 || theirs.length === 0 || scopesOverlap(mine, theirs, options);
     });
     if (clash) {
       skipped.push({ id: candidate.id, title: candidate.title, reason: mine.length === 0 || known(clash.id).length === 0 ? `its file scope is unknown next to "${clash.title}"` : `its files overlap "${clash.title}"` });
