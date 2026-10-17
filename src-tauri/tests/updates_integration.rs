@@ -113,11 +113,11 @@ fn refuses_to_scan_an_unbounded_tag_list() {
 
 #[test]
 fn malformed_lines_do_not_abort_the_scan() {
-    let output = format!("garbage-without-a-tab\n{}", ls_remote(&["v1.4.0"]));
+    let output = format!("garbage-without-a-tab\n{}", ls_remote(&["v1.5.0"]));
     let (tag, _) = latest_stable_tag(&output)
         .expect("parses")
         .expect("a stable tag");
-    assert_eq!(tag, "v1.4.0");
+    assert_eq!(tag, "v1.5.0");
 }
 
 #[test]

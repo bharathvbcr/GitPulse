@@ -315,22 +315,22 @@ mod tests {
     #[test]
     fn a_second_daemon_is_refused_and_names_the_first() {
         let dir = tempfile::tempdir().unwrap();
-        let first = match acquire(dir.path(), "1.4.0") {
+        let first = match acquire(dir.path(), "1.5.0") {
             Acquire::Held(lock) => lock,
             other => panic!("the first daemon was not admitted: {other:?}"),
         };
         match acquire(dir.path(), "1.4.1") {
             Acquire::Occupied(owner) => {
                 assert_eq!(owner.pid, Some(std::process::id()));
-                assert_eq!(owner.version.as_deref(), Some("1.4.0"));
+                assert_eq!(owner.version.as_deref(), Some("1.5.0"));
             }
             other => panic!("a second daemon ran beside the first: {other:?}"),
         }
         let status = status_in(dir.path(), "1.4.1");
         assert!(status.running && status.mismatch, "{status:?}");
-        assert!(!status_in(dir.path(), "1.4.0").mismatch);
+        assert!(!status_in(dir.path(), "1.5.0").mismatch);
         drop(first);
-        assert!(!status_in(dir.path(), "1.4.0").running);
+        assert!(!status_in(dir.path(), "1.5.0").running);
         assert!(matches!(acquire(dir.path(), "1.4.1"), Acquire::Held(_)));
     }
 
@@ -344,15 +344,15 @@ mod tests {
     #[test]
     fn releasing_the_lock_does_not_wait_for_a_forked_copy_of_the_descriptor() {
         let dir = tempfile::tempdir().unwrap();
-        let first = match acquire(dir.path(), "1.4.0") {
+        let first = match acquire(dir.path(), "1.5.0") {
             Acquire::Held(lock) => lock,
             other => panic!("the first daemon was not admitted: {other:?}"),
         };
         let forked_copy = first._file.try_clone().unwrap();
-        assert!(status_in(dir.path(), "1.4.0").running);
+        assert!(status_in(dir.path(), "1.5.0").running);
         drop(first);
         assert!(
-            !status_in(dir.path(), "1.4.0").running,
+            !status_in(dir.path(), "1.5.0").running,
             "a copy of the descriptor kept a stopped daemon's lock held"
         );
         assert!(matches!(acquire(dir.path(), "1.4.1"), Acquire::Held(_)));

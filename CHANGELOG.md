@@ -11,7 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-10-17
+## [1.5.0] - 2026-10-17
 
 ### Added
 
@@ -374,6 +374,8 @@ before that tag is pushed.
   repository's message.** The commit box wiped the draft and the amend flag of
   whichever repository was showing when the commit returned, not the one it ran
   in. It now leaves the repository you are looking at alone.
+
+## [1.4.0] - 2026-10-11
 
 Agents that start in the background with a pane showing every one at work,
 stacked worktree tabs, a model choice per agent, one agent guidance in every
@@ -4298,7 +4300,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...v1.3.0

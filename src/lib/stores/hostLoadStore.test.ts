@@ -59,7 +59,7 @@ function status(over: Partial<HostLoadStatus> = {}): HostLoadStatus {
     pressure: "warn",
     governor: calmGovernor,
     snapshot_path: "/x/host-load.v1",
-    writer: { pid: 1, start_us: 2, version: "1.4.0", path: "/a/gitpulse" },
+    writer: { pid: 1, start_us: 2, version: "1.5.0", path: "/a/gitpulse" },
     writer_is_self: true,
     snapshot: null,
     procs: null,

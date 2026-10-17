@@ -883,7 +883,7 @@ mod tests {
         WriterIdentity {
             pid: 4242,
             start_us: 1_699_000_100_000_000,
-            version: "1.4.0".into(),
+            version: "1.5.0".into(),
             path: "/Applications/GitPulse.app/Contents/MacOS/gitpulse".into(),
         }
     }

@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn the_newest_published_release_wins_over_a_newer_unpublished_tag() {
-        let listing = format!("{}{}{}", line("v1.2.1"), line("v1.4.0"), line("v1.3.0"));
+        let listing = format!("{}{}{}", line("v1.2.1"), line("v1.5.0"), line("v1.3.0"));
         let asked = std::cell::RefCell::new(Vec::new());
         let result = evaluate("1.2.0", &listing, &|tag, _| {
             asked.borrow_mut().push(tag.to_string());
@@ -556,7 +556,7 @@ mod tests {
         assert!(result.release_url.ends_with("/releases/tag/v1.3.0"));
         assert_eq!(
             *asked.borrow(),
-            ["v1.4.0", "v1.3.0"],
+            ["v1.5.0", "v1.3.0"],
             "newest first, stopping at the first published"
         );
     }

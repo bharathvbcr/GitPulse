@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "license": "MIT",
   "description": "Fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5",

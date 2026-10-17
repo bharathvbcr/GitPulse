@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "GitPulse control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never writes git.",
   "author": {
     "name": "GitPulse Team"

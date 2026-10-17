@@ -1,23 +1,22 @@
-# GitPulse 1.4.0 — release notes
+# GitPulse 1.5.0 — release notes
 
-**Requested label was v1.3.5, merging 1.3.4 into 1.3.5. There is no 1.3.4 section anywhere in this repository, and no `[1.3.5]` changelog heading. The tree is 1.4.0 (`package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and `plugins/gitpulse/plugin.json`). Tags were not moved.**
+**The release being cut is 1.5.0.** The owner withdrew 1.3.5: that label was a mistake, there is no 1.3.4 section, and there is no `[1.3.5]` heading. **1.4.0 remains the previous changelog section** (`## [1.4.0] - 2026-10-11`). Product stamps are 1.5.0. Local tags `v1.3.5` (`3d21d7f6`) and `v1.4.0` (`ed54ac18`) stay where they are.
 
-These notes are everything since the published release **v1.3.1** (annotated tag `v1.3.1` → `0e020ab1`, changelog `## [1.3.1] - 2026-09-22`). v1.4.0 was never published. The local annotated tag `v1.4.0` still points at `ed54ac18`, which is 528 commits behind HEAD `0f862e80b94db4c6ebfc7447d806c3d91533811a`. Local annotated tag `v1.3.5` still points at `3d21d7f6`. Safety tags were left in place.
+`## [1.5.0] - 2026-10-17` is only the text that was `[Unreleased]` before `690094b5` (GPU terminal rendering, the host-load governor, snapshot reads, the scrollback setting, idle wakes, and the other bullets that sat above the old `[1.4.0]` heading). `## [Unreleased]` is empty. Compare links:
 
-`CHANGELOG.md` now has an empty `## [Unreleased]` and `## [1.4.0] - 2026-10-17`. That section is the previous `[1.4.0] - 2026-10-11` body with the former Unreleased body moved above it. Wording of the entries was not rewritten. The compare links were already in Keep a Changelog form and were left as they are:
-
-- `[Unreleased]: …/compare/v1.4.0...HEAD`
+- `[Unreleased]: …/compare/v1.5.0...HEAD`
+- `[1.5.0]: …/compare/v1.4.0...v1.5.0`
 - `[1.4.0]: …/compare/v1.3.1...v1.4.0`
 
-The Documentation subsection of the previous 1.4.0 body still says the feature reference covers "the 1.3.5 behaviour". That sentence was not edited.
+The Documentation subsection of the 1.4.0 body still says the feature reference covers "the 1.3.5 behaviour". That sentence was not edited.
 
-The 528 commits after the local `v1.4.0` tag are mostly fixes and tests (157 `fix`, 138 `test`, 33 `perf`, 26 `docs`, 20 `feat`). The busiest scopes are terminal, ledger, mcp, repostore, pulse, ingest, files, and git. No commit subject used a breaking-change marker.
+The 528 commits after the local `v1.4.0` tag are the 1.5.0 work: mostly fixes and tests (157 `fix`, 138 `test`, 33 `perf`, 26 `docs`, 20 `feat`). The busiest scopes are terminal, ledger, mcp, repostore, pulse, ingest, files, and git.
 
-The GitHub release body is still produced by `scripts/release-notes.mjs` from the changelog section. This file is the grouped reading of that section.
+The GitHub release body is still produced by `scripts/release-notes.mjs` from the changelog section for the tag being built. This file groups the 1.5.0 section. Highlights that belong to the previous section are marked Previous 1.4.0.
 
 ## Highlights
 
-Each item is the changelog's own claim. "Former Unreleased" means the block that was under `## [Unreleased]` and now sits at the top of `## [1.4.0]`. "Previous 1.4.0" means the body dated 2026-10-11.
+Each item is the changelog's own claim. "Former Unreleased" means the block now under `## [1.5.0] - 2026-10-17`. "Previous 1.4.0" means the body dated 2026-10-11.
 
 - **Background agents, stacked worktree tabs, and a model per agent.** Agents start in the background with a pane of everyone at work; every checkout of one repository stacks as tabs; Settings → Agents → Agent models chooses the model. One agent guidance is included in every handoff. Previous 1.4.0 intro and Added ("Stacked worktree tabs", "Choose each agent's model").
 - **The task board can delete, merge, group, undo, and run in waves.** Agents can delete and merge tasks and are asked to group findings onto one card. People get Undo, bulk changes, swimlanes, saved views, work-in-progress limits, checklists, and links. "Run in waves" launches the top N suggested tasks in their own worktrees and merges only a `passed` verdict, and nothing is pushed. Previous 1.4.0 intro and Added ("Run the board in waves", "Undo on the task board", "Agents can delete a board task", "Agents can merge duplicate board tasks", "Agents group work instead of filing a card per finding", "Board views").
@@ -75,4 +74,4 @@ Each item is the changelog's own claim. "Former Unreleased" means the block that
 
 - **The GPU terminal renderer is not cleared to ship on the bench that decides it.** `docs/PERFORMANCE.md`'s TUI-redraw A/B has not run. The setting exists and a lost context falls back to the DOM renderer. Former Unreleased Added ("GPU terminal rendering").
 - **Prebuilt remote installs are unavailable.** None are pinned yet, so that rung reports itself unavailable. Previous 1.4.0 Security ("Remote tool installs").
-- **The local `v1.4.0` tag is not this commit.** It still names `ed54ac18`. Publishing 1.4.0 at HEAD means moving that existing local tag. That move was not done here.
+- **Local tags `v1.4.0` and `v1.3.5` were left in place.** `v1.4.0` still names `ed54ac18`. `v1.3.5` still names `3d21d7f6`.
