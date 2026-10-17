@@ -722,9 +722,10 @@ fn docs_rename_live_sidecar_benchmark() {
                 }
                 Arm::Calls(workers) => {
                     let started = Instant::now();
-                    let mut each =
+                    let (checked, _) =
                         crate::harness::time_file_checks_for_bench(path, &files, "modify", workers)
                             .expect("time the sidecar calls");
+                    let mut each: Vec<Duration> = checked.into_iter().map(|(d, _)| d).collect();
                     let wall = started.elapsed();
                     judged[index] = each.len();
                     each.sort();
@@ -777,6 +778,282 @@ fn docs_rename_live_sidecar_benchmark() {
         "docs_rename_live_bench load_after={:?}",
         crate::test_support::env::host_load()
     );
+}
+
+/// One repository of the realistic-state benchmark: the 5,000-note hub corpus
+/// in a given state of task binding and ledger history.
+struct StateRepo {
+    name: &'static str,
+    _dir: tempfile::TempDir,
+    path: String,
+    from: String,
+    to: String,
+}
+
+/// Builds the hub corpus in a fresh repository, then puts it in the state
+/// asked for: `planned` binds it to a task whose declared scope lists those
+/// paths, `ledger_events` appends that many prior events to its ledger. The
+/// repository is canonicalised first so the binding and the checks agree on
+/// its address.
+fn state_repo(name: &'static str, planned: Option<&[String]>, ledger_events: usize) -> StateRepo {
+    use std::time::Instant;
+    let dir = git_repo();
+    for n in 0..MAX_DOC_FILES {
+        write(
+            dir.path(),
+            &format!("notes/{:02}/note-{n:05}.md", n % 50),
+            &format!("# Note {n}\n[[note-00000]] [m](../00/note-00000.md) #corpus body-{n}\n"),
+        );
+    }
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "-qm", "benchmark corpus"]);
+    let path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    if let Some(planned) = planned {
+        let db = crate::tasks::store_path(&path);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        let files: Vec<serde_json::Value> = planned
+            .iter()
+            .map(|p| serde_json::json!({"path": p, "allowed_change": "modify"}))
+            .collect();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                 VALUES ('TASK-B', 'Bench', '', ?1, 'in_progress')",
+                [serde_json::to_string(&files).unwrap()],
+            )
+            .unwrap();
+        crate::ledger::bindings::bind(&path, &path, "TASK-B").expect("bind the task");
+    }
+    let started = Instant::now();
+    for i in 0..ledger_events {
+        crate::ledger::append(crate::ledger::Draft {
+            repo_path: path.clone(),
+            action: "git.commit".to_string(),
+            object: Some(format!("history-{i}")),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            outcome: Some(crate::ledger::Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("prior ledger event");
+    }
+    if ledger_events > 0 {
+        println!(
+            "docs_rename_state_bench state={name} ledger_events={ledger_events} seeded_ms={:.0}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    probe::set_clock_ahead(Duration::from_secs(5));
+    load_vault(&path, true).unwrap();
+    load_vault(&path, true).unwrap();
+    StateRepo {
+        name,
+        _dir: dir,
+        path,
+        from: "notes/00/note-00000.md".to_string(),
+        to: "moved/note-00000.md".to_string(),
+    }
+}
+
+/// The real sidecar's cost under realistic state: a bound task scope (a
+/// declared glob, and every note listed explicitly), a ledger with thousands of
+/// prior events, and both. Per round, for every state in rotating order, three
+/// arms in rotating order: the sidecar calls alone at 1 and at production
+/// workers (no ledger record, no rename), and the full gate inside a hub rename
+/// at production workers. Min of `RUNS`. A counting wrapper around `manvi`
+/// logs every sidecar start, so a respawn during any run is counted rather
+/// than inferred, and every verdict is classified so a sidecar that
+/// short-circuited would show as one rule rather than as speed.
+///
+/// `GITPULSE_MANVI_BIN=$(command -v manvi) cargo test --release
+/// --manifest-path src-tauri/Cargo.toml --lib
+/// docs::rename_tests::docs_rename_realistic_state_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore = "needs a real manvi (GITPULSE_MANVI_BIN); a measurement, not a check"]
+fn docs_rename_realistic_state_benchmark() {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+    const RUNS: usize = 5;
+    const LEDGER_EVENTS: usize = 20_000;
+    let manvi = std::env::var("GITPULSE_BENCH_MANVI")
+        .or_else(|_| std::env::var("GITPULSE_MANVI_BIN"))
+        .expect("GITPULSE_MANVI_BIN names the manvi to measure");
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let serial = crate::harness::sidecar::test_serial();
+    let scratch = tempfile::tempdir().unwrap();
+    let starts = scratch.path().join("starts.log");
+    let wrapper = crate::harness::counting_manvi_wrapper(scratch.path(), &manvi, &starts);
+    let _binary = crate::harness::sidecar::bind_test_binary(&serial, wrapper);
+    let started_count = || {
+        std::fs::read_to_string(&starts)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    };
+    let production = crate::harness::production_guard_workers();
+    println!(
+        "docs_rename_state_bench manvi={manvi} load_before={:?}",
+        crate::test_support::env::host_load()
+    );
+
+    let every_note: Vec<String> = (0..MAX_DOC_FILES)
+        .map(|n| format!("notes/{:02}/note-{n:05}.md", n % 50))
+        .chain(["moved/note-00000.md".to_string()])
+        .collect();
+    let glob = ["notes/**".to_string(), "moved/**".to_string()];
+    let states = [
+        state_repo("unbound_empty_ledger", None, 0),
+        state_repo("bound_glob_scope", Some(&glob), 0),
+        state_repo("bound_5000_listed", Some(&every_note), 0),
+        state_repo("unbound_20k_ledger", None, LEDGER_EVENTS),
+        state_repo("bound_glob_20k_ledger", Some(&glob), LEDGER_EVENTS),
+    ];
+
+    // Fast-path check: classify every verdict of one pass per state.
+    for state in &states {
+        let files: Vec<String> = (1..MAX_DOC_FILES)
+            .map(|n| format!("notes/{:02}/note-{n:05}.md", n % 50))
+            .collect();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let (checked, scope_bytes) =
+            crate::harness::time_file_checks_for_bench(&state.path, &files, "modify", 1)
+                .expect("classify the verdicts");
+        let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, verdict) in &checked {
+            *classes
+                .entry(format!(
+                    "status={:?} rule={:?} checked={} gate_failed={} degraded={:?} task_id={:?}",
+                    verdict.status,
+                    verdict.rule,
+                    verdict.checked,
+                    verdict.gate_failed(),
+                    verdict.degraded,
+                    verdict.task_id,
+                ))
+                .or_default() += 1;
+        }
+        assert!(checked.iter().all(|(_, v)| v.checked && !v.gate_failed()));
+        println!(
+            "docs_rename_state_bench state={} scope_bytes_per_request={scope_bytes} verdicts={classes:?}",
+            state.name
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Arm {
+        Calls(usize),
+        Full,
+    }
+    let arms = [Arm::Calls(1), Arm::Calls(production), Arm::Full];
+    let mut calls: BTreeMap<(usize, usize), [Duration; 4]> = BTreeMap::new();
+    let mut full: BTreeMap<usize, (Duration, Duration, Duration)> = BTreeMap::new();
+    let mut swaps: Vec<(String, String)> = states
+        .iter()
+        .map(|s| (s.from.clone(), s.to.clone()))
+        .collect();
+    let starts_at_beginning = started_count();
+    for round in 0..RUNS {
+        for step in 0..states.len() {
+            let si = (step + round) % states.len();
+            let state = &states[si];
+            for astep in 0..arms.len() {
+                let arm = arms[(astep + round) % arms.len()];
+                match arm {
+                    Arm::Calls(workers) => {
+                        let files: Vec<String> = (1..MAX_DOC_FILES)
+                            .map(|n| format!("notes/{:02}/note-{n:05}.md", n % 50))
+                            .collect();
+                        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+                        let before = Instant::now();
+                        let (checked, _) = crate::harness::time_file_checks_for_bench(
+                            &state.path,
+                            &files,
+                            "modify",
+                            workers,
+                        )
+                        .expect("time the sidecar calls");
+                        let wall = before.elapsed();
+                        let mut each: Vec<Duration> = checked.into_iter().map(|(d, _)| d).collect();
+                        each.sort();
+                        let pct =
+                            |q: f64| each[((each.len() as f64 * q) as usize).min(each.len() - 1)];
+                        let sample = [pct(0.50), pct(0.95), *each.last().unwrap(), wall];
+                        println!(
+                            "docs_rename_state_bench round={round} state={} arm=calls_w{workers} \
+                             p50_ms={:.3} p95_ms={:.3} max_ms={:.3} wall_ms={:.1}",
+                            state.name,
+                            ms(sample[0]),
+                            ms(sample[1]),
+                            ms(sample[2]),
+                            ms(wall),
+                        );
+                        let slot = calls.entry((si, workers)).or_insert(sample);
+                        *slot = std::array::from_fn(|i| slot[i].min(sample[i]));
+                    }
+                    Arm::Full => {
+                        let before = started_count();
+                        let (a, b) = swaps[si].clone();
+                        let (gate, wall, verdicts) =
+                            live_gate_rename(&state.path, &a, &b, production);
+                        swaps[si] = (b, a);
+                        assert!(verdicts > 0, "the live gate judged nothing");
+                        let respawns = started_count() - before;
+                        println!(
+                            "docs_rename_state_bench round={round} state={} arm=full_w{production} \
+                             gate_ms={:.1} rename_ms={:.1} sidecar_starts_during={respawns}",
+                            state.name,
+                            ms(gate),
+                            ms(wall),
+                        );
+                        let best = full.entry(si).or_insert((gate, wall, gate));
+                        best.2 = best.2.min(gate);
+                        if wall < best.1 {
+                            best.0 = gate;
+                            best.1 = wall;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (si, state) in states.iter().enumerate() {
+        for workers in [1, production] {
+            let s = calls[&(si, workers)];
+            println!(
+                "docs_rename_state_bench SUMMARY state={} arm=calls_w{workers} p50_ms={:.3} \
+                 p95_ms={:.3} max_ms={:.3} min_wall_ms={:.1} runs={RUNS}",
+                state.name,
+                ms(s[0]),
+                ms(s[1]),
+                ms(s[2]),
+                ms(s[3]),
+            );
+        }
+        let (gate, wall, min_gate) = full[&si];
+        println!(
+            "docs_rename_state_bench SUMMARY state={} arm=full_w{production} min_gate_ms={:.1} \
+             best_run_gate_ms={:.1} best_run_rename_ms={:.1} gate_share={:.1}% runs={RUNS}",
+            state.name,
+            ms(min_gate),
+            ms(gate),
+            ms(wall),
+            100.0 * ms(gate) / ms(wall),
+        );
+    }
+    println!(
+        "docs_rename_state_bench sidecar_starts_total={} starts_before_timed_section={} \
+         load_after={:?}",
+        started_count(),
+        starts_at_beginning,
+        crate::test_support::env::host_load()
+    );
+    drop(states);
 }
 
 /// A repository where `count` notes link at `docs/Roadmap.md`.

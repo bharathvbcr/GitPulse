@@ -1443,8 +1443,61 @@ single round for the 1-worker arm had p50 0.45 ms, p95 0.84 ms, max 8.8 ms; for
   the 2 ms simulation implied.
 - Decision input: at the measured cost a multi-path policy op could save at most
   about 1.2 s of a 39 s rename (3%), so it does not clear the 15 to 30% bar.
-  Not measured here: a user profile with a bound task scope and a large ledger
-  (the hermetic profile is empty), and a cold sidecar under memory pressure.
+  The caveat on this run was an unbound checkout and an empty ledger; the next
+  section re-measures with both changed.
+
+### The same measurement under realistic state (2026-10-16)
+
+`docs_rename_realistic_state_benchmark` (rename_tests.rs, `#[ignore]`d) builds
+five hub repositories and runs, per round and rotated, the calls-only arm at 1
+and 8 workers and the full gate inside a hub rename at 8 workers in each. The
+sidecar is the same manvi (v0.1.0, 142fd8f6) behind a counting wrapper that logs
+every start. Release, **min of 5**. Hermetic HOME, never the user's profile.
+Host load: 31 (peaking above 50) at the start, 5.9 at the end, on 18 cores,
+so rename times (32 to 38 s here) and the 8-worker maxima are noisy.
+
+| state | scope bytes per request | calls p50 / p95 / max, 1 worker | calls p50 / p95 / max, 8 workers | gate wall (min) | rename (best run) | gate share |
+| --- | --- | --- | --- | --- | --- | --- |
+| unbound, empty ledger | 0 | 0.15 / 0.19 / 0.44 ms | 0.98 / 1.13 / 53.8 ms | 1,145 ms | 35,271 ms | 3.5% |
+| bound, glob scope (`notes/**`, `moved/**`) | 186 | 0.15 / 0.20 / 0.45 ms | 0.92 / 1.11 / 1.8 ms | 1,255 ms | 34,462 ms | 4.0% |
+| bound, all 5,000 notes listed as planned files | 125,186 | 1.16 / 1.46 / 2.79 ms | 5.73 / 7.15 / 8.4 ms | 4,044 ms | 37,532 ms | 11.2% |
+| unbound, 20,000 prior ledger events | 0 | 0.14 / 0.18 / 0.47 ms | 0.89 / 1.06 / 6.5 ms | 1,092 ms | 32,385 ms | 4.6% |
+| bound glob scope, 20,000 prior ledger events | 186 | 0.16 / 0.22 / 0.59 ms | 1.03 / 1.21 / 29.1 ms | 1,205 ms | 37,848 ms | 3.6% |
+
+- **The sidecar evaluated policy.** Every one of the 4,999 verdicts per state
+  came back `checked=true`, `gate_failed=false`, `degraded=[]`. Unbound, all are
+  `Demoted` with rule `task.absent` (the task rung was reached and the host
+  posture demoted it); bound, all are `Allowed` with the declared task id. The
+  harness errors on any check that could not run, so none is counted as fast.
+- **A bound scope costs nothing at a realistic size.** A declared scope of a few
+  entries adds 186 bytes to each request and no measurable time. Only a scope
+  that lists every note (125 KB per request, 626 MB through the pipe per hub
+  rename) moves the gate: 4.0 s, 11.2%.
+- **A 20,000-event ledger costs nothing measurable** (1.09 and 1.20 s gates, the
+  same as the empty ledger within noise).
+- **No respawn.** One sidecar start across the whole run, including 25 full hub
+  renames (`sidecar_starts_during=0` on each). The call timeout is 15 s
+  (`DEFAULT_CALL_TIMEOUT`) against a worst observed call of 108 ms, and a
+  timeout or transport fault is what arms the 30 s `RESPAWN_BACKOFF`, so a
+  respawn needs a call to stall 140x longer than anything seen.
+- **Rule set.** Manvi's file ladder is code (hard rules, scope rung) with three
+  booleans read when the sidecar starts (hard rules, neighbour scope, same-dir),
+  not a rule file that grows with a repository, so there is no larger rule set
+  to load. The bound states exercise the scope rung. Whether an ambient
+  `MANVI_*` flag changes the rung count was not tested.
+- **Flip threshold.** With about 34 s of non-gate rename, 15% needs a 5.9 s gate:
+  about 1.2 ms of effective cost per call at the 8-worker rate, about 4.6x the
+  measured 0.25 ms (1.2 s over 5,001 calls). Only one state gets near it, the
+  all-listed scope at 11.2%, and that is a payload cost (125 KB of scope
+  re-sent with every call), not a round-trip cost.
+- **Best case for a multi-path op.** One request carrying all 5,001 paths pays
+  one round trip and sends the scope once. The gate keeps Manvi's per-path
+  evaluation (not measurable from here, so it is not subtracted) and
+  GitPulse's per-verdict ledger record (the full gate is about 0.45 s above the
+  calls-only wall of 0.68 s unbound). So it saves at most about 0.7 s (2%) in
+  the realistic states and at most about 3.6 s (10%) in the all-listed state,
+  where the saving is the repeated scope payload (inferred from the 186-byte
+  against 125,186-byte rows, not measured in isolation).
 
 ### What is left in the 44.6 s
 
