@@ -6,8 +6,8 @@ use super::gate_tests::{head_of, record, store_record};
 use super::tests::{filed, live, person_edits, profile};
 use super::{complete_task, resolve};
 use crate::workbench::verification_driver::{
-    decide, run_now, status, status_batch, target_of, Backend, Driver, Facts, Report, Step, Target,
-    MAX_ACTIVE,
+    base_from_parent_read, decide, run_now, status, status_batch, target_of, verification_base,
+    Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
 };
 use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
 use crate::workbench::WorkbenchError;
@@ -22,6 +22,10 @@ struct Fake {
     cancelled: Cell<bool>,
     clock: Cell<Duration>,
     epoch: Instant,
+    /// When set, `head_of` returns this instead of reading the worktree.
+    head_error: RefCell<Option<String>>,
+    /// When set, `base_of` returns this instead of a base.
+    base_error: RefCell<Option<String>>,
 }
 
 impl Fake {
@@ -32,6 +36,8 @@ impl Fake {
             cancelled: Cell::new(false),
             clock: Cell::new(Duration::ZERO),
             epoch: Instant::now(),
+            head_error: RefCell::new(None),
+            base_error: RefCell::new(None),
         }
     }
 }
@@ -48,9 +54,15 @@ impl Backend for Fake {
         Ok(json!({"ok": true}))
     }
     fn head_of(&self, worktree: &str) -> Result<String, String> {
+        if let Some(err) = self.head_error.borrow().clone() {
+            return Err(err);
+        }
         gate::current_head(worktree)
     }
     fn base_of(&self, _: &str, _: &str) -> Result<String, String> {
+        if let Some(err) = self.base_error.borrow().clone() {
+            return Err(err);
+        }
         Ok("base-oid".into())
     }
     fn now(&self) -> Instant {
@@ -555,6 +567,206 @@ fn the_host_verdict_read_leaves_the_profile_unchanged() {
         "the status read committed to the profile"
     );
     drop(dir);
+}
+
+#[test]
+fn a_deferred_head_read_is_asked_again_and_a_permanent_one_is_recorded() {
+    let target = Target {
+        worktree: "/w".into(),
+        head: "h1".into(),
+    };
+    let step = |head: Result<String, String>, latest: Option<Record>| {
+        decide(&Facts {
+            revision: 3,
+            logs: "",
+            target: &target,
+            current_head: head,
+            latest: Ok(latest),
+            attempt: None,
+            item_id: "i",
+        })
+    };
+    assert_eq!(
+        step(
+            Err("git rev-parse deferred under load after 2.000s".into()),
+            None
+        ),
+        Step::Skip
+    );
+    assert_eq!(
+        step(
+            Err("rev-parse timed out after 1.000s waiting for a process slot".into()),
+            None
+        ),
+        Step::Skip
+    );
+    assert!(matches!(
+        step(Err("not a git repository".into()), None),
+        Step::CouldNotRun(why) if why.contains("not a git repository")
+    ));
+    let deferred = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: "could_not_run".into(),
+        degraded: vec![
+            "the worktree's head could not be read: git rev-parse deferred under load after 2.010s"
+                .into(),
+        ],
+        ..Record::default()
+    };
+    assert_eq!(step(Ok("h1".into()), Some(deferred.clone())), Step::Start);
+    let waiting = decide(&Facts {
+        revision: 3,
+        logs: "",
+        target: &target,
+        current_head: Ok("h1".into()),
+        latest: Ok(Some(deferred)),
+        attempt: Some((Duration::from_secs(21 * 60), 3)),
+        item_id: "i",
+    });
+    assert!(
+        matches!(waiting, Step::CouldNotRun(ref why) if why.contains("no verdict")),
+        "{waiting:?}"
+    );
+    let sidecar = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: "could_not_run".into(),
+        degraded: vec!["the verification could not be started: the sidecar is not running".into()],
+        ..Record::default()
+    };
+    assert_eq!(step(Ok("h1".into()), Some(sidecar)), Step::Skip);
+}
+
+#[test]
+fn a_head_read_deferred_under_load_records_nothing_and_starts_once_it_can_be_read() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    *fake.head_error.borrow_mut() = Some("git rev-parse deferred under load after 2.000s".into());
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake), Report::default());
+    assert!(fake.starts.borrow().is_empty());
+    assert!(
+        !logs(&store, &id).contains("could not run"),
+        "{}",
+        logs(&store, &id)
+    );
+    fake.head_error.borrow_mut().take();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    assert_eq!(fake.starts.borrow().len(), 1);
+}
+
+#[test]
+fn a_base_read_deferred_under_load_records_nothing_and_is_asked_again() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    *fake.base_error.borrow_mut() = Some("merge-base deferred under load after 2.000s".into());
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).could_not_run, 0);
+    assert!(fake.starts.borrow().is_empty());
+    assert!(
+        !logs(&store, &id).contains("could not run"),
+        "{}",
+        logs(&store, &id)
+    );
+    fake.base_error.borrow_mut().take();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+}
+
+#[test]
+fn a_could_not_run_caused_by_a_deferred_read_is_retried_once_the_head_can_be_read() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let head = head_of(&repo);
+    let mut rec = record(&id, "", "could_not_run", &repo, &head);
+    rec["degraded"] = json!([
+        "the worktree's head could not be read: git rev-parse deferred under load after 2.010s"
+    ]);
+    store_record(&store, &id, &rec);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    assert_eq!(fake.starts.borrow().len(), 1);
+}
+
+#[test]
+fn verification_base_of_a_commit_on_the_default_branch_is_its_parent() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    let parent = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let head = head_of(&repo);
+    let base = verification_base(repo.path(), &head).unwrap();
+    assert_eq!(base, parent);
+    assert_ne!(base, head);
+}
+
+#[test]
+fn verification_base_of_a_feature_branch_is_where_it_left_the_default_branch() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let fork = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "feature"],
+    );
+    let head = head_of(&repo);
+    let base = verification_base(repo.path(), &head).unwrap();
+    assert_eq!(base, fork);
+    assert_ne!(base, head);
+}
+
+#[test]
+fn verification_base_of_a_root_commit_on_the_default_branch_is_an_error() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "root"],
+    );
+    let err = verification_base(repo.path(), &head_of(&repo)).unwrap_err();
+    assert!(err.contains("no parent"), "{err}");
+}
+
+#[test]
+fn a_deferred_parent_read_is_not_rewritten_as_a_missing_parent() {
+    let deferred =
+        "rev-parse deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner";
+    assert_eq!(
+        base_from_parent_read(Err(deferred.into()), "abc").unwrap_err(),
+        deferred
+    );
+    let slot = "git rev-parse timed out after 1.500s waiting for a process slot";
+    assert_eq!(
+        base_from_parent_read(Err(slot.into()), "abc").unwrap_err(),
+        slot
+    );
+    let missing =
+        base_from_parent_read(Err("fatal: Needed a single revision".into()), "abc").unwrap_err();
+    assert!(missing.contains("no parent"), "{missing}");
+    assert_eq!(
+        base_from_parent_read(Err("not a git repository".into()), "abc").unwrap_err(),
+        "not a git repository"
+    );
+    let same = base_from_parent_read(Ok("abc".into()), "abc").unwrap_err();
+    assert!(same.contains("no parent"), "{same}");
 }
 
 #[test]
