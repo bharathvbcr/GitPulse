@@ -1093,3 +1093,63 @@ continuously costs the daemon one event per write).
   repositories with very large ignored trees (where the untracked cache is
   documented to help, and which the synthetic fixtures do not model); the page
   cache is never dropped, so "cold" is indicative only.
+
+## 2026-10-15: WebContent WebKit Malloc, continued soak of the pre-wave install (ft-bc59566cd39b)
+
+The 2026-10-13 baseline (WebKit Malloc 290–291 MB dirty, phys_footprint 486–547 MB, peak 941 MB) was this same installed process at 13.5 h. The captures below are that process still running. They are not a post-wave build, and they are not a fixed workload taken an hour after a reinstall. Quitting the process, or replacing `/Applications/GitPulse.app`, would end the live session, so that sample was not taken. There is no "after" number for a rebuilt app.
+
+### Workload and host
+
+Process start, confirmed still alive while the figures below were read: Mon Oct 12 22:53:27 2026.
+
+* App pid 53224, `/Applications/GitPulse.app/Contents/MacOS/gitpulse`. This binary predates the lag-wave merges. `GRAPH_CACHE_LIMIT` (6) and the scrollback defaults are in this source tree and are not in that binary.
+* WebContent pid 53227. GPU pid 53226. WebContent is not a child of the app; `ps` does not attribute it.
+* The session is the user's real one. Repository count and terminal-tab count were not controlled, and the app's direct child processes are not a tab count, so this note states neither N nor M.
+* Host memory is 64 GB (`68719476736` bytes). Load while the captures were parsed, with those three processes still up: `{ 61.66 41.30 35.41 }`. `memory_pressure` then: pages free 63753, swapins 554850, swapouts 1028827 (page size 16384). The footprint files do not record load. The machine was not idle.
+
+### `footprint -v` (page size 16384)
+
+Two captures of pid 53227, minutes apart, printed by `node scripts/memory-footprint.mjs --footprint`. Category rows other than WebKit Malloc are from the same summary block in each file.
+
+| | first | second |
+| --- | --- | --- |
+| phys_footprint | 1094 MB | 1103 MB |
+| phys_footprint_peak | 1905 MB | 1905 MB |
+| WebKit Malloc dirty | 632 MB (140 MB reclaimable, 201 regions) | 669 MB (10 MB reclaimable, 209 regions) |
+| Untagged dirty | 257 MB | 266 MB |
+| Owned physical footprint (unmapped) (graphics) dirty | 148 MB (174 MB reclaimable) | 109 MB (32 MB reclaimable) |
+| JS JIT Generated Code dirty | 34 MB | 35 MB |
+| Malloc Small dirty | 12 MB | 12 MB |
+
+Graphics belongs to ft-cc4be67b and is not part of WebKit Malloc. Untagged is not folded into it either. RSS of pid 53227 at the later reading was 777152 KB; RSS is not phys_footprint.
+
+The other two processes at the same time, so they are not mistaken for the WebContent heap:
+
+* App pid 53224: phys_footprint 268 MB, peak 1165 MB, WebKit Malloc dirty 5.19 MB (6 regions).
+* GPU pid 53226: phys_footprint 170 MB, peak 510 MB, WebKit Malloc dirty 1.66 MB (8 regions).
+
+Against the 2026-10-13 baseline, this pre-wave WebContent grew. WebKit Malloc dirty went from 290–291 MB to 632 MB and then 669 MB. phys_footprint went from 486–547 MB to 1094 MB and then 1103 MB. Peak went from 941 MB to 1905 MB. Between the two captures, reclaimable WebKit Malloc fell from 140 MB to 10 MB while dirty rose, so the second capture is not a smaller heap.
+
+### What was not attributed
+
+No Web Inspector heap snapshot of this WebContent was taken. The running release view was not started inspectable, and a second GitPulse or `tauri dev` cannot sit beside the single-instance app. A Node heap is not WebKit Malloc. The top five retainers of the 669 MB are not named here because they were not measured.
+
+The class costs below are V8, from `node --expose-gc scripts/memory-footprint.mjs` on this run. The terminal figure does not call `term.open()`, so it has no DOM.
+
+* Graph, a first page of 5000 rows: scholarlmConfluence retains 2.85 MB (597 bytes a row, from 87 rows); devprismMainline retains 3.08 MB (645 bytes a row, from 240). Six such pages are about 18 MB, which is what `GRAPH_CACHE_LIMIT` is for. That cap is not in the sampled binary.
+* One xterm, scrollback 5000, 200 columns: 5050 rows hold 11.56 MB of cells; heap +2.38 MB, ArrayBuffers +12.12 MB. Scrollback 1000: 2.40 MB of cells, heap +0.55 MB, ArrayBuffers +2.91 MB. Scrollback 5000 at 120 columns: 6.92 MB of cells.
+* The DOM renderer keeps a row element per viewport row (`DomRenderer._refreshRowElements`), not per scrollback row. Cell bytes and WebKit Malloc were not measured in the same process, so this note does not assign the 669 MB to terminals or the Untagged 266 MB to cell buffers.
+
+### Bound
+
+What still grows with time, and with how many repository tabs have hosted a dock: each strip keeps up to `MAX_STRIP_TABS` (128) tabs, ended ones included, and each mounted tab holds an xterm. Repository tabs have no ceiling. Live PTY sessions are already capped (`DEFAULT_TERMINAL_SESSIONS` 32, `MAX_TERMINAL_SESSIONS` 128). One buffer plateaus at its scrollback. The accumulation is finished tabs left mounted.
+
+`shouldReleaseEndedBuffer` is true only for status `exited` while off screen. `releaseEndedScrollback` sets scrollback to 0, which is when xterm drops the rows. The last screen stays in the viewport. A plain-text tail of `ENDED_TAIL_CHARS` (32768), at most `MAX_ENDED_TAILS` (32) process-wide, is written back only when that viewport is empty, so it is not appended onto the screen the trim kept. The replay has no color. A live session, hidden or not, is not trimmed. The component stays mounted: unmounting calls `leave()`, which detaches or closes a process that may still be running. Ended tabs past the tail cap, and every ended tab's rows above the last screen, are dropped on purpose.
+
+`endedBuffer.test.ts` fills a 200-column xterm past a 5000-row scrollback, requires more than 8 MB of cells, and requires under 200 KB after the release, including after the option is raised to 5000 again. Raising the option does not allocate the rows back until new output, and an ended session produces none. `TerminalSession.test.ts` requires that call and the empty-viewport guard.
+
+Shared reads (`src/lib/ipc/sharedReads.ts`, the map in `invoke.ts`) join an in-flight read. They are not a retained result cache. This pass did not re-audit the oid-keyed churn cache that `cmd_branch_stats` fills.
+
+### Footprint parser
+
+`node scripts/memory-footprint.mjs --footprint <file>` prints phys_footprint, peak, and WebKit Malloc dirty, reclaimable, and regions. It does not need `--expose-gc` and it does not run the microbench. A category the file does not contain is reported absent, not as zero. Covered by `scripts/footprint-summary.test.ts`.

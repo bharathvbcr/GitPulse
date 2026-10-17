@@ -50,6 +50,7 @@
   import { askConfirm } from "../stores/modalStore";
   import { openTaskForRun } from "../workbench/taskOpen";
   import { sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
+  import { forgetEndedTail } from "../terminal/endedBuffer";
   import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
@@ -592,7 +593,10 @@
   });
 
   onDestroy(() => {
-    for (const tab of tabState.tabs) terminalLaunchRequests.forget(tab.id);
+    for (const tab of tabState.tabs) {
+      terminalLaunchRequests.forget(tab.id);
+      forgetEndedTail(tab.id);
+    }
     releaseTaskTerminal(holder);
   });
 
@@ -613,6 +617,7 @@
    */
   function dropTab(id: string, keepRequest = false) {
     terminalLaunchRequests.forget(id);
+    forgetEndedTail(id);
     // A tab closed before it took a slot no longer counts against the room
     // this panel leaves for queued starts, and gives up its hold. Closed by
     // the reader, its request goes too — it was still queued, and would
