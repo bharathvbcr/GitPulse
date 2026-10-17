@@ -683,6 +683,21 @@ fn deferrable_object() -> Value {
     })
 }
 
+/// The `agents` facet: it states no cause of its own, so a deferral shows on
+/// it and on `live` and each `live.kinds` entry that carries the cause.
+fn agents_output() -> Value {
+    let mut agents = deferrable_object();
+    agents["properties"]["live"] = json!({
+        "type": "object",
+        "properties": {
+            "deferred": deferred_property(),
+            "retry_after_ms": retry_after_property(),
+            "kinds": { "type": "array", "items": deferrable_object() }
+        }
+    });
+    agents
+}
+
 /// The shape of a facet that reports its own scan failure.
 fn ok_error_output(extra: Value, required: &[&str]) -> Value {
     let mut properties = json!({
@@ -763,7 +778,7 @@ fn build_tools() -> Vec<Value> {
                 "properties": {
                     "repo_path": { "type": "string" },
                     "worktrees": deferrable_object(),
-                    "agents": deferrable_object(),
+                    "agents": agents_output(),
                     "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
                     "ledger": deferrable_object(),

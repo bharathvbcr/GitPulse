@@ -472,13 +472,33 @@ pub fn deferral_retry_after_ms() -> u64 {
     1000u64.div_ceil(u64::from(per_sec.max(1)))
 }
 
+/// One `; `-separated piece of an error: the gate's refusal, or one that
+/// [`sessions_error`] prefixed with the agent kind it concerns (`claude: `).
+/// Either way the refusal itself must start the piece, so a real error that
+/// merely quotes the phrase is not one.
+fn is_deferral_segment(segment: &str) -> bool {
+    let refusal = match segment.split_once(": ") {
+        Some((kind, rest))
+            if !kind.is_empty()
+                && kind
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) =>
+        {
+            rest
+        }
+        _ => segment,
+    };
+    crate::engine::git_cli::is_deferred_under_load(refusal)
+        || crate::engine::git_cli::is_deferred_under_load(segment)
+}
+
 /// True when `value` is a string the spawn gate's deferral wording (or the
 /// ledger's typed `deferred_worktree` code) produced. One predicate for the
 /// whole seam: [`crate::engine::git_cli::is_deferred_under_load`].
 fn is_deferral_text(value: &serde_json::Value) -> bool {
     value.as_str().is_some_and(|text| {
-        crate::engine::git_cli::is_deferred_under_load(text)
-            || text == crate::ledger::bindings::DEFERRED_WORKTREE
+        text == crate::ledger::bindings::DEFERRED_WORKTREE
+            || !text.is_empty() && text.split("; ").all(is_deferral_segment)
     })
 }
 
@@ -495,8 +515,10 @@ fn is_deferral_text(value: &serde_json::Value) -> bool {
 ///
 /// An object is marked only when its own failure is a deferral (an `error`
 /// field the gate wrote, or the `deferred_worktree` code) and it does not say
-/// `ok: true`. A parent is never marked on a descendant's account. The return
-/// value is true when anything beneath, or here, was marked.
+/// `ok: true`. A parent that states a different cause is never marked on a
+/// descendant's account; one that states none (`agents`, whose cause lives in
+/// `live`) is. The return value is true when anything beneath, or here, was
+/// marked.
 pub fn mark_deferrals(payload: &mut serde_json::Value) -> bool {
     use serde_json::Value;
     match payload {
@@ -513,7 +535,14 @@ pub fn mark_deferrals(payload: &mut serde_json::Value) -> bool {
                     .iter()
                     .any(|(key, value)| key.ends_with("error") && is_deferral_text(value))
                     || map.get("error_code").is_some_and(is_deferral_text));
-            if own {
+            // A failed facet that states no cause of its own (`agents` keeps
+            // the cause only in `live`) speaks through the descendant that
+            // does. One that states a different cause is never marked.
+            let states_cause = map.iter().any(|(key, value)| {
+                key.ends_with("error") && value.as_str().is_some_and(|text| !text.is_empty())
+            });
+            let inherits = found && map.get("ok") == Some(&Value::Bool(false)) && !states_cause;
+            if own || inherits {
                 map.insert(DEFERRED_FIELD.to_string(), Value::Bool(true));
                 map.insert(
                     RETRY_AFTER_FIELD.to_string(),
