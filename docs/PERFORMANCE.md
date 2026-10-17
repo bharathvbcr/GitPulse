@@ -1394,7 +1394,110 @@ the absolute rename times):
   the spawn plus scheduling noise dominates). No speed claim is made for it and
   the bench asserts none.
 - Not measured: the real sidecar's round-trip latency, the scope lookup, and
-  the ledger recording `guard_files` does per verdict.
+  the ledger recording `guard_files` does per verdict. (Measured below.)
+
+### The real sidecar round trip (2026-10-16, base b91c79fc)
+
+`docs_rename_live_sidecar_benchmark` (rename_tests.rs, `#[ignore]`d) runs the
+same 5,000-note hub through the real policy path against a live `manvi serve`
+sidecar: `harness::guard_file` for the source and destination, then
+`guard_files`' production walk (scope once, judge, record in the ledger, gate)
+at 8 workers and at 1. It reaches the real path through two `#[cfg(test)]`
+hooks in harness/mod.rs (`guard_files_with_workers_for_bench`,
+`time_file_checks_for_bench`); no production code changed. The sidecar runs
+under the test build's hermetic HOME. The `git mv` line is not judged in the
+live arms (4,999 rewrites plus 2 = 5,001 calls against the simulated arms'
+5,002). Release build, **min of 5**, six arms interleaved and rotated each
+round.
+
+- manvi: `/Users/bharath/.local/bin/manvi`, v0.1.0, revision
+  142fd8f67f2ca470decbd65b8d9387c472258820 (clean). First call (spawn plus
+  call) 34.9 ms, excluded from the figures.
+- Host load: load average 19.8 on 18 cores at the start, 12.2 at the end, other
+  agents building throughout. Absolute rename times (39 to 48 s) are noisy;
+  read the shares.
+
+| arm | calls | per-call p50 | p95 | max | gate wall (min) | rename (best run) | gate share |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| no-op gate (0 ms, 8 workers): harness overhead | 4,999 | n/a | n/a | n/a | 1.5 ms | 41,485 ms | 0.0% |
+| simulated 2 ms, 8 workers (control) | 4,999 | 2 ms (slept) | n/a | n/a | 1,526 ms | 48,101 ms | 3.2% |
+| live, 8 workers, full gate incl. ledger | 4,999 | n/a | n/a | n/a | 1,162 ms | 39,082 ms | 3.0% |
+| live, 1 worker, full gate incl. ledger | 4,999 | n/a | n/a | n/a | 1,770 ms | 43,080 ms | 5.0% |
+| live calls only (no ledger, no rename), 1 worker | 4,999 | 0.18 ms | 0.39 ms | 0.95 ms | 1,133 ms | n/a | n/a |
+| live calls only, 8 workers | 4,999 | 1.14 ms | 1.66 ms | 53.8 ms | 807 ms | n/a | n/a |
+
+Per-call figures are the min over the 5 rounds of each statistic. The worst
+single round for the 1-worker arm had p50 0.45 ms, p95 0.84 ms, max 8.8 ms; for
+8 workers p50 2.14 ms, p95 3.49 ms, max 108 ms (queueing behind one sidecar).
+
+- The real round trip is **about 0.2 to 0.5 ms** (p50, one call in flight),
+  an order of magnitude under the 2 ms stand-in and far under the 10 to 20 ms
+  that would justify a new op. The harness's own overhead is 1.5 ms for the
+  whole walk, so the figures above are the sidecar, not the test.
+- The whole gate, with scope lookup and a ledger record per verdict, is 1.2 s
+  with 8 workers and 1.8 s with 1: **3.0% and 5.0%** of a hub rename, and the
+  rename is dominated by the durable writes in the next section.
+- 8 workers overlap only about 1.5x on the calls alone (807 ms against
+  1,133 ms) and per-call latency rises to about 1.1 ms: the sidecar serves them
+  nearly serially. The fan-out saves about 0.6 s per hub rename, not the 16 s
+  the 2 ms simulation implied.
+- Decision input: at the measured cost a multi-path policy op could save at most
+  about 1.2 s of a 39 s rename (3%), so it does not clear the 15 to 30% bar.
+  The caveat on this run was an unbound checkout and an empty ledger; the next
+  section re-measures with both changed.
+
+### The same measurement under realistic state (2026-10-16)
+
+`docs_rename_realistic_state_benchmark` (rename_tests.rs, `#[ignore]`d) builds
+five hub repositories and runs, per round and rotated, the calls-only arm at 1
+and 8 workers and the full gate inside a hub rename at 8 workers in each. The
+sidecar is the same manvi (v0.1.0, 142fd8f6) behind a counting wrapper that logs
+every start. Release, **min of 5**. Hermetic HOME, never the user's profile.
+Host load: 31 (peaking above 50) at the start, 5.9 at the end, on 18 cores,
+so rename times (32 to 38 s here) and the 8-worker maxima are noisy.
+
+| state | scope bytes per request | calls p50 / p95 / max, 1 worker | calls p50 / p95 / max, 8 workers | gate wall (min) | rename (best run) | gate share |
+| --- | --- | --- | --- | --- | --- | --- |
+| unbound, empty ledger | 0 | 0.15 / 0.19 / 0.44 ms | 0.98 / 1.13 / 53.8 ms | 1,145 ms | 35,271 ms | 3.5% |
+| bound, glob scope (`notes/**`, `moved/**`) | 186 | 0.15 / 0.20 / 0.45 ms | 0.92 / 1.11 / 1.8 ms | 1,255 ms | 34,462 ms | 4.0% |
+| bound, all 5,000 notes listed as planned files | 125,186 | 1.16 / 1.46 / 2.79 ms | 5.73 / 7.15 / 8.4 ms | 4,044 ms | 37,532 ms | 11.2% |
+| unbound, 20,000 prior ledger events | 0 | 0.14 / 0.18 / 0.47 ms | 0.89 / 1.06 / 6.5 ms | 1,092 ms | 32,385 ms | 4.6% |
+| bound glob scope, 20,000 prior ledger events | 186 | 0.16 / 0.22 / 0.59 ms | 1.03 / 1.21 / 29.1 ms | 1,205 ms | 37,848 ms | 3.6% |
+
+- **The sidecar evaluated policy.** Every one of the 4,999 verdicts per state
+  came back `checked=true`, `gate_failed=false`, `degraded=[]`. Unbound, all are
+  `Demoted` with rule `task.absent` (the task rung was reached and the host
+  posture demoted it); bound, all are `Allowed` with the declared task id. The
+  harness errors on any check that could not run, so none is counted as fast.
+- **A bound scope costs nothing at a realistic size.** A declared scope of a few
+  entries adds 186 bytes to each request and no measurable time. Only a scope
+  that lists every note (125 KB per request, 626 MB through the pipe per hub
+  rename) moves the gate: 4.0 s, 11.2%.
+- **A 20,000-event ledger costs nothing measurable** (1.09 and 1.20 s gates, the
+  same as the empty ledger within noise).
+- **No respawn.** One sidecar start across the whole run, including 25 full hub
+  renames (`sidecar_starts_during=0` on each). The call timeout is 15 s
+  (`DEFAULT_CALL_TIMEOUT`) against a worst observed call of 108 ms, and a
+  timeout or transport fault is what arms the 30 s `RESPAWN_BACKOFF`, so a
+  respawn needs a call to stall 140x longer than anything seen.
+- **Rule set.** Manvi's file ladder is code (hard rules, scope rung) with three
+  booleans read when the sidecar starts (hard rules, neighbour scope, same-dir),
+  not a rule file that grows with a repository, so there is no larger rule set
+  to load. The bound states exercise the scope rung. Whether an ambient
+  `MANVI_*` flag changes the rung count was not tested.
+- **Flip threshold.** With about 34 s of non-gate rename, 15% needs a 5.9 s gate:
+  about 1.2 ms of effective cost per call at the 8-worker rate, about 4.6x the
+  measured 0.25 ms (1.2 s over 5,001 calls). Only one state gets near it, the
+  all-listed scope at 11.2%, and that is a payload cost (125 KB of scope
+  re-sent with every call), not a round-trip cost.
+- **Best case for a multi-path op.** One request carrying all 5,001 paths pays
+  one round trip and sends the scope once. The gate keeps Manvi's per-path
+  evaluation (not measurable from here, so it is not subtracted) and
+  GitPulse's per-verdict ledger record (the full gate is about 0.45 s above the
+  calls-only wall of 0.68 s unbound). So it saves at most about 0.7 s (2%) in
+  the realistic states and at most about 3.6 s (10%) in the all-listed state,
+  where the saving is the repeated scope payload (inferred from the 186-byte
+  against 125,186-byte rows, not measured in isolation).
 
 ### What is left in the 44.6 s
 

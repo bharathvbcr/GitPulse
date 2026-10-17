@@ -475,6 +475,84 @@ pub(crate) const fn production_guard_workers() -> usize {
     GUARD_FILES_CONCURRENCY
 }
 
+/// Test-only door to [`guard_files_with`], so the live-sidecar benchmark runs
+/// the production walk (scope once, judge, record, gate) at a chosen worker
+/// count.
+#[cfg(test)]
+pub(crate) fn guard_files_with_workers_for_bench(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<Vec<PolicyVerdict>, String> {
+    guard_files_with(repo_path, files, op, workers)
+}
+
+/// Test-only: the sidecar round trip alone. Resolves the scope once, then
+/// times every [`check_file`] call (no ledger record, no gating) on `workers`
+/// threads, returning each file's duration and verdict in order, and the byte
+/// size of the declared scope every request carries (0 when unbound). A check
+/// that could not run is an `Err`, never a duration.
+#[cfg(test)]
+pub(crate) fn time_file_checks_for_bench(
+    repo_path: &str,
+    files: &[&str],
+    op: &str,
+    workers: usize,
+) -> Result<(Vec<(std::time::Duration, PolicyVerdict)>, usize), String> {
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = scope_at(&address).map_err(|failure| failure.reason)?;
+    let scope_bytes = scope.as_ref().map_or(0, |scope| {
+        serde_json::to_vec(scope).map_or(0, |bytes| bytes.len())
+    });
+    let lent = sidecar::test_serial_held_here();
+    let timed = judge_in_order(
+        files,
+        workers,
+        |file| {
+            let _lent = sidecar::lend_test_serial(lent);
+            let started = std::time::Instant::now();
+            let verdict = check_file(repo_path, file, op, scope.as_ref());
+            (started.elapsed(), verdict)
+        },
+        |_| false,
+    );
+    let each = timed
+        .into_iter()
+        .zip(files)
+        .map(|(slot, file)| match slot {
+            Some((_, verdict)) if verdict.gate_failed() => {
+                Err(format!("the sidecar could not judge {file}"))
+            }
+            Some(judged) => Ok(judged),
+            None => Err(format!("{file} was never judged")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((each, scope_bytes))
+}
+
+/// Test-only: a sidecar counted from outside. A `manvi` wrapper that appends
+/// one line to `log` every time the sidecar process starts, then becomes the
+/// real binary (`exec`, so the pid is the sidecar's). Returns the script path.
+#[cfg(all(test, unix))]
+pub(crate) fn counting_manvi_wrapper(
+    dir: &std::path::Path,
+    real: &str,
+    log: &std::path::Path,
+) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("counting-manvi");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec '{}' \"$@\"\n",
+        log.display(),
+        real
+    );
+    std::fs::write(&script, body).expect("write the counting wrapper");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make the counting wrapper executable");
+    script.to_string_lossy().into_owned()
+}
+
 /// The task scope this checkout is working under, if it is bound to one.
 ///
 /// Two lookups, both cheap and both allowed to come back empty:
