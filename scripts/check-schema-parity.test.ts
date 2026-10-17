@@ -94,6 +94,15 @@ describe("rustConstant", () => {
     }
   });
 
+  it("counts only live declarations: comments are blanked, string contents are not", () => {
+    const C = "EXTRACTION_SCHEMA_VERSION";
+    expect(rustConstant(`/* old\npub const ${C}: &str = "1";\nstill comment */\npub const ${C}: &str = "2";`, C)).toBe(2);
+    expect(rustConstant(`/* a /* nested */ pub const ${C}: &str = "1"; */\npub const ${C}: &str = "3";`, C)).toBe(3);
+    expect(rustConstant(`pub const ${C}: &str = "4"; // pub const ${C}: &str = "9";`, C)).toBe(4);
+    expect(rustConstant(`const URL: &str = "http://x/*";\npub const ${C}: &str = "5";\n// */`, C)).toBe(5);
+    expect(rustConstant(`const Q: char = '"';\npub const ${C}: &str = "6";`, C)).toBe(6);
+  });
+
   it("refuses an owner whose extract constant is not a number rather than leaving it undefined", () => {
     const read = (file: string) =>
       file === SCHEMAS.extract.file

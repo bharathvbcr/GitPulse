@@ -1,7 +1,5 @@
 // Adversarial coverage for the EXTRACTION_SCHEMA_VERSION parity row
-// (ft-576fb6dc). `it.fails` marks a break the implementation has today: the
-// test states the correct behaviour and passes only while the break exists, so
-// fixing it turns the suite red until the marker is removed.
+// (ft-576fb6dc). The cases marked BREAK were `it.fails` until they were fixed.
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,7 +45,7 @@ describe("rustConstant, extraction constant lookalikes", () => {
   // BREAK: a declaration inside a comment is read as the real constant, so a
   // file whose live constant was deleted or renamed but whose doc comment
   // still quotes the old line reports a version that nothing compiles.
-  it.fails("ignores a lookalike declaration in a line, doc or block comment", () => {
+  it("ignores a lookalike declaration in a line, doc or block comment", () => {
     expect(rustConstant(`// pub const ${C}: &str = "1";\n`, C)).toBeNull();
     expect(rustConstant(`/// pub const ${C}: &str = "1";\n`, C)).toBeNull();
     expect(rustConstant(`/* pub const ${C}: &str = "1"; */`, C)).toBeNull();
@@ -56,7 +54,7 @@ describe("rustConstant, extraction constant lookalikes", () => {
   // BREAK (same root): a commented-out old value next to the live one turns a
   // readable constant into null, which readSchemas then throws on, so the
   // whole check stops with "owner unreadable" rather than reading the live one.
-  it.fails("reads the live constant when a comment above it quotes an old value", () => {
+  it("reads the live constant when a comment above it quotes an old value", () => {
     expect(rustConstant(`// pub const ${C}: &str = "1";\npub const ${C}: &str = "2";`, C)).toBe(2);
   });
 });
@@ -96,7 +94,7 @@ describe("judge and summarize", () => {
   // BREAK (low): NaN is typeof "number", so a NaN reading is judged stale
   // ("NaN, DevCouncil writes 94") instead of unverifiable. Every shipped
   // reader validates upstream, so this is unreachable today.
-  it.fails("a NaN reading is unverifiable, not stale", () => {
+  it("a NaN reading is unverifiable, not stale", () => {
     expect(judge(owner, { reader: "r", keys: ["extract"], schemas: { extract: Number.NaN } }).verdict).toBe("unverifiable");
   });
 });
