@@ -241,7 +241,8 @@ removal paths have no other interaction.
     tests, the same family as before; flaky versus real is unverified. The `env.rs` panics in the log
     come from a test of a failing test, and that test passes.
   - Coverage floor: failed only because the two failing gates wrote no lcov reports.
-  - Log: `.claude/worktrees/consolidate-1016/tmp/ci-local-6b7c42fa-run2.log`.
+  - The log lived in that worktree's gitignored `tmp/` and was not kept; the counts above are its
+    summary.
 - Earlier run on b4a0ce6e: 14 of 18 gates passed. Native renderer drag-preview failed, and passed
   522/522 on an isolated rerun. 5 Rust watcher/worktree tests failed, matching the known load-flake
   shape; flaky versus real is unverified.
