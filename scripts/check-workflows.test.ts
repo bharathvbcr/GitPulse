@@ -4,9 +4,12 @@ import { describe, expect, it } from "vitest";
 import { GATES } from "./ci-local.mjs";
 import {
   INSTALL_HINT,
+  checkoutsPersistingCredentials,
   hasWorkflowLevelPermissions,
   interpret,
+  unpinnedActions,
   workflowFiles,
+  workflowPolicyFindings,
   workflowsMissingPermissions,
 } from "./check-workflows.mjs";
 
@@ -57,6 +60,57 @@ describe("check:workflows", () => {
 
     const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
     expect(workflowsMissingPermissions(dir)).toEqual([]);
+  });
+
+  it("refuses a third-party action that is not pinned to a commit", () => {
+    const yaml = [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - uses: ./.github/actions/local",
+      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "      - name: Tagged",
+      "        uses: oven-sh/setup-bun@v2",
+      "      - name: Branch",
+      "        uses: dtolnay/rust-toolchain@stable",
+      "      - uses: docker://alpine:3.20",
+      "      - uses: owner/short@3d3c42e",
+    ].join("\n");
+    // A local action has no ref to move, and a docker image is not an action
+    // ref; a tag, a branch and an abbreviated SHA can all be repointed.
+    expect(unpinnedActions(yaml)).toEqual([
+      "oven-sh/setup-bun@v2",
+      "dtolnay/rust-toolchain@stable",
+      "owner/short@3d3c42e",
+    ]);
+  });
+
+  it("refuses a checkout that leaves the token in .git/config", () => {
+    const yaml = [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - name: Kept",
+      "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "      - name: Dropped",
+      "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "        with:",
+      "          fetch-depth: 0",
+      "          persist-credentials: false",
+      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "        with:",
+      "          persist-credentials: true",
+      "      - name: Next",
+      "        run: echo persist-credentials: false",
+    ].join("\n");
+    // Only the checkout's own `with:` counts: a later step mentioning the key,
+    // or the key set to true, does not drop the credential.
+    expect(checkoutsPersistingCredentials(yaml)).toEqual([0, 2]);
+  });
+
+  it("holds every workflow in this repository to both rules", () => {
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    expect(workflowPolicyFindings(dir)).toEqual([]);
   });
 
   it("prints the rust coverage summary without rerunning the tests", () => {
@@ -145,13 +199,8 @@ describe("check:workflows", () => {
         fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)),
         "utf8",
       );
-      // release.yml pins the same action to the commit v2 resolved to. The other
-      // workflows in this loop still name the tag, and this check still requires that.
-      const caches = source.split(
-        name === "release.yml"
-          ? "uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
-          : "uses: Swatinem/rust-cache@v2",
-      );
+      // Every workflow pins the action to the commit v2 resolved to.
+      const caches = source.split("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6");
       expect(caches.length, name).toBeGreaterThan(1);
       for (const block of caches.slice(1)) {
         // ImageOS is a runner process env var, not a workflow `env` key, so

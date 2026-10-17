@@ -12,8 +12,12 @@
  * binary exits 2 (checker could not run) and is reported differently from
  * workflows that were checked and found faulty, which exits 1.
  *
- * Exit codes: 0 workflows are clean · 1 actionlint found problems ·
- * 2 the check could not run
+ * Two rules are read here without actionlint, because a release job holds a
+ * write token: every third-party `uses:` is pinned to a commit SHA, and every
+ * checkout sets `persist-credentials: false`.
+ *
+ * Exit codes: 0 workflows are clean · 1 actionlint or a pinning rule found
+ * problems · 2 the check could not run
  */
 
 import { spawnSync } from "node:child_process";
@@ -74,6 +78,54 @@ export function workflowsMissingPermissions(dir) {
 }
 
 /**
+ * Every `uses:` ref that can be repointed under the workflow: a tag, a branch
+ * or an abbreviated SHA. A local action (`./`) and a docker image have no such
+ * ref. A tag is the hole: whoever controls the action's repository can move it,
+ * and the next run executes that code with this job's token.
+ *
+ * @param {string} yaml
+ * @returns {string[]}
+ */
+export function unpinnedActions(yaml) {
+  return [...yaml.matchAll(/^\s*(?:- )?uses:\s+(\S+)/gm)]
+    .map((match) => match[1])
+    .filter((ref) => !ref.startsWith("./") && !ref.startsWith("docker://"))
+    .filter((ref) => !/@[0-9a-f]{40}$/.test(ref));
+}
+
+/**
+ * Indexes (0-based, in file order) of `actions/checkout` steps whose own
+ * `with:` does not set `persist-credentials: false`. Without it the checkout
+ * writes the job's token into `.git/config`, where every later step — and every
+ * build script it runs — can read it.
+ *
+ * @param {string} yaml
+ * @returns {number[]}
+ */
+export function checkoutsPersistingCredentials(yaml) {
+  const steps = yaml.split(/\n(?=[ \t]*- )/).filter((step) => /^\s*(?:- )?uses:\s+actions\/checkout@/m.test(step));
+  return steps.flatMap((step, index) => (/^\s+persist-credentials:\s*false\s*$/m.test(step) ? [] : [index]));
+}
+
+/**
+ * Both rules over every workflow in `dir`, one line per finding.
+ *
+ * @param {string} dir
+ * @returns {string[]}
+ */
+export function workflowPolicyFindings(dir) {
+  return workflowFiles(dir).flatMap((name) => {
+    const text = readFileSync(path.join(dir, name), "utf8");
+    return [
+      ...unpinnedActions(text).map((ref) => `${name}: ${ref} is not pinned to a 40-character commit SHA`),
+      ...checkoutsPersistingCredentials(text).map(
+        (index) => `${name}: checkout #${index + 1} does not set persist-credentials: false`,
+      ),
+    ];
+  });
+}
+
+/**
  * @param {{ status: number | null, error?: Error }} result
  * @returns {{ code: number, message: string | null }}
  */
@@ -93,6 +145,10 @@ export function main() {
     console.error(`FAIL: no workflow files found in ${WORKFLOW_DIR} — nothing was checked`);
     return 2;
   }
+  // Read before actionlint and reported whatever it says: these rules need no
+  // binary, so a missing actionlint must not hide them.
+  const findings = workflowPolicyFindings(WORKFLOW_DIR);
+  for (const finding of findings) console.error(`FAIL: ${finding}`);
   const result = spawnSync("actionlint", ["-color"], {
     cwd: REPO_ROOT,
     stdio: "inherit",
@@ -100,11 +156,12 @@ export function main() {
     killSignal: "SIGKILL",
   });
   const { code, message } = interpret(result);
+  if (code !== 0) console.error(`FAIL: ${message}`);
+  // A rule that was checked and broken outranks an actionlint that could not run.
+  if (findings.length) return 1;
   if (code === 0) {
-    console.log(`OK: ${files.length} workflow files lint clean (${files.join(", ")})`);
-    return 0;
+    console.log(`OK: ${files.length} workflow files lint clean, every action pinned to a commit, no checkout keeps its token (${files.join(", ")})`);
   }
-  console.error(`FAIL: ${message}`);
   return code;
 }
 

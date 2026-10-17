@@ -93,14 +93,11 @@ it("supports hosted runners without an external devmap CLI and reports that abse
 it("pins third-party actions to the commit their tag resolved to", () => {
   const uses = [...workflow.matchAll(/^\s*uses:\s+(\S+)/gm)].map((match) => match[1]);
   const floating = uses.filter((use) => !/@[0-9a-f]{40}$/.test(use));
-  // @stable is a branch (refs/heads/stable). refs/tags/stable does not exist,
-  // so that action stays on the ref GitHub already resolves.
-  expect(floating).toEqual([
-    "dtolnay/rust-toolchain@stable",
-    "dtolnay/rust-toolchain@stable",
-    "dtolnay/rust-toolchain@stable",
-  ]);
+  expect(floating).toEqual([]);
   for (const pin of [
+    // The stable branch's head. That branch's action.yml defaults `toolchain`
+    // to stable, so the pin freezes the action's code and keeps its behaviour.
+    "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable",
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
     "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7",
     "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2",
