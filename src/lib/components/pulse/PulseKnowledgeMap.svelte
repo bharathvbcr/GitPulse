@@ -15,6 +15,13 @@
     onRefresh?: () => void;
   } = $props();
 
+  /** Areas the sample never blamed: their authors are absent from every figure. */
+  const unsampledAreas = $derived(
+    (knowledge?.areas ?? [])
+      .filter((a) => a.sampled_files === 0)
+      .map((a) => a.area),
+  );
+
   function formatRelativeDays(timestampSecs: number): string {
     if (!timestampSecs) return "Unknown";
     const nowSecs = Math.floor(Date.now() / 1000);
@@ -199,7 +206,15 @@
     <!-- Truncation / Honesty Note -->
     {#if knowledge.truncated}
       <div class="text-[11px] text-textMuted/80 italic flex items-center gap-1.5 border-t border-border/30 pt-2">
-        <span>* Scan capped at {knowledge.scanned_files} candidate files to bound execution time. Large repositories retain honest bounds.</span>
+        <span>
+          * Sampled {knowledge.scanned_files} of {knowledge.candidate_files} files, highest churn first
+          in each of {knowledge.areas_total} areas.
+          {#if unsampledAreas.length > 0}
+            Not sampled: {unsampledAreas.join(", ")}{knowledge.areas_total > knowledge.areas.length
+              ? ` and ${knowledge.areas_total - knowledge.areas.length} more`
+              : ""}.
+          {/if}
+        </span>
       </div>
     {/if}
   {/if}

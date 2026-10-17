@@ -202,6 +202,8 @@ describe("pulseStore", () => {
       half_life_days: 90,
       truncated: false,
       duration_ms: 15,
+      areas: [],
+      areas_total: 0,
     };
     const mockDora = {
       deploy_frequency_per_week: 2.5,
@@ -312,6 +314,8 @@ describe("pulseStore failure reporting", () => {
               half_life_days: 1,
               truncated: false,
               duration_ms: 1,
+              areas: [],
+              areas_total: 0,
             }),
       cache: createRepoPanelCache(),
     });

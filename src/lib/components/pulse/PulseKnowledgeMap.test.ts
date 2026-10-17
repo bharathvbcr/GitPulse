@@ -13,6 +13,11 @@ describe("PulseKnowledgeMap component", () => {
     expect(source).toContain("knowledge.truncated");
   });
 
+  it("names the areas the sample never blamed", () => {
+    expect(source).toContain("sampled_files === 0");
+    expect(source).toContain("Not sampled:");
+  });
+
   it("offers a re-scan that is disabled while one is in flight", () => {
     expect(source).toContain("disabled={loading}");
   });

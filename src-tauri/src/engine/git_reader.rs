@@ -369,6 +369,8 @@ pub struct LanguageStatsReport {
     pub candidate_files: usize,
 }
 
+/// Rows of [`KnowledgeReport::areas`] sent to the UI.
+pub const MAX_REPORTED_AREAS: usize = 256;
 pub const DEFAULT_PULSE_COMMITS: usize = 5_000;
 pub const MAX_PULSE_COMMITS: usize = 25_000;
 
@@ -491,6 +493,21 @@ pub struct KnowledgeReport {
     pub half_life_days: u32,
     pub truncated: bool,
     pub duration_ms: u64,
+    /// Which top-level areas the sample drew from, busiest first. An area with
+    /// `sampled_files == 0` was not blamed at all, so its authors are missing
+    /// from every figure above. Capped at [`MAX_REPORTED_AREAS`] rows;
+    /// `areas_total` is the uncapped count.
+    pub areas: Vec<AreaCoverage>,
+    pub areas_total: usize,
+}
+
+/// One top-level area (a first path component; `(root)` for files at the top)
+/// and how much of it the ownership sample covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AreaCoverage {
+    pub area: String,
+    pub candidate_files: usize,
+    pub sampled_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2098,12 +2115,12 @@ impl GitReader {
             "log",
             count_arg.as_str(),
             "--topo-order",
-            "--use-mailmap",
             "--numstat",
             // `%b` is required: Co-authored-by trailers live in the body, never
             // in `%s`. A metric that can only ever be zero is not a metric.
             "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%s%x00%aN%x00%aE%x00%b%x00",
         ];
+        args.extend(mailmap_flag("log"));
         // The same named ref set the graph walks. Contributor counts and churn
         // are claims about what people did; a `--all` walk credits them with
         // machine-written checkpoint commits from agent-harness namespaces,
@@ -2206,35 +2223,72 @@ impl GitReader {
     ) -> Result<KnowledgeReport, String> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
-        let has_mailmap = repo.join(".mailmap").is_file();
-
         let cap = max_files.unwrap_or(128).clamp(1, 512);
 
-        let stdout = match git_text(&repo, &["ls-files", "-z", "--cached"]) {
-            Ok(out) => out,
-            Err(e) => {
-                if is_unborn_head_error(&e) {
-                    return Ok(KnowledgeReport {
-                        scanned_files: 0,
-                        candidate_files: 0,
-                        scanned_lines: 0,
-                        bus_factor: 0,
-                        primary_authors: Vec::new(),
-                        orphaned_files: Vec::new(),
-                        age_distribution: CodeAgeDistribution::default(),
-                        half_life_days: 0,
-                        truncated: false,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                }
-                return Err(e);
+        // The report describes the commit HEAD names, not the worktree: it is
+        // blamed at that oid, so the oid is the content half of the memo key.
+        let head = match git_text(&repo, &["log", "-n1", "--format=%H"]) {
+            Ok(out) => out.trim().to_string(),
+            Err(e) if is_unborn_head_error(&e) => {
+                return Ok(KnowledgeReport {
+                    scanned_files: 0,
+                    candidate_files: 0,
+                    scanned_lines: 0,
+                    bus_factor: 0,
+                    primary_authors: Vec::new(),
+                    orphaned_files: Vec::new(),
+                    age_distribution: CodeAgeDistribution::default(),
+                    half_life_days: 0,
+                    truncated: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    areas: Vec::new(),
+                    areas_total: 0,
+                });
             }
+            Err(e) => return Err(e),
         };
 
-        let mut all_candidates: Vec<String> = stdout
+        // Kept against the ref stamp (config, HEAD, replace refs, shallow and
+        // grafts files) and keyed by the oid, the sample size, the blame
+        // budget and the mailmap inputs the stamp cannot see. An answer that
+        // was cut short, or whose mailmap could not be fingerprinted, is
+        // measured again next time rather than kept.
+        let mailmap = ownership_mailmap_inputs(&repo);
+        let (cap_key, blame_key) = (cap.to_string(), blame_cap.to_string());
+        let key = [
+            KNOWLEDGE_MEMO_KEY,
+            head.as_str(),
+            cap_key.as_str(),
+            blame_key.as_str(),
+            mailmap.as_deref().unwrap_or(""),
+        ];
+        let stamp = ref_cache::stamp(&repo, &[]);
+        let answered = ref_cache::through_stamped(&repo, &key, stamp.as_ref(), || {
+            let (report, complete) =
+                Self::measure_ownership(&repo, &head, cap, blame_cap, started)?;
+            let text = serde_json::to_string(&report)
+                .map_err(|e| format!("could not encode the ownership report: {e}"))?;
+            Ok((text, complete && mailmap.is_some()))
+        })?;
+        serde_json::from_str(&answered)
+            .map_err(|e| format!("could not decode the kept ownership report: {e}"))
+    }
+
+    /// Blames the sample of `head`'s files and folds it into the report. The
+    /// flag is true when nothing was cut short or failed, so the answer is the
+    /// same one a later call would measure.
+    fn measure_ownership(
+        repo: &Path,
+        head: &str,
+        cap: usize,
+        blame_cap: usize,
+        started: Instant,
+    ) -> Result<(KnowledgeReport, bool), String> {
+        let stdout = git_text(repo, &["ls-tree", "-r", "-z", "--name-only", head])?;
+
+        let all_candidates: Vec<String> = stdout
             .split('\0')
             .filter_map(|p| {
-                let p = p.trim();
                 if p.is_empty() {
                     return None;
                 }
@@ -2267,8 +2321,14 @@ impl GitReader {
 
         let candidate_files = all_candidates.len();
         let truncated = candidate_files > cap;
-        all_candidates.truncate(cap);
-        let selected_files = all_candidates;
+        // One log walk ranks every file; a sample that fits needs no ranking.
+        let churn = if truncated {
+            ownership_churn(repo, head)
+        } else {
+            HashMap::new()
+        };
+        let sample = select_ownership_sample(all_candidates, &churn, cap);
+        let selected_files = sample.files;
 
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2286,25 +2346,28 @@ impl GitReader {
         // file, so every count built from it is a lower bound.
         let mut blame_cut_short = false;
         let mut scanned_lines = 0;
+        let mut deadline_hit = false;
+        let mut blame_failed = false;
 
         for file_path in selected_files {
             if Instant::now() > deadline {
+                deadline_hit = true;
                 break;
             }
 
             let mut args = vec!["blame", "--line-porcelain", "-w"];
-            if has_mailmap {
-                args.push("--use-mailmap");
-            }
-            args.push("--");
-            args.push(&file_path);
+            args.extend(mailmap_flag("blame"));
+            args.extend([head, "--", file_path.as_str()]);
 
-            let stdout = match git_text_capped(&repo, &args, blame_cap) {
+            let stdout = match git_text_capped(repo, &args, blame_cap) {
                 Ok((out, incomplete)) => {
                     blame_cut_short |= incomplete.is_some();
                     out
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    blame_failed = true;
+                    continue;
+                }
             };
 
             let lines = parse_blame_porcelain(&stdout);
@@ -2409,7 +2472,8 @@ impl GitReader {
         orphaned_files.sort_by_key(|a| std::cmp::Reverse(a.lines_count));
         orphaned_files.truncate(50);
 
-        Ok(KnowledgeReport {
+        let complete = !(blame_cut_short || deadline_hit || blame_failed);
+        let report = KnowledgeReport {
             scanned_files,
             candidate_files,
             scanned_lines,
@@ -2420,7 +2484,10 @@ impl GitReader {
             half_life_days,
             truncated: truncated || blame_cut_short || scanned_files < candidate_files,
             duration_ms: started.elapsed().as_millis() as u64,
-        })
+            areas: sample.areas,
+            areas_total: sample.areas_total,
+        };
+        Ok((report, complete))
     }
 
     pub fn dora_report(repo_path: &str, window_days: Option<u32>) -> Result<DoraReport, String> {
@@ -2671,6 +2738,191 @@ impl GitReader {
 
 /// True when git's error says the repository has no commit to read yet: an
 /// empty history, which is an answer, not a failed read.
+/// The one mailmap rule for every author a report names: the mailmap is always
+/// applied, and git finds the map itself (`.mailmap` in the worktree,
+/// `mailmap.file`, `mailmap.blob`, at any config level); no caller probes for
+/// a file of its own. What differs is only how each subcommand is told: `log`
+/// applies a map when asked with `--use-mailmap`, while `blame` applies it
+/// unconditionally and rejects the flag (`error: unknown option`, git 2.56),
+/// so passing it there fails every blame in a repository that has a `.mailmap`.
+fn mailmap_flag(subcommand: &str) -> Option<&'static str> {
+    (subcommand == "log").then_some("--use-mailmap")
+}
+
+/// Memo namespace of the ownership report in [`ref_cache`]; bump it when the
+/// report's meaning changes so an older kept answer cannot be read.
+const KNOWLEDGE_MEMO_KEY: &str = "knowledge-report/v1";
+
+/// Commits the churn ranking reads. The ranking only orders candidates, so a
+/// bounded recent window is the right measure of "what changes".
+const OWNERSHIP_CHURN_COMMITS: usize = DEFAULT_PULSE_COMMITS;
+
+/// Largest mailmap file folded into the memo key. A bigger one is not
+/// fingerprinted, so nothing is kept.
+const MAX_MAILMAP_BYTES: u64 = 1024 * 1024;
+
+/// What git reads to resolve authors that the ref stamp does not cover: the
+/// `mailmap.*` settings, the content of the worktree `.mailmap` and of the file
+/// `mailmap.file` names, and the blob `mailmap.blob` resolves to. `None` when
+/// any of them cannot be read exactly, which means the answer is not kept.
+fn ownership_mailmap_inputs(repo: &Path) -> Option<String> {
+    fn content_of(path: &Path) -> Option<String> {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() && meta.len() <= MAX_MAILMAP_BYTES => {
+                let bytes = std::fs::read(path).ok()?;
+                Some(format!("{:016x}", crate::ledger::ids::fnv1a64(&bytes)))
+            }
+            Ok(meta) if meta.is_file() => None,
+            Ok(_) => Some("not-a-file".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("absent".to_string()),
+            Err(_) => None,
+        }
+    }
+
+    let config = git_text(repo, &["config", "--list", "-z"]).ok()?;
+    let mut settings: Vec<&str> = config
+        .split('\0')
+        .filter(|entry| entry.to_ascii_lowercase().starts_with("mailmap."))
+        .collect();
+    settings.sort_unstable();
+    let mut inputs = vec![
+        format!("settings={settings:?}"),
+        format!("tree={}", content_of(&repo.join(".mailmap"))?),
+    ];
+    for entry in &settings {
+        let (name, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        match name.to_ascii_lowercase().as_str() {
+            "mailmap.file" => {
+                let path = match value.strip_prefix("~/") {
+                    Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
+                    None => repo.join(value),
+                };
+                inputs.push(format!("file={}", content_of(&path)?));
+            }
+            "mailmap.blob" => {
+                // A value git would read as an option is not a revision.
+                if value.starts_with('-') {
+                    return None;
+                }
+                let spec = format!("{value}^{{blob}}");
+                let oid = git_text(repo, &["rev-parse", "--verify", "-q", spec.as_str()])
+                    .map(|out| out.trim().to_string())
+                    .unwrap_or_else(|_| "unresolved".to_string());
+                inputs.push(format!("blob={oid}"));
+            }
+            _ => {}
+        }
+    }
+    Some(inputs.join("\u{1}"))
+}
+
+/// Lines changed per path over the recent history `head` reaches, from one
+/// `git log --numstat` walk (never a spawn per file). A walk that fails ranks
+/// by path alone, which is what the sample did before it was ranked.
+fn ownership_churn(repo: &Path, head: &str) -> HashMap<String, usize> {
+    let count = OWNERSHIP_CHURN_COMMITS.to_string();
+    let args = [
+        "log",
+        "-n",
+        count.as_str(),
+        "--no-merges",
+        "--numstat",
+        "-z",
+        "--format=",
+        head,
+    ];
+    let stdout = match git_text_capped(repo, &args, budget::MAX_PULSE_BYTES) {
+        Ok((out, _)) => out,
+        Err(e) => {
+            log::warn!(target: "pulse", "ownership churn for {}: {e}", repo.display());
+            return HashMap::new();
+        }
+    };
+    let mut churn: HashMap<String, usize> = HashMap::new();
+    for change in parse_numstat_files(&stdout) {
+        *churn.entry(change.path).or_insert(0) += change.additions + change.deletions;
+    }
+    churn
+}
+
+/// The files ownership will blame, and what that leaves out.
+struct OwnershipSample {
+    files: Vec<String>,
+    areas: Vec<AreaCoverage>,
+    areas_total: usize,
+}
+
+/// First path component, or `(root)` for a file at the top level.
+fn ownership_area(path: &str) -> &str {
+    path.split_once('/').map_or("(root)", |(area, _)| area)
+}
+
+/// Picks up to `cap` of `candidates`: the busiest file of each area first
+/// (busiest areas first when there are more areas than slots), then the rest
+/// by churn. Path order breaks ties. The result is ordered busiest first, so a
+/// deadline that cuts the blame short drops the least relevant files.
+fn select_ownership_sample(
+    candidates: Vec<String>,
+    churn: &HashMap<String, usize>,
+    cap: usize,
+) -> OwnershipSample {
+    let weight = |path: &String| churn.get(path).copied().unwrap_or(0);
+    let mut by_area: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for path in candidates {
+        by_area
+            .entry(ownership_area(&path).to_string())
+            .or_default()
+            .push(path);
+    }
+    for files in by_area.values_mut() {
+        files.sort_by(|a, b| weight(b).cmp(&weight(a)).then_with(|| a.cmp(b)));
+    }
+    let mut areas: Vec<(String, Vec<String>)> = by_area.into_iter().collect();
+    let area_weight = |files: &Vec<String>| files.iter().map(&weight).sum::<usize>();
+    areas.sort_by(|a, b| {
+        area_weight(&b.1)
+            .cmp(&area_weight(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut chosen: Vec<String> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    for (index, (_, files)) in areas.iter().enumerate() {
+        let mut files = files.iter();
+        if index < cap {
+            chosen.extend(files.next().cloned());
+        }
+        rest.extend(files.cloned());
+    }
+    rest.sort_by(|a, b| weight(b).cmp(&weight(a)).then_with(|| a.cmp(b)));
+    chosen.extend(rest.into_iter().take(cap.saturating_sub(chosen.len())));
+    chosen.sort_by(|a, b| weight(b).cmp(&weight(a)).then_with(|| a.cmp(b)));
+
+    let sampled: HashSet<&str> = chosen.iter().map(String::as_str).collect();
+    let areas_total = areas.len();
+    let coverage = areas
+        .iter()
+        .take(MAX_REPORTED_AREAS)
+        .map(|(area, files)| {
+            let in_sample = files
+                .iter()
+                .filter(|f| sampled.contains(f.as_str()))
+                .count();
+            AreaCoverage {
+                area: area.clone(),
+                candidate_files: files.len(),
+                sampled_files: in_sample,
+            }
+        })
+        .collect();
+    OwnershipSample {
+        files: chosen,
+        areas: coverage,
+        areas_total,
+    }
+}
+
 fn is_unborn_head_error(error: &str) -> bool {
     let msg = error.to_lowercase();
     msg.contains("does not have any commits")
@@ -10581,6 +10833,235 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert!(report.bus_factor >= 1);
         assert!(!report.primary_authors.is_empty());
         assert_eq!(report.age_distribution.total_lines, report.scanned_lines);
+    }
+
+    /// A repository of `cold` one-line files under `src/` plus `hot` files at
+    /// the top level whose names sort after every `src/` path, then three
+    /// commits that rewrite only the hot files. By path order the hot files are
+    /// last; by churn they are first.
+    fn churn_fixture(cold: usize, hot: usize) -> tempfile::TempDir {
+        let dir = init_repo_with_remotes(&[], "main");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for n in 0..cold {
+            std::fs::write(dir.path().join(format!("src/c{n:03}.rs")), "fn cold() {}\n").unwrap();
+        }
+        for n in 0..hot {
+            std::fs::write(
+                dir.path().join(format!("zz_hot_{n:02}.rs")),
+                "fn hot() {}\n",
+            )
+            .unwrap();
+        }
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-m", "feat: seed files"]);
+        for round in 0..3 {
+            for n in 0..hot {
+                let body: String = (0..60)
+                    .map(|l| format!("let r{round}_{l} = {l};\n"))
+                    .collect();
+                std::fs::write(dir.path().join(format!("zz_hot_{n:02}.rs")), body).unwrap();
+            }
+            git_in(dir.path(), &["add", "-A"]);
+            git_in(
+                dir.path(),
+                &["commit", "-m", &format!("feat: churn {round}")],
+            );
+        }
+        dir
+    }
+
+    fn blame_spawns(root: &Path) -> usize {
+        git_cli::spawn_log::spawns_in(root)
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "blame"))
+            .count()
+    }
+
+    /// S4-09: the sample was the first 128 paths in path order, so the files
+    /// that change most could be left out entirely.
+    #[test]
+    fn the_ownership_sample_includes_the_highest_churn_files_that_sort_last() {
+        let dir = churn_fixture(290, 10);
+        let path = dir.path().to_str().unwrap();
+        let report = GitReader::knowledge_report(path, None).expect("report");
+        assert_eq!(report.candidate_files, 300);
+        assert!(report.truncated, "128 of 300 is a sample");
+        // Each hot file carries 60 lines and each cold one a single line, so
+        // a hot file left out of the sample shows as a missing 59 lines.
+        assert_eq!(report.scanned_files, 128);
+        assert_eq!(
+            report.scanned_lines,
+            10 * 60 + 118,
+            "ten hot files at 60 lines plus 118 one-line files: {report:?}"
+        );
+    }
+
+    #[test]
+    fn the_ownership_report_names_the_areas_it_sampled_and_the_ones_it_did_not() {
+        let dir = churn_fixture(20, 2);
+        let path = dir.path().to_str().unwrap();
+        for area in ["docs", "harness", "go"] {
+            std::fs::create_dir_all(dir.path().join(area)).unwrap();
+            std::fs::write(dir.path().join(area).join("x.txt"), "x\n").unwrap();
+        }
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-m", "docs: more areas"]);
+
+        let whole = GitReader::knowledge_report(path, None).expect("whole");
+        assert_eq!(whole.areas_total, 5);
+        assert!(
+            whole
+                .areas
+                .iter()
+                .all(|a| a.sampled_files == a.candidate_files),
+            "{:?}",
+            whole.areas
+        );
+
+        // Two slots for five areas: the busiest areas are sampled, and the
+        // rest are named with zero files sampled rather than left out.
+        let cut = GitReader::knowledge_report(path, Some(2)).expect("cut");
+        assert!(cut.truncated);
+        assert_eq!(cut.areas_total, 5);
+        assert_eq!(cut.areas.len(), 5, "no area is silently missing");
+        assert_eq!(cut.areas.iter().filter(|a| a.sampled_files > 0).count(), 2);
+        let src = cut.areas.iter().find(|a| a.area == "src").expect("src");
+        assert_eq!(src.candidate_files, 20);
+        let root = cut.areas.iter().find(|a| a.area == "(root)").expect("root");
+        assert_eq!(root.candidate_files, 2);
+        assert!(
+            root.sampled_files > 0,
+            "the high-churn area is sampled first"
+        );
+    }
+
+    #[test]
+    fn a_second_ownership_call_with_no_ref_movement_spawns_no_blame() {
+        let _kept = ref_cache::retention();
+        ref_cache::eager(|| {
+            let dir = churn_fixture(5, 2);
+            let root = dir.path().canonicalize().unwrap();
+            let path = root.to_str().unwrap();
+            let first = GitReader::knowledge_report(path, None).expect("first");
+            let cold = blame_spawns(&root);
+            assert_eq!(cold, 7, "one blame per file on the cold call");
+            let second = GitReader::knowledge_report(path, None).expect("second");
+            assert_eq!(
+                blame_spawns(&root),
+                cold,
+                "the memo answers the second call"
+            );
+            assert_eq!(second.scanned_lines, first.scanned_lines);
+
+            git_in(
+                &root,
+                &["commit", "--allow-empty", "-m", "chore: move HEAD"],
+            );
+            GitReader::knowledge_report(path, None).expect("after a commit");
+            assert!(blame_spawns(&root) > cold, "a moved HEAD is measured again");
+        });
+    }
+
+    /// A user-level `mailmap.file` with no `.mailmap` in the tree: git itself
+    /// resolves it, so Pulse and Ownership must name the author the same way.
+    fn user_level_mailmap(home: &Path) -> std::path::PathBuf {
+        let mailmap = home.join("people.mailmap");
+        std::fs::write(
+            &mailmap,
+            "Canonical Person <canon@example.com> <old@example.com>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[mailmap]\n\tfile = {}\n", mailmap.display()),
+        )
+        .unwrap();
+        mailmap
+    }
+
+    /// `git blame` rejects `--use-mailmap`, so passing it whenever the tree
+    /// had a `.mailmap` made every blame fail and the report came back empty.
+    #[test]
+    fn an_in_tree_mailmap_does_not_empty_the_ownership_report() {
+        let dir = init_repo_with_remotes(&[], "main");
+        std::fs::write(
+            dir.path().join(".mailmap"),
+            "Canonical Person <canon@example.com> <old@example.com>\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("code.rs"), "fn a() {}\n").unwrap();
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(
+            dir.path(),
+            &[
+                "commit",
+                "-m",
+                "feat: code",
+                "--author=Old Name <old@example.com>",
+            ],
+        );
+        let own = GitReader::knowledge_report(dir.path().to_str().unwrap(), None).expect("report");
+        assert_eq!(own.scanned_files, 2, "{own:?}");
+        assert!(
+            own.primary_authors
+                .iter()
+                .any(|a| a.author_email == "canon@example.com"),
+            "{own:?}"
+        );
+        assert!(!own.truncated, "{own:?}");
+    }
+
+    #[test]
+    fn a_user_level_mailmap_file_names_the_author_the_same_on_pulse_and_ownership() {
+        use crate::test_support::env::{bind_env, env_serial};
+        let serial = env_serial();
+        let home = tempfile::TempDir::new().unwrap();
+        let mailmap = user_level_mailmap(home.path());
+        let _env = bind_env(&serial)
+            .set("HOME", home.path())
+            .set("XDG_CONFIG_HOME", home.path().join("xdg"))
+            .set("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"));
+        let _kept = ref_cache::retention();
+        ref_cache::eager(|| {
+            let dir = init_repo_with_remotes(&[], "main");
+            assert!(!dir.path().join(".mailmap").exists());
+            std::fs::write(dir.path().join("code.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+            git_in(dir.path(), &["add", "code.rs"]);
+            git_in(
+                dir.path(),
+                &[
+                    "commit",
+                    "-m",
+                    "feat: code",
+                    "--author=Old Name <old@example.com>",
+                ],
+            );
+            let path = dir.path().to_str().unwrap();
+
+            let pulse = GitReader::pulse_report(path, Some(10)).expect("pulse");
+            assert_eq!(pulse.commits[0].author_email, "canon@example.com");
+            let own = GitReader::knowledge_report(path, None).expect("ownership");
+            let names: Vec<_> = own
+                .primary_authors
+                .iter()
+                .map(|a| (a.author_name.as_str(), a.author_email.as_str()))
+                .collect();
+            assert_eq!(
+                names,
+                [("Canonical Person", "canon@example.com")],
+                "{own:?}"
+            );
+
+            // The mailmap is an input of the memo: editing it is not served
+            // from the answer measured under the old one.
+            std::fs::write(
+                &mailmap,
+                "Renamed Person <renamed@example.com> <old@example.com>\n",
+            )
+            .unwrap();
+            let again = GitReader::knowledge_report(path, None).expect("again");
+            assert_eq!(again.primary_authors[0].author_email, "renamed@example.com");
+        });
     }
 
     /// A blame cut off at its byte budget is a prefix of the file. The report
