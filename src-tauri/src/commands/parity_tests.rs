@@ -433,7 +433,10 @@ fn adv_edge_inputs_keep_judged_equal_to_run() {
             accepted += 1;
             // A mutating spawn must exist; judged == run is asserted per line.
             seen.assert_run_as_judged(label, 1);
-            assert!(!seen.spawned.is_empty(), "{label}: accepted but spawned nothing");
+            assert!(
+                !seen.spawned.is_empty(),
+                "{label}: accepted but spawned nothing"
+            );
         }
         Err(_) => {
             refused += 1;
@@ -441,17 +444,37 @@ fn adv_edge_inputs_keep_judged_equal_to_run() {
         }
     };
 
-    for name in ["-x", "--force", "refs/heads/pfx", "ünï/çode", "a..b", "a~1", "-D"] {
+    for name in [
+        "-x",
+        "--force",
+        "refs/heads/pfx",
+        "ünï/çode",
+        "a..b",
+        "a~1",
+        "-D",
+    ] {
         let (r, s) = fx.observe(cmd_create_branch(repo.clone(), name.into(), None));
         tally(&format!("create branch {name:?}"), r.map(|_| ()), &s);
     }
     for start in ["", "-x", "--orphan", "HEAD~0", "main"] {
-        let (r, s) = fx.observe(cmd_create_branch(repo.clone(), "sp".into(), Some(start.into())));
+        let (r, s) = fx.observe(cmd_create_branch(
+            repo.clone(),
+            "sp".into(),
+            Some(start.into()),
+        ));
         tally(&format!("create branch start {start:?}"), r.map(|_| ()), &s);
         // best effort cleanup so the next start point can create it again
         let _ = tauri::async_runtime::block_on(cmd_delete_branch(repo.clone(), "sp".into(), true));
     }
-    for name in ["-x", "--force", "v-é", "a..b", "a~1", "x:y", "tag with space"] {
+    for name in [
+        "-x",
+        "--force",
+        "v-é",
+        "a..b",
+        "a~1",
+        "x:y",
+        "tag with space",
+    ] {
         let (r, s) = fx.observe(cmd_create_tag(repo.clone(), name.into(), None, None));
         tally(&format!("create tag {name:?}"), r.map(|_| ()), &s);
         let (r, s) = fx.observe(cmd_delete_tag(repo.clone(), name.into()));
@@ -467,7 +490,11 @@ fn adv_edge_inputs_keep_judged_equal_to_run() {
     }
     let (r, s) = fx.observe(cmd_rename_branch(repo.clone(), "-x".into(), "y".into()));
     tally("rename from flag", r.map(|_| ()), &s);
-    let (r, s) = fx.observe(cmd_rename_branch(repo.clone(), "main".into(), "--force".into()));
+    let (r, s) = fx.observe(cmd_rename_branch(
+        repo.clone(),
+        "main".into(),
+        "--force".into(),
+    ));
     tally("rename to flag", r.map(|_| ()), &s);
 
     // Vacuity guard: both outcomes must have been exercised.
@@ -481,14 +508,21 @@ fn adv_edge_inputs_keep_judged_equal_to_run() {
 /// an `allow` for) `git tag -d -f`, `git branch --force` and the like.
 #[cfg(unix)]
 #[test]
-#[ignore = "break: cmd_* judge the argv before the writer's validate_ref_name runs, so a refused name still reaches the gate and ledger (pre-existing ordering, now behind builders that do not validate)"]
 fn adv_a_name_the_writer_refuses_is_never_judged() {
     let fx = Fixture::new(ALLOW);
     let repo = fx.repo.clone();
     let (r, s) = fx.observe(cmd_delete_tag(repo.clone(), "-f".into()));
     assert!(r.is_err());
-    assert!(s.judged.is_empty(), "the gate was asked to judge {:?}", s.judged);
+    assert!(
+        s.judged.is_empty(),
+        "the gate was asked to judge {:?}",
+        s.judged
+    );
     let (r, s) = fx.observe(cmd_create_branch(repo, "--force".into(), None));
     assert!(r.is_err());
-    assert!(s.judged.is_empty(), "the gate was asked to judge {:?}", s.judged);
+    assert!(
+        s.judged.is_empty(),
+        "the gate was asked to judge {:?}",
+        s.judged
+    );
 }
