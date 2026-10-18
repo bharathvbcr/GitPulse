@@ -7,6 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
+mod graft;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -78,6 +79,10 @@ pub(super) enum Event {
 /// holds the two equal, because a banner and the inbox row it mirrors must not
 /// disagree about what Snooze means.
 pub(super) const SNOOZE_SECONDS: u32 = 3600;
+
+/// The heading of every activity banner. The same words go to Graft, so the
+/// phone shows what the Mac showed.
+pub(super) const ACTIVITY_HEADING: &str = "GitPulse activity";
 
 /// At most this many delivered banners are checked for withdrawal in one pass.
 /// Notification Center keeps a history of its own; the cap keeps a pass to a
@@ -306,15 +311,27 @@ fn finish(host: &WorkbenchState, id: &str, submitted: bool) -> Result<(), Workbe
     ))
 }
 
+/// Takes banners down: Notification Center first, then the copy Graft holds
+/// for the phone. The second half only enqueues and cannot hold the first up.
+fn retract(natives: &[String]) {
+    platform::withdraw(natives);
+    graft::remove(natives);
+}
+
 // A send error is an uncertain result (including callback timeout), so only an
 // explicit callback outcome may move the saved claim to submitted or failed.
+//
+// Returns the banner's identity once the saved delivery reads `submitted`, so
+// the caller can offer the same banner to Graft. Nothing here depends on that:
+// the delivery record is final before the return, and an unreadable record
+// simply yields `None`.
 fn deliver(
     host: &WorkbenchState,
     notice: &Notice,
     minute: u16,
     sound: bool,
     send: impl FnOnce(&str, &str, bool) -> Result<bool, WorkbenchError>,
-) -> Result<(), WorkbenchError> {
+) -> Result<Option<String>, WorkbenchError> {
     let claimed = call(
         host,
         "notifications.claim",
@@ -329,7 +346,39 @@ fn deliver(
     }
     host.check_open()?;
     let submitted = send(&record.native_id, &notice.title, sound)?;
-    finish(host, &record.id, submitted)
+    finish(host, &record.id, submitted)?;
+    let recorded =
+        submitted && delivery(host, &record.id).is_ok_and(|saved| saved.state == "submitted");
+    Ok(recorded.then_some(record.native_id))
+}
+
+/// What the worker does with one [`deliver`] result.
+///
+/// A banner recorded as submitted is offered to Graft, by enqueueing it and
+/// nothing more: the socket is never touched on this thread. The three codes
+/// below mean another pass or process already settled this notice, which is
+/// the claim doing its job; any other error stops the batch.
+fn settle(
+    delivered: Result<Option<String>, WorkbenchError>,
+    notice: &Notice,
+    sound: bool,
+) -> Result<(), WorkbenchError> {
+    match delivered {
+        Ok(Some(native)) => {
+            graft::post(&native, ACTIVITY_HEADING, &notice.title, sound);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "not_eligible" | "revision_conflict" | "claim_consumed"
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn install(app: &tauri::AppHandle) {
@@ -455,9 +504,8 @@ fn run(
                 // A failed pass is reported but does not hold back delivery:
                 // the next pass retries it, and a stale banner is a smaller
                 // harm than a withheld one.
-                let withdrawn = platform::delivered().and_then(|delivered| {
-                    withdraw(&host, &delivered, unix_now()?, platform::withdraw)
-                });
+                let withdrawn = platform::delivered()
+                    .and_then(|delivered| withdraw(&host, &delivered, unix_now()?, retract));
                 if let Err(error) = withdrawn {
                     if let Ok(mut current) = status.lock() {
                         current.error = Some(error.message);
@@ -496,16 +544,11 @@ fn run(
                         ));
                     }
                     for notice in notices {
-                        if let Err(error) =
-                            deliver(&host, &notice, minute, preferences.sound, platform::submit)
-                        {
-                            if !matches!(
-                                error.code.as_str(),
-                                "not_eligible" | "revision_conflict" | "claim_consumed"
-                            ) {
-                                return Err(error);
-                            }
-                        }
+                        settle(
+                            deliver(&host, &notice, minute, preferences.sound, platform::submit),
+                            &notice,
+                            preferences.sound,
+                        )?;
                     }
                 }
                 Ok(())
@@ -580,8 +623,15 @@ struct SessionHost {
 
 impl crate::alerts::Host for SessionHost {
     fn submit(&self, native: &str, heading: &str, body: &str, sound: bool) -> Result<bool, String> {
-        platform::post(native, heading, body, sound, platform::SESSION_CATEGORY)
-            .map_err(|error| error.message)
+        let accepted = platform::post(native, heading, body, sound, platform::SESSION_CATEGORY)
+            .map_err(|error| error.message)?;
+        // Session banners have no durable record, so the OS accepting one is
+        // the whole condition. An uncertain result (an `Err` above) is not
+        // forwarded: nothing says the Mac showed it.
+        if accepted {
+            graft::post(native, heading, body, sound);
+        }
+        Ok(accepted)
     }
 
     /// Both halves are required, and the window half is asked of the window
@@ -848,9 +898,8 @@ mod tests {
         host
     }
 
-    /// One task with one activity notice that the OS accepted as a banner,
-    /// through the real claim/finish path. Returns (notice id, banner id).
-    fn bannered(host: &WorkbenchState, task: &str) -> (String, String) {
+    /// One task with one activity notice that has not been bannered yet.
+    fn noticed(host: &WorkbenchState, task: &str) -> Notice {
         call(host,"items.put",json!({"id":task,"request_id":task,"expected_revision":0,"title":task,"repository_ids":["r"],"primary_repository_id":"r"})).unwrap();
         let proposal = format!("{task}-p");
         call(host,"enhancements.create",json!({"id":proposal,"request_id":proposal,"expected_revision":0,"task_id":task,"source_revision":1,"fields":["title"],"provider":"local","model":"configured"})).unwrap();
@@ -860,19 +909,24 @@ mod tests {
             json!({"id":proposal,"request_id":format!("{task}-c"),"expected_revision":1,"title":"Better"}),
         )
         .unwrap();
-        let id = format!("event-{}", done["sequence"].as_u64().unwrap());
-        let notice = Notice {
-            id: id.clone(),
+        Notice {
+            id: format!("event-{}", done["sequence"].as_u64().unwrap()),
             title: "Task enhancement ready to review".into(),
-        };
+        }
+    }
+
+    /// [`noticed`], then accepted by the OS through the real claim/finish
+    /// path. Returns (notice id, banner id).
+    fn bannered(host: &WorkbenchState, task: &str) -> (String, String) {
+        let notice = noticed(host, task);
         let mut native = String::new();
         deliver(host, &notice, 720, false, |n, _, _| {
             native = n.to_owned();
             Ok(true)
         })
         .unwrap();
-        assert_eq!(delivery(host, &id).unwrap().state, "submitted");
-        (id, native)
+        assert_eq!(delivery(host, &notice.id).unwrap().state, "submitted");
+        (notice.id, native)
     }
 
     fn act(host: &WorkbenchState, id: &str, action: &str) {
@@ -1091,6 +1145,132 @@ mod tests {
             stale_banners(&host, std::slice::from_ref(&native), now).unwrap(),
             vec![native]
         );
+    }
+
+    /// Only a banner whose saved delivery reads `submitted` is named for
+    /// forwarding. A refusal by the OS (`failed`) and a lost reply
+    /// (`uncertain`) are not: nothing says the Mac showed them.
+    #[test]
+    fn only_a_recorded_submission_is_named_for_forwarding() {
+        let root = tempfile::tempdir().unwrap();
+        let host = profile_host(root.path());
+
+        let accepted = noticed(&host, "accepted");
+        let native = deliver(&host, &accepted, 720, false, |_, _, _| Ok(true))
+            .unwrap()
+            .expect("a submitted banner is named");
+        assert_eq!(delivery(&host, &accepted.id).unwrap().native_id, native);
+
+        let refused = noticed(&host, "refused");
+        assert_eq!(
+            deliver(&host, &refused, 720, false, |_, _, _| Ok(false)).unwrap(),
+            None
+        );
+        assert_eq!(delivery(&host, &refused.id).unwrap().state, "failed");
+
+        let lost = noticed(&host, "lost");
+        deliver(&host, &lost, 720, false, |_, _, _| {
+            Err(WorkbenchError::new("timeout", "OS callback lost"))
+        })
+        .unwrap_err();
+        assert_eq!(delivery(&host, &lost.id).unwrap().state, "uncertain");
+    }
+
+    /// The hook between the delivery record and Graft: what is offered, what
+    /// is not, and that neither the record nor the batch's error handling
+    /// depends on the socket — present, answering, or absent.
+    #[cfg(unix)]
+    #[test]
+    fn forwarding_follows_a_submission_and_never_touches_the_record() {
+        use super::graft::fake_server_tests::{FakeGraft, Reply};
+        use crate::test_support::coverage_relaxed;
+        use crate::test_support::env::{bind_env, env_serial};
+
+        let serial = env_serial();
+        let root = tempfile::tempdir().unwrap();
+        let host = profile_host(root.path());
+        let fake = FakeGraft::start(Reply::Line(r#"{"ok":true,"sent":true}"#.into()));
+        let _env = bind_env(&serial).set("GRAFT_NOTIFY_SOCKET", fake.path());
+
+        let notice = noticed(&host, "t");
+        let delivered = deliver(&host, &notice, 720, true, |_, _, _| Ok(true));
+        let saved = delivery(&host, &notice.id).unwrap();
+        assert_eq!(saved.state, "submitted");
+
+        let started = std::time::Instant::now();
+        settle(delivered, &notice, true).unwrap();
+        assert!(
+            started.elapsed() < coverage_relaxed(Duration::from_millis(250)),
+            "settling waited on the socket"
+        );
+        let line = fake
+            .next_request(coverage_relaxed(Duration::from_secs(3)))
+            .expect("the banner was offered to Graft");
+        let sent: Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(sent["op"], "post");
+        assert_eq!(sent["key"], saved.native_id.as_str());
+        assert_eq!(sent["title"], ACTIVITY_HEADING);
+        assert_eq!(sent["text"], notice.title.as_str());
+        assert_eq!(sent["silent"], false, "the banner played its sound");
+
+        // Forwarding changed nothing the coordinator owns.
+        let after = delivery(&host, &notice.id).unwrap();
+        assert_eq!(
+            (after.state.as_str(), after.revision),
+            ("submitted", saved.revision)
+        );
+
+        // Not named, not offered; settled-elsewhere errors are not errors;
+        // anything else still stops the batch.
+        settle(Ok(None), &notice, true).unwrap();
+        for code in ["not_eligible", "revision_conflict", "claim_consumed"] {
+            settle(Err(WorkbenchError::new(code, "x")), &notice, true).unwrap();
+        }
+        assert_eq!(
+            settle(
+                Err(WorkbenchError::new("protocol_error", "x")),
+                &notice,
+                true
+            )
+            .unwrap_err()
+            .code,
+            "protocol_error"
+        );
+        assert!(
+            fake.next_request(Duration::from_millis(300)).is_none(),
+            "nothing else was offered"
+        );
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// Graft not running: the same submission settles the same way, and the
+    /// delivery record is exactly what it is without the feature.
+    #[cfg(unix)]
+    #[test]
+    fn with_no_graft_a_submission_settles_unchanged() {
+        use crate::test_support::coverage_relaxed;
+        use crate::test_support::env::{bind_env, env_serial};
+
+        let serial = env_serial();
+        let root = tempfile::tempdir().unwrap();
+        let host = profile_host(root.path());
+        let nowhere = root.path().join("no-graft.sock");
+        let _env = bind_env(&serial).set("GRAFT_NOTIFY_SOCKET", &nowhere);
+
+        let notice = noticed(&host, "t");
+        let delivered = deliver(&host, &notice, 720, false, |_, _, _| Ok(true));
+        let before = delivery(&host, &notice.id).unwrap();
+        let started = std::time::Instant::now();
+        settle(delivered, &notice, false).unwrap();
+        assert!(started.elapsed() < coverage_relaxed(Duration::from_millis(250)));
+        // The worker finds no socket on its own time; give it one pass.
+        std::thread::sleep(Duration::from_millis(200));
+        let after = delivery(&host, &notice.id).unwrap();
+        assert_eq!(
+            (after.state, after.revision),
+            (before.state, before.revision)
+        );
+        assert!(!nowhere.exists(), "nothing created a socket");
     }
 
     #[test]

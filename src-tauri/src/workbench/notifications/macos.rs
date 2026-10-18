@@ -203,7 +203,7 @@ pub(super) fn authorization(request: bool) -> Result<String, WorkbenchError> {
 pub(super) fn submit(native: &str, title: &str, sound: bool) -> Result<bool, WorkbenchError> {
     post(
         native,
-        "GitPulse activity",
+        super::ACTIVITY_HEADING,
         title,
         sound,
         WORKBENCH_CATEGORY,
