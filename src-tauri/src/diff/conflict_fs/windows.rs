@@ -115,8 +115,15 @@ pub(in crate::diff) fn read(path: &Path) -> Result<Worktree, String> {
     Ok(read_entry(path)?.1)
 }
 
-pub(super) fn read_for_save(path: &Path, cap: usize) -> Result<Worktree, String> {
-    let _parents = crate::fs_entry::pin_parents(path, true).map_err(|e| e.to_string())?;
+/// Reads `path` for a save or a create, making its parents; every directory
+/// made is appended to `created` so a failed create can remove it again.
+pub(super) fn read_for_save(
+    path: &Path,
+    cap: usize,
+    created: &mut Vec<PathBuf>,
+) -> Result<Worktree, String> {
+    let _parents = crate::fs_entry::pin_parents_recording(path, true, Some(created))
+        .map_err(|e| e.to_string())?;
     // Preserve ordinary-save write permission checks without truncation.
     match OpenOptions::new()
         .write(true)

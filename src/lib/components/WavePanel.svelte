@@ -93,10 +93,10 @@
     // Every wait but a merge ends at once; a merge in flight finishes or rolls back first, and the panel says so meanwhile.
     const settling = runner.cancel();
     const watching = runner;
-    const follow = setInterval(() => { if (!disposed && runner === watching) record = watching.record(); }, 250);
+    const stopFollow = createAdaptiveTimer(() => { if (!disposed && runner === watching) record = watching.record(); }, 250);
     try { await settling; if (!disposed && runner) record = runner.record(); }
     catch (cause) { if (!disposed) error = explainError(cause); }
-    finally { clearInterval(follow); if (!disposed) { busy = false; stopping = false; } }
+    finally { stopFollow(); if (!disposed) { busy = false; stopping = false; } }
   }
 </script>
 

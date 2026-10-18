@@ -137,6 +137,20 @@ fn main() {
             std::hint::black_box(&blob);
             Sample::default().counter("bytes", length)
         }));
+        // The diff viewer's read (`with_digest: false`): the same bytes with no
+        // digest pass, so this row against `get_file_blob` is the digest's cost.
+        let view_root = blob_root.clone();
+        let view_name = name.clone();
+        cases.push(Case::new(
+            format!("get_file_blob_view {label}"),
+            move || {
+                let blob =
+                    GitReader::get_file_blob_view(&view_root, &view_name, None).expect("blob");
+                let length = blob.text.as_ref().map_or(0, |t| t.len()) as u64;
+                std::hint::black_box(&blob);
+                Sample::default().counter("bytes", length)
+            },
+        ));
         let save_root = blob_root.clone();
         let (even, odd) = (text.clone(), format!("X{}", &text[1..]));
         let mut turn = false;

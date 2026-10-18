@@ -22,6 +22,13 @@ const source = readFileSync(
  * here: invariants about cost.
  */
 describe("DiffViewer source contracts", () => {
+  it("reads image blobs without the content digest it never uses", () => {
+    const reads = source.split('invoke<FileBlob>("cmd_get_file_blob", {').slice(1);
+    expect(reads.length).toBe(2);
+    // Each read's argument object ends at the first `});` after it opens.
+    for (const read of reads) expect(read.slice(0, read.indexOf("});"))).toContain("withDigest: false");
+  });
+
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "DiffViewer.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);

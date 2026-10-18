@@ -645,6 +645,7 @@ mod payload_cap_tests {
             "src/lib.rs".into(),
             huge,
             None,
+            None,
         ))
         .expect_err("over the cap");
         assert!(err.message().contains("too large"), "{err}");

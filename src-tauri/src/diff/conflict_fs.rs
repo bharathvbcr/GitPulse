@@ -689,14 +689,18 @@ fn read_source(
     }
 }
 
-/// Windows does not report the directories its pin made, so a failed create
-/// there leaves them (unlike unix, where they are removed again).
+/// The Windows pin records the directories it makes in `created`, as the unix
+/// walk does, so a failed create removes them again through the same cleanup.
+/// UNVERIFIED on Windows: there is no Windows host, and `cargo check --target
+/// x86_64-pc-windows-msvc` stops at `libsqlite3-sys`' C build on this machine,
+/// so this path has been neither compiled nor run. The shared cleanup loop it
+/// feeds is run on unix by `a_failed_create_removes_the_directories_it_made_and_only_those`.
 #[cfg(windows)]
 fn read_source(
     path: &Path,
     expected: Expect<'_>,
     cap: usize,
-    _created: &mut Vec<std::path::PathBuf>,
+    created: &mut Vec<std::path::PathBuf>,
 ) -> Result<Worktree, String> {
     if matches!(expected, Expect::Absent) && std::fs::symlink_metadata(path).is_ok() {
         // Any entry at all refuses a create; its form does not matter.
@@ -705,7 +709,7 @@ fn read_source(
             mode: "160000".into(),
         });
     }
-    windows::read_for_save(path, cap)
+    windows::read_for_save(path, cap, created)
 }
 
 /// Maps a failed publish to the typed failure when another writer caused it.
@@ -865,6 +869,33 @@ mod write_tests {
         assert_eq!(token, content_token(Some(b"")));
         assert_ne!(token, "absent");
         assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    /// The cleanup is one cross-platform loop over the directories the
+    /// platform's pin recorded in `created`; this is its unix run (the Windows
+    /// pin records through `pin_dir_chain_recording`, compiled by
+    /// `cargo check --target x86_64-pc-windows-msvc` only).
+    #[test]
+    fn a_failed_create_removes_the_directories_it_made_and_only_those() {
+        let (_root, root) = dir();
+        std::fs::create_dir(root.join("kept")).unwrap();
+        let target = root.join("kept/a/b/new.txt");
+        let result = write_regular_expecting(&target, Expect::Absent, |_| {
+            Err("encoder refused".to_string())
+        });
+        assert_eq!(result, Err(WriteFailure::Other("encoder refused".into())));
+        assert!(!root.join("kept/a").exists(), "made by the call: removed");
+        assert!(root.join("kept").is_dir(), "was there before: kept");
+
+        // A directory another creator already filled is not this call's to
+        // remove, and its file is never lost.
+        std::fs::create_dir_all(root.join("kept/d")).unwrap();
+        std::fs::write(root.join("kept/d/theirs.txt"), b"x").unwrap();
+        let result = write_regular_expecting(&root.join("kept/d/n.txt"), Expect::Absent, |_| {
+            Err("encoder refused".to_string())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(root.join("kept/d/theirs.txt")).unwrap(), b"x");
     }
 
     #[test]

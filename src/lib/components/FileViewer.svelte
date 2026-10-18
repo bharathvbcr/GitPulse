@@ -5,6 +5,7 @@
   import { hasDirtyEditorTabs, type EditorTabState } from "../files/editorTabs";
   import type { FileSidePane } from "../files/filePaneLayout";
   import type { FileBlob } from "../files/types";
+  import { overwriteNote } from "../files/overwriteNote";
   import { recordEditorDrafts } from "../files/editorDraftRegistry";
   import { loadPersistedEditorTabs, savePersistedEditorTabs } from "../files/editorTabPersist";
   import {
@@ -318,12 +319,17 @@
    * reloads the blob so Compare shows what is there now; the error is still
    * thrown so the editor stays in edit mode.
    */
-  async function saveDraft(path: string, newContent: string, overrideBase?: string | null) {
+  async function saveDraft(
+    path: string,
+    newContent: string,
+    overrideBase?: string | null,
+    overwrite = false,
+  ) {
     // The repository the save was started in: a refusal belongs to it, not to
     // whichever repository has the same relative path open when it settles.
     const repo = hydratedRepo;
     try {
-      await handleFileSave(path, newContent, overrideBase);
+      await handleFileSave(path, newContent, overrideBase, overwrite);
       saveRefusal = null;
     } catch (err: unknown) {
       const typed = readFileWriteError(err);
@@ -358,7 +364,9 @@
       return;
     }
     try {
-      await saveDraft(path, draft.content, conflict.actual);
+      // `overwrite` is the user's choice to keep the buffer: the write is
+      // byte-exact even over a disk file the editor could not round-trip.
+      await saveDraft(path, draft.content, conflict.actual, true);
     } catch (err: unknown) {
       repoStore.setError(formatError(err));
     }
@@ -423,7 +431,12 @@
    * draft, the blob just shown); a string saves against that version, which is
    * how Overwrite names the one it already saw; null is an unconditional write.
    */
-  async function handleFileSave(path: string, newContent: string, overrideBase?: string | null) {
+  async function handleFileSave(
+    path: string,
+    newContent: string,
+    overrideBase?: string | null,
+    overwrite = false,
+  ) {
     const repo = hydratedRepo;
     if (!repo || !path) throw new Error("No active file to save");
     if ($repoStore.currentPath !== repo) {
@@ -448,6 +461,8 @@
         filePath: path,
         content: newContent,
         expectedBase,
+        // Sent only for Overwrite, so an ordinary save's payload is unchanged.
+        ...(overwrite ? { overwrite: true } : {}),
       });
       completeCachedEditorSave(repo, path, newContent, saved.output.disk_base);
       if ($repoStore.currentPath === repo) await repoStore.refresh();
@@ -954,6 +969,7 @@
             <EditorConflictBanner
               path={activeTabPath}
               unbased={activeConflict.actual === null}
+              overwriteNote={overwriteNote(activeBlob)}
               disk={activeBlob.text ?? ""}
               draft={activeDraft.content}
               onReload={() => void reloadFromDisk()}

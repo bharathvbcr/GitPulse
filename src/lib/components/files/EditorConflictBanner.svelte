@@ -7,6 +7,7 @@
     draft,
     busy = false,
     unbased = false,
+    overwriteNote = null,
     onReload,
     onOverwrite,
   }: {
@@ -18,6 +19,8 @@
     busy?: boolean;
     /** The draft has no recorded disk version, so a save cannot say whether the file changed. */
     unbased?: boolean;
+    /** Why Overwrite writes the draft exactly as typed (the disk file is not faithfully editable), or null. */
+    overwriteNote?: string | null;
     onReload: () => void;
     onOverwrite: () => void;
   } = $props();
@@ -50,6 +53,9 @@
     </button>
     <button type="button" class="gp-btn-danger" disabled={busy} onclick={onOverwrite}>Overwrite</button>
   </div>
+  {#if overwriteNote}
+    <p class="mt-1 text-textMuted" data-testid="editor-conflict-overwrite-note">{overwriteNote}</p>
+  {/if}
   {#if comparing}
     <div class="mt-2 grid grid-cols-2 gap-2 max-sm:grid-cols-1" data-testid="editor-conflict-compare">
       {#each [true, false] as onDisk (onDisk)}

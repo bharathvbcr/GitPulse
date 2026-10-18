@@ -456,6 +456,18 @@ pub(crate) fn pin_directory(path: &Path) -> io::Result<std::fs::File> {
 
 #[cfg(windows)]
 pub(crate) fn pin_parents(path: &Path, create: bool) -> io::Result<Vec<std::fs::File>> {
+    pin_parents_recording(path, create, None)
+}
+
+/// [`pin_parents`] that also appends every directory it makes to `created`,
+/// outermost first, so a create that then fails can remove exactly those
+/// (as the unix walk does).
+#[cfg(windows)]
+pub(crate) fn pin_parents_recording(
+    path: &Path,
+    create: bool,
+    created: Option<&mut Vec<std::path::PathBuf>>,
+) -> io::Result<Vec<std::fs::File>> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -465,7 +477,7 @@ pub(crate) fn pin_parents(path: &Path, create: bool) -> io::Result<Vec<std::fs::
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
-    pin_dir_chain(parent, create)
+    pin_dir_chain_recording(parent, create, created)
 }
 
 /// Pin `dir` and every ancestor. Windows has no `O_NOFOLLOW` walk, so the
@@ -474,6 +486,16 @@ pub(crate) fn pin_parents(path: &Path, create: bool) -> io::Result<Vec<std::fs::
 /// be renamed or removed, and none of them may be a reparse point.
 #[cfg(windows)]
 pub(crate) fn pin_dir_chain(dir: &Path, create: bool) -> io::Result<Vec<std::fs::File>> {
+    pin_dir_chain_recording(dir, create, None)
+}
+
+/// [`pin_dir_chain`] that records each directory it creates in `created`.
+#[cfg(windows)]
+pub(crate) fn pin_dir_chain_recording(
+    dir: &Path,
+    create: bool,
+    mut created: Option<&mut Vec<std::path::PathBuf>>,
+) -> io::Result<Vec<std::fs::File>> {
     use std::path::{Component, PathBuf};
     if !dir.is_absolute() {
         return Err(io::Error::new(
@@ -497,7 +519,11 @@ pub(crate) fn pin_dir_chain(dir: &Path, create: bool) -> io::Result<Vec<std::fs:
                 let handle = match pin_directory(&current) {
                     Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                         match std::fs::create_dir(&current) {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                if let Some(created) = created.as_deref_mut() {
+                                    created.push(current.clone());
+                                }
+                            }
                             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                             Err(error) => return Err(error),
                         }

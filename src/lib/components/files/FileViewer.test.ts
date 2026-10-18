@@ -23,6 +23,13 @@ describe("FileViewer", () => {
     expect(source).toContain("guard.isLive()");
   });
 
+  it("sends overwrite only from the banner's Overwrite, so no ordinary save can skip the encoder", () => {
+    expect(source).toContain("saveDraft(path, draft.content, conflict.actual, true)");
+    expect(source).toContain("...(overwrite ? { overwrite: true } : {})");
+    expect(source).toContain("overwriteNote={overwriteNote(activeBlob)}");
+    expect(source).not.toMatch(/onSave=\{[^}]*true\)/);
+  });
+
   it("keeps editor tabs across view remounts with preview vs pin semantics", () => {
     expect(source).toContain("createRepoPanelCache");
     expect(source).toContain("openPreview");
@@ -240,7 +247,7 @@ describe("FileViewer", () => {
     expect(refusal).toContain("saveRefusal = { repo, path, actual: typed.actual }");
     // The error is rethrown so the editor stays in edit mode and the draft stays dirty.
     expect(refusal).toContain("throw err;");
-    expect(refusal).toContain("saveDraft(path, draft.content, conflict.actual)");
+    expect(refusal).toContain("saveDraft(path, draft.content, conflict.actual, true)");
     expect(refusal).toContain("requestDiscardDraft(path)");
     expect(refusal.indexOf("requestDiscardDraft(path)")).toBeLessThan(
       refusal.indexOf("await loadFileContent(path)"),
