@@ -687,7 +687,11 @@ mod tests {
                 ("ulid", &cut.ulid, ID_BOUND),
                 ("ts_utc", &cut.ts_utc, ID_BOUND),
                 ("repo_path", &cut.repo_path, PATH_BOUND),
-                ("worktree_path", cut.worktree_path.as_ref().unwrap(), PATH_BOUND),
+                (
+                    "worktree_path",
+                    cut.worktree_path.as_ref().unwrap(),
+                    PATH_BOUND,
+                ),
                 ("actor_kind", &cut.actor_kind, ID_BOUND),
                 ("actor_id", cut.actor_id.as_ref().unwrap(), ID_BOUND),
                 ("session_id", cut.session_id.as_ref().unwrap(), ID_BOUND),
@@ -761,10 +765,18 @@ mod tests {
         // Cut from the end: what is left is a prefix, with no sentinel element.
         let kept = value["findings"].as_array().unwrap();
         assert!(!kept.is_empty() && kept.len() < 4000);
-        assert_eq!(kept[..], verdict["findings"].as_array().unwrap()[..kept.len()]);
+        assert_eq!(
+            kept[..],
+            verdict["findings"].as_array().unwrap()[..kept.len()]
+        );
         // The cut is recorded in the row's detail, a member the verdict never had to carry.
         let detail: Value = serde_json::from_str(&cut.detail_json.expect("detail")).unwrap();
-        assert!(detail["verdict_truncated"]["elements_dropped"].as_u64().unwrap() > 0);
+        assert!(
+            detail["verdict_truncated"]["elements_dropped"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]
@@ -781,7 +793,10 @@ mod tests {
         let value: Value = serde_json::from_str(&cut).unwrap();
         let items = value.as_array().expect("still an array");
         assert_eq!(items[0], json!({ "exit": 0, "stderr": "boom" }));
-        assert!(items.iter().all(Value::is_object), "an element changed type");
+        assert!(
+            items.iter().all(Value::is_object),
+            "an element changed type"
+        );
         let last = items.last().unwrap();
         assert_eq!(last["gitpulse_truncated"]["total"], 3000);
         // An evidence array of strings is cut the same way, with a string marker.

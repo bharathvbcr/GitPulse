@@ -3409,10 +3409,92 @@ mod tests {
         "relays Manvi's task view; the shape is Manvi's contract",
     )];
 
-    /// Tools whose payload holds no list the budget probe can inflate, each
-    /// with why. The probe cannot cut what is not a list, so these are the ones
-    /// the 64 KiB budget is not exercised against.
-    const NO_LIST_TO_INFLATE: &[(&str, &str)] = &[];
+    /// Whether a schema declares an array anywhere (`"type": "array"`, alone
+    /// or in a type list), at any depth.
+    fn schema_declares_array(schema: &Value) -> bool {
+        match schema {
+            Value::Object(members) => {
+                let typed = match members.get("type") {
+                    Some(Value::String(name)) => name == "array",
+                    Some(Value::Array(names)) => names.iter().any(|n| n == "array"),
+                    _ => false,
+                };
+                typed || members.values().any(schema_declares_array)
+            }
+            Value::Array(items) => items.iter().any(schema_declares_array),
+            _ => false,
+        }
+    }
+
+    /// Tools the budget probe cannot inflate because their `outputSchema`
+    /// declares no array: nothing in the payload is a list to cut, so the 64 KiB
+    /// budget has nothing to do beyond the long-string probe, which every one
+    /// of them passes. The test checks the claim against the schema.
+    const NO_ARRAY_IN_SCHEMA: &[(&str, &str)] = &[
+        (
+            "gitpulse_task_view",
+            "object-only schema; Manvi's view, capped per row and per list in `task_view`",
+        ),
+        ("gitpulse_add_task", "one task record back, no list"),
+        ("gitpulse_complete_task", "one task record back, no list"),
+        ("gitpulse_delete_task", "one deletion receipt, no list"),
+        ("gitpulse_provenance", "one provenance record, no list"),
+        ("devmap_status", "one status envelope, no list"),
+        ("devmap_preview", "one preview verdict, no list"),
+    ];
+
+    /// Tools whose `outputSchema` declares an array that is empty in every
+    /// payload the fixtures reach (no ledger events, no tasks on the board that
+    /// the call lists, no dead symbols, no collisions): the probe needs a
+    /// non-empty list to inflate, and building a populated fixture per tool
+    /// is a separate piece of work. Their long strings are still probed. The
+    /// test checks the schema does declare an array, so the claim cannot be a
+    /// tool that simply has none.
+    const EMPTY_ON_FIXTURES: &[(&str, &str)] = &[
+        (
+            "gitpulse_collision_risk",
+            "no overlapping dirty files on the fixture repositories",
+        ),
+        (
+            "gitpulse_ledger_events",
+            "the fixture ledger holds no events; page budgets are held by the ledger page tests",
+        ),
+        (
+            "gitpulse_import_tasks",
+            "no briefs to import, so no imported list",
+        ),
+        (
+            "gitpulse_list_tasks",
+            "no list in any payload this test reaches",
+        ),
+        (
+            "gitpulse_codeintel_impact",
+            "the one-generation fixture has no callers",
+        ),
+        (
+            "gitpulse_codeintel_dependencies",
+            "the one-generation fixture has no edges",
+        ),
+        (
+            "gitpulse_codeintel_trace",
+            "the one-generation fixture has no path",
+        ),
+        (
+            "gitpulse_codeintel_dead_symbols",
+            "the one-generation fixture reports none",
+        ),
+        (
+            "devmap_dependencies",
+            "the one-generation fixture has no edges",
+        ),
+        ("devmap_impact", "the one-generation fixture has no callers"),
+        ("devmap_trace", "the one-generation fixture has no path"),
+        (
+            "devmap_dead_symbols",
+            "the one-generation fixture reports none",
+        ),
+        ("devmap_clones", "the one-generation fixture has no clones"),
+    ];
 
     fn is_object_only_exempt(name: &str) -> bool {
         OBJECT_ONLY_OUTPUT_SCHEMAS
@@ -3688,15 +3770,28 @@ mod tests {
             .iter()
             .filter_map(|tool| {
                 let name = tool["name"].as_str().expect("name");
-                let listed = NO_LIST_TO_INFLATE.iter().any(|(exempt, _)| *exempt == name);
-                (probed.contains(name) == listed)
-                    .then(|| format!("{name} (probed={}, listed={listed})", probed.contains(name)))
+                let in_list =
+                    |list: &[(&str, &str)]| list.iter().any(|(exempt, _)| *exempt == name);
+                let has_array = schema_declares_array(&tool["outputSchema"]);
+                let listed = in_list(NO_ARRAY_IN_SCHEMA) || in_list(EMPTY_ON_FIXTURES);
+                // The reasons are checked, not just stated: a tool listed as
+                // having no array must declare none, and one listed as empty
+                // on the fixtures must declare one.
+                let reason_holds = (!in_list(NO_ARRAY_IN_SCHEMA) || !has_array)
+                    && (!in_list(EMPTY_ON_FIXTURES) || has_array);
+                (probed.contains(name) == listed || !reason_holds).then(|| {
+                    format!(
+                        "{name} (probed={}, listed={listed}, schema declares an array={has_array})",
+                        probed.contains(name)
+                    )
+                })
             })
             .collect();
         assert!(
             misfiled.is_empty(),
             "each advertised tool must be budget-probed or listed in NO_LIST_TO_INFLATE with a \
-             reason, and not both: {misfiled:?}"
+             reason, and not both:\n{}",
+            misfiled.join("\n")
         );
         // Every advertised tool whose result holds a string was run with a
         // long one at the mirror threshold.
