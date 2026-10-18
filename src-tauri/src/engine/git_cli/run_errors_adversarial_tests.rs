@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::engine::git_reader::{head_is_unborn, GitReader};
+use crate::procguard::LockedSpawn;
 use crate::test_support::{commit_at, git_in};
 use std::path::Path;
 
@@ -24,7 +25,7 @@ fn real_git_failure(repo: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(repo)
         .env("LC_ALL", "C")
-        .output()
+        .output_locked()
         .unwrap();
     assert!(!out.status.success(), "{args:?} was expected to fail");
     String::from_utf8_lossy(&out.stderr).trim().to_string()
@@ -547,7 +548,7 @@ fn a_fresh_reftable_repo_is_unborn() {
     let init = std::process::Command::new("git")
         .args(["init", "-q", "-b", "main", "--ref-format=reftable"])
         .arg(dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     if !init.status.success() {
         return;
