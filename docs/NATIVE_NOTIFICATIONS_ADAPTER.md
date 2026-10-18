@@ -171,14 +171,20 @@ dependency.
 - **Refusals.** `disabled`, `source-not-allowed`, `rate-limited`, `bad-request`
   and `too-large`, and a timeout or I/O error, are logged once per code
   (`graft-notify`), with the code and never a title, text or key.
-- **The gate is Graft's.** GitPulse has no switch for this and adds none: the
-  activity preferences live in the Manvi store (a schema change there cascades
-  to DevCouncil, Manvi and Jarvis), and the session settings in `tools.json`
-  would cover only half the banners. Graft's own master switch (off by default)
-  and per-program allow list are the user's control; GitPulse is offered to the
-  user in Graft's settings the first time it is refused `source-not-allowed`.
-  The phone only ever receives banners that GitPulse's own settings (enabled,
-  quiet hours, mutes, background) let through.
+- **The gate is Graft's.** GitPulse has no switch for this: none was added.
+  The activity preferences live in the Manvi store, where a schema change
+  cascades to DevCouncil, Manvi and Jarvis, so a switch cannot go there. A
+  GitPulse-local key in `tools.json` (where `session_alerts` lives) could hold
+  one for both banner kinds if it is ever wanted; it was left out because
+  Graft's own master switch (off by default) and per-program allow list already
+  are the user's control. Graft lists GitPulse in its settings the first time
+  it is refused `source-not-allowed` (per its contract). The phone only ever
+  receives banners that GitPulse's own settings (enabled, quiet hours, mutes,
+  background) let through.
+- **One cost on the coordinator's path.** After the OS accepts an activity
+  banner, `deliver` re-reads the saved delivery (one store read) to confirm it
+  says `submitted` before naming the banner for forwarding. Everything else
+  about forwarding is an enqueue.
 
 Verified (Rust tests against a fake Unix-socket server in a temp directory, via
 `GRAFT_NOTIFY_SOCKET`): request shape, caps and the oversized-field case; the

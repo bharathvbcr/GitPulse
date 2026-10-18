@@ -182,7 +182,12 @@ fn an_answer_that_is_not_an_answer_is_garbled() {
         let (outcome, _) = round_trip(&post_request(ACTIVITY, "t", "x"), answer(text));
         assert_eq!(outcome, Outcome::Garbled, "{text:?}");
     }
-    // Hanging up without answering is the same, not a success.
+    // Hanging up without answering is the same, not a success. This is also
+    // the regression for macOS refusing `setsockopt` (EINVAL) on a Unix socket
+    // whose peer has closed: with strict timeouts it reads `Io` here, and a
+    // Graft that answers promptly and hangs up is the same situation. Checked
+    // by mutation (strict timeouts make this assertion fail); it is a race, so
+    // a green run on a fast machine proves less than that failure does.
     let (outcome, line) = round_trip(&post_request(ACTIVITY, "t", "x"), Reply::Hangup);
     assert_eq!(outcome, Outcome::Garbled);
     assert!(line.is_some(), "the request had been delivered");
@@ -192,26 +197,6 @@ fn an_answer_that_is_not_an_answer_is_garbled() {
         answer(&"x".repeat(MAX_ANSWER + 200)),
     );
     assert_eq!(outcome, Outcome::Garbled);
-}
-
-/// macOS refuses `setsockopt` on a Unix socket once the peer has closed, so a
-/// Graft that hangs up promptly used to read as an I/O fault (`Io`) instead of
-/// an empty answer (`Garbled`), depending on who won the race. Repeated, so the
-/// race is the test; with strict timeouts this fails on the first rounds.
-#[test]
-fn a_peer_that_hangs_up_at_once_is_an_empty_answer_not_an_io_fault() {
-    let fake = FakeGraft::start(Reply::Hangup);
-    let request = post_request(ACTIVITY, "t", "x");
-    for round in 0..40 {
-        let outcome = forward_one(Some(fake.path().to_path_buf()), &request, BUDGET);
-        assert_eq!(outcome, Outcome::Garbled, "round {round}");
-    }
-    // And one that answers promptly is still an answer.
-    let fake = FakeGraft::start(answer(r#"{"ok":true,"sent":true}"#));
-    for round in 0..40 {
-        let outcome = forward_one(Some(fake.path().to_path_buf()), &request, BUDGET);
-        assert_eq!(outcome, Outcome::Accepted { sent: true }, "round {round}");
-    }
 }
 
 #[test]

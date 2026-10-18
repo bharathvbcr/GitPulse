@@ -15,6 +15,10 @@
 //! GitPulse preference: an unknown program is refused `source-not-allowed` and
 //! offered to the user in Graft's settings. Wire contract: Graft PROTOCOL.md
 //! §10.13 "Local submission".
+// Graft's socket is a Unix socket. On other targets `exchange` reports the
+// peer absent without building any answer, so the answer types and parser are
+// compiled but never constructed; they stay so both targets share one shape.
+#![cfg_attr(not(unix), allow(dead_code))]
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -268,9 +272,11 @@ fn exchange(path: &Path, request: &[u8], budget: Duration) -> Outcome {
         |e: &std::io::Error| matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
     // macOS refuses `setsockopt` (EINVAL, kind `InvalidInput`) on a Unix socket
     // whose peer has already closed — which is what a Graft that answers
-    // quickly looks like by the time we get here. Nothing can block on a
-    // closed peer, so that refusal is not a fault: the read that follows
-    // returns the answer already buffered, or end of file. Any other failure
+    // quickly looks like by the time we get here (probed on macOS for a fully
+    // closed peer; half-closed peers are inferred, not probed). A closed peer
+    // should not make a read block, so that refusal is not a fault: the read
+    // that follows returns the answer already buffered, or end of file, and
+    // the deadline check still bounds a peer that is not closed. Any other failure
     // means the timeout is not in force, and the exchange stops.
     let bound = |result: std::io::Result<()>| match result {
         Err(e) if e.kind() != ErrorKind::InvalidInput => Err(()),
