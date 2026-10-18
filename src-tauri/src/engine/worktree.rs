@@ -2894,7 +2894,14 @@ fn remove_worktree_split(
 /// `std::fs::remove_dir_all` itself, which does not satisfy the seam's
 /// higher-ranked `&Path` signature.
 fn delete_dir_tree(path: &Path) -> std::io::Result<()> {
-    std::fs::remove_dir_all(path)
+    delete_dir_tree_with(path, &|path| std::fs::remove_dir_all(path))
+}
+
+fn delete_dir_tree_with(
+    path: &Path,
+    remove_once: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    remove_once(path)
 }
 
 /// Deletes the files [`remove_worktree_split`] moved aside, with the lock
@@ -2977,29 +2984,35 @@ impl SweepReport {
 /// fails closed: when the worktree records cannot be read, so that "a record
 /// points into it" cannot be checked, it deletes nothing and says so.
 fn sweep_teardown_asides(repo: &Path) -> SweepReport {
-    sweep_teardown_asides_from(repo, &|holding| {
-        Ok(std::fs::read_dir(holding)?
-            .map(|entry| {
-                entry.map(|entry| {
-                    (
-                        entry.file_name().to_string_lossy().into_owned(),
-                        entry.path(),
-                    )
+    sweep_teardown_asides_from(
+        repo,
+        &|holding| {
+            Ok(std::fs::read_dir(holding)?
+                .map(|entry| {
+                    entry.map(|entry| {
+                        (
+                            entry.file_name().to_string_lossy().into_owned(),
+                            entry.path(),
+                        )
+                    })
                 })
-            })
-            .collect())
-    })
+                .collect())
+        },
+        &delete_dir_tree,
+    )
 }
 
 /// A listing of the holding directory: `(name, path)` per entry, or the error
 /// reading that entry, or the error listing it at all.
 type EntryListing = std::io::Result<Vec<std::io::Result<(String, PathBuf)>>>;
 
-/// [`sweep_teardown_asides`] with the listing of the holding directory passed
-/// in, so a test can hand it an entry that failed to read.
+/// [`sweep_teardown_asides`] with the listing of the holding directory and the
+/// deleter passed in, so a test can hand it an entry that failed to read or an
+/// aside that another sweep deletes first.
 fn sweep_teardown_asides_from(
     repo: &Path,
     list_entries: &dyn Fn(&Path) -> EntryListing,
+    delete_tree: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> SweepReport {
     let mut report = SweepReport::default();
     let holding = match resolve_git_common_dir(repo) {
@@ -3202,7 +3215,7 @@ fn sweep_teardown_asides_from(
             report.kept += 1;
             continue;
         }
-        match std::fs::remove_dir_all(&target) {
+        match delete_tree(&target) {
             Ok(()) => {
                 if let Some(marker) = &marker {
                     let _ = std::fs::remove_file(marker);
@@ -8289,6 +8302,79 @@ some-future-field whatever
         }
     }
 
+    fn list_holding(holding: &Path) -> EntryListing {
+        Ok(std::fs::read_dir(holding)?
+            .map(|entry| {
+                entry.map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.path(),
+                    )
+                })
+            })
+            .collect())
+    }
+
+    /// 1. The aside is deleted by another sweep between this sweep's listing
+    ///    and its delete: the delete says NotFound, which is the goal state.
+    #[test]
+    fn the_sweep_does_not_report_an_aside_a_concurrent_sweep_deleted_first() {
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-35-1");
+        let report = sweep_teardown_asides_from(dir.path(), &list_holding, &|path| {
+            std::fs::remove_dir_all(path)?; // the other sweep wins
+            std::fs::remove_dir_all(path) // this sweep's delete finds nothing
+        });
+        assert!(report.problems.is_empty(), "{report:?}");
+        assert!(!aside.exists());
+    }
+
+    /// 1. The other sweep deletes children while this one walks the tree, so
+    ///    NotFound surfaces from inside the recursive delete.
+    #[test]
+    fn deleting_an_aside_survives_children_vanishing_mid_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let aside = dir.path().join("1-36-1");
+        std::fs::create_dir_all(aside.join("build")).unwrap();
+        std::fs::write(aside.join("build/out.o"), "object\n").unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let result = delete_dir_tree_with(&aside, &|path| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                // The other sweep removes a child, then this walk trips on it.
+                std::fs::remove_file(path.join("build/out.o")).unwrap();
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            std::fs::remove_dir_all(path)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!aside.exists());
+        assert_eq!(attempts.get(), 2);
+    }
+
+    /// 1. Only NotFound is the goal state: a delete that is refused is still
+    ///    reported.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_still_reports_an_aside_it_is_not_permitted_to_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _wt) = teardown_fixture(None);
+        let aside = plant_aside(dir.path(), "1-37-1");
+        let holding = aside.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&holding, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let report = sweep_teardown_asides_from(dir.path(), &list_holding, &delete_dir_tree);
+        std::fs::set_permissions(&holding, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if report.removed == 1 {
+            return; // running as a user the mode does not bind (root)
+        }
+        assert_eq!(report.problems.len(), 1, "{report:?}");
+        assert!(
+            report.problems[0].contains("could not delete the leftover"),
+            "{report:?}"
+        );
+        assert!(aside.exists());
+    }
+
     /// 1. An aside this process is deleting right now is not swept, marker or
     ///    no marker, even when its name is old enough for any other rule.
     #[test]
@@ -8981,12 +9067,16 @@ some-future-field whatever
         let (dir, _wt) = teardown_fixture(None);
         let aside = plant_aside(dir.path(), "1-34-1");
         let path = aside.clone();
-        let report = sweep_teardown_asides_from(dir.path(), &|_| {
-            Ok(vec![
-                Err(std::io::Error::other("injected: entry unreadable")),
-                Ok(("1-34-1".to_string(), path.clone())),
-            ])
-        });
+        let report = sweep_teardown_asides_from(
+            dir.path(),
+            &|_| {
+                Ok(vec![
+                    Err(std::io::Error::other("injected: entry unreadable")),
+                    Ok(("1-34-1".to_string(), path.clone())),
+                ])
+            },
+            &delete_dir_tree,
+        );
         assert_eq!(report.removed, 1, "{report:?}");
         assert_eq!(report.problems.len(), 1, "{report:?}");
         assert!(
