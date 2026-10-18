@@ -4,6 +4,8 @@
 //! the process starts afterwards; if it did not, a drained bucket would still
 //! shed at 0.000s and the lane's fix would be a no-op in production.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use gitpulse_lib::engine::git_cli::{
@@ -43,7 +45,10 @@ fn a_worker_thread_in_the_mcp_configuration_waits_instead_of_shedding() {
     match outcome {
         Ok((spawns, paced)) => {
             println!("paced after {spawns} spawns, one call took {paced:?}");
-            assert!(paced < Duration::from_millis(2_500), "{paced:?}");
+            assert!(
+                paced < common::env::coverage_relaxed(Duration::from_millis(2_500)),
+                "{paced:?}"
+            );
         }
         Err(error) => panic!("shed={} at the reserve: {error}", error.contains(SHED)),
     }
