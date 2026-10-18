@@ -15,7 +15,7 @@ pub struct ReleasePublishResult {
 pub async fn cmd_checkout_branch(
     repo_path: String,
     branch_name: String,
-) -> Result<Guarded<crate::engine::git_writer::CheckoutOutcome>, String> {
+) -> Result<Guarded<crate::engine::git_writer::CheckoutOutcome>, IpcError> {
     off_thread(move || {
         // The writer resolves exactly one argv (switch to a local branch or to
         // the local twin of a remote-tracking name, `--track` to create it, or
@@ -35,7 +35,7 @@ pub async fn cmd_checkout_branch(
 pub async fn cmd_checkout_detached(
     repo_path: String,
     revision: String,
-) -> Result<Guarded<crate::engine::git_writer::CheckoutOutcome>, String> {
+) -> Result<Guarded<crate::engine::git_writer::CheckoutOutcome>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::checkout_detached_argv(&revision)?;
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -51,7 +51,7 @@ pub async fn cmd_create_branch(
     repo_path: String,
     branch_name: String,
     start_point: Option<String>,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::create_branch_argv(&branch_name, start_point.as_deref())?;
         let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
@@ -66,7 +66,7 @@ pub async fn cmd_delete_branch(
     repo_path: String,
     branch_name: String,
     force: bool,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::delete_branch_argv(&branch_name, force)?;
         let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
@@ -84,7 +84,7 @@ pub async fn cmd_rename_branch(
     repo_path: String,
     old_name: String,
     new_name: String,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::rename_branch_argv(&old_name, &new_name)?;
         let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
@@ -98,7 +98,7 @@ pub async fn cmd_rename_branch(
 pub async fn cmd_deadbranch_scan(
     repo_path: String,
     config: Option<crate::engine::deadbranch::DeadbranchConfig>,
-) -> Result<crate::engine::deadbranch::DeadbranchScanResult, String> {
+) -> Result<crate::engine::deadbranch::DeadbranchScanResult, IpcError> {
     off_thread(move || {
         let conf = config.unwrap_or_default();
         crate::engine::deadbranch::scan_stale_branches(&repo_path, &conf)
@@ -112,7 +112,7 @@ pub async fn cmd_deadbranch_clean(
     branches: Vec<String>,
     force: bool,
     create_backup: bool,
-) -> Result<Guarded<crate::engine::deadbranch::DeadbranchCleanResult>, String> {
+) -> Result<Guarded<crate::engine::deadbranch::DeadbranchCleanResult>, IpcError> {
     off_thread(move || {
         let fold = VerdictFold::default();
         let result = crate::engine::deadbranch::clean_branches_with_gate(
@@ -136,7 +136,7 @@ pub async fn cmd_deadbranch_clean(
 #[tauri::command(async)]
 pub async fn cmd_deadbranch_list_backups(
     repo_path: String,
-) -> Result<Vec<crate::engine::deadbranch::DeadbranchBackupInfo>, String> {
+) -> Result<Vec<crate::engine::deadbranch::DeadbranchBackupInfo>, IpcError> {
     off_thread(move || crate::engine::deadbranch::list_backups(&repo_path)).await
 }
 
@@ -145,7 +145,7 @@ pub async fn cmd_deadbranch_restore(
     repo_path: String,
     backup_path: String,
     branches: Option<Vec<String>>,
-) -> Result<Guarded<crate::engine::deadbranch::DeadbranchRestoreResult>, String> {
+) -> Result<Guarded<crate::engine::deadbranch::DeadbranchRestoreResult>, IpcError> {
     off_thread(move || {
         let fold = VerdictFold::default();
         let result = crate::engine::deadbranch::restore_backup_with_gate(
@@ -168,21 +168,21 @@ pub async fn cmd_deadbranch_restore(
 #[tauri::command(async)]
 pub async fn cmd_branch_cleanup_plan(
     repo_path: String,
-) -> Result<crate::ops::BranchCleanupPlan, String> {
+) -> Result<crate::ops::BranchCleanupPlan, IpcError> {
     off_thread(move || crate::ops::branch_cleanup_plan(&repo_path)).await
 }
 
 /// The half of ref retention `cmd_branch_cleanup_plan` cannot see: a commit
 /// held by a tag alone is on no branch, so that plan counts it nowhere.
 #[tauri::command(async)]
-pub async fn cmd_tag_cleanup_plan(repo_path: String) -> Result<crate::ops::TagCleanupPlan, String> {
+pub async fn cmd_tag_cleanup_plan(repo_path: String) -> Result<crate::ops::TagCleanupPlan, IpcError> {
     off_thread(move || crate::ops::tag_cleanup_plan(&repo_path)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_review_outgoing_commits(
     repo_path: String,
-) -> Result<crate::ops::CommitReviewReport, String> {
+) -> Result<crate::ops::CommitReviewReport, IpcError> {
     off_thread(move || crate::ops::review_outgoing_commits(&repo_path)).await
 }
 
@@ -192,7 +192,7 @@ pub async fn cmd_create_tag(
     tag_name: String,
     commit_id: Option<String>,
     message: Option<String>,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::create_tag_argv(&tag_name, commit_id.as_deref(), message.as_deref())?;
         let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
@@ -208,7 +208,7 @@ pub async fn cmd_create_tag(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<Guarded<()>, String> {
+pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::delete_tag_argv(&tag_name)?;
         let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
@@ -226,7 +226,7 @@ pub async fn cmd_publish_release(
     repo_path: String,
     tag: String,
     message: String,
-) -> Result<Guarded<ReleasePublishResult>, String> {
+) -> Result<Guarded<ReleasePublishResult>, IpcError> {
     off_thread(move || {
         let plan = crate::ops::prepare_release(&repo_path, &tag, &message)?;
         let tag_policy = if plan.create_tag {

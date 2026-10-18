@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { IpcError } from "../ipc/invoke";
 import {
   STASH_ACTIONS,
   parseStashList,
@@ -152,21 +153,27 @@ describe("stashActionPayload", () => {
 });
 
 describe("isStaleStackError", () => {
-  it("recognizes the backend's refusal so the UI can refresh instead of erroring", () => {
+  const stale = (message: string) => new IpcError("stale_stash", message);
+
+  it("recognizes the backend's refusal by its kind so the UI can refresh instead of erroring", () => {
     expect(
       isStaleStackError(
-        'Stash entry 2 changed since it was listed — it now holds "On main: other". Refresh the stash list and try again.',
+        stale('Stash entry 2 changed since it was listed — it now holds "On main: other". Refresh the stash list and try again.'),
       ),
     ).toBe(true);
-    expect(
-      isStaleStackError(
-        "Stash entry 5 no longer exists — the stash stack now holds 2 entries. Refresh the stash list and try again.",
-      ),
-    ).toBe(true);
+    expect(isStaleStackError(stale("any wording at all"))).toBe(true);
   });
 
   it("does not swallow unrelated failures", () => {
-    expect(isStaleStackError("error: could not restore untracked files from stash")).toBe(false);
+    expect(isStaleStackError(new IpcError("unclassified", "error: could not restore untracked files from stash"))).toBe(false);
+    expect(isStaleStackError(undefined)).toBe(false);
+  });
+
+  it("never reads the wording: the same text without the kind is not the refusal", () => {
+    const text = "Stash entry 5 no longer exists — the stash stack now holds 2 entries. Refresh the stash list and try again.";
+    expect(isStaleStackError(text)).toBe(false);
+    expect(isStaleStackError(new Error(text))).toBe(false);
+    expect(isStaleStackError(new IpcError("unclassified", text))).toBe(false);
   });
 });
 

@@ -130,9 +130,7 @@
   const mapFailureMode = $derived(
     classifyMapFailure({
       cliAvailable: cliStatus?.available ?? null,
-      cliReason: cliStatus?.reason,
       mapAvailable: load?.available ?? null,
-      mapReason: load?.reason,
       mapPath: load?.path,
     }),
   );

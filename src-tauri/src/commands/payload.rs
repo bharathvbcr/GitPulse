@@ -66,6 +66,12 @@ impl From<PayloadError> for String {
     }
 }
 
+impl From<PayloadError> for crate::ipc_error::IpcError {
+    fn from(error: PayloadError) -> Self {
+        Self::from(error.to_string())
+    }
+}
+
 /// `content` for a single-file command (`devmap_preview`, `write_file_content`).
 pub(crate) fn check_content(
     what: &'static str,

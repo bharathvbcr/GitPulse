@@ -10,7 +10,7 @@ pub async fn cmd_markdown_render(
     text: String,
     repo_path: Option<String>,
     file_path: Option<String>,
-) -> Result<crate::markdown::RenderedMarkdown, String> {
+) -> Result<crate::markdown::RenderedMarkdown, IpcError> {
     off_thread(move || {
         // A location is both or neither: a path without its repository could
         // only be resolved against something the caller did not name.
@@ -29,7 +29,7 @@ pub async fn cmd_markdown_render(
 pub async fn cmd_docs_refresh(
     repo_path: String,
     background: Option<bool>,
-) -> Result<crate::docs::DocsStatus, String> {
+) -> Result<crate::docs::DocsStatus, IpcError> {
     if background.unwrap_or(false) {
         off_thread_background(move || crate::docs::refresh(&repo_path)).await
     } else {
@@ -38,7 +38,7 @@ pub async fn cmd_docs_refresh(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_docs_status(repo_path: String) -> Result<crate::docs::DocsStatus, String> {
+pub async fn cmd_docs_status(repo_path: String) -> Result<crate::docs::DocsStatus, IpcError> {
     off_thread(move || crate::docs::status(&repo_path)).await
 }
 
@@ -47,7 +47,7 @@ pub async fn cmd_docs_search(
     repo_path: String,
     query: String,
     limit: Option<u32>,
-) -> Result<Vec<markdev_vault::SearchHit>, String> {
+) -> Result<Vec<markdev_vault::SearchHit>, IpcError> {
     off_thread(move || {
         crate::docs::search(
             &repo_path,
@@ -61,7 +61,7 @@ pub async fn cmd_docs_search(
 #[tauri::command(async)]
 pub async fn cmd_docs_broken_links(
     repo_path: String,
-) -> Result<Vec<crate::docs::BrokenLink>, String> {
+) -> Result<Vec<crate::docs::BrokenLink>, IpcError> {
     off_thread(move || crate::docs::broken_links(&repo_path)).await
 }
 
@@ -69,7 +69,7 @@ pub async fn cmd_docs_broken_links(
 pub async fn cmd_docs_backlinks(
     repo_path: String,
     path: String,
-) -> Result<Vec<markdev_vault::Backlink>, String> {
+) -> Result<Vec<markdev_vault::Backlink>, IpcError> {
     off_thread(move || crate::docs::backlinks(&repo_path, &path)).await
 }
 
@@ -80,7 +80,7 @@ pub async fn cmd_docs_graph(
     depth: Option<u32>,
     tag: Option<String>,
     folder: Option<String>,
-) -> Result<markdev_vault::Graph, String> {
+) -> Result<markdev_vault::Graph, IpcError> {
     off_thread(move || {
         crate::docs::graph(
             &repo_path,
@@ -99,7 +99,7 @@ pub async fn cmd_docs_rename(
     repo_path: String,
     from: String,
     to: String,
-) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
+) -> Result<Guarded<crate::docs::DocRenameOutcome>, IpcError> {
     off_thread(move || docs_rename_guarded(&repo_path, &from, &to)).await
 }
 
@@ -171,7 +171,7 @@ pub async fn cmd_move_path(
     repo_path: String,
     from: String,
     to: String,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let mut policy = None;
         GitWriter::move_path(&repo_path, &from, &to, |plan| {
@@ -191,7 +191,7 @@ pub async fn cmd_move_path(
 pub async fn cmd_delete_path(
     repo_path: String,
     path: String,
-) -> Result<Guarded<crate::engine::git_writer::DeleteOutcome>, String> {
+) -> Result<Guarded<crate::engine::git_writer::DeleteOutcome>, IpcError> {
     off_thread(move || {
         let fold = VerdictFold::default();
         let output = GitWriter::delete_path(&repo_path, &path, |plan| {

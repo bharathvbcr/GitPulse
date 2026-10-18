@@ -18,7 +18,7 @@ pub fn cmd_pick_folder() -> Option<String> {
 /// so an agent hammering status/fetch/graph in parallel keeps the runtime
 /// responsive.
 #[tauri::command(async)]
-pub async fn cmd_list_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
+pub async fn cmd_list_branches(repo_path: String) -> Result<Vec<BranchInfo>, IpcError> {
     off_thread(move || GitReader::list_branches(&repo_path)).await
 }
 
@@ -26,12 +26,12 @@ pub async fn cmd_list_branches(repo_path: String) -> Result<Vec<BranchInfo>, Str
 /// shortstat walks stay off the initial load and memoize through the oid-keyed
 /// churn cache, so repeat calls while browsing are cheap.
 #[tauri::command(async)]
-pub async fn cmd_branch_stats(repo_path: String) -> Result<BranchStatsReport, String> {
+pub async fn cmd_branch_stats(repo_path: String) -> Result<BranchStatsReport, IpcError> {
     off_thread(move || GitReader::branch_stats(&repo_path)).await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_get_status(repo_path: String) -> Result<Vec<FileStatus>, String> {
+pub async fn cmd_get_status(repo_path: String) -> Result<Vec<FileStatus>, IpcError> {
     off_thread(move || GitReader::get_status(&repo_path)).await
 }
 
@@ -41,7 +41,7 @@ pub async fn cmd_get_file_diff(
     file_path: String,
     is_staged: bool,
     ignore_whitespace: Option<bool>,
-) -> Result<DiffPayload, String> {
+) -> Result<DiffPayload, IpcError> {
     off_thread(move || {
         GitReader::get_file_diff(
             &repo_path,
@@ -57,7 +57,7 @@ pub async fn cmd_get_file_diff(
 pub async fn cmd_get_commit_diff(
     repo_path: String,
     commit_id: String,
-) -> Result<DiffPayload, String> {
+) -> Result<DiffPayload, IpcError> {
     off_thread(move || GitReader::get_commit_diff(&repo_path, &commit_id)).await
 }
 
@@ -66,7 +66,7 @@ pub async fn cmd_get_commit_file_diff(
     repo_path: String,
     commit_id: String,
     file_path: String,
-) -> Result<DiffPayload, String> {
+) -> Result<DiffPayload, IpcError> {
     off_thread(move || GitReader::get_commit_file_diff(&repo_path, &commit_id, &file_path)).await
 }
 
@@ -75,7 +75,7 @@ pub async fn cmd_get_range_diff(
     repo_path: String,
     from: String,
     to: String,
-) -> Result<DiffPayload, String> {
+) -> Result<DiffPayload, IpcError> {
     off_thread(move || GitReader::get_range_diff(&repo_path, &from, &to)).await
 }
 
@@ -83,7 +83,7 @@ pub async fn cmd_get_range_diff(
 pub async fn cmd_get_commit_files(
     repo_path: String,
     commit_id: String,
-) -> Result<Vec<CommitFileChange>, String> {
+) -> Result<Vec<CommitFileChange>, IpcError> {
     off_thread(move || GitReader::get_commit_files(&repo_path, &commit_id)).await
 }
 
@@ -91,7 +91,7 @@ pub async fn cmd_get_commit_files(
 pub async fn cmd_get_commit_details(
     repo_path: String,
     commit_id: String,
-) -> Result<CommitDetails, String> {
+) -> Result<CommitDetails, IpcError> {
     off_thread(move || GitReader::get_commit_details(&repo_path, &commit_id)).await
 }
 
@@ -103,7 +103,7 @@ pub async fn cmd_get_commit_details(
 pub async fn cmd_verify_commit_signature(
     repo_path: String,
     commit_id: String,
-) -> Result<CommitSignatureCheck, String> {
+) -> Result<CommitSignatureCheck, IpcError> {
     off_thread(move || verify_commit_signature(&repo_path, &commit_id)).await
 }
 
@@ -112,7 +112,7 @@ pub async fn cmd_get_file_content(
     repo_path: String,
     file_path: String,
     commit_id: Option<String>,
-) -> Result<String, String> {
+) -> Result<String, IpcError> {
     off_thread(move || GitReader::get_file_content(&repo_path, &file_path, commit_id.as_deref()))
         .await
 }
@@ -123,7 +123,7 @@ pub async fn cmd_get_file_blob(
     file_path: String,
     commit_id: Option<String>,
     with_digest: Option<bool>,
-) -> Result<FileBlob, String> {
+) -> Result<FileBlob, IpcError> {
     off_thread(move || {
         // The digest names the version a save is judged against. A reader that
         // never saves (the diff viewer) asks for none and skips the hashing
@@ -173,7 +173,7 @@ pub async fn cmd_write_file_content(
             Ok(Guarded { policy, output })
         })())
     })
-    .await?
+    .await.map_err(|e| e.message)?
 }
 
 /// Creates an empty file that must not exist yet, for Explorer's New File and
@@ -192,7 +192,7 @@ pub async fn cmd_create_file(
             Ok(Guarded { policy, output: () })
         })())
     })
-    .await?
+    .await.map_err(|e| e.message)?
 }
 
 #[tauri::command(async)]
@@ -209,7 +209,7 @@ pub fn cmd_compute_word_diff(old_line: String, new_line: String) -> IntraLineDif
 pub async fn cmd_syntax_highlight(
     language: String,
     code: String,
-) -> Result<Vec<crate::syntax::SyntaxHighlightSpan>, String> {
+) -> Result<Vec<crate::syntax::SyntaxHighlightSpan>, IpcError> {
     off_thread(move || crate::syntax::highlight(&language, &code)).await
 }
 
@@ -233,19 +233,19 @@ pub async fn cmd_get_file_blame(
     repo_path: String,
     file_path: String,
     revision: Option<String>,
-) -> Result<Vec<BlameLine>, String> {
+) -> Result<Vec<BlameLine>, IpcError> {
     off_thread(move || GitReader::get_file_blame(&repo_path, &file_path, revision.as_deref())).await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_list_repo_files(repo_path: String) -> Result<Vec<String>, String> {
+pub async fn cmd_list_repo_files(repo_path: String) -> Result<Vec<String>, IpcError> {
     off_thread(move || GitReader::list_repo_files(&repo_path)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_list_tags(
     repo_path: String,
-) -> Result<crate::engine::git_reader::TagList, String> {
+) -> Result<crate::engine::git_reader::TagList, IpcError> {
     off_thread(move || GitReader::list_tags(&repo_path)).await
 }
 
@@ -253,7 +253,7 @@ pub async fn cmd_list_tags(
 pub async fn cmd_get_reflog(
     repo_path: String,
     max_entries: Option<usize>,
-) -> Result<Vec<ReflogEntry>, String> {
+) -> Result<Vec<ReflogEntry>, IpcError> {
     off_thread(move || GitReader::get_reflog(&repo_path, max_entries.unwrap_or(200))).await
 }
 
@@ -267,7 +267,7 @@ pub async fn cmd_search_content(
     pattern: String,
     options: Option<crate::engine::content_search::ContentSearchOptions>,
     cancel_token: Option<String>,
-) -> Result<crate::engine::content_search::ContentSearchReport, String> {
+) -> Result<crate::engine::content_search::ContentSearchReport, IpcError> {
     off_thread(move || {
         let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
         let result = crate::engine::content_search::search(
@@ -285,17 +285,17 @@ pub async fn cmd_search_content(
 /// What resetting HEAD's branch to `target` would take off it. Read-only and
 /// ungated; the reset itself goes through the guarded [`cmd_reset`].
 #[tauri::command(async)]
-pub async fn cmd_reset_preview(repo_path: String, target: String) -> Result<ResetPreview, String> {
+pub async fn cmd_reset_preview(repo_path: String, target: String) -> Result<ResetPreview, IpcError> {
     off_thread(move || GitReader::reset_preview(&repo_path, &target)).await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_get_language_stats(repo_path: String) -> Result<LanguageStatsReport, String> {
+pub async fn cmd_get_language_stats(repo_path: String) -> Result<LanguageStatsReport, IpcError> {
     off_thread(move || GitReader::get_repo_language_stats(&repo_path)).await
 }
 
 /// Fresh HEAD identity for menu copy actions, including detached HEAD.
 #[tauri::command(async)]
-pub async fn cmd_get_head_id(repo_path: String) -> Result<String, String> {
+pub async fn cmd_get_head_id(repo_path: String) -> Result<String, IpcError> {
     off_thread(move || GitReader::head_id(&repo_path)).await
 }

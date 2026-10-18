@@ -12,7 +12,7 @@
   import AgentCommitMenu from "./AgentCommitMenu.svelte";
   import HookRunNotice from "./HookRunNotice.svelte";
   import IdentityPrompt from "./IdentityPrompt.svelte";
-  import { isIdentityMissing } from "../repos/gitPreflight";
+  import { ipcErrorKind, type IpcErrorKind } from "../ipc/invoke";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatError } from "../ui/formatError";
   import { repoScope } from "../repos/repoScope.svelte";
@@ -61,7 +61,7 @@
   let isGenerating = $state(false);
   let generation = $state<AiGeneration | null>(null);
   let aiError = $state<string | null>(null);
-  let commitError = $state<string | null>(null);
+  let commitError = $state<{ message: string; kind: IpcErrorKind } | null>(null);
   let isCommitting = $state(false);
   let lastVerdict = $state<PolicyVerdict | null>(null);
 
@@ -187,7 +187,7 @@
   }
 
   async function finishCommit(
-    outcome: { ok: boolean; error?: string; policy?: PolicyVerdict | null },
+    outcome: { ok: boolean; error?: string; cause?: unknown; policy?: PolicyVerdict | null },
     epoch: number,
   ) {
     // The commit ran against the repository it was started in. When the person
@@ -198,7 +198,7 @@
     if (!outcome.ok) {
       // A refused commit keeps its message: the user has to change the action,
       // not retype the description of it.
-      commitError = outcome.error ?? "The commit did not run.";
+      commitError = { message: outcome.error ?? "The commit did not run.", kind: ipcErrorKind(outcome.cause) };
       return;
     }
     commitDraft.set("");
@@ -433,13 +433,13 @@
     <HookRunNotice />
   {/if}
 
-  {#if commitError && isIdentityMissing(commitError)}
+  {#if commitError?.kind === "identity_missing"}
     <IdentityPrompt
       onSaved={() => { commitError = null; void handleCommit(); }}
       onDismiss={() => (commitError = null)}
     />
   {:else if commitError}
-    <div class="text-[10px] text-rose-400 whitespace-pre-wrap font-mono leading-relaxed">{commitError}</div>
+    <div class="text-[10px] text-rose-400 whitespace-pre-wrap font-mono leading-relaxed">{commitError.message}</div>
   {:else if lastVerdict}
     <div
       class="text-[10px] flex flex-col gap-0.5 {lastVerdict.status === 'unchecked'

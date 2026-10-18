@@ -24,6 +24,7 @@ pub mod ingest;
 pub mod insights;
 pub mod lappi;
 pub mod ledger;
+pub mod ipc_error;
 pub mod limits;
 #[cfg(unix)]
 pub mod local_socket;

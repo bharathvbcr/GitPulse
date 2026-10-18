@@ -10,7 +10,7 @@ fn slow_command_is_visible_in_diagnostics_without_recording_its_payload() {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         Err::<(), _>("private command payload".to_string())
     }));
-    assert_eq!(result.unwrap_err(), "private command payload");
+    assert_eq!(result.unwrap_err().message, "private command payload");
     let lines = crate::logging::diagnostic_tail(500);
     let line = lines.iter().find(|line| {
         line.contains("[performance]") && line.contains("slow_command_is_visible_in_diagnostics")

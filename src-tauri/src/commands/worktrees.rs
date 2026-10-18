@@ -18,7 +18,7 @@ use crate::engine::worktree::MergeTeardownError;
 pub async fn cmd_list_worktrees(
     repo_path: String,
     depth: Option<crate::engine::worktree::ScanDepth>,
-) -> Result<Vec<WorktreeInfo>, String> {
+) -> Result<Vec<WorktreeInfo>, IpcError> {
     // Past `listing` it spawns git per worktree (capped), so it belongs on
     // the blocking pool like every other reader.
     let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Listing);
@@ -36,7 +36,7 @@ pub async fn cmd_add_worktree(
     detach: bool,
     cow_caches: Option<bool>,
     run_hooks: Option<bool>,
-) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, String> {
+) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, IpcError> {
     off_thread(move || {
         // GitPulse's task-worktree container has one creator, the task
         // provisioner, which keeps it out of `git status` first.
@@ -75,7 +75,7 @@ pub async fn cmd_add_worktree(
 #[tauri::command(async)]
 pub async fn cmd_preview_worktree_hooks(
     repo_path: String,
-) -> Result<Option<crate::engine::worktree_hooks::WorktreeHooksPreview>, String> {
+) -> Result<Option<crate::engine::worktree_hooks::WorktreeHooksPreview>, IpcError> {
     off_thread(move || {
         let repo = crate::engine::git_cli::validate_repo(&repo_path)?;
         crate::engine::preview_worktree_hooks(&repo)
@@ -86,7 +86,7 @@ pub async fn cmd_preview_worktree_hooks(
 /// Records consent to run the hooks file whose text is `content` — the text
 /// the person was shown. Refused if the file on disk is no longer exactly that.
 #[tauri::command(async)]
-pub async fn cmd_approve_worktree_hooks(repo_path: String, content: String) -> Result<(), String> {
+pub async fn cmd_approve_worktree_hooks(repo_path: String, content: String) -> Result<(), IpcError> {
     off_thread(move || {
         let repo = crate::engine::git_cli::validate_repo(&repo_path)?;
         crate::engine::approve_worktree_hooks(&repo, &content)
@@ -101,7 +101,7 @@ pub async fn cmd_remove_worktree(
     target_path: String,
     force: bool,
     workbench: State<'_, crate::workbench::WorkbenchState>,
-) -> Result<Guarded<crate::engine::worktree::WorktreeRemoval>, String> {
+) -> Result<Guarded<crate::engine::worktree::WorktreeRemoval>, IpcError> {
     let workbench = workbench.inner().clone();
     off_thread(move || {
         remove_worktree_guarded(
@@ -144,7 +144,7 @@ pub async fn cmd_lock_worktree(
     repo_path: String,
     target_path: String,
     reason: Option<String>,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv_owned =
             crate::engine::worktree::lock_worktree_argv(&target_path, reason.as_deref());
@@ -160,7 +160,7 @@ pub async fn cmd_lock_worktree(
 pub async fn cmd_unlock_worktree(
     repo_path: String,
     target_path: String,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv_owned = crate::engine::worktree::unlock_worktree_argv(&target_path);
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
@@ -172,7 +172,7 @@ pub async fn cmd_unlock_worktree(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_prune_worktree(repo_path: String) -> Result<Guarded<()>, String> {
+pub async fn cmd_prune_worktree(repo_path: String) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let argv_owned = crate::engine::worktree::prune_worktree_argv();
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
@@ -212,7 +212,7 @@ pub async fn cmd_worktree_merge_teardown(
             &|repo, argv| guard(repo, argv),
         ))
     })
-    .await?
+    .await.map_err(|e| e.message)?
 }
 
 /// Body of [`cmd_worktree_merge_teardown`].
@@ -262,7 +262,7 @@ pub(crate) fn merge_teardown_guarded(
 pub async fn cmd_worktree_cow_sync(
     repo_path: String,
     target_path: String,
-) -> Result<Vec<crate::engine::cow_clone::ReflinkResult>, String> {
+) -> Result<Vec<crate::engine::cow_clone::ReflinkResult>, IpcError> {
     off_thread(move || {
         let repo = crate::engine::validate_repo(&repo_path)?;
         // The target comes from the webview. Only a checkout git lists as a
@@ -284,7 +284,7 @@ pub async fn cmd_worktree_cow_sync(
 pub async fn cmd_worktree_routes(
     worktree_path: String,
     branch: Option<String>,
-) -> Result<Vec<crate::engine::portless::WorktreeRouteInfo>, String> {
+) -> Result<Vec<crate::engine::portless::WorktreeRouteInfo>, IpcError> {
     off_thread(move || {
         Ok(crate::engine::portless::detect_worktree_routes(
             &worktree_path,
@@ -300,7 +300,7 @@ pub async fn cmd_worktree_ai_summary(
     repo_path: String,
     worktree_path: String,
     branch: Option<String>,
-) -> Result<String, String> {
+) -> Result<String, IpcError> {
     off_thread(move || worktree_ai_summary(&repo_path, &worktree_path, branch.as_deref())).await
 }
 

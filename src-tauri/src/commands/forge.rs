@@ -9,7 +9,7 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
     // same degraded context a missing CLI would.
     off_thread(move || Ok::<_, String>(load_github_context(&repo_path)))
         .await
-        .unwrap_or_else(|e| GitHubContext {
+        .map_err(|e| e.message).unwrap_or_else(|e| GitHubContext {
             available: false,
             cli_present: false,
             host: String::new(),
@@ -42,7 +42,7 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
 pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsReport {
     off_thread(move || Ok::<_, String>(load_workflow_runs_report(&repo_path)))
         .await
-        .unwrap_or_else(|e| crate::github::GitHubRunsReport {
+        .map_err(|e| e.message).unwrap_or_else(|e| crate::github::GitHubRunsReport {
             available: false,
             checked: false,
             cli_present: false,
@@ -61,7 +61,7 @@ pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsRepo
 pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport {
     off_thread(move || Ok::<_, String>(load_dependabot_alerts(&repo_path)))
         .await
-        .unwrap_or_else(DependabotReport::transport_failure)
+        .map_err(|e| e.message).unwrap_or_else(DependabotReport::transport_failure)
 }
 
 /// Open GitHub code scanning alerts for the Health view, via `gh api`. Like
@@ -71,7 +71,7 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
 pub async fn cmd_github_code_scanning_alerts(repo_path: String) -> CodeScanningReport {
     off_thread(move || Ok::<_, String>(load_code_scanning_alerts(&repo_path)))
         .await
-        .unwrap_or_else(CodeScanningReport::transport_failure)
+        .map_err(|e| e.message).unwrap_or_else(CodeScanningReport::transport_failure)
 }
 
 #[tauri::command(async)]
@@ -80,7 +80,7 @@ pub async fn cmd_github_create_issue(
     title: String,
     body: String,
     labels: Vec<String>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // Validate before anything external runs, then judge the exact argv
         // create_issue executes — built once by the shared `issue_create_argv`
@@ -102,7 +102,7 @@ pub async fn cmd_github_create_issue(
 pub async fn cmd_github_checkout_pr(
     repo_path: String,
     number: u64,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // pr_checkout_argv refuses a fabricated number before discovery, so
         // an invalid request never produces a judged-but-unexecutable line.
@@ -125,7 +125,7 @@ pub async fn cmd_github_checkout_pr(
 pub async fn cmd_github_pr_view(
     repo_path: String,
     number: u64,
-) -> Result<crate::github::PullRequestDetail, String> {
+) -> Result<crate::github::PullRequestDetail, IpcError> {
     off_thread(move || crate::github::view_pull_request(&repo_path, number)).await
 }
 
@@ -136,7 +136,7 @@ pub async fn cmd_github_pr_view(
 pub async fn cmd_github_pr_action(
     repo_path: String,
     action: crate::github::PrAction,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let remote = discover_github_remote(&repo_path)?
             .ok_or_else(|| "No GitHub remote configured".to_string())?;
@@ -161,7 +161,7 @@ pub async fn cmd_github_pr_action(
 pub async fn cmd_github_workflows(repo_path: String) -> crate::github::actions::WorkflowsReport {
     off_thread(move || Ok::<_, String>(crate::github::actions::load_workflows_report(&repo_path)))
         .await
-        .unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
+        .map_err(|e| e.message).unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
 }
 
 /// Dispatches a workflow (`gh workflow run <selector> --ref <ref>`), after
@@ -172,7 +172,7 @@ pub async fn cmd_github_trigger_workflow(
     repo_path: String,
     workflow: String,
     git_ref: String,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let remote = discover_github_remote(&repo_path)?
             .ok_or_else(|| "No GitHub remote configured".to_string())?;
@@ -192,7 +192,7 @@ pub async fn cmd_github_trigger_workflow(
 pub async fn cmd_github_rerun_run(
     repo_path: String,
     run_id: u64,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let remote = discover_github_remote(&repo_path)?
             .ok_or_else(|| "No GitHub remote configured".to_string())?;
@@ -210,7 +210,7 @@ pub async fn cmd_github_rerun_run(
 pub async fn cmd_github_cancel_run(
     repo_path: String,
     run_id: u64,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let remote = discover_github_remote(&repo_path)?
             .ok_or_else(|| "No GitHub remote configured".to_string())?;
@@ -237,7 +237,7 @@ pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::Firebase
         // A thread-pool failure is not "no Firebase config": it is a status that
         // could not be read, and it says so rather than rendering as a repository
         // that does not use Firebase.
-        .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
+        .map_err(|e| e.message).unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
 }
 
 /// Lists App Hosting backends for one project.
@@ -252,7 +252,7 @@ pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::Firebase
 pub async fn cmd_firebase_backends(
     repo_path: String,
     project_id: String,
-) -> Result<Guarded<crate::firebase::apphosting::FirebaseBackendsReport>, String> {
+) -> Result<Guarded<crate::firebase::apphosting::FirebaseBackendsReport>, IpcError> {
     off_thread(move || {
         let probe = crate::firebase::firebase_cli_probe();
         if !probe.present {
@@ -282,7 +282,7 @@ pub async fn cmd_firebase_rollouts(
     repo_path: String,
     project_id: String,
     backend_id: String,
-) -> Result<Guarded<crate::firebase::apphosting::FirebaseRolloutsReport>, String> {
+) -> Result<Guarded<crate::firebase::apphosting::FirebaseRolloutsReport>, IpcError> {
     off_thread(move || {
         let probe = crate::firebase::firebase_cli_probe();
         if !probe.present {
@@ -334,7 +334,7 @@ pub async fn cmd_firebase_create_rollout(
     project_id: String,
     backend_id: String,
     git_commit: String,
-) -> Result<Guarded<crate::firebase::apphosting::RolloutCreateOutcome>, String> {
+) -> Result<Guarded<crate::firebase::apphosting::RolloutCreateOutcome>, IpcError> {
     off_thread(move || {
         let probe = crate::firebase::firebase_cli_probe();
         if !probe.present {
@@ -369,6 +369,6 @@ pub async fn cmd_firebase_create_rollout(
 /// with its verdict; a completed run against a clean tree is recorded as a
 /// git-native verification note on HEAD. See `ci_local` for both.
 #[tauri::command(async)]
-pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, String> {
+pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, IpcError> {
     off_thread(move || crate::ci_local::run_ci_local(&repo_path)).await
 }

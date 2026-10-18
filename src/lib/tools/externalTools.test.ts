@@ -123,68 +123,26 @@ describe("installButtonLabel", () => {
 });
 
 describe("classifyMapFailure", () => {
-  it("separates no CLI from missing sqlite and missing JSON", () => {
-    expect(
-      classifyMapFailure({
-        cliAvailable: false,
-        mapAvailable: false,
-        mapReason: "whatever",
-      }),
-    ).toBe("no_cli");
+  const MAP = "/repo/.devcouncil/repo_map.json";
 
-    expect(
-      classifyMapFailure({
-        cliAvailable: true,
-        mapAvailable: false,
-        mapReason: "no map at .devcouncil/codeintel/devmap.sqlite",
-      }),
-    ).toBe("no_sqlite_store");
+  it("separates no CLI from a missing map file and from everything else, by what the backend reported", () => {
+    expect(classifyMapFailure({ cliAvailable: false, mapAvailable: false })).toBe("no_cli");
+    expect(classifyMapFailure({ cliAvailable: false, mapAvailable: false, mapPath: MAP })).toBe("no_cli");
+    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: false, mapPath: MAP })).toBe("no_json_artifact");
+    // A refusal before any file was looked at names no file.
+    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: false })).toBe("other");
+    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: false, mapPath: null })).toBe("other");
+    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: true, mapPath: MAP })).toBe("other");
+    expect(classifyMapFailure({ cliAvailable: null, mapAvailable: null })).toBe("other");
+  });
 
-    expect(
-      classifyMapFailure({
-        cliAvailable: true,
-        mapAvailable: false,
-        mapReason: "index has not been built",
-      }),
-    ).toBe("no_sqlite_store");
-
-    expect(
-      classifyMapFailure({
-        cliAvailable: true,
-        mapAvailable: false,
-        mapReason: "no repo map at /repo/.devcouncil/repo_map.json; run Build Map first",
-        mapPath: "/repo/.devcouncil/repo_map.json",
-      }),
-    ).toBe("no_json_artifact");
-
-    expect(
-      classifyMapFailure({
-        cliAvailable: true,
-        mapAvailable: false,
-        mapReason: "something else",
-        mapPath: "/repo/.devcouncil/repo_map.json",
-      }),
-    ).toBe("no_json_artifact");
-
-    expect(
-      classifyMapFailure({
-        cliAvailable: true,
-        mapAvailable: false,
-        mapReason: "unknown",
-      }),
-    ).toBe("other");
-
-    expect(
-      classifyMapFailure({
-        cliAvailable: true,
-        mapAvailable: true,
-      }),
-    ).toBe("other");
+  it("does not take a mode out of a reason's wording: the input has no reason to read", () => {
+    const input = { cliAvailable: true, mapAvailable: false, mapReason: "no repo map at x; sqlite index has not been built" };
+    expect(classifyMapFailure(input as never)).toBe("other");
   });
 
   it("mapFailureMessage names the action for each mode", () => {
     expect(mapFailureMessage("no_cli")).toContain("Setup");
-    expect(mapFailureMessage("no_sqlite_store")).toContain("Build");
     expect(mapFailureMessage("no_json_artifact")).toContain("repo_map.json");
     expect(mapFailureMessage("other", "custom")).toBe("custom");
     expect(mapFailureMessage("other")).toBe("Map unavailable");

@@ -30,7 +30,7 @@ pub async fn cmd_terminal_spawn(
     acknowledged: Option<bool>,
     start_dir: Option<String>,
     on_output: crate::terminal::OutputChannel,
-) -> Result<crate::terminal::TerminalSpawned, String> {
+) -> Result<crate::terminal::TerminalSpawned, IpcError> {
     let state = state.inner().clone();
     off_thread(move || {
         // Expanded here, at the boundary, rather than in the caller: the flags
@@ -210,7 +210,7 @@ pub async fn cmd_terminal_incidents(
 #[tauri::command(async)]
 pub async fn cmd_terminal_conversations(
     session_ids: Vec<String>,
-) -> Result<Vec<crate::workbench::conversation::ConversationTranscript>, String> {
+) -> Result<Vec<crate::workbench::conversation::ConversationTranscript>, IpcError> {
     off_thread(move || crate::workbench::conversation::transcripts(&session_ids)).await
 }
 
@@ -285,7 +285,7 @@ pub async fn cmd_terminal_run(
     repo_path: String,
     args: Vec<String>,
     timeout_secs: Option<u64>,
-) -> Result<crate::terminal::TerminalRunResult, String> {
+) -> Result<crate::terminal::TerminalRunResult, IpcError> {
     off_thread(move || crate::terminal::run_terminal(&repo_path, &args, timeout_secs)).await
 }
 
@@ -301,7 +301,7 @@ pub async fn cmd_manvi_run_action(
     args: Vec<String>,
     action_kind: crate::terminal::ManviActionKind,
     timeout_secs: Option<u64>,
-) -> Result<crate::terminal::TerminalRunResult, String> {
+) -> Result<crate::terminal::TerminalRunResult, IpcError> {
     off_thread(move || {
         crate::terminal::run_manvi_action(&repo_path, &args, action_kind, timeout_secs)
     })

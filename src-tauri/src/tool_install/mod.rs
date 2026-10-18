@@ -13,6 +13,7 @@ pub mod components;
 pub mod release;
 
 use crate::engine::git_cli::{self, BoundedRun};
+use crate::ipc_error::{IpcError, IpcErrorKind};
 use crate::tool_capability;
 use crate::tool_config;
 use serde::{Deserialize, Serialize};
@@ -170,6 +171,11 @@ pub struct InstallOutcome {
     pub timed_out: bool,
     pub cancelled: bool,
     pub reason: Option<String>,
+    /// What `reason` is, when it is one the UI acts on (a repository that has
+    /// not been approved, say). Set once, in [`install_with_rung`], so the
+    /// desktop never reads the wording of `reason` to find out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<IpcErrorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rung: Option<InstallRung>,
 }
@@ -1080,12 +1086,18 @@ pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> 
                 cancelled: false,
                 reason: Some("another tool install is already running".into()),
                 rung: preferred,
+                reason_kind: None,
             };
         }
         *guard = Some(tool);
     }
 
-    let outcome = install_inner(tool, preferred);
+    let mut outcome = install_inner(tool, preferred);
+    outcome.reason_kind = outcome
+        .reason
+        .clone()
+        .map(|reason| IpcError::from_command_text(reason).kind)
+        .filter(|kind| *kind != IpcErrorKind::Unclassified);
 
     *install_guard()
         .lock()
@@ -1115,6 +1127,7 @@ fn install_inner(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallO
             cancelled: false,
             reason: None,
             rung: Some(InstallRung::AlreadyOnPath),
+            reason_kind: None,
         };
     }
 
@@ -1143,6 +1156,7 @@ fn install_inner(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallO
             cancelled: cancelled(),
             reason: Some(format!("no install rung available: {}", blocks.join("; "))),
             rung: None,
+            reason_kind: None,
         };
     };
 
@@ -1165,6 +1179,7 @@ fn install_inner(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallO
                 cancelled: false,
                 reason: rs.block.clone(),
                 rung: Some(rung),
+                reason_kind: None,
             };
         }
     }
@@ -1187,6 +1202,7 @@ fn install_inner(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallO
                 cancelled: false,
                 reason: None,
                 rung: Some(rung),
+                reason_kind: None,
             }
         }
         InstallRung::PrebuiltRelease => install_prebuilt_rung(tool),
@@ -1239,6 +1255,7 @@ fn finish_ok(
             ))
         },
         rung: Some(rung),
+        reason_kind: None,
     }
 }
 
@@ -1286,6 +1303,7 @@ fn install_prebuilt_rung(tool: ExternalTool) -> InstallOutcome {
             cancelled: cancelled(),
             reason: Some(reason),
             rung: Some(InstallRung::PrebuiltRelease),
+            reason_kind: None,
         },
     }
 }
@@ -1308,6 +1326,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             cancelled: true,
             reason: Some("cancelled before start".into()),
             rung: Some(InstallRung::ToolchainRemote),
+            reason_kind: None,
         };
     }
     let mut cmd = match tool {
@@ -1330,6 +1349,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                         cancelled: false,
                         reason: Some("cargo is not installed".into()),
                         rung: Some(InstallRung::ToolchainRemote),
+                        reason_kind: None,
                     };
                 }
             };
@@ -1356,6 +1376,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                         cancelled: false,
                         reason: Some("go is not installed".into()),
                         rung: Some(InstallRung::ToolchainRemote),
+                        reason_kind: None,
                     };
                 }
             };
@@ -1388,6 +1409,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                 cancelled: false,
                 reason: Some(reason),
                 rung: Some(InstallRung::ToolchainRemote),
+                reason_kind: None,
             };
         }
     }
@@ -1411,6 +1433,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             cancelled: true,
             reason: Some("cancelled".into()),
             rung: Some(InstallRung::ToolchainRemote),
+            reason_kind: None,
         },
         InstallRun::Failed(err) => InstallOutcome {
             tool,
@@ -1427,6 +1450,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             cancelled: cancelled(),
             reason: Some(err),
             rung: Some(InstallRung::ToolchainRemote),
+            reason_kind: None,
         },
         InstallRun::Finished(run) => {
             let stdout = bytes_to_string(run.stdout);
@@ -1451,6 +1475,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                         run.status_code
                     )),
                     rung: Some(InstallRung::ToolchainRemote),
+                    reason_kind: None,
                 };
             }
             finish_ok(
@@ -1485,6 +1510,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                 cancelled: cancelled(),
                 reason: Some(reason),
                 rung: Some(InstallRung::LocalCheckout),
+                reason_kind: None,
             };
         }
     };
@@ -1506,6 +1532,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                 cancelled: cancelled(),
                 reason: Some(reason),
                 rung: Some(InstallRung::LocalCheckout),
+                reason_kind: None,
             };
         }
     };
@@ -1526,6 +1553,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             cancelled: true,
             reason: Some("cancelled before start".into()),
             rung: Some(InstallRung::LocalCheckout),
+            reason_kind: None,
         };
     }
 
@@ -1549,6 +1577,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                         cancelled: false,
                         reason: Some("cargo is not installed".into()),
                         rung: Some(InstallRung::LocalCheckout),
+                        reason_kind: None,
                     };
                 }
             };
@@ -1581,6 +1610,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                         cancelled: false,
                         reason: Some("go is not installed".into()),
                         rung: Some(InstallRung::LocalCheckout),
+                        reason_kind: None,
                     };
                 }
             };
@@ -1617,6 +1647,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             cancelled: true,
             reason: Some("cancelled".into()),
             rung: Some(InstallRung::LocalCheckout),
+            reason_kind: None,
         },
         InstallRun::Failed(err) => {
             let was_timeout = git_cli::is_run_timeout(&err);
@@ -1642,6 +1673,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                 cancelled: cancelled(),
                 reason: Some(err),
                 rung: Some(InstallRung::LocalCheckout),
+                reason_kind: None,
             }
         }
         InstallRun::Finished(run) => {
@@ -1667,6 +1699,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                         run.status_code
                     )),
                     rung: Some(InstallRung::LocalCheckout),
+                    reason_kind: None,
                 };
             }
             finish_ok(

@@ -9,7 +9,7 @@ use crate::codeintel::WalkBounds;
 #[tauri::command(async)]
 pub async fn cmd_codeintel_status(
     repo_path: String,
-) -> Result<crate::codeintel::CodeintelStatus, String> {
+) -> Result<crate::codeintel::CodeintelStatus, IpcError> {
     off_thread(move || Ok(crate::codeintel::status(&repo_path))).await
 }
 
@@ -19,7 +19,7 @@ pub async fn cmd_codeintel_search(
     repo_path: String,
     query: String,
     token_budget: Option<u32>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelSymbolHit>, String> {
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelSymbolHit>, IpcError> {
     off_thread(move || Ok(crate::codeintel::search(&repo_path, &query, token_budget))).await
 }
 
@@ -29,7 +29,7 @@ pub async fn cmd_codeintel_symbols_for_file(
     repo_path: String,
     file_path: String,
     head_sha: String,
-) -> Result<crate::codeintel::CodeintelFileSymbols, String> {
+) -> Result<crate::codeintel::CodeintelFileSymbols, IpcError> {
     off_thread(move || {
         Ok(crate::codeintel::symbols_for_file(
             &repo_path, &file_path, &head_sha,
@@ -45,7 +45,7 @@ pub async fn cmd_codeintel_impact(
     target: String,
     token_budget: Option<u32>,
     cancel_token: Option<String>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, IpcError> {
     off_thread(move || {
         let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
         let result = crate::codeintel::impact_at_rung(
@@ -79,7 +79,7 @@ pub async fn cmd_codeintel_suspects(
     symptom: String,
     since: String,
     depth: Option<u32>,
-) -> Result<crate::codeintel::CodeintelSuspectsPayload, String> {
+) -> Result<crate::codeintel::CodeintelSuspectsPayload, IpcError> {
     off_thread(move || {
         Ok(crate::codeintel::suspects(
             &repo_path, &symptom, &since, depth,
@@ -93,7 +93,7 @@ pub async fn cmd_codeintel_suspects(
 pub async fn cmd_codeintel_dead_symbols(
     repo_path: String,
     token_budget: Option<u32>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelDeadSymbol>, String> {
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelDeadSymbol>, IpcError> {
     off_thread(move || Ok(crate::codeintel::dead_symbols(&repo_path, token_budget))).await
 }
 
@@ -104,7 +104,7 @@ pub async fn cmd_codeintel_dependencies(
     file_path: String,
     token_budget: Option<u32>,
     min_rung: Option<String>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, IpcError> {
     off_thread(move || {
         Ok(crate::codeintel::dependencies_at_rung(
             &repo_path,
@@ -126,7 +126,7 @@ pub async fn cmd_codeintel_trace(
     to: String,
     token_budget: Option<u32>,
     min_rung: Option<String>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, IpcError> {
     off_thread(move || {
         Ok(crate::codeintel::trace_between_at_rung(
             &repo_path,
@@ -148,7 +148,7 @@ pub async fn cmd_codeintel_neighbors(
     targets: Vec<String>,
     token_budget: Option<u32>,
     min_rung: Option<String>,
-) -> Result<Vec<crate::codeintel::CodeintelNeighbors>, String> {
+) -> Result<Vec<crate::codeintel::CodeintelNeighbors>, IpcError> {
     off_thread(move || {
         crate::codeintel::neighbors(
             &repo_path,
@@ -168,7 +168,7 @@ pub async fn cmd_codeintel_explore(
     query: String,
     token_budget: Option<u32>,
     limit: Option<u32>,
-) -> Result<crate::codeintel::CodeintelExplore, String> {
+) -> Result<crate::codeintel::CodeintelExplore, IpcError> {
     off_thread(move || {
         Ok(crate::codeintel::explore(
             &repo_path,
@@ -188,7 +188,7 @@ pub async fn cmd_codeintel_affected_tests(
     targets: Vec<String>,
     token_budget: Option<u32>,
     max_depth: Option<usize>,
-) -> Result<crate::codeintel::CodeintelAffectedTests, String> {
+) -> Result<crate::codeintel::CodeintelAffectedTests, IpcError> {
     off_thread(move || {
         Ok(crate::codeintel::affected_tests(
             &repo_path,
@@ -208,7 +208,7 @@ pub async fn cmd_codeintel_affected_tests(
 pub async fn cmd_codeintel_clones(
     repo_path: String,
     token_budget: Option<u32>,
-) -> Result<crate::codeintel::CodeintelClones, String> {
+) -> Result<crate::codeintel::CodeintelClones, IpcError> {
     off_thread(move || Ok(crate::codeintel::clones(&repo_path, token_budget))).await
 }
 
@@ -219,7 +219,7 @@ pub async fn cmd_codeintel_impact_layered(
     target: String,
     token_budget: Option<u32>,
     cancel_token: Option<String>,
-) -> Result<crate::codeintel::CodeintelLayeredImpact, String> {
+) -> Result<crate::codeintel::CodeintelLayeredImpact, IpcError> {
     off_thread(move || {
         let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
         let result = crate::codeintel::impact_layered_with_cancel(
@@ -241,7 +241,7 @@ pub async fn cmd_codeintel_impact_layered_many(
     targets: Vec<String>,
     token_budget: Option<u32>,
     cancel_token: Option<String>,
-) -> Result<Vec<crate::codeintel::CodeintelLayeredImpact>, String> {
+) -> Result<Vec<crate::codeintel::CodeintelLayeredImpact>, IpcError> {
     off_thread(move || {
         let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
         let result = crate::codeintel::impact_layered_many_with_cancel(
@@ -264,7 +264,7 @@ pub async fn cmd_codeintel_impact_at_rung(
     token_budget: Option<u32>,
     min_rung: Option<String>,
     cancel_token: Option<String>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, IpcError> {
     off_thread(move || {
         let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
         let result = crate::codeintel::impact_at_rung(
@@ -284,13 +284,13 @@ pub async fn cmd_codeintel_impact_at_rung(
 /// Trip an in-flight codeintel walk (file switch / dismiss). Timeout also
 /// trips the same flag; this is the user-driven half.
 #[tauri::command(async)]
-pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, String> {
+pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, IpcError> {
     Ok(crate::codeintel::cancel_query(&cancel_token))
 }
 
 /// Build the code map via the installed `devmap` CLI.
 #[tauri::command(async)]
-pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
+pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
         crate::devmap::build(&repo_path)
@@ -300,7 +300,7 @@ pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildO
 
 /// Incremental refresh via the installed `devmap` CLI.
 #[tauri::command(async)]
-pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
+pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
         crate::devmap::refresh(&repo_path)
@@ -321,7 +321,7 @@ pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::Buil
 pub async fn cmd_devmap_maybe_refresh(
     repo_path: String,
     repo_changed: Option<bool>,
-) -> Result<crate::devmap::LiveRefreshOutcome, String> {
+) -> Result<crate::devmap::LiveRefreshOutcome, IpcError> {
     off_thread_background(move || {
         Ok(crate::devmap::live::start_refresh(
             &repo_path,
@@ -333,7 +333,7 @@ pub async fn cmd_devmap_maybe_refresh(
 
 /// `devmap status --json` via the CLI.
 #[tauri::command(async)]
-pub async fn cmd_devmap_status(repo_path: String) -> Result<crate::devmap::CliStatus, String> {
+pub async fn cmd_devmap_status(repo_path: String) -> Result<crate::devmap::CliStatus, IpcError> {
     off_thread(move || Ok(crate::devmap::cli_status(&repo_path))).await
 }
 
@@ -343,7 +343,7 @@ pub async fn cmd_devmap_preview(
     repo_path: String,
     file_path: String,
     content: String,
-) -> Result<crate::devmap::PreviewFileResult, String> {
+) -> Result<crate::devmap::PreviewFileResult, IpcError> {
     // Refused before the buffer is moved into the worker or copied again.
     super::payload::check_content(
         "preview file content",
@@ -366,7 +366,7 @@ pub async fn cmd_devmap_preview_many(
     repo_path: String,
     files: Vec<(String, String)>,
     cancel_token: Option<String>,
-) -> Result<crate::devmap::PreviewOutcome, String> {
+) -> Result<crate::devmap::PreviewOutcome, IpcError> {
     super::payload::check_preview_batch(&files)?;
     off_thread(move || Ok(preview_many_cancellable(&repo_path, &files, cancel_token))).await
 }
@@ -386,7 +386,7 @@ fn preview_many_cancellable(
 
 /// Read `.devcouncil/repo_map.json` into GitPulse's typed navigator mirror.
 #[tauri::command(async)]
-pub async fn cmd_devmap_repo_map(repo_path: String) -> Result<crate::devmap::RepoMapLoad, String> {
+pub async fn cmd_devmap_repo_map(repo_path: String) -> Result<crate::devmap::RepoMapLoad, IpcError> {
     off_thread(move || Ok(crate::devmap::load_repo_map(&repo_path))).await
 }
 
@@ -400,7 +400,7 @@ pub async fn cmd_devmap_viz(
     repo_path: String,
     symbols: Option<bool>,
     max_nodes: Option<usize>,
-) -> Result<crate::devmap::GraphVizLoad, String> {
+) -> Result<crate::devmap::GraphVizLoad, IpcError> {
     off_thread(move || {
         Ok(crate::devmap::load_code_graph_viz(
             &repo_path, symbols, max_nodes,
@@ -413,7 +413,7 @@ pub async fn cmd_devmap_viz(
 #[tauri::command(async)]
 pub async fn cmd_devmap_map_preview(
     repo_path: String,
-) -> Result<crate::devmap::GraphVizLoad, String> {
+) -> Result<crate::devmap::GraphVizLoad, IpcError> {
     off_thread(move || Ok(crate::devmap::load_map_preview(&repo_path))).await
 }
 
@@ -425,7 +425,7 @@ pub async fn cmd_workspace_register(
     registry_root: String,
     repo_path: String,
     name: Option<String>,
-) -> Result<crate::workspace_registry::WorkspaceRegisterResult, String> {
+) -> Result<crate::workspace_registry::WorkspaceRegisterResult, IpcError> {
     off_thread(move || {
         crate::workspace_registry::register(&registry_root, &repo_path, name.as_deref())
     })
@@ -437,7 +437,7 @@ pub async fn cmd_workspace_register(
 pub async fn cmd_workspace_unregister(
     registry_root: String,
     name: String,
-) -> Result<crate::workspace_registry::WorkspaceUnregisterResult, String> {
+) -> Result<crate::workspace_registry::WorkspaceUnregisterResult, IpcError> {
     off_thread(move || crate::workspace_registry::unregister(&registry_root, &name)).await
 }
 
@@ -445,7 +445,7 @@ pub async fn cmd_workspace_unregister(
 #[tauri::command(async)]
 pub async fn cmd_workspace_list(
     registry_root: String,
-) -> Result<crate::workspace_registry::WorkspaceSnapshot, String> {
+) -> Result<crate::workspace_registry::WorkspaceSnapshot, IpcError> {
     off_thread(move || crate::workspace_registry::list(&registry_root)).await
 }
 
@@ -459,7 +459,7 @@ pub async fn cmd_workspace_list(
 pub async fn cmd_devcouncil_init(
     repo_path: String,
     open_repos: Vec<String>,
-) -> Result<crate::devmap::InitReport, String> {
+) -> Result<crate::devmap::InitReport, IpcError> {
     off_thread(move || crate::devmap::initialize_repository(&repo_path, &open_repos)).await
 }
 
@@ -473,7 +473,7 @@ pub async fn cmd_devcouncil_init(
 #[tauri::command(async)]
 pub async fn cmd_devcouncil_suite_status(
     repo_path: Option<String>,
-) -> Result<crate::tool_install::components::SuiteReport, String> {
+) -> Result<crate::tool_install::components::SuiteReport, IpcError> {
     off_thread(move || {
         Ok(crate::tool_install::components::suite_report(
             repo_path.as_deref(),
@@ -488,7 +488,7 @@ pub async fn cmd_devcouncil_suite_status(
 pub async fn cmd_devmap_integration_preview(
     repo_path: String,
     host: crate::devmap::IntegrationHost,
-) -> Result<crate::devmap::IntegrationPlan, String> {
+) -> Result<crate::devmap::IntegrationPlan, IpcError> {
     off_thread(move || Ok(crate::devmap::preview_integration(&repo_path, host))).await
 }
 
@@ -497,7 +497,7 @@ pub async fn cmd_devmap_integration_preview(
 #[tauri::command(async)]
 pub async fn cmd_devmap_integration_survey(
     repo_path: String,
-) -> Result<Vec<crate::devmap::IntegrationPlan>, String> {
+) -> Result<Vec<crate::devmap::IntegrationPlan>, IpcError> {
     off_thread(move || Ok(crate::devmap::survey_integrations(&repo_path))).await
 }
 
@@ -510,7 +510,7 @@ pub async fn cmd_devmap_integration_survey(
 pub async fn cmd_devmap_integration_apply(
     repo_path: String,
     host: crate::devmap::IntegrationHost,
-) -> Result<crate::devmap::IntegrationPlan, String> {
+) -> Result<crate::devmap::IntegrationPlan, IpcError> {
     off_thread(move || Ok(crate::devmap::apply_integration(&repo_path, host))).await
 }
 
@@ -519,7 +519,7 @@ pub async fn cmd_devmap_integration_apply(
 pub async fn cmd_workspace_sync(
     registry_root: String,
     repo_paths: Vec<String>,
-) -> Result<crate::workspace_registry::WorkspaceSnapshot, String> {
+) -> Result<crate::workspace_registry::WorkspaceSnapshot, IpcError> {
     off_thread(move || crate::workspace_registry::sync_open_tabs(&registry_root, &repo_paths)).await
 }
 
@@ -530,7 +530,7 @@ pub async fn cmd_workspace_search(
     query: String,
     token_budget: Option<u32>,
     semantic: Option<bool>,
-) -> Result<crate::workspace_registry::WorkspaceSearchResult, String> {
+) -> Result<crate::workspace_registry::WorkspaceSearchResult, IpcError> {
     off_thread(move || {
         crate::workspace_registry::search(
             &registry_root,
@@ -546,7 +546,7 @@ pub async fn cmd_workspace_search(
 #[tauri::command(async)]
 pub async fn cmd_workspace_link_candidates(
     registry_root: String,
-) -> Result<crate::workspace_registry::WorkspaceLinksResult, String> {
+) -> Result<crate::workspace_registry::WorkspaceLinksResult, IpcError> {
     off_thread(move || crate::workspace_registry::link_candidates(&registry_root)).await
 }
 
@@ -554,7 +554,7 @@ pub async fn cmd_workspace_link_candidates(
 #[tauri::command(async)]
 pub async fn cmd_insights_snapshot(
     repo_path: String,
-) -> Result<crate::insights::InsightsSnapshot, String> {
+) -> Result<crate::insights::InsightsSnapshot, IpcError> {
     off_thread(move || Ok(crate::insights::snapshot(&repo_path))).await
 }
 
@@ -563,7 +563,7 @@ pub async fn cmd_insights_snapshot(
 #[tauri::command(async)]
 pub async fn cmd_collision_risk(
     repo_path: String,
-) -> Result<crate::insights::CollisionRisk, String> {
+) -> Result<crate::insights::CollisionRisk, IpcError> {
     off_thread(move || Ok(crate::insights::collision_risk(&repo_path))).await
 }
 
@@ -581,7 +581,7 @@ pub async fn cmd_collision_risk(
 pub async fn cmd_fleet_snapshot(
     repo_paths: Vec<String>,
     window_days: Option<u32>,
-) -> Result<crate::insights::FleetSnapshot, String> {
+) -> Result<crate::insights::FleetSnapshot, IpcError> {
     off_thread(move || Ok(crate::insights::fleet_snapshot(&repo_paths, window_days))).await
 }
 
@@ -594,7 +594,7 @@ pub async fn cmd_fleet_snapshot(
 pub async fn cmd_fleet_record_metrics(
     repo_path: String,
     metrics: crate::ledger::FleetMetricsInput,
-) -> Result<(), String> {
+) -> Result<(), IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         crate::ledger::save_fleet_metrics(&repo.to_string_lossy(), &metrics)

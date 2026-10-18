@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  IDENTITY_MISSING,
   identityProblem,
-  isHookCancelled,
-  isIdentityMissing,
   parseGitPreflight,
   preflightProblem,
 } from "./gitPreflight";
@@ -28,17 +25,6 @@ describe("git preflight", () => {
 });
 
 describe("commit preflight errors", () => {
-  it("recognises the identity refusal by its opening phrase only", () => {
-    expect(isIdentityMissing(`${IDENTITY_MISSING}: user.name is not set.`)).toBe(true);
-    expect(isIdentityMissing("Author identity unknown")).toBe(false);
-    expect(isIdentityMissing(undefined)).toBe(false);
-  });
-
-  it("recognises a cancelled hook run", () => {
-    expect(isHookCancelled("git commit was cancelled while running its pre-commit hook (installed) in /r/.git/hooks.")).toBe(true);
-    expect(isHookCancelled("git commit timed out after 1200s")).toBe(false);
-  });
-
   it("validates an identity the way the backend does", () => {
     expect(identityProblem("Ada", "ada@gitpulse.dev")).toBeNull();
     expect(identityProblem("  ", "ada@gitpulse.dev")).toMatch(/name/);

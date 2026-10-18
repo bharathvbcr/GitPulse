@@ -3,14 +3,14 @@
 use super::*;
 
 #[tauri::command(async)]
-pub async fn cmd_resolve_repo(repo_path: String) -> Result<ResolvedRepo, String> {
+pub async fn cmd_resolve_repo(repo_path: String) -> Result<ResolvedRepo, IpcError> {
     off_thread(move || resolve_repo(&repo_path)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_repository_trust(
     repo_path: String,
-) -> Result<crate::repository_trust::TrustPreview, String> {
+) -> Result<crate::repository_trust::TrustPreview, IpcError> {
     off_thread(move || crate::repository_trust::inspect(&repo_path)).await
 }
 
@@ -18,7 +18,7 @@ pub async fn cmd_repository_trust(
 pub async fn cmd_grant_repository_trust(
     repo_path: String,
     expected_identity: String,
-) -> Result<(), String> {
+) -> Result<(), IpcError> {
     off_thread(move || {
         crate::repository_trust::grant_confirmed(
             &repo_path,
@@ -30,7 +30,7 @@ pub async fn cmd_grant_repository_trust(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_revoke_repository_trust(repo_path: String) -> Result<(), String> {
+pub async fn cmd_revoke_repository_trust(repo_path: String) -> Result<(), IpcError> {
     off_thread(move || crate::repository_trust::revoke(&repo_path)).await
 }
 
@@ -39,7 +39,7 @@ pub async fn cmd_watch_repo(
     app: AppHandle,
     state: State<'_, WatcherState>,
     repo_path: String,
-) -> Result<String, String> {
+) -> Result<String, IpcError> {
     // start_watch shells out to git (validate_repo, resolve_git_dir/common
     // dir) and installs OS watches — the same blocking profile as every other
     // reader command, so it belongs on the blocking pool rather than an async
@@ -53,7 +53,7 @@ pub async fn cmd_watch_repo(
 pub async fn cmd_unwatch_repo(
     state: State<'_, WatcherState>,
     repo_path: String,
-) -> Result<(), String> {
+) -> Result<(), IpcError> {
     let watcher_state = state.inner().clone();
     off_thread(move || unwatch(&watcher_state, repo_path)).await
 }

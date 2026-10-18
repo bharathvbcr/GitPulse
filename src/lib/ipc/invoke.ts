@@ -3,15 +3,87 @@ import {
   type InvokeArgs,
   type InvokeOptions,
 } from "@tauri-apps/api/core";
-import {
-  MAX_DEFERRED_RETRIES,
-  isDeferredUnderLoad,
-  jitteredRetryDelayMs,
-} from "../async/deferral";
+import { MAX_DEFERRED_RETRIES, jitteredRetryDelayMs } from "../async/deferral";
 import { withDeadline } from "../async/deadline";
 import { whenDocumentShown } from "../runtime/foreground";
 import { activity, observeSettled } from "../diagnostics/activity";
-import { formatError } from "../ui/formatError";
+
+/**
+ * What a command's error is, as far as the frontend acts on it. Mirrors
+ * `IpcErrorKind` in src-tauri/src/ipc_error.rs, which
+ * scripts/enum-variant-contract.test.ts pins in both directions.
+ */
+export const IPC_ERROR_KINDS = [
+  "unclassified",
+  "deferred_under_load",
+  "slot_wait_timeout",
+  "timed_out",
+  "spawn_not_found",
+  "spawn_failed",
+  "repository_trust_required",
+  "identity_missing",
+  "hook_cancelled",
+  "stale_stash",
+  "ledger_not_initialised",
+  "ledger_failed",
+] as const;
+
+export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];
+
+/**
+ * A command's error: `{ kind, message, detail? }` on the wire (`IpcError` in
+ * src-tauri/src/ipc_error.rs), this class once it is read.
+ *
+ * An `Error`, so every `err instanceof Error ? err.message : String(err)` a
+ * caller already writes shows the message, and `toString` is the message
+ * itself rather than `IpcError: ...`, so `String(err)` and a template literal
+ * show what the string rejection showed. `message` is byte-for-byte the text
+ * the backend used to send.
+ */
+export class IpcError extends Error {
+  readonly kind: IpcErrorKind;
+  readonly detail: unknown;
+
+  constructor(kind: IpcErrorKind, message: string, detail?: unknown) {
+    super(message);
+    this.name = "IpcError";
+    this.kind = kind;
+    this.detail = detail;
+  }
+
+  override toString(): string {
+    return this.message;
+  }
+}
+
+/**
+ * The one guard: reads a rejection as an `IpcError`, or null when it is not
+ * one. A string (a command not yet typed, or a stand-in in a test), an `Error`,
+ * a `{ code, message }` payload of a command with its own error type, and an
+ * object naming a kind this build does not know are all null: the caller shows
+ * them and does not branch on them.
+ *
+ * Nothing here, or anywhere else, reads inside a message. `unclassified` is a
+ * kind like any other and means the message is for a person only.
+ */
+export function readIpcError(payload: unknown): IpcError | null {
+  if (payload instanceof IpcError) return payload;
+  if (payload === null || typeof payload !== "object" || payload instanceof Error) return null;
+  const { kind, message, detail } = payload as Record<string, unknown>;
+  if (typeof kind !== "string" || typeof message !== "string") return null;
+  if (!(IPC_ERROR_KINDS as readonly string[]).includes(kind)) return null;
+  return new IpcError(kind as IpcErrorKind, message, detail);
+}
+
+/** The kind of a rejection: `unclassified` for anything that is not an `IpcError`. */
+export function ipcErrorKind(error: unknown): IpcErrorKind {
+  return readIpcError(error)?.kind ?? "unclassified";
+}
+
+/** True when the rejection is the backend declining to start git under load. */
+function isDeferred(error: unknown): boolean {
+  return ipcErrorKind(error) === "deferred_under_load";
+}
 
 /**
  * The one IPC entry point the frontend uses.
@@ -205,7 +277,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       try {
         return await call<T>(cmd, rest);
       } catch (error) {
-        if (!isDeferredUnderLoad(formatError(error))) throw error;
+        if (!isDeferred(error)) throw error;
         last = error;
       }
     }
@@ -282,7 +354,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       if (pending) return pending as Promise<T>;
     }
     return call<T>(cmd, rest).catch((error: unknown) => {
-      if (!isDeferredUnderLoad(formatError(error))) throw error;
+      if (!isDeferred(error)) throw error;
       if (key === undefined) key = lazyRetryKey(cmd, rest[0]);
       // Not plain data: the deferral is the answer, exactly as if the call
       // had never been eligible for a retry.
@@ -318,7 +390,12 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   }
 }
 
-// Each answer is noted for UI stall attribution (diagnostics/activity.ts).
+// Each answer is noted for UI stall attribution (diagnostics/activity.ts), and
+// a rejection leaves here as an `IpcError` when the backend sent one.
 export const invoke = withDeferralRetry(
-  observeSettled(tauriInvoke, (cmd) => activity.noteCommandSettled(cmd)),
+  observeSettled(
+    tauriInvoke,
+    (cmd) => activity.noteCommandSettled(cmd),
+    (error) => readIpcError(error) ?? error,
+  ),
 );

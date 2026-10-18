@@ -19,7 +19,7 @@ pub async fn cmd_clone_repo(
     target_dir: String,
     options: Option<CloneOptions>,
     progress_id: Option<String>,
-) -> Result<String, String> {
+) -> Result<String, IpcError> {
     off_thread(move || {
         use tauri::Emitter;
         let options = options.unwrap_or_default();
@@ -42,7 +42,7 @@ pub async fn cmd_clone_repo(
 /// Whether a usable git is installed: missing, older than 2.23, or broken,
 /// each with a message the user can act on. Asked once at startup.
 #[tauri::command(async)]
-pub async fn cmd_git_preflight() -> Result<crate::engine::git_cli::GitPreflight, String> {
+pub async fn cmd_git_preflight() -> Result<crate::engine::git_cli::GitPreflight, IpcError> {
     off_thread(|| Ok(crate::engine::git_cli::git_preflight())).await
 }
 
@@ -50,7 +50,7 @@ pub async fn cmd_git_preflight() -> Result<crate::engine::git_cli::GitPreflight,
 /// in this repository, its hook included. Returns how many were stopped;
 /// zero when nothing was running, which the UI says rather than pretends.
 #[tauri::command(async)]
-pub async fn cmd_cancel_git_hooks(repo_path: String) -> Result<usize, String> {
+pub async fn cmd_cancel_git_hooks(repo_path: String) -> Result<usize, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         Ok(crate::engine::git_cli::cancel_hooked_git(&repo))
@@ -60,7 +60,7 @@ pub async fn cmd_cancel_git_hooks(repo_path: String) -> Result<usize, String> {
 
 /// The name and email a commit here would be recorded under.
 #[tauri::command(async)]
-pub async fn cmd_git_identity(repo_path: String) -> Result<GitIdentity, String> {
+pub async fn cmd_git_identity(repo_path: String) -> Result<GitIdentity, IpcError> {
     off_thread(move || GitWriter::identity(&repo_path)).await
 }
 
@@ -72,7 +72,7 @@ pub async fn cmd_set_git_identity(
     name: String,
     email: String,
     scope: IdentityScope,
-) -> Result<Guarded<GitIdentity>, String> {
+) -> Result<Guarded<GitIdentity>, IpcError> {
     off_thread(move || {
         GitWriter::validate_identity(&name, &email)?;
         let fold = VerdictFold::default();
@@ -93,7 +93,7 @@ pub async fn cmd_set_git_identity(
 pub async fn cmd_fetch(
     repo_path: String,
     remote: Option<String>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let argv: Vec<String> = match remote.as_deref() {
             Some(remote) => vec!["git".into(), "fetch".into(), remote.into()],
@@ -116,7 +116,7 @@ pub async fn cmd_fetch(
 /// fetch, but not as a user action: it runs as background work the spawn
 /// gate sheds under load, and it skips a repository another command holds.
 #[tauri::command(async)]
-pub async fn cmd_auto_fetch(repo_path: String) -> Result<Guarded<AutoFetchOutcome>, String> {
+pub async fn cmd_auto_fetch(repo_path: String) -> Result<Guarded<AutoFetchOutcome>, IpcError> {
     off_thread(move || {
         let policy = guard_background(&repo_path, &crate::engine::git_writer::AUTO_FETCH_ARGV)?;
         let output = GitWriter::auto_fetch(&repo_path)?;
@@ -127,7 +127,7 @@ pub async fn cmd_auto_fetch(repo_path: String) -> Result<Guarded<AutoFetchOutcom
 
 /// `pull.rebase` as configured for this repository, or `None` when unset.
 #[tauri::command(async)]
-pub async fn cmd_pull_rebase_config(repo_path: String) -> Result<Option<String>, String> {
+pub async fn cmd_pull_rebase_config(repo_path: String) -> Result<Option<String>, IpcError> {
     off_thread(move || GitWriter::pull_rebase_config(&repo_path)).await
 }
 
@@ -137,7 +137,7 @@ pub async fn cmd_pull(
     remote: Option<String>,
     branch: Option<String>,
     rebase: Option<bool>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // A pull merges or rebases into the working tree, which is what the
         // write gate exists to protect. The judged argv is the one
@@ -171,7 +171,7 @@ pub async fn cmd_push(
     remote: Option<String>,
     branch: Option<String>,
     force: Option<bool>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let force = force.unwrap_or(false);
         let args = GitWriter::plan_push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
@@ -189,7 +189,7 @@ pub async fn cmd_push(
 
 /// Lists configured remotes with their fetch/push URLs. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_list_remotes(repo_path: String) -> Result<RemoteList, String> {
+pub async fn cmd_list_remotes(repo_path: String) -> Result<RemoteList, IpcError> {
     off_thread(move || crate::engine::remotes::list(&repo_path)).await
 }
 
@@ -201,7 +201,7 @@ pub async fn cmd_list_remotes(repo_path: String) -> Result<RemoteList, String> {
 pub async fn cmd_remote_change(
     repo_path: String,
     change: RemoteChange,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let (policy, output) = crate::engine::remotes::apply_with(&repo_path, &change, |argv| {
             guard(&repo_path, argv)
@@ -215,7 +215,7 @@ pub async fn cmd_remote_change(
 
 /// Lists embedded submodules and whether each is usable. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_list_submodules(repo_path: String) -> Result<SubmoduleList, String> {
+pub async fn cmd_list_submodules(repo_path: String) -> Result<SubmoduleList, IpcError> {
     off_thread(move || crate::engine::submodules::list(&repo_path)).await
 }
 
@@ -224,7 +224,7 @@ pub async fn cmd_list_submodules(repo_path: String) -> Result<SubmoduleList, Str
 pub async fn cmd_submodule_change(
     repo_path: String,
     change: SubmoduleChange,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let (policy, output) =
             crate::engine::submodules::apply_with(&repo_path, &change, |argv| {
@@ -240,7 +240,7 @@ pub async fn cmd_submodule_change(
 /// Read-only and ungated: it runs on every status refresh, and putting a
 /// sidecar round trip in front of a background read would buy no decision.
 #[tauri::command(async)]
-pub async fn cmd_repo_operation(repo_path: String) -> Result<Option<RepoOperation>, String> {
+pub async fn cmd_repo_operation(repo_path: String) -> Result<Option<RepoOperation>, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         crate::engine::repo_op::detect(&repo)
@@ -275,12 +275,12 @@ pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, St
 /// like the user action it is, so it is not deferred behind background
 /// refreshes. Trust-checked like any read; runs no Git.
 #[tauri::command(async)]
-pub async fn cmd_note_tab_activated(repo_path: String) -> Result<(), String> {
+pub async fn cmd_note_tab_activated(repo_path: String) -> Result<(), IpcError> {
     off_thread(move || crate::engine::git_cli::note_tab_activated(&repo_path)).await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, String> {
+pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         last_fetch_at_ms(&repo)
@@ -300,7 +300,7 @@ pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, String>
 pub async fn cmd_repo_operation_action(
     repo_path: String,
     action: OperationAction,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // The gate runs inside `run_action_with`, under the repository lock and
         // against the same argv that executes. Detecting and judging out here

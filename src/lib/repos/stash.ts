@@ -12,6 +12,8 @@
  * never separate the two.
  */
 
+import { ipcErrorKind } from "../ipc/invoke";
+
 /** Mirrors the Rust `StashEntry`; snake_case like every other wire type. */
 export interface StashEntry {
   index: number;
@@ -164,9 +166,13 @@ export function stashActionPayload(
 /**
  * Recognizes the backend's stale-stack refusal, so the UI can respond by
  * refreshing rather than by showing a raw error the user cannot act on.
+ *
+ * Reads the rejection's kind (`stale_stash`, set where the refusal is written:
+ * `STALE_STACK_HINT` in src-tauri/src/engine/stash.rs), not its wording, so a
+ * reworded or wrapped message cannot change what the panel does.
  */
-export function isStaleStackError(message: string): boolean {
-  return /Refresh the stash list/i.test(message);
+export function isStaleStackError(cause: unknown): boolean {
+  return ipcErrorKind(cause) === "stale_stash";
 }
 
 /** Empty-state wording that distinguishes "no stashes" from "not loaded". */

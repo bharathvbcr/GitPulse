@@ -1,6 +1,6 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, writable } from "svelte/store";
-import { invalidateSharedReads, invoke } from "../ipc/invoke";
+import { invalidateSharedReads, invoke, ipcErrorKind } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
@@ -216,8 +216,6 @@ const REFETCH_SELECTION_KINDS = new Set([
   "commit",
 ]);
 
-const REPOSITORY_TRUST_REQUIRED = "REPOSITORY_TRUST_REQUIRED";
-
 /** What a person reads when a tab cannot be opened at all. */
 function openRefusalMessage(reason: "invalid" | "capacity"): string {
   return reason === "capacity"
@@ -225,8 +223,13 @@ function openRefusalMessage(reason: "invalid" | "capacity"): string {
     : "Invalid repository path";
 }
 
-export function repositoryTrustRefused(message: string): boolean {
-  return message.includes(REPOSITORY_TRUST_REQUIRED);
+/**
+ * True when the rejection is the backend refusing to run in a repository that
+ * has not been approved (`repository_trust_required`). The kind is the whole
+ * answer: a wrapped or reworded message neither makes nor hides it.
+ */
+export function repositoryTrustRefused(cause: unknown): boolean {
+  return ipcErrorKind(cause) === "repository_trust_required";
 }
 
 /**
@@ -1230,7 +1233,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(id, live.generation, {
         isLoading: false,
         error: message,
-        trustRequired: repositoryTrustRefused(message) || live.trustRequired,
+        trustRequired: repositoryTrustRefused(err) || live.trustRequired,
       });
       return false;
     }
@@ -1342,7 +1345,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(id, generation, {
         isLoading: false,
         error: message,
-        ...(repositoryTrustRefused(message) ? { trustRequired: true } : {}),
+        ...(repositoryTrustRefused(err) ? { trustRequired: true } : {}),
       });
     }
   }
@@ -1790,7 +1793,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
         const message = formatError(err);
-        const refused = repositoryTrustRefused(message);
+        const refused = repositoryTrustRefused(err);
         if (refused && !extras.deferTrust) {
           try {
             const trustedPath = await requestRepositoryTrust(rawPath, "Trust and Open", invokeFn);

@@ -3,7 +3,7 @@
 use super::*;
 
 #[tauri::command(async)]
-pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, String> {
+pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let (verdicts, _) =
             GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Stage, |argv| {
@@ -19,7 +19,7 @@ pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guar
 }
 
 #[tauri::command(async)]
-pub async fn cmd_unstage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, String> {
+pub async fn cmd_unstage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let (verdicts, _) =
             GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Unstage, |argv| {
@@ -40,7 +40,7 @@ pub async fn cmd_change_index(
     repo_path: String,
     file_paths: Vec<String>,
     action: IndexAction,
-) -> Result<Guarded<usize>, String> {
+) -> Result<Guarded<usize>, IpcError> {
     off_thread(move || {
         let (verdicts, output) =
             GitWriter::change_index_with(&repo_path, &file_paths, action, |argv| {
@@ -59,7 +59,7 @@ pub async fn cmd_change_index(
 pub async fn cmd_stage_selective_patch(
     repo_path: String,
     file_patch: FilePatch,
-) -> Result<(), String> {
+) -> Result<(), IpcError> {
     off_thread(move || {
         // Paths and line contents are interpolated verbatim into the patch
         // text; validate before anything reaches `git apply`.
@@ -83,7 +83,7 @@ pub async fn cmd_stage_selective_patch(
 pub async fn cmd_unstage_selective_patch(
     repo_path: String,
     file_patch: FilePatch,
-) -> Result<(), String> {
+) -> Result<(), IpcError> {
     off_thread(move || {
         PatchBuilder::validate_file_patch(&file_patch)?;
         let patch = PatchBuilder::build_selective_patch(&file_patch, false);
@@ -100,7 +100,7 @@ pub async fn cmd_commit(
     repo_path: String,
     message: String,
     amend: bool,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // Mirror GitWriter::commit_inner's branching exactly so the judged
         // line is the line that would run: an amend with an empty message is
@@ -135,7 +135,7 @@ pub async fn cmd_commit(
 pub async fn cmd_quick_commit(
     repo_path: String,
     message: String,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let add_argv: Vec<&str> = std::iter::once("git")
             .chain(GitWriter::QUICK_COMMIT_ADD_ARGV.iter().copied())
@@ -159,7 +159,7 @@ pub async fn cmd_quick_commit(
 pub async fn cmd_discard_changes(
     repo_path: String,
     file_path: String,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let op = discard_file_op(&repo_path, &file_path);
         let policy = guard_file(&repo_path, &file_path, op)?;

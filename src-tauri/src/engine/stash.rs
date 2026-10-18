@@ -24,6 +24,11 @@ use crate::engine::git_writer::{repo_mutation_lock, validate_oid};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// The closing sentence of both stale-stack refusals. It is also how
+/// `IpcError::from_command_text` types them as `StaleStash`, so the two cannot
+/// drift: the frontend refreshes on the kind and never reads this text.
+pub(crate) const STALE_STACK_HINT: &str = "Refresh the stash list and try again.";
+
 /// Upper bound on entries returned in one listing. A stash stack this deep is
 /// already pathological; the bound keeps a runaway `.git` from pulling an
 /// unbounded payload through the IPC boundary.
@@ -239,7 +244,7 @@ where
     let Some(entry) = entries.entries.iter().find(|e| e.index == index) else {
         return Err(format!(
             "Stash entry {index} no longer exists — the stash stack now holds {} entr{}. \
-             Refresh the stash list and try again.",
+             {STALE_STACK_HINT}",
             entries.entries.len(),
             if entries.entries.len() == 1 {
                 "y"
@@ -254,7 +259,7 @@ where
         // `drop` would now destroy work the user never saw.
         return Err(format!(
             "Stash entry {index} changed since it was listed — it now holds \"{}\". \
-             Refresh the stash list and try again.",
+             {STALE_STACK_HINT}",
             entry.subject
         ));
     }

@@ -102,19 +102,27 @@ type Raw = <T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions) => Promi
  * that forgot its `catch`. Forwarding costs the caller exactly one microtask
  * (pinned by activity.test.ts). Tauri's own `invoke` cannot be hooked below
  * this: it is an `async` wrapper over a non-writable `__TAURI_INTERNALS__`.
+ *
+ * `translate` re-shapes a rejection on its way out (the IPC entry point turns
+ * the backend's error payload into an `IpcError` here), in the reaction that
+ * already exists, so reading the error costs no further microtask.
  */
-export function observeSettled(raw: Raw, onSettled: (command: string) => void): Raw {
+export function observeSettled(
+  raw: Raw,
+  onSettled: (command: string) => void,
+  translate: (error: unknown) => unknown = (error) => error,
+): Raw {
   return <T>(cmd: string, ...rest: [args?: InvokeArgs, options?: InvokeOptions]): Promise<T> => {
     let pending: Promise<T>;
     try {
       pending = Promise.resolve(raw<T>(cmd, ...rest));
     } catch (error) {
       onSettled(cmd);
-      return Promise.reject(error);
+      return Promise.reject(translate(error));
     }
     return pending.then(
       (value) => { onSettled(cmd); return value; },
-      (error: unknown) => { onSettled(cmd); throw error; },
+      (error: unknown) => { onSettled(cmd); throw translate(error); },
     );
   };
 }

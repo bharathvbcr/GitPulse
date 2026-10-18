@@ -7,7 +7,7 @@ pub async fn cmd_rebase_interactive(
     repo_path: String,
     onto_commit: String,
     steps: Vec<RebaseStep>,
-) -> Result<Guarded<()>, String> {
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         // The gate must judge the commands that actually run, and
         // execute_rebase_sequence never runs `git rebase`: it replays the
@@ -49,7 +49,7 @@ pub async fn cmd_merge_branch(
     repo_path: String,
     branch_name: String,
     mode: Option<MergeMode>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let fold = VerdictFold::default();
         let output = GitWriter::merge_branch(
@@ -76,7 +76,7 @@ pub async fn cmd_restack(
     branch: String,
     onto: String,
     fork_point: Option<String>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // Plan, judge, and execute under ONE mutation-lock span: the upstream
         // resolved here is frozen into both the argv the gate judges and the
@@ -112,7 +112,7 @@ pub async fn cmd_stash_save(
     repo_path: String,
     message: Option<String>,
     options: Option<StashSaveOptions>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let options = options.unwrap_or_default();
         let argv = options.argv(message.as_deref());
@@ -125,7 +125,7 @@ pub async fn cmd_stash_save(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, String> {
+pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let policy = guard(&repo_path, &["git", "stash", "pop"])?;
         let output = GitWriter::stash_pop(&repo_path)?;
@@ -138,13 +138,13 @@ pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, String>
 
 /// Lists the stash stack. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_stash_list(repo_path: String) -> Result<crate::engine::stash::StashList, String> {
+pub async fn cmd_stash_list(repo_path: String) -> Result<crate::engine::stash::StashList, IpcError> {
     off_thread(move || crate::engine::stash::list(&repo_path)).await
 }
 
 /// Renders the diff a stash entry holds, addressed by object id.
 #[tauri::command(async)]
-pub async fn cmd_stash_show(repo_path: String, oid: String) -> Result<DiffPayload, String> {
+pub async fn cmd_stash_show(repo_path: String, oid: String) -> Result<DiffPayload, IpcError> {
     off_thread(move || crate::engine::stash::show(&repo_path, &oid)).await
 }
 
@@ -161,7 +161,7 @@ pub async fn cmd_stash_action(
     action: StashAction,
     index: usize,
     expected_oid: String,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let (policy, output) = crate::engine::stash::run_action_with(
             &repo_path,
@@ -187,7 +187,7 @@ pub async fn cmd_cherry_pick(
     repo_path: String,
     commits: Vec<String>,
     no_commit: Option<bool>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let no_commit = no_commit.unwrap_or(false);
         let argv = GitWriter::replay_argv("cherry-pick", &commits, no_commit);
@@ -204,7 +204,7 @@ pub async fn cmd_revert(
     repo_path: String,
     commits: Vec<String>,
     no_commit: Option<bool>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let no_commit = no_commit.unwrap_or(false);
         let argv = GitWriter::replay_argv("revert", &commits, no_commit);
@@ -225,7 +225,7 @@ pub async fn cmd_reset(
     repo_path: String,
     mode: ResetMode,
     target: String,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let argv = GitWriter::reset_argv(mode, &target);
         let policy = guard(&repo_path, &argv)?;

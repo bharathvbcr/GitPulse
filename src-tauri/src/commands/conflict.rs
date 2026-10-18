@@ -6,7 +6,7 @@ use super::*;
 pub async fn cmd_conflict_snapshot(
     repo_path: String,
     file_path: String,
-) -> Result<ConflictSnapshot, String> {
+) -> Result<ConflictSnapshot, IpcError> {
     off_thread(move || conflict_session::snapshot(&repo_path, &file_path)).await
 }
 
@@ -14,7 +14,7 @@ pub async fn cmd_conflict_snapshot(
 pub async fn cmd_save_conflict(
     repo_path: String,
     request: ConflictSaveRequest,
-) -> Result<Guarded<ConflictSaveOutcome>, String> {
+) -> Result<Guarded<ConflictSaveOutcome>, IpcError> {
     off_thread(move || {
         save_conflict_folded(
             &repo_path,
@@ -56,6 +56,6 @@ pub(super) fn save_conflict_folded(
 }
 
 #[tauri::command(async)]
-pub fn cmd_preview_conflict(document: ConflictDocument) -> Result<String, String> {
-    ConflictResolver::render_preview(&document).map_err(str::to_owned)
+pub fn cmd_preview_conflict(document: ConflictDocument) -> Result<String, IpcError> {
+    ConflictResolver::render_preview(&document).map_err(IpcError::from)
 }

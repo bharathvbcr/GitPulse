@@ -37,6 +37,7 @@ use crate::graph::{
     mainline_chain_ids, simplify_history_reporting, BezierGeometryCalculator, CubicBezierCurve,
     LaneSolver, MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
 };
+use crate::ipc_error::IpcError;
 use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
 use serde::{Deserialize, Serialize};
@@ -85,7 +86,12 @@ pub use worktrees::*;
 /// Runs a blocking body on Tauri's blocking thread pool instead of an async
 /// worker thread. Every git/gh/npm subprocess call, repository scan and
 /// sidecar round trip below goes through this seam.
-async fn off_thread<F, T>(body: F) -> Result<T, String>
+///
+/// The error leaves as an [`IpcError`]: the body's text is typed once, here, by
+/// [`IpcError::from_command_text`], so every command that runs through this
+/// seam reports a deferral, a timeout or a trust refusal as a kind the
+/// frontend can branch on without reading the message.
+async fn off_thread<F, T>(body: F) -> Result<T, IpcError>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
@@ -114,7 +120,8 @@ where
         result
     })
     .await
-    .map_err(|e| format!("background task failed: {e}"))?
+    .map_err(|e| IpcError::from(format!("background task failed: {e}")))?
+    .map_err(IpcError::from_command_text)
 }
 
 /// How many blocking-pool threads a class of command may hold at once, or
@@ -136,7 +143,7 @@ fn pool_limit(class: crate::engine::git_cli::Admission) -> Option<usize> {
 /// [`off_thread`] for work whose child processes are `Admission::Background`:
 /// waits for a permit first (see [`pool_limit`]) without holding a pool thread
 /// while it waits.
-async fn off_thread_background<F, T>(body: F) -> Result<T, String>
+async fn off_thread_background<F, T>(body: F) -> Result<T, IpcError>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,

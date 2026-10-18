@@ -273,7 +273,7 @@
     ]);
   }
 
-  async function run(key: string, action: () => Promise<{ ok: boolean; error?: string }>) {
+  async function run(key: string, action: () => Promise<{ ok: boolean; error?: string; cause?: unknown }>) {
     if (busy) return;
     busy = key;
     try {
@@ -281,7 +281,7 @@
       if (!outcome.ok) {
         const message = outcome.error ?? "The action could not be completed.";
         toastStore.error(
-          isStaleStackError(message)
+          isStaleStackError(outcome.cause)
             ? "The stash list changed — refreshed. Try again."
             : message,
         );

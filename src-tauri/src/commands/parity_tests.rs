@@ -124,8 +124,8 @@ impl Fixture {
     /// judge and what git was started with while it ran.
     fn observe<T>(
         &self,
-        command: impl std::future::Future<Output = Result<T, String>>,
-    ) -> (Result<T, String>, Observed) {
+        command: impl std::future::Future<Output = Result<T, IpcError>>,
+    ) -> (Result<T, IpcError>, Observed) {
         let cursor = crate::ledger::latest_cursor(&self.repo).expect("ledger cursor");
         let spawned_before =
             crate::engine::git_cli::spawn_log::spawns_in(Path::new(&self.repo)).len();
@@ -213,10 +213,10 @@ impl Observed {
 }
 
 /// The command was refused by the gate, not by anything else.
-fn assert_blocked<T: std::fmt::Debug>(result: Result<T, String>) {
+fn assert_blocked<T: std::fmt::Debug>(result: Result<T, IpcError>) {
     let error = result.expect_err("the gate said Blocked, so the command must fail");
     assert!(
-        error.starts_with("Blocked by"),
+        error.message.starts_with("Blocked by"),
         "refused for another reason: {error}"
     );
 }
@@ -428,7 +428,7 @@ fn adv_edge_inputs_keep_judged_equal_to_run() {
     let repo = fx.repo.clone();
     let mut accepted = 0usize;
     let mut refused = 0usize;
-    let mut tally = |label: &str, result: Result<(), String>, seen: &Observed| match result {
+    let mut tally = |label: &str, result: Result<(), IpcError>, seen: &Observed| match result {
         Ok(()) => {
             accepted += 1;
             // A mutating spawn must exist; judged == run is asserted per line.

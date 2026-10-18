@@ -7,7 +7,9 @@ import { withDeferralRetry } from "./invoke";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
-const DEFERRAL = `git status${DEFERRED_UNDER_LOAD_MARKER}2.013s: the git spawn rate limit admitted nothing sooner`;
+const DEFERRAL_MESSAGE = `git status${DEFERRED_UNDER_LOAD_MARKER}2.013s: the git spawn rate limit admitted nothing sooner`;
+/** What the backend rejects with: `IpcError` in src-tauri/src/ipc_error.rs. */
+const DEFERRAL = { kind: "deferred_under_load", message: DEFERRAL_MESSAGE };
 
 function harness(
   answers: Array<unknown | Error | string>,
@@ -19,8 +21,8 @@ function harness(
   const raw = vi.fn(async (cmd: string, args?: unknown) => {
     calls.push([cmd, args]);
     const next = answers.length > 1 ? answers.shift() : answers[0];
-    // Tauri rejects with the Rust `Err(String)` itself, not an Error.
-    if (typeof next === "string" && next.includes(DEFERRED_UNDER_LOAD_MARKER)) throw next;
+    // Tauri rejects with the Rust error payload itself, not an Error.
+    if (next === DEFERRAL) throw next;
     if (next instanceof Error) throw next;
     return next;
   });
@@ -49,20 +51,43 @@ function harness(
   return { invoke, raw, calls, delays, tick, settle, sleeping: () => release.length };
 }
 
-describe("withDeferralRetry and a typed rejection", () => {
-  it("reads a `{code, message}` rejection by its message: a deferral is retried, anything else is thrown as it came", async () => {
+describe("withDeferralRetry reads the kind, never the message", () => {
+  const instant = { sleep: () => Promise.resolve(), random: () => 0, whenShown: () => Promise.resolve() };
+
+  /** A command that rejects with `payload` once, then answers. */
+  function rejectsOnce(payload: unknown) {
+    let answers = 0;
+    const raw = vi.fn(async (): Promise<string> => {
+      if ((answers += 1) === 1) throw payload;
+      return "answer";
+    });
+    return { raw, invoke: withDeferralRetry(raw as never, instant) };
+  }
+
+  it("retries a `deferred_under_load` error", async () => {
+    const { raw, invoke } = rejectsOnce(DEFERRAL);
+    await expect(invoke("cmd_list_branches", { repoPath: "/r" })).resolves.toBe("answer");
+    expect(raw).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["a string that says it is a deferral", DEFERRAL_MESSAGE],
+    ["an `unclassified` error whose message says it is a deferral", { kind: "unclassified", message: DEFERRAL_MESSAGE }],
+    ["a `{code, message}` payload whose message says it is a deferral", { code: "refused", message: DEFERRAL_MESSAGE }],
+    ["an Error whose message says it is a deferral", new Error(DEFERRAL_MESSAGE)],
+    ["a kind this build does not know", { kind: "deferred_for_a_while", message: DEFERRAL_MESSAGE }],
+    ["another kind", { kind: "timed_out", message: DEFERRAL_MESSAGE }],
+  ])("throws %s as it came, once", async (_name, payload) => {
+    const { raw, invoke } = rejectsOnce(payload);
+    await expect(invoke("cmd_list_branches", { repoPath: "/r" })).rejects.toBe(payload);
+    expect(raw).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a typed command's own error payload as it came", async () => {
     const typed = { code: "conflict", message: "Merging a into main conflicted", paths: ["f.txt"] };
-    const raw = vi.fn(async (): Promise<string> => { throw typed; });
-    const invoke = withDeferralRetry(raw as never, { sleep: () => Promise.resolve(), random: () => 0, whenShown: () => Promise.resolve() });
+    const { raw, invoke } = rejectsOnce(typed);
     await expect(invoke("cmd_worktree_merge_teardown", { repoPath: "/r" })).rejects.toBe(typed);
     expect(raw).toHaveBeenCalledTimes(1);
-
-    const deferred = { code: "refused", message: DEFERRAL };
-    let answers = 0;
-    const flaky = vi.fn(async (): Promise<string> => { if ((answers += 1) === 1) throw deferred; return "answer"; });
-    const retrying = withDeferralRetry(flaky as never, { sleep: () => Promise.resolve(), random: () => 0, whenShown: () => Promise.resolve() });
-    await expect(retrying("cmd_list_branches", { repoPath: "/r" })).resolves.toBe("answer");
-    expect(flaky).toHaveBeenCalledTimes(2);
   });
 });
 

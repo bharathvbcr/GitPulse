@@ -48,19 +48,9 @@ export interface GitIdentity {
 /** Mirrors the Rust `IdentityScope`. */
 export type IdentityScope = "repo" | "global";
 
-/** Opening phrase of a commit refused for want of an identity (Rust `IDENTITY_MISSING`). */
-export const IDENTITY_MISSING = "Git does not know who you are";
-
-export function isIdentityMissing(error: string | null | undefined): boolean {
-  return typeof error === "string" && error.startsWith(IDENTITY_MISSING);
-}
-
-/** The phrase a user-cancelled hook-running command carries (Rust `CANCELLED_MARKER`). */
-const HOOK_CANCELLED_MARKER = " was cancelled while running ";
-
-export function isHookCancelled(error: string | null | undefined): boolean {
-  return typeof error === "string" && error.includes(HOOK_CANCELLED_MARKER);
-}
+// A commit refused for want of an identity arrives as an `identity_missing`
+// error, and a user-cancelled hook run as `hook_cancelled` (see `IpcErrorKind`
+// in ipc/invoke.ts); neither is recognised by its wording here.
 
 /** Client-side mirror of `GitWriter::validate_identity`; the backend still decides. */
 export function identityProblem(name: string, email: string): string | null {

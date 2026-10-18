@@ -5,7 +5,7 @@
  * PATH. Install uses a four-rung ladder (PATH → prebuilt → toolchain remote →
  * local checkout).
  */
-import { invoke } from "../ipc/invoke";
+import { invoke, type IpcErrorKind } from "../ipc/invoke";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { autoInit } from "../codeintel/autoInit";
 import { boundText } from "../codeintel/walkIncomplete";
@@ -77,6 +77,8 @@ export interface InstallOutcome {
   timed_out: boolean;
   cancelled: boolean;
   reason: string | null;
+  /** What `reason` is when the UI acts on it; set by the backend, never read out of `reason`. */
+  reason_kind?: IpcErrorKind | null;
   rung?: InstallRung | null;
 }
 
@@ -161,7 +163,7 @@ export async function installExternalTool(
 ): Promise<InstallOutcome> {
   const outcome = await invoke<InstallOutcome>("cmd_external_tool_install", { tool, rung: rung ?? null });
   if (!outcome.ok && outcome.rung === "local_checkout" && outcome.source_used &&
-      outcome.reason?.includes("REPOSITORY_TRUST_REQUIRED")) {
+      outcome.reason_kind === "repository_trust_required") {
     if (!(await requestRepositoryTrust(outcome.source_used, "Trust and Install"))) {
       return { ...outcome, cancelled: true, reason: "Repository trust was declined" };
     }
@@ -244,33 +246,25 @@ export function installButtonLabel(status: ToolStatus): string {
 }
 
 /** Map failure modes that need different user actions. */
-export type MapFailureMode = "no_cli" | "no_sqlite_store" | "no_json_artifact" | "other";
+export type MapFailureMode = "no_cli" | "no_json_artifact" | "other";
 
+/**
+ * Which of the map's failure modes this is, from facts the backend reports and
+ * never from the wording of a reason.
+ *
+ * `load_repo_map` (src-tauri/src/devmap/repo_map.rs) names the map file in
+ * `path` exactly when the failure is about that file (missing, unreadable,
+ * oversized, not valid); a refusal before any file was looked at (not a
+ * repository) leaves `path` empty. So a failed load that names its file is the
+ * missing-artifact case, and one that does not is shown with its own reason.
+ */
 export function classifyMapFailure(input: {
   cliAvailable: boolean | null;
-  cliReason?: string | null;
   mapAvailable: boolean | null;
-  mapReason?: string | null;
   mapPath?: string | null;
 }): MapFailureMode {
   if (input.cliAvailable === false) return "no_cli";
-  const reason = (input.mapReason ?? "").toLowerCase();
-  if (
-    reason.includes("devmap.sqlite") ||
-    reason.includes("sqlite") ||
-    reason.includes("no store") ||
-    reason.includes("index has not been built")
-  ) {
-    return "no_sqlite_store";
-  }
-  if (
-    reason.includes("repo_map.json") ||
-    reason.includes("no repo map") ||
-    (input.mapAvailable === false && (input.mapPath ?? "").includes("repo_map.json"))
-  ) {
-    return "no_json_artifact";
-  }
-  if (input.mapAvailable === false) return "other";
+  if (input.mapAvailable === false && input.mapPath) return "no_json_artifact";
   return "other";
 }
 
@@ -278,8 +272,6 @@ export function mapFailureMessage(mode: MapFailureMode, fallback?: string | null
   switch (mode) {
     case "no_cli":
       return "devmap CLI is not installed — run Setup to install it.";
-    case "no_sqlite_store":
-      return "No codeintel sqlite store yet — click Build to index this repository.";
     case "no_json_artifact":
       return "No repo_map.json artifact yet — click Build to generate the navigator map.";
     default:

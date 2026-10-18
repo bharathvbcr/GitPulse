@@ -19,21 +19,21 @@ use super::*;
 pub async fn cmd_check_app_update() -> crate::updates::UpdateCheck {
     off_thread(|| Ok(crate::updates::check_for_update()))
         .await
-        .unwrap_or_else(crate::updates::UpdateCheck::failed)
+        .map_err(|e| e.message).unwrap_or_else(crate::updates::UpdateCheck::failed)
 }
 
 /// MCP 2.0 / Agent Plugins 1.0 installer facts: binary path, plugin manifests, tool catalog.
 /// Off the main thread: it stats, canonicalizes and reads files, and a plain
 /// `#[tauri::command]` runs on the GUI thread.
 #[tauri::command(async)]
-pub async fn cmd_mcp_info() -> Result<crate::insights::McpInfo, String> {
+pub async fn cmd_mcp_info() -> Result<crate::insights::McpInfo, IpcError> {
     off_thread(|| Ok(crate::insights::mcp_info())).await
 }
 
 /// Probe whether `devmap` / `manvi` are installed, which path answered, and
 /// whether a sibling checkout can feed an in-app install.
 #[tauri::command(async)]
-pub async fn cmd_external_tools_status() -> Result<crate::tool_install::ToolsStatus, String> {
+pub async fn cmd_external_tools_status() -> Result<crate::tool_install::ToolsStatus, IpcError> {
     off_thread(|| Ok(crate::tool_install::status_all())).await
 }
 
@@ -42,7 +42,7 @@ pub async fn cmd_external_tools_status() -> Result<crate::tool_install::ToolsSta
 pub async fn cmd_external_tool_install(
     tool: crate::tool_install::ExternalTool,
     rung: Option<crate::tool_install::InstallRung>,
-) -> Result<crate::tool_install::InstallOutcome, String> {
+) -> Result<crate::tool_install::InstallOutcome, IpcError> {
     off_thread(move || Ok(crate::tool_install::install_with_rung(tool, rung))).await
 }
 
@@ -57,7 +57,7 @@ pub fn cmd_external_tool_install_cancel() {
 #[tauri::command(async)]
 pub async fn cmd_external_tool_uninstall(
     tool: crate::tool_install::ExternalTool,
-) -> Result<String, String> {
+) -> Result<String, IpcError> {
     off_thread(move || crate::tool_install::uninstall_tool(tool)).await
 }
 
@@ -66,7 +66,7 @@ pub async fn cmd_external_tool_uninstall(
 pub async fn cmd_external_tool_set_disabled(
     tool: crate::tool_install::ExternalTool,
     disabled: bool,
-) -> Result<crate::tool_config::ToolConfigView, String> {
+) -> Result<crate::tool_config::ToolConfigView, IpcError> {
     off_thread(move || {
         crate::tool_install::set_tool_disabled(tool, disabled)?;
         crate::tool_config::view()
@@ -75,14 +75,14 @@ pub async fn cmd_external_tool_set_disabled(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_tool_config_get() -> Result<crate::tool_config::ToolConfigView, String> {
+pub async fn cmd_tool_config_get() -> Result<crate::tool_config::ToolConfigView, IpcError> {
     off_thread(crate::tool_config::view).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_tool_config_save(
     config: crate::tool_config::ToolConfig,
-) -> Result<crate::tool_config::ToolConfigView, String> {
+) -> Result<crate::tool_config::ToolConfigView, IpcError> {
     off_thread(move || {
         crate::tool_config::save_confirmed(&config, &crate::desktop::confirm::native)?;
         crate::tool_config::view()
@@ -97,7 +97,7 @@ pub async fn cmd_tool_config_save(
 /// together: "enabled, and nothing has been delivered" reads very differently
 /// from "enabled, and nine were suppressed because you were watching".
 #[tauri::command(async)]
-pub async fn cmd_session_alerts() -> Result<SessionAlertsView, String> {
+pub async fn cmd_session_alerts() -> Result<SessionAlertsView, IpcError> {
     off_thread(|| {
         Ok(SessionAlertsView {
             settings: crate::tool_config::session_alerts(),
@@ -123,7 +123,7 @@ pub struct SessionAlertsView {
 /// the frontend: a chooser that offered a mode this build cannot expand would
 /// be offering a launch that fails at spawn.
 #[tauri::command(async)]
-pub async fn cmd_agent_defaults() -> Result<AgentDefaultsView, String> {
+pub async fn cmd_agent_defaults() -> Result<AgentDefaultsView, IpcError> {
     off_thread(|| Ok(agent_defaults_view())).await
 }
 
@@ -179,7 +179,7 @@ pub(super) fn agent_defaults_view() -> AgentDefaultsView {
 pub async fn cmd_agent_models(
     launcher: String,
     refresh: Option<bool>,
-) -> Result<crate::workbench::agent_models::AgentModelCatalog, String> {
+) -> Result<crate::workbench::agent_models::AgentModelCatalog, IpcError> {
     off_thread(move || {
         crate::workbench::agent_models::models_for(launcher.trim(), refresh.unwrap_or(false))
     })
@@ -190,7 +190,7 @@ pub async fn cmd_agent_models(
 pub async fn cmd_agent_defaults_save(
     terminals: State<'_, crate::terminal::TerminalSessions>,
     defaults: crate::tool_config::AgentDefaults,
-) -> Result<AgentDefaultsView, String> {
+) -> Result<AgentDefaultsView, IpcError> {
     let terminals = terminals.inner().clone();
     off_thread(move || {
         crate::tool_config::set_agent_defaults(defaults)?;
@@ -206,7 +206,7 @@ pub async fn cmd_agent_defaults_save(
 #[tauri::command(async)]
 pub async fn cmd_session_alerts_save(
     settings: crate::tool_config::SessionAlertSettings,
-) -> Result<SessionAlertsView, String> {
+) -> Result<SessionAlertsView, IpcError> {
     off_thread(move || {
         let bridge = settings.hook_bridge && settings.enabled;
         crate::tool_config::set_session_alerts(settings)?;
@@ -229,14 +229,14 @@ pub async fn cmd_session_alerts_save(
 /// reason session alerts do: "recording on, nothing written" and "recording
 /// on, stopped at the store cap" look the same from a switch alone.
 #[tauri::command(async)]
-pub async fn cmd_lappi_settings() -> Result<crate::lappi::LappiView, String> {
+pub async fn cmd_lappi_settings() -> Result<crate::lappi::LappiView, IpcError> {
     off_thread(|| Ok(crate::lappi::view())).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_lappi_settings_save(
     settings: crate::tool_config::LappiSettings,
-) -> Result<crate::lappi::LappiView, String> {
+) -> Result<crate::lappi::LappiView, IpcError> {
     off_thread(move || {
         crate::tool_config::set_lappi_settings(settings)?;
         Ok(crate::lappi::view())
@@ -249,7 +249,7 @@ pub async fn cmd_lappi_settings_save(
 /// snapshot — its sessions, launched trees, memguard and orphans
 /// (`docs/LOAD_GOVERNOR.md`).
 #[tauri::command(async)]
-pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, String> {
+pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, IpcError> {
     off_thread(|| Ok(crate::sysload::status())).await
 }
 
@@ -260,7 +260,7 @@ pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, St
 /// `start_us` is microseconds since the epoch, well inside a JavaScript
 /// number's exact range.
 #[tauri::command(async)]
-pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<String, String> {
+pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<String, IpcError> {
     off_thread(move || {
         crate::sysload::terminate_orphan(pid, start_us, &crate::desktop::confirm::native)
     })
@@ -271,13 +271,13 @@ pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<S
 /// native dialog that page script cannot click, launches pass for two
 /// minutes (`sysload::admit_anyway`). There is no agent path to this.
 #[tauri::command(async)]
-pub async fn cmd_host_load_admit_anyway() -> Result<String, String> {
+pub async fn cmd_host_load_admit_anyway() -> Result<String, IpcError> {
     off_thread(|| crate::sysload::admit_anyway(&crate::desktop::confirm::native)).await
 }
 
 /// The host-load kill switch, as stored.
 #[tauri::command(async)]
-pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSettings, String> {
+pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSettings, IpcError> {
     off_thread(|| Ok(crate::tool_config::host_load_settings())).await
 }
 
@@ -285,7 +285,7 @@ pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSett
 #[tauri::command(async)]
 pub async fn cmd_host_load_settings_save(
     settings: crate::tool_config::HostLoadSettings,
-) -> Result<crate::tool_config::HostLoadSettings, String> {
+) -> Result<crate::tool_config::HostLoadSettings, IpcError> {
     off_thread(move || {
         crate::tool_config::set_host_load_settings(settings)?;
         Ok(crate::tool_config::host_load_settings())
@@ -296,12 +296,12 @@ pub async fn cmd_host_load_settings_save(
 /// Whether this repository posts verification results to GitHub. Off until
 /// turned on; an unreadable setting is an error, never a yes.
 #[tauri::command(async)]
-pub async fn cmd_verify_status_enabled(repo_path: String) -> Result<bool, String> {
+pub async fn cmd_verify_status_enabled(repo_path: String) -> Result<bool, IpcError> {
     off_thread(move || crate::workbench::verify_status::enabled_for(&repo_path)).await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_verify_status_save(repo_path: String, enabled: bool) -> Result<(), String> {
+pub async fn cmd_verify_status_save(repo_path: String, enabled: bool) -> Result<(), IpcError> {
     off_thread(move || crate::workbench::verify_status::set_enabled(&repo_path, enabled)).await
 }
 
@@ -316,7 +316,7 @@ pub async fn cmd_verify_status_post(
     comment: bool,
     dry_run: bool,
     workbench: State<'_, crate::workbench::WorkbenchState>,
-) -> Result<crate::workbench::verify_status::PostedVerifyStatus, String> {
+) -> Result<crate::workbench::verify_status::PostedVerifyStatus, IpcError> {
     let workbench = workbench.inner().clone();
     off_thread(move || {
         crate::workbench::verify_status::post_via_app(
@@ -331,7 +331,7 @@ pub async fn cmd_verify_status_post(
 pub async fn cmd_attempt_review(
     run_id: String,
     workbench: State<'_, crate::workbench::WorkbenchState>,
-) -> Result<crate::workbench::review::AttemptReview, String> {
+) -> Result<crate::workbench::review::AttemptReview, IpcError> {
     let workbench = workbench.inner().clone();
     off_thread(move || crate::workbench::review::attempt_review(&workbench, &run_id, None)).await
 }
@@ -345,7 +345,7 @@ pub async fn cmd_attempt_review_record(
     decision: String,
     note: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
-) -> Result<crate::workbench::review::AttemptReview, String> {
+) -> Result<crate::workbench::review::AttemptReview, IpcError> {
     let workbench = workbench.inner().clone();
     off_thread(move || {
         crate::workbench::review::attempt_review(
@@ -359,7 +359,7 @@ pub async fn cmd_attempt_review_record(
 
 /// Turns the review gate on or off for the repository `repo_path` belongs to.
 #[tauri::command(async)]
-pub async fn cmd_review_gate_save(repo_path: String, enabled: bool) -> Result<(), String> {
+pub async fn cmd_review_gate_save(repo_path: String, enabled: bool) -> Result<(), IpcError> {
     off_thread(move || {
         let dir = crate::harness::review::common_dir(std::path::Path::new(&repo_path))?;
         crate::tool_config::set_review_gate(Some(&dir), Some(enabled))
@@ -384,7 +384,7 @@ pub async fn cmd_session_alerts_visible(
     terminals: State<'_, crate::terminal::TerminalSessions>,
     session_ids: Vec<String>,
     background_ids: Option<Vec<String>>,
-) -> Result<(), String> {
+) -> Result<(), IpcError> {
     crate::alerts::set_visible_sessions(session_ids);
     crate::terminal::set_background_sessions(&terminals, &background_ids.unwrap_or_default());
     Ok(())
@@ -398,7 +398,7 @@ pub async fn cmd_session_alerts_visible(
 /// permission while the window reloaded is still shown asking.
 #[tauri::command(async)]
 pub async fn cmd_session_attention_standing(
-) -> Result<Vec<crate::alerts::StandingAttention>, String> {
+) -> Result<Vec<crate::alerts::StandingAttention>, IpcError> {
     Ok(crate::alerts::standing())
 }
 
@@ -408,7 +408,7 @@ pub async fn cmd_session_attention_standing(
 /// question was replayed to the next page, and its banner stayed in the
 /// notification centre asking it.
 #[tauri::command(async)]
-pub async fn cmd_session_attention_answered(session_id: String) -> Result<(), String> {
+pub async fn cmd_session_attention_answered(session_id: String) -> Result<(), IpcError> {
     if crate::alerts::answered(&session_id) {
         Ok(())
     } else {
@@ -419,21 +419,21 @@ pub async fn cmd_session_attention_answered(session_id: String) -> Result<(), St
 #[tauri::command(async)]
 pub async fn cmd_tool_ladder(
     tool: crate::tool_install::ExternalTool,
-) -> Result<crate::tool_install::LadderAssessment, String> {
+) -> Result<crate::tool_install::LadderAssessment, IpcError> {
     off_thread(move || Ok(crate::tool_install::assess_ladder(tool))).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_tool_preflight(
     tool: crate::tool_install::ExternalTool,
-) -> Result<crate::tool_install::PreflightReport, String> {
+) -> Result<crate::tool_install::PreflightReport, IpcError> {
     off_thread(move || Ok(crate::tool_install::preflight(tool))).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_tool_verify(
     tool: crate::tool_install::ExternalTool,
-) -> Result<crate::tool_install::VerifyReport, String> {
+) -> Result<crate::tool_install::VerifyReport, IpcError> {
     off_thread(move || Ok(crate::tool_install::verify_connected(tool))).await
 }
 
@@ -441,7 +441,7 @@ pub async fn cmd_tool_verify(
 pub async fn cmd_onboarding_clone_source(
     tool: crate::tool_install::ExternalTool,
     parent_dir: String,
-) -> Result<crate::tool_install::CloneSourceOutcome, String> {
+) -> Result<crate::tool_install::CloneSourceOutcome, IpcError> {
     off_thread(move || Ok(crate::tool_install::clone_source(tool, &parent_dir))).await
 }
 
@@ -457,7 +457,7 @@ pub fn cmd_tool_capability_refresh() {
 /// deliberately absent — it mutates state Manvi owns, and a second writer could
 /// interleave with the harness's own serialised writes.
 #[tauri::command(async)]
-pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantView, String> {
+pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantView, IpcError> {
     off_thread(move || Ok(crate::grants::view(&repo_path))).await
 }
 
@@ -468,7 +468,7 @@ pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantVi
 /// harness's capability probe requires a base URL and a model, which is the
 /// answer rather than the question.
 #[tauri::command(async)]
-pub async fn cmd_local_scan() -> Result<crate::harness::ScanResult, String> {
+pub async fn cmd_local_scan() -> Result<crate::harness::ScanResult, IpcError> {
     off_thread(crate::ai::scan_local_servers).await
 }
 
@@ -486,7 +486,7 @@ pub async fn cmd_provenance_freshness(
     repo_path: String,
     commit_sha: String,
     base_branch: Option<String>,
-) -> Result<crate::engine::ProvenanceFreshness, String> {
+) -> Result<crate::engine::ProvenanceFreshness, IpcError> {
     let repo = validate_repo(&repo_path)?;
     off_thread(move || {
         Ok(crate::engine::provenance::compute_freshness(
@@ -512,7 +512,7 @@ pub async fn cmd_provenance_freshness_batch(
     repo_path: String,
     revisions: Vec<String>,
     base_branch: Option<String>,
-) -> Result<Vec<crate::engine::ProvenanceFreshness>, String> {
+) -> Result<Vec<crate::engine::ProvenanceFreshness>, IpcError> {
     let repo = validate_repo(&repo_path)?;
     off_thread(move || {
         Ok(crate::engine::provenance::freshness_batch(
@@ -525,19 +525,19 @@ pub async fn cmd_provenance_freshness_batch(
 }
 
 #[tauri::command]
-pub async fn cmd_cleaner_state() -> Result<crate::storage::hygiene::global::CleanerState, String> {
+pub async fn cmd_cleaner_state() -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
     off_thread(|| crate::storage::hygiene::global::service()?.state()).await
 }
 
 #[tauri::command]
 pub async fn cmd_cleaner_save(
     config: crate::storage::hygiene::global::CleanerConfig,
-) -> Result<crate::storage::hygiene::global::CleanerState, String> {
+) -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
     off_thread(move || crate::storage::hygiene::global::service()?.save(config)).await
 }
 
 #[tauri::command]
-pub async fn cmd_cleaner_scan() -> Result<crate::storage::hygiene::global::CleanerInventory, String>
+pub async fn cmd_cleaner_scan() -> Result<crate::storage::hygiene::global::CleanerInventory, IpcError>
 {
     off_thread(|| crate::storage::hygiene::global::service()?.inventory()).await
 }
@@ -545,7 +545,7 @@ pub async fn cmd_cleaner_scan() -> Result<crate::storage::hygiene::global::Clean
 #[tauri::command]
 pub async fn cmd_cleaner_run(
     revision: u64,
-) -> Result<crate::storage::hygiene::global::CleanerState, String> {
+) -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
     off_thread(move || {
         crate::storage::hygiene::global::service()?.start(
             false,
@@ -557,6 +557,6 @@ pub async fn cmd_cleaner_run(
 }
 
 #[tauri::command]
-pub async fn cmd_cleaner_cancel() -> Result<crate::storage::hygiene::global::CleanerState, String> {
+pub async fn cmd_cleaner_cancel() -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
     off_thread(|| crate::storage::hygiene::global::service()?.cancel()).await
 }

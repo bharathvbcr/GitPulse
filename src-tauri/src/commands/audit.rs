@@ -18,7 +18,7 @@ pub async fn cmd_ledger_tail(
     cursor: i64,
     limit: u32,
     newest: Option<bool>,
-) -> Result<Vec<crate::ledger::LedgerEvent>, String> {
+) -> Result<Vec<crate::ledger::LedgerEvent>, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
@@ -40,7 +40,7 @@ pub async fn cmd_ledger_tail(
 /// what a repository with nothing in it returns; without this, the two would be
 /// the same picture.
 #[tauri::command(async)]
-pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::LedgerStatus, String> {
+pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::LedgerStatus, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         crate::ledger::bindings::repository_status(&repo.to_string_lossy())
@@ -57,7 +57,7 @@ pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::Ledge
 /// contend with an active agent's writer lease, and a UI process that takes one
 /// strands the task when the window closes.
 #[tauri::command(async)]
-pub async fn cmd_task_view(repo_path: String) -> Result<crate::tasks::TaskView, String> {
+pub async fn cmd_task_view(repo_path: String) -> Result<crate::tasks::TaskView, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
@@ -77,7 +77,7 @@ pub async fn cmd_task_view(repo_path: String) -> Result<crate::tasks::TaskView, 
 pub async fn cmd_task_scopes(
     repo_path: String,
     task_ids: Vec<String>,
-) -> Result<Vec<crate::tasks::TaskScope>, String> {
+) -> Result<Vec<crate::tasks::TaskScope>, IpcError> {
     off_thread(move || task_scopes(&repo_path, &task_ids)).await
 }
 
@@ -184,7 +184,7 @@ pub async fn cmd_bind_worktree_task(
     repo_path: String,
     worktree_path: String,
     task_id: String,
-) -> Result<i64, String> {
+) -> Result<i64, IpcError> {
     off_thread(move || {
         bind_after_catch_up(
             &repo_path,
@@ -202,7 +202,7 @@ pub async fn cmd_bind_worktree_task(
 pub async fn cmd_unbind_worktree_task(
     repo_path: String,
     worktree_path: String,
-) -> Result<i64, String> {
+) -> Result<i64, IpcError> {
     off_thread(move || unbind_after_catch_up(&repo_path, &worktree_path, catch_up_before_binding))
         .await
 }
@@ -212,7 +212,7 @@ pub async fn cmd_unbind_worktree_task(
 pub async fn cmd_worktree_task(
     repo_path: String,
     worktree_path: String,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, IpcError> {
     off_thread(move || {
         crate::ledger::bindings::resolve(&repo_path, &worktree_path).map_err(|e| e.to_string())
     })
@@ -230,7 +230,7 @@ pub async fn cmd_worktree_task(
 /// call is bounded by the catch-up budget however a phase stalls, and repeated
 /// calls inside a minute share one pass.
 #[tauri::command(async)]
-pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, String> {
+pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         // Resolving the repository's family happens inside the pass's budget,

@@ -275,7 +275,7 @@ pub async fn cmd_get_commit_graph(
     revision: Option<String>,
     skip: Option<usize>,
     ref_scope: Option<RefScope>,
-) -> Result<CommitGraphPayload, String> {
+) -> Result<CommitGraphPayload, IpcError> {
     off_thread(move || {
         // One row over the cap: the extra row is the has_more probe and is
         // dropped before lanes are solved. This arithmetic and the reader's
@@ -492,7 +492,7 @@ impl StackWalkBudget {
 #[tauri::command(async)]
 pub async fn cmd_get_stack_hierarchy(
     repo_path: String,
-) -> Result<crate::stack::StackHierarchyPayload, String> {
+) -> Result<crate::stack::StackHierarchyPayload, IpcError> {
     off_thread(move || {
         stack_hierarchy(
             &repo_path,
