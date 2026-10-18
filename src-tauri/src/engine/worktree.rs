@@ -2901,6 +2901,14 @@ fn delete_dir_tree(path: &Path) -> std::io::Result<()> {
 /// its walk before the NotFound is reported.
 const VANISHED_WALK_RETRIES: usize = 8;
 
+/// Whether `path` is confirmed absent (NotFound, not any other error and not
+/// a symlink's target). The one check that lets a NotFound from a delete count
+/// as "already removed".
+fn path_is_gone(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Deletes a tree with `remove_once`, treating NotFound as the goal state. A
 /// concurrent sweep can delete the tree, or children of it, while this walk is
 /// reading it, so NotFound can come from the top or from inside the walk: if
@@ -2916,9 +2924,7 @@ fn delete_dir_tree_with(
     loop {
         match remove_once(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if matches!(std::fs::symlink_metadata(path),
-                    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound)
-                {
+                if path_is_gone(path) {
                     return Ok(());
                 }
                 attempt += 1;
@@ -3250,8 +3256,10 @@ fn sweep_teardown_asides_from(
                 report.removed += 1;
             }
             // Gone already (another sweep deleted it between the listing and
-            // this delete): the goal state, and that sweep reports it.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // this delete): the goal state, and that sweep reports it. Only
+            // when the aside is confirmed gone: a NotFound with the tree still
+            // there is a failure, and the marker is what finds a sibling aside.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && path_is_gone(&target) => {
                 if let Some(marker) = &marker {
                     let _ = std::fs::remove_file(marker);
                 }
@@ -9588,7 +9596,6 @@ some-future-field whatever
     /// there) into "already removed": it is a problem, and the marker, the
     /// only thing that finds a sibling aside, must stay.
     #[test]
-    #[ignore = "break: sweep treats the NotFound that delete_dir_tree_with returns after exhausting its retries (tree still present) as already removed: no problem reported, marker deleted, sibling aside orphaned"]
     fn adv22_sweep_reports_a_persistent_vanishing_walk_and_keeps_the_marker() {
         let (dir, wt) = teardown_fixture(None);
         let beside = wt
@@ -9638,9 +9645,7 @@ some-future-field whatever
             path: path.clone(),
             marker: Some(marker.clone()),
         };
-        let note = finish_teardown(Some(aside), &mut |p| {
-            delete_dir_tree_with(p, &vanishing)
-        });
+        let note = finish_teardown(Some(aside), &mut |p| delete_dir_tree_with(p, &vanishing));
         assert!(note.is_some_and(|n| n.contains("could not be deleted")));
         assert!(marker.exists());
         assert!(path.exists());
