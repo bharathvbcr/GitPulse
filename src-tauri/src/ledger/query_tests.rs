@@ -269,7 +269,7 @@ fn every_indexed_filter_is_served_by_its_index_and_the_rest_walk_the_key_to_thei
     let cases = [
         (
             EventQuery {
-                since_ts: Some("2026-01-01T03:00:00.000Z".into()),
+                since_ts: Some("2026-01-02T09:18:00.000Z".into()),
                 ..EventQuery::default()
             },
             "idx_events_ts",
@@ -469,7 +469,7 @@ fn bench_newest_five_on_a_45k_row_ledger() {
 #[test]
 fn newest_first_since_ts_reads_limit_rows_not_every_row_since() {
     let (_dir, repo) = repo_dir();
-    fill(&repo, 3_000);
+    fill(&repo, 900);
     let desc = |since: &str, limit: u32| EventQuery {
         descending: true,
         limit,
@@ -485,7 +485,7 @@ fn newest_first_since_ts_reads_limit_rows_not_every_row_since() {
             "{plan:?}"
         );
         // Recent since_ts, matches below the limit: the index, never a scan.
-        let plan = explain_query(conn, &desc("2026-01-03T01:58:00.000Z", 5));
+        let plan = explain_query(conn, &desc("2026-01-01T14:58:00.000Z", 5));
         assert!(
             plan.iter().any(|step| step.contains("idx_events_ts"))
                 && plan.iter().all(|step| !step.starts_with("SCAN")),
@@ -509,7 +509,7 @@ fn newest_first_since_ts_reads_limit_rows_not_every_row_since() {
     // And the answers are the newest rows, whichever plan served them.
     for since in [
         "2000-01-01T00:00:00.000Z",
-        "2026-01-03T01:58:00.000Z",
+        "2026-01-01T14:58:00.000Z",
         "2099-01-01T00:00:00.000Z",
     ] {
         let got = page(&repo, &desc(since, 5));
@@ -521,6 +521,63 @@ fn newest_first_since_ts_reads_limit_rows_not_every_row_since() {
             .map(|e| e.id)
             .collect();
         assert_eq!(ids(&got), expected, "since {since}");
+    }
+}
+
+/// Append cost by index: 10 000 real appends into a fresh ledger per
+/// configuration, configurations rotated each round so no one always runs
+/// first, minimum of 5 rounds. Run alone:
+/// `GITPULSE_TEST_WRITE_BUDGET=0 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture ledger::query_tests::bench_append`
+#[test]
+#[ignore = "benchmark: 200 000 real appends; run alone with GITPULSE_TEST_WRITE_BUDGET=0"]
+fn bench_append_cost_by_index() {
+    let configs: [(&str, &[&str]); 4] = [
+        ("none", &["idx_events_ts", "idx_events_action"]),
+        ("ts only", &["idx_events_action"]),
+        ("action only", &["idx_events_ts"]),
+        ("ts + action", &[]),
+    ];
+    let rows = 10_000;
+    let mut best = [std::time::Duration::MAX; 4];
+    for round in 0..5 {
+        for step in 0..configs.len() {
+            let which = (round + step) % configs.len();
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().to_str().unwrap().to_string();
+            with_conn(&repo, |conn| {
+                for index in configs[which].1 {
+                    conn.execute_batch(&format!("DROP INDEX {index}"))
+                        .map_err(|e| LedgerError::new("t", e.to_string()))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            let started = Instant::now();
+            for n in 0..rows {
+                append(Draft {
+                    repo_path: repo.clone(),
+                    worktree_path: Some(format!("/w/{}", n % 5)),
+                    session_id: Some(format!("S{}", n % 4)),
+                    task_id: (n % 2 == 0).then(|| format!("T{}", n % 7)),
+                    action: format!("session.{}", ["command", "stop", "start"][n % 3]),
+                    object: Some(format!("echo {n}")),
+                    actor_kind: Some(ActorKind::Agent),
+                    outcome: Some(Outcome::Ok),
+                    ..Draft::default()
+                })
+                .unwrap();
+            }
+            best[which] = best[which].min(started.elapsed());
+        }
+    }
+    let base = best[0].as_secs_f64();
+    for (index, (name, _)) in configs.iter().enumerate() {
+        println!(
+            "APPENDBY {name}: {:?} ({:?}/append), ratio {:.3}",
+            best[index],
+            best[index] / u32::try_from(rows).unwrap(),
+            best[index].as_secs_f64() / base
+        );
     }
 }
 

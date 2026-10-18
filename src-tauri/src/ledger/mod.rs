@@ -89,6 +89,11 @@ CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE sessi
 -- stop at `limit` matches. SQLite appends the rowid to every index key, so
 -- `idx_events_ts` is already the composite (ts_utc, id) the `since_ts` read
 -- uses. Both columns are NOT NULL, so neither index can be partial on that.
+-- Measured cost (ledger::query_tests::bench_append_cost_by_index, 10 000
+-- appends, rotated order, min of 5, host load ~20-27): 150.0 us/append with
+-- neither, 160.1 us with both (+6.7%); alone each measured +8% to +11%, so the
+-- figures are noisy at that size. What it buys: newest-first `action` and
+-- `since_ts` reads that stop at `limit` instead of scanning the history.
 -- `idx_events_action` carries the predicate `id > 0` (true of every row) and the
 -- read states it, because SQLite uses a partial index only when the query
 -- contains its predicate: a plain index on `action` competes with the
