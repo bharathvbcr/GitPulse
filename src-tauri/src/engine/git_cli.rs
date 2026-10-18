@@ -31,6 +31,9 @@ mod thread_io;
 
 mod shared_budget;
 
+#[cfg(test)]
+mod awaiting_adversarial;
+
 pub(crate) mod hooks;
 pub use hooks::{
     cancel as cancel_hooked_git, is_cancelled as is_hooked_git_cancelled, HOOK_TIMEOUT,
