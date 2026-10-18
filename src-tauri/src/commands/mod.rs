@@ -97,6 +97,8 @@ where
     T: Send + 'static,
 {
     let mut timing = crate::logging::performance::CommandTiming::queue(std::any::type_name::<F>());
+    // The command this body belongs to, for the deferral retry's allowlist.
+    let command = crate::ipc_error::command_name(std::any::type_name::<F>());
     // A test's governor injection is thread-local; carry it to the pool thread
     // so a test can drive the real command under pressure.
     #[cfg(test)]
@@ -115,7 +117,7 @@ where
         // rest of a mutation's body to a user action, and this scope is what
         // ends that promotion before the pool thread runs anything else — and
         // keeps a mutation's deferral from reading as safe to retry.
-        let result = crate::ipc_error::run_command(body);
+        let result = crate::ipc_error::run_command_as(command, body);
         timing.finish(&result);
         result
     })

@@ -128,8 +128,8 @@ impl IpcError {
     /// ends up: typed only if a producer on this thread wrote exactly this
     /// text (see [`typed_text`]), and never retryable when the command was a
     /// user action.
-    fn from_scope_text(text: String, user_action: bool) -> Self {
-        let written = kind_written_as(&text);
+    fn from_scope_text(text: String, replay_safe: bool, user_action: bool) -> Self {
+        let (written, detail) = kind_written_as(&text);
         let kind = if user_action {
             // A user action may already have changed something, so it is never
             // asked again: not for its own deferral, not for a wrapped one.
@@ -137,20 +137,21 @@ impl IpcError {
                 IpcErrorKind::DeferredUnderLoad => IpcErrorKind::Unclassified,
                 kind => kind,
             }
-        } else if written == IpcErrorKind::Unclassified
-            && kind_was_written(IpcErrorKind::DeferredUnderLoad)
-        {
-            // A read that was declined by the spawn gate and then failed, whatever
-            // words the engine put around the refusal on the way out. Asking a
-            // read again is harmless and the frontend bounds it
-            // (`MAX_DEFERRED_RETRIES`), so only this kind, which is the one that
-            // drives a retry, is typed by "the gate refused something during this
-            // command" rather than by the exact text.
+        } else if replay_safe && written == IpcErrorKind::Unclassified && saw_deferral() {
+            // A READ that the spawn gate declined and that then failed, whatever
+            // words the engine put around the refusal on the way out. Only a
+            // command on `REPLAY_SAFE_READS` gets this: asking it again is
+            // harmless, and the frontend bounds it (`MAX_DEFERRED_RETRIES`). Every
+            // other command's deferral is typed by exact text or not at all.
             IpcErrorKind::DeferredUnderLoad
         } else {
             written
         };
-        Self::new(kind, text)
+        let error = Self::new(kind, text);
+        match detail {
+            Some(detail) if kind != IpcErrorKind::Unclassified => error.with_detail(detail),
+            _ => error,
+        }
     }
 
     /// True when the message contains `needle`. For tests and Rust callers
@@ -160,25 +161,108 @@ impl IpcError {
     }
 }
 
-/// How many typed messages a thread remembers at once. A command body writes a
-/// handful at most; the bound stops a loop that fails a thousand times from
-/// growing the list.
-const MAX_TYPED: usize = 16;
+/// How many distinct deferral texts a command remembers. A read that fails more
+/// distinct spawns than this has seen the gate refuse a lot, and past the cap the
+/// loose retry rule is switched off for that command (see [`Records::overflowed`])
+/// rather than something being forgotten: it fails closed.
+const MAX_DEFERRALS: usize = 16;
+
+/// What the producers wrote on one thread during one command.
+///
+/// Trust, identity and stale-stash are singletons that nothing evicts: the
+/// frontend acts on them (a prompt, a refresh), so a flood of deferrals must not
+/// be able to push one out, and the last refusal of each is the one a command
+/// returns. Deferrals are a deduplicated set with a cap.
+#[derive(Clone, Default)]
+pub(crate) struct Records {
+    trust: Option<(String, Option<serde_json::Value>)>,
+    identity: Option<String>,
+    stale: Option<String>,
+    deferrals: Vec<String>,
+    /// More distinct deferrals than [`MAX_DEFERRALS`] were written.
+    overflowed: bool,
+}
+
+impl Records {
+    fn write(&mut self, kind: IpcErrorKind, text: &str, detail: Option<serde_json::Value>) {
+        match kind {
+            IpcErrorKind::RepositoryTrustRequired => self.trust = Some((text.to_string(), detail)),
+            IpcErrorKind::IdentityMissing => self.identity = Some(text.to_string()),
+            IpcErrorKind::StaleStash => self.stale = Some(text.to_string()),
+            IpcErrorKind::DeferredUnderLoad => {
+                if self.deferrals.iter().any(|written| written == text) {
+                    return;
+                }
+                if self.deferrals.len() >= MAX_DEFERRALS {
+                    self.overflowed = true;
+                } else {
+                    self.deferrals.push(text.to_string());
+                }
+            }
+            // Kinds a producer does not write through here (the ledger maps
+            // its own code, and `Unclassified` is the absence of a record).
+            IpcErrorKind::Unclassified
+            | IpcErrorKind::LedgerNotInitialised
+            | IpcErrorKind::LedgerFailed => {}
+        }
+    }
+
+    fn kind_of(&self, text: &str) -> (IpcErrorKind, Option<serde_json::Value>) {
+        if let Some((written, detail)) = &self.trust {
+            if written == text {
+                return (IpcErrorKind::RepositoryTrustRequired, detail.clone());
+            }
+        }
+        if self.identity.as_deref() == Some(text) {
+            return (IpcErrorKind::IdentityMissing, None);
+        }
+        if self.stale.as_deref() == Some(text) {
+            return (IpcErrorKind::StaleStash, None);
+        }
+        if self.deferrals.iter().any(|written| written == text) {
+            return (IpcErrorKind::DeferredUnderLoad, None);
+        }
+        (IpcErrorKind::Unclassified, None)
+    }
+
+    /// Folds another thread's records into these. Singletons of `other` win;
+    /// deferrals are added under the same cap.
+    fn absorb(&mut self, other: Records) {
+        if other.trust.is_some() {
+            self.trust = other.trust;
+        }
+        if other.identity.is_some() {
+            self.identity = other.identity;
+        }
+        if other.stale.is_some() {
+            self.stale = other.stale;
+        }
+        for text in other.deferrals {
+            self.write(IpcErrorKind::DeferredUnderLoad, &text, None);
+        }
+        self.overflowed |= other.overflowed;
+    }
+}
 
 thread_local! {
-    static TYPED: RefCell<Vec<(IpcErrorKind, String)>> = const { RefCell::new(Vec::new()) };
+    static TYPED: RefCell<Records> = RefCell::new(Records::default());
 }
 
 /// Records that `text` is a failure of `kind` and returns it unchanged. Called
 /// by the code that writes the failure, at the point it writes it.
 pub(crate) fn typed_text(kind: IpcErrorKind, text: String) -> String {
-    TYPED.with(|typed| {
-        let mut typed = typed.borrow_mut();
-        if typed.len() >= MAX_TYPED {
-            typed.remove(0);
-        }
-        typed.push((kind, text.clone()));
-    });
+    TYPED.with(|typed| typed.borrow_mut().write(kind, &text, None));
+    text
+}
+
+/// [`typed_text`] with structured detail the frontend can read, such as which
+/// repository a refusal is about.
+pub(crate) fn typed_text_with_detail(
+    kind: IpcErrorKind,
+    text: String,
+    detail: serde_json::Value,
+) -> String {
+    TYPED.with(|typed| typed.borrow_mut().write(kind, &text, Some(detail)));
     text
 }
 
@@ -186,40 +270,122 @@ pub(crate) fn typed_text(kind: IpcErrorKind, text: String) -> String {
 /// command began. For a caller that holds a result struct rather than a
 /// message and needs the same answer the error path would give.
 pub(crate) fn kind_was_written(kind: IpcErrorKind) -> bool {
-    TYPED.with(|typed| typed.borrow().iter().any(|(written, _)| *written == kind))
+    TYPED.with(|typed| {
+        let typed = typed.borrow();
+        match kind {
+            IpcErrorKind::RepositoryTrustRequired => typed.trust.is_some(),
+            IpcErrorKind::IdentityMissing => typed.identity.is_some(),
+            IpcErrorKind::StaleStash => typed.stale.is_some(),
+            IpcErrorKind::DeferredUnderLoad => !typed.deferrals.is_empty(),
+            IpcErrorKind::Unclassified
+            | IpcErrorKind::LedgerNotInitialised
+            | IpcErrorKind::LedgerFailed => false,
+        }
+    })
 }
 
-fn kind_written_as(text: &str) -> IpcErrorKind {
+/// The gate refused something during this command, and not so many things that
+/// the record is incomplete.
+fn saw_deferral() -> bool {
     TYPED.with(|typed| {
-        typed
-            .borrow()
-            .iter()
-            .rev()
-            .find(|(_, written)| written == text)
-            .map_or(IpcErrorKind::Unclassified, |(kind, _)| *kind)
+        let typed = typed.borrow();
+        !typed.deferrals.is_empty() && !typed.overflowed
     })
+}
+
+fn kind_written_as(text: &str) -> (IpcErrorKind, Option<serde_json::Value>) {
+    TYPED.with(|typed| typed.borrow().kind_of(text))
+}
+
+/// A copy of what this thread has written, for a seam that hands one thread's
+/// answer to another (see [`absorb`]).
+pub(crate) fn snapshot() -> Records {
+    TYPED.with(|typed| typed.borrow().clone())
+}
+
+/// Folds `records` into this thread's. A single-flight waiter is given the
+/// leader's answer and, with it, what the leader's producers wrote, so the
+/// waiter's command types the same text the leader's does.
+pub(crate) fn absorb(records: Records) {
+    TYPED.with(|typed| typed.borrow_mut().absorb(records));
 }
 
 struct TypedScope;
 
 impl TypedScope {
     fn enter() -> Self {
-        TYPED.with(|typed| typed.borrow_mut().clear());
+        TYPED.with(|typed| *typed.borrow_mut() = Records::default());
         Self
     }
 }
 
 impl Drop for TypedScope {
     fn drop(&mut self) {
-        TYPED.with(|typed| typed.borrow_mut().clear());
+        TYPED.with(|typed| *typed.borrow_mut() = Records::default());
     }
+}
+
+/// The commands a deferred call may be asked again for, whatever words wrap the
+/// refusal: reads, each checked to have no write a replay could repeat. A
+/// command is on this list or its deferral is typed only by exact text, and a
+/// user action never is. Unverified means not retried, so a command that is not
+/// here stays correct and merely shows the refusal instead of retrying it.
+///
+/// Pinned by `replay_safe_reads_are_exactly_the_reviewed_list` and checked
+/// against the command sources by `every_replay_safe_read_is_a_command`.
+pub(crate) const REPLAY_SAFE_READS: &[&str] = &[
+    "cmd_branch_stats",
+    "cmd_get_commit_details",
+    "cmd_get_commit_diff",
+    "cmd_get_commit_file_diff",
+    "cmd_get_commit_files",
+    "cmd_get_commit_graph",
+    "cmd_get_file_blame",
+    "cmd_get_file_blob",
+    "cmd_get_file_content",
+    "cmd_get_file_diff",
+    "cmd_get_head_id",
+    "cmd_get_range_diff",
+    "cmd_get_reflog",
+    "cmd_get_status",
+    "cmd_last_fetch_at",
+    "cmd_list_branches",
+    "cmd_list_remotes",
+    "cmd_list_repo_files",
+    "cmd_list_submodules",
+    "cmd_list_tags",
+    "cmd_repo_operation",
+    "cmd_reset_preview",
+    "cmd_stash_list",
+    "cmd_stash_show",
+];
+
+/// The `cmd_*` function a command body's closure belongs to, from the closure's
+/// type name (`gitpulse_lib::commands::inspect::cmd_get_status::{{closure}}`).
+pub(crate) fn command_name(type_name: &str) -> Option<&str> {
+    type_name
+        .split("::")
+        .find(|segment| segment.starts_with("cmd_"))
+}
+
+/// [`run_command_as`] for a body that is not a named command: nothing is replay
+/// safe about it.
+#[cfg(test)]
+pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+    run_command_as(None, body)
 }
 
 /// Runs one command body ([`git_cli::run_command_scope`]) and types its error.
 ///
 /// A pool thread carries nothing in from the command before it or out to the
 /// one after: the remembered messages are cleared on entry and on exit.
-pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+/// `command` is the command's name when it has one; it decides whether the
+/// loose deferral rule may apply (see [`REPLAY_SAFE_READS`]).
+pub(crate) fn run_command_as<T>(
+    command: Option<&str>,
+    body: impl FnOnce() -> Result<T, String>,
+) -> Result<T, IpcError> {
+    let replay_safe = command.is_some_and(|name| REPLAY_SAFE_READS.contains(&name));
     let _scope = TypedScope::enter();
     let mut user_action = false;
     let result = git_cli::run_command_scope(|| {
@@ -227,7 +393,7 @@ pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result
         user_action = git_cli::current_admission() == Admission::Interactive;
         result
     });
-    result.map_err(|text| IpcError::from_scope_text(text, user_action))
+    result.map_err(|text| IpcError::from_scope_text(text, replay_safe, user_action))
 }
 
 impl fmt::Display for IpcError {

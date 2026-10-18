@@ -675,9 +675,16 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
     }
     // Typed where it is written: the desktop opens its trust prompt on this
     // kind, so no other text may be able to raise it (see `crate::ipc_error`).
-    Err(crate::ipc_error::typed_text(
+    // The detail names the repository the refusal is about, so a command that
+    // touched more than one cannot have the wrong tab flagged: the frontend can
+    // compare `detail.path` with the tab it is acting on.
+    Err(crate::ipc_error::typed_text_with_detail(
         crate::ipc_error::IpcErrorKind::RepositoryTrustRequired,
         refusal,
+        serde_json::json!({
+            "path": current.checkout.path.display().to_string(),
+            "common_dir": current.common_dir.path.display().to_string(),
+        }),
     ))
 }
 

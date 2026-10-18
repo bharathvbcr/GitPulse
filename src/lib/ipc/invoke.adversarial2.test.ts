@@ -7,9 +7,7 @@ const DEFERRAL = {
 };
 
 describe("deferral retry versus the caller's AbortSignal (adversarial round 2)", () => {
-  // `it.fails` passes while the break stands and fails once it is fixed, so a
-  // fix has to flip it to `it`.
-  it.fails("break: an abort during the backoff stops the retry chain, so no further command is sent", async () => {
+  it("an abort during the backoff stops the retry chain, so no further command is sent", async () => {
     vi.useFakeTimers();
     try {
       const raw = vi.fn(async () => {
@@ -30,7 +28,31 @@ describe("deferral retry versus the caller's AbortSignal (adversarial round 2)",
     }
   });
 
-  it.fails("break: a deadline that has passed stops the retry chain too", async () => {
+  it("a caller that aborts does not stop a retry another caller is still waiting on", async () => {
+    vi.useFakeTimers();
+    try {
+      let sent = 0;
+      const raw = vi.fn(async () => {
+        sent += 1;
+        if (sent === 1) throw DEFERRAL;
+        return "answer";
+      });
+      const invoke = withDeferralRetry(raw as never, { random: () => 0, whenShown: () => Promise.resolve() });
+      const controller = new AbortController();
+      const aborting = invoke("cmd_x", { a: 1 }, { signal: controller.signal }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(10);
+      const patient = invoke<string>("cmd_x", { a: 1 });
+      controller.abort();
+      expect(await aborting).toMatchObject({ name: "AbortError" });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(patient).resolves.toBe("answer");
+      expect(raw).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a deadline that has passed stops the retry chain too", async () => {
     vi.useFakeTimers();
     try {
       const raw = vi.fn(async () => {
@@ -40,8 +62,12 @@ describe("deferral retry versus the caller's AbortSignal (adversarial round 2)",
       const outcome = invoke("cmd_x", { a: 1 }, { deadlineMs: 4_000 }).catch((e: unknown) => e);
       await vi.advanceTimersByTimeAsync(4_001);
       expect(await outcome).toMatchObject({ name: "DeadlineError" });
+      // The first retry went out at 3 s, inside the 4 s deadline, and that is
+      // the caller's to have; nothing goes out once the deadline has passed.
+      const sentInTime = raw.mock.calls.length;
+      expect(sentInTime).toBe(2);
       await vi.advanceTimersByTimeAsync(200_000);
-      expect(raw).toHaveBeenCalledTimes(1);
+      expect(raw).toHaveBeenCalledTimes(sentInTime);
     } finally {
       vi.useRealTimers();
     }

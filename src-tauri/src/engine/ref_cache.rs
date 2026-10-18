@@ -440,7 +440,11 @@ pub(crate) fn through_stamped_coalesced(
     run: impl FnOnce() -> Result<(String, bool), String>,
 ) -> Result<String, String> {
     type Key = (PathBuf, Vec<String>, u64, git_cli::Admission);
-    type Flights = crate::singleflight::SingleFlight<Key, Result<String, String>>;
+    // The answer travels with what the leader's producers wrote on its thread
+    // (`ipc_error::snapshot`), so a waiter's command types the leader's refusal
+    // the way the leader's does: the text alone says nothing about its kind.
+    type Flights =
+        crate::singleflight::SingleFlight<Key, (Result<String, String>, crate::ipc_error::Records)>;
     static FLIGHTS: OnceLock<Flights> = OnceLock::new();
     let Some(stamped) = stamp else {
         return through_stamped(repo, args, None, run);
@@ -451,9 +455,12 @@ pub(crate) fn through_stamped_coalesced(
         stamped.0.fingerprint(),
         git_cli::current_admission(),
     );
-    FLIGHTS
-        .get_or_init(Flights::default)
-        .run(key, || through_stamped(repo, args, stamp, run))
+    let (answer, records) = FLIGHTS.get_or_init(Flights::default).run(key, || {
+        let answer = through_stamped(repo, args, stamp, run);
+        (answer, crate::ipc_error::snapshot())
+    });
+    crate::ipc_error::absorb(records);
+    answer
 }
 
 /// The monotonic "now" the TTL is measured on. Production reads the real
@@ -1603,5 +1610,82 @@ mod tests {
             Ok(("b-recomputed".to_string(), true))
         });
         assert_eq!(again.as_deref(), Ok("b-recomputed"));
+    }
+
+    /// A waiter joined to a leader the spawn gate refused is handed the leader's
+    /// refusal, and its own command must type it the way the leader's does: the
+    /// refusal was written on the leader's thread, and the single-flight carries
+    /// that record across with the answer.
+    #[test]
+    fn a_coalesced_waiter_is_typed_by_the_leaders_refusal() {
+        use crate::ipc_error::{run_command_as, IpcErrorKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let repo = fx.main.clone();
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let (stamp_tx, stamp_rx) = mpsc::channel::<Stamp>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let leader = {
+            let repo = repo.clone();
+            let runs = runs.clone();
+            std::thread::spawn(move || {
+                let clock = ManualClock::install();
+                let stamp = stamp_aged(&clock, Duration::from_secs(10));
+                stamp_tx.send(stamp.clone()).unwrap();
+                run_command_as(Some("cmd_get_file_blame"), || {
+                    through_stamped_coalesced(
+                        &repo,
+                        &["log", "coalesced-refusal"],
+                        Some(&stamp),
+                        || {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            let _ = started_rx.recv_timeout(Duration::from_secs(10));
+                            std::thread::sleep(Duration::from_millis(300));
+                            Err(git_cli::refusal_message(
+                                "git log",
+                                git_cli::Refusal::Refused {
+                                    waited: Duration::from_millis(2000),
+                                },
+                            ))
+                        },
+                    )
+                    .map_err(|refused| format!("Blame unavailable: {refused}"))
+                })
+            })
+        };
+        let stamp = stamp_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let waiter = {
+            let repo = repo.clone();
+            let runs = runs.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                run_command_as(Some("cmd_get_file_blame"), || {
+                    through_stamped_coalesced(
+                        &repo,
+                        &["log", "coalesced-refusal"],
+                        Some(&stamp),
+                        || {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok(("waiter-answer".to_string(), true))
+                        },
+                    )
+                    .map_err(|refused| format!("Blame unavailable: {refused}"))
+                })
+            })
+        };
+        let led = leader.join().unwrap().expect_err("the leader was refused");
+        let waited = waiter
+            .join()
+            .unwrap()
+            .expect_err("the waiter shares the refusal");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the waiter must have joined the run"
+        );
+        assert_eq!(led.kind, IpcErrorKind::DeferredUnderLoad, "{led}");
+        assert_eq!(waited.kind, IpcErrorKind::DeferredUnderLoad, "{waited}");
     }
 }

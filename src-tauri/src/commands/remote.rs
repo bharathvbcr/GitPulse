@@ -22,10 +22,6 @@ pub async fn cmd_clone_repo(
 ) -> Result<String, IpcError> {
     off_thread(move || {
         use tauri::Emitter;
-        // A clone creates the destination and may fail after it has started, so
-        // it is a user action: its deferral is never retried, and it is admitted
-        // like the click that asked for it.
-        crate::engine::git_cli::mark_interactive();
         let options = options.unwrap_or_default();
         let mut on_progress = |progress: &CloneProgress| {
             if let Some(id) = &progress_id {

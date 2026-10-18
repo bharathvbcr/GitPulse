@@ -42,6 +42,11 @@ fn plain(text: &str) -> IpcError {
     run_command(|| Err::<(), _>(text.to_string())).expect_err("the body failed")
 }
 
+/// A command body that is a named read on the replay-safe list.
+fn read<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+    run_command_as(Some("cmd_get_status"), body)
+}
+
 /// What the producer for `kind` makes of the fixture's message.
 fn produced(kind: IpcErrorKind) -> IpcError {
     let message = wire_message(&kind_name(kind));
@@ -213,7 +218,7 @@ fn a_mutations_own_deferral_is_never_typed_retryable() {
 /// thread during this command and asking a read again is harmless.
 #[test]
 fn an_engine_prefixed_deferral_from_a_read_is_typed_retryable() {
-    let error = run_command(|| {
+    let error = read(|| {
         let written = refusal_message(
             "git blame",
             Refusal::Refused {
@@ -231,7 +236,7 @@ fn an_engine_prefixed_deferral_from_a_read_is_typed_retryable() {
 /// something before the refusal.
 #[test]
 fn the_same_wrapper_from_a_mutation_is_unclassified() {
-    let error = run_command(|| {
+    let error = read(|| {
         mark_user_action("/nonexistent-adv-repo");
         let written = refusal_message(
             "git blame",
@@ -253,7 +258,7 @@ fn the_same_wrapper_from_a_mutation_is_unclassified() {
 /// bound is pinned in `src/lib/ipc/invoke.test.ts`.
 #[test]
 fn a_read_declined_once_then_failed_for_good_is_retryable_and_keeps_its_message() {
-    let error = run_command(|| {
+    let error = read(|| {
         let _declined = refusal_message(
             "git status",
             Refusal::Refused {
@@ -270,7 +275,7 @@ fn a_read_declined_once_then_failed_for_good_is_retryable_and_keeps_its_message(
 /// A refusal on one command is not remembered by the next.
 #[test]
 fn a_deferral_one_command_saw_does_not_make_the_next_one_retryable() {
-    let _first = run_command(|| {
+    let _first = read(|| {
         let _ = refusal_message(
             "git status",
             Refusal::Refused {
@@ -288,9 +293,138 @@ fn a_deferral_one_command_saw_does_not_make_the_next_one_retryable() {
 #[test]
 fn deferral_text_with_no_producer_record_is_unclassified_even_for_a_read() {
     let inner = wire_message("deferred_under_load");
+    let error = read(|| Err::<(), _>(format!("Blame unavailable: {inner}"))).expect_err("failed");
+    assert_eq!(error.kind, IpcErrorKind::Unclassified);
+}
+
+/// A command that is not on the replay-safe list never gets the loose rule,
+/// however the refusal is worded: its deferral is typed by exact text or not at
+/// all. Unverified means not retried.
+#[test]
+fn a_command_off_the_replay_safe_list_is_never_typed_by_the_loose_rule() {
+    for command in [
+        None,
+        Some("cmd_devcouncil_init"),
+        Some("cmd_external_tool_install"),
+        Some("cmd_cleaner_run"),
+        Some("cmd_clone_repo"),
+        Some("cmd_bind_worktree_task"),
+        Some("cmd_revoke_repository_trust"),
+    ] {
+        let error = run_command_as(command, || {
+            let written = refusal_message(
+                "git status",
+                Refusal::Refused {
+                    waited: Duration::from_millis(2000),
+                },
+            );
+            Err::<(), _>(format!("Could not finish: {written}"))
+        })
+        .expect_err("failed");
+        assert_eq!(
+            error.kind,
+            IpcErrorKind::Unclassified,
+            "{command:?}: {error}"
+        );
+    }
+}
+
+/// The commands the loose rule applies to are exactly this list. Adding to it is
+/// a decision that the command's replay is harmless, so it is made here, in
+/// review, and not by editing a constant.
+#[test]
+fn replay_safe_reads_are_exactly_the_reviewed_list() {
     assert_eq!(
-        plain(&format!("Blame unavailable: {inner}")).kind,
-        IpcErrorKind::Unclassified
+        REPLAY_SAFE_READS,
+        [
+            "cmd_branch_stats",
+            "cmd_get_commit_details",
+            "cmd_get_commit_diff",
+            "cmd_get_commit_file_diff",
+            "cmd_get_commit_files",
+            "cmd_get_commit_graph",
+            "cmd_get_file_blame",
+            "cmd_get_file_blob",
+            "cmd_get_file_content",
+            "cmd_get_file_diff",
+            "cmd_get_head_id",
+            "cmd_get_range_diff",
+            "cmd_get_reflog",
+            "cmd_get_status",
+            "cmd_last_fetch_at",
+            "cmd_list_branches",
+            "cmd_list_remotes",
+            "cmd_list_repo_files",
+            "cmd_list_submodules",
+            "cmd_list_tags",
+            "cmd_repo_operation",
+            "cmd_reset_preview",
+            "cmd_stash_list",
+            "cmd_stash_show",
+        ]
+    );
+}
+
+/// Every name on the list is a real command with no gate, no writer call and no
+/// user-action mark in its body, so a rename cannot leave the list naming
+/// nothing and a read that grows a write is noticed.
+#[test]
+fn every_replay_safe_read_is_a_command_that_does_not_write() {
+    let mut sources = String::new();
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands"))
+        .expect("commands directory")
+    {
+        let path = entry.expect("entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.ends_with(".rs") && !name.ends_with("tests.rs") {
+            sources.push_str(&std::fs::read_to_string(&path).expect("source"));
+        }
+    }
+    for name in REPLAY_SAFE_READS {
+        let needle_async = format!("pub async fn {name}(");
+        let needle_sync = format!("pub fn {name}(");
+        let at = sources
+            .find(&needle_async)
+            .or_else(|| sources.find(&needle_sync))
+            .unwrap_or_else(|| panic!("{name} is not a command in src/commands"));
+        let body = &sources[at..sources[at..]
+            .find("\n}\n")
+            .map_or(sources.len(), |end| at + end)];
+        for writer in [
+            "GitWriter::",
+            "guard(",
+            "guard_file(",
+            "mark_user_action",
+            "mark_interactive",
+            "std::fs::write",
+            "fs::remove",
+            "append",
+        ] {
+            assert!(
+                !body.contains(writer),
+                "{name} reaches `{writer}`, so a replay is not harmless"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_command_name_is_read_from_its_closure_type() {
+    assert_eq!(
+        command_name("gitpulse_lib::commands::inspect::cmd_get_status::{{closure}}::{{closure}}"),
+        Some("cmd_get_status")
+    );
+    assert_eq!(
+        command_name("gitpulse_lib::commands::off_thread_background::{{closure}}"),
+        None
+    );
+    assert_eq!(
+        command_name("gitpulse_lib::ipc_error::tests::some_test::{{closure}}"),
+        None
     );
 }
 
@@ -357,10 +491,14 @@ fn a_command_never_inherits_what_the_one_before_wrote() {
 #[test]
 fn the_memory_is_bounded() {
     let _scope = TypedScope::enter();
-    for n in 0..(MAX_TYPED * 4) {
+    for n in 0..(MAX_DEFERRALS * 4) {
         typed_text(IpcErrorKind::DeferredUnderLoad, format!("deferral {n}"));
     }
-    TYPED.with(|typed| assert_eq!(typed.borrow().len(), MAX_TYPED));
+    TYPED.with(|typed| {
+        let typed = typed.borrow();
+        assert_eq!(typed.deferrals.len(), MAX_DEFERRALS);
+        assert!(typed.overflowed, "the cap says it was passed");
+    });
 }
 
 /// The refusal the stash engine really writes, not a copy of its wording.

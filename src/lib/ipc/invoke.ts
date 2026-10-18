@@ -239,6 +239,10 @@ function lazyRetryKey(cmd: string, args: InvokeArgs | undefined): string | null 
   }
 }
 
+/** Whether a caller is still waiting for the answer. */
+type Interest = () => boolean;
+const ALWAYS_INTERESTED: Interest = () => true;
+
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** Wraps `raw` so a deferral is retried with the shared backoff. */
@@ -246,9 +250,14 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   const sleep = options.sleep ?? defaultSleep;
   const random = options.random ?? Math.random;
   const whenShown = options.whenShown ?? whenDocumentShown;
-  const retrying = new Map<string, Promise<unknown>>();
+  /**
+   * Calls waiting to retry, with the callers still waiting on each. A retry is
+   * sent only while one of them is, so a caller that has aborted or run out of
+   * time never causes another command to be sent on its account.
+   */
+  const retrying = new Map<string, { chain: Promise<unknown>; interests: Set<Interest> }>();
   /** Allowlisted reads in flight, by command and canonical arguments; see `sharedReads.ts`. */
-  const sharing = new Map<string, { promise: Promise<unknown>; generation: number }>();
+  const sharing = new Map<string, { promise: Promise<unknown>; generation: number; interests: Set<Interest> }>();
 
   /**
    * One call to `raw`, always as a promise. Tauri's own `invoke` returns one;
@@ -264,11 +273,15 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     }
   }
 
-  async function retry<T>(cmd: string, rest: Rest, first: unknown): Promise<T> {
+  async function retry<T>(cmd: string, rest: Rest, first: unknown, interests: Set<Interest>): Promise<T> {
     let last = first;
     for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES; attempt += 1) {
       await sleep(jitteredRetryDelayMs(attempt, random));
       await whenShown();
+      // Checked after every wait, immediately before the send: the backoff and
+      // a hidden window are long, and a caller that aborted or timed out in
+      // them has been answered already. Nobody left means nothing is sent.
+      if (![...interests].some((interested) => interested())) throw last;
       try {
         return await call<T>(cmd, rest);
       } catch (error) {
@@ -292,7 +305,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   // `.catch`, and is checked for plain data only if it is actually deferred.
   // The exported `invoke` sits one microtask above `tauriInvoke`, for the
   // stall-attribution note below.
-  function dispatch<T>(cmd: string, rest: Rest): Promise<T> {
+  function dispatch<T>(cmd: string, rest: Rest, interest: Interest): Promise<T> {
     // An identical read already in flight is the answer to this one. The
     // promise is shared as it is: each caller's deadline or abort signal wraps
     // it in `bound`, so one caller giving up detaches that caller and leaves
@@ -306,9 +319,13 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
           // may have changed the repository since (a write, an unknown
           // command, a watcher event) makes the running read a pre-change
           // answer, which a caller asking now must not be handed.
-          if (live && live.generation === readGeneration) return live.promise as Promise<T>;
-          const shared = dispatchOne<T>(cmd, rest);
-          sharing.set(key, { promise: shared, generation: readGeneration });
+          if (live && live.generation === readGeneration) {
+            live.interests.add(interest);
+            return live.promise as Promise<T>;
+          }
+          const interests = new Set([interest]);
+          const shared = dispatchOne<T>(cmd, rest, interests);
+          sharing.set(key, { promise: shared, generation: readGeneration, interests });
           const clear = () => {
             if (sharing.get(key)?.promise === shared) sharing.delete(key);
           };
@@ -316,13 +333,13 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
           return shared;
         }
       }
-      return dispatchOne<T>(cmd, rest);
+      return dispatchOne<T>(cmd, rest, new Set([interest]));
     }
     // Not a named read: it may change what a read would answer, so it ends
     // the generation twice, when it is sent and when it settles. A read that
     // started before either is never joined by one that starts after.
     readGeneration += 1;
-    const call = dispatchOne<T>(cmd, rest);
+    const call = dispatchOne<T>(cmd, rest, new Set([interest]));
     const settled = () => {
       readGeneration += 1;
     };
@@ -330,7 +347,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     return call;
   }
 
-  function dispatchOne<T>(cmd: string, rest: Rest): Promise<T> {
+  function dispatchOne<T>(cmd: string, rest: Rest, interests: Set<Interest>): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
     // So is a byte buffer; both are known without serializing anything.
@@ -346,7 +363,10 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       key = lazyRetryKey(cmd, rest[0]);
       if (key === null) return call<T>(cmd, rest);
       const pending = retrying.get(key);
-      if (pending) return pending as Promise<T>;
+      if (pending) {
+        for (const interest of interests) pending.interests.add(interest);
+        return pending.chain as Promise<T>;
+      }
     }
     return call<T>(cmd, rest).catch((error: unknown) => {
       if (!isDeferred(error)) throw error;
@@ -356,11 +376,14 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       if (key === null) throw error;
       const settledKey = key;
       const joined = retrying.get(settledKey);
-      if (joined) return joined as Promise<T>;
-      const chain = retry<T>(cmd, rest, error).finally(() => {
-        if (retrying.get(settledKey) === chain) retrying.delete(settledKey);
+      if (joined) {
+        for (const interest of interests) joined.interests.add(interest);
+        return joined.chain as Promise<T>;
+      }
+      const chain = retry<T>(cmd, rest, error, interests).finally(() => {
+        if (retrying.get(settledKey)?.chain === chain) retrying.delete(settledKey);
       });
-      retrying.set(settledKey, chain);
+      retrying.set(settledKey, { chain, interests });
       return chain;
     });
   }
@@ -377,8 +400,14 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   /** `dispatch` under the caller's wait bound; a call with neither adds nothing. */
   function bound<T>(cmd: string, rest: Rest, deadlineMs: number | undefined, signal: AbortSignal | undefined): Promise<T> {
     const limited = deadlineMs !== undefined && Number.isFinite(deadlineMs);
-    if (!limited && !signal) return dispatch<T>(cmd, rest);
-    return withDeadline(() => dispatch<T>(cmd, rest), limited ? deadlineMs : Infinity, {
+    if (!limited && !signal) return dispatch<T>(cmd, rest, ALWAYS_INTERESTED);
+    // Still waiting: not aborted and inside the deadline. The deferral retry
+    // asks this before every send (see `retry`), so a caller that has been
+    // answered with an `AbortError` or a `DeadlineError` is never the reason
+    // another command goes out.
+    const startedAt = Date.now();
+    const interest: Interest = () => !signal?.aborted && !(limited && Date.now() - startedAt >= (deadlineMs as number));
+    return withDeadline(() => dispatch<T>(cmd, rest, interest), limited ? deadlineMs : Infinity, {
       signal,
       message: `${cmd} timed out after ${Math.round((deadlineMs ?? 0) / 1000)} s without an answer`,
     });

@@ -186,9 +186,6 @@ pub async fn cmd_bind_worktree_task(
     task_id: String,
 ) -> Result<i64, IpcError> {
     off_thread(move || {
-        // Appends a binding row, so a refusal after it began is a user
-        // action's and is never retried: a replay would bind twice.
-        crate::engine::git_cli::mark_interactive();
         bind_after_catch_up(
             &repo_path,
             &worktree_path,
@@ -206,12 +203,8 @@ pub async fn cmd_unbind_worktree_task(
     repo_path: String,
     worktree_path: String,
 ) -> Result<i64, IpcError> {
-    off_thread(move || {
-        // Appends an unbinding row; see `cmd_bind_worktree_task`.
-        crate::engine::git_cli::mark_interactive();
-        unbind_after_catch_up(&repo_path, &worktree_path, catch_up_before_binding)
-    })
-    .await
+    off_thread(move || unbind_after_catch_up(&repo_path, &worktree_path, catch_up_before_binding))
+        .await
 }
 
 /// The task a worktree is bound to, or `null`.
