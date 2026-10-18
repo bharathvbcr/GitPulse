@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Fixed
 
+- The Edit/Write hook (`gitpulse-hook collision-guard`) asks the running app for
+  its collision scan instead of reading `git status` in every worktree itself.
+  The app keeps the scan for 5 s, so a burst of edits over 7 worktrees spawns 8
+  git children where it spawned 40 (100 down to 50 when the file is contended).
+  A contended file is still re-read in the worktrees that hold it before it is
+  reported. With no app, a busy or older app, or an answer that is stale or
+  looked at nothing, the hook scans for itself as before. `gitpulse-hook` and
+  the app need reinstalling together to get the saving.
+
 - Pulse's ownership and bus-factor report samples the highest-churn files of
   every top-level area instead of the first 128 paths, and names the areas it
   did and did not sample. It is blamed at `HEAD` and kept until `HEAD`, the ref

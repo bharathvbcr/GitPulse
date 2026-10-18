@@ -825,7 +825,7 @@ fn collision_guard_with(
     let remaining = BUDGET.saturating_sub(started.elapsed());
     let scanned = within_budget(remaining, {
         let target = target.clone();
-        move || insights::collision_risk_for_path(&root_arg, &target)
+        move || scan_collisions(&root_arg, &target)
     });
     let Some(risk) = scanned else {
         return merge_outputs(
@@ -1134,6 +1134,22 @@ pub fn serve_gate(cwd: &str, command: &str) -> Result<Value, String> {
 #[cfg(target_os = "macos")]
 const GATE_APP_DEADLINE: Duration = Duration::from_millis(750);
 
+/// An id no other request of this machine carries, for the app to echo back.
+#[cfg(target_os = "macos")]
+fn mailbox_id(kind: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    format!(
+        "{kind}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn judged_by_app(cwd: &str, command: &str) -> Option<ScopedVerdict> {
     judged_by_app_in(crate::tool_config::default_config_dir()?, cwd, command)
@@ -1143,19 +1159,9 @@ fn judged_by_app(cwd: &str, command: &str) -> Option<ScopedVerdict> {
 #[cfg(target_os = "macos")]
 fn judged_by_app_in(dir: PathBuf, cwd: &str, command: &str) -> Option<ScopedVerdict> {
     use crate::desktop::instance::{reach_owner, Request};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    let id = format!(
-        "gate-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos()),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
     let request = Request::GateCommand {
-        id,
+        id: mailbox_id("gate"),
         cwd: cwd.to_string(),
         command: command.to_string(),
     };
@@ -1200,6 +1206,171 @@ fn judged_by_app_in(dir: PathBuf, cwd: &str, command: &str) -> Option<ScopedVerd
 #[cfg(not(target_os = "macos"))]
 fn judged_by_app(_cwd: &str, _command: &str) -> Option<ScopedVerdict> {
     None
+}
+
+/* ── the collision scan, asked of the app first ───────────────────────────── */
+
+/// How long a hook gives the app to answer one collision scan.
+///
+/// Longer than [`GATE_APP_DEADLINE`] on purpose: a cold scan reads `git status`
+/// in up to 16 worktrees (about 150 ms each on the loaded machine this was
+/// measured on, in parallel but not free), where a verdict is one sidecar
+/// round trip. The first edit after the memo expires pays the scan; the app
+/// finishes it whether or not this hook is still waiting, so the next ask is
+/// answered from memory either way. Still well inside [`BUDGET`] and the host's
+/// timeout, and the hook scans for itself when it passes.
+#[cfg(target_os = "macos")]
+const COLLISION_APP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The oldest app answer a hook believes, in milliseconds: twice the age the
+/// app promises to serve ([`insights::COLLISION_MEMO_TTL`]), so a clock hiccup
+/// does not discard a good answer and a wedged or foreign peer cannot hand over
+/// a stale one.
+#[cfg(target_os = "macos")]
+const COLLISION_MAX_AGE_MS: u64 = 2 * insights::COLLISION_MEMO_TTL.as_millis() as u64;
+
+/// The app's half of collision-guard: the scan for an edit of `path` in the
+/// worktree `repo`, from the memory in [`insights::collision_risk_for_path_memoized`].
+///
+/// Trimmed to what the hook reads (the row for `path`, and the counts that make
+/// a negative answer qualified) so a reply fits one mailbox frame however many
+/// files other worktrees hold dirty. A scan that read nothing is an error and
+/// not a reply: the hook then scans for itself and reports exactly what it
+/// reports with no app, so "could not look" cannot be turned into anything by
+/// crossing the socket.
+pub fn serve_collision(repo: &str, path: &str) -> Result<Value, String> {
+    let mut answer = insights::collision_risk_for_path_memoized(repo, path);
+    if answer.risk.scanned_worktrees == 0 {
+        return Err(format!(
+            "the scan read no worktree: {}",
+            or_unknown(&answer.risk.error)
+        ));
+    }
+    answer.risk.items.retain(|item| item.path == path);
+    answer.risk.shared_worktrees.clear();
+    serde_json::to_value(answer).map_err(|error| error.to_string())
+}
+
+/// The collision scan for an edit of `target` in `root`: the app's, from its
+/// memory, when it answers in time; otherwise this process reads every worktree
+/// itself, as it always did. Either way the result is a full scan with its
+/// partial-coverage fields filled in — never an empty list standing in for one
+/// that could not run — and the one that was not the app's says why.
+fn scan_collisions(root: &str, target: &str) -> CollisionRisk {
+    match scanned_by_app(root, target) {
+        Ok(risk) => risk,
+        Err(why) => {
+            log::debug!(target: "hooks", "collision guard: scanning here, the app did not: {why}");
+            insights::collision_risk_for_path(root, target)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn scanned_by_app(root: &str, target: &str) -> Result<CollisionRisk, String> {
+    scanned_by_app_in(
+        scan_profile(root).ok_or("no profile directory to find the app in")?,
+        root,
+        target,
+    )
+}
+
+/// The profile directory whose app is asked to scan `root`.
+///
+/// Under test it is the one a test registered for exactly this repository, and
+/// otherwise none: a test of the hook must not reach a GitPulse the developer
+/// has running, and parallel tests must not reach each other's.
+#[cfg(all(target_os = "macos", not(test)))]
+fn scan_profile(_root: &str) -> Option<PathBuf> {
+    crate::tool_config::default_config_dir()
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn scan_profile(root: &str) -> Option<PathBuf> {
+    test_apps::profile_for(root)
+}
+
+/// Which temporary profile answers collision scans for which repository.
+#[cfg(all(target_os = "macos", test))]
+mod test_apps {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    static APPS: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+    pub(super) fn profile_for(root: &str) -> Option<PathBuf> {
+        APPS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(repo, _)| repo == Path::new(root))
+            .map(|(_, profile)| profile.clone())
+    }
+
+    /// Registers `profile` for `repo` until the returned guard drops.
+    pub(crate) fn register(repo: &Path, profile: &Path) -> impl Drop {
+        struct Unregister(PathBuf);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                APPS.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|(repo, _)| *repo != self.0);
+            }
+        }
+        APPS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((repo.to_path_buf(), profile.to_path_buf()));
+        Unregister(repo.to_path_buf())
+    }
+}
+
+/// [`scanned_by_app`] against the app that owns profile directory `dir`.
+#[cfg(target_os = "macos")]
+fn scanned_by_app_in(dir: PathBuf, root: &str, target: &str) -> Result<CollisionRisk, String> {
+    use crate::desktop::instance::{reach_owner, Request};
+
+    let request = Request::CollisionScan {
+        id: mailbox_id("scan"),
+        repo: root.to_string(),
+        path: target.to_string(),
+    };
+    // Detached at the deadline, like every other wait on another process here.
+    let answer = within_budget(
+        COLLISION_APP_DEADLINE + Duration::from_millis(100),
+        move || {
+            reach_owner(&dir, COLLISION_APP_DEADLINE)
+                .ok_or_else(|| "no GitPulse is answering".to_string())?
+                .collisions(&request, COLLISION_APP_DEADLINE)
+        },
+    )
+    .ok_or("the app missed its deadline")??;
+    let answer: insights::MemoizedCollision = serde_json::from_value(answer)
+        .map_err(|error| format!("the answer is malformed: {error}"))?;
+    if answer.age_ms > COLLISION_MAX_AGE_MS {
+        return Err(format!(
+            "the app's answer is {} ms old; {COLLISION_MAX_AGE_MS} is the most believed",
+            answer.age_ms
+        ));
+    }
+    // A reply that read nothing is not a scan; `serve_collision` never sends
+    // one, so this is a peer that is not the app.
+    if answer.risk.scanned_worktrees == 0 {
+        return Err("the app's answer read no worktree".into());
+    }
+    log::debug!(
+        target: "hooks",
+        "collision guard: the app answered, age {} ms, scanned={} unscanned={} failed={}",
+        answer.age_ms,
+        answer.risk.scanned_worktrees,
+        answer.risk.unscanned_worktrees,
+        answer.risk.failed_worktrees,
+    );
+    Ok(answer.risk)
+}
+
+/// There is no mailbox off macOS; the hook scans for itself.
+#[cfg(not(target_os = "macos"))]
+fn scanned_by_app(_root: &str, _target: &str) -> Result<CollisionRisk, String> {
+    Err("only the macOS app answers a collision scan".into())
 }
 
 /// One harness judgement, built on the caller's thread and run on whichever
@@ -3309,6 +3480,309 @@ done
     #[cfg(unix)]
     fn guard_here(input: &HookInput) -> HookOutput {
         collision_guard_with(input, |job| Some(job()))
+    }
+
+    /// Where each directory's spawn log stood, to count only what follows.
+    #[cfg(unix)]
+    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<usize> {
+        dirs.iter()
+            .map(|dir| crate::engine::git_cli::spawn_log::spawns_in(dir).len())
+            .collect()
+    }
+
+    /// Git children one burst of guarded edits started, by what they ran.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct SpawnCost {
+        worktree_list: usize,
+        status: usize,
+        /// Everything else: the symbol check's `ls-files`, `rev-parse`, `diff`.
+        other: usize,
+    }
+
+    impl SpawnCost {
+        fn total(&self) -> usize {
+            self.worktree_list + self.status + self.other
+        }
+    }
+
+    /// Git children started in `dirs` since `marks`.
+    #[cfg(unix)]
+    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[usize]) -> SpawnCost {
+        let argvs: Vec<Vec<String>> = dirs
+            .iter()
+            .zip(marks)
+            .flat_map(|(dir, mark)| {
+                crate::engine::git_cli::spawn_log::spawns_in(dir)[*mark..].to_vec()
+            })
+            .collect();
+        let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);
+        let worktree_list = argvs.iter().filter(|a| has(a, "worktree")).count();
+        let status = argvs.iter().filter(|a| has(a, "status")).count();
+        SpawnCost {
+            worktree_list,
+            status,
+            other: argvs.len() - worktree_list - status,
+        }
+    }
+
+    const SIBLINGS: usize = 6;
+    const EDITS: usize = 5;
+
+    /// A repository and `SIBLINGS` worktrees of it, each dirty in a file of its
+    /// own — the ordinary state of a machine running parallel agents. With
+    /// `contended`, each also holds `seed.txt`, the file the edits are of, dirty.
+    #[cfg(unix)]
+    struct Farm {
+        _repo: tempfile::TempDir,
+        _siblings: tempfile::TempDir,
+        repo: String,
+        sibling_dirs: Vec<std::path::PathBuf>,
+        /// The repository and every sibling: where git is spawned.
+        dirs: Vec<std::path::PathBuf>,
+    }
+
+    #[cfg(unix)]
+    fn farm(contended: bool) -> Farm {
+        use crate::test_support::git_in;
+        let (repo_dir, repo, _requests) = scoped_hook_fixture(false);
+        let siblings = tempfile::tempdir().expect("sibling worktrees");
+        let root = siblings.path().canonicalize().expect("canonical farm");
+        let mut dirs = vec![std::path::PathBuf::from(&repo)];
+        let mut sibling_dirs = Vec::new();
+        for n in 0..SIBLINGS {
+            let wt = root.join(format!("sibling-{n}"));
+            git_in(
+                Path::new(&repo),
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &format!("b{n}"),
+                    &wt.to_string_lossy(),
+                ],
+            );
+            std::fs::write(wt.join(format!("own-{n}.txt")), "mine").expect("dirty a sibling");
+            if contended {
+                std::fs::write(wt.join("seed.txt"), format!("edit {n}")).expect("contend seed");
+            }
+            dirs.push(wt.clone());
+            sibling_dirs.push(wt);
+        }
+        Farm {
+            _repo: repo_dir,
+            _siblings: siblings,
+            repo,
+            sibling_dirs,
+            dirs,
+        }
+    }
+
+    /// `EDITS` guarded edits of `seed.txt`, each its own hook decision, and the
+    /// git children they started.
+    #[cfg(unix)]
+    fn burst(farm: &Farm) -> (Vec<HookOutput>, SpawnCost) {
+        let marks = spawn_marks(&farm.dirs);
+        let outputs: Vec<HookOutput> = (0..EDITS)
+            .map(|_| guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo))))
+            .collect();
+        let cost = spawn_cost(&farm.dirs, &marks);
+        (outputs, cost)
+    }
+
+    #[cfg(unix)]
+    fn asks(output: &HookOutput) -> bool {
+        output
+            .hook_specific_output
+            .as_ref()
+            .is_some_and(|specific| specific.permission_decision == Some(PermissionDecision::Ask))
+    }
+
+    /// A GitPulse for the hooks of `repo` to ask, as `launch::establish`
+    /// attaches one: `answers` is whether its collision scan is attached.
+    #[cfg(target_os = "macos")]
+    struct TestApp {
+        _profile: tempfile::TempDir,
+        _owner: crate::desktop::instance::Primary,
+        _registered: Box<dyn std::any::Any>,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn app_for(repo: &str, answers: bool) -> TestApp {
+        use crate::desktop::instance::{claim, Claim};
+        // Short enough for the socket: the per-user temp dir is most of `sun_path`.
+        let profile = tempfile::Builder::new()
+            .prefix("cg")
+            .tempdir_in("/tmp")
+            .expect("profile dir");
+        let owner = match claim(profile.path(), Duration::from_millis(200)) {
+            Claim::Primary(primary) => primary,
+            _ => panic!("expected to own the profile"),
+        };
+        if answers {
+            owner.attach_collision(std::sync::Arc::new(serve_collision));
+        }
+        let registered = Box::new(test_apps::register(Path::new(repo), profile.path()));
+        TestApp {
+            _profile: profile,
+            _owner: owner,
+            _registered: registered,
+        }
+    }
+
+    /// Every Edit/Write in an agent runs `collision-guard` as a fresh process,
+    /// and each one used to read `git worktree list` and then `git status` in
+    /// every worktree of the repository (measured on the live app: 20 git
+    /// children per edit over 7 worktrees). A burst of edits must cost one scan,
+    /// not one scan each: the machine-wide process storm of 2026-10-17 was this
+    /// fan-out, and every exec is checked by syspolicyd.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_burst_of_edits_costs_one_scan_when_the_app_answers() {
+        let farm = farm(false);
+        let _app = app_for(&farm.repo, true);
+        let (outputs, cost) = burst(&farm);
+        eprintln!(
+            "collision-guard, app answers: {EDITS} edits over {} worktrees: {} git children {cost:?}",
+            SIBLINGS + 1,
+            cost.total()
+        );
+        assert!(
+            outputs.iter().all(HookOutput::is_silent),
+            "an uncontended file was reported"
+        );
+        assert!(
+            cost.status <= SIBLINGS + 1,
+            "{EDITS} edits read git status {} times over {} worktrees; one scan is {}",
+            cost.status,
+            SIBLINGS + 1,
+            SIBLINGS + 1
+        );
+        assert!(cost.worktree_list <= 1, "{cost:?}");
+        assert_eq!(cost.other, 0, "{cost:?}");
+    }
+
+    /// The same burst with no app to ask is what every edit did before: each
+    /// one scans every worktree itself, and decides the same way.
+    #[cfg(unix)]
+    #[test]
+    fn without_the_app_every_edit_scans_every_worktree_itself() {
+        let farm = farm(false);
+        let (outputs, cost) = burst(&farm);
+        eprintln!(
+            "collision-guard, no app: {EDITS} edits over {} worktrees: {} git children {cost:?}",
+            SIBLINGS + 1,
+            cost.total()
+        );
+        assert!(outputs.iter().all(HookOutput::is_silent));
+        assert_eq!(cost.status, EDITS * (SIBLINGS + 1), "{cost:?}");
+        assert_eq!(cost.worktree_list, EDITS, "{cost:?}");
+    }
+
+    /// A contended file is still reported on every edit, with the same decision
+    /// the unmemoized scan makes, and the symbol check — a DevMap open and git
+    /// reads per party — is paid once for the burst.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_contended_file_is_reported_on_every_edit_and_its_symbol_check_is_paid_once() {
+        let farm = farm(true);
+        let _app = app_for(&farm.repo, true);
+        let (outputs, cost) = burst(&farm);
+        eprintln!(
+            "collision-guard, app answers, contended: {EDITS} edits: {} git children {cost:?}",
+            cost.total()
+        );
+        for output in &outputs {
+            assert!(
+                asks(output),
+                "a contended edit went unreported: {:?}",
+                output.render()
+            );
+            let reason = output
+                .hook_specific_output
+                .as_ref()
+                .and_then(|specific| specific.permission_decision_reason.clone())
+                .unwrap_or_default();
+            assert!(
+                reason.contains(&format!("{SIBLINGS} other worktrees")),
+                "{reason}"
+            );
+        }
+        // One scan, then each positive re-read in the worktrees it names.
+        assert!(
+            cost.status <= (SIBLINGS + 1) + EDITS * SIBLINGS,
+            "status {} {cost:?}",
+            cost.status
+        );
+        // Two reads per party for the symbol check, once, not once per edit.
+        assert!(cost.other <= 2 * SIBLINGS, "{cost:?}");
+        assert!(cost.worktree_list <= 1, "{cost:?}");
+    }
+
+    /// A positive is never served from memory: once every sibling has put the
+    /// file back, the next edit is not blocked on the claim that they hold it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_collision_that_has_ended_is_not_reported_from_memory() {
+        use crate::test_support::git_in;
+        let farm = farm(true);
+        let _app = app_for(&farm.repo, true);
+        let edit = || guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
+        assert!(asks(&edit()), "the collision was real");
+        for sibling in &farm.sibling_dirs {
+            git_in(sibling, &["checkout", "--", "seed.txt"]);
+        }
+        let after = edit();
+        assert!(
+            after.is_silent(),
+            "a memoized positive blocked an edit: {:?}",
+            after.render()
+        );
+    }
+
+    /// An app that is there but will not answer scans — it predates them, is
+    /// busy, or has not attached the sink — leaves the hook to scan for itself,
+    /// and a contended file is reported exactly as it is with no app at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_app_that_will_not_scan_leaves_the_hook_to_scan_and_still_report() {
+        let farm = farm(true);
+        let _app = app_for(&farm.repo, false);
+        let (outputs, cost) = burst(&farm);
+        assert!(outputs.iter().all(asks), "a refusal read as no collision");
+        assert_eq!(cost.status, EDITS * (SIBLINGS + 1), "{cost:?}");
+    }
+
+    /// The hook believes only a scan that looked, and only one the app has not
+    /// let go stale: a peer on the mailbox that is not the app, or a wedged one,
+    /// is scanned past.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_app_answer_that_is_stale_or_looked_at_nothing_is_not_believed() {
+        use crate::desktop::instance::{claim, Claim};
+        let farm = farm(false);
+        let ask = |tamper: fn(&mut Value)| {
+            let profile = tempfile::Builder::new()
+                .prefix("cg")
+                .tempdir_in("/tmp")
+                .expect("profile dir");
+            let Claim::Primary(owner) = claim(profile.path(), Duration::from_millis(200)) else {
+                panic!("expected to own the profile");
+            };
+            owner.attach_collision(std::sync::Arc::new(move |repo, path| {
+                let mut reply = serve_collision(repo, path)?;
+                tamper(&mut reply);
+                Ok(reply)
+            }));
+            scanned_by_app_in(profile.path().to_path_buf(), &farm.repo, "seed.txt")
+        };
+        assert!(ask(|_| {}).is_ok(), "an honest answer is believed");
+        let stale = ask(|reply| reply["age_ms"] = json!(COLLISION_MAX_AGE_MS + 1));
+        assert!(stale.unwrap_err().contains("ms old"));
+        let blind = ask(|reply| reply["risk"]["scanned_worktrees"] = json!(0));
+        assert!(blind.unwrap_err().contains("read no worktree"));
+        let malformed = ask(|reply| *reply = json!({"risk": 1}));
+        assert!(malformed.unwrap_err().contains("malformed"));
     }
 
     /// The Edit/Write hook used to check collisions only, so a task-bound

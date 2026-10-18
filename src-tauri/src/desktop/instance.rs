@@ -107,9 +107,31 @@ pub enum Request {
         cwd: String,
         command: String,
     },
+    /// An agent hook asking which other worktrees hold `path` dirty before it
+    /// lets an edit of it run. Answered on the connection like
+    /// [`Request::GateCommand`], by the sink [`Primary::attach_collision`] put
+    /// there: the app remembers the scan for a few seconds, so a burst of
+    /// edits costs one set of `git status` reads instead of one each.
+    CollisionScan {
+        /// Echoed in the answer, as for [`Request::GateCommand`].
+        id: String,
+        /// The worktree the edit is in (absolute).
+        repo: String,
+        /// The edited file, relative to `repo`.
+        path: String,
+    },
 }
 
 impl Request {
+    /// The id an answer must echo, for the requests that are answered on their
+    /// own connection.
+    fn answered_id(&self) -> Option<&str> {
+        match self {
+            Request::GateCommand { id, .. } | Request::CollisionScan { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
     /// Bounds a frame from another process before anything acts on it. The
     /// sender is this user's own GitPulse, but a socket is a socket.
     pub fn validate(&self) -> Result<(), String> {
@@ -151,6 +173,26 @@ impl Request {
                 }
                 if command.is_empty() || command.len() > MAX_GATE_COMMAND_BYTES {
                     return Err("gate command is empty or too long".into());
+                }
+                Ok(())
+            }
+            Request::CollisionScan { id, repo, path } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("scan request id is empty, too long or not printable".into());
+                }
+                if repo.is_empty()
+                    || repo.len() > MAX_PATH_BYTES
+                    || repo.contains('\0')
+                    || !Path::new(repo).is_absolute()
+                {
+                    return Err("scan repository must be an absolute path".into());
+                }
+                if path.is_empty()
+                    || path.len() > MAX_PATH_BYTES
+                    || path.contains('\0')
+                    || Path::new(path).is_absolute()
+                {
+                    return Err("scan path must be relative to its repository".into());
                 }
                 Ok(())
             }
@@ -507,11 +549,33 @@ impl Secondary {
     /// this request's id. Anything else — a refusal, a missing or foreign id, a
     /// missing reply — is an error, and the caller judges the command itself.
     pub fn gate(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
-        let Request::GateCommand { id, .. } = request else {
+        if !matches!(request, Request::GateCommand { .. }) {
             return Err("not a gate request".into());
-        };
+        }
+        self.answered(request, within)
+    }
+
+    /// Asks the owner which worktrees hold a file dirty: the owner's reply to
+    /// [`Request::CollisionScan`], on the same terms as [`Secondary::gate`] —
+    /// only an answer that echoes this request's id and carries a reply counts,
+    /// and anything else is an error the caller scans for itself on.
+    pub fn collisions(
+        self,
+        request: &Request,
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(request, Request::CollisionScan { .. }) {
+            return Err("not a scan request".into());
+        }
+        self.answered(request, within)
+    }
+
+    fn answered(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
+        let id = request
+            .answered_id()
+            .ok_or("this request is not answered on its connection")?;
         let ack = self.exchange(request, within)?;
-        if ack.id.as_deref() != Some(id.as_str()) {
+        if ack.id.as_deref() != Some(id) {
             return Err("the answer names another request".into());
         }
         ack.reply
@@ -560,6 +624,9 @@ pub fn reach_owner(dir: &Path, hello: Duration) -> Option<Secondary> {
 /// Judges one command for a hook: `(cwd, command)` to the verdict's JSON.
 pub type GateSink = Arc<dyn Fn(&str, &str) -> Result<serde_json::Value, String> + Send + Sync>;
 
+/// Scans for a hook: `(repo, path)` to the collision scan's JSON.
+pub type ScanSink = GateSink;
+
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
 #[derive(Default)]
@@ -573,6 +640,7 @@ struct Shared {
     active: AtomicUsize,
     gating: AtomicUsize,
     gate: Mutex<Option<GateSink>>,
+    collision: Mutex<Option<ScanSink>>,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -590,6 +658,7 @@ impl Shared {
             active: AtomicUsize::new(0),
             gating: AtomicUsize::new(0),
             gate: Mutex::new(None),
+            collision: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -692,6 +761,17 @@ impl Primary {
         *self
             .shared
             .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Where hooks' collision scans are answered from now on. Until this is
+    /// called a [`Request::CollisionScan`] is refused, and its hook scans the
+    /// worktrees itself.
+    pub fn attach_collision(&self, sink: ScanSink) {
+        *self
+            .shared
+            .collision
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
@@ -1019,6 +1099,9 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     if let Request::GateCommand { id, cwd, command } = &request {
         return answer_gate(stream, shared, id, cwd, command).map_err(Ended::Refused);
     }
+    if let Request::CollisionScan { id, repo, path } = &request {
+        return answer_scan(stream, shared, id, repo, path).map_err(Ended::Refused);
+    }
     let verdict = admit(shared, request);
     let ack = match &verdict {
         Ok(_) => Ack::accepted(),
@@ -1045,21 +1128,53 @@ fn answer_gate(
     cwd: &str,
     command: &str,
 ) -> Result<(), String> {
+    answer_asked(
+        stream,
+        shared,
+        id,
+        (&shared.gate, "the gate"),
+        (cwd, command),
+    )
+}
+
+/// Answers a hook's [`Request::CollisionScan`] on its connection, on the same
+/// terms as [`answer_gate`]: an error is a refusal the hook scans past, never
+/// an answer. Counted against the same [`MAX_GATE_HANDLERS`], so hook traffic
+/// of either kind cannot use up the handlers a relaunch needs.
+fn answer_scan(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    repo: &str,
+    path: &str,
+) -> Result<(), String> {
+    answer_asked(
+        stream,
+        shared,
+        id,
+        (&shared.collision, "the collision scan"),
+        (repo, path),
+    )
+}
+
+fn answer_asked(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    (which, name): (&Mutex<Option<GateSink>>, &str),
+    (first, second): (&str, &str),
+) -> Result<(), String> {
     let slot = GateSlot::take(shared);
-    // Cloned out so the lock is not held while the verdict is worked out.
-    let sink = shared
-        .gate
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
+    // Cloned out so the lock is not held while the answer is worked out.
+    let sink = which.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let outcome = if shared.closing.load(Ordering::Acquire) {
         Err("GitPulse is quitting".to_string())
     } else if slot.is_none() {
-        Err("the gate is busy".to_string())
+        Err(format!("{name} is busy"))
     } else {
         match sink {
-            Some(sink) => sink(cwd, command),
-            None => Err("the gate is not attached".to_string()),
+            Some(sink) => sink(first, second),
+            None => Err(format!("{name} is not attached")),
         }
     };
     let ack = match outcome {

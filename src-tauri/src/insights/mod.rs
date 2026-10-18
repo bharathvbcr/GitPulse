@@ -5,9 +5,13 @@
 //! a check that did not run must never look like one that ran and found
 //! nothing. Nothing here mutates a repository.
 
+mod collision_memo;
 mod entity_collision;
 pub(crate) mod live_sessions;
 
+pub use collision_memo::{
+    collision_risk_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
+};
 pub use entity_collision::{
     classify_overlapping_path, parse_old_side_ranges, EntityCollisionKind, EntityCollisionVerdict,
     LineRange, OldSideHunk,
@@ -1537,6 +1541,24 @@ fn collision_from_list(
     live: &LiveSessionFacet,
     deadline: Option<&worktree::ScanDeadline>,
 ) -> CollisionRisk {
+    collision_from_list_reading(list, live, deadline, &changed_paths_within)
+}
+
+/// One worktree's changed paths, and whether the list was cut at its cap: the
+/// answer of [`changed_paths_within`], or of a memo standing in for it.
+type PathsRead = Result<(Vec<String>, bool), String>;
+
+/// [`collision_from_list`] reading each unread worktree through `read`.
+///
+/// The only other caller is the memoized scan the app answers hooks with
+/// ([`collision_memo`]), which is why the reader is a parameter: the cap, the
+/// shared-worktree ordering and the unscanned accounting stay in one place.
+fn collision_from_list_reading(
+    list: &[WorktreeInfo],
+    live: &LiveSessionFacet,
+    deadline: Option<&worktree::ScanDeadline>,
+    read: &(dyn Fn(&str, Option<&worktree::ScanDeadline>) -> PathsRead + Sync),
+) -> CollisionRisk {
     let shared = shared_paths(live);
     // A worktree that two sessions share is scanned ahead of the cap: it is
     // the one place a collision is already known to be possible.
@@ -1545,7 +1567,7 @@ fn collision_from_list(
         .filter(|w| !w.is_bare)
         .partition(|w| shared.contains(w.path.as_str()));
 
-    type Read = Result<(Vec<String>, bool), String>;
+    type Read = PathsRead;
     let mut scans: Vec<(&WorktreeInfo, Option<Read>)> = Vec::new();
     let mut pending: Vec<usize> = Vec::new();
     let mut fresh_reads_left = MAX_COLLISION_SCANS;
@@ -1578,7 +1600,7 @@ fn collision_from_list(
     let to_read: Vec<&WorktreeInfo> = pending.iter().map(|&at| scans[at].0).collect();
     let fresh: Vec<Read> = to_read
         .into_par_iter()
-        .map(|wt| with_admission(class, || changed_paths_within(&wt.path, deadline)))
+        .map(|wt| with_admission(class, || read(&wt.path, deadline)))
         .collect();
     for (at, read) in pending.into_iter().zip(fresh) {
         scans[at].1 = Some(read);

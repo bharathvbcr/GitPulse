@@ -1340,6 +1340,123 @@ fn a_gate_answer_carries_the_sinks_verdict_and_the_requests_id() {
     assert_eq!(refused, Err("no verdict".to_string()));
 }
 
+fn scan_request(id: &str) -> Request {
+    Request::CollisionScan {
+        id: id.into(),
+        repo: "/repo".into(),
+        path: "src/lib.rs".into(),
+    }
+}
+
+#[test]
+fn a_scan_request_is_bounded_before_anything_acts_on_it() {
+    assert_eq!(scan_request("s-1").validate(), Ok(()));
+    let with = |id: &str, repo: &str, path: &str| Request::CollisionScan {
+        id: id.into(),
+        repo: repo.into(),
+        path: path.into(),
+    };
+    let refused = [
+        with("", "/repo", "a.rs"),
+        with("s\n1", "/repo", "a.rs"),
+        with(&"s".repeat(MAX_NATIVE_ID + 1), "/repo", "a.rs"),
+        with("s", "repo", "a.rs"),
+        with("s", "", "a.rs"),
+        with("s", "/re\0po", "a.rs"),
+        with("s", &format!("/{}", "r".repeat(MAX_PATH_BYTES)), "a.rs"),
+        with("s", "/repo", ""),
+        with("s", "/repo", "/etc/passwd"),
+        with("s", "/repo", "a\0.rs"),
+        with("s", "/repo", &"p".repeat(MAX_PATH_BYTES + 1)),
+    ];
+    for request in refused {
+        assert!(request.validate().is_err(), "{request:?}");
+    }
+}
+
+#[test]
+fn a_scan_request_is_refused_until_a_scan_sink_is_attached_whatever_the_gate_does() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    // A gate is not a scan: attaching one must not make the other answer.
+    owner.attach_gate(Arc::new(|_, _| Ok(serde_json::json!({"gate": true}))));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .collisions(&scan_request("s-1"), Duration::from_secs(5));
+    assert_eq!(
+        refused,
+        Err("the collision scan is not attached".to_string())
+    );
+
+    // And the other way round: a scan sink answers no gate request.
+    let other = profile();
+    let owner_two = primary(other.path());
+    owner_two.attach_collision(Arc::new(|_, _| Ok(serde_json::json!({"scan": true}))));
+    let socket = Paths::in_dir(&other.path().canonicalize().unwrap()).socket;
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&gate_request("g-1"), Duration::from_secs(5));
+    assert_eq!(refused, Err("the gate is not attached".to_string()));
+    drop((owner, owner_two));
+}
+
+#[test]
+fn a_scan_answer_carries_the_sinks_reply_and_the_requests_id() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    owner.attach_collision(Arc::new(|repo, path| {
+        Ok(serde_json::json!({"repo": repo, "path": path}))
+    }));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let reply = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .collisions(&scan_request("s-7"), Duration::from_secs(5))
+        .expect("answered");
+    assert_eq!(
+        reply,
+        serde_json::json!({"repo": "/repo", "path": "src/lib.rs"})
+    );
+
+    // A sink that errors is a refusal, never a reply; the hook scans for itself.
+    owner.attach_collision(Arc::new(|_, _| Err("no scan".into())));
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .collisions(&scan_request("s-8"), Duration::from_secs(5));
+    assert_eq!(refused, Err("no scan".to_string()));
+
+    // The two request kinds are not interchangeable at the client either.
+    let mismatched = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&scan_request("s-9"), Duration::from_secs(5));
+    assert_eq!(mismatched, Err("not a gate request".to_string()));
+}
+
+#[test]
+fn an_owner_that_predates_scans_refuses_the_request_instead_of_answering_it() {
+    // What an older app sees: a `kind` it does not know. The frame does not
+    // parse as an envelope, so it is refused and the hook scans for itself.
+    let dir = profile();
+    let owner = primary(dir.path());
+    let received = recorder(&owner);
+    let (mut stream, mut reader) = raw(dir.path());
+    let ack = ack_of(
+        &mut stream,
+        &mut reader,
+        b"{\"v\":1,\"request\":{\"kind\":\"collision_scan_next\",\"id\":\"x\",\"repo\":\"/r\",\"path\":\"p\"}}\n",
+    );
+    assert!(!ack.accepted && ack.reason.is_some() && ack.reply.is_none());
+    assert!(
+        received.try_recv().is_err(),
+        "a refused frame reached the app"
+    );
+}
+
 #[test]
 fn a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch() {
     let dir = profile();

@@ -721,6 +721,78 @@ repository-free directory (a mutation making the app answer `bound: false`
 fails it), and feeds the hook seven kinds of wrong answer plus a control
 (`a_peer_that_answers_wrongly_is_not_believed`).
 
+## 2026-10-17: collision-guard over the app mailbox
+
+`gitpulse-hook collision-guard` runs on every Edit/Write of an agent GitPulse
+launched, as a fresh process, and each run read `git worktree list` and then
+`git status --porcelain -z` in every worktree (up to `MAX_COLLISION_SCANS`,
+16). Sampled on the live app that was 127 hook runs and at least 297 git
+children in 60 s, more than the app itself spawned, in the window where every
+exec was queueing behind syspolicyd. A fresh process can keep nothing between
+calls, so no in-process cache could help.
+
+**Shape.** `Request::CollisionScan { id, repo, path }` is answered on its own
+connection, like `GateCommand`, by the sink `launch::establish` attaches
+(`hooks::serve_collision`). The app answers from `insights::collision_memo`:
+the worktree listing and each worktree's changed paths are kept for `TTL`
+(5 s) and filled one caller at a time per key, so a burst of hooks costs one
+scan. The hook (`scan_collisions`) gives the app `COLLISION_APP_DEADLINE` (2 s)
+and otherwise scans every worktree itself, exactly as before.
+
+**Why 2 s and not the gate's 750 ms.** A cold scan reads up to 16 worktrees (a
+status read was about 150 ms on the loaded machine this was sampled on), where a
+verdict is one sidecar round trip. The app finishes the scan whether or not the
+hook is still waiting, so the next ask is answered from memory either way. This
+was reasoned from that sample, not benchmarked end to end; the bound is inside
+the hook's 5 s budget.
+
+**What a stale answer can and cannot do.** collision-guard turns a positive
+into an `ask`, which a headless agent's host turns into a deny, so the two
+directions are not alike:
+
+- A **negative** may be up to `TTL` old: a sibling that dirtied the same file in
+  the last few seconds is missed. The unmemoized scan has the same blind spot
+  over its own duration, so the memo widens a window that already existed.
+- A **positive is never served from memory.** A scan that finds the file dirty
+  elsewhere is re-read in exactly the worktrees it names before it is believed
+  (`a_collision_that_has_ended_is_not_reported_from_memory`). Only the symbol
+  verdict that refines it is kept for `TTL`.
+- A read that failed is never kept, and a failure beside a remembered listing
+  throws the listing away and scans once more.
+- The reply carries `age_ms`; the hook refuses an answer older than twice `TTL`,
+  one that read no worktree, and one that does not decode. Any refusal, timeout,
+  busy slot (`MAX_GATE_HANDLERS` is shared with gate verdicts) or an app that
+  predates the request (the frame does not parse, so it is refused) falls back
+  to the hook's own full scan. An empty list never stands in for a scan that
+  could not run.
+
+**Measured** (`hooks::tests`, 5 guarded edits of one file over a repository and
+6 sibling worktrees, git children counted per working directory):
+
+| case | before | after |
+| --- | --- | --- |
+| uncontended file: `worktree list` / `status` / other | 5 / 35 / 0 = 40 (8 per edit) | 1 / 7 / 0 = 8 (1.6 per edit) |
+| file dirty in all 6 siblings: `worktree list` / `status` / other | 5 / 35 / 60 = 100 (20 per edit) | 1 / 37 / 12 = 50 (10 per edit) |
+
+"Other" is the symbol check's `ls-files` and `rev-parse` per party. In the
+contended case the status count does not fall (37 against 35): the positive is
+re-read each time on purpose. The saving there is the listing and the symbol
+check, once per burst instead of once per edit.
+
+**Not measured:** the live app. `gitpulse-hook` and the app must both be
+rebuilt and reinstalled before a re-sample, and the MANVI gate does not allow
+writes to `/Applications` from an agent session. An older hook against a newer
+app, or the reverse, scans for itself and behaves as before.
+
+**Security impact.** The request is read-only and adds no write path. The
+caller supplies a worktree path and a relative file; the app re-derives trust
+and the listing itself (`validate_repo`), so an untrusted repository is refused
+exactly as it is in the hook's process. The reply discloses the paths of dirty
+files in a repository GitPulse is trusted in, to any process of the same user
+on the mailbox, which can run `git status` itself. The reply is trimmed to the
+requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
+and 0600 socket rules are the gate's.
+
 ## 2026-10-12: benchmark harness and the loaded-host baseline (ft-c0d9313f)
 
 The audit's perf cards need a number to be measured against. Before this there
