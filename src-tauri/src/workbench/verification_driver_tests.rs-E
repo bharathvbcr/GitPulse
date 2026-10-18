@@ -1,0 +1,1265 @@
+//! The verification driver's state machine: stale head, a person who moved the
+//! card meanwhile, a duplicate trigger, a sidecar that is down, a host that is
+//! going away, and the bound on how many run at once.
+
+use super::gate_tests::{head_of, record, store_record};
+use super::tests::{filed, live, person_edits, profile};
+use super::{complete_task, resolve};
+use crate::workbench::verification_driver::{
+    base_from_parent_read, decide, run_now, status, status_batch, target_of, verification_base,
+    Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
+};
+use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
+use crate::workbench::WorkbenchError;
+use dc_store::Store;
+use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
+
+struct Fake {
+    starts: RefCell<Vec<Value>>,
+    sidecar_down: Cell<bool>,
+    cancelled: Cell<bool>,
+    clock: Cell<Duration>,
+    epoch: Instant,
+    /// When set, `head_of` returns this instead of reading the worktree.
+    head_error: RefCell<Option<String>>,
+    /// When set, `base_of` returns this instead of a base.
+    base_error: RefCell<Option<String>>,
+}
+
+impl Fake {
+    fn new() -> Self {
+        Self {
+            starts: RefCell::new(Vec::new()),
+            sidecar_down: Cell::new(false),
+            cancelled: Cell::new(false),
+            clock: Cell::new(Duration::ZERO),
+            epoch: Instant::now(),
+            head_error: RefCell::new(None),
+            base_error: RefCell::new(None),
+        }
+    }
+}
+
+impl Backend for Fake {
+    fn start(&self, params: Value) -> Result<Value, WorkbenchError> {
+        if self.sidecar_down.get() {
+            return Err(WorkbenchError::new(
+                "worker_error",
+                "the sidecar is not running",
+            ));
+        }
+        self.starts.borrow_mut().push(params);
+        Ok(json!({"ok": true}))
+    }
+    fn head_of(&self, worktree: &str) -> Result<String, String> {
+        if let Some(err) = self.head_error.borrow().clone() {
+            return Err(err);
+        }
+        gate::current_head(worktree)
+    }
+    fn base_of(&self, _: &str, _: &str) -> Result<String, String> {
+        if let Some(err) = self.base_error.borrow().clone() {
+            return Err(err);
+        }
+        Ok("base-oid".into())
+    }
+    fn now(&self) -> Instant {
+        self.epoch + self.clock.get()
+    }
+    fn cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
+}
+
+fn setup() -> (tempfile::TempDir, Store, tempfile::TempDir, String) {
+    let (dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let id = filed(&store, &repo, "gp-drv", "Ship the exporter");
+    (dir, store, repo, id)
+}
+
+/// The agent claims done and is held in review.
+fn claim(store: &Store, repo: &tempfile::TempDir, id: &str) {
+    let r = complete_task(
+        store,
+        repo.path().to_str().unwrap(),
+        id,
+        "done",
+        None,
+        Some("done"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(r["status"], "review", "{r}");
+}
+
+fn status_of(store: &Store, id: &str) -> String {
+    live(store, id).unwrap()["status"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+fn logs(store: &Store, id: &str) -> String {
+    live(store, id).unwrap()["logs"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// What the sidecar writes once it has a verdict, under the request the driver sent.
+fn verdict(store: &Store, repo: &tempfile::TempDir, id: &str, outcome: &str, fake: &Fake) {
+    let sent = fake.starts.borrow();
+    let mut r = record(id, outcome, "settled", repo, &head_of(repo));
+    r["request_id"] = sent.last().unwrap()["request_id"].clone();
+    store_record(store, id, &r);
+}
+
+#[test]
+fn a_held_claim_starts_one_verification_at_its_head_and_a_duplicate_trigger_starts_none() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    let sent = fake.starts.borrow();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["head"], head_of(&repo));
+    assert_eq!(sent[0]["item_id"], id);
+    assert_eq!(
+        sent[0]["request_id"],
+        format!("auto-{id}-{}", head_of(&repo))
+    );
+    assert_eq!(status_of(&store, &id), "review");
+}
+
+#[test]
+fn a_restarted_driver_does_not_start_a_second_verification_for_the_same_head() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    Driver::default().sweep(&store, &fake);
+    // The sidecar has it running; a fresh driver (new process) adopts it.
+    let mut r = record(&id, "", "running", &repo, &head_of(&repo));
+    r["request_id"] = fake.starts.borrow()[0]["request_id"].clone();
+    store_record(&store, &id, &r);
+    assert_eq!(Driver::default().sweep(&store, &fake).started, 0);
+}
+
+#[test]
+fn a_pass_for_the_head_moves_the_held_card_to_done_with_the_verdict_in_its_history() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    driver.sweep(&store, &fake);
+    verdict(&store, &repo, &id, "passed", &fake);
+    assert_eq!(driver.sweep(&store, &fake).promoted, 1);
+    assert_eq!(status_of(&store, &id), "done");
+    assert!(logs(&store, &id).contains("Verification passed; moved to done"));
+    assert_eq!(driver.sweep(&store, &fake), Report::default());
+}
+
+#[test]
+fn a_new_head_after_the_claim_is_stale_and_is_neither_started_nor_promoted() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more"],
+    );
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake), Report::default());
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn a_pass_recorded_for_an_older_head_does_not_promote_the_card() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    driver.sweep(&store, &fake);
+    let old = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more"],
+    );
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &old));
+    driver.sweep(&store, &fake);
+    assert_eq!(status_of(&store, &id), "review");
+}
+
+#[test]
+fn a_card_the_person_moved_while_it_verified_is_not_moved_by_a_pass() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    driver.sweep(&store, &fake);
+    person_edits(&store, &id, |i| {
+        i.insert("status".into(), json!("in_progress"));
+    });
+    verdict(&store, &repo, &id, "passed", &fake);
+    driver.sweep(&store, &fake);
+    assert_eq!(status_of(&store, &id), "in_progress");
+    assert!(!logs(&store, &id).contains("moved to done"));
+}
+
+#[test]
+fn a_card_the_person_edited_while_it_verified_stays_in_review_with_the_pass_recorded_once() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    driver.sweep(&store, &fake);
+    person_edits(&store, &id, |i| {
+        i.insert("title".into(), json!("Ship the exporter, v2"));
+    });
+    verdict(&store, &repo, &id, "passed", &fake);
+    assert_eq!(driver.sweep(&store, &fake).parked, 1);
+    assert_eq!(status_of(&store, &id), "review");
+    let after = logs(&store, &id);
+    assert!(after.contains("the card changed meanwhile"), "{after}");
+    // A later sweep, even from a fresh driver, does not undo that restraint.
+    assert_eq!(Driver::default().sweep(&store, &fake), Report::default());
+    assert_eq!(status_of(&store, &id), "review");
+    assert_eq!(logs(&store, &id), after);
+}
+
+#[test]
+fn failed_and_degraded_verdicts_keep_the_card_in_review_and_are_recorded_once() {
+    for outcome in ["failed", "degraded"] {
+        let (_d, store, repo, id) = setup();
+        claim(&store, &repo, &id);
+        let fake = Fake::new();
+        let mut driver = Driver::default();
+        driver.sweep(&store, &fake);
+        verdict(&store, &repo, &id, outcome, &fake);
+        assert_eq!(driver.sweep(&store, &fake).parked, 1, "{outcome}");
+        assert_eq!(status_of(&store, &id), "review", "{outcome}");
+        let after = logs(&store, &id);
+        assert!(
+            after.contains(&format!("--- Verification {outcome} (")),
+            "{after}"
+        );
+        assert_eq!(driver.sweep(&store, &fake), Report::default(), "{outcome}");
+        assert_eq!(logs(&store, &id), after, "{outcome}");
+    }
+}
+
+#[test]
+fn a_sidecar_that_is_down_is_recorded_as_could_not_run_not_failed_and_not_retried() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    fake.sidecar_down.set(true);
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).could_not_run, 1);
+    assert_eq!(status_of(&store, &id), "review");
+    let after = logs(&store, &id);
+    assert!(after.contains("Verification could not run"), "{after}");
+    assert!(after.contains("not a failed verification"), "{after}");
+    let shown = status(&store, &fake, &id).unwrap();
+    assert_eq!(shown["state"], "could_not_run", "{shown}");
+    // Neither a retry storm nor a pass.
+    fake.sidecar_down.set(false);
+    assert_eq!(driver.sweep(&store, &fake), Report::default());
+    assert!(fake.starts.borrow().is_empty());
+    let identity = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+    let held = gate::check(&store, &id, &identity);
+    assert!(matches!(held, gate::Gate::Held(m) if m.contains("could not run")));
+}
+
+#[test]
+fn a_verification_that_never_settles_is_recorded_as_could_not_run() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    driver.sweep(&store, &fake);
+    fake.clock.set(Duration::from_secs(21 * 60));
+    assert_eq!(driver.sweep(&store, &fake).could_not_run, 1);
+    assert_eq!(
+        status(&store, &fake, &id).unwrap()["state"],
+        "could_not_run"
+    );
+}
+
+#[test]
+fn a_host_that_is_shutting_down_starts_nothing() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    fake.cancelled.set(true);
+    assert_eq!(Driver::default().sweep(&store, &fake), Report::default());
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn only_a_bounded_number_of_verifications_run_at_once() {
+    let (_d, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let ids: Vec<String> = (0..MAX_ACTIVE + 2)
+        .map(|n| filed(&store, &repo, &format!("gp-{n}"), &format!("Task {n}")))
+        .collect();
+    for id in &ids {
+        claim(&store, &repo, id);
+    }
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).started, MAX_ACTIVE);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    assert_eq!(fake.starts.borrow().len(), MAX_ACTIVE);
+}
+
+#[test]
+fn a_card_that_is_not_a_held_claim_is_never_verified() {
+    let (_d, store, repo, id) = setup();
+    person_edits(&store, &id, |i| {
+        i.insert("status".into(), json!("review"));
+    });
+    assert!(target_of(&live(&store, &id).unwrap()).is_none());
+    let fake = Fake::new();
+    assert_eq!(Driver::default().sweep(&store, &fake), Report::default());
+    let _ = repo;
+}
+
+#[test]
+fn the_held_block_names_the_worktree_and_head_the_claim_was_made_at() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let target = target_of(&live(&store, &id).unwrap()).unwrap();
+    assert_eq!(target.head, head_of(&repo));
+    assert!(std::fs::canonicalize(&target.worktree).is_ok());
+}
+
+#[test]
+fn status_names_every_state_apart() {
+    let (_d, store, repo, id) = setup();
+    let fake = Fake::new();
+    assert_eq!(status(&store, &fake, &id).unwrap()["state"], "none");
+    let head = head_of(&repo);
+    for (state, outcome, want) in [
+        ("running", "", "running"),
+        ("settled", "passed", "passed"),
+        ("settled", "failed", "failed"),
+        ("settled", "degraded", "degraded"),
+        ("settled", "mystery", "degraded"),
+    ] {
+        store_record(&store, &id, &record(&id, outcome, state, &repo, &head));
+        assert_eq!(status(&store, &fake, &id).unwrap()["state"], want);
+    }
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more"],
+    );
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
+    assert_eq!(status(&store, &fake, &id).unwrap()["stale"], true);
+}
+
+#[test]
+fn decide_is_a_pure_function_of_what_it_is_given() {
+    let target = Target {
+        worktree: "/w".into(),
+        head: "h1".into(),
+    };
+    let base = |latest: Option<Record>, head: &str, attempt: Option<(Duration, i64)>| {
+        decide(&Facts {
+            revision: 3,
+            logs: "",
+            target: &target,
+            current_head: Ok(head.into()),
+            latest: Ok(latest),
+            attempt,
+            item_id: "i",
+        })
+    };
+    assert_eq!(base(None, "h1", None), Step::Start);
+    assert_eq!(base(None, "h2", None), Step::Skip);
+    assert_eq!(base(None, "h1", Some((Duration::ZERO, 3))), Step::Wait);
+    let passed = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: "settled".into(),
+        outcome: "passed".into(),
+        request_id: "r".into(),
+        ..Record::default()
+    };
+    assert_eq!(
+        base(Some(passed.clone()), "h1", Some((Duration::ZERO, 3))),
+        Step::Promote
+    );
+    assert_eq!(
+        base(Some(passed.clone()), "h1", Some((Duration::ZERO, 2))),
+        Step::PassedButChanged
+    );
+    let other_head = Record {
+        head: "h0".into(),
+        ..passed
+    };
+    assert_eq!(base(Some(other_head), "h1", None), Step::Start);
+}
+
+/// A claim whose worktree is gone was recorded as `could_not_run` once, then
+/// again on every sweep: 920 identical blocks filled one card's log and its
+/// evidence rows ran into the thousands, each write waking every open board.
+/// An unreadable head records that once; a verdict already stored for the
+/// claim — that one, or a settled one — is not written over.
+#[test]
+fn an_unreadable_head_is_recorded_once_and_never_over_a_stored_verdict() {
+    let target = Target {
+        worktree: "/gone".into(),
+        head: "h1".into(),
+    };
+    let decide_with = |latest: Result<Option<Record>, String>| {
+        decide(&Facts {
+            revision: 3,
+            logs: "",
+            target: &target,
+            current_head: Err("Cannot access path '/gone'".into()),
+            latest,
+            attempt: None,
+            item_id: "i",
+        })
+    };
+    assert!(matches!(decide_with(Ok(None)), Step::CouldNotRun(_)));
+    let recorded = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: STATE_COULD_NOT_RUN.into(),
+        request_id: "auto-i-h1".into(),
+        ..Record::default()
+    };
+    assert_eq!(decide_with(Ok(Some(recorded.clone()))), Step::Skip);
+    let settled = Record {
+        state: "settled".into(),
+        outcome: "failed".into(),
+        ..recorded.clone()
+    };
+    assert_eq!(decide_with(Ok(Some(settled))), Step::Skip);
+    // A record for another claim says nothing about this one.
+    let older = Record {
+        head: "h0".into(),
+        ..recorded
+    };
+    assert!(matches!(decide_with(Ok(Some(older))), Step::CouldNotRun(_)));
+    // A store that cannot be read is asked again, not written to.
+    assert_eq!(decide_with(Err("locked".into())), Step::Skip);
+}
+
+/// The same, end to end: sweeps over a card whose worktree was deleted leave
+/// one evidence row and one note, not one per sweep.
+#[test]
+fn sweeps_over_a_deleted_worktree_write_one_could_not_run() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    std::fs::remove_dir_all(repo.path()).unwrap();
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    let mut total = 0;
+    for _ in 0..5 {
+        total += driver.sweep(&store, &fake).could_not_run;
+        // A fresh driver, as after a restart, has no memory to lean on.
+        driver = Driver::default();
+    }
+    assert_eq!(total, 1, "an unreadable head was recorded {total} times");
+    assert_eq!(
+        logs(&store, &id)
+            .matches("Verification could not run")
+            .count(),
+        1
+    );
+    assert_eq!(status_of(&store, &id), "review");
+}
+
+/// The board's one-scan read gives every card the record the per-card read
+/// gives it: the newest verification, past newer rows of other kinds, and
+/// nothing for a card never verified.
+#[test]
+fn the_batched_verdict_read_agrees_with_the_per_card_read() {
+    let (_d, store, repo, id) = setup();
+    let other = filed(&store, &repo, "gp-other", "Another");
+    let never = filed(&store, &repo, "gp-never", "Never verified");
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "failed", "settled", &repo, &head));
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
+    store_record(&store, &other, &record(&other, "", "running", &repo, &head));
+    store
+        .evidence_append(
+            "other.kind",
+            Some(&other),
+            None,
+            None,
+            "{\"not\":\"a verdict\"}",
+        )
+        .unwrap();
+    let ids = [id.clone(), other.clone(), never.clone()];
+    let batch = gate::latest_many(&store, &ids).unwrap();
+    for one in &ids {
+        assert_eq!(
+            batch.get(one),
+            gate::latest(&store, one).unwrap().as_ref(),
+            "{one}"
+        );
+    }
+    assert_eq!(batch[&id].outcome, "passed");
+    assert!(!batch.contains_key(&never));
+    assert!(gate::latest_many(&store, &[]).unwrap().is_empty());
+}
+
+/// The board reads verdicts on every refresh. That read commits nothing: a
+/// commit there would itself be announced as a change and read again.
+#[test]
+fn the_host_verdict_read_leaves_the_profile_unchanged() {
+    let (dir, path) = profile();
+    let host = crate::workbench::WorkbenchState::for_profile(&path);
+    let store = Store::open(&path).unwrap();
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let id = filed(&store, &repo, "gp-ro", "Read me");
+    store_record(
+        &store,
+        &id,
+        &record(&id, "passed", "settled", &repo, &head_of(&repo)),
+    );
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    let version = || -> i64 {
+        observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = version();
+    let out = host
+        .request("verifications.board", &json!({"ids": [id]}).to_string())
+        .unwrap();
+    assert_eq!(out["items"][&id]["state"], "passed", "{out}");
+    assert_eq!(
+        version(),
+        before,
+        "the verdict read committed to the profile"
+    );
+    // The task sheet polls this one every few seconds while a run is open.
+    let out = host
+        .request("verifications.status", &json!({"id": id}).to_string())
+        .unwrap();
+    assert_eq!(out["state"], "passed", "{out}");
+    assert_eq!(
+        version(),
+        before,
+        "the status read committed to the profile"
+    );
+    drop(dir);
+}
+
+#[test]
+fn a_deferred_head_read_is_asked_again_and_a_permanent_one_is_recorded() {
+    let target = Target {
+        worktree: "/w".into(),
+        head: "h1".into(),
+    };
+    let step = |head: Result<String, String>, latest: Option<Record>| {
+        decide(&Facts {
+            revision: 3,
+            logs: "",
+            target: &target,
+            current_head: head,
+            latest: Ok(latest),
+            attempt: None,
+            item_id: "i",
+        })
+    };
+    assert_eq!(
+        step(
+            Err("git rev-parse deferred under load after 2.000s".into()),
+            None
+        ),
+        Step::Skip
+    );
+    assert_eq!(
+        step(
+            Err("rev-parse timed out after 1.000s waiting for a process slot".into()),
+            None
+        ),
+        Step::Skip
+    );
+    assert!(matches!(
+        step(Err("not a git repository".into()), None),
+        Step::CouldNotRun(why) if why.contains("not a git repository")
+    ));
+    let deferred = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: "could_not_run".into(),
+        degraded: vec![
+            "the worktree's head could not be read: git rev-parse deferred under load after 2.010s"
+                .into(),
+        ],
+        ..Record::default()
+    };
+    assert_eq!(step(Ok("h1".into()), Some(deferred.clone())), Step::Start);
+    let waiting = decide(&Facts {
+        revision: 3,
+        logs: "",
+        target: &target,
+        current_head: Ok("h1".into()),
+        latest: Ok(Some(deferred)),
+        attempt: Some((Duration::from_secs(21 * 60), 3)),
+        item_id: "i",
+    });
+    assert!(
+        matches!(waiting, Step::CouldNotRun(ref why) if why.contains("no verdict")),
+        "{waiting:?}"
+    );
+    let sidecar = Record {
+        item_id: "i".into(),
+        head: "h1".into(),
+        state: "could_not_run".into(),
+        degraded: vec!["the verification could not be started: the sidecar is not running".into()],
+        ..Record::default()
+    };
+    assert_eq!(step(Ok("h1".into()), Some(sidecar)), Step::Skip);
+}
+
+#[test]
+fn a_head_read_deferred_under_load_records_nothing_and_starts_once_it_can_be_read() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    *fake.head_error.borrow_mut() = Some("git rev-parse deferred under load after 2.000s".into());
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake), Report::default());
+    assert!(fake.starts.borrow().is_empty());
+    assert!(
+        !logs(&store, &id).contains("could not run"),
+        "{}",
+        logs(&store, &id)
+    );
+    fake.head_error.borrow_mut().take();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    assert_eq!(fake.starts.borrow().len(), 1);
+}
+
+#[test]
+fn a_base_read_deferred_under_load_records_nothing_and_is_asked_again() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    *fake.base_error.borrow_mut() = Some("merge-base deferred under load after 2.000s".into());
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).could_not_run, 0);
+    assert!(fake.starts.borrow().is_empty());
+    assert!(
+        !logs(&store, &id).contains("could not run"),
+        "{}",
+        logs(&store, &id)
+    );
+    fake.base_error.borrow_mut().take();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+}
+
+#[test]
+fn a_could_not_run_caused_by_a_deferred_read_is_retried_once_the_head_can_be_read() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let head = head_of(&repo);
+    let mut rec = record(&id, "", "could_not_run", &repo, &head);
+    rec["degraded"] = json!([
+        "the worktree's head could not be read: git rev-parse deferred under load after 2.010s"
+    ]);
+    store_record(&store, &id, &rec);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+    assert_eq!(driver.sweep(&store, &fake).started, 0);
+    assert_eq!(fake.starts.borrow().len(), 1);
+}
+
+#[test]
+fn verification_base_of_a_commit_on_the_default_branch_is_its_parent() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    let parent = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let head = head_of(&repo);
+    let base = verification_base(repo.path(), &head).unwrap();
+    assert_eq!(base, parent);
+    assert_ne!(base, head);
+}
+
+#[test]
+fn verification_base_of_a_feature_branch_is_where_it_left_the_default_branch() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let fork = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "feature"],
+    );
+    let head = head_of(&repo);
+    let base = verification_base(repo.path(), &head).unwrap();
+    assert_eq!(base, fork);
+    assert_ne!(base, head);
+}
+
+#[test]
+fn verification_base_of_a_root_commit_on_the_default_branch_is_an_error() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "root"],
+    );
+    let err = verification_base(repo.path(), &head_of(&repo)).unwrap_err();
+    assert!(err.contains("no parent"), "{err}");
+}
+
+#[test]
+fn a_deferred_parent_read_is_not_rewritten_as_a_missing_parent() {
+    let deferred =
+        "rev-parse deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner";
+    assert_eq!(
+        base_from_parent_read(Err(deferred.into()), "abc").unwrap_err(),
+        deferred
+    );
+    let slot = "git rev-parse timed out after 1.500s waiting for a process slot";
+    assert_eq!(
+        base_from_parent_read(Err(slot.into()), "abc").unwrap_err(),
+        slot
+    );
+    let missing =
+        base_from_parent_read(Err("fatal: Needed a single revision".into()), "abc").unwrap_err();
+    assert!(missing.contains("no parent"), "{missing}");
+    assert_eq!(
+        base_from_parent_read(Err("not a git repository".into()), "abc").unwrap_err(),
+        "not a git repository"
+    );
+    let same = base_from_parent_read(Ok("abc".into()), "abc").unwrap_err();
+    assert!(same.contains("no parent"), "{same}");
+}
+
+#[test]
+fn a_batched_read_names_only_verified_cards_and_marks_a_moved_head_stale() {
+    let (_d, store, repo, id) = setup();
+    let other = filed(&store, &repo, "gp-other", "Unverified");
+    let fake = Fake::new();
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "failed", "settled", &repo, &head));
+    let ids = [id.clone(), other.clone()];
+    let out = status_batch(&store, &fake, &ids).unwrap();
+    assert_eq!(out["items"][&id]["state"], "failed", "{out}");
+    assert_eq!(out["items"][&id]["stale"], false);
+    assert!(out["items"].get(&other).is_none(), "{out}");
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more"],
+    );
+    let out = status_batch(&store, &fake, &ids).unwrap();
+    assert_eq!(out["items"][&id]["stale"], true);
+}
+
+#[test]
+fn a_batched_read_that_cannot_read_a_record_fails_instead_of_reporting_none() {
+    let (_d, store, repo, id) = setup();
+    store_record(
+        &store,
+        &id,
+        &record(&id, "passed", "settled", &repo, &head_of(&repo)),
+    );
+    store
+        .evidence_append(
+            gate::EVIDENCE_TYPE,
+            Some(&id),
+            None,
+            None,
+            "{\"request_id\": 7}",
+        )
+        .unwrap();
+    let err = status_batch(&store, &Fake::new(), &[id]).unwrap_err();
+    assert_eq!(err.code, "store_error");
+}
+
+#[test]
+fn a_batched_read_is_bounded() {
+    let (_d, store, _repo, _id) = setup();
+    let ids: Vec<String> = (0..300).map(|n| format!("i{n}")).collect();
+    assert_eq!(
+        status_batch(&store, &Fake::new(), &ids).unwrap_err().code,
+        "invalid_input"
+    );
+}
+
+#[test]
+fn a_manual_verify_after_the_claimed_worktree_was_torn_down_judges_the_repository_checkout() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("attempt");
+    let linked_str = linked.to_str().unwrap();
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "add", "-q", "-b", "attempt", linked_str],
+    );
+    let claimed = complete_task(&store, linked_str, &id, "done", None, Some("done"), None).unwrap();
+    assert_eq!(claimed["status"], "review", "{claimed}");
+    let fake = Fake::new();
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap();
+    // While the worktree exists it is the one judged.
+    run_now(&store, &fake, &id, None).unwrap();
+    assert_eq!(
+        canon(fake.starts.borrow()[0]["worktree"].as_str().unwrap()),
+        canon(linked_str)
+    );
+    // Merge-and-teardown removes it; the re-verify must follow the work to the checkout.
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", linked_str]);
+    assert!(!linked.exists());
+    run_now(&store, &fake, &id, None).expect("the re-verify falls back to the repository checkout");
+    let sent = fake.starts.borrow();
+    assert_eq!(
+        canon(sent[1]["worktree"].as_str().unwrap()),
+        canon(repo.path().to_str().unwrap())
+    );
+}
+
+/// A linked worktree with one commit of its own, claimed done and held in review.
+fn claimed_attempt(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+    parent: &tempfile::TempDir,
+) -> String {
+    let linked = parent.path().join("attempt");
+    let linked_str = linked.to_str().unwrap().to_owned();
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "add", "-q", "-b", "attempt", &linked_str],
+    );
+    crate::test_support::git_in(
+        &linked,
+        &["commit", "-q", "--allow-empty", "-m", "the attempt's work"],
+    );
+    let claimed = complete_task(store, &linked_str, id, "done", None, Some("done"), None).unwrap();
+    assert_eq!(claimed["status"], "review", "{claimed}");
+    linked_str
+}
+
+#[test]
+fn a_manual_verify_of_a_claim_whose_worktree_was_removed_unmerged_is_refused() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    // Abandoned: the worktree is deleted and its commit never reached the checkout.
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let fake = Fake::new();
+    let error =
+        run_now(&store, &fake, &id, None).expect_err("the checkout does not hold the claimed work");
+    assert_eq!(error.code, "repository_unavailable", "{}", error.message);
+    assert!(error.message.contains("not merged"), "{}", error.message);
+    assert!(
+        fake.starts.borrow().is_empty(),
+        "no verification may judge the checkout in its place"
+    );
+}
+
+#[test]
+fn a_manual_verify_of_a_claim_merged_and_torn_down_judges_the_checkout_that_holds_it() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge", "attempt"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let fake = Fake::new();
+    run_now(&store, &fake, &id, None).expect("the merged work is judged where it landed");
+    let sent = fake.starts.borrow();
+    assert_eq!(
+        std::fs::canonicalize(sent[0]["worktree"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(repo.path()).unwrap()
+    );
+}
+
+#[test]
+fn a_manual_verify_of_a_squash_merged_claim_is_refused_rather_than_guessed() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    // A squash lands the content under another commit: nothing proves the claim's commit landed.
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--squash", "attempt"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "squashed"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let fake = Fake::new();
+    assert!(run_now(&store, &fake, &id, None).is_err());
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn the_base_after_a_teardown_merge_is_the_pre_merge_target_tip_not_head() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    let before = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge", "attempt"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let after = head_of(&repo);
+    assert_ne!(before, after);
+    // What `HostBackend::base_of` answers in the primary checkout after the merge.
+    let base = verification_base(repo.path(), &after).expect("a merge commit has a first parent");
+    assert_eq!(
+        base, before,
+        "the base is the target's tip before the merge"
+    );
+    assert_ne!(base, after, "an empty range judges nothing");
+}
+
+#[test]
+fn a_named_base_is_diffed_against_in_the_merged_checkout() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    let before = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge", "attempt"],
+    );
+    // A later merge lands on top: the earlier member is judged against everything since its own merge.
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "a later member"],
+    );
+    // The leftover worktree still exists: the named base still means the checkout.
+    let fake = Fake::new();
+    run_now(&store, &fake, &id, Some(&before)).expect("a pre-merge tip is a valid base");
+    let sent = fake.starts.borrow();
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap();
+    assert_eq!(sent[0]["base"], before.as_str());
+    assert_eq!(sent[0]["head"], head_of(&repo).as_str());
+    assert_eq!(
+        canon(sent[0]["worktree"].as_str().unwrap()),
+        canon(repo.path().to_str().unwrap())
+    );
+    drop(sent);
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+}
+
+#[test]
+fn a_named_base_that_judges_nothing_or_is_not_a_commit_is_refused_without_starting() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "-c", "side"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "side"],
+    );
+    let side = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    let tip = head_of(&repo);
+    let fake = Fake::new();
+    for (named, code) in [
+        (tip.as_str(), "invalid_input"),
+        (side.as_str(), "invalid_input"),
+        ("not-a-commit", "invalid_input"),
+        ("abcdef0", "repository_unavailable"),
+    ] {
+        let error = run_now(&store, &fake, &id, Some(named)).expect_err(named);
+        assert_eq!(error.code, code, "{named}: {}", error.message);
+    }
+    assert!(
+        fake.starts.borrow().is_empty(),
+        "nothing may be started for a refused base"
+    );
+}
+
+// ---- adversarial review of the post-merge base (b17/007a2b4b-adv) ----
+
+/// A claimed attempt in its own worktree and branch, so two members can coexist.
+fn claimed_named_attempt(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+    parent: &tempfile::TempDir,
+    name: &str,
+) -> String {
+    let linked = parent.path().join(name);
+    let linked_str = linked.to_str().unwrap().to_owned();
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "add", "-q", "-b", name, &linked_str],
+    );
+    crate::test_support::git_in(
+        &linked,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("work of {name}"),
+        ],
+    );
+    let claimed = complete_task(store, &linked_str, id, "done", None, Some("done"), None).unwrap();
+    assert_eq!(claimed["status"], "review", "{claimed}");
+    linked_str
+}
+
+#[test]
+fn two_members_merged_in_turn_are_each_judged_over_their_own_pre_merge_tip() {
+    let (_d, store, repo, id_a) = setup();
+    let id_b = filed(&store, &repo, "gp-drv-b", "Ship the importer");
+    let parent = tempfile::tempdir().unwrap();
+    let lin_a = claimed_named_attempt(&store, &repo, &id_a, &parent, "mem-a");
+    let lin_b = claimed_named_attempt(&store, &repo, &id_b, &parent, "mem-b");
+    let before_a = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--no-ff", "-m", "A", "mem-a"]);
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &lin_a]);
+    let before_b = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--no-ff", "-m", "B", "mem-b"]);
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &lin_b]);
+    let tip = head_of(&repo);
+    assert_ne!(before_a, before_b);
+    let fake = Fake::new();
+    run_now(&store, &fake, &id_a, Some(&before_a)).expect("A over A's merge and B's");
+    run_now(&store, &fake, &id_b, Some(&before_b)).expect("B over B's merge");
+    let sent = fake.starts.borrow();
+    assert_eq!(sent[0]["base"], before_a.as_str());
+    assert_eq!(sent[0]["head"], tip.as_str());
+    assert_eq!(sent[1]["base"], before_b.as_str());
+    assert_eq!(sent[1]["head"], tip.as_str());
+    assert_ne!(sent[0]["base"], sent[1]["base"]);
+}
+
+#[test]
+fn a_short_uppercase_or_padded_base_resolves_to_the_full_commit_id() {
+    let (_d, store, repo, id) = setup();
+    let first = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    let fake = Fake::new();
+    let forms = [
+        first[..7].to_owned(),
+        first.to_uppercase(),
+        format!("  {first}\n"),
+    ];
+    for form in &forms {
+        run_now(&store, &fake, &id, Some(form)).unwrap_or_else(|e| panic!("{form:?}: {e:?}"));
+    }
+    for sent in fake.starts.borrow().iter() {
+        assert_eq!(
+            sent["base"],
+            first.as_str(),
+            "the full id is what is started"
+        );
+    }
+}
+
+#[test]
+fn a_64_hex_base_in_a_sha1_repository_and_other_malformed_bases_start_nothing() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    let fake = Fake::new();
+    let sha256 = "a".repeat(64);
+    let too_long = "a".repeat(65);
+    let too_short = "abcdef".to_owned();
+    let empty = String::new();
+    for named in [&sha256, &too_long, &too_short, &empty] {
+        let error = run_now(&store, &fake, &id, Some(named)).expect_err(named);
+        assert!(
+            error.code == "invalid_input" || error.code == "repository_unavailable",
+            "{named}: {error:?}"
+        );
+    }
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn a_target_force_moved_after_the_merge_refuses_the_recorded_base() {
+    let (_d, store, repo, id) = setup();
+    let before = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "-c", "side"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "side"],
+    );
+    let side = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "merge"],
+    );
+    let merged = head_of(&repo);
+    // Force-moved onto an unrelated line: the recorded base is no ancestor of the head.
+    crate::test_support::git_in(repo.path(), &["reset", "-q", "--hard", &side]);
+    let fake = Fake::new();
+    let e = run_now(&store, &fake, &id, Some(&merged)).expect_err("merged is not below side");
+    assert_eq!(e.code, "invalid_input", "{e:?}");
+    // Force-moved back to the pre-merge tip: an empty range.
+    crate::test_support::git_in(repo.path(), &["reset", "-q", "--hard", &before]);
+    let e = run_now(&store, &fake, &id, Some(&before)).expect_err("base == head");
+    assert_eq!(e.code, "invalid_input", "{e:?}");
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn a_hex_base_that_is_also_a_branch_name_is_not_read_as_the_branch() {
+    let (_d, store, repo, id) = setup();
+    let root = head_of(&repo);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "before"],
+    );
+    let before = head_of(&repo);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "tip"]);
+    // A branch named like the abbreviated id of `before`, pointing at the root commit.
+    crate::test_support::git_in(repo.path(), &["branch", &before[..12], &root]);
+    let fake = Fake::new();
+    let _ = run_now(&store, &fake, &id, Some(&before[..12]));
+    let sent = fake.starts.borrow();
+    assert!(
+        sent.is_empty() || sent[0]["base"] == before.as_str(),
+        "the base asked for was {before} but the range starts at {}",
+        sent[0]["base"]
+    );
+}
+
+/// `rev-parse` children started in `repo` so far.
+fn rev_parses_in(repo: &std::path::Path) -> usize {
+    // The card names its worktree by canonical path; the log keys on cwd.
+    let repo = std::fs::canonicalize(repo).unwrap();
+    crate::engine::git_cli::spawn_log::spawns_in(&repo)
+        .iter()
+        .filter(|argv| argv.iter().any(|arg| arg == "rev-parse"))
+        .count()
+}
+
+/// The driver sweeps every few seconds over every held card, and each sweep
+/// reads each card's head. An unchanged worktree must not cost a process per
+/// sweep: this was the whole of the steady `rev-parse` rate (23 cards every
+/// 3 s is 7.7 launches a second).
+#[test]
+fn repeated_head_and_base_reads_of_an_unchanged_worktree_launch_git_at_most_once() {
+    let _held = crate::engine::ref_cache::retention();
+    let repo = crate::test_support::git_repo();
+    let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let path = repo.path().to_str().unwrap();
+    let before = rev_parses_in(repo.path());
+    let (head, base) = crate::engine::ref_cache::eager(|| {
+        let head = gate::current_head(path).unwrap();
+        let base = verification_base(repo.path(), &head).unwrap();
+        for _ in 0..5 {
+            assert_eq!(gate::current_head(path).unwrap(), head);
+            assert_eq!(verification_base(repo.path(), &head).unwrap(), base);
+        }
+        (head, base)
+    });
+    assert_ne!(head, base);
+    let spawned = crate::engine::git_cli::spawn_log::spawns_in(repo.path());
+    let head_reads = spawned
+        .iter()
+        .filter(|argv| argv.iter().any(|arg| arg == "HEAD^{commit}"))
+        .count();
+    assert_eq!(head_reads, 1, "head was read {head_reads} times");
+    let used = rev_parses_in(repo.path()) - before;
+    // The head once, then the base's own two reads once.
+    assert!(used <= 3, "{used} rev-parse children for one head and one base");
+}
+
+/// N unchanged cards, swept repeatedly, launch nothing after the first read;
+/// a commit in one card's worktree costs only that card a read.
+#[test]
+fn a_sweep_over_unchanged_cards_launches_no_git_and_a_commit_invalidates_only_its_card() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_d, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let mut repos = Vec::new();
+    for n in 0..6 {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let id = filed(&store, &repo, &format!("gp-sweep-{n}"), "Ship the exporter");
+        claim(&store, &repo, &id);
+        repos.push(repo);
+    }
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    let counts = |repos: &[tempfile::TempDir]| -> Vec<usize> {
+        repos.iter().map(|r| rev_parses_in(r.path())).collect()
+    };
+    crate::engine::ref_cache::eager(|| {
+        // Warms every card's head.
+        driver.sweep(&store, &fake);
+        let warm = counts(&repos);
+        assert!(warm.iter().all(|n| *n > 0), "the seam saw no spawns: {warm:?}");
+        for _ in 0..4 {
+            driver.sweep(&store, &fake);
+        }
+        assert_eq!(counts(&repos), warm, "an idle sweep launched git");
+        // One card's worktree commits: only it is read again.
+        crate::test_support::git_in(
+            repos[2].path(),
+            &["commit", "-q", "--allow-empty", "-m", "more"],
+        );
+        driver.sweep(&store, &fake);
+        for (n, (now, was)) in counts(&repos).iter().zip(&warm).enumerate() {
+            assert_eq!(now - was, usize::from(n == 2), "card {n}");
+        }
+    });
+}
+
+/// A ref moved with `update-ref` straight after it was read, inside one
+/// timestamp tick, is still seen: git replaces the ref file by rename, so its
+/// identity changes whatever its mtime says.
+#[test]
+fn a_head_moved_by_update_ref_within_the_same_tick_is_seen() {
+    let _held = crate::engine::ref_cache::retention();
+    let repo = crate::test_support::git_repo();
+    let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    let path = repo.path().to_str().unwrap();
+    let first = gate::current_head(path).unwrap();
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    crate::engine::ref_cache::eager(|| {
+        let second = gate::current_head(path).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(gate::current_head(path).unwrap(), second);
+        git(&["update-ref", "HEAD", &first]);
+        assert_eq!(gate::current_head(path).unwrap(), first);
+        git(&["update-ref", "HEAD", &second]);
+        assert_eq!(gate::current_head(path).unwrap(), second);
+    });
+}

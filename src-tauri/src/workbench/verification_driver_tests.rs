@@ -588,7 +588,7 @@ fn a_deferred_head_read_is_asked_again_and_a_permanent_one_is_recorded() {
     };
     assert_eq!(
         step(
-            Err("git rev-parse deferred under load after 2.000s".into()),
+            Err("git rev-parse deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner".into()),
             None
         ),
         Step::Skip
@@ -643,7 +643,7 @@ fn a_head_read_deferred_under_load_records_nothing_and_starts_once_it_can_be_rea
     let (_d, store, repo, id) = setup();
     claim(&store, &repo, &id);
     let fake = Fake::new();
-    *fake.head_error.borrow_mut() = Some("git rev-parse deferred under load after 2.000s".into());
+    *fake.head_error.borrow_mut() = Some("git rev-parse deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner".into());
     let mut driver = Driver::default();
     assert_eq!(driver.sweep(&store, &fake), Report::default());
     assert!(fake.starts.borrow().is_empty());
@@ -663,7 +663,7 @@ fn a_base_read_deferred_under_load_records_nothing_and_is_asked_again() {
     let (_d, store, repo, id) = setup();
     claim(&store, &repo, &id);
     let fake = Fake::new();
-    *fake.base_error.borrow_mut() = Some("merge-base deferred under load after 2.000s".into());
+    *fake.base_error.borrow_mut() = Some("merge-base deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner".into());
     let mut driver = Driver::default();
     assert_eq!(driver.sweep(&store, &fake).could_not_run, 0);
     assert!(fake.starts.borrow().is_empty());
@@ -1154,4 +1154,182 @@ fn a_hex_base_that_is_also_a_branch_name_is_not_read_as_the_branch() {
         "the base asked for was {before} but the range starts at {}",
         sent[0]["base"]
     );
+}
+
+/// `rev-parse` children started in `repo` so far.
+fn rev_parses_in(repo: &std::path::Path) -> usize {
+    // The log keys on the cwd as the caller spelled it: a card names its
+    // worktree by canonical path, a direct caller by the tempdir's.
+    let canonical = std::fs::canonicalize(repo).unwrap();
+    let mut spellings = vec![repo.to_path_buf()];
+    if canonical != repo {
+        spellings.push(canonical);
+    }
+    spellings
+        .iter()
+        .flat_map(|path| crate::engine::git_cli::spawn_log::spawns_in(path))
+        .filter(|argv| argv.iter().any(|arg| arg == "rev-parse"))
+        .count()
+}
+
+/// The driver sweeps every few seconds over every held card, and each sweep
+/// reads each card's head. An unchanged worktree must not cost a process per
+/// sweep: this was the whole of the steady `rev-parse` rate (23 cards every
+/// 3 s is 7.7 launches a second).
+#[test]
+fn repeated_head_and_base_reads_of_an_unchanged_worktree_launch_git_at_most_once() {
+    let _held = crate::engine::ref_cache::retention();
+    let repo = crate::test_support::git_repo();
+    let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let path = repo.path().to_str().unwrap();
+    let before = rev_parses_in(repo.path());
+    let (head, base) = crate::engine::ref_cache::eager(|| {
+        let head = gate::current_head(path).unwrap();
+        let base = verification_base(repo.path(), &head).unwrap();
+        for _ in 0..5 {
+            assert_eq!(gate::current_head(path).unwrap(), head);
+            assert_eq!(verification_base(repo.path(), &head).unwrap(), base);
+        }
+        (head, base)
+    });
+    assert_ne!(head, base);
+    let spawned = crate::engine::git_cli::spawn_log::spawns_in(repo.path());
+    let head_reads = spawned
+        .iter()
+        .filter(|argv| argv.iter().any(|arg| arg == "HEAD^{commit}"))
+        .count();
+    assert_eq!(head_reads, 1, "head was read {head_reads} times");
+    let used = rev_parses_in(repo.path()) - before;
+    // The head once, then the base's own two reads once.
+    assert!(
+        used <= 3,
+        "{used} rev-parse children for one head and one base"
+    );
+}
+
+/// N unchanged cards, swept repeatedly, launch nothing after the first read;
+/// a commit in one card's worktree costs only that card a read.
+#[test]
+fn a_sweep_over_unchanged_cards_launches_no_git_and_a_commit_invalidates_only_its_card() {
+    let _held = crate::engine::ref_cache::retention();
+    let (_d, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let mut repos = Vec::new();
+    for n in 0..6 {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        let id = filed(&store, &repo, &format!("gp-sweep-{n}"), "Ship the exporter");
+        claim(&store, &repo, &id);
+        repos.push(repo);
+    }
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    let counts = |repos: &[tempfile::TempDir]| -> Vec<usize> {
+        repos.iter().map(|r| rev_parses_in(r.path())).collect()
+    };
+    crate::engine::ref_cache::eager(|| {
+        // Warms every card's head.
+        driver.sweep(&store, &fake);
+        let warm = counts(&repos);
+        assert!(
+            warm.iter().all(|n| *n > 0),
+            "the seam saw no spawns: {warm:?}"
+        );
+        for _ in 0..4 {
+            driver.sweep(&store, &fake);
+        }
+        assert_eq!(counts(&repos), warm, "an idle sweep launched git");
+        // One card's worktree commits: only it is read again.
+        crate::test_support::git_in(
+            repos[2].path(),
+            &["commit", "-q", "--allow-empty", "-m", "more"],
+        );
+        driver.sweep(&store, &fake);
+        for (n, (now, was)) in counts(&repos).iter().zip(&warm).enumerate() {
+            assert_eq!(now - was, usize::from(n == 2), "card {n}");
+        }
+    });
+}
+
+/// Steady `rev-parse` launch rate of the driver's per-card head read: 23
+/// fixture worktrees, one read each every `SWEEP_PERIOD` (3 s), for 60 s of
+/// wall clock, the pre-fix read (`git_cli::git_text`, one child per call)
+/// interleaved with the cached one, min of two rounds.
+/// Run: `cargo test --lib -- --ignored --nocapture steady_head_read_rate`.
+#[test]
+#[ignore = "60 s per variant per round; run by hand for the numbers"]
+fn steady_head_read_rate_before_and_after() {
+    let repos: Vec<_> = (0..23)
+        .map(|_| {
+            let repo = crate::test_support::git_repo();
+            crate::test_support::git_in(
+                repo.path(),
+                &["commit", "-q", "--allow-empty", "-m", "init"],
+            );
+            repo
+        })
+        .collect();
+    // Past the racy window, so a stamp may be stored.
+    std::thread::sleep(Duration::from_secs(4));
+    let launches = |repos: &[tempfile::TempDir]| -> usize {
+        repos.iter().map(|r| rev_parses_in(r.path())).sum()
+    };
+    let run = |cached: bool| -> f64 {
+        let before = launches(&repos);
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(60) {
+            let sweep = Instant::now();
+            for repo in &repos {
+                let path = repo.path().to_str().unwrap();
+                if cached {
+                    gate::current_head(path).unwrap();
+                } else {
+                    crate::engine::git_cli::git_text(
+                        repo.path(),
+                        &["rev-parse", "--verify", "HEAD^{commit}"],
+                    )
+                    .unwrap();
+                }
+            }
+            std::thread::sleep(Duration::from_secs(3).saturating_sub(sweep.elapsed()));
+        }
+        let used = launches(&repos) - before;
+        eprintln!("cached={cached}: {used} launches");
+        used as f64 / started.elapsed().as_secs_f64()
+    };
+    let (mut old, mut new) = (f64::MAX, f64::MAX);
+    for _ in 0..2 {
+        old = old.min(run(false));
+        new = new.min(run(true));
+    }
+    eprintln!("steady rev-parse launches/s over 23 cards: before {old:.2}, after {new:.2}");
+    assert!(new <= 1.0, "{new:.2} launches/s");
+}
+
+/// A ref moved with `update-ref` straight after it was read, inside one
+/// timestamp tick, is still seen: git replaces the ref file by rename, so its
+/// identity changes whatever its mtime says.
+#[test]
+fn a_head_moved_by_update_ref_within_the_same_tick_is_seen() {
+    let _held = crate::engine::ref_cache::retention();
+    let repo = crate::test_support::git_repo();
+    let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    let path = repo.path().to_str().unwrap();
+    let first = gate::current_head(path).unwrap();
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    crate::engine::ref_cache::eager(|| {
+        let second = gate::current_head(path).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(gate::current_head(path).unwrap(), second);
+        git(&["update-ref", "HEAD", &first]);
+        assert_eq!(gate::current_head(path).unwrap(), first);
+        git(&["update-ref", "HEAD", &second]);
+        assert_eq!(gate::current_head(path).unwrap(), second);
+    });
 }

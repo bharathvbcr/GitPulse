@@ -750,6 +750,20 @@ fn missing_parent(err: &str) -> bool {
 /// A git question that was not asked is returned as that error. It is not
 /// rewritten into "no parent" or "no default branch".
 pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, String> {
+    // The base is a function of `head`, the default branch and the other refs,
+    // all of which the ref stamp covers, so an unchanged repository is
+    // answered without the three or four reads below. The "argv" is a key
+    // for the cache, never run. Only an answer is kept: a deferral or a root
+    // commit is an `Err` and is asked again.
+    crate::engine::ref_cache::through(
+        worktree,
+        &[crate::engine::ref_cache::ALL_REFS],
+        &["verification-base", head],
+        || verification_base_uncached(worktree, head).map(|base| (base, true)),
+    )
+}
+
+fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, String> {
     let head = resolve_commit(worktree, head)?;
     let fork = default_fork(worktree, &head)?;
     if fork != head {
