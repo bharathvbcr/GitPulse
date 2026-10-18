@@ -6596,7 +6596,7 @@ mod tests {
         assert!(error.contains("exists; cannot create"), "{error}");
         assert!(!is_transient_git_lock_error(&error), "{error}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "a permanent failure is not retried with backoff"
         );
     }
