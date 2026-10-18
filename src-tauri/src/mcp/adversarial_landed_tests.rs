@@ -37,13 +37,17 @@ fn put(repo: &str, file: &str, content: &str, message: &str) -> String {
 }
 
 /// `(label, repository, commit, base)` for every landing shape and failure.
-fn fixtures() -> (Vec<tempfile::TempDir>, Vec<(String, String, String, Option<String>)>) {
+fn fixtures() -> (
+    Vec<tempfile::TempDir>,
+    Vec<(String, String, String, Option<String>)>,
+) {
     let mut keep = Vec::new();
     let mut cases = Vec::new();
-    let mut add = |label: &str, dir: tempfile::TempDir, repo: String, commit: String, base: Option<&str>| {
-        keep.push(dir);
-        cases.push((label.to_string(), repo, commit, base.map(str::to_string)));
-    };
+    let mut add =
+        |label: &str, dir: tempfile::TempDir, repo: String, commit: String, base: Option<&str>| {
+            keep.push(dir);
+            cases.push((label.to_string(), repo, commit, base.map(str::to_string)));
+        };
 
     // ff
     let (dir, repo) = repo_with_root();
@@ -110,7 +114,13 @@ fn fixtures() -> (Vec<tempfile::TempDir>, Vec<(String, String, String, Option<St
 
     // option-looking input must stay an operand
     let (dir, repo) = repo_with_root();
-    add("option-like commit", dir, repo, "--output=/etc/gitpulse-should-not-exist".into(), Some("main"));
+    add(
+        "option-like commit",
+        dir,
+        repo,
+        "--output=/etc/gitpulse-should-not-exist".into(),
+        Some("main"),
+    );
     let (dir, repo) = repo_with_root();
     let c = git(&repo, &["rev-parse", "HEAD"]);
     add("option-like base", dir, repo, c, Some("--all"));
@@ -133,8 +143,18 @@ fn fixtures() -> (Vec<tempfile::TempDir>, Vec<(String, String, String, Option<St
     assert!(out.status.success(), "{out:?}");
     crate::test_support::trust_repo(clone_dir.path());
     keep.push(origin_dir);
-    cases.push(("shallow, below the boundary".into(), clone.clone(), old, Some("origin/main".into())));
-    cases.push(("shallow, unmerged tip".into(), clone, feature, Some("origin/main".into())));
+    cases.push((
+        "shallow, below the boundary".into(),
+        clone.clone(),
+        old,
+        Some("origin/main".into()),
+    ));
+    cases.push((
+        "shallow, unmerged tip".into(),
+        clone,
+        feature,
+        Some("origin/main".into()),
+    ));
     keep.push(clone_dir);
     (keep, cases)
 }
@@ -158,7 +178,10 @@ fn assert_conforms(label: &str, payload: &Value, schema: &Value) {
     assert!(violations.is_empty(), "{label}: {violations:?}\n{payload}");
     let properties = schema["properties"].as_object().expect("properties");
     for key in payload.as_object().expect("object").keys() {
-        assert!(properties.contains_key(key), "{label}: undeclared field {key}");
+        assert!(
+            properties.contains_key(key),
+            "{label}: undeclared field {key}"
+        );
     }
     for required in schema["required"].as_array().expect("required") {
         assert!(
@@ -202,27 +225,43 @@ fn live_landed_and_provenance_payloads_meet_their_output_schemas_on_every_fixtur
         );
         // null landed always says why; true/false never carries a null-reason.
         if landed["landed"].is_null() {
-            assert!(!landed["error"].as_str().unwrap().is_empty(), "{label}: {landed}");
+            assert!(
+                !landed["error"].as_str().unwrap().is_empty(),
+                "{label}: {landed}"
+            );
         }
         seen.insert(landed["landed"].to_string());
 
         if validate_arguments("gitpulse_provenance", &provenance_arguments).is_ok() {
             let provenance = handle_tool_call("gitpulse_provenance", &provenance_arguments)
                 .unwrap_or_else(|e| panic!("{label}: provenance errored: {e}"));
-            assert_conforms(&format!("provenance/{label}"), &provenance, &provenance_schema);
+            assert_conforms(
+                &format!("provenance/{label}"),
+                &provenance,
+                &provenance_schema,
+            );
             // A null relation always says why; a measured one never has a reason.
             let measured = !provenance["landed_on_base"].is_null();
             assert_eq!(
-                provenance["base_relation_reason"].as_str().unwrap().is_empty(),
+                provenance["base_relation_reason"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty(),
                 measured,
                 "{label}: {provenance}"
             );
-            assert_eq!(provenance["on_base"], provenance["landed_on_base"], "{label}");
+            assert_eq!(
+                provenance["on_base"], provenance["landed_on_base"],
+                "{label}"
+            );
         }
     }
     // The fixtures reached all three answers: true, false and null.
     for answer in ["true", "false", "null"] {
-        assert!(seen.contains(answer), "no fixture answered {answer}: {seen:?}");
+        assert!(
+            seen.contains(answer),
+            "no fixture answered {answer}: {seen:?}"
+        );
     }
 }
 
@@ -238,13 +277,23 @@ fn gitpulse_landed_is_read_only_everywhere_the_server_says_so() {
     let manifest: Value =
         serde_json::from_str(contents[0]["text"].as_str().expect("text")).expect("json");
     let writes = manifest["writes"].as_array().expect("writes");
-    assert!(!writes.iter().any(|name| name == "gitpulse_landed"), "{writes:?}");
+    assert!(
+        !writes.iter().any(|name| name == "gitpulse_landed"),
+        "{writes:?}"
+    );
     // And it is in the manifest's tool list at all.
     let listed = manifest["tools"]
         .as_array()
-        .map(|tools| tools.iter().any(|t| t == "gitpulse_landed" || t["name"] == "gitpulse_landed"))
+        .map(|tools| {
+            tools
+                .iter()
+                .any(|t| t == "gitpulse_landed" || t["name"] == "gitpulse_landed")
+        })
         .unwrap_or(true);
-    assert!(listed, "gitpulse_landed missing from the manifest's tools: {manifest}");
+    assert!(
+        listed,
+        "gitpulse_landed missing from the manifest's tools: {manifest}"
+    );
 }
 
 fn ledger_repo(rows: usize) -> (tempfile::TempDir, String) {

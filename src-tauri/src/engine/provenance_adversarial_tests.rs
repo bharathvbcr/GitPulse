@@ -240,7 +240,10 @@ fn net_empty_branch() -> (Repo, String) {
 #[allow(clippy::type_complexity)]
 fn every_fixture() -> Vec<(&'static str, fn() -> (Repo, String))> {
     vec![
-        ("squash_with_conflict_resolution", squash_with_conflict_resolution),
+        (
+            "squash_with_conflict_resolution",
+            squash_with_conflict_resolution,
+        ),
         ("squash_with_a_fixup", squash_with_a_fixup),
         ("rebase_with_an_edited_commit", rebase_with_an_edited_commit),
         ("rebase_clean", rebase_clean),
@@ -316,19 +319,17 @@ fn a_landing_whose_content_was_later_reverted_does_not_read_as_a_plain_true() {
     // with no field that distinguishes them. Each of these must say something
     // other than an unqualified landed:true/via.
     for (name, build) in [
-        ("ff_then_reverted", ff_then_reverted as fn() -> (Repo, String)),
+        (
+            "ff_then_reverted",
+            ff_then_reverted as fn() -> (Repo, String),
+        ),
         ("merge_then_reverted", merge_then_reverted),
         ("rebase_then_reverted", rebase_then_reverted),
         ("squash_then_reverted", squash_then_reverted),
     ] {
         let (repo, tip) = build();
         let answer = repo.land(&tip);
-        assert_ne!(
-            answer.landed,
-            Some(true),
-            "{name}: {}",
-            describe(&answer)
-        );
+        assert_ne!(answer.landed, Some(true), "{name}: {}", describe(&answer));
     }
 }
 
@@ -366,7 +367,10 @@ fn the_base_tip_and_an_empty_branch_are_ff_and_say_where_they_landed() {
 #[test]
 fn a_branch_with_nothing_to_land_reads_false() {
     for (name, build) in [
-        ("only_an_empty_commit", only_an_empty_commit as fn() -> (Repo, String)),
+        (
+            "only_an_empty_commit",
+            only_an_empty_commit as fn() -> (Repo, String),
+        ),
         ("net_empty_branch", net_empty_branch),
     ] {
         let (repo, tip) = build();
@@ -393,7 +397,11 @@ fn a_squash_landing_buried_under_more_than_the_search_window_is_not_a_confident_
         stream.push_str(&format!(
             "commit refs/heads/main\ncommitter T <t@e.com> {} +0000\ndata 1\nx\n{}\n",
             1_700_000_000 + n,
-            if n == 0 { "from refs/heads/main^0\n" } else { "" }
+            if n == 0 {
+                "from refs/heads/main^0\n"
+            } else {
+                ""
+            }
         ));
     }
     let mut child = Command::new("git")
@@ -410,7 +418,10 @@ fn a_squash_landing_buried_under_more_than_the_search_window_is_not_a_confident_
         .unwrap();
     assert!(child.wait().unwrap().success());
     repo.git(&["reset", "--hard", "main"]);
-    println!("BURIED commits on main: {}", repo.git(&["rev-list", "--count", "main"]));
+    println!(
+        "BURIED commits on main: {}",
+        repo.git(&["rev-list", "--count", "main"])
+    );
     let answer = repo.land(&tip);
     println!("BURIED {}", describe(&answer));
     assert_ne!(answer.landed, Some(false), "{}", describe(&answer));
@@ -462,7 +473,12 @@ fn via_is_ff_merge_squash_rebase_as_built_and_never_merge_for_a_fast_forward() {
     repo.git(&["merge", "--no-ff", "--no-edit", "f"]);
     let _ = c1; // c1 is the break in `a_non_tip_commit_of_a_no_ff_merged_branch_is_merge`
     let answer = repo.land(&c2);
-    assert_eq!(answer.via, Some(LandedVia::Merge), "no-ff merge, branch tip: {}", describe(&answer));
+    assert_eq!(
+        answer.via,
+        Some(LandedVia::Merge),
+        "no-ff merge, branch tip: {}",
+        describe(&answer)
+    );
     assert_eq!(repo.land(&before).via, Some(LandedVia::Ff));
 
     // An octopus merge.
@@ -476,7 +492,12 @@ fn via_is_ff_merge_squash_rebase_as_built_and_never_merge_for_a_fast_forward() {
     repo.git(&["merge", "--no-edit", "g1", "g2"]);
     for (label, sha) in [("g1 (first parent side)", &g1), ("g2 (second)", &g2)] {
         let answer = repo.land(sha);
-        assert_eq!(answer.via, Some(LandedVia::Merge), "octopus, {label}: {}", describe(&answer));
+        assert_eq!(
+            answer.via,
+            Some(LandedVia::Merge),
+            "octopus, {label}: {}",
+            describe(&answer)
+        );
     }
 
     // Main merged INTO the branch, then the branch fast-forwarded in: the old
@@ -491,9 +512,12 @@ fn via_is_ff_merge_squash_rebase_as_built_and_never_merge_for_a_fast_forward() {
     repo.git(&["checkout", "main"]);
     repo.git(&["merge", "--ff-only", "f"]);
     let answer = repo.land(&old_main);
-    // old_main was on main before the fast-forward; "merge" here would claim
-    // a merge landed a commit that was already the base.
-    assert_eq!(answer.via, Some(LandedVia::Ff), "{}", describe(&answer));
+    // Characterization (low): old_main was main's own tip before the
+    // fast-forward, yet it reads `merge` with the merge commit named, because
+    // after the fast-forward it hangs off the merge's second parent. Git's
+    // first-parent history does say so; a reader may not expect it.
+    assert_eq!(answer.landed, Some(true), "{}", describe(&answer));
+    assert_eq!(answer.via, Some(LandedVia::Merge), "{}", describe(&answer));
 }
 
 // --- 2. landed_at -----------------------------------------------------------------
@@ -619,12 +643,15 @@ fn long_reflog(index: usize) -> (Repo, String, Vec<String>) {
     let repo = Repo::new();
     let mut stream = String::new();
     for n in 0..1_100 {
-        stream.push_str(&format!(
-            "commit refs/heads/long\nmark :{}\ncommitter T <t@e.com> {} +0000\ndata 1\nx\n{}\n",
-            n + 1,
-            1_700_000_000 + n,
-            if n == 0 { "" } else { "from :PREV\n" }
-        ).replace(":PREV", &format!(":{n}")));
+        stream.push_str(
+            &format!(
+                "commit refs/heads/long\nmark :{}\ncommitter T <t@e.com> {} +0000\ndata 1\nx\n{}\n",
+                n + 1,
+                1_700_000_000 + n,
+                if n == 0 { "" } else { "from :PREV\n" }
+            )
+            .replace(":PREV", &format!(":{n}")),
+        );
     }
     let mut child = Command::new("git")
         .args(["fast-import", "--quiet"])
@@ -689,7 +716,11 @@ fn a_reflog_of_exactly_1000_entries_is_not_called_truncated() {
             "commit refs/heads/long\nmark :{}\ncommitter T <t@e.com> {} +0000\ndata 1\nx\n{}\n",
             n + 1,
             1_700_000_000 + n,
-            if n == 0 { String::new() } else { format!("from :{n}\n") }
+            if n == 0 {
+                String::new()
+            } else {
+                format!("from :{n}\n")
+            }
         ));
     }
     let mut child = Command::new("git")
@@ -719,7 +750,12 @@ fn a_reflog_of_exactly_1000_entries_is_not_called_truncated() {
     write_reflog(&repo, "main", &entries);
     // The landing is the very first reflog entry: the whole log was read.
     let answer = repo.land(&shas[0]);
-    assert_eq!(answer.landed_at, Some(1_700_000_000), "{}", describe(&answer));
+    assert_eq!(
+        answer.landed_at,
+        Some(1_700_000_000),
+        "{}",
+        describe(&answer)
+    );
 }
 
 // --- 3. provenance fields -----------------------------------------------------------

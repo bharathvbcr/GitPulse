@@ -44,7 +44,12 @@ fn populated(repo: &str, rows: usize) {
                     format!("/w/{}", n % 5),
                     (n % 3 == 0).then_some("gitpulse-ledger-identity"),
                     (n % 4 == 0).then(|| format!("T{}", n % 7)),
-                    ["worktree.bind", "worktree.unbind", "reflog.commit", "ledger.reanchor"][n % 4],
+                    [
+                        "worktree.bind",
+                        "worktree.unbind",
+                        "reflog.commit",
+                        "ledger.reanchor"
+                    ][n % 4],
                     format!("obj-z{n}"),
                 ],
             )
@@ -64,9 +69,17 @@ fn existing_queries() -> Vec<(&'static str, String, Vec<String>)> {
     let mut three = two.clone();
     three.push(s("2026-02-01T00:30:00.000Z"));
     vec![
-        ("latest binding", LATEST_BINDING_SQL.to_string(), two.clone()),
+        (
+            "latest binding",
+            LATEST_BINDING_SQL.to_string(),
+            two.clone(),
+        ),
         ("binding as of", BINDING_AS_OF_SQL.to_string(), three),
-        ("binding history", BINDING_HISTORY_SQL.to_string(), two.clone()),
+        (
+            "binding history",
+            BINDING_HISTORY_SQL.to_string(),
+            two.clone(),
+        ),
         (
             "newest binding of a sibling",
             "SELECT ts_utc, ulid, action, task_id FROM events
@@ -107,14 +120,23 @@ fn existing_queries() -> Vec<(&'static str, String, Vec<String>)> {
              WHERE session_id = ?1 AND action = ?2 AND repo_path IN (?3, ?4)
              ORDER BY id LIMIT 65"
                 .to_string(),
-            vec![s("gitpulse-ledger-identity"), s("ledger.reanchor"), s("/a"), s("/b")],
+            vec![
+                s("gitpulse-ledger-identity"),
+                s("ledger.reanchor"),
+                s("/a"),
+                s("/b"),
+            ],
         ),
         (
             "latest identity",
             "SELECT detail_json FROM events WHERE session_id = ?1 AND action IN (?2, ?3)
              ORDER BY id DESC LIMIT 1"
                 .to_string(),
-            vec![s("gitpulse-ledger-identity"), s("ledger.anchor"), s("ledger.reanchor")],
+            vec![
+                s("gitpulse-ledger-identity"),
+                s("ledger.anchor"),
+                s("ledger.reanchor"),
+            ],
         ),
         (
             "by ulid",
@@ -421,7 +443,11 @@ fn limit_extremes_are_clamped_not_refused_or_unbounded() {
             )
             .unwrap()
             .unwrap();
-            assert_eq!(found.events.len(), expected, "limit {limit} desc {descending}");
+            assert_eq!(
+                found.events.len(),
+                expected,
+                "limit {limit} desc {descending}"
+            );
             assert!(found.more);
         }
     }
