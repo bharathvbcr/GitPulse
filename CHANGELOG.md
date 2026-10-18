@@ -191,7 +191,7 @@ reinstalling.
     much it read and how much there was.
   - A repository is caught up at most once a minute, however often you switch
     tabs.
-  - Each Claude and Codex transcript is read and parsed once for all of a
+  - Each Claude transcript is read and parsed once for all of a
     repository's worktrees, instead of once per worktree, in 1 MiB chunks.
 - **The Insights snapshot reads each worktree's status once.**
   - The worktree rows and the collision check now describe the same read.

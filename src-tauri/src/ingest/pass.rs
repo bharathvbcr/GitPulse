@@ -1,6 +1,7 @@
 //! The family-wide transcript pass.
 //!
-//! Claude and Codex transcripts belong to the machine, not to a worktree, yet
+//! Claude transcripts (the only source ingested; no Codex reader exists)
+//! belong to the machine, not to a worktree, yet
 //! progress is recorded per worktree (`transcript_cursors (worktree_key,
 //! file_key, byte_offset)`) and used to be replayed per worktree: with eighteen
 //! worktrees one corpus was read and parsed up to eighteen times. One pass now
