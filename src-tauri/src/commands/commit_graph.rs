@@ -63,46 +63,12 @@ pub struct GraphNotes {
     pub notices: Vec<String>,
 }
 
-/// `git rev-parse HEAD` fails this way when the branch has no commits yet —
-/// a brand-new repository, or `git checkout --orphan`. That is a true
-/// statement about the repository, not a probe GitPulse failed to run, so it
-/// belongs in `notices` rather than the diagnostics ring.
-pub(super) fn is_unborn_head_error(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("ambiguous argument 'head'")
-        || lower.contains("needed a single revision")
-        || (lower.contains("unknown revision") && lower.contains("head"))
-}
-
-/// Whether a failed HEAD probe means the checked-out branch has no commits.
-///
-/// Git words an unborn branch and a branch whose ref file is unreadable
-/// identically (`ambiguous argument 'HEAD'`), so the error text only says
-/// "HEAD did not resolve". The branch is unborn when HEAD names a ref that is
-/// absent; if that ref is present and still did not resolve, it is damaged,
-/// and calling it "no commits yet" would present a fault as a repository fact.
-/// Any probe that cannot answer counts as "not unborn": the caller then
-/// records the original error as a warning.
-pub(super) fn head_is_unborn(repo: &Path, err: &str) -> bool {
-    if !is_unborn_head_error(err) {
-        return false;
-    }
-    let Ok(target) = crate::engine::git_cli::git_text(repo, &["symbolic-ref", "-q", "HEAD"]) else {
-        return false;
-    };
-    let Ok(located) =
-        crate::engine::git_cli::git_text(repo, &["rev-parse", "--git-path", target.trim()])
-    else {
-        return false;
-    };
-    let located = Path::new(located.trim());
-    let located = if located.is_absolute() {
-        located.to_path_buf()
-    } else {
-        repo.join(located)
-    };
-    !located.exists()
-}
+/// A failed `git rev-parse HEAD` on a branch with no commits yet (a brand-new
+/// repository, or `git checkout --orphan`) is a true statement about the
+/// repository, not a probe GitPulse failed to run, so it belongs in `notices`
+/// rather than the diagnostics ring. The classifier is the one
+/// `git_reader` uses; a damaged ref that prints the same words is not unborn.
+use crate::engine::git_reader::head_is_unborn;
 
 pub(super) const UNBORN_HEAD_NOTICE: &str =
     "This repository has no commits yet, so the graph has no HEAD marker.";
