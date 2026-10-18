@@ -600,7 +600,7 @@ fn save_edited_text(
     crate::diff::write_regular_expecting(&dest, expect, |existing| {
         let encoded = crate::engine::text_shape::encode_edited_text(file_path, existing, content);
         match encoded {
-            Err(_) if false && overwrite => Ok(content.as_bytes().to_vec()),
+            Err(_) if overwrite => Ok(content.as_bytes().to_vec()),
             other => other,
         }
     })
@@ -11394,15 +11394,17 @@ mod tests {
     /// A nested repository whose `.git` FILE names a gitdir elsewhere in the
     /// tree: `sub/.git` -> `gitdir: ../.modules/sub`.
     fn nested_repo_with_separate_gitdir() -> (tempfile::TempDir, String) {
+        use crate::procguard::LockedSpawn;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().canonicalize().unwrap();
         init_plain_git_repo(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join(".modules")).unwrap();
         std::fs::write(root.join("sub/lib.txt"), "x\n").unwrap();
         let output = std::process::Command::new("git")
             .args(["init", "-q", "--separate-git-dir", "../.modules/sub"])
             .current_dir(root.join("sub"))
-            .output()
+            .output_locked()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(root.join("sub/.git").is_file());

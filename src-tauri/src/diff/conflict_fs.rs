@@ -691,8 +691,10 @@ fn read_source(
 
 /// The Windows pin records the directories it makes in `created`, as the unix
 /// walk does, so a failed create removes them again through the same cleanup.
-/// Compiled for `x86_64-pc-windows-msvc` by `cargo check` only: no Windows host
-/// has run it.
+/// UNVERIFIED on Windows: there is no Windows host, and `cargo check --target
+/// x86_64-pc-windows-msvc` stops at `libsqlite3-sys`' C build on this machine,
+/// so this path has been neither compiled nor run. The shared cleanup loop it
+/// feeds is run on unix by `a_failed_create_removes_the_directories_it_made_and_only_those`.
 #[cfg(windows)]
 fn read_source(
     path: &Path,
