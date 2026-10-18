@@ -1197,6 +1197,8 @@
           repoPath: repo,
           filePath: path,
           commitId: commitId || null,
+          // Only displayed here, never saved from: skip the digest pass.
+          withDigest: false,
         });
         let oldBlob: FileBlob | null = null;
         try {
@@ -1204,6 +1206,7 @@
             repoPath: repo,
             filePath: path,
             commitId: commitId ? `${commitId}^` : "HEAD",
+            withDigest: false,
           });
         } catch {
           oldBlob = null;

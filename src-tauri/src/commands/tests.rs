@@ -24,6 +24,60 @@ fn repo_with_tracked_and_untracked() -> tempfile::TempDir {
     dir
 }
 
+/// `with_digest` is additive: leaving it out (every existing caller) keeps the
+/// digest, and `false` is the diff viewer's read, which names no version
+/// because it never saves.
+#[test]
+fn get_file_blob_computes_the_digest_unless_the_caller_declines_it() {
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    let read = |with_digest: Option<bool>| {
+        tauri::async_runtime::block_on(cmd_get_file_blob(
+            root.clone(),
+            "fresh.txt".into(),
+            None,
+            with_digest,
+        ))
+        .expect("blob")
+    };
+    let default = read(None);
+    let explicit = read(Some(true));
+    let declined = read(Some(false));
+    assert!(default.disk_base.is_some(), "default keeps the digest");
+    assert_eq!(default.disk_base, explicit.disk_base);
+    assert_eq!(declined.disk_base, None, "declined: no digest pass");
+    assert_eq!(declined.text, default.text, "the bytes are the same");
+}
+
+/// The Overwrite flag reaches the byte-exact path, and an ordinary save of the
+/// same mixed-EOL file is still refused.
+#[test]
+fn write_file_content_overwrite_replaces_a_mixed_eol_file_byte_exactly() {
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    std::fs::write(dir.path().join("fresh.txt"), b"a\r\nb\nc\r\n").unwrap();
+    let write = |overwrite: Option<bool>| {
+        tauri::async_runtime::block_on(cmd_write_file_content(
+            root.clone(),
+            "fresh.txt".into(),
+            "mine\nonly\n".into(),
+            None,
+            overwrite,
+        ))
+    };
+    assert!(write(None).is_err(), "an ordinary save is refused");
+    assert!(write(Some(false)).is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("fresh.txt")).unwrap(),
+        b"a\r\nb\nc\r\n"
+    );
+    write(Some(true)).expect("overwrite succeeds");
+    assert_eq!(
+        std::fs::read(dir.path().join("fresh.txt")).unwrap(),
+        b"mine\nonly\n"
+    );
+}
+
 /// The gate must never answer for a root it was never given.
 ///
 /// Pre-fix the caller's string went straight to the sidecar as `root`, so

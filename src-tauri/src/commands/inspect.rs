@@ -122,8 +122,19 @@ pub async fn cmd_get_file_blob(
     repo_path: String,
     file_path: String,
     commit_id: Option<String>,
+    with_digest: Option<bool>,
 ) -> Result<FileBlob, String> {
-    off_thread(move || GitReader::get_file_blob(&repo_path, &file_path, commit_id.as_deref())).await
+    off_thread(move || {
+        // The digest names the version a save is judged against. A reader that
+        // never saves (the diff viewer) asks for none and skips the hashing
+        // pass; leaving the argument out keeps the digest, as before.
+        if with_digest.unwrap_or(true) {
+            GitReader::get_file_blob(&repo_path, &file_path, commit_id.as_deref())
+        } else {
+            GitReader::get_file_blob_view(&repo_path, &file_path, commit_id.as_deref())
+        }
+    })
+    .await
 }
 
 /// Writes a file inside the repository, after the write gate has judged the
@@ -135,12 +146,17 @@ pub async fn cmd_get_file_blob(
 /// save is refused as `changed_on_disk` when the file no longer has those
 /// bytes. Leaving it out is an explicit overwrite. The reply's `disk_base` is
 /// the base the draft carries from here on.
+///
+/// `overwrite` is the conflict banner's Overwrite: the buffer replaces a disk
+/// file the editor could not round-trip (invalid UTF-8, mixed line endings)
+/// byte-exactly instead of being refused. Leaving it out is an ordinary save.
 #[tauri::command(async)]
 pub async fn cmd_write_file_content(
     repo_path: String,
     file_path: String,
     content: String,
     expected_base: Option<String>,
+    overwrite: Option<bool>,
 ) -> Result<Guarded<SavedFile>, FileWriteError> {
     super::payload::check_content("file content", &content, super::payload::MAX_CONTENT_BYTES)
         .map_err(|e| FileWriteError::from(e.to_string()))?;
@@ -148,12 +164,12 @@ pub async fn cmd_write_file_content(
     off_thread(move || {
         Ok((|| {
             let policy = guard_file(&repo_path, &file_path, "modify")?;
-            let output = sandbox_save_edited_text(
-                &repo_path,
-                &file_path,
-                &content,
-                expected_base.as_deref(),
-            )?;
+            let save = if overwrite.unwrap_or(false) {
+                sandbox_overwrite_edited_text
+            } else {
+                sandbox_save_edited_text
+            };
+            let output = save(&repo_path, &file_path, &content, expected_base.as_deref())?;
             Ok(Guarded { policy, output })
         })())
     })
