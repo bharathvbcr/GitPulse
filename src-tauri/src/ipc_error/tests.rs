@@ -246,3 +246,122 @@ fn a_ledger_code_is_carried_in_the_detail() {
     assert_eq!(error.message, "[open_failed] no database");
     assert_eq!(error.detail, Some(json!({ "code": "open_failed" })));
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial review (b17/5c1313c9-adv). Each `ignore = "break: ..."` test
+// states the EXPECTED behaviour and fails against the lane's implementation.
+// ---------------------------------------------------------------------------
+
+/// Retry safety: a mutation's own deferral is rewritten by
+/// `git_cli::not_retryable` so the frontend never retries it, but that rewrite
+/// only reads the WHOLE text. `from_command_text` also reads after each `": "`,
+/// so a mutation whose error is `<context>: <runner deferral>` is not rewritten
+/// and is then typed `deferred_under_load`, which `invoke.ts` retries.
+#[test]
+#[ignore = "break: a mutation's prefixed deferral survives not_retryable and is typed deferred_under_load (retried)"]
+fn a_mutations_prefixed_deferral_is_never_typed_retryable() {
+    let inner = wire_message("deferred_under_load");
+    let result = crate::engine::git_cli::run_command_scope(|| {
+        crate::engine::git_cli::mark_user_action("/nonexistent-adv-repo");
+        Err::<(), String>(format!("Stash failed: {inner}"))
+    });
+    let text = result.expect_err("the body failed");
+    let error = IpcError::from_command_text(text.clone());
+    assert_ne!(
+        error.kind,
+        IpcErrorKind::DeferredUnderLoad,
+        "a user action that started must not read as retryable: {text}"
+    );
+}
+
+/// Retry safety: text a child printed and the engine relayed. A repository
+/// hook's stderr is attacker-controlled; if it starts with a runner-shaped
+/// deferral, the boundary scan types the whole failed commit as retryable.
+#[test]
+#[ignore = "break: relayed hook stderr that spells a deferral after a ': ' boundary is typed deferred_under_load"]
+fn relayed_child_output_cannot_forge_a_deferral() {
+    for forged in [
+        "git commit failed: git status deferred under load after 0.5s: x",
+        "commit-msg hook rejected the commit: git push deferred under load after 1s: x",
+        "Hook output: fix retry when the gate deferred under load after 2s: tune",
+    ] {
+        assert_ne!(
+            IpcError::from_command_text(forged.to_string()).kind,
+            IpcErrorKind::DeferredUnderLoad,
+            "{forged}"
+        );
+    }
+}
+
+/// Security: `repository_trust_required` opens the trust prompt and marks a tab
+/// untrusted. `repository_trust::refused` is `contains(REQUIRED)`, so any error
+/// that quotes a branch, path, remote or commit subject spelling the marker is
+/// typed as a trust refusal.
+#[test]
+#[ignore = "break: attacker-controlled names that contain REPOSITORY_TRUST_REQUIRED type as repository_trust_required"]
+fn names_that_spell_the_trust_marker_do_not_raise_the_trust_kind() {
+    for hostile in [
+        "fatal: a branch named 'REPOSITORY_TRUST_REQUIRED' already exists",
+        "Not a Git repository: /tmp/REPOSITORY_TRUST_REQUIRED/x",
+        "fatal: unable to access 'https://h/REPOSITORY_TRUST_REQUIRED.git/': Could not resolve host",
+        "commit-msg hook rejected: subject 'REPOSITORY_TRUST_REQUIRED: fix'",
+    ] {
+        assert_ne!(
+            IpcError::from_command_text(hostile.to_string()).kind,
+            IpcErrorKind::RepositoryTrustRequired,
+            "{hostile}"
+        );
+    }
+}
+
+/// The same flaw for the hook-cancel and stale-stash markers (both `contains`):
+/// a branch or stash message spelling the phrase is typed as the refusal.
+#[test]
+#[ignore = "break: contains()-based owned markers (hook cancel, stale stash) match quoted user text"]
+fn quoted_user_text_does_not_raise_hook_cancel_or_stale_stash() {
+    let cancelled = "fatal: invalid branch name 'build was cancelled while running tests'";
+    assert_ne!(
+        IpcError::from_command_text(cancelled.to_string()).kind,
+        IpcErrorKind::HookCancelled,
+        "{cancelled}"
+    );
+    let stash = format!("Could not apply stash 'WIP: {STALE_STACK_HINT}': conflict");
+    assert_ne!(
+        IpcError::from_command_text(stash.clone()).kind,
+        IpcErrorKind::StaleStash,
+        "{stash}"
+    );
+}
+
+/// Marker precedence: owned markers are read before the runner shape, so text
+/// that legitimately is a runner deferral loses its kind when it also quotes a
+/// marker.
+#[test]
+#[ignore = "break: owned-marker precedence hides a genuine runner deferral that quotes a marker"]
+fn a_genuine_deferral_that_names_a_marker_keeps_its_kind() {
+    let text = format!(
+        "{}: REPOSITORY_TRUST_REQUIRED",
+        refusal_message(
+            "git branch",
+            Refusal::Refused {
+                waited: Duration::from_millis(2000),
+            },
+        )
+    );
+    assert_eq!(
+        IpcError::from_command_text(text).kind,
+        IpcErrorKind::DeferredUnderLoad
+    );
+}
+
+/// Slot-wait uses whole-text `contains` of two phrases (no anchoring, unlike
+/// the other runner shapes), so quoted text types as `slot_wait_timeout`.
+#[test]
+#[ignore = "break: is_slot_wait_timeout is unanchored contains()"]
+fn quoted_slot_wait_phrases_are_not_a_slot_wait_timeout() {
+    let hostile = "fatal: bad ref 'x timed out after 5s waiting for a process slot'";
+    assert_ne!(
+        IpcError::from_command_text(hostile.to_string()).kind,
+        IpcErrorKind::SlotWaitTimeout
+    );
+}
