@@ -1044,6 +1044,13 @@ The cost applies only to the editor open (`cmd_get_file_blob`, whose base names
 the bytes the user saw). View-only reads (`get_file_content`, the code graph's
 file text) use `get_file_blob_view` and skip the digest pass.
 
+The diff viewer's image reads pass `withDigest: false` to `cmd_get_file_blob`
+and take the `get_file_blob_view` path. `repo_read` carries a
+`get_file_blob_view` row beside each `get_file_blob` row (2026-10-18, load
+average 25.9 on 18 CPUs, 15 samples, min): 1 MB 1.22 ms to 1.08 ms, 8 MB
+9.47 ms to 8.09 ms, 1 KB 146 us to 79 us. The digest is gone from that path.
+Single run, not interleaved A/B, on a loaded host.
+
 The open path is over the 5% budget at 1 MB and 8 MB, and that is accepted as
 the cost of correctness. Without a base, a save writes the whole draft over
 whatever an agent or `git pull` put on disk while the file was open, with no
