@@ -247,6 +247,11 @@ fn is_hfs_ignorable(c: char) -> bool {
 /// a `refs` directory. Symlinks are not followed for `objects` and `refs`,
 /// which git requires to be real directories in a gitdir it creates.
 fn is_git_directory(dir: &Path) -> bool {
+    // A symlink is the entry itself, not the directory it names: moving or
+    // deleting a link whose target is a gitdir never touches the gitdir.
+    if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return false;
+    }
     let is_dir = |name: &str| {
         std::fs::symlink_metadata(dir.join(name)).is_ok_and(|meta| meta.file_type().is_dir())
     };
