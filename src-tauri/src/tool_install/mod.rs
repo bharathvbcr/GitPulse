@@ -979,10 +979,6 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn timed_out(err: &str) -> bool {
-    err.contains("timed out") || err.contains("timeout")
-}
-
 enum InstallRun {
     Finished(BoundedRun),
     Cancelled { stdout: String, stderr: String },
@@ -1427,7 +1423,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             exit_code: None,
             stdout: String::new(),
             stderr: err.clone(),
-            timed_out: timed_out(&err),
+            timed_out: git_cli::is_run_timeout(&err),
             cancelled: cancelled(),
             reason: Some(err),
             rung: Some(InstallRung::ToolchainRemote),
@@ -1623,7 +1619,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             rung: Some(InstallRung::LocalCheckout),
         },
         InstallRun::Failed(err) => {
-            let was_timeout = timed_out(&err);
+            let was_timeout = git_cli::is_run_timeout(&err);
             // The source module may itself be a nested checkout. The approval
             // flow must name the same repository that process admission checks.
             let source = if crate::repository_trust::refused(&err) {

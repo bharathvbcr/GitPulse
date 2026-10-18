@@ -2164,7 +2164,7 @@ impl GitReader {
         let (stdout, payload_incomplete) = match log {
             Ok(out) => out,
             Err(e) => {
-                if is_unborn_head_error(&e) {
+                if head_is_unborn(&repo, &e) {
                     return Ok(PulseReport {
                         commits: Vec::new(),
                         top_files_by_churn: Vec::new(),
@@ -2181,6 +2181,9 @@ impl GitReader {
             }
         };
 
+        if stdout.trim().is_empty() {
+            verify_empty_history_is_real(&repo)?;
+        }
         let mut captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
         apply_signatures(&mut captured.commits, signatures.signatures);
         Ok(PulseReport {
@@ -2238,7 +2241,7 @@ impl GitReader {
         // blamed at that oid, so the oid is the content half of the memo key.
         let head = match git_text(&repo, &["log", "-n1", "--format=%H"]) {
             Ok(out) => out.trim().to_string(),
-            Err(e) if is_unborn_head_error(&e) => {
+            Err(e) if head_is_unborn(&repo, &e) => {
                 return Ok(KnowledgeReport {
                     scanned_files: 0,
                     candidate_files: 0,
@@ -2559,7 +2562,7 @@ impl GitReader {
         ) {
             Ok(out) => out,
             Err(e) => {
-                if is_unborn_head_error(&e) {
+                if head_is_unborn(&repo, &e) {
                     return Ok(DoraReport {
                         deploy_frequency_per_week: 0.0,
                         deploy_rating: "Low".to_string(),
@@ -2994,12 +2997,66 @@ fn select_ownership_sample(
     }
 }
 
-fn is_unborn_head_error(error: &str) -> bool {
+/// The phrases git uses when `HEAD` did not resolve, per command. Kept in one
+/// place so the two readers of "is this branch unborn?" (this module and
+/// `commands::commit_graph`) cannot drift into different answers.
+///
+/// - `git rev-parse HEAD`: `ambiguous argument 'HEAD'`, `Needed a single
+///   revision`, `unknown revision ... HEAD`.
+/// - `git log` / `for-each-ref`: `your current branch 'x' does not have any
+///   commits yet`, `bad default revision 'HEAD'`, `Needed a single revision`.
+///
+/// `fatal: your current branch` is a prefix git ALSO prints for a damaged ref
+/// (`... appears to be broken`), and rev-parse words an unborn branch and an
+/// unreadable ref file identically, so a phrase match alone only says "HEAD did
+/// not resolve"; [`head_is_unborn`] is the answer.
+const UNBORN_HEAD_PHRASES: &[&str] = &[
+    "does not have any commits",
+    "bad default revision 'head'",
+    "fatal: your current branch",
+    "needed a single revision",
+    "ambiguous argument 'head'",
+];
+
+/// True when `error` is one of the ways git says `HEAD` did not resolve. Not
+/// proof the branch is unborn: use [`head_is_unborn`] before treating it as an
+/// empty repository.
+pub(crate) fn is_unborn_head_error(error: &str) -> bool {
     let msg = error.to_lowercase();
-    msg.contains("does not have any commits")
-        || msg.contains("bad default revision 'head'")
-        || msg.contains("fatal: your current branch")
-        || msg.contains("fatal: needed a single revision")
+    UNBORN_HEAD_PHRASES
+        .iter()
+        .any(|phrase| msg.contains(phrase))
+        || (msg.contains("unknown revision") && msg.contains("head"))
+}
+
+/// Whether a failed HEAD read means the checked-out branch has no commits.
+///
+/// The branch is unborn when HEAD names a ref that is absent; if that ref is
+/// present and still did not resolve, it is damaged, and calling it "no
+/// commits yet" would present a fault as a repository fact. Any probe that
+/// cannot answer (detached HEAD, git refusing) counts as "not unborn": the
+/// caller then reports the original error.
+pub(crate) fn head_is_unborn(repo: &Path, error: &str) -> bool {
+    is_unborn_head_error(error) && head_ref_is_absent(repo)
+}
+
+/// True when `HEAD` is symbolic and the ref it names has no file: the branch
+/// has never had a commit. A present ref is not absent, so a damaged one is
+/// never reported as unborn. A probe that cannot answer is not "absent".
+fn head_ref_is_absent(repo: &Path) -> bool {
+    let Ok(target) = git_text(repo, &["symbolic-ref", "-q", "HEAD"]) else {
+        return false;
+    };
+    let Ok(located) = git_text(repo, &["rev-parse", "--git-path", target.trim()]) else {
+        return false;
+    };
+    let located = Path::new(located.trim());
+    let located = if located.is_absolute() {
+        located.to_path_buf()
+    } else {
+        repo.join(located)
+    };
+    !located.exists()
 }
 
 /// How the DORA commit scan bounds itself by date.
@@ -3124,6 +3181,22 @@ fn dora_commit_scan(
     }
 }
 
+/// Refuses to let an empty history stand when `HEAD` names a branch ref that is
+/// present but unreadable. A walk over named refs skips a broken one with a
+/// warning and exits 0, so the empty answer never passes through the unborn
+/// classifier at all; the only evidence is that `HEAD` itself will not resolve
+/// while its branch exists. An unborn branch (ref absent) is a real empty
+/// history and passes.
+fn verify_empty_history_is_real(repo: &Path) -> Result<(), String> {
+    match git_text(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(_) => Ok(()),
+        Err(_) if head_ref_is_absent(repo) => Ok(()),
+        Err(error) => Err(format!(
+            "History is empty but HEAD does not resolve: the branch ref is present and unreadable ({error})"
+        )),
+    }
+}
+
 /// Wall-clock budget for one DORA report across all of its git reads.
 const DORA_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -3144,7 +3217,7 @@ fn dora_git(repo: &Path, started: Instant, args: &[&str], step: &str) -> Result<
         })?;
     match git_text_with_timeout(repo, args, left) {
         Ok(text) => Ok(text),
-        Err(error) if is_unborn_head_error(&error) => Ok(String::new()),
+        Err(error) if head_is_unborn(repo, &error) => Ok(String::new()),
         Err(error) => Err(format!("DORA {step} failed: {error}")),
     }
 }
@@ -12758,6 +12831,48 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             assert_eq!(report.cfr_sample_commits, 0, "{walk:?}");
             assert!(!report.commit_scan_truncated, "{walk:?}");
         }
+    }
+
+    /// A repository whose checked-out branch ref file holds garbage: HEAD names
+    /// a ref that exists but cannot be read, which git words much like an
+    /// unborn branch.
+    fn damaged_branch_repo() -> tempfile::TempDir {
+        let dir = adv_repo_with_dates(&[ADV_ANCHOR - ADV_DAY]);
+        let target = git_text(dir.path(), &["symbolic-ref", "HEAD"]).unwrap();
+        std::fs::write(dir.path().join(".git").join(target.trim()), "garbage\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn dora_and_pulse_on_a_damaged_branch_ref_are_errors_not_empty_reports() {
+        let dir = damaged_branch_repo();
+        let path = dir.path().to_str().unwrap();
+        for walk in ADV_WALKS {
+            let dora = GitReader::dora_report_scanning(path, Some(90), 4_096, ADV_ANCHOR, walk);
+            assert!(
+                dora.is_err(),
+                "{walk:?}: an empty DORA report for a broken ref"
+            );
+        }
+        let pulse = GitReader::pulse_report(path, None);
+        assert!(pulse.is_err(), "an empty pulse report for a broken ref");
+        let knowledge = GitReader::knowledge_report(path, None);
+        assert!(
+            knowledge.is_err(),
+            "an empty knowledge report for a broken ref"
+        );
+    }
+
+    #[test]
+    fn dora_on_a_branch_pointing_at_a_missing_ref_is_still_an_empty_answer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let path = dir.path().to_str().unwrap();
+        assert!(GitReader::pulse_report(path, None)
+            .unwrap()
+            .commits
+            .is_empty());
+        assert!(GitReader::dora_report(path, Some(90)).is_ok());
     }
 
     #[test]
