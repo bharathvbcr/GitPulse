@@ -39,6 +39,8 @@ Done is evidence-gated by Manvi. Each card below is in **review**, because no Ma
 | **ft-c0d321c1** proposals | **Stale.** All 7 criteria were already on `main` (8156f0a2, 802999bb, 53e95963, 2026-10-12). Verified and re-tested; no code changed | n/a | Manvi held done; the macOS screenshot was not taken |
 | **ft-8f398bb6** write primitives | Writes into a nested repo's real gitdir are refused at any depth; deleting or moving a folder that holds one is refused by a bounded downward walk (refuses at its cap); `.git` spellings that git refuses are refused, including `\` (CVE-2019-1354 shape); Overwrite is byte-exact over mixed-EOL or invalid-UTF-8 files; DiffViewer skips the digest | 3, including **HIGH**: `delete .modules` wiped a nested repo's history; and **MEDIUM**: `.git\config` was accepted | Item 2 (owner decision, widens file mode); Windows path unverified; moving a folder holding a work tree whose `.git` points outside it |
 
+| **ft-5c1313c9** typed IpcError (wave run on 2026-10-18 after the owner's 4th "merge + next wave") | `IpcError {kind, message, detail?}` across ~240 commands, with byte-identical messages. Kinds are typed at their source (spawn-gate deferral, trust refusal with `{path, common_dir}`, missing identity, stale stash). A plain String is `unclassified` and never re-parsed. The deferral retry is limited to 24 reviewed read commands and stops once no caller waits. The classifier contract scan follows provenance | v1: **3 HIGH** (a mutation's wrapped deferral retried; hook stderr forging a deferral; an attacker-named branch raising the trust prompt). v2: 4 MED plus a writer audit (4 "read" commands found to write). **Fable ruling (A)**: decouple retry eligibility from admission; revert the admission changes; fix and merge | Helper-thread deferrals are not typed (fail-safe; pinned; **ft-e2c10b99**). Allowlist identity uses the closure type name. Trust `detail` is not yet consumed in the UI |
+
 Coordinator commits made directly on `main`:
 - `adfb63c8`: RELEASE_REPORT.md (owner: "commit").
 - `e53886cc`: CARD 28 docs half. The ingest module doc and the 1.5.0 notes no longer claim Codex ingest.
@@ -129,6 +131,7 @@ Host load was 20 to 350 on 18 cores all run, so wall-clock numbers are noisy. Co
 | ft-da85cd55 | P1/high | Edit-time hooks drain the shared spawn budget (~15 spawns each); refusals don't name the bucket |
 | ft-22bcf053 | P2/low | sweep_teardown_asides concurrent race (built this run) |
 | ft-df6bf5ea | P2/medium | gitpulse_landed, split from CARD 15 with 8 break groups and Fable's semantics |
+| ft-e2c10b99 | P2/medium | Thread typed errors through git_cli so helper-thread and single-flight deferrals keep their kind (follow-up to ft-5c1313c9) |
 
 Follow-ups recorded on existing cards instead of new ones:
 - CARD 21: the load flake it introduced.
@@ -189,7 +192,13 @@ Run on `e7fd6e48` (all lanes merged); the log is `tmp/build-1017/final-e7fd6e48.
 | `dev verify` | **could not run**: there is no DevCouncil state in this repo, as in the last build. This is not a pass |
 | Manvi verification | no `work.verify.task` record for any card, so every card is held in **review** |
 
-**Final `main`:** the commit after this report (this report is committed on top of `67809283`). It is many commits ahead of `origin/main`. Nothing was pushed.
+**Later wave (2026-10-18), on `ef961ae5`:**
+- ft-5c1313c9 merged. Another session had meanwhile fast-forwarded `main` with its Graft notification forwarding (`c00431ab`); that tip was health-checked green.
+- fmt, clippy and `bun run check` are clean.
+- Full vitest: **768 files, 10,782 passed, 0 failed.**
+- `cargo test --tests --no-fail-fast`: **122 integration targets ok**. Lib: 4989 passed, 1 failed (the catch_up trust-storage load flake, which passes alone).
+
+**Final `main`:** the commit after this report update. It is many commits ahead of `origin/main`. Nothing was pushed.
 
 **Not verified on the final tip:** the Chrome/WebKit browser harnesses, `ci:local` as a whole, and the installed app. The binaries are not rebuilt (§8.1).
 
