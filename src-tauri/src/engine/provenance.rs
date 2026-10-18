@@ -44,19 +44,28 @@ pub struct SessionEpisodeNote {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvenanceFreshness {
     pub commit_sha: String,
-    /// Commits between this one and the base, or `None` when it could not be
-    /// measured.
+    /// How many commits the base has that this one does not: `rev-list
+    /// --count <commit>..<base>`, or `None` when it could not be measured.
     ///
-    /// `None` is not zero. Zero means "nothing has moved since this was
-    /// verified", which is the strongest possible statement; a failed
-    /// measurement means nothing at all, and the two must never render the
-    /// same. This field was a bare `u32` defaulting to 0 on failure, so an
-    /// unreachable base branch — or a commit that is not an ancestor of it —
-    /// reported maximum freshness.
+    /// This measures how far the *base has moved past* the commit, nothing
+    /// else. It is zero both for the base tip itself and for a commit that is
+    /// *ahead of* the base (the range `A..B` is empty whenever `B` is an
+    /// ancestor of `A`), so a zero does not say the commit is on the base:
+    /// `on_base` and `ahead` say that.
+    ///
+    /// `None` is not zero. Zero means "the base has nothing this commit
+    /// lacks", the strongest possible statement; a failed measurement means
+    /// nothing at all, and the two must never render the same. This field was
+    /// a bare `u32` defaulting to 0 on failure, so an unreachable base branch
+    /// reported maximum freshness. A commit that merely is not an ancestor of
+    /// the base is *measured* (how far the base moved since they forked) and
+    /// reports a number, not `None`.
     pub distance: Option<u32>,
     /// Decays with distance. `None` when distance could not be measured.
     pub confidence: Option<f32>,
-    /// True only when the distance was measured *and* is zero.
+    /// True only when the distance was measured *and* is zero. As `distance`,
+    /// it does not mean the commit is on the base: a commit ahead of the base
+    /// is also "fresh" here.
     pub is_fresh: bool,
     /// Empty when the distance was measured; otherwise why it was not.
     pub unmeasured_reason: String,
@@ -70,6 +79,58 @@ pub struct ProvenanceFreshness {
     pub notes_readable: bool,
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
+    // Where the commit sits relative to the base, additive to `distance`.
+    // Every one is `None` when it could not be established, with
+    // `base_relation_reason` saying why; a `false` is only ever a measured
+    // answer. A badge row (`freshness_batch`) does not spend processes on them
+    // and says so there.
+    /// True when the commit is reachable from the base: it landed there by
+    /// fast-forward or merge. False means measured and not reachable (ahead
+    /// of, or diverged from, the base); a squash or rebase landing is also
+    /// false here because those create new commits. `None` when unmeasurable,
+    /// including a shallow clone where
+    /// "not reachable" could just be missing history.
+    pub landed_on_base: Option<bool>,
+    /// Reachability of the commit from the base, under the name the
+    /// freshness fields are read against. Always equal to `landed_on_base`.
+    pub on_base: Option<bool>,
+    /// The commit the base resolved to.
+    pub base_oid: Option<String>,
+    /// The common ancestor of the commit and the base; the commit itself when
+    /// it is on the base. `None` when the two share no history.
+    pub merge_base: Option<String>,
+    /// Commits reachable from this one and not from the base.
+    pub ahead: Option<u32>,
+    /// Commits reachable from the base and not from this one; equals
+    /// `distance` when both were measured.
+    pub behind: Option<u32>,
+    /// Empty when the relation was measured; otherwise why it was not.
+    pub base_relation_reason: String,
+}
+
+/// Where a commit sits relative to the base it was measured against: what
+/// [`base_relation`] measures, to be laid onto a [`ProvenanceFreshness`] by
+/// [`ProvenanceFreshness::with_relation`]. One `merge-base --is-ancestor` and
+/// one `rev-list --left-right --count` produce it, plus a `merge-base` when
+/// the commit is not an ancestor, to name the fork point.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BaseRelation {
+    landed_on_base: Option<bool>,
+    base_oid: Option<String>,
+    merge_base: Option<String>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+    base_relation_reason: String,
+}
+
+impl BaseRelation {
+    /// The answer when nothing could be established, with the reason.
+    fn unmeasured(reason: impl Into<String>) -> Self {
+        Self {
+            base_relation_reason: reason.into(),
+            ..Self::default()
+        }
+    }
 }
 
 /// One `--ref=` argument, so the two note refs cannot drift into being spelled
@@ -216,15 +277,38 @@ impl ProvenanceFreshness {
     /// struct out again, so none of them can quietly ship a `distance: 0` or
     /// a `notes_readable: true` that the failure did not earn.
     fn unexamined(commit_sha: impl Into<String>, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         Self {
             commit_sha: commit_sha.into(),
             distance: None,
             confidence: None,
             is_fresh: false,
-            unmeasured_reason: reason.into(),
+            landed_on_base: None,
+            on_base: None,
+            base_oid: None,
+            merge_base: None,
+            ahead: None,
+            behind: None,
+            base_relation_reason: reason.clone(),
+            unmeasured_reason: reason,
             notes_readable: false,
             verification: None,
             session: None,
+        }
+    }
+
+    /// This row with where its commit sits relative to the base. `on_base` is
+    /// `landed_on_base` under the name the freshness fields are read against.
+    fn with_relation(self, relation: BaseRelation) -> Self {
+        Self {
+            landed_on_base: relation.landed_on_base,
+            on_base: relation.landed_on_base,
+            base_oid: relation.base_oid,
+            merge_base: relation.merge_base,
+            ahead: relation.ahead,
+            behind: relation.behind,
+            base_relation_reason: relation.base_relation_reason,
+            ..self
         }
     }
 
@@ -729,6 +813,118 @@ fn measure_distance(repo: &Path, commit_sha: &str, base: &str) -> (Option<u32>, 
     }
 }
 
+/// The complete stdout of a git command that must exit zero, or why not.
+///
+/// A prefix of a stream cut at the output cap is an error here, never a
+/// shorter answer: every caller below interprets the whole text.
+fn git_complete_text(repo: &Path, args: &[&str], label: &str) -> Result<String, String> {
+    let run = git_captured(repo, args)?.require_complete(label)?;
+    if !run.success {
+        return Err(format!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+}
+
+/// `(ahead, behind)` of `commit` against `base`: one
+/// `rev-list --left-right --count commit...base`.
+fn left_right_count(repo: &Path, commit: &str, base: &str) -> Result<(u32, u32), String> {
+    let range = format!("{commit}...{base}");
+    let text = git_complete_text(
+        repo,
+        &["rev-list", "--left-right", "--count", &range, "--"],
+        "git rev-list --left-right --count",
+    )?;
+    let mut fields = text.split_whitespace().map(str::parse::<u32>);
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(Ok(ahead)), Some(Ok(behind)), None) => Ok((ahead, behind)),
+        _ => Err(format!(
+            "git rev-list --left-right --count returned {:?}, not two counts",
+            text.trim()
+        )),
+    }
+}
+
+fn is_shallow(repo: &Path) -> Result<bool, String> {
+    git_complete_text(
+        repo,
+        &["rev-parse", "--is-shallow-repository"],
+        "git rev-parse --is-shallow-repository",
+    )
+    .map(|text| text.trim() == "true")
+}
+
+/// Where `commit` sits relative to `base` (both object names git produced).
+///
+/// Reachability is `merge-base --is-ancestor`, the same check the review gate
+/// uses ([`crate::harness::review::contains`]), where exit 1 is the answer
+/// "no" and any other failure is an error rather than a "no". The counts come
+/// from one `rev-list --left-right --count`. The two must agree (`ahead == 0`
+/// exactly when the commit is reachable); a disagreement is reported
+/// unmeasured rather than picking a side.
+fn base_relation(repo: &Path, commit: &str, base: &str) -> BaseRelation {
+    let unmeasured = |reason: String| BaseRelation {
+        base_oid: Some(base.to_string()),
+        ..BaseRelation::unmeasured(reason)
+    };
+    let reachable = match crate::harness::review::contains(repo, base, commit) {
+        Ok(reachable) => reachable,
+        Err(reason) => return unmeasured(format!("not measured: {reason}")),
+    };
+    let (ahead, behind) = match left_right_count(repo, commit, base) {
+        Ok(counts) => counts,
+        Err(reason) => return unmeasured(format!("not measured: {reason}")),
+    };
+    if reachable != (ahead == 0) {
+        return unmeasured(format!(
+            "not measured: git disagrees with itself (is-ancestor {reachable}, {ahead} commits ahead)"
+        ));
+    }
+    if !reachable {
+        // Not reachable in a shallow clone may only be history that was never
+        // fetched, so no "no" is given there.
+        match is_shallow(repo) {
+            Ok(false) => {}
+            Ok(true) => {
+                return unmeasured(
+                    "not measured: this is a shallow clone, so a commit that is not reachable \
+                     from the base may only be missing history"
+                        .to_string(),
+                )
+            }
+            Err(reason) => return unmeasured(format!("not measured: {reason}")),
+        }
+    }
+    let merge_base = if reachable {
+        Some(commit.to_string())
+    } else {
+        match git_captured(repo, &["merge-base", commit, base]) {
+            Ok(run) if run.success && run.incomplete.is_none() => {
+                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
+            }
+            // Exit 1 with nothing on stderr is "no common ancestor".
+            Ok(run) if run.status_code == 1 && run.stderr.is_empty() && !run.cancelled => None,
+            Ok(run) => {
+                return unmeasured(format!(
+                    "not measured: git merge-base failed: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                ))
+            }
+            Err(reason) => return unmeasured(format!("not measured: {reason}")),
+        }
+    };
+    BaseRelation {
+        landed_on_base: Some(reachable),
+        base_oid: Some(base.to_string()),
+        merge_base,
+        ahead: Some(ahead),
+        behind: Some(behind),
+        base_relation_reason: String::new(),
+    }
+}
+
 /// Freshness for many revisions, in one pass.
 ///
 /// Answers one entry per input, in input order, so a caller can zip the result
@@ -935,6 +1131,13 @@ fn freshness_rows(
                 (Ok(base), None) => measure_distance(repo, &sha, base),
                 (Err(reason), _) => (None, reason.clone()),
             };
+            let relation = match (&base, unnoted) {
+                (Ok(base), Unnoted::Measure) => base_relation(repo, &sha, base),
+                (Ok(_), Unnoted::Skip) => BaseRelation::unmeasured(
+                    "not measured: a batch row does not compute its relation to the base",
+                ),
+                (Err(reason), _) => BaseRelation::unmeasured(reason.clone()),
+            };
             // The listing says these notes are there. A read that fails now is
             // a note we could not get at, so the entry says the notes were not
             // readable rather than handing back a `None` that reads as "this
@@ -963,7 +1166,8 @@ fn freshness_rows(
                     verification,
                     session,
                     ..ProvenanceFreshness::unexamined(sha, reason)
-                };
+                }
+                .with_relation(relation);
             }
 
             ProvenanceFreshness {
@@ -975,7 +1179,9 @@ fn freshness_rows(
                 verification: verification.unwrap_or(None),
                 session: session.unwrap_or(None),
                 commit_sha: sha,
+                ..ProvenanceFreshness::unexamined("", "")
             }
+            .with_relation(relation)
         })
         .collect()
 }
@@ -1215,6 +1421,20 @@ mod batch_tests {
             .pop()
             .expect("one entry");
 
+        // The relation to the base is the one thing a badge row does not
+        // spend processes on, and says so rather than guessing.
+        assert!(!batched.base_relation_reason.is_empty());
+        assert_eq!(batched.landed_on_base, None);
+        let single = ProvenanceFreshness {
+            landed_on_base: None,
+            on_base: None,
+            base_oid: None,
+            merge_base: None,
+            ahead: None,
+            behind: None,
+            base_relation_reason: batched.base_relation_reason.clone(),
+            ..single
+        };
         assert_eq!(single, batched);
     }
 
@@ -1653,7 +1873,10 @@ mod batch_tests {
         );
         assert!(answer.notes_readable);
         let used = &spawned()[before..];
-        assert_eq!(used.len(), 4, "{used:?}");
+        // Four for the freshness, plus the two that say where the commit sits
+        // relative to the base: one `merge-base --is-ancestor`, one
+        // `rev-list --left-right --count`. A commit on the base needs no third.
+        assert_eq!(used.len(), 6, "{used:?}");
         assert!(
             !used.iter().any(|argv| argv.iter().any(|a| a == "show")),
             "{used:?}"
@@ -1673,7 +1896,8 @@ mod batch_tests {
         // The note the listing has, read by the blob it named.
         assert_eq!(count("show"), 0, "{used:?}");
         assert_eq!(count("--batch"), 1, "{used:?}");
-        assert_eq!(used.len(), 5, "{used:?}");
+        // Five as before, plus the two relation reads (see above).
+        assert_eq!(used.len(), 7, "{used:?}");
     }
 
     /// Answers are taken by size, so a note holding newlines, a fake header
@@ -2014,3 +2238,7 @@ mod batch_tests {
         assert!(f.verification.is_some(), "the note was not found: {f:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "provenance_relation_tests.rs"]
+mod relation_tests;
