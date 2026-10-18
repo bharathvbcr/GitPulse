@@ -40,10 +40,6 @@ const NO_TS_MIRROR = new Map<string, string>([
     "modelled in the UI as PlannerAction plus a separate wire union, because Reword carries a payload and serializes as an object rather than a bare string",
   ],
   [
-    "LandedVia",
-    "the `gitpulse_landed` MCP tool's `via` field: serialized to MCP clients, whose schema lists the four spellings; no frontend component reads it",
-  ],
-  [
     "CapabilityAnswer",
     "process-local cache only; IPC returns ToolStatus.installed / reason, never this enum",
   ],

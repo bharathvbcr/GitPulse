@@ -20,14 +20,14 @@ before that tag is pushed.
   `distance` and `is_fresh` are unchanged and now documented for what they
   measure: how far the base moved past the commit, which is 0 for a commit
   *ahead of* the base too. Its output schema is typed.
-- `gitpulse_landed` answers whether a commit's work reached a base and how
-  (`ff`, `merge`, `squash`, `rebase`; null with a reason when it cannot be told), with the landing commit and the
-  time from the base reflog.
 - `gitpulse_ledger_events` takes `order: "desc"` (the newest first; `{order:
   "desc", limit: 5}` no longer pages the history oldest-first) and the filters
   `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and
-  `after_ref`, each served by an index. The ledger gains five additive indexes
-  the next time a writer opens it; nothing else in the schema changes.
+  `after_ref`. `since_ts`, `action`, `task_id` and `session_id` are
+  index-backed; `object`, `worktree_path` and `after_ref` are not, and stop at
+  `limit` matches (one that matches nothing reads the whole ledger). The ledger
+  gains two additive indexes (`ts_utc`, `action`) the next time a writer opens
+  it; nothing else in the schema changes.
 
 ### Fixed
 

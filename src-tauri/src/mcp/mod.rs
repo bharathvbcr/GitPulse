@@ -641,14 +641,6 @@ tool_args! {
     }
 }
 
-tool_args! {
-    struct LandedArgs {
-        repo_path: String = repo_spec(),
-        commit: String = path_spec("Commit (SHA or any revision) to ask about"),
-        base: Option<String> = path_spec("Base branch or revision it should have landed on (default HEAD)"),
-    }
-}
-
 /// Read a tool's arguments, which [`validate_arguments`] has already accepted.
 ///
 /// Extraction repeats none of the bounds; it refuses what a schema cannot say
@@ -1154,7 +1146,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_provenance",
             "Commit provenance",
-            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false. `gitpulse_landed` also recognises squash and rebase landings, which are not reachable.",
+            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false.",
             ProvenanceArgs::properties(),
             &ProvenanceArgs::required(),
             json!({
@@ -1180,33 +1172,6 @@ fn build_tools() -> Vec<Value> {
                     "commit_sha", "distance", "confidence", "is_fresh", "unmeasured_reason",
                     "notes_readable", "verification", "session", "landed_on_base", "on_base",
                     "base_oid", "merge_base", "ahead", "behind", "base_relation_reason"
-                ]
-            }),
-        ),
-        tool(
-            "gitpulse_landed",
-            "Has a commit landed",
-            "Has a commit's work reached a base, and how. `via` is `ff` or `merge` when the commit is reachable from the base, `rebase` when every patch is on the base under new ids, `squash` when one base commit carries the sum of its patch. `landed: false` means none of those four routes was found; a landing that edited the content on the way in is not detected, because the content comparison (`git merge-tree --write-tree`) writes objects into the repository and is not used (owner decision 2). `merge_commit` is the base commit that brought it in (merge or squash), `landed_at` the Unix time of the first base reflog entry containing it (null with `landed_at_reason` when the reflog cannot say). `landed` is null with `error`, never false, when it could not be told: an unresolvable commit or base, a shallow clone, or a patch comparison that could not run. Writes nothing: no ref, index, working-tree file or object.",
-            LandedArgs::properties(),
-            &LandedArgs::required(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "commit": { "type": "string" },
-                    "base_oid": { "type": ["string", "null"] },
-                    "landed": { "type": ["boolean", "null"] },
-                    "via": {
-                        "type": ["string", "null"],
-                        "enum": ["ff", "merge", "squash", "rebase", null]
-                    },
-                    "merge_commit": { "type": ["string", "null"] },
-                    "landed_at": { "type": ["integer", "null"] },
-                    "landed_at_reason": { "type": "string" },
-                    "error": { "type": "string" }
-                },
-                "required": [
-                    "commit", "base_oid", "landed", "via", "merge_commit", "landed_at",
-                    "landed_at_reason", "error"
                 ]
             }),
         ),
@@ -1716,14 +1681,6 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 &a.repo_path,
                 &a.commit_sha,
                 a.base_branch.as_deref()
-            )))
-        }
-        "gitpulse_landed" => {
-            let a: LandedArgs = parse(name, arguments)?;
-            Ok(json!(crate::engine::provenance::landed(
-                &a.repo_path,
-                &a.commit,
-                a.base.as_deref()
             )))
         }
         _ => Err(format!("Unknown tool: {name}")),
@@ -2866,7 +2823,6 @@ mod tests {
                 "from",
                 "to",
                 "commit_sha",
-                "commit",
                 "task_id",
             ] {
                 if tool["inputSchema"]["properties"][extra].is_object() {
@@ -2999,56 +2955,6 @@ mod tests {
             &json!({ "repo_path": repo, "order": "sideways" }),
         );
         assert!(refused.is_err(), "{refused:?}");
-    }
-
-    #[test]
-    fn gitpulse_landed_is_a_read_only_tool_that_answers_over_the_wire() {
-        let tool = tools()
-            .into_iter()
-            .find(|t| t["name"] == "gitpulse_landed")
-            .expect("gitpulse_landed is advertised");
-        assert_eq!(tool["annotations"]["readOnlyHint"], true);
-        // The manifest derives its `writes` list from the annotations; a read
-        // must not appear in it.
-        let contents = resources::read("gitpulse://server/manifest").expect("manifest");
-        let manifest: Value =
-            serde_json::from_str(contents[0]["text"].as_str().expect("text")).expect("json");
-        assert!(
-            !manifest["writes"]
-                .as_array()
-                .expect("writes")
-                .iter()
-                .any(|name| name == "gitpulse_landed"),
-            "{manifest}"
-        );
-        let (_dir, repo) = repository_with_ledger_rows(0, 0);
-        let init = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output_locked()
-                .expect("git");
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        };
-        init(&[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "init",
-        ]);
-        let answer = handle_tool_call(
-            "gitpulse_landed",
-            &json!({ "repo_path": repo, "commit": "HEAD" }),
-        )
-        .expect("landed");
-        assert_eq!(answer["landed"], true, "{answer}");
-        assert_eq!(answer["via"], "ff");
-        assert!(answer["base_oid"].is_string());
     }
 
     /// A trusted repository whose ledger holds `rows` events carrying `detail`
@@ -3643,7 +3549,6 @@ mod tests {
                     "from",
                     "to",
                     "commit_sha",
-                    "commit",
                     "task_id",
                     "symptom",
                     "since",
@@ -6148,7 +6053,6 @@ mod tests {
             ("gitpulse_codeintel_dead_symbols", BudgetArgs),
             ("gitpulse_codeintel_suspects", SuspectsArgs),
             ("gitpulse_provenance", ProvenanceArgs),
-            ("gitpulse_landed", LandedArgs),
             ("devmap_status", RepoArgs),
             ("devmap_search", SearchArgs),
             ("devmap_dependencies", dm::DependenciesArgs),
@@ -6249,7 +6153,6 @@ mod tests {
                 ("gitpulse_codeintel_dead_symbols", BudgetArgs),
                 ("gitpulse_codeintel_suspects", SuspectsArgs),
                 ("gitpulse_provenance", ProvenanceArgs),
-                ("gitpulse_landed", LandedArgs),
                 ("devmap_status", RepoArgs),
                 ("devmap_search", SearchArgs),
                 ("devmap_dependencies", dm::DependenciesArgs),

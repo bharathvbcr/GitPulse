@@ -100,7 +100,6 @@ Pass an **absolute** `repo_path` on every call.
 | `gitpulse_task_view` | DevCouncil tasks/leases, when a store exists |
 | `gitpulse_codeintel_search` / `_impact` / `_dependencies` / `_trace` / `_dead_symbols` | In-process DevMap code graph (schema 20). The GUI also exposes neighbors, explore, affected tests, clones, and layered impact — those are Tauri commands today, not MCP tools. |
 | `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`) |
-| `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`; never writes to the repository) |
 
 Prompts: `gitpulse_preflight`, `gitpulse_collision_triage`, `gitpulse_handoff`, `gitpulse_session_brief`.
 

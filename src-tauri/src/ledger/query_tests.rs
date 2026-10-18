@@ -263,7 +263,7 @@ fn a_filtered_page_is_bounded_and_continues_by_cursor() {
 }
 
 #[test]
-fn every_filter_is_served_by_an_index_never_a_full_scan() {
+fn every_indexed_filter_is_served_by_its_index_and_the_rest_walk_the_key_to_their_limit() {
     let (_dir, repo) = repo_dir();
     fill(&repo, 2_000);
     let cases = [
@@ -283,20 +283,6 @@ fn every_filter_is_served_by_an_index_never_a_full_scan() {
         ),
         (
             EventQuery {
-                object: Some("obj-77".into()),
-                ..EventQuery::default()
-            },
-            "idx_events_object",
-        ),
-        (
-            EventQuery {
-                worktree_path: Some("/w/3".into()),
-                ..EventQuery::default()
-            },
-            "idx_events_worktree",
-        ),
-        (
-            EventQuery {
                 task_id: Some("T4".into()),
                 ..EventQuery::default()
             },
@@ -308,13 +294,6 @@ fn every_filter_is_served_by_an_index_never_a_full_scan() {
                 ..EventQuery::default()
             },
             "idx_events_session",
-        ),
-        (
-            EventQuery {
-                after_ref: Some("x".into()),
-                ..EventQuery::default()
-            },
-            "idx_events_after_ref",
         ),
     ];
     with_conn(&repo, |conn| {
@@ -339,6 +318,39 @@ fn every_filter_is_served_by_an_index_never_a_full_scan() {
                 );
             }
         }
+        // `object`, `worktree_path` and `after_ref` have no index of their own
+        // (each would cost every append): they walk the primary key and stop at
+        // `limit` matches, so none of them sorts and none uses an index meant
+        // for something else.
+        for query in [
+            EventQuery {
+                object: Some("obj-77".into()),
+                ..EventQuery::default()
+            },
+            EventQuery {
+                worktree_path: Some("/w/3".into()),
+                ..EventQuery::default()
+            },
+            EventQuery {
+                after_ref: Some("x".into()),
+                ..EventQuery::default()
+            },
+        ] {
+            let plan = explain_query(
+                conn,
+                &EventQuery {
+                    descending: true,
+                    limit: 5,
+                    ..query.clone()
+                },
+            );
+            let text = plan.join(" | ");
+            assert_eq!(
+                plan,
+                vec!["SEARCH events USING INTEGER PRIMARY KEY (rowid>?)".to_string()],
+                "{query:?}: {text}"
+            );
+        }
         // The unfiltered newest-N read is a seek on the primary key, with the
         // LIMIT in the statement.
         let newest = explain_query(
@@ -360,14 +372,14 @@ fn every_filter_is_served_by_an_index_never_a_full_scan() {
             limit: 5,
             ..EventQuery::default()
         }
-        .sql(6, true);
+        .sql(6, SincePlan::Planner);
         assert!(sql.contains("ORDER BY id DESC LIMIT ?"), "{sql}");
         Ok(())
     })
     .unwrap();
 }
 
-/// A ledger written before these indexes existed gains them the next time a
+/// A ledger written before these two indexes existed gains them the next time a
 /// writer opens it, by the same additive `CREATE INDEX IF NOT EXISTS` batch
 /// that creates the rest.
 #[test]
@@ -375,11 +387,8 @@ fn an_older_ledger_gains_the_indexes_on_the_next_writable_open() {
     let (_dir, repo) = repo_dir();
     fill(&repo, 10);
     with_conn(&repo, |conn| {
-        conn.execute_batch(
-            "DROP INDEX idx_events_ts; DROP INDEX idx_events_action; DROP INDEX idx_events_object;
-             DROP INDEX idx_events_worktree; DROP INDEX idx_events_after_ref;",
-        )
-        .map_err(|e| LedgerError::new("t", e.to_string()))
+        conn.execute_batch("DROP INDEX idx_events_ts; DROP INDEX idx_events_action;")
+            .map_err(|e| LedgerError::new("t", e.to_string()))
     })
     .unwrap();
     tests_support::reset_registry_for(&repo);
@@ -394,13 +403,7 @@ fn an_older_ledger_gains_the_indexes_on_the_next_writable_open() {
             .map_err(|e| LedgerError::new("t", e.to_string()))
     })
     .unwrap();
-    for index in [
-        "idx_events_ts",
-        "idx_events_action",
-        "idx_events_object",
-        "idx_events_worktree",
-        "idx_events_after_ref",
-    ] {
+    for index in ["idx_events_ts", "idx_events_action"] {
         assert!(names.iter().any(|name| name == index), "{index}: {names:?}");
     }
 }
@@ -459,3 +462,67 @@ fn bench_newest_five_on_a_45k_row_ledger() {
     );
     assert!(best_indexed <= best_paged);
 }
+
+/// `{order: desc, limit, since_ts}` reads only `limit` rows however old
+/// `since_ts` is: with many matches it walks the primary key from the newest id
+/// (no sort), and with few it takes them from the index.
+#[test]
+fn newest_first_since_ts_reads_limit_rows_not_every_row_since() {
+    let (_dir, repo) = repo_dir();
+    fill(&repo, 3_000);
+    let desc = |since: &str, limit: u32| EventQuery {
+        descending: true,
+        limit,
+        since_ts: Some(since.into()),
+        ..EventQuery::default()
+    };
+    with_conn(&repo, |conn| {
+        // Old since_ts, thousands of matches: primary-key walk, no sort.
+        let plan = explain_query(conn, &desc("2000-01-01T00:00:00.000Z", 5));
+        assert_eq!(
+            plan,
+            vec!["SEARCH events USING INTEGER PRIMARY KEY (rowid>?)".to_string()],
+            "{plan:?}"
+        );
+        // Recent since_ts, matches below the limit: the index, never a scan.
+        let plan = explain_query(conn, &desc("2026-01-03T01:58:00.000Z", 5));
+        assert!(
+            plan.iter().any(|step| step.contains("idx_events_ts"))
+                && plan.iter().all(|step| !step.starts_with("SCAN")),
+            "{plan:?}"
+        );
+        // Oldest first: the index.
+        let plan = explain_query(
+            conn,
+            &EventQuery {
+                since_ts: Some("2026-01-01T03:00:00.000Z".into()),
+                ..EventQuery::default()
+            },
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("idx_events_ts")),
+            "{plan:?}"
+        );
+        Ok(())
+    })
+    .unwrap();
+    // And the answers are the newest rows, whichever plan served them.
+    for since in [
+        "2000-01-01T00:00:00.000Z",
+        "2026-01-03T01:58:00.000Z",
+        "2099-01-01T00:00:00.000Z",
+    ] {
+        let got = page(&repo, &desc(since, 5));
+        let expected: Vec<i64> = every_event(&repo)
+            .iter()
+            .rev()
+            .filter(|e| e.ts_utc.as_str() >= since)
+            .take(5)
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids(&got), expected, "since {since}");
+    }
+}
+
+#[path = "adversarial_tests.rs"]
+mod adversarial;

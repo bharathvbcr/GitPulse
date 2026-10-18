@@ -924,34 +924,6 @@
     ],
     "type": "object"
   },
-  "gitpulse_landed": {
-    "additionalProperties": false,
-    "properties": {
-      "base": {
-        "description": "base",
-        "maxLength": 4096,
-        "minLength": 1,
-        "type": "string"
-      },
-      "commit": {
-        "description": "commit",
-        "maxLength": 4096,
-        "minLength": 1,
-        "type": "string"
-      },
-      "repo_path": {
-        "description": "Absolute path to a git repository",
-        "maxLength": 4096,
-        "minLength": 1,
-        "type": "string"
-      }
-    },
-    "required": [
-      "repo_path",
-      "commit"
-    ],
-    "type": "object"
-  },
   "gitpulse_ledger_events": {
     "additionalProperties": false,
     "properties": {

@@ -82,18 +82,20 @@ CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
     WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
--- The indexes the filtered `gitpulse_ledger_events` read seeks. The three on
--- `action`, `object` and `worktree_path` carry the predicate `id > 0` (true of
--- every row) and that read states it, because SQLite uses a partial index only
--- when the query contains its predicate. Without it these plain single-column
--- indexes compete with the purpose-built ones above (`idx_events_binding`,
--- `idx_events_reflog`, `idx_events_session`) and the planner picks them for the
--- binding, reflog and re-anchor queries, which they serve worse.
+-- The two indexes the filtered `gitpulse_ledger_events` read adds, for the
+-- `since_ts` and `action` filters (`task_id` and `session_id` use the two
+-- above). `object`, `worktree_path` and `after_ref` are deliberately not
+-- indexed: each index is an append-time cost on every event, and those filters
+-- stop at `limit` matches. SQLite appends the rowid to every index key, so
+-- `idx_events_ts` is already the composite (ts_utc, id) the `since_ts` read
+-- uses. Both columns are NOT NULL, so neither index can be partial on that.
+-- `idx_events_action` carries the predicate `id > 0` (true of every row) and the
+-- read states it, because SQLite uses a partial index only when the query
+-- contains its predicate: a plain index on `action` competes with the
+-- purpose-built ones (`idx_events_binding`, `idx_events_reflog`) and the
+-- planner picks it for the binding and re-anchor queries, which it serves worse.
 CREATE INDEX IF NOT EXISTS idx_events_ts       ON events(ts_utc);
 CREATE INDEX IF NOT EXISTS idx_events_action   ON events(action) WHERE id > 0;
-CREATE INDEX IF NOT EXISTS idx_events_object   ON events(object) WHERE id > 0;
-CREATE INDEX IF NOT EXISTS idx_events_worktree ON events(worktree_path) WHERE id > 0;
-CREATE INDEX IF NOT EXISTS idx_events_after_ref ON events(after_ref) WHERE after_ref IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_binding  ON events(worktree_path, ts_utc)
   WHERE action IN ('worktree.bind', 'worktree.unbind');
 CREATE TABLE IF NOT EXISTS ledger_family_imports (
@@ -2174,17 +2176,31 @@ impl Default for EventQuery {
     }
 }
 
+/// How a read whose only filter is `since_ts` is planned.
+///
+/// Rows are ordered by `id`, which the index on `ts_utc` is not, so left to
+/// the planner a newest-first read with an old `since_ts` reads and sorts every
+/// row since it, and one with a recent `since_ts` that matches little walks the
+/// whole table. `idx_events_ts` ends in the rowid (it is the composite
+/// `(ts_utc, id)`), so a probe for `limit + 1` rows at or after `since_ts` is
+/// answered from the index alone, and it chooses:
+/// - few matches (at most `limit`), or oldest-first: read them through the
+///   index (a sort of at most the matches);
+/// - many matches, newest first: walk the primary key from the newest id and
+///   test `ts_utc` row by row, which stops after `limit` rows because the
+///   newest rows are the ones that match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SincePlan {
+    /// Not a `since_ts`-only read, or `idx_events_ts` is absent (a ledger no
+    /// writer has opened since it was added); the planner decides.
+    Planner,
+    Index,
+    KeyWalk,
+}
+
 impl EventQuery {
-    /// The SELECT and its parameters. Only the filters that are set appear, so
-    /// the planner is never handed an `? IS NULL OR col = ?` it cannot index.
-    ///
-    /// `ts_index` says `idx_events_ts` exists (a ledger no writer has opened
-    /// since the index was added lacks it, and `INDEXED BY` a missing index is
-    /// an error). With `since_ts` as the only filter the planner prefers a
-    /// primary-key walk that tests `ts_utc` row by row, which is cheap while
-    /// recent rows match and a full scan when none do, so the index is named.
-    fn sql(&self, limit: u32, ts_index: bool) -> (String, Vec<rusqlite::types::Value>) {
-        use rusqlite::types::Value;
+    /// Picks the [`SincePlan`] for this read of `conn`.
+    fn since_plan(&self, conn: &Connection, limit: u32) -> Result<SincePlan, LedgerError> {
         let only_since = self.since_ts.is_some()
             && [
                 &self.action,
@@ -2196,21 +2212,64 @@ impl EventQuery {
             ]
             .iter()
             .all(|filter| filter.is_none());
-        let source = if ts_index && only_since {
+        let Some(since) = self.since_ts.as_deref().filter(|_| only_since) else {
+            return Ok(SincePlan::Planner);
+        };
+        let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
+        let indexed = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_ts'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(failed)?
+            .is_some();
+        if !indexed {
+            return Ok(SincePlan::Planner);
+        }
+        let matches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM events INDEXED BY idx_events_ts
+                                       WHERE ts_utc >= ?1 LIMIT ?2)",
+                params![since, i64::from(limit) + 1],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        Ok(if self.descending && matches > i64::from(limit) {
+            SincePlan::KeyWalk
+        } else {
+            SincePlan::Index
+        })
+    }
+
+    /// The SELECT and its parameters. Only the filters that are set appear, so
+    /// the planner is never handed an `? IS NULL OR col = ?` it cannot index.
+    ///
+    /// `since` says how a `since_ts`-only read is planned (see [`SincePlan`]).
+    fn sql(&self, limit: u32, since: SincePlan) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        let source = if since == SincePlan::Index {
             "events INDEXED BY idx_events_ts"
         } else {
             "events"
         };
-        // `id > 0` is the predicate of the partial indexes on action, object
-        // and worktree_path (see SCHEMA); ids start at 1, so it removes nothing.
+        // `id > 0` is the predicate of the partial index on action (see
+        // SCHEMA); ids start at 1, so it removes nothing.
         let mut clauses = vec!["id > 0".to_string(), "id > ?".to_string()];
         let mut values = vec![Value::Integer(self.after)];
         if let Some(before) = self.before {
             clauses.push("id < ?".to_string());
             values.push(Value::Integer(before));
         }
+        // A unary plus keeps the key walk from being replaced by the index.
+        let since_clause = if since == SincePlan::KeyWalk {
+            "+ts_utc >= ?"
+        } else {
+            "ts_utc >= ?"
+        };
         let filters = [
-            ("ts_utc >= ?", &self.since_ts),
+            (since_clause, &self.since_ts),
             ("action = ?", &self.action),
             ("object = ?", &self.object),
             ("worktree_path = ?", &self.worktree_path),
@@ -2263,7 +2322,8 @@ pub fn query_readonly_page(
 /// that pins every filter to an index.
 #[cfg(test)]
 fn explain_query(conn: &Connection, query: &EventQuery) -> Vec<String> {
-    let (sql, values) = query.sql(query.limit, true);
+    let since = query.since_plan(conn, query.limit).expect("since plan");
+    let (sql, values) = query.sql(query.limit, since);
     let mut stmt = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .expect("prepare plan");
@@ -2291,17 +2351,8 @@ fn read_events(
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     with_access(repo_path, access, |conn| {
-        let ts_index = query.since_ts.is_some()
-            && conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_ts'",
-                    [],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?
-                .is_some();
-        let (sql, values) = query.sql(limit + 1, ts_index);
+        let since = query.since_plan(conn, limit)?;
+        let (sql, values) = query.sql(limit + 1, since);
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
