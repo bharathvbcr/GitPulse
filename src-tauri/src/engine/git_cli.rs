@@ -2043,6 +2043,16 @@ fn subcommand_index(args: &[&str]) -> Option<usize> {
     None
 }
 
+/// `err` without the one optional `[code] ` prefix the ledger adds. Every
+/// anchored check on a runner message goes through this, so none can be
+/// defeated by the prefix the others tolerate.
+fn strip_code_prefix(err: &str) -> &str {
+    match err.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+        Some((code, rest)) if code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => rest,
+        _ => err,
+    }
+}
+
 /// True when `err` is the gate declining to start a child under load. The
 /// command may succeed if asked again once load falls; it did not run.
 ///
@@ -2054,10 +2064,7 @@ fn subcommand_index(args: &[&str]) -> Option<usize> {
 /// the wait as `<seconds>s:`. The label ends at the FIRST marker, so a hostile
 /// path that carries a complete refusal later in the text cannot qualify.
 pub(crate) fn is_deferred_under_load(err: &str) -> bool {
-    let body = match err.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
-        Some((code, rest)) if code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => rest,
-        _ => err,
-    };
+    let body = strip_code_prefix(err);
     let Some((label, after)) = body.split_once(DEFERRED_MARKER) else {
         return false;
     };
@@ -2277,20 +2284,41 @@ impl RunError {
     /// timeouts so a program path that spells the timeout phrase cannot turn a
     /// spawn failure into a hang.
     pub(crate) fn classify(err: &str) -> Self {
+        let body = strip_code_prefix(err);
         if is_deferred_under_load(err) {
             Self::Deferred
+        } else if is_spawn_not_found(body) {
+            Self::SpawnNotFound
+        } else if body.starts_with("Failed to spawn ") {
+            Self::SpawnFailed
         } else if is_slot_wait_timeout(err) {
             Self::SlotWaitTimeout
-        } else if is_spawn_not_found(err) {
-            Self::SpawnNotFound
-        } else if err.starts_with("Failed to spawn ") {
-            Self::SpawnFailed
-        } else if is_timed_out(err) {
+        } else if is_runner_timeout_shape(body) {
             Self::Timeout
         } else {
             Self::Other
         }
     }
+}
+
+/// The runner's own deadline text, `<label> timed out after <n>s`, anchored at
+/// the start: a label of plain words (program and subcommand, or a program
+/// path), the marker, then the seconds. Text a child printed and a caller
+/// relayed (`... Operation timed out after 30001 milliseconds`) has a label
+/// full of punctuation and a unit that is not `s`, and is not this.
+fn is_runner_timeout_shape(body: &str) -> bool {
+    let Some((label, after)) = body.split_once(TIMEOUT_MARKER) else {
+        return false;
+    };
+    let plain_label = !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '/'));
+    let digits = after
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b'.')
+        .count();
+    plain_label && digits > 0 && after[digits..].starts_with('s')
 }
 
 /// True when `err` is a child that started and ran past its deadline: not a
@@ -4890,28 +4918,121 @@ fn collect_drained_deadline(rx: &mpsc::Receiver<Drained>, deadline: Instant) -> 
 /// Whether the command is safe to run again at all is
 /// [`lock_retry_allowed`]'s question, not this one's.
 pub fn is_transient_git_lock_error(err: &str) -> bool {
+    // The quoted lock path is blanked before the guard phrases are looked for,
+    // so a repository path that spells `remote:` or `but expected` is still a
+    // lock, and the guards match only git's own message structure.
     let first = err.lines().next().unwrap_or_default().to_ascii_lowercase();
-    if first.contains("remote:")
-        || first.contains("exists; cannot create")
-        || first.contains("but expected")
+    let Some(lock) = lock_path_span(&first) else {
+        return first.contains("another git process seems to be running")
+            && !first.trim_start().starts_with("remote:");
+    };
+    let rest = format!("{}{}", &first[..lock.start], &first[lock.end..]);
+    let lost_race = rest
+        .find(" is at ")
+        .is_some_and(|at| rest[at..].contains(" but expected "));
+    if rest.trim_start().starts_with("remote:")
+        || rest.contains("exists; cannot create")
+        || lost_race
     {
         return false;
     }
-    (first.contains("unable to create")
-        && first.contains(".lock'")
-        && first.contains("file exists"))
-        || first.contains("another git process seems to be running")
+    lock.directory_create || rest.contains("file exists")
+}
+
+/// The quoted `...lock` path in git's "could not take this lock" wording, by
+/// byte offsets into the lowercased first line.
+struct LockPath {
+    start: usize,
+    end: usize,
+    /// `unable to create directory for '...lock'`: a racing ref-directory
+    /// create, which says no `File exists`.
+    directory_create: bool,
+}
+
+fn lock_path_span(first_lower: &str) -> Option<LockPath> {
+    for (opener, directory_create) in [
+        ("unable to create directory for '", true),
+        ("unable to create '", false),
+    ] {
+        if let Some(at) = first_lower.find(opener) {
+            let start = at + opener.len();
+            let end = first_lower.rfind(".lock'")? + ".lock".len();
+            if end >= start {
+                return Some(LockPath {
+                    start,
+                    end,
+                    directory_create,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The lock path git names on the first line of `diagnosis`, original case.
+fn lock_path_named(diagnosis: &str) -> Option<&str> {
+    let first = diagnosis.lines().next()?;
+    let span = lock_path_span(&first.to_ascii_lowercase())?;
+    first.get(span.start..span.end)
+}
+
+/// Whether a failed hook-running command (`commit`, `merge`, `cherry-pick`, ...)
+/// failed on a lock inside THIS repository's git directory (or its common
+/// directory, where ref locks live).
+///
+/// git takes `index.lock` before it runs any hook, so git's own lock failure
+/// on this repository proves no hook started and replaying runs nothing twice.
+/// A lock line that names another path is something else's: a nested git a hook
+/// ran, or another repository. Anything that cannot be resolved is refused.
+fn lock_is_in_this_repository(repo: &Path, diagnosis: &str) -> bool {
+    let Some(named) = lock_path_named(diagnosis) else {
+        return false;
+    };
+    let Ok(dirs) = git_text(
+        repo,
+        &["rev-parse", "--absolute-git-dir", "--git-common-dir"],
+    ) else {
+        return false;
+    };
+    let named = Path::new(named);
+    // A lock file that is gone by now is compared through its directory.
+    let named = named.canonicalize().ok().or_else(|| {
+        let parent = named.parent()?.canonicalize().ok()?;
+        Some(parent.join(named.file_name()?))
+    });
+    let Some(named) = named else {
+        return false;
+    };
+    dirs.lines().any(|dir| {
+        let dir = Path::new(dir.trim());
+        let dir = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            repo.join(dir)
+        };
+        dir.canonicalize().is_ok_and(|dir| named.starts_with(dir))
+    })
 }
 
 /// Subcommands that talk to a remote. A failure that mentions a lock may be the
 /// server's, and running one again repeats the network work.
 const NETWORK_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone", "ls-remote"];
 
-/// Whether `git <sub>` may be run again after a lock failure: never a command
-/// that ran hooks (a hook can take minutes and has side effects) or touched the
-/// network (see [`NETWORK_SUBCOMMANDS`]).
+/// Whether `git <sub>` may be run again after ANY lock-shaped failure: never a
+/// command that ran hooks (a hook can take minutes and has side effects) or
+/// touched the network (see [`NETWORK_SUBCOMMANDS`]). A hook-running command
+/// is replayed only on proof the hook never started: see
+/// [`lock_is_in_this_repository`].
 fn lock_retry_allowed(sub: &str) -> bool {
     hooks::hooks_run_by(sub).is_none() && !NETWORK_SUBCOMMANDS.contains(&sub)
+}
+
+/// The full retry decision for one failed attempt of `git <sub>`.
+fn lock_retry_wanted(repo: Option<&Path>, sub: &str, diagnosis: &str) -> bool {
+    if !is_transient_git_lock_error(diagnosis) || NETWORK_SUBCOMMANDS.contains(&sub) {
+        return false;
+    }
+    lock_retry_allowed(sub) || repo.is_some_and(|repo| lock_is_in_this_repository(repo, diagnosis))
 }
 
 /// Backoff for attempts 1..=3: 50 + 150 + 300 ms = 500 ms, plus a tiny pid jitter
@@ -5053,10 +5174,7 @@ fn git_run_inner(
             stderr.trim()
         };
         if !diagnosis.is_empty() {
-            if attempts < MAX_LOCK_RETRIES
-                && lock_retry_allowed(sub)
-                && is_transient_git_lock_error(diagnosis)
-            {
+            if attempts < MAX_LOCK_RETRIES && lock_retry_wanted(repo, sub, diagnosis) {
                 attempts += 1;
                 std::thread::sleep(
                     Duration::from_millis(lock_retry_backoff_ms(attempts))
@@ -6434,6 +6552,9 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
         git_text(dir.path(), &["add", "f.txt"]).unwrap();
         let counter = dir.path().join("hook-count");
+        // A nested git the hook ran against ANOTHER repository: its lock line
+        // names a path outside this git dir, so it is never replayed.
+        let other = tempfile::TempDir::new().unwrap();
         let hook = dir.path().join(".git/hooks/pre-commit");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
         std::fs::write(
@@ -6441,7 +6562,7 @@ mod tests {
             format!(
                 "#!/bin/sh\necho run >> '{}'\necho \"fatal: Unable to create '{}/.git/index.lock': File exists.\" >&2\nexit 1\n",
                 counter.display(),
-                dir.path().display()
+                other.path().display()
             ),
         )
         .unwrap();

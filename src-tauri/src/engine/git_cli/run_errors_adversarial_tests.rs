@@ -139,7 +139,6 @@ fn non_hook_commands_ride_out_a_held_lock() {
 /// before it runs any hook, so a lock failure on commit has run nothing and is
 /// the commonest contention there is. Before the change this retried.
 #[test]
-#[ignore = "break: commit with NO hooks is never retried on real index.lock contention"]
 fn commit_without_hooks_rides_out_a_held_index_lock() {
     let repo = repo_with_commit();
     let path = repo.path();
@@ -159,11 +158,14 @@ fn commit_without_hooks_rides_out_a_held_index_lock() {
 /// BREAK: same class for the other commands in `hooks_run_by` that fail on the
 /// index/ref lock before any hook runs (merge, cherry-pick, revert, rebase).
 #[test]
-#[ignore = "break: merge/cherry-pick are never retried on a held index.lock even with no hooks"]
 fn merge_and_cherry_pick_without_hooks_ride_out_a_held_index_lock() {
     let repo = repo_with_commit();
     let path = repo.path();
     git_in(path, &["checkout", "-q", "x"]);
+    // A real change: `commit_at` commits empty, and cherry-picking an empty
+    // commit stops with "now empty" whatever the lock did.
+    std::fs::write(path.join("side.txt"), "side\n").unwrap();
+    git_in(path, &["add", "side.txt"]);
     commit_at(path, "side", 1_700_000_100, "a@example.com");
     git_in(path, &["checkout", "-q", "main"]);
     let t = hold_lock(path.join(".git/index.lock"), 150);
@@ -177,10 +179,12 @@ fn merge_and_cherry_pick_without_hooks_ride_out_a_held_index_lock() {
     assert!(picked.is_ok(), "cherry-pick: {picked:?}");
 }
 
-/// A commit that fails on a held lock returns at once instead of backing off:
-/// pins today's behaviour (the contrast with the ignored test above).
+/// A commit that fails on a lock that is never released backs off and then
+/// gives up with git's own message: it is retried (the first attempt is not
+/// final), and the retries are bounded. This pinned the opposite while commit
+/// was wholesale excluded from the lock retry.
 #[test]
-fn commit_on_a_held_lock_fails_on_the_first_attempt_today() {
+fn commit_on_a_held_lock_is_retried_then_fails_with_gits_message() {
     let repo = repo_with_commit();
     let path = repo.path();
     std::fs::write(path.join("b"), "b\n").unwrap();
@@ -191,11 +195,38 @@ fn commit_on_a_held_lock_fails_on_the_first_attempt_today() {
     let error = git_text(path, &["commit", "-m", "two"]).expect_err("lock held");
     assert!(is_transient_git_lock_error(&error), "{error}");
     assert!(
-        started.elapsed() < Duration::from_millis(300),
+        started.elapsed() >= Duration::from_millis(450),
         "no backoff happened: {:?}",
         started.elapsed()
     );
     std::fs::remove_file(lock).unwrap();
+}
+
+/// A hook-running command is replayed only for a lock in THIS repository's git
+/// directory; a lock line naming another path (a nested git in a hook, another
+/// repository) is not.
+#[test]
+fn hooked_commands_retry_only_for_a_lock_in_their_own_git_dir() {
+    let repo = repo_with_commit();
+    let other = repo_with_commit();
+    let path = repo.path();
+    let own = format!(
+        "fatal: Unable to create '{}/.git/index.lock': File exists.",
+        path.display()
+    );
+    let foreign = format!(
+        "fatal: Unable to create '{}/.git/index.lock': File exists.",
+        other.path().display()
+    );
+    for sub in ["commit", "merge", "cherry-pick", "revert", "rebase", "am"] {
+        assert!(lock_retry_wanted(Some(path), sub, &own), "{sub}");
+        assert!(!lock_retry_wanted(Some(path), sub, &foreign), "{sub}");
+        assert!(!lock_retry_wanted(None, sub, &own), "{sub}: no repo");
+    }
+    for sub in ["push", "fetch", "pull", "clone", "ls-remote"] {
+        assert!(!lock_retry_wanted(Some(path), sub, &own), "{sub}");
+    }
+    assert!(lock_retry_wanted(Some(path), "add", &foreign));
 }
 
 /// A lock failure that happens before any hook ran says nothing was run. The
@@ -212,7 +243,11 @@ fn a_lock_failure_on_commit_happens_before_the_pre_commit_hook() {
     let marker = path.join("hook-ran");
     let hook = path.join(".git/hooks/pre-commit");
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    std::fs::write(&hook, format!("#!/bin/sh\necho ran >> '{}'\n", marker.display())).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho ran >> '{}'\n", marker.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(path.join(".git/index.lock"), b"").unwrap();
     let message = real_git_failure(path, &["commit", "-m", "two"]);
@@ -279,7 +314,6 @@ fn bare_cannot_lock_ref_is_not_a_transient_lock() {
 /// `File exists`. The old classifier retried it (unable to create + .lock);
 /// the new one never does.
 #[test]
-#[ignore = "break: 'unable to create directory for ...lock' (racing ref-dir prune) lost its retry"]
 fn racing_ref_directory_create_is_still_transient() {
     assert!(is_transient_git_lock_error(
         "error: cannot lock ref 'refs/heads/a/b': unable to create directory for '/r/.git/refs/heads/a/b.lock'"
@@ -290,7 +324,6 @@ fn racing_ref_directory_create_is_still_transient() {
 /// BREAK: the guard words are matched anywhere on the line, so a repository
 /// whose path contains "remote:" or "but expected" is never retried.
 #[test]
-#[ignore = "break: first-line guard words match inside the repository path"]
 fn a_path_containing_a_guard_word_is_still_a_lock() {
     assert!(is_transient_git_lock_error(
         "fatal: Unable to create '/Users/me/remote: backups/r/.git/index.lock': File exists."
@@ -323,9 +356,11 @@ fn run_error_message_shapes() {
     );
     // raw, coded, doubly coded
     assert_eq!(RunError::classify(&ran), RunError::Timeout);
+    assert_eq!(RunError::classify(&format!("[a] {ran}")), RunError::Timeout);
     assert_eq!(
         RunError::classify(&format!("[a] [b] {ran}")),
-        RunError::Timeout
+        RunError::Other,
+        "one code prefix is stripped, for every anchored check alike"
     );
     assert_eq!(
         RunError::classify(&format!("[a] [b] {deferred}")),
@@ -341,8 +376,8 @@ fn run_error_message_shapes() {
     // the runner's: an exit-status failure that names such a path is not.
     assert_eq!(
         RunError::classify("devmap exited with status 2: /tmp/job timed out after 3 retries/x"),
-        RunError::Timeout,
-        "documents: exit-failure text that contains the marker reads as a timeout"
+        RunError::Other,
+        "exit-failure text that merely contains the marker is not the runner's deadline"
     );
     assert_eq!(RunError::classify(&slot), RunError::SlotWaitTimeout);
     assert_eq!(RunError::classify(&deferred), RunError::Deferred);
@@ -353,9 +388,9 @@ fn run_error_message_shapes() {
 /// the start of the message, so any prefix (a `[code]` or a caller wrapper)
 /// defeats the precedence the doc comment promises.
 #[test]
-#[ignore = "break: a prefixed spawn failure naming a path with the timeout phrase classifies as Timeout"]
 fn prefixed_spawn_failure_with_hostile_path_is_not_a_timeout() {
-    let hostile = format!("Failed to spawn /Users/x/devmap{TIMEOUT_MARKER}1s/devmap: permission denied");
+    let hostile =
+        format!("Failed to spawn /Users/x/devmap{TIMEOUT_MARKER}1s/devmap: permission denied");
     assert!(!is_run_timeout(&format!("[spawn_failed] {hostile}")));
     assert!(!is_run_timeout(&format!("Install failed: {hostile}")));
 }
@@ -364,7 +399,6 @@ fn prefixed_spawn_failure_with_hostile_path_is_not_a_timeout() {
 /// to carry " timed out after " (curl and cargo print "Operation timed out
 /// after 30001 milliseconds") reads as the runner's deadline.
 #[test]
-#[ignore = "break: relayed child text 'Operation timed out after N ms' classifies as a runner Timeout"]
 fn a_relayed_child_timeout_is_not_a_runner_timeout() {
     assert!(!is_run_timeout(
         "git fetch failed: fatal: unable to access 'https://h/r.git/': Operation timed out after 30001 milliseconds with 0 bytes received"
@@ -383,8 +417,13 @@ fn a_real_slow_child_is_classified_as_a_timeout_by_both_runners() {
     std::fs::write(&bin, "#!/bin/sh\nsleep 5\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let err = run_bounded(Command::new(&bin), "devmap", Duration::from_millis(200), None)
-        .expect_err("slow child must time out");
+    let err = run_bounded(
+        Command::new(&bin),
+        "devmap",
+        Duration::from_millis(200),
+        None,
+    )
+    .expect_err("slow child must time out");
     assert!(is_run_timeout(&err), "{err}");
     assert_eq!(RunError::classify(&err), RunError::Timeout, "{err}");
 
@@ -407,7 +446,11 @@ fn a_real_slow_child_is_classified_as_a_timeout_by_both_runners() {
         None,
     )
     .expect_err("missing binary");
-    assert_eq!(RunError::classify(&missing), RunError::SpawnNotFound, "{missing}");
+    assert_eq!(
+        RunError::classify(&missing),
+        RunError::SpawnNotFound,
+        "{missing}"
+    );
 }
 
 // ---- unborn HEAD -------------------------------------------------------------
@@ -482,7 +525,6 @@ fn a_packed_only_ref_resolves_and_is_not_unborn() {
 /// deleted, with HEAD on a new unborn `feature`, is a real unborn repository
 /// that is reported as an error.
 #[test]
-#[ignore = "break: an unborn branch whose ref path is an empty directory is reported as damaged"]
 fn an_unborn_branch_whose_ref_path_is_an_empty_directory_is_unborn() {
     let dir = tempfile::TempDir::new().unwrap();
     git_in(dir.path(), &["init", "-q", "-b", "main"]);

@@ -3056,7 +3056,11 @@ fn head_ref_is_absent(repo: &Path) -> bool {
     } else {
         repo.join(located)
     };
-    !located.exists()
+    // A ref is a regular file. A directory at the ref path (a leftover
+    // `refs/heads/feature/` after `feature/x` was deleted) holds no ref, and
+    // git calls that branch unborn. Asking git instead (`rev-parse --verify`)
+    // cannot help: it fails the same way for an absent ref and a garbage one.
+    !located.is_file()
 }
 
 /// How the DORA commit scan bounds itself by date.
