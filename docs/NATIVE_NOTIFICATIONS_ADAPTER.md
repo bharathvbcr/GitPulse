@@ -133,6 +133,63 @@ actions instead of presenting inactive controls.
   calls have bounded callback waits. Windows/Linux report unsupported native
   delivery; no additional platform bindings were added.
 
+## Forwarding to Graft (phone)
+
+Graft.app, the Mac side of the user's phone pairing, listens on a local Unix
+socket (Graft `PROTOCOL.md` §10.13, "Local submission"). GitPulse offers it the
+banners it has already shown, so they also reach the paired phone. The code is
+`workbench/notifications/graft.rs`; it uses `std::os::unix::net` and adds no
+dependency.
+
+- **What is forwarded.** The same heading and body as the banner, after the OS
+  accepted it: an activity banner once its saved delivery reads `submitted`,
+  and a session banner once the OS accepts it (a session has no durable record).
+  Nothing is forwarded for `failed` or `uncertain`, so the phone never shows a
+  banner the Mac did not. Withdrawal sends `remove` for each banner the
+  withdrawal pass takes down; session banners have no withdrawal, and Graft
+  drops held items after 24 hours (its contract, not something GitPulse
+  checked). The banner's sound setting becomes the
+  request's `silent` flag.
+- **Key.** The banner's own identity (`gitpulse.<profile>.event-N`, or
+  `gitpulse.session.<session>`), which is already inside Graft's key grammar.
+  The same banner always yields the same key and a `remove` finds what its
+  `post` made. An identity outside the grammar is not forwarded; Graft rejects
+  a bad key and never truncates it, so it is not guessed at.
+- **Caps.** The heading, body and application name are cut to Graft's byte
+  caps (256, 2048 and 128) on a code-point boundary. A body that JSON escaping
+  inflates past the 8192-byte request limit is shortened, not dropped.
+- **Socket.** `GRAFT_NOTIFY_SOCKET`, else
+  `~/Library/Application Support/Graft/notify.sock`. One request per connection;
+  connect, write and read share a hard one-second budget.
+- **Off the delivery path.** The coordinator and the session notifier only
+  enqueue to a bounded queue (16) that drops when full; one supervised thread
+  does the socket work. A hung or absent Graft can therefore cost at most a
+  dropped forward. It changes no delivery record, never moves the
+  claim/uncertain/submitted state machine, never delays a banner or the
+  five-second reconcile, and nothing is retried. A missing socket (Graft not
+  running) is a quiet no-op.
+- **Refusals.** `disabled`, `source-not-allowed`, `rate-limited`, `bad-request`
+  and `too-large`, and a timeout or I/O error, are logged once per code
+  (`graft-notify`), with the code and never a title, text or key.
+- **The gate is Graft's.** GitPulse has no switch for this and adds none: the
+  activity preferences live in the Manvi store (a schema change there cascades
+  to DevCouncil, Manvi and Jarvis), and the session settings in `tools.json`
+  would cover only half the banners. Graft's own master switch (off by default)
+  and per-program allow list are the user's control; GitPulse is offered to the
+  user in Graft's settings the first time it is refused `source-not-allowed`.
+  The phone only ever receives banners that GitPulse's own settings (enabled,
+  quiet hours, mutes, background) let through.
+
+Verified (Rust tests against a fake Unix-socket server in a temp directory, via
+`GRAFT_NOTIFY_SOCKET`): request shape, caps and the oversized-field case; the
+key's stability and charset; every refusal code and a garbled answer; a missing
+socket and a stale socket file; a server that never answers and one that drips
+bytes (both bounded by the one-second budget and not retried); a full queue
+dropping while the caller is not delayed; the delivery record being unchanged
+with a listening Graft and with none. **Unverified:** a real Graft.app (the
+Graft side was not running), delivery to the phone, and the installed GitPulse
+bundle posting through the socket.
+
 ## Verification and remaining qualification
 
 Verified: eight canonical store tests cover watermark/disabled behavior,
