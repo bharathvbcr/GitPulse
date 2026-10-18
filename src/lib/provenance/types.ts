@@ -31,8 +31,11 @@ export interface SessionEpisodeNote {
 export interface ProvenanceFreshness {
   commit_sha: string;
   /**
-   * Commits between this one and the base, or `null` when it could not be
-   * measured.
+   * How many commits the base has that this one does not
+   * (`rev-list --count <commit>..<base>`), or `null` when it could not be
+   * measured. It is 0 for a commit *ahead of* the base as well as for the base
+   * tip, so it says how far the base moved, not whether the commit is on it:
+   * read `landed_on_base` and `ahead` for that.
    *
    * `null` is not zero. Zero is the strongest claim this type can make —
    * "nothing has moved since this was verified" — so a failed measurement
@@ -57,4 +60,23 @@ export interface ProvenanceFreshness {
   notes_readable: boolean;
   verification: VerificationNote | null;
   session: SessionEpisodeNote | null;
+  /**
+   * Whether the commit is reachable from the base (landed there by fast-forward
+   * or merge). `false` is a measured "not reachable": a commit *ahead of* the
+   * base has `distance` 0 and is still `false` here. `null` when it could not
+   * be measured (unresolvable base, shallow clone, a badge row) — never `false`.
+   */
+  landed_on_base: boolean | null;
+  /** The same reachability, under the name the freshness fields are read against. */
+  on_base: boolean | null;
+  /** The commit the base resolved to. */
+  base_oid: string | null;
+  /** The common ancestor of the commit and the base. */
+  merge_base: string | null;
+  /** Commits on this one and not on the base. */
+  ahead: number | null;
+  /** Commits on the base and not on this one; equals `distance` when both were measured. */
+  behind: number | null;
+  /** Empty when the relation was measured; otherwise why it was not. */
+  base_relation_reason: string;
 }

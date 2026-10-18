@@ -61,13 +61,13 @@ fn a_commit_ahead_of_the_base_is_not_on_it_and_distance_is_unchanged() {
     assert_eq!(f.distance, Some(0));
     assert!(f.is_fresh);
     // What it never said, now said.
-    assert_eq!(f.relation.landed_on_base, Some(false));
-    assert_eq!(f.relation.on_base, Some(false));
-    assert_eq!(f.relation.ahead, Some(1));
-    assert_eq!(f.relation.behind, Some(0));
-    assert_eq!(f.relation.base_oid.as_deref(), Some(base.as_str()));
-    assert_eq!(f.relation.merge_base.as_deref(), Some(base.as_str()));
-    assert_eq!(f.relation.base_relation_reason, "");
+    assert_eq!(f.landed_on_base, Some(false));
+    assert_eq!(f.on_base, Some(false));
+    assert_eq!(f.ahead, Some(1));
+    assert_eq!(f.behind, Some(0));
+    assert_eq!(f.base_oid.as_deref(), Some(base.as_str()));
+    assert_eq!(f.merge_base.as_deref(), Some(base.as_str()));
+    assert_eq!(f.base_relation_reason, "");
 }
 
 #[test]
@@ -78,14 +78,14 @@ fn a_merged_commit_is_on_the_base_and_behind_counts_what_followed_it() {
 
     let f = compute_freshness(repo.as_str(), &merged, Some("main"));
 
-    assert_eq!(f.relation.landed_on_base, Some(true));
-    assert_eq!(f.relation.on_base, Some(true));
-    assert_eq!(f.relation.ahead, Some(0));
-    assert_eq!(f.relation.behind, Some(1));
-    assert_eq!(f.distance, f.relation.behind);
-    assert_eq!(f.relation.merge_base.as_deref(), Some(merged.as_str()));
+    assert_eq!(f.landed_on_base, Some(true));
+    assert_eq!(f.on_base, Some(true));
+    assert_eq!(f.ahead, Some(0));
+    assert_eq!(f.behind, Some(1));
+    assert_eq!(f.distance, f.behind);
+    assert_eq!(f.merge_base.as_deref(), Some(merged.as_str()));
     assert_eq!(
-        f.relation.base_oid.as_deref(),
+        f.base_oid.as_deref(),
         Some(repo.git(&["rev-parse", "main"]).as_str())
     );
 }
@@ -98,14 +98,14 @@ fn an_unresolvable_base_is_unmeasured_with_a_reason_never_false() {
     let f = compute_freshness(repo.as_str(), &sha, Some("no-such-branch"));
 
     assert_eq!(f.distance, None);
-    assert_eq!(f.relation.landed_on_base, None);
-    assert_eq!(f.relation.on_base, None);
-    assert_eq!(f.relation.ahead, None);
-    assert_eq!(f.relation.behind, None);
+    assert_eq!(f.landed_on_base, None);
+    assert_eq!(f.on_base, None);
+    assert_eq!(f.ahead, None);
+    assert_eq!(f.behind, None);
     assert!(
-        f.relation.base_relation_reason.contains("no-such-branch"),
+        f.base_relation_reason.contains("no-such-branch"),
         "{}",
-        f.relation.base_relation_reason
+        f.base_relation_reason
     );
 }
 
@@ -137,11 +137,11 @@ fn a_shallow_clone_does_not_answer_not_reachable() {
 
     let f = compute_freshness(path, &feature, Some("origin/main"));
 
-    assert_eq!(f.relation.landed_on_base, None, "{f:?}");
+    assert_eq!(f.landed_on_base, None, "{f:?}");
     assert!(
-        f.relation.base_relation_reason.contains("shallow"),
+        f.base_relation_reason.contains("shallow"),
         "{}",
-        f.relation.base_relation_reason
+        f.base_relation_reason
     );
     let answer = landed(path, &feature, Some("origin/main"));
     assert_eq!(answer.landed, None);
@@ -153,8 +153,8 @@ fn a_batch_row_does_not_claim_a_relation_it_did_not_measure() {
     let repo = Repo::new();
     let sha = repo.git(&["rev-parse", "HEAD"]);
     let rows = freshness_batch(repo.as_str(), &[sha], None);
-    assert_eq!(rows[0].relation.landed_on_base, None);
-    assert!(!rows[0].relation.base_relation_reason.is_empty());
+    assert_eq!(rows[0].landed_on_base, None);
+    assert!(!rows[0].base_relation_reason.is_empty());
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn a_squash_landing_names_the_squash_commit() {
     assert!(answer.landed_at.is_some(), "{answer:?}");
     // Not reachable, and the freshness read says so rather than "landed".
     let f = compute_freshness(repo.as_str(), &tip, Some("main"));
-    assert_eq!(f.relation.landed_on_base, Some(false));
+    assert_eq!(f.landed_on_base, Some(false));
 }
 
 #[test]

@@ -51,7 +51,7 @@ pub struct ProvenanceFreshness {
     /// else. It is zero both for the base tip itself and for a commit that is
     /// *ahead of* the base (the range `A..B` is empty whenever `B` is an
     /// ancestor of `A`), so a zero does not say the commit is on the base:
-    /// [`BaseRelation::on_base`] and [`BaseRelation::ahead`] say that.
+    /// `on_base` and `ahead` say that.
     ///
     /// `None` is not zero. Zero means "the base has nothing this commit
     /// lacks", the strongest possible statement; a failed measurement means
@@ -79,20 +79,11 @@ pub struct ProvenanceFreshness {
     pub notes_readable: bool,
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
-    /// Where the commit sits relative to the base, additive to `distance`.
-    #[serde(flatten)]
-    pub relation: BaseRelation,
-}
-
-/// Where a commit sits relative to the base it was measured against.
-///
-/// Every field is `None` when the relation could not be established, with
-/// `base_relation_reason` saying why; a `false` is only ever a measured
-/// answer. One `merge-base --is-ancestor` and one `rev-list --left-right
-/// --count` produce it, plus a `merge-base` when the commit is not an
-/// ancestor, to name the fork point.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct BaseRelation {
+    // Where the commit sits relative to the base, additive to `distance`.
+    // Every one is `None` when it could not be established, with
+    // `base_relation_reason` saying why; a `false` is only ever a measured
+    // answer. A badge row (`freshness_batch`) does not spend processes on them
+    // and says so there.
     /// True when the commit is reachable from the base: it landed there by
     /// fast-forward or merge. False means measured and not reachable (ahead
     /// of, or diverged from, the base); a squash or rebase landing is also
@@ -117,9 +108,24 @@ pub struct BaseRelation {
     pub base_relation_reason: String,
 }
 
+/// Where a commit sits relative to the base it was measured against: what
+/// [`base_relation`] measures, to be laid onto a [`ProvenanceFreshness`] by
+/// [`ProvenanceFreshness::with_relation`]. One `merge-base --is-ancestor` and
+/// one `rev-list --left-right --count` produce it, plus a `merge-base` when
+/// the commit is not an ancestor, to name the fork point.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BaseRelation {
+    landed_on_base: Option<bool>,
+    base_oid: Option<String>,
+    merge_base: Option<String>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+    base_relation_reason: String,
+}
+
 impl BaseRelation {
     /// The answer when nothing could be established, with the reason.
-    pub fn unmeasured(reason: impl Into<String>) -> Self {
+    fn unmeasured(reason: impl Into<String>) -> Self {
         Self {
             base_relation_reason: reason.into(),
             ..Self::default()
@@ -277,11 +283,32 @@ impl ProvenanceFreshness {
             distance: None,
             confidence: None,
             is_fresh: false,
-            relation: BaseRelation::unmeasured(reason.clone()),
+            landed_on_base: None,
+            on_base: None,
+            base_oid: None,
+            merge_base: None,
+            ahead: None,
+            behind: None,
+            base_relation_reason: reason.clone(),
             unmeasured_reason: reason,
             notes_readable: false,
             verification: None,
             session: None,
+        }
+    }
+
+    /// This row with where its commit sits relative to the base. `on_base` is
+    /// `landed_on_base` under the name the freshness fields are read against.
+    fn with_relation(self, relation: BaseRelation) -> Self {
+        Self {
+            landed_on_base: relation.landed_on_base,
+            on_base: relation.landed_on_base,
+            base_oid: relation.base_oid,
+            merge_base: relation.merge_base,
+            ahead: relation.ahead,
+            behind: relation.behind,
+            base_relation_reason: relation.base_relation_reason,
+            ..self
         }
     }
 
@@ -890,7 +917,6 @@ fn base_relation(repo: &Path, commit: &str, base: &str) -> BaseRelation {
     };
     BaseRelation {
         landed_on_base: Some(reachable),
-        on_base: Some(reachable),
         base_oid: Some(base.to_string()),
         merge_base,
         ahead: Some(ahead),
@@ -1472,9 +1498,9 @@ fn freshness_rows(
                     is_fresh: distance == Some(0),
                     verification,
                     session,
-                    relation,
                     ..ProvenanceFreshness::unexamined(sha, reason)
-                };
+                }
+                .with_relation(relation);
             }
 
             ProvenanceFreshness {
@@ -1485,9 +1511,10 @@ fn freshness_rows(
                 notes_readable: true,
                 verification: verification.unwrap_or(None),
                 session: session.unwrap_or(None),
-                relation,
                 commit_sha: sha,
+                ..ProvenanceFreshness::unexamined("", "")
             }
+            .with_relation(relation)
         })
         .collect()
 }
@@ -1729,10 +1756,16 @@ mod batch_tests {
 
         // The relation to the base is the one thing a badge row does not
         // spend processes on, and says so rather than guessing.
-        assert!(!batched.relation.base_relation_reason.is_empty());
-        assert_eq!(batched.relation.landed_on_base, None);
+        assert!(!batched.base_relation_reason.is_empty());
+        assert_eq!(batched.landed_on_base, None);
         let single = ProvenanceFreshness {
-            relation: batched.relation.clone(),
+            landed_on_base: None,
+            on_base: None,
+            base_oid: None,
+            merge_base: None,
+            ahead: None,
+            behind: None,
+            base_relation_reason: batched.base_relation_reason.clone(),
             ..single
         };
         assert_eq!(single, batched);
