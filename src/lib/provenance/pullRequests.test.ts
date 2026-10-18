@@ -16,6 +16,13 @@ function resolved(sha: string, over: Partial<ProvenanceFreshness> = {}): Provena
     notes_readable: true,
     verification: null,
     session: null,
+    landed_on_base: null,
+    on_base: null,
+    base_oid: null,
+    merge_base: null,
+    ahead: null,
+    behind: null,
+    base_relation_reason: "not measured",
     ...over,
   };
 }
@@ -30,6 +37,13 @@ function unresolved(rev: string): ProvenanceFreshness {
     notes_readable: false,
     verification: null,
     session: null,
+    landed_on_base: null,
+    on_base: null,
+    base_oid: null,
+    merge_base: null,
+    ahead: null,
+    behind: null,
+    base_relation_reason: "not measured",
   };
 }
 

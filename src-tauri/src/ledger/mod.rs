@@ -82,6 +82,25 @@ CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
     WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
+-- The two indexes the filtered `gitpulse_ledger_events` read adds, for the
+-- `since_ts` and `action` filters (`task_id` and `session_id` use the two
+-- above). `object`, `worktree_path` and `after_ref` are deliberately not
+-- indexed: each index is an append-time cost on every event, and those filters
+-- stop at `limit` matches. SQLite appends the rowid to every index key, so
+-- `idx_events_ts` is already the composite (ts_utc, id) the `since_ts` read
+-- uses. Both columns are NOT NULL, so neither index can be partial on that.
+-- Measured cost (ledger::query_tests::bench_append_cost_by_index, 10 000
+-- appends, rotated order, min of 5, host load ~20-27): 150.0 us/append with
+-- neither, 160.1 us with both (+6.7%); alone each measured +8% to +11%, so the
+-- figures are noisy at that size. What it buys: newest-first `action` and
+-- `since_ts` reads that stop at `limit` instead of scanning the history.
+-- `idx_events_action` carries the predicate `id > 0` (true of every row) and the
+-- read states it, because SQLite uses a partial index only when the query
+-- contains its predicate: a plain index on `action` competes with the
+-- purpose-built ones (`idx_events_binding`, `idx_events_reflog`) and the
+-- planner picks it for the binding and re-anchor queries, which it serves worse.
+CREATE INDEX IF NOT EXISTS idx_events_ts       ON events(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_events_action   ON events(action) WHERE id > 0;
 CREATE INDEX IF NOT EXISTS idx_events_binding  ON events(worktree_path, ts_utc)
   WHERE action IN ('worktree.bind', 'worktree.unbind');
 CREATE TABLE IF NOT EXISTS ledger_family_imports (
@@ -2105,33 +2124,251 @@ fn read_after(
     access: Access,
     max_bytes: Option<usize>,
 ) -> Result<(Vec<LedgerEvent>, bool), LedgerError> {
+    let query = EventQuery {
+        after: cursor,
+        limit,
+        descending: newest,
+        ..EventQuery::default()
+    };
+    let page = read_events(repo_path, &query, access, max_bytes)?;
+    let mut events = page.events;
+    if newest {
+        events.reverse();
+    }
+    Ok((events, page.byte_capped))
+}
+
+/// Which events [`read_events`] selects, and in which order.
+///
+/// Rows are ordered by `id` (the cursor) and each filter is an equality or a
+/// lower bound on a column an index covers, so a filtered newest-first read
+/// seeks an index and stops at its limit rather than scanning history.
+#[derive(Debug, Clone)]
+pub struct EventQuery {
+    /// Rows with an id greater than this.
+    pub after: i64,
+    /// Rows with an id less than this; `None` is no upper bound.
+    pub before: Option<i64>,
+    /// Page size, clamped to 1..=1000.
+    pub limit: u32,
+    /// Newest id first when true, oldest first otherwise.
+    pub descending: bool,
+    /// `ts_utc >= since_ts`: the fixed-width UTC spelling the ledger stores.
+    pub since_ts: Option<String>,
+    pub action: Option<String>,
+    pub object: Option<String>,
+    pub worktree_path: Option<String>,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub after_ref: Option<String>,
+}
+
+impl Default for EventQuery {
+    fn default() -> Self {
+        Self {
+            after: 0,
+            before: None,
+            limit: 50,
+            descending: false,
+            since_ts: None,
+            action: None,
+            object: None,
+            worktree_path: None,
+            task_id: None,
+            session_id: None,
+            after_ref: None,
+        }
+    }
+}
+
+/// How a read whose only filter is `since_ts` is planned.
+///
+/// Rows are ordered by `id`, which the index on `ts_utc` is not, so left to
+/// the planner a newest-first read with an old `since_ts` reads and sorts every
+/// row since it, and one with a recent `since_ts` that matches little walks the
+/// whole table. `idx_events_ts` ends in the rowid (it is the composite
+/// `(ts_utc, id)`), so a probe for `limit + 1` rows at or after `since_ts` is
+/// answered from the index alone, and it chooses:
+/// - few matches (at most `limit`), or oldest-first: read them through the
+///   index (a sort of at most the matches);
+/// - many matches, newest first: walk the primary key from the newest id and
+///   test `ts_utc` row by row, which stops after `limit` rows because the
+///   newest rows are the ones that match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SincePlan {
+    /// Not a `since_ts`-only read, or `idx_events_ts` is absent (a ledger no
+    /// writer has opened since it was added); the planner decides.
+    Planner,
+    Index,
+    KeyWalk,
+}
+
+impl EventQuery {
+    /// Picks the [`SincePlan`] for this read of `conn`.
+    fn since_plan(&self, conn: &Connection, limit: u32) -> Result<SincePlan, LedgerError> {
+        let only_since = self.since_ts.is_some()
+            && [
+                &self.action,
+                &self.object,
+                &self.worktree_path,
+                &self.task_id,
+                &self.session_id,
+                &self.after_ref,
+            ]
+            .iter()
+            .all(|filter| filter.is_none());
+        let Some(since) = self.since_ts.as_deref().filter(|_| only_since) else {
+            return Ok(SincePlan::Planner);
+        };
+        let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
+        let indexed = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_ts'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(failed)?
+            .is_some();
+        if !indexed {
+            return Ok(SincePlan::Planner);
+        }
+        let matches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM events INDEXED BY idx_events_ts
+                                       WHERE ts_utc >= ?1 LIMIT ?2)",
+                params![since, i64::from(limit) + 1],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        Ok(if self.descending && matches > i64::from(limit) {
+            SincePlan::KeyWalk
+        } else {
+            SincePlan::Index
+        })
+    }
+
+    /// The SELECT and its parameters. Only the filters that are set appear, so
+    /// the planner is never handed an `? IS NULL OR col = ?` it cannot index.
+    ///
+    /// `since` says how a `since_ts`-only read is planned (see [`SincePlan`]).
+    fn sql(&self, limit: u32, since: SincePlan) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        let source = if since == SincePlan::Index {
+            "events INDEXED BY idx_events_ts"
+        } else {
+            "events"
+        };
+        // `id > 0` is the predicate of the partial index on action (see
+        // SCHEMA); ids start at 1, so it removes nothing.
+        let mut clauses = vec!["id > 0".to_string(), "id > ?".to_string()];
+        let mut values = vec![Value::Integer(self.after)];
+        if let Some(before) = self.before {
+            clauses.push("id < ?".to_string());
+            values.push(Value::Integer(before));
+        }
+        // A unary plus keeps the key walk from being replaced by the index.
+        let since_clause = if since == SincePlan::KeyWalk {
+            "+ts_utc >= ?"
+        } else {
+            "ts_utc >= ?"
+        };
+        let filters = [
+            (since_clause, &self.since_ts),
+            ("action = ?", &self.action),
+            ("object = ?", &self.object),
+            ("worktree_path = ?", &self.worktree_path),
+            ("task_id = ?", &self.task_id),
+            ("session_id = ?", &self.session_id),
+            ("after_ref = ?", &self.after_ref),
+        ];
+        for (clause, value) in filters {
+            if let Some(value) = value {
+                clauses.push(clause.to_string());
+                values.push(Value::Text(value.clone()));
+            }
+        }
+        values.push(Value::Integer(i64::from(limit)));
+        let order = if self.descending { "DESC" } else { "ASC" };
+        let sql = format!(
+            "SELECT id, ulid, ts_utc, schema_version, repo_path, worktree_path,
+                    actor_kind, actor_id, session_id, task_id, action, object,
+                    argv_json, outcome, verdict_json, before_ref, after_ref,
+                    duration_ms, detail_json
+             FROM {source} WHERE {} ORDER BY id {order} LIMIT ?",
+            clauses.join(" AND ")
+        );
+        (sql, values)
+    }
+}
+
+/// One page of [`read_events`], in the query's own order.
+pub struct EventPage {
+    pub events: Vec<LedgerEvent>,
+    /// Rows after the page's last one were left for the byte budget.
+    pub byte_capped: bool,
+    /// More rows matched past the limit.
+    pub more: bool,
+}
+
+/// [`tail_readonly_page`] for a filtered, ordered read; `Ok(None)` is no ledger.
+pub fn query_readonly_page(
+    repo_path: &str,
+    query: &EventQuery,
+    max_bytes: usize,
+) -> Result<Option<EventPage>, LedgerError> {
+    if !is_initialised(repo_path) {
+        return Ok(None);
+    }
+    read_events(repo_path, query, Access::ReadOnly, Some(max_bytes)).map(Some)
+}
+
+/// The `EXPLAIN QUERY PLAN` steps of [`EventQuery`]'s statement, for the test
+/// that pins every filter to an index.
+#[cfg(test)]
+fn explain_query(conn: &Connection, query: &EventQuery) -> Vec<String> {
+    let since = query.since_plan(conn, query.limit).expect("since plan");
+    let (sql, values) = query.sql(query.limit, since);
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare plan");
+    stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        row.get::<_, String>(3)
+    })
+    .expect("plan")
+    .collect::<Result<_, _>>()
+    .expect("plan rows")
+}
+
+/// The one reader of event rows. Rows come back in the query's order, one past
+/// the limit being read to say whether more follow.
+fn read_events(
+    repo_path: &str,
+    query: &EventQuery,
+    access: Access,
+    max_bytes: Option<usize>,
+) -> Result<EventPage, LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
     // An unbounded limit would let one call page an entire history into the
     // webview. 1000 is well past a screenful and far short of a memory problem.
-    let limit = limit.clamp(1, 1000);
+    let limit = query.limit.clamp(1, 1000);
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
-    let order = if newest { "DESC" } else { "ASC" };
     with_access(repo_path, access, |conn| {
+        let since = query.since_plan(conn, limit)?;
+        let (sql, values) = query.sql(limit + 1, since);
         let mut stmt = conn
-            .prepare(&format!(
-                "SELECT id, ulid, ts_utc, schema_version, repo_path, worktree_path,
-                        actor_kind, actor_id, session_id, task_id, action, object,
-                        argv_json, outcome, verdict_json, before_ref, after_ref,
-                        duration_ms, detail_json
-                 FROM events WHERE id > ?1 ORDER BY id {order} LIMIT ?2"
-            ))
+            .prepare(&sql)
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
         let rows = stmt
-            .query_map(params![cursor, limit], event_from_row)
+            .query_map(rusqlite::params_from_iter(values), event_from_row)
             .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
         let mut events = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| LedgerError::new("row_failed", e.to_string()))?;
-        if newest {
-            events.reverse();
-        }
+        let more = events.len() > limit as usize;
+        events.truncate(limit as usize);
         // The earlier locations of a repository that moved, read only when a
         // row names a path that is not the repository's own.
         let mut prior: Option<Vec<String>> = None;
@@ -2154,7 +2391,11 @@ fn read_after(
             event.repo_path.clone_from(&canonical_repo_path);
         }
         let Some(budget) = max_bytes else {
-            return Ok((events, false));
+            return Ok(EventPage {
+                events,
+                byte_capped: false,
+                more,
+            });
         };
         let mut used = 0;
         let mut page = Vec::with_capacity(events.len());
@@ -2169,7 +2410,11 @@ fn read_after(
             used += size;
             page.push(event);
         }
-        Ok((page, capped))
+        Ok(EventPage {
+            events: page,
+            byte_capped: capped,
+            more,
+        })
     })
 }
 
@@ -2180,7 +2425,7 @@ fn valid_ulid(value: &str) -> bool {
             .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
 }
 
-fn valid_utc_timestamp(value: &str) -> bool {
+pub(crate) fn valid_utc_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 24
         && bytes[4] == b'-'
@@ -3669,6 +3914,9 @@ mod contract_tests;
 
 #[cfg(test)]
 mod reliability_tests;
+
+#[cfg(test)]
+mod query_tests;
 
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
