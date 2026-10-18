@@ -1460,4 +1460,133 @@ mod tests {
         };
         assert!(old.settled(now));
     }
+
+    const NANO: Duration = Duration::from_nanos(1);
+
+    /// Boundaries to the nanosecond, not the millisecond: the TTL and the young
+    /// stamp guard have no float or rounding slack.
+    #[test]
+    fn adv_ade6_boundaries_are_exact_to_the_nanosecond() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let young = stamp_aged(&clock, RACY_WINDOW - NANO);
+        assert!(computed(&fx, &["log", "adv-nano-young"], &young));
+        assert!(
+            computed(&fx, &["log", "adv-nano-young"], &young),
+            "RACY_WINDOW - 1 ns old is stored"
+        );
+        let settled = stamp_aged(&clock, RACY_WINDOW);
+        assert!(computed(&fx, &["log", "adv-nano-settled"], &settled));
+        assert!(!computed(&fx, &["log", "adv-nano-settled"], &settled));
+        let args = ["log", "adv-nano-ttl"];
+        let stamp = stamp_aged(&clock, Duration::from_secs(10));
+        assert!(computed(&fx, &args, &stamp));
+        clock.advance(TTL - NANO);
+        assert!(!computed(&fx, &args, &stamp), "served 1 ns before the TTL");
+        clock.advance(NANO);
+        assert!(computed(&fx, &args, &stamp), "recomputed at the TTL");
+    }
+
+    /// The wall clock steps back an hour while the monotonic clock keeps
+    /// going: every mtime then looks "in the future", so nothing is stored
+    /// (correct, uncached) and the cache recovers once the wall clock passes
+    /// the newest mtime again. It is a bounded outage, not a permanent one.
+    #[test]
+    fn adv_ade6_a_wall_clock_step_back_refuses_to_store_and_then_recovers() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let stamp = stamp_aged(&clock, Duration::from_secs(10));
+        let args = ["log", "adv-skew"];
+        assert!(computed(&fx, &args, &stamp));
+        assert!(!computed(&fx, &args, &stamp), "stored while the clocks agree");
+        let (mono, wall) = CLOCK.with(std::cell::Cell::get).unwrap();
+        CLOCK.with(|cell| {
+            cell.set(Some((
+                mono + Duration::from_secs(30),
+                wall - Duration::from_secs(3600),
+            )))
+        });
+        for _ in 0..3 {
+            assert!(
+                computed(&fx, &args, &stamp),
+                "the stamp looks like it is from the future, so it is recomputed every time"
+            );
+        }
+        CLOCK.with(|cell| {
+            cell.set(Some((
+                mono + Duration::from_secs(40),
+                wall + Duration::from_secs(40),
+            )))
+        });
+        assert!(
+            !computed(&fx, &args, &stamp),
+            "the entry stored before the step (40 s old) is served again"
+        );
+        let fresh = ["log", "adv-skew-after"];
+        assert!(computed(&fx, &fresh, &stamp));
+        assert!(!computed(&fx, &fresh, &stamp), "storing works again once the wall clock is back");
+    }
+
+    /// Single-flight: the leader computes on thread A (which has a manual
+    /// clock), a follower on thread B (the real clock) joins that run and gets
+    /// the same answer without computing. Then B, asking on its own, is not
+    /// served an entry stamped on A's clock.
+    #[test]
+    fn adv_ade6_a_coalesced_waiter_on_another_thread_gets_the_leaders_answer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let repo = fx.main.clone();
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let (stamp_tx, stamp_rx) = mpsc::channel::<Stamp>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let leader = {
+            let repo = repo.clone();
+            let runs = runs.clone();
+            std::thread::spawn(move || {
+                let clock = ManualClock::install();
+                let stamp = stamp_aged(&clock, Duration::from_secs(10));
+                stamp_tx.send(stamp.clone()).unwrap();
+                let value = through_stamped_coalesced(
+                    &repo,
+                    &["log", "adv-coalesce-thread"],
+                    Some(&stamp),
+                    || {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_rx.recv_timeout(Duration::from_secs(10));
+                        std::thread::sleep(Duration::from_millis(300));
+                        Ok(("leader-answer".to_string(), true))
+                    },
+                );
+                (value, stamp)
+            })
+        };
+        let stamp = stamp_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let waiter = {
+            let repo = repo.clone();
+            let runs = runs.clone();
+            let stamp = stamp.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                through_stamped_coalesced(&repo, &["log", "adv-coalesce-thread"], Some(&stamp), || {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(("waiter-answer".to_string(), true))
+                })
+            })
+        };
+        let (led, _) = leader.join().unwrap();
+        let waited = waiter.join().unwrap();
+        assert_eq!(led.as_deref(), Ok("leader-answer"));
+        assert_eq!(waited.as_deref(), Ok("leader-answer"), "the waiter did not share the run");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // The entry A stored was stamped on A's clock (an hour ahead of the
+        // real one): thread B must neither serve it nor panic on it.
+        let again = through_stamped(&repo, &["log", "adv-coalesce-thread"], Some(&stamp), || {
+            Ok(("b-recomputed".to_string(), true))
+        });
+        assert_eq!(again.as_deref(), Ok("b-recomputed"));
+    }
 }
