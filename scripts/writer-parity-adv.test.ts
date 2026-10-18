@@ -69,8 +69,8 @@ describe("derived writer commands really share their builder", () => {
     // on is that a `"git"` literal in the body reclassifies the command out of
     // the derived set.
     const mutated = fnBody(COMMANDS, "cmd_delete_tag").replace(
-      "&GitWriter::delete_tag_argv(&tag_name)",
-      '&["git", "tag", "-d", tag_name.as_str()]',
+      "let argv = GitWriter::delete_tag_argv(&tag_name)?;",
+      'let argv = ["git", "tag", "-d", tag_name.as_str()];',
     );
     expect(mutated).toMatch(/"git"/);
     expect(mutated).toContain("GitWriter::delete_tag");
