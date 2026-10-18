@@ -205,6 +205,25 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
     );
 }
 
+/// The engine wraps some runner failures in its own words (`Blame
+/// unavailable: ...`). The read is still asked again: the gate's refusal was
+/// recorded on this command's thread.
+#[test]
+fn a_wrapped_read_shed_under_memory_pressure_still_reaches_the_frontend_as_a_deferral() {
+    use crate::sysload::{GovernorInput, Level};
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+    let error =
+        tauri::async_runtime::block_on(cmd_get_file_blame(root, "README.md".to_string(), None))
+            .expect_err("the read is shed");
+    assert_eq!(
+        error.kind,
+        crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+        "{error}"
+    );
+}
+
 /// The probe that picks the declared operation runs before the gate, so it
 /// carries its own promotion: shed as a deferrable read it failed closed to
 /// "delete" for a tracked file that is only being restored.

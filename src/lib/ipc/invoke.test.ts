@@ -121,6 +121,24 @@ describe("withDeferralRetry", () => {
     expect(h.delays).toEqual([3_000, 6_000, 12_000, 24_000, 30_000]);
   });
 
+  // The backend types a read that was declined once and then failed on
+  // something permanent as a deferral too (src-tauri/src/ipc_error.rs). The
+  // retry is what bounds that: it asks at most MAX_DEFERRED_RETRIES more times
+  // and then shows the error as it came, permanent message and all.
+  it("gives a permanent failure typed as a deferral back after the bounded retries, message intact", async () => {
+    const permanent = { kind: "deferred_under_load", message: "fatal: bad object HEAD" };
+    const raw = vi.fn(async () => { throw permanent; });
+    const delays: number[] = [];
+    const invoke = withDeferralRetry(raw as never, {
+      sleep: (ms) => { delays.push(ms); return Promise.resolve(); },
+      random: () => 0,
+      whenShown: () => Promise.resolve(),
+    });
+    await expect(invoke("cmd_get_status", { repoPath: "/r" })).rejects.toBe(permanent);
+    expect(raw).toHaveBeenCalledTimes(1 + MAX_DEFERRED_RETRIES);
+    expect(delays).toEqual([3_000, 6_000, 12_000, 24_000, 30_000]);
+  });
+
   it("joins an identical call to the retry already waiting", async () => {
     const h = harness([DEFERRAL, "answer"]);
     const first = h.invoke("cmd_stash_list", { repoPath: "/r" });

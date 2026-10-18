@@ -29,6 +29,13 @@
 //! is not equal to what the producer wrote, so it is unclassified. A command
 //! that was a user action never carries the retryable kind out at all.
 //!
+//! One kind is typed more loosely, on purpose: a command that was *not* a user
+//! action, failed, and had the spawn gate refuse something during it, carries
+//! `DeferredUnderLoad` whatever the final text, because the engine wraps
+//! runner errors in its own words in about twenty places and the frontend
+//! retries a declined read. Only that kind drives a retry, and asking a read
+//! again is idempotent and bounded (`MAX_DEFERRED_RETRIES`).
+//!
 //! The kind list is mirrored by `IPC_ERROR_KINDS` in `src/lib/ipc/invoke.ts`
 //! and pinned against it by `scripts/enum-variant-contract.test.ts`.
 
@@ -122,9 +129,26 @@ impl IpcError {
     /// text (see [`typed_text`]), and never retryable when the command was a
     /// user action.
     fn from_scope_text(text: String, user_action: bool) -> Self {
-        let kind = match kind_written_as(&text) {
-            IpcErrorKind::DeferredUnderLoad if user_action => IpcErrorKind::Unclassified,
-            kind => kind,
+        let written = kind_written_as(&text);
+        let kind = if user_action {
+            // A user action may already have changed something, so it is never
+            // asked again: not for its own deferral, not for a wrapped one.
+            match written {
+                IpcErrorKind::DeferredUnderLoad => IpcErrorKind::Unclassified,
+                kind => kind,
+            }
+        } else if written == IpcErrorKind::Unclassified
+            && kind_was_written(IpcErrorKind::DeferredUnderLoad)
+        {
+            // A read that was declined by the spawn gate and then failed, whatever
+            // words the engine put around the refusal on the way out. Asking a
+            // read again is harmless and the frontend bounds it
+            // (`MAX_DEFERRED_RETRIES`), so only this kind, which is the one that
+            // drives a retry, is typed by "the gate refused something during this
+            // command" rather than by the exact text.
+            IpcErrorKind::DeferredUnderLoad
+        } else {
+            written
         };
         Self::new(kind, text)
     }

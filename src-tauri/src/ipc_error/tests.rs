@@ -207,26 +207,91 @@ fn a_mutations_own_deferral_is_never_typed_retryable() {
     );
 }
 
-/// A read's deferral that another layer put its own words in front of is
-/// unclassified: the retry reads what the runner wrote, not what a caller made
-/// of it. (It used to be found after any `": "`; a prefix a mutation or a
-/// repository's own text controls could then forge it.)
+/// The engine puts its own words in front of a runner failure in about twenty
+/// places (`Blame unavailable: <deferral>`). A READ that the spawn gate declined
+/// is retried whatever the words, because the gate recorded the refusal on this
+/// thread during this command and asking a read again is harmless.
 #[test]
-fn an_engine_prefixed_deferral_is_not_typed() {
+fn an_engine_prefixed_deferral_from_a_read_is_typed_retryable() {
+    let error = run_command(|| {
+        let written = refusal_message(
+            "git blame",
+            Refusal::Refused {
+                waited: Duration::from_millis(2000),
+            },
+        );
+        Err::<(), _>(format!("Blame unavailable: {written}"))
+    })
+    .expect_err("failed");
+    assert_eq!(error.kind, IpcErrorKind::DeferredUnderLoad, "{error}");
+    assert!(error.message.starts_with("Blame unavailable: "), "{error}");
+}
+
+/// The same wrapper from a mutation is not retried: it may have changed
+/// something before the refusal.
+#[test]
+fn the_same_wrapper_from_a_mutation_is_unclassified() {
+    let error = run_command(|| {
+        mark_user_action("/nonexistent-adv-repo");
+        let written = refusal_message(
+            "git blame",
+            Refusal::Refused {
+                waited: Duration::from_millis(2000),
+            },
+        );
+        Err::<(), _>(format!("Blame unavailable: {written}"))
+    })
+    .expect_err("failed");
+    assert_eq!(error.kind, IpcErrorKind::Unclassified, "{error}");
+}
+
+/// A read that was declined once and then failed on something permanent is
+/// typed retryable too, because the record says "the gate refused something",
+/// not "this text is the refusal". That is bounded and harmless: the frontend
+/// asks again at most `MAX_DEFERRED_RETRIES` (5) times on a 3 s to 30 s
+/// backoff, then shows the error, whose message is the permanent one. The
+/// bound is pinned in `src/lib/ipc/invoke.test.ts`.
+#[test]
+fn a_read_declined_once_then_failed_for_good_is_retryable_and_keeps_its_message() {
+    let error = run_command(|| {
+        let _declined = refusal_message(
+            "git status",
+            Refusal::Refused {
+                waited: Duration::from_millis(2000),
+            },
+        );
+        Err::<(), _>("fatal: bad object HEAD".to_string())
+    })
+    .expect_err("failed");
+    assert_eq!(error.kind, IpcErrorKind::DeferredUnderLoad);
+    assert_eq!(error.message, "fatal: bad object HEAD");
+}
+
+/// A refusal on one command is not remembered by the next.
+#[test]
+fn a_deferral_one_command_saw_does_not_make_the_next_one_retryable() {
+    let _first = run_command(|| {
+        let _ = refusal_message(
+            "git status",
+            Refusal::Refused {
+                waited: Duration::from_millis(2000),
+            },
+        );
+        Err::<(), _>("one".to_string())
+    });
+    let second = plain("two");
+    assert_eq!(second.kind, IpcErrorKind::Unclassified);
+}
+
+/// Text that spells a deferral but that no producer wrote is still nothing:
+/// the loose rule needs the gate's own record.
+#[test]
+fn deferral_text_with_no_producer_record_is_unclassified_even_for_a_read() {
     let inner = wire_message("deferred_under_load");
     assert_eq!(
         plain(&format!("Blame unavailable: {inner}")).kind,
         IpcErrorKind::Unclassified
     );
-    let written = refusal_message(
-        "git blame",
-        Refusal::Refused {
-            waited: Duration::from_millis(2000),
-        },
-    );
-    let wrapped =
-        run_command(|| Err::<(), _>(format!("Blame unavailable: {written}"))).expect_err("failed");
-    assert_eq!(wrapped.kind, IpcErrorKind::Unclassified);
 }
 
 /// Text a child printed and the engine relayed, such as a repository hook's

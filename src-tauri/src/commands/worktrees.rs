@@ -274,6 +274,9 @@ pub async fn cmd_worktree_cow_sync(
         // list`, no scan of any worktree. Any other existing directory used to
         // be filled with the anchor's caches and links.
         let family = crate::engine::worktree::resolve_worktree_family(&repo_path, &target_path)?;
+        // Past the read above, this writes cache copies into the worktree, so a
+        // refusal from here on is a user action's and is never retried.
+        crate::engine::git_cli::mark_interactive();
         crate::engine::cow_clone::reflink_ignored_caches(
             &repo,
             &family.worktree,
