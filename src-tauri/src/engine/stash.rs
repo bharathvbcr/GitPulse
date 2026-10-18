@@ -24,10 +24,14 @@ use crate::engine::git_writer::{repo_mutation_lock, validate_oid};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// The closing sentence of both stale-stack refusals. It is also how
-/// `IpcError::from_command_text` types them as `StaleStash`, so the two cannot
-/// drift: the frontend refreshes on the kind and never reads this text.
+/// The closing sentence of both stale-stack refusals.
 pub(crate) const STALE_STACK_HINT: &str = "Refresh the stash list and try again.";
+
+/// A stale-stack refusal, typed where it is written (see `crate::ipc_error`):
+/// the panel refreshes on the `StaleStash` kind and never reads the sentence.
+fn stale(message: String) -> String {
+    crate::ipc_error::typed_text(crate::ipc_error::IpcErrorKind::StaleStash, message)
+}
 
 /// Upper bound on entries returned in one listing. A stash stack this deep is
 /// already pathological; the bound keeps a runaway `.git` from pulling an
@@ -242,7 +246,7 @@ where
     // is a claim from before it took the lock.
     let entries = list_in(&repo)?;
     let Some(entry) = entries.entries.iter().find(|e| e.index == index) else {
-        return Err(format!(
+        return Err(stale(format!(
             "Stash entry {index} no longer exists — the stash stack now holds {} entr{}. \
              {STALE_STACK_HINT}",
             entries.entries.len(),
@@ -251,17 +255,17 @@ where
             } else {
                 "ies"
             }
-        ));
+        )));
     };
     if !entry.oid.eq_ignore_ascii_case(expected_oid) {
         // The single failure this module exists to prevent: another worktree,
         // client or agent pushed or dropped a stash, every index shifted, and
         // `drop` would now destroy work the user never saw.
-        return Err(format!(
+        return Err(stale(format!(
             "Stash entry {index} changed since it was listed — it now holds \"{}\". \
              {STALE_STACK_HINT}",
             entry.subject
-        ));
+        )));
     }
 
     let argv = action_argv(action, &entry.selector, &entry.oid);

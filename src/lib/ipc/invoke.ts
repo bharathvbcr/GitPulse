@@ -16,13 +16,8 @@ import { activity, observeSettled } from "../diagnostics/activity";
 export const IPC_ERROR_KINDS = [
   "unclassified",
   "deferred_under_load",
-  "slot_wait_timeout",
-  "timed_out",
-  "spawn_not_found",
-  "spawn_failed",
   "repository_trust_required",
   "identity_missing",
-  "hook_cancelled",
   "stale_stash",
   "ledger_not_initialised",
   "ledger_failed",

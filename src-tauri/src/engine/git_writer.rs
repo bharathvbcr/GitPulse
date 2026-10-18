@@ -1090,11 +1090,16 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if missing.is_empty() {
             return Ok(());
         }
-        Err(format!(
-            "{IDENTITY_MISSING}: {} {} not set. Set your name and email for this repository \
-             or for every repository, then commit again.",
-            missing.join(" and "),
-            if missing.len() == 1 { "is" } else { "are" }
+        // Typed where it is written: the commit box offers the identity prompt
+        // on this kind, not on the wording (see `crate::ipc_error`).
+        Err(crate::ipc_error::typed_text(
+            crate::ipc_error::IpcErrorKind::IdentityMissing,
+            format!(
+                "{IDENTITY_MISSING}: {} {} not set. Set your name and email for this repository \
+                 or for every repository, then commit again.",
+                missing.join(" and "),
+                if missing.len() == 1 { "is" } else { "are" }
+            ),
         ))
     }
 
@@ -5989,6 +5994,14 @@ mod tests {
             assert!(err.starts_with(IDENTITY_MISSING), "{err}");
             assert!(err.contains("user.name"), "{err}");
         }
+        // The kind the commit box reads comes out of the command seam typed,
+        // from the producer, with the text unchanged.
+        let typed = crate::ipc_error::run_command(|| {
+            GitWriter::commit(&repo_path(&dir), "no identity", false)
+        })
+        .unwrap_err();
+        assert_eq!(typed.kind, crate::ipc_error::IpcErrorKind::IdentityMissing);
+        assert!(typed.message.starts_with(IDENTITY_MISSING), "{typed}");
         assert_eq!(head_oid(&dir), before);
         let staged = git_text(dir.path(), &["diff", "--cached", "--name-only"]).unwrap();
         assert_eq!(

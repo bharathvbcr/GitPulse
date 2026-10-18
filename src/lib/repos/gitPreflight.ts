@@ -49,8 +49,7 @@ export interface GitIdentity {
 export type IdentityScope = "repo" | "global";
 
 // A commit refused for want of an identity arrives as an `identity_missing`
-// error, and a user-cancelled hook run as `hook_cancelled` (see `IpcErrorKind`
-// in ipc/invoke.ts); neither is recognised by its wording here.
+// error (see `IpcErrorKind` in ipc/invoke.ts), never recognised by its wording.
 
 /** Client-side mirror of `GitWriter::validate_identity`; the backend still decides. */
 export function identityProblem(name: string, email: string): string | null {

@@ -87,10 +87,10 @@ pub use worktrees::*;
 /// worker thread. Every git/gh/npm subprocess call, repository scan and
 /// sidecar round trip below goes through this seam.
 ///
-/// The error leaves as an [`IpcError`]: the body's text is typed once, here, by
-/// [`IpcError::from_command_text`], so every command that runs through this
-/// seam reports a deferral, a timeout or a trust refusal as a kind the
-/// frontend can branch on without reading the message.
+/// The error leaves as an [`IpcError`]. Its kind is the one a producer wrote
+/// for exactly this text (`crate::ipc_error::run_command`); the text is never
+/// searched, so a wrapped, relayed or quoted message is `unclassified`, and a
+/// deferral never leaves a user action as a retryable kind.
 async fn off_thread<F, T>(body: F) -> Result<T, IpcError>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -115,13 +115,12 @@ where
         // rest of a mutation's body to a user action, and this scope is what
         // ends that promotion before the pool thread runs anything else — and
         // keeps a mutation's deferral from reading as safe to retry.
-        let result = crate::engine::git_cli::run_command_scope(body);
+        let result = crate::ipc_error::run_command(body);
         timing.finish(&result);
         result
     })
     .await
     .map_err(|e| IpcError::from(format!("background task failed: {e}")))?
-    .map_err(IpcError::from_command_text)
 }
 
 /// How many blocking-pool threads a class of command may hold at once, or

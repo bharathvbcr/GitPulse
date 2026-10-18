@@ -8,32 +8,12 @@
     "message": "git status deferred under load after 2.013s: the git spawn rate limit admitted nothing sooner"
   },
   {
-    "kind": "slot_wait_timeout",
-    "message": "git status timed out after 90.000s waiting for a process slot"
-  },
-  {
-    "kind": "timed_out",
-    "message": "gh timed out after 90s"
-  },
-  {
-    "kind": "spawn_not_found",
-    "message": "Failed to spawn gh: no such program: No such file or directory (os error 2)"
-  },
-  {
-    "kind": "spawn_failed",
-    "message": "Failed to spawn git: permission denied"
-  },
-  {
     "kind": "repository_trust_required",
     "message": "REPOSITORY_TRUST_REQUIRED: Open /a in GitPulse and trust it."
   },
   {
     "kind": "identity_missing",
     "message": "Git does not know who you are: user.name is not set. Set your name and email for this repository or for every repository, then commit again."
-  },
-  {
-    "kind": "hook_cancelled",
-    "message": "git commit was cancelled while running its pre-commit hook. Review the working tree before retrying."
   },
   {
     "kind": "stale_stash",

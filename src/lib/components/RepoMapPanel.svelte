@@ -131,7 +131,7 @@
     classifyMapFailure({
       cliAvailable: cliStatus?.available ?? null,
       mapAvailable: load?.available ?? null,
-      mapPath: load?.path,
+      mapFailure: load?.failure,
     }),
   );
   const mapFailureText = $derived(

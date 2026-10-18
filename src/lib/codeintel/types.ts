@@ -634,11 +634,16 @@ export interface RepoMapDocument {
   dead_clusters_incomplete?: string | null;
 }
 
+/** Mirrors the Rust `RepoMapFailure`: the action a failed map load needs. */
+export type RepoMapFailure = "no_sqlite_store" | "map_artifact_failed";
+
 export interface RepoMapLoad {
   available: boolean;
   reason?: string | null;
   path?: string | null;
   map?: RepoMapDocument | null;
+  /** Absent when the map loaded, and when the refusal came before any file was looked at. */
+  failure?: RepoMapFailure | null;
 }
 
 export interface DevmapPreviewFileResult {

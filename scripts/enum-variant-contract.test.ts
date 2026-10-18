@@ -376,9 +376,9 @@ describe("a const-tuple mirror is compared like any other union", () => {
   });
 
   it("fails when Rust gains a kind the tuple lacks", () => {
-    const rust = RUST.replace("StaleStash,\n", "StaleStash,\n      HookCancelled,\n");
+    const rust = RUST.replace("StaleStash,\n", "StaleStash,\n      IdentityMissing,\n");
     expect(drift(rust, tuple(["unclassified", "deferred_under_load", "stale_stash"])))
-      .toEqual(["IpcErrorKind: Rust sends hook_cancelled; TS does not accept them"]);
+      .toEqual(["IpcErrorKind: Rust sends identity_missing; TS does not accept them"]);
   });
 
   it("fails when the tuple lists a kind Rust never sends", () => {

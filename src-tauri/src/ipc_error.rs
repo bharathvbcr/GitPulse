@@ -2,56 +2,60 @@
 //!
 //! A command used to reject with a bare string, and the frontend classified it
 //! by looking for a phrase inside it, so rewording a Rust message could change
-//! what the UI did without a type error or a failing test. The payload is now
+//! what the UI did, and text a repository controls (a branch name, a commit
+//! subject, a hook's stderr) could pose as one. The payload is now
 //! `{ kind, message, detail? }`: `kind` is a closed set the frontend branches
 //! on, `message` is the text a person reads (byte-for-byte what the string
 //! was), and `detail` is optional structured JSON.
 //!
-//! `kind` has one producer per source, all here:
-//! * [`IpcError::from_command_text`] reads a runner or command message with
-//!   [`RunError::classify`] and the Rust-owned markers of the few refusals the
-//!   UI acts on. It is the only place that looks inside a message.
-//! * `From<LedgerError>` maps the ledger's `code`.
+//! **Nothing in here reads inside a message.** A kind is attached where the
+//! failure is produced, by the one module that produces it:
+//!
+//! * the spawn gate's deferral (`git_cli::refusal_message`), the repository
+//!   trust refusal (`repository_trust`), the missing commit identity
+//!   (`git_writer`) and the stale stash refusal (`engine::stash`) each call
+//!   [`typed_text`] with the kind and the message they wrote;
+//! * `From<LedgerError>` maps the ledger's own `code`;
 //! * `From<String>` and `From<&str>` are [`IpcErrorKind::Unclassified`], which
 //!   the frontend treats as opaque: it shows the message and never matches
 //!   text inside it.
 //!
+//! [`typed_text`] hands the message back unchanged and remembers, on the
+//! thread that produced it, that *this exact text* has that kind. When a
+//! command body ends, [`run_command`] gives the error its kind only if the
+//! text that came out is one of those, character for character. A message
+//! another layer wrapped (`Stash failed: <deferral>`), rewrote
+//! (`git_cli::not_retryable`) or merely quoted (a branch named like a marker)
+//! is not equal to what the producer wrote, so it is unclassified. A command
+//! that was a user action never carries the retryable kind out at all.
+//!
 //! The kind list is mirrored by `IPC_ERROR_KINDS` in `src/lib/ipc/invoke.ts`
 //! and pinned against it by `scripts/enum-variant-contract.test.ts`.
 
-use crate::engine::git_cli::RunError;
-use crate::engine::git_writer::IDENTITY_MISSING;
+use crate::engine::git_cli::{self, Admission, RunError};
 use crate::ledger::LedgerError;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fmt;
 
 /// What went wrong, as far as the frontend acts on it.
 ///
 /// Closed on purpose: a new kind is a new frontend behaviour, so it is added
-/// here, in `IPC_ERROR_KINDS`, and where the frontend branches on it.
+/// here, in `IPC_ERROR_KINDS`, and where the frontend branches on it. A kind
+/// nothing reads is not mirrored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcErrorKind {
     /// Nothing the frontend branches on. The message is for a person only.
     Unclassified,
     /// The spawn gate declined to start git under load; nothing ran, and the
-    /// same call may succeed a few seconds later.
+    /// same call may succeed a few seconds later. Never carried by a command
+    /// that was a user action.
     DeferredUnderLoad,
-    /// The child never got a process slot inside its deadline; it did not run.
-    SlotWaitTimeout,
-    /// The child started and was killed at its deadline, so whether its side
-    /// effect happened is unknown.
-    TimedOut,
-    /// The OS found no program to run.
-    SpawnNotFound,
-    /// The OS refused to start the program for another reason.
-    SpawnFailed,
     /// The repository has not been approved for execution.
     RepositoryTrustRequired,
     /// A commit was refused for want of `user.name` / `user.email`.
     IdentityMissing,
-    /// The user cancelled a command that was running hooks.
-    HookCancelled,
     /// A stash action named a stack entry that has moved or gone.
     StaleStash,
     /// The activity ledger has not been initialised for this repository.
@@ -63,31 +67,28 @@ pub enum IpcErrorKind {
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 7] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
-        Self::SlotWaitTimeout,
-        Self::TimedOut,
-        Self::SpawnNotFound,
-        Self::SpawnFailed,
         Self::RepositoryTrustRequired,
         Self::IdentityMissing,
-        Self::HookCancelled,
         Self::StaleStash,
         Self::LedgerNotInitialised,
         Self::LedgerFailed,
     ];
 }
 
+/// The runner's own typed view. Only a deferral is a kind the frontend acts
+/// on; every other runner failure is a message for a person.
 impl From<RunError> for IpcErrorKind {
     fn from(error: RunError) -> Self {
         match error {
             RunError::Deferred => Self::DeferredUnderLoad,
-            RunError::SlotWaitTimeout => Self::SlotWaitTimeout,
-            RunError::Timeout => Self::TimedOut,
-            RunError::SpawnNotFound => Self::SpawnNotFound,
-            RunError::SpawnFailed => Self::SpawnFailed,
-            RunError::Other => Self::Unclassified,
+            RunError::SlotWaitTimeout
+            | RunError::Timeout
+            | RunError::SpawnNotFound
+            | RunError::SpawnFailed
+            | RunError::Other => Self::Unclassified,
         }
     }
 }
@@ -116,21 +117,16 @@ impl IpcError {
         self
     }
 
-    /// Types a command's message by its source: the runner's own failure
-    /// shapes through [`RunError::classify`], then the markers of the refusals
-    /// the UI acts on, each owned by the module that writes it.
-    ///
-    /// For text a command produced from git, a program, or a repository check.
-    /// Text from anywhere else is a plain `String` and stays unclassified.
-    pub fn from_command_text(message: String) -> Self {
-        // The owned markers come first: a trust refusal at spawn time reads
-        // `Failed to spawn go: REPOSITORY_TRUST_REQUIRED: ...`, which the runner
-        // shapes alone would call a spawn failure.
-        let kind = match classify_owned_marker(&message) {
-            IpcErrorKind::Unclassified => classify_runner(&message),
+    /// The error for `text`, which is where a command body's `String` error
+    /// ends up: typed only if a producer on this thread wrote exactly this
+    /// text (see [`typed_text`]), and never retryable when the command was a
+    /// user action.
+    fn from_scope_text(text: String, user_action: bool) -> Self {
+        let kind = match kind_written_as(&text) {
+            IpcErrorKind::DeferredUnderLoad if user_action => IpcErrorKind::Unclassified,
             kind => kind,
         };
-        Self::new(kind, message)
+        Self::new(kind, text)
     }
 
     /// True when the message contains `needle`. For tests and Rust callers
@@ -140,48 +136,74 @@ impl IpcError {
     }
 }
 
-/// How many `": "` boundaries are tried as the start of a runner message.
-const WRAPPED_STARTS: usize = 8;
+/// How many typed messages a thread remembers at once. A command body writes a
+/// handful at most; the bound stops a loop that fails a thousand times from
+/// growing the list.
+const MAX_TYPED: usize = 16;
 
-/// [`RunError::classify`] on the whole text, then on what follows each of the
-/// first few `": "` boundaries.
-///
-/// Engine code prefixes a runner failure with its own context (`Blame
-/// unavailable: git blame deferred under load after ...`), and the frontend
-/// retried those as it retried the bare message. `RunError`'s shapes are
-/// anchored at the start of the text so that a path which spells a marker is
-/// not mistaken for the runner's own message, and the same anchoring holds at
-/// every boundary here: a label with a `/` or a quote in it is not a runner
-/// label, so `Not a Git repository: /x deferred under load after 1s: y` stays
-/// unclassified.
-fn classify_runner(message: &str) -> IpcErrorKind {
-    let whole: IpcErrorKind = RunError::classify(message).into();
-    if whole != IpcErrorKind::Unclassified {
-        return whole;
-    }
-    message
-        .match_indices(": ")
-        .take(WRAPPED_STARTS)
-        .map(|(at, delimiter)| {
-            IpcErrorKind::from(RunError::classify(&message[at + delimiter.len()..]))
-        })
-        .find(|kind| *kind != IpcErrorKind::Unclassified)
-        .unwrap_or(IpcErrorKind::Unclassified)
+thread_local! {
+    static TYPED: RefCell<Vec<(IpcErrorKind, String)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The refusals whose phrase is defined by Rust and acted on by the UI.
-fn classify_owned_marker(message: &str) -> IpcErrorKind {
-    if crate::engine::git_cli::hooks::is_cancelled(message) {
-        IpcErrorKind::HookCancelled
-    } else if crate::repository_trust::refused(message) {
-        IpcErrorKind::RepositoryTrustRequired
-    } else if message.starts_with(IDENTITY_MISSING) {
-        IpcErrorKind::IdentityMissing
-    } else if message.contains(crate::engine::stash::STALE_STACK_HINT) {
-        IpcErrorKind::StaleStash
-    } else {
-        IpcErrorKind::Unclassified
+/// Records that `text` is a failure of `kind` and returns it unchanged. Called
+/// by the code that writes the failure, at the point it writes it.
+pub(crate) fn typed_text(kind: IpcErrorKind, text: String) -> String {
+    TYPED.with(|typed| {
+        let mut typed = typed.borrow_mut();
+        if typed.len() >= MAX_TYPED {
+            typed.remove(0);
+        }
+        typed.push((kind, text.clone()));
+    });
+    text
+}
+
+/// Whether a failure of `kind` was written on this thread since the current
+/// command began. For a caller that holds a result struct rather than a
+/// message and needs the same answer the error path would give.
+pub(crate) fn kind_was_written(kind: IpcErrorKind) -> bool {
+    TYPED.with(|typed| typed.borrow().iter().any(|(written, _)| *written == kind))
+}
+
+fn kind_written_as(text: &str) -> IpcErrorKind {
+    TYPED.with(|typed| {
+        typed
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(_, written)| written == text)
+            .map_or(IpcErrorKind::Unclassified, |(kind, _)| *kind)
+    })
+}
+
+struct TypedScope;
+
+impl TypedScope {
+    fn enter() -> Self {
+        TYPED.with(|typed| typed.borrow_mut().clear());
+        Self
     }
+}
+
+impl Drop for TypedScope {
+    fn drop(&mut self) {
+        TYPED.with(|typed| typed.borrow_mut().clear());
+    }
+}
+
+/// Runs one command body ([`git_cli::run_command_scope`]) and types its error.
+///
+/// A pool thread carries nothing in from the command before it or out to the
+/// one after: the remembered messages are cleared on entry and on exit.
+pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+    let _scope = TypedScope::enter();
+    let mut user_action = false;
+    let result = git_cli::run_command_scope(|| {
+        let result = body();
+        user_action = git_cli::current_admission() == Admission::Interactive;
+        result
+    });
+    result.map_err(|text| IpcError::from_scope_text(text, user_action))
 }
 
 impl fmt::Display for IpcError {

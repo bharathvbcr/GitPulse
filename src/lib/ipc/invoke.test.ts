@@ -76,7 +76,7 @@ describe("withDeferralRetry reads the kind, never the message", () => {
     ["a `{code, message}` payload whose message says it is a deferral", { code: "refused", message: DEFERRAL_MESSAGE }],
     ["an Error whose message says it is a deferral", new Error(DEFERRAL_MESSAGE)],
     ["a kind this build does not know", { kind: "deferred_for_a_while", message: DEFERRAL_MESSAGE }],
-    ["another kind", { kind: "timed_out", message: DEFERRAL_MESSAGE }],
+    ["another kind", { kind: "stale_stash", message: DEFERRAL_MESSAGE }],
   ])("throws %s as it came, once", async (_name, payload) => {
     const { raw, invoke } = rejectsOnce(payload);
     await expect(invoke("cmd_list_branches", { repoPath: "/r" })).rejects.toBe(payload);

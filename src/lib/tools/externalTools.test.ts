@@ -123,16 +123,16 @@ describe("installButtonLabel", () => {
 });
 
 describe("classifyMapFailure", () => {
-  const MAP = "/repo/.devcouncil/repo_map.json";
-
-  it("separates no CLI from a missing map file and from everything else, by what the backend reported", () => {
+  it("maps what the backend reported to the action it needs", () => {
+    const failed = { cliAvailable: true, mapAvailable: false } as const;
     expect(classifyMapFailure({ cliAvailable: false, mapAvailable: false })).toBe("no_cli");
-    expect(classifyMapFailure({ cliAvailable: false, mapAvailable: false, mapPath: MAP })).toBe("no_cli");
-    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: false, mapPath: MAP })).toBe("no_json_artifact");
-    // A refusal before any file was looked at names no file.
-    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: false })).toBe("other");
-    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: false, mapPath: null })).toBe("other");
-    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: true, mapPath: MAP })).toBe("other");
+    expect(classifyMapFailure({ cliAvailable: false, mapAvailable: false, mapFailure: "no_sqlite_store" })).toBe("no_cli");
+    expect(classifyMapFailure({ ...failed, mapFailure: "no_sqlite_store" })).toBe("no_sqlite_store");
+    expect(classifyMapFailure({ ...failed, mapFailure: "map_artifact_failed" })).toBe("no_json_artifact");
+    // A refusal before any file was looked at carries no failure.
+    expect(classifyMapFailure(failed)).toBe("other");
+    expect(classifyMapFailure({ ...failed, mapFailure: null })).toBe("other");
+    expect(classifyMapFailure({ cliAvailable: true, mapAvailable: true, mapFailure: "no_sqlite_store" })).toBe("other");
     expect(classifyMapFailure({ cliAvailable: null, mapAvailable: null })).toBe("other");
   });
 
@@ -143,6 +143,7 @@ describe("classifyMapFailure", () => {
 
   it("mapFailureMessage names the action for each mode", () => {
     expect(mapFailureMessage("no_cli")).toContain("Setup");
+    expect(mapFailureMessage("no_sqlite_store")).toContain("Build");
     expect(mapFailureMessage("no_json_artifact")).toContain("repo_map.json");
     expect(mapFailureMessage("other", "custom")).toBe("custom");
     expect(mapFailureMessage("other")).toBe("Map unavailable");

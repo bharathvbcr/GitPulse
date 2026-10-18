@@ -184,6 +184,27 @@ fn discard_is_never_shed_under_memory_pressure() {
     );
 }
 
+/// The frontend retries a read the gate deferred, on its kind. This is the real
+/// command, under real injected pressure, so it also proves the producer's text
+/// reaches the seam unwrapped for the read the app makes most.
+#[test]
+fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
+    use crate::sysload::{GovernorInput, Level};
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+    let error = tauri::async_runtime::block_on(cmd_get_status(root)).expect_err("the read is shed");
+    assert_eq!(
+        error.kind,
+        crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+        "{error}"
+    );
+    assert!(
+        error.message.contains(" deferred under load after "),
+        "{error}"
+    );
+}
+
 /// The probe that picks the declared operation runs before the gate, so it
 /// carries its own promotion: shed as a deferrable read it failed closed to
 /// "delete" for a tracked file that is only being restored.

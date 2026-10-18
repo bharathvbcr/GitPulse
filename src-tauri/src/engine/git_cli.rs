@@ -2402,25 +2402,31 @@ pub(crate) fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> St
 }
 
 pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
+    // A deferral is typed where it is written (see `crate::ipc_error`): the
+    // command that returns this exact text carries the kind, and nothing reads
+    // the marker back out of a message.
+    let deferred = |text: String| {
+        crate::ipc_error::typed_text(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text)
+    };
     match refusal {
         Refusal::Cancelled => format!("{label} cancelled before spawn"),
         Refusal::TimedOut { deadline } => format!(
             "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
             deadline.as_secs_f64()
         ),
-        Refusal::Refused { waited } => format!(
+        Refusal::Refused { waited } => deferred(format!(
             "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner",
             waited.as_secs_f64()
-        ),
-        Refusal::Shed => format!(
+        )),
+        Refusal::Shed => deferred(format!(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low"
-        ),
-        Refusal::Pressure { reactive } => format!(
+        )),
+        Refusal::Pressure { reactive } => deferred(format!(
             "{label}{DEFERRED_MARKER}0.000s: {} work is shed while the host is under memory \
              pressure",
             if reactive { "reactive" } else { "background" }
-        ),
+        )),
     }
 }
 

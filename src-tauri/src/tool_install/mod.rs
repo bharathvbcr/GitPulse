@@ -13,7 +13,7 @@ pub mod components;
 pub mod release;
 
 use crate::engine::git_cli::{self, BoundedRun};
-use crate::ipc_error::{IpcError, IpcErrorKind};
+use crate::ipc_error::IpcErrorKind;
 use crate::tool_capability;
 use crate::tool_config;
 use serde::{Deserialize, Serialize};
@@ -1061,14 +1061,17 @@ pub fn install(tool: ExternalTool) -> InstallOutcome {
     install_with_rung(tool, None)
 }
 
-/// Types `outcome.reason` once, for the desktop to read instead of its wording.
-/// Only a kind the UI acts on is set; an ordinary failure leaves it absent.
+/// Says whether a failed install was the repository trust refusal, for the
+/// desktop to read instead of the wording of `reason`.
+///
+/// The answer is the one the typed source gave on this thread while the
+/// install ran (see `crate::ipc_error`): the refusal is wrapped in a spawn
+/// error before it reaches `reason`, so the text is not searched, and a
+/// checkout whose path spells the marker cannot raise it.
 fn with_reason_kind(mut outcome: InstallOutcome) -> InstallOutcome {
-    outcome.reason_kind = outcome
-        .reason
-        .clone()
-        .map(|reason| IpcError::from_command_text(reason).kind)
-        .filter(|kind| *kind != IpcErrorKind::Unclassified);
+    let refused =
+        !outcome.ok && crate::ipc_error::kind_was_written(IpcErrorKind::RepositoryTrustRequired);
+    outcome.reason_kind = refused.then_some(IpcErrorKind::RepositoryTrustRequired);
     outcome
 }
 

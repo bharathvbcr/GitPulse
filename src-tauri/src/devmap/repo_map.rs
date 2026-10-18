@@ -263,6 +263,19 @@ pub struct PreferredDeadLists<'a> {
     pub unreachable_suppressed: bool,
 }
 
+/// Why the map could not be loaded, when the panel has an action for it. The
+/// panel reads this, never the wording of `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoMapFailure {
+    /// The code-intelligence store has never been built here, so there is no
+    /// map to read either: the action is Build.
+    NoSqliteStore,
+    /// The store exists but the map file is missing, unreadable, oversized or
+    /// not valid: the action is generating the map again.
+    MapArtifactFailed,
+}
+
 /// Outcome of loading the on-disk consumer map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoMapLoad {
@@ -270,15 +283,25 @@ pub struct RepoMapLoad {
     pub reason: Option<String>,
     pub path: Option<String>,
     pub map: Option<RepoMapDocument>,
+    /// Absent when the map loaded, and when the refusal came before any file
+    /// was looked at (the path is not a repository), where `reason` is shown
+    /// as it stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<RepoMapFailure>,
 }
 
 impl RepoMapLoad {
-    fn unavailable(reason: impl Into<String>, path: Option<String>) -> Self {
+    fn unavailable(
+        reason: impl Into<String>,
+        path: Option<String>,
+        failure: Option<RepoMapFailure>,
+    ) -> Self {
         Self {
             available: false,
             reason: Some(reason.into()),
             path,
             map: None,
+            failure,
         }
     }
 }
@@ -297,21 +320,35 @@ pub fn parse_repo_map(text: &str) -> Result<RepoMapDocument, String> {
 pub fn load_repo_map(repo_path: &str) -> RepoMapLoad {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return RepoMapLoad::unavailable(e, None),
+        Err(e) => return RepoMapLoad::unavailable(e, None, None),
     };
     let path = repo_map_path(&repo);
     let path_str = path.to_string_lossy().into_owned();
     if !path.is_file() {
+        // No store at all means the repository was never indexed; a store
+        // without the map means only the map has to be made again.
+        let failure = if devmap_query::paths::store_path(&repo).exists() {
+            RepoMapFailure::MapArtifactFailed
+        } else {
+            RepoMapFailure::NoSqliteStore
+        };
         return RepoMapLoad::unavailable(
             format!("no repo map at {path_str}; run Build Map first"),
             Some(path_str),
+            Some(failure),
         );
     }
     use devmap_query::host::{ArtifactProvider, FilesystemArtifactProvider};
     let provider = FilesystemArtifactProvider::for_repo(&repo);
     let document = match provider.read_repo_map() {
         Ok(document) => document,
-        Err(error) => return RepoMapLoad::unavailable(error.to_string(), Some(path_str)),
+        Err(error) => {
+            return RepoMapLoad::unavailable(
+                error.to_string(),
+                Some(path_str),
+                Some(RepoMapFailure::MapArtifactFailed),
+            )
+        }
     };
     match serde_json::from_value(document) {
         Ok(map) => RepoMapLoad {
@@ -319,10 +356,12 @@ pub fn load_repo_map(repo_path: &str) -> RepoMapLoad {
             reason: None,
             path: Some(path_str),
             map: Some(map),
+            failure: None,
         },
         Err(e) => RepoMapLoad::unavailable(
             format!("repo_map.json is not valid JSON: {e}"),
             Some(path_str),
+            Some(RepoMapFailure::MapArtifactFailed),
         ),
     }
 }
@@ -332,6 +371,43 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("fixtures/repo_map_minimal.json");
+
+    #[test]
+    fn a_failed_load_says_which_action_it_needs_without_its_reason_being_read() {
+        let repo = crate::test_support::git_repo();
+        let path = repo.path().to_str().expect("fixture path");
+
+        // Never indexed: no store, so no map either. The action is Build.
+        let never_indexed = load_repo_map(path);
+        assert!(!never_indexed.available);
+        assert_eq!(never_indexed.failure, Some(RepoMapFailure::NoSqliteStore));
+        assert!(never_indexed.path.is_some());
+
+        // A store without the map: only the map has to be made again.
+        let store = devmap_query::paths::store_path(repo.path());
+        std::fs::create_dir_all(store.parent().expect("store dir")).expect("state dir");
+        std::fs::write(&store, b"").expect("store file");
+        assert_eq!(
+            load_repo_map(path).failure,
+            Some(RepoMapFailure::MapArtifactFailed)
+        );
+
+        // A map that is not valid is the same action.
+        let map = repo_map_path(repo.path());
+        std::fs::create_dir_all(map.parent().expect("map dir")).expect("map dir");
+        std::fs::write(&map, b"{ not json").expect("map file");
+        let broken = load_repo_map(path);
+        assert!(!broken.available);
+        assert_eq!(broken.failure, Some(RepoMapFailure::MapArtifactFailed));
+
+        // A path that is not a repository never looked at a file: no failure
+        // kind and no path, so the panel shows the reason as it stands.
+        let plain = tempfile::TempDir::new().expect("tempdir");
+        let refused = load_repo_map(plain.path().to_str().expect("path"));
+        assert!(!refused.available);
+        assert_eq!(refused.failure, None);
+        assert_eq!(refused.path, None);
+    }
 
     #[test]
     fn fixture_deserializes_into_the_owned_mirror() {

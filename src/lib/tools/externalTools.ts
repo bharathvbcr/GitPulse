@@ -9,6 +9,7 @@ import { invoke, type IpcErrorKind } from "../ipc/invoke";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { autoInit } from "../codeintel/autoInit";
 import { boundText } from "../codeintel/walkIncomplete";
+import type { RepoMapFailure } from "../codeintel/types";
 
 /**
  * A failure message has to fit the Map status strip.
@@ -246,32 +247,38 @@ export function installButtonLabel(status: ToolStatus): string {
 }
 
 /** Map failure modes that need different user actions. */
-export type MapFailureMode = "no_cli" | "no_json_artifact" | "other";
+export type MapFailureMode = "no_cli" | "no_sqlite_store" | "no_json_artifact" | "other";
 
 /**
- * Which of the map's failure modes this is, from facts the backend reports and
- * never from the wording of a reason.
- *
- * `load_repo_map` (src-tauri/src/devmap/repo_map.rs) names the map file in
- * `path` exactly when the failure is about that file (missing, unreadable,
- * oversized, not valid); a refusal before any file was looked at (not a
- * repository) leaves `path` empty. So a failed load that names its file is the
- * missing-artifact case, and one that does not is shown with its own reason.
+ * Which of the map's failure modes this is, from the reason the backend
+ * reports (`RepoMapLoad.failure`, set by `load_repo_map` in
+ * src-tauri/src/devmap/repo_map.rs) and never from the wording of a message.
+ * A refusal before any file was looked at (not a repository) carries no
+ * failure, and is shown with its own reason.
  */
 export function classifyMapFailure(input: {
   cliAvailable: boolean | null;
   mapAvailable: boolean | null;
-  mapPath?: string | null;
+  mapFailure?: RepoMapFailure | null;
 }): MapFailureMode {
   if (input.cliAvailable === false) return "no_cli";
-  if (input.mapAvailable === false && input.mapPath) return "no_json_artifact";
-  return "other";
+  if (input.mapAvailable !== false) return "other";
+  switch (input.mapFailure) {
+    case "no_sqlite_store":
+      return "no_sqlite_store";
+    case "map_artifact_failed":
+      return "no_json_artifact";
+    default:
+      return "other";
+  }
 }
 
 export function mapFailureMessage(mode: MapFailureMode, fallback?: string | null): string {
   switch (mode) {
     case "no_cli":
       return "devmap CLI is not installed — run Setup to install it.";
+    case "no_sqlite_store":
+      return "No codeintel sqlite store yet — click Build to index this repository.";
     case "no_json_artifact":
       return "No repo_map.json artifact yet — click Build to generate the navigator map.";
     default:

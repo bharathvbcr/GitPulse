@@ -437,7 +437,7 @@ impl CommandTiming {
         }
     }
 
-    pub(crate) fn finish<T>(&mut self, result: &Result<T, String>) {
+    pub(crate) fn finish<T, E>(&mut self, result: &Result<T, E>) {
         if result.is_err() {
             self.outcome = "error";
         }

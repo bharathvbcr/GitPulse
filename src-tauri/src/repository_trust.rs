@@ -673,7 +673,12 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
             ));
         }
     }
-    Err(refusal)
+    // Typed where it is written: the desktop opens its trust prompt on this
+    // kind, so no other text may be able to raise it (see `crate::ipc_error`).
+    Err(crate::ipc_error::typed_text(
+        crate::ipc_error::IpcErrorKind::RepositoryTrustRequired,
+        refusal,
+    ))
 }
 
 /// Whether this repository's own main checkout carries a pre-repository
