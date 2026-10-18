@@ -163,7 +163,10 @@ fn symlinks_to_a_nested_gitdir_are_never_written_through() {
     assert!(sandbox_join_write_entry(&f.repo, "lnk/HEAD").is_err());
     // The link itself, as an entry, is allowed (it is the entry, not the dir).
     assert!(sandbox_join_write_entry(&f.repo, "lnk").is_ok());
-    assert_eq!(std::fs::read(f.repo.join(".modules/sub/HEAD")).unwrap(), head);
+    assert_eq!(
+        std::fs::read(f.repo.join(".modules/sub/HEAD")).unwrap(),
+        head
+    );
     GitWriter::move_path(&f.repo_str, "lnk", "lnk2", |_| Ok(())).unwrap();
     assert!(f.repo.join(".modules/sub/HEAD").exists());
     // A chain: link to a link.
@@ -234,7 +237,10 @@ fn overwrite_cannot_bypass_the_base_or_the_gitdir_guard() {
     let stale = "0000000000000000000000000000000000000000";
     let err = sandbox_overwrite_edited_text(&f.repo_str, "a.txt", "mine\n", Some(stale))
         .expect_err("a base that is not the disk's is refused");
-    assert!(matches!(err, FileWriteError::ChangedOnDisk { .. }), "{err:?}");
+    assert!(
+        matches!(err, FileWriteError::ChangedOnDisk { .. }),
+        "{err:?}"
+    );
     assert_eq!(std::fs::read(f.repo.join("a.txt")).unwrap(), b"one\n");
     for target in [".modules/sub/HEAD", "sub/.git", ".git/config"] {
         assert!(
