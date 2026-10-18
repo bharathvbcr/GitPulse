@@ -6063,7 +6063,7 @@ mod tests {
     }
     #[cfg(unix)]
     const RETRYING_ALIAS: &str =
-        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1";
+        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo \"fatal: Unable to create 'x.lock': File exists.\" >&2; exit 1";
 
     /// Where the total budget runs out between two lock retries decides which
     /// seam reports it: the top of the loop returns an error, a child killed
