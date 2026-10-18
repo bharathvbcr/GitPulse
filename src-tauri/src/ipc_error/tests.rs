@@ -174,6 +174,16 @@ fn a_runner_failure_the_engine_prefixed_keeps_its_kind() {
 }
 
 #[test]
+fn a_trust_refusal_at_spawn_time_is_the_trust_kind_not_a_spawn_failure() {
+    let text =
+        "Failed to spawn go: REPOSITORY_TRUST_REQUIRED: Open /source in GitPulse and trust it";
+    assert_eq!(
+        IpcError::from_command_text(text.to_string()).kind,
+        IpcErrorKind::RepositoryTrustRequired
+    );
+}
+
+#[test]
 fn a_path_that_spells_a_marker_is_not_a_runner_failure_however_deep() {
     for hostile in [
         "Not a Git repository: /tmp/a deferred under load after 1.0s: x",

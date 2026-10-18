@@ -123,8 +123,11 @@ impl IpcError {
     /// For text a command produced from git, a program, or a repository check.
     /// Text from anywhere else is a plain `String` and stays unclassified.
     pub fn from_command_text(message: String) -> Self {
-        let kind = match classify_runner(&message) {
-            IpcErrorKind::Unclassified => classify_owned_marker(&message),
+        // The owned markers come first: a trust refusal at spawn time reads
+        // `Failed to spawn go: REPOSITORY_TRUST_REQUIRED: ...`, which the runner
+        // shapes alone would call a spawn failure.
+        let kind = match classify_owned_marker(&message) {
+            IpcErrorKind::Unclassified => classify_runner(&message),
             kind => kind,
         };
         Self::new(kind, message)

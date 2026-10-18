@@ -369,7 +369,13 @@ fn a_repo_path_that_is_not_a_repository_fails_on_the_error_channel() {
         json!({ "repoPath": plain.path().to_string_lossy() }),
     )
     .expect_err("a non-repository must not report an empty status");
-    assert!(error.is_string(), "expected a string error, got {error}");
+    assert_eq!(error["kind"], "unclassified", "got {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Not a Git repository")),
+        "the message is the text the string error carried: {error}"
+    );
 }
 
 #[test]
@@ -929,7 +935,7 @@ fn global_cleaner_ipc_rejects_invalid_policies_and_caller_supplied_execution_aut
             .unwrap();
     config["retention_days"] = json!(0);
     let error = invoke("cmd_cleaner_save", json!({"config":config})).unwrap_err();
-    assert!(error.as_str().unwrap().contains("Retention"));
+    assert!(error["message"].as_str().unwrap().contains("Retention"));
     config["retention_days"] = json!(30);
     config["command"] = json!("untrusted command");
     assert!(invoke("cmd_cleaner_save", json!({"config":config})).is_err());
