@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::engine::git_cli::{refusal_message, Refusal};
+use crate::procguard::LockedSpawn;
 
 fn shed(label: &str) -> String {
     refusal_message(label, Refusal::Shed)
@@ -177,7 +178,7 @@ fn the_real_trust_refusal_names_its_repository_in_the_detail() {
     let status = std::process::Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     assert!(status.success());
     let canonical = dir
