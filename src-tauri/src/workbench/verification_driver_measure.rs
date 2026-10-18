@@ -14,8 +14,16 @@
 //! unpaced spawn gate, so nothing is shed or deferred under load. The numbers
 //! are the driver's demand, not what admission let through.
 //!
-//! The profile must be a copy. A path inside the GitPulse config directory
-//! (the live profile's home) is refused before anything opens it. Rerun from
+//! Trust mirrors the app's. The test process is hermetic, so its own trust
+//! store is empty and every real repository would be refused before git runs.
+//! Each target worktree whose repository the developer's real store trusts is
+//! given a session grant (memory only); the rest stay refused, as they are in
+//! the app. The real store is only read.
+//!
+//! The profile must be a copy. A path inside the developer's GitPulse config
+//! directory (the live profile's home) is refused before anything opens it.
+//! macOS only: the real config directory is resolved the way the app resolves
+//! it there. Rerun from
 //! the repository root, on a fresh copy each time (the driver writes to it):
 //!
 //! ```text
@@ -31,16 +39,18 @@ use crate::workbench::verification_gate as gate;
 use crate::workbench::WorkbenchError;
 use dc_store::Store;
 use serde_json::{json, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The host backend with Manvi's start replaced by a counter.
+#[derive(Default)]
 struct Measured {
     starts: Cell<usize>,
     heads: Cell<usize>,
     heads_failed: Cell<usize>,
+    errors: RefCell<BTreeSet<String>>,
 }
 
 impl Backend for Measured {
@@ -51,8 +61,13 @@ impl Backend for Measured {
     fn head_of(&self, worktree: &str) -> Result<String, String> {
         self.heads.set(self.heads.get() + 1);
         let head = gate::current_head(worktree);
-        if head.is_err() {
+        if let Err(error) = &head {
             self.heads_failed.set(self.heads_failed.get() + 1);
+            let mut errors = self.errors.borrow_mut();
+            // A few distinct causes, each cut short: enough to name why.
+            if errors.len() < 8 {
+                errors.insert(error.chars().take(120).collect());
+            }
         }
         head
     }
@@ -67,19 +82,36 @@ impl Backend for Measured {
     }
 }
 
+/// The developer's own GitPulse config directory, as the app resolves it on
+/// macOS from the `HOME` the hermetic constructor replaced.
+fn real_config_dir() -> PathBuf {
+    if !cfg!(target_os = "macos") {
+        panic!("the measurement resolves the real config directory the macOS way");
+    }
+    crate::test_support::env::hermetic::real_home()
+        .expect("the developer's real HOME")
+        .join("Library")
+        .join("Application Support")
+        .join("GitPulse")
+}
+
 /// The copy to sweep, refused when it is the live profile or lives beside it.
-fn profile_copy() -> PathBuf {
+fn profile_copy(real_config: &Path) -> PathBuf {
     let path = PathBuf::from(
         std::env::var_os("GITPULSE_DRIVER_MEASURE_PROFILE")
             .expect("GITPULSE_DRIVER_MEASURE_PROFILE names the profile copy to sweep"),
     );
     assert!(path.is_absolute(), "the profile copy path must be absolute");
     let path = path.canonicalize().expect("the profile copy exists");
-    if let Some(config) = crate::tool_config::default_config_dir() {
+    let configs = [
+        Some(real_config.to_path_buf()),
+        crate::tool_config::default_config_dir(),
+    ];
+    for config in configs.into_iter().flatten() {
         let config = config.canonicalize().unwrap_or(config);
         assert!(
             !path.starts_with(&config),
-            "{} is inside the live GitPulse config directory {}; measure a copy",
+            "{} is inside the GitPulse config directory {}; measure a copy",
             path.display(),
             config.display()
         );
@@ -87,10 +119,31 @@ fn profile_copy() -> PathBuf {
     path
 }
 
+/// Session-grants each present worktree whose repository the real store
+/// trusts. Returns how many were granted and how many the real store refuses.
+fn mirror_real_trust(real_config: &Path, worktrees: &BTreeSet<String>) -> (usize, usize) {
+    let root = real_config.join("repository-trust-v1");
+    assert!(root.is_dir(), "no real trust store at {}", root.display());
+    let (mut granted, mut refused) = (0, 0);
+    for worktree in worktrees.iter().filter(|w| Path::new(w).is_dir()) {
+        match crate::repository_trust::trusted_by_store_at(&root, worktree) {
+            Ok(true) => {
+                let preview = crate::repository_trust::inspect(worktree).expect("inspect");
+                crate::repository_trust::grant(worktree, &preview.identity, false)
+                    .expect("session grant");
+                granted += 1;
+            }
+            Ok(false) | Err(_) => refused += 1,
+        }
+    }
+    (granted, refused)
+}
+
 #[test]
 #[ignore = "measurement over a copy of a real profile for a fixed window; needs GITPULSE_DRIVER_MEASURE_PROFILE (rerun command in this file's header)"]
 fn measure_driver_children_over_a_profile_copy() {
-    let profile = profile_copy();
+    let real_config = real_config_dir();
+    let profile = profile_copy(&real_config);
     let window = Duration::from_secs(
         std::env::var("GITPULSE_DRIVER_MEASURE_SECS")
             .ok()
@@ -98,18 +151,24 @@ fn measure_driver_children_over_a_profile_copy() {
             .unwrap_or(45),
     );
     let store = Store::open(&profile).expect("open the profile copy");
-    let backend = Measured {
-        starts: Cell::new(0),
-        heads: Cell::new(0),
-        heads_failed: Cell::new(0),
-    };
+    let before = held_cards(&store).expect("list held cards");
+    let claimed: BTreeSet<String> = before
+        .iter()
+        .filter_map(target_of)
+        .map(|t| t.worktree)
+        .collect();
+    let (trust_granted, trust_refused) = mirror_real_trust(&real_config, &claimed);
+    let backend = Measured::default();
     let mut driver = Driver::default();
     let mut totals = Report::default();
     let mut sweeps = 0usize;
+    let mut longest = Duration::ZERO;
     let began = Instant::now();
     // The install loop's shape: sweep, then wait a period.
     while began.elapsed() < window {
+        let swept = Instant::now();
         let report = driver.sweep(&store, &backend);
+        longest = longest.max(swept.elapsed());
         totals.started += report.started;
         totals.promoted += report.promoted;
         totals.parked += report.parked;
@@ -148,10 +207,14 @@ fn measure_driver_children_over_a_profile_copy() {
         json!({
             "window_s": elapsed.as_secs_f64(),
             "sweeps": sweeps,
+            "longest_sweep_s": longest.as_secs_f64(),
             "review_cards": cards.len(),
             "held_with_target": targets.len(),
             "target_worktrees": worktrees.len(),
             "target_worktrees_present": present,
+            "trust_granted_from_real_store": trust_granted,
+            "trust_refused_by_real_store": trust_refused,
+            "head_of_errors": backend.errors.borrow().iter().collect::<Vec<_>>(),
             "head_of_calls": backend.heads.get(),
             "head_of_failed": backend.heads_failed.get(),
             "stub_starts": backend.starts.get(),
@@ -164,6 +227,11 @@ fn measure_driver_children_over_a_profile_copy() {
         })
     );
     assert!(sweeps > 0, "the window ran no sweep");
+    // A run where no head could be read measured nothing; never report it.
+    assert!(
+        backend.heads.get() > backend.heads_failed.get(),
+        "no worktree head was read; the measurement is empty"
+    );
     assert_eq!(
         backend.starts.get(),
         totals.started,
