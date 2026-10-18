@@ -10,6 +10,7 @@ use gitpulse_lib::engine::git_cli::{
     sandbox_overwrite_edited_text, sandbox_write, FileWriteError,
 };
 use gitpulse_lib::engine::git_writer::GitWriter;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -57,7 +58,7 @@ fn nested_head_commit(repo: &Path, dir: &str) -> bool {
     std::process::Command::new("git")
         .args(["rev-parse", "--verify", "-q", "HEAD"])
         .current_dir(repo.join(dir))
-        .output()
+        .output_locked()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
