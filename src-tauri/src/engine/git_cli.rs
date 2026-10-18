@@ -3137,6 +3137,12 @@ impl SpawnGate {
 
     /// Tokens background work may not spend: a quarter of the burst, so
     /// optional work is shed while reactive reads still have budget.
+    /// How long one token takes to refill: the soonest the shared record can
+    /// answer differently than it just did.
+    fn refill_interval(&self) -> Duration {
+        Duration::from_millis(1000_u64.div_ceil(u64::from(self.refill_per_sec.max(1))))
+    }
+
     fn background_reserve(&self) -> u32 {
         self.burst / 4
     }
@@ -3195,6 +3201,11 @@ impl SpawnGate {
         }
         reservation.held = background || interactive;
         let mut token_wait_started: Option<Instant> = None;
+        // When this waiter may next ask the shared record. A record changes at
+        // most once per refill interval, so a waiter that was denied has
+        // nothing to learn from asking sooner, and each ask is a locked read
+        // and rewrite of a file every process shares.
+        let mut next_shared_ask: Option<Instant> = None;
         // A token the shared budget granted while the gate lock was released.
         // Kept for the next pass, which re-reads the gate before spending it:
         // the slot it was asked for may have gone to another waiter meanwhile.
@@ -3258,14 +3269,22 @@ impl SpawnGate {
             // The shared budget is asked last, and only by a spawn that would
             // otherwise start now, so a granted token is spent at once below
             // and never taken for a waiter that then gives up.
-            if tokens_ok
+            let asks_shared = tokens_ok
                 && rate_limited
                 && !interactive
                 && !shared_token_held
                 && state.in_flight < self.limit
                 && eligible
-                && self.shared.is_some()
-            {
+                && self.shared.is_some();
+            // A waiter (anything that will not be refused at once) is paced to
+            // the refill interval; a first ask, or a spawn that is refused on
+            // its answer, is not delayed.
+            let paced = asks_shared
+                && (!background || awaits_budget)
+                && next_shared_ask.is_some_and(|at| now < at);
+            if paced {
+                tokens_ok = false;
+            } else if asks_shared {
                 // The shared record is a file under a lock that may sleep-poll
                 // for [`shared_budget::LOCK_PATIENCE`], and a denial writes it
                 // too. None of that may happen under the gate mutex, where it
@@ -3288,6 +3307,21 @@ impl SpawnGate {
                     tokens_ok = tokens_available(&state);
                 } else {
                     tokens_ok = false;
+                    next_shared_ask = Some(Instant::now() + self.refill_interval());
+                }
+            }
+            // An awaiting background reader counts in `waiting_background`
+            // only while it waits for a SLOT, which is what the count reserves
+            // a slot for (see `eligibility`). One short of tokens cannot use a
+            // slot, so it must not keep one from a reactive read that can.
+            if awaits_budget {
+                if reservation.held && !tokens_ok {
+                    state.waiting_background = state.waiting_background.saturating_sub(1);
+                    reservation.held = false;
+                    self.released.notify_all();
+                } else if !reservation.held && tokens_ok {
+                    state.waiting_background += 1;
+                    reservation.held = true;
                 }
             }
             if !tokens_ok {
@@ -3494,7 +3528,7 @@ const SPAWN_PER_SEC: u32 = 8;
 /// How long a caller may block once the burst is spent. Longer than one
 /// refill interval, short enough that a saturated storm does not pin the
 /// blocking pool until the 90s git deadline.
-const SPAWN_QUEUE_BUDGET: Duration = Duration::from_secs(2);
+pub(crate) const SPAWN_QUEUE_BUDGET: Duration = Duration::from_secs(2);
 
 pub(crate) fn production_spawn_rate() -> (u32, u32) {
     (SPAWN_BURST, SPAWN_PER_SEC)

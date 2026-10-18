@@ -168,7 +168,6 @@ fn parked_waiters_do_not_hold_the_gate_and_all_end_at_the_budget() {
 /// token and a free slot is refused until the waiter gives up. Before the
 /// change the shed waiter left at once.
 #[test]
-#[ignore = "break: a token-starved MCP waiter reserves the last slot from Reactive for up to 2 s"]
 fn a_token_starved_waiter_does_not_block_a_reactive_read_that_has_a_slot_and_a_token() {
     // limit 2: one Reactive permit in flight is limit - 1.
     let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::with_rate(2, 8, 1)));
@@ -237,7 +236,6 @@ fn measure_shared_record_writes_of_four_waiting_readers() {
 /// staying at the refill rate. The record can only change once per refill
 /// interval (125 ms at 8/s), so a waiter has no reason to re-ask faster.
 #[test]
-#[ignore = "break: each parked waiter rewrites the shared record every 50 ms (~20/s each)"]
 fn waiting_readers_ask_the_shared_record_no_faster_than_it_refills() {
     let asks = asks_by_parked_waiters(4);
     // One ask per refill interval per process (production: 8/s) plus slack.

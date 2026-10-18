@@ -844,7 +844,7 @@ fn changes_from_status(files: &[FileStatus], truncated: bool) -> ChangesFacet {
 /// worktrees. The parked-operation probe reads control files and starts no
 /// process, so it is bounded by the worktree count; the clock still ends it
 /// early.
-const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One-shot read of everything an agent needs to see the repository as the
 /// Work view does: worktrees, agent sessions, dirty files, collisions, ledger

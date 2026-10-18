@@ -938,6 +938,17 @@ mod test_env;
 mod tests {
     use super::*;
 
+    /// A deferred and retried insights read, with its wait for budget at every
+    /// spawn, still ends inside the per-call budget the watchdog enforces.
+    #[test]
+    fn a_deferred_and_retried_read_fits_the_call_budget() {
+        let worst = mcp::WORST_CASE_DEFERRED_READ;
+        assert!(
+            worst < DEFAULT_CALL_BUDGET,
+            "{worst:?} vs {DEFAULT_CALL_BUDGET:?}"
+        );
+    }
+
     /// A writer the test can read back after the wire's worker wrote to it.
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
