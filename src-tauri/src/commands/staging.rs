@@ -67,22 +67,13 @@ pub async fn cmd_stage_selective_patch(
         let patch = PatchBuilder::build_selective_patch(&file_patch, true);
         // This is a mutating git action (index rewrite via `git apply
         // --cached`), so it goes through the same command gate as every
-        // other mutation. The argv is exactly what
-        // GitWriter::apply_patch_to_index runs. The verdict is not returned:
+        // other mutation. The argv is the one
+        // GitWriter::apply_patch_to_index runs: both come from
+        // apply_patch_to_index_argv. The verdict is not returned:
         // this command's IPC shape predates Guarded<()>, and changing it
         // would break the frontend contract — an allow proceeds silently, a
         // refusal surfaces as Err either way.
-        guard(
-            &repo_path,
-            &[
-                "git",
-                "apply",
-                "--cached",
-                "--unidiff-zero",
-                "--recount",
-                "-",
-            ],
-        )?;
+        guard(&repo_path, &GitWriter::apply_patch_to_index_argv())?;
         GitWriter::apply_patch_to_index(&repo_path, &patch)
     })
     .await
@@ -96,17 +87,7 @@ pub async fn cmd_unstage_selective_patch(
     off_thread(move || {
         PatchBuilder::validate_file_patch(&file_patch)?;
         let patch = PatchBuilder::build_selective_patch(&file_patch, false);
-        guard(
-            &repo_path,
-            &[
-                "git",
-                "apply",
-                "--cached",
-                "--unidiff-zero",
-                "--recount",
-                "-",
-            ],
-        )?;
+        guard(&repo_path, &GitWriter::apply_patch_to_index_argv())?;
         GitWriter::apply_patch_to_index(&repo_path, &patch)
     })
     .await
