@@ -381,14 +381,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-query",
-        "commit": "1ae3bc15a62a3875f9dd827899ba774aa1c50ab0"
+        "commit": "7aa6bf516e150a2d8e5a8c8666e35b62b2c42f5f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"0.2.5\"",
         "package.edition = \"2021\"",
         "package.rust-version = \"1.99\"",
         "package.license = \"Apache-2.0\"",
@@ -401,7 +401,7 @@
         "dropped [dev-dependencies]"
       ],
       "files": {
-        "Cargo.toml": "0e69b5a28489ec73db18131288fb9b80ddc05e0e4a5ca2b353948e4c4e0175a5",
+        "Cargo.toml": "342b697fe2aee672cd477274deec4ad2a4e3511320d8452cd3249e6bb9e30db9",
         "assets/force-graph.min.js.bundle": "1008539bb9e171a0dc343453366451a1b3a6ded06028ef4f978608b658ba2d0a",
         "src/api_routes.rs": "a69fbe47bb527450f560e72971c248f317453154eec44a7afe6d0467e21dcadb",
         "src/artifacts.rs": "d7e67ce112540a6c6640440a1e02ea1d2df1857d7fed5eb84166f0cbf58ab979",
@@ -426,7 +426,7 @@
         "src/engine/trace.rs": "a49c86c3fd34d21e6df3c4f2900881bb1c7dc2c92e9408347442ce5af379f296",
         "src/engine/traversal.rs": "55e4c2eeebe7108e184d513d43b70bc29a40d65bd0bb23cb79482d2c13f591fd",
         "src/engine/workspace.rs": "354930f9789e5ec3fd67d8f09545e5bb5c8a57340a74c17e86edbc24bb21ac2f",
-        "src/engine.rs": "1595f2a3e2a9be2f46b242fcf55763432515bea6201aa1f5bc216456af4ae5bd",
+        "src/engine.rs": "6bdaf9dcfe282eff7a8b273e89f6fa9b934a05fbc780d589badafe6b5f0b7b58",
         "src/escape.rs": "d87b290b8613736bf735d4424495b33dfbbda99e1d944abb5507ef63a9b8b27e",
         "src/evidence.rs": "46a2139fcd5b6aa46bde3e9eb622ab41786a630050f3fa7c423fe69c6d22f52f",
         "src/export.rs": "7fd87c98fd1ca3e851f637cf9118b3f8bc1163f4e342525c22f5348b86ad543f",
@@ -492,14 +492,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-store",
-        "commit": "1ae3bc15a62a3875f9dd827899ba774aa1c50ab0"
+        "commit": "7aa6bf516e150a2d8e5a8c8666e35b62b2c42f5f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"0.2.5\"",
         "package.edition = \"2021\"",
         "package.rust-version = \"1.99\"",
         "package.license = \"Apache-2.0\"",
@@ -511,7 +511,7 @@
         "dependencies.rayon from the workspace"
       ],
       "files": {
-        "Cargo.toml": "d4ef7cf1d135ae3ee64c70777fff9fb9717a0bf9317a23d4d538019a717fc534",
+        "Cargo.toml": "8c1e5b7158dca912f9842b6eebf2030f7aaf65386dc1c93ea43a1607bbfc7b5a",
         "src/bin/hold_uncommitted_child.rs": "99d06534e8155f43fcba3291b816a681a1de9de4dab02ca84cbbcc891758a807",
         "src/coverage.rs": "f3fb2fdbd56d1c98651954fb91a5126ac689a9d0abb904330f973317bcd21d92",
         "src/db/generation.rs": "931b8390b2af848eecc139b909641eddfe00be01440f297593fcbbd9e1e4a53e",
@@ -519,7 +519,7 @@
         "src/db/migrate.rs": "916a715f265302f64b77f291124b4d2286d1727c468a7d72992d67e8772ec781",
         "src/db/open.rs": "4283ec7fbf260b51f9e74d7d9cfced91719a77f638d461d3e38f1b81580f2345",
         "src/db/pending.rs": "f2de8cd36c83a842ba8ed516b467625927fd09089f4a36214739eee5759c0267",
-        "src/db/query.rs": "e087883dbb829a3adbf2410eb7fd5f7c96e373f3620f5b1144f2241e521bee63",
+        "src/db/query.rs": "bdfd1887a608d14fc0a9d2c6bba9c3d5e07a6b3b6f6dcdf426003b489e7958d9",
         "src/db/tests/agentic_queue_regressions.rs": "285efe484891a5b18b095b48691f797063d74acaa26bd5a3bb4fadbe42f38af9",
         "src/db/tests/bounded_claim_tests.rs": "81deb585e0c2e56e8334a22fba88776d602703e2c4fb8e651458117494363b60",
         "src/db/tests/carry_forward_tests.rs": "6314b81d526077e6e8c2a8b7917f2e0f226611637744b5410cec2c559d863485",
@@ -529,7 +529,7 @@
         "src/db/tests/hostile_store_tests.rs": "94e988c98119aae12f74e8f191beb567df7ab54639eb3f113272c2e999d9f408",
         "src/db/tests/sidecar_link_tests.rs": "fd0014892605e15b4baafe36c1991861dbbfc8c3237a0c3c7fa584788be800a5",
         "src/db/write.rs": "545be2270f40c7d341badd51ab653849160fdc5c8c2e8d6beae47ac87f5cbb9f",
-        "src/db.rs": "e65625fbd9bf14a789db85539638270000e7d70ccaf7aa513a4d1e104434b0ae",
+        "src/db.rs": "0cf62b9fbe9bb265e7427d13944288692cfa88be4ae742b631d01596b5097417",
         "src/edge_index.rs": "6857b9a6aac51e1a0c9f56b32fef4f8cf08691ae08bd693902c22c667b2853b8",
         "src/extract_cache.rs": "d96214cd467df075866cb8d1e6921ff4ad55127d56eba08d7c94868c7bb3fe00",
         "src/lib.rs": "a024fbb26aabde2d13def7e6304ab63567ec475d30ed030f4ac6f1fe97daca81",
