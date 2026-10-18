@@ -1322,7 +1322,7 @@ fn steady_head_read_rate_before_and_after() {
     let run = |cached: bool| -> f64 {
         let before = launches(&repos);
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(60) {
+        while started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(60)) {
             let sweep = Instant::now();
             for repo in &repos {
                 let path = repo.path().to_str().unwrap();
