@@ -1541,6 +1541,84 @@ Unset the local override with `git config --local --unset-all user.name` and \
         })
     }
 
+    /// Git's argv for `branch <name> [<start>]`. Shared by the command gate and
+    /// [`Self::create_branch`], so the judged line is the line that runs.
+    pub fn create_branch_argv<'a>(
+        branch_name: &'a str,
+        start_point: Option<&'a str>,
+    ) -> Vec<&'a str> {
+        let mut argv = vec!["git", "branch", branch_name];
+        if let Some(sp) = start_point {
+            argv.push(sp);
+        }
+        argv
+    }
+
+    /// Git's argv for `branch -d|-D <name>`, shared like [`Self::create_branch_argv`].
+    pub fn delete_branch_argv(branch_name: &str, force: bool) -> Vec<&str> {
+        vec![
+            "git",
+            "branch",
+            if force { "-D" } else { "-d" },
+            branch_name,
+        ]
+    }
+
+    /// Git's argv for `branch -m <old> <new>`, shared like [`Self::create_branch_argv`].
+    pub fn rename_branch_argv<'a>(old_name: &'a str, new_name: &'a str) -> Vec<&'a str> {
+        vec!["git", "branch", "-m", old_name, new_name]
+    }
+
+    /// Git's argv for `apply --cached --unidiff-zero --recount -`: the line
+    /// both selective stage and selective unstage judge and
+    /// [`Self::apply_patch_to_index`] runs.
+    pub fn apply_patch_to_index_argv() -> Vec<&'static str> {
+        vec![
+            "git",
+            "apply",
+            "--cached",
+            "--unidiff-zero",
+            "--recount",
+            "-",
+        ]
+    }
+
+    /// Git's argv for creating a tag (annotated when `message` is given),
+    /// shared by the command gate and [`Self::create_tag`].
+    pub fn create_tag_argv<'a>(
+        tag_name: &'a str,
+        commit_id: Option<&'a str>,
+        message: Option<&'a str>,
+    ) -> Vec<&'a str> {
+        let mut argv = vec!["git", "tag"];
+        if let Some(msg) = message {
+            argv.extend(["-a", tag_name, "-m", msg]);
+        } else {
+            argv.push(tag_name);
+        }
+        if let Some(cid) = commit_id {
+            argv.push(cid);
+        }
+        argv
+    }
+
+    /// Git's argv for `tag -d <name>`, shared by the command gate and [`Self::delete_tag`].
+    pub fn delete_tag_argv(tag_name: &str) -> Vec<&str> {
+        vec!["git", "tag", "-d", tag_name]
+    }
+
+    /// The fully-qualified ref [`Self::push_tag`] publishes for `tag`.
+    pub fn tag_push_ref(tag: &str) -> String {
+        format!("refs/tags/{tag}")
+    }
+
+    /// Git's argv for pushing exactly one tag ref to a named remote. It names
+    /// the remote, never its URL, so nothing credential-bearing is judged.
+    /// Shared by the command gate and [`Self::push_tag`].
+    pub fn push_tag_argv<'a>(remote: &'a str, tag_ref: &'a str) -> Vec<&'a str> {
+        vec!["git", "push", remote, tag_ref]
+    }
+
     pub fn create_branch(
         repo_path: &str,
         branch_name: &str,
@@ -1552,15 +1630,14 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch_name)?;
-        let mut args = vec!["branch", branch_name];
         if let Some(sp) = start_point {
             // Start points are revisions, not refs-to-create: HEAD~1 and raw
             // oids are legal here. Reflog/peel grammar stays excluded by
             // validate_oid_or_revision on purpose.
             validate_oid_or_revision(sp)?;
-            args.push(sp);
         }
-        git_text(&repo, args.as_slice())?;
+        let argv = Self::create_branch_argv(branch_name, start_point);
+        git_text(&repo, &argv[1..])?;
         Ok(())
     }
 
@@ -1605,8 +1682,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .trim()
             .to_string();
         validate_oid(&tip)?;
-        let flag = if force { "-D" } else { "-d" };
-        git_text(&repo, &["branch", flag, branch_name])?;
+        let argv = Self::delete_branch_argv(branch_name, force);
+        git_text(&repo, &argv[1..])?;
         // Journal only after a successful delete so a refused `-d` never claims
         // the branch is gone. The tip itself was resolved before the ref left.
         record_deleted_branch_tip(repo_path, branch_name, &tip, force);
@@ -1621,7 +1698,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(old_name)?;
         validate_ref_name(new_name)?;
-        git_text(&repo, &["branch", "-m", old_name, new_name])?;
+        let argv = Self::rename_branch_argv(old_name, new_name);
+        git_text(&repo, &argv[1..])?;
         Ok(())
     }
 
@@ -1631,11 +1709,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        git_with_stdin(
-            &repo,
-            &["apply", "--cached", "--unidiff-zero", "--recount", "-"],
-            patch_content.as_bytes(),
-        )?;
+        let argv = Self::apply_patch_to_index_argv();
+        git_with_stdin(&repo, &argv[1..], patch_content.as_bytes())?;
         Ok(())
     }
 
@@ -1969,8 +2044,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         crate::engine::remotes::require_configured(&repo, remote)?;
         validate_ref_name(remote)?;
         validate_ref_name(tag)?;
-        let refspec = format!("refs/tags/{tag}");
-        git_text_network(&repo, &["push", remote, &refspec])
+        let tag_ref = Self::tag_push_ref(tag);
+        let argv = Self::push_tag_argv(remote, &tag_ref);
+        git_text_network(&repo, &argv[1..])
     }
 
     /// Git's arguments (no program) for the merge step of `mode`. Shared by
@@ -2291,20 +2367,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if message.is_some() {
             Self::refuse_fixture_identity(&repo, false)?;
         }
-        let mut args = vec!["tag"];
-        if let Some(msg) = message {
-            args.push("-a");
-            args.push(tag_name);
-            args.push("-m");
-            args.push(msg);
-        } else {
-            args.push(tag_name);
-        }
         if let Some(cid) = commit_id {
             validate_oid(cid)?;
-            args.push(cid);
         }
-        git_text(&repo, &args)?;
+        let argv = Self::create_tag_argv(tag_name, commit_id, message);
+        git_text(&repo, &argv[1..])?;
         Ok(())
     }
 
@@ -2315,7 +2382,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(tag_name)?;
-        git_text(&repo, &["tag", "-d", tag_name])?;
+        let argv = Self::delete_tag_argv(tag_name);
+        git_text(&repo, &argv[1..])?;
         Ok(())
     }
 
@@ -2814,9 +2882,8 @@ pub(crate) fn record_deleted_branch_tip(
     tip: &str,
     force: bool,
 ) {
-    let flag = if force { "-D" } else { "-d" };
     BranchDeleteJournal::resolve(repo_path).record(
-        &["git", "branch", flag, branch_name],
+        &GitWriter::delete_branch_argv(branch_name, force),
         branch_name,
         tip,
         crate::ledger::Outcome::Ok,

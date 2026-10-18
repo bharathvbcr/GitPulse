@@ -53,10 +53,7 @@ pub async fn cmd_create_branch(
     start_point: Option<String>,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let mut argv = vec!["git", "branch", branch_name.as_str()];
-        if let Some(ref sp) = start_point {
-            argv.push(sp.as_str());
-        }
+        let argv = GitWriter::create_branch_argv(&branch_name, start_point.as_deref());
         let policy = guard(&repo_path, &argv)?;
         GitWriter::create_branch(&repo_path, &branch_name, start_point.as_deref())?;
         Ok(Guarded { policy, output: () })
@@ -71,8 +68,10 @@ pub async fn cmd_delete_branch(
     force: bool,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let flag = if force { "-D" } else { "-d" };
-        let policy = guard(&repo_path, &["git", "branch", flag, branch_name.as_str()])?;
+        let policy = guard(
+            &repo_path,
+            &GitWriter::delete_branch_argv(&branch_name, force),
+        )?;
         // Tip is journalled inside delete_branch as ledger before_ref; callers
         // that still hold the name (sidebar toast / cleanup candidate) restore
         // with create_branch and do not need the SHA on this wire.
@@ -91,7 +90,7 @@ pub async fn cmd_rename_branch(
     off_thread(move || {
         let policy = guard(
             &repo_path,
-            &["git", "branch", "-m", old_name.as_str(), new_name.as_str()],
+            &GitWriter::rename_branch_argv(&old_name, &new_name),
         )?;
         GitWriter::rename_branch(&repo_path, &old_name, &new_name)?;
         Ok(Guarded { policy, output: () })
@@ -199,18 +198,7 @@ pub async fn cmd_create_tag(
     message: Option<String>,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let mut argv = vec!["git", "tag"];
-        if message.is_some() {
-            argv.push("-a");
-            argv.push(tag_name.as_str());
-            argv.push("-m");
-            argv.push(message.as_deref().unwrap_or_default());
-        } else {
-            argv.push(tag_name.as_str());
-        }
-        if let Some(cid) = commit_id.as_deref() {
-            argv.push(cid);
-        }
+        let argv = GitWriter::create_tag_argv(&tag_name, commit_id.as_deref(), message.as_deref());
         let policy = guard(&repo_path, &argv)?;
         GitWriter::create_tag(
             &repo_path,
@@ -226,7 +214,7 @@ pub async fn cmd_create_tag(
 #[tauri::command(async)]
 pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let policy = guard(&repo_path, &["git", "tag", "-d", tag_name.as_str()])?;
+        let policy = guard(&repo_path, &GitWriter::delete_tag_argv(&tag_name))?;
         GitWriter::delete_tag(&repo_path, &tag_name)?;
         Ok(Guarded { policy, output: () })
     })
@@ -247,23 +235,19 @@ pub async fn cmd_publish_release(
         let tag_policy = if plan.create_tag {
             Some(guard(
                 &repo_path,
-                &[
-                    "git",
-                    "tag",
-                    "-a",
-                    plan.tag.as_str(),
-                    "-m",
-                    plan.message.as_str(),
-                    plan.head.as_str(),
-                ],
+                &GitWriter::create_tag_argv(
+                    &plan.tag,
+                    Some(plan.head.as_str()),
+                    Some(plan.message.as_str()),
+                ),
             )?)
         } else {
             None
         };
-        let tag_ref = format!("refs/tags/{}", plan.tag);
+        let tag_ref = GitWriter::tag_push_ref(&plan.tag);
         let push_policy = guard(
             &repo_path,
-            &["git", "push", plan.remote.as_str(), tag_ref.as_str()],
+            &GitWriter::push_tag_argv(&plan.remote, &tag_ref),
         )?;
 
         if plan.create_tag {

@@ -3087,3 +3087,173 @@ fn release_unmerged_entries_are_not_reported_as_staged_changes() {
         "unmerged entries must remain in conflict review, not ready to commit: {statuses:?}"
     );
 }
+
+// ------------------------------------------------------------------ tags ---
+
+/// `git <args>` in `dir`, stdout split into lines. A failing git is a failed
+/// test: these helpers only read state the assertions then compare.
+fn git_lines(dir: &Path, args: &[&str]) -> Vec<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output_locked()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn tags_of(dir: &Path) -> Vec<String> {
+    git_lines(dir, &["tag", "--list"])
+}
+
+/// A seeded repository whose `origin` is a local bare repository.
+fn repo_with_bare_origin() -> (TestRepo, TempDir) {
+    let repo = TestRepo::init();
+    repo.write("seed.txt", "seed\n");
+    repo.commit_all("seed");
+    let bare = TempDir::new().expect("bare tempdir");
+    run_git(bare.path(), &["init", "--bare", "-b", "main"]);
+    run_git(
+        repo.dir.path(),
+        &["remote", "add", "origin", &bare.path().to_string_lossy()],
+    );
+    (repo, bare)
+}
+
+#[test]
+fn delete_tag_removes_only_the_named_tag() {
+    let repo = TestRepo::init();
+    repo.write("seed.txt", "seed\n");
+    repo.commit_all("seed");
+    for tag in ["v1", "v1-rc", "v2"] {
+        run_git(repo.dir.path(), &["tag", tag]);
+    }
+
+    GitWriter::delete_tag(&repo.path_str(), "v1").expect("delete the named tag");
+
+    assert_eq!(
+        tags_of(repo.dir.path()),
+        ["v1-rc", "v2"],
+        "a tag sharing the prefix, and every other tag, must survive"
+    );
+}
+
+#[test]
+fn delete_tag_refuses_flags_and_patterns_and_a_missing_tag() {
+    let repo = TestRepo::init();
+    repo.write("seed.txt", "seed\n");
+    repo.commit_all("seed");
+    for tag in ["a", "ab", "b"] {
+        run_git(repo.dir.path(), &["tag", tag]);
+    }
+
+    for refused in ["-f", "-d", "--force", "*", "a*", "[ab]", "a b", ""] {
+        let error = GitWriter::delete_tag(&repo.path_str(), refused)
+            .expect_err(&format!("{refused:?} must be refused"));
+        assert!(
+            error.starts_with("Invalid ref name"),
+            "{refused:?} was refused for the wrong reason: {error}"
+        );
+        assert_eq!(
+            tags_of(repo.dir.path()),
+            ["a", "ab", "b"],
+            "refusing {refused:?} must delete nothing"
+        );
+    }
+
+    let error = GitWriter::delete_tag(&repo.path_str(), "never-created")
+        .expect_err("a tag that does not exist is an error, not a silent success");
+    assert!(error.contains("never-created"), "{error}");
+    assert_eq!(tags_of(repo.dir.path()), ["a", "ab", "b"]);
+}
+
+#[test]
+fn push_tag_publishes_exactly_the_tag_ref_and_no_branch() {
+    let (repo, bare) = repo_with_bare_origin();
+    // Names that exist as BOTH a branch and a tag, plus a branch and a tag
+    // that must stay home: only `refs/tags/dup` may reach the remote.
+    run_git(repo.dir.path(), &["tag", "dup"]);
+    run_git(repo.dir.path(), &["branch", "dup"]);
+    run_git(repo.dir.path(), &["branch", "side"]);
+    run_git(repo.dir.path(), &["tag", "stays-home"]);
+
+    GitWriter::push_tag(&repo.path_str(), "origin", "dup").expect("push the tag");
+
+    assert_eq!(
+        git_lines(bare.path(), &["for-each-ref", "--format=%(refname)"]),
+        ["refs/tags/dup"],
+        "the remote holds that one tag ref and no branch"
+    );
+    let local_tag = git_lines(repo.dir.path(), &["rev-parse", "refs/tags/dup"]);
+    let remote_tag = git_lines(bare.path(), &["rev-parse", "refs/tags/dup"]);
+    assert_eq!(local_tag, remote_tag, "the same object was published");
+}
+
+#[test]
+fn push_tag_refuses_an_unconfigured_remote_a_flag_and_a_missing_tag() {
+    let (repo, bare) = repo_with_bare_origin();
+    run_git(repo.dir.path(), &["tag", "v1"]);
+    let before = git_lines(bare.path(), &["for-each-ref"]);
+
+    let error = GitWriter::push_tag(&repo.path_str(), "elsewhere", "v1")
+        .expect_err("an unconfigured remote");
+    assert!(error.contains("not a configured remote"), "{error}");
+    // A path is a repository, but not a configured remote name.
+    let error = GitWriter::push_tag(&repo.path_str(), &bare.path().to_string_lossy(), "v1")
+        .expect_err("a URL or path in the remote slot");
+    assert!(error.contains("not a configured remote"), "{error}");
+    let error = GitWriter::push_tag(&repo.path_str(), "origin", "--delete")
+        .expect_err("a flag in the tag slot");
+    assert!(error.starts_with("Invalid ref name"), "{error}");
+    GitWriter::push_tag(&repo.path_str(), "origin", "no-such-tag")
+        .expect_err("a tag that does not exist locally");
+
+    assert_eq!(
+        git_lines(bare.path(), &["for-each-ref"]),
+        before,
+        "every refusal left the remote untouched"
+    );
+}
+
+#[test]
+fn a_tag_and_a_branch_survive_a_create_then_delete_round_trip() {
+    let repo = TestRepo::init();
+    repo.write("seed.txt", "seed\n");
+    repo.commit_all("seed");
+    let head = git_lines(repo.dir.path(), &["rev-parse", "HEAD"]).remove(0);
+    let path = repo.path_str();
+
+    GitWriter::create_tag(&path, "light", Some(&head), None).expect("lightweight tag");
+    GitWriter::create_tag(&path, "noted", None, Some("a message")).expect("annotated tag");
+    GitWriter::create_branch(&path, "topic", Some("HEAD")).expect("branch");
+    assert_eq!(tags_of(repo.dir.path()), ["light", "noted"]);
+    assert_eq!(
+        git_lines(repo.dir.path(), &["cat-file", "-t", "refs/tags/noted"]),
+        ["tag"],
+        "a message makes the tag annotated"
+    );
+    assert_eq!(
+        git_lines(repo.dir.path(), &["cat-file", "-t", "refs/tags/light"]),
+        ["commit"]
+    );
+
+    GitWriter::delete_tag(&path, "light").expect("delete light");
+    GitWriter::delete_tag(&path, "noted").expect("delete noted");
+    GitWriter::delete_branch(&path, "topic", false).expect("delete branch");
+    assert!(tags_of(repo.dir.path()).is_empty());
+    assert_eq!(
+        git_lines(repo.dir.path(), &["branch", "--format=%(refname:short)"]),
+        ["main"]
+    );
+
+    // The names are free again.
+    GitWriter::create_tag(&path, "light", Some(&head), None).expect("recreate the tag");
+    assert_eq!(tags_of(repo.dir.path()), ["light"]);
+}
