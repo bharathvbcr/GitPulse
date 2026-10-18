@@ -531,10 +531,7 @@ impl ManualClock {
     pub(crate) fn rewind(&self, by: Duration) {
         CLOCK.with(|cell| {
             let (mono, wall) = cell.get().expect("clock installed");
-            cell.set(Some((
-                mono.checked_sub(by).expect("headroom"),
-                wall - by,
-            )));
+            cell.set(Some((mono.checked_sub(by).expect("headroom"), wall - by)));
         });
     }
 }
@@ -1341,7 +1338,10 @@ mod tests {
         clock.advance(TTL - MILLI);
         assert!(!computed(&fx, &args, &stamp), "served 1 ms before the TTL");
         clock.advance(MILLI);
-        assert!(computed(&fx, &args, &stamp), "recomputed at exactly the TTL");
+        assert!(
+            computed(&fx, &args, &stamp),
+            "recomputed at exactly the TTL"
+        );
         assert!(!computed(&fx, &args, &stamp), "and kept afresh from there");
     }
 
