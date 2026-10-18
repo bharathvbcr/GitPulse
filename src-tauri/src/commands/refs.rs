@@ -175,7 +175,9 @@ pub async fn cmd_branch_cleanup_plan(
 /// The half of ref retention `cmd_branch_cleanup_plan` cannot see: a commit
 /// held by a tag alone is on no branch, so that plan counts it nowhere.
 #[tauri::command(async)]
-pub async fn cmd_tag_cleanup_plan(repo_path: String) -> Result<crate::ops::TagCleanupPlan, IpcError> {
+pub async fn cmd_tag_cleanup_plan(
+    repo_path: String,
+) -> Result<crate::ops::TagCleanupPlan, IpcError> {
     off_thread(move || crate::ops::tag_cleanup_plan(&repo_path)).await
 }
 

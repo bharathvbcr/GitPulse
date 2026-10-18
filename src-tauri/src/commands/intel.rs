@@ -300,7 +300,9 @@ pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildO
 
 /// Incremental refresh via the installed `devmap` CLI.
 #[tauri::command(async)]
-pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::BuildOutcome, IpcError> {
+pub async fn cmd_devmap_refresh(
+    repo_path: String,
+) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
         crate::devmap::refresh(&repo_path)
@@ -386,7 +388,9 @@ fn preview_many_cancellable(
 
 /// Read `.devcouncil/repo_map.json` into GitPulse's typed navigator mirror.
 #[tauri::command(async)]
-pub async fn cmd_devmap_repo_map(repo_path: String) -> Result<crate::devmap::RepoMapLoad, IpcError> {
+pub async fn cmd_devmap_repo_map(
+    repo_path: String,
+) -> Result<crate::devmap::RepoMapLoad, IpcError> {
     off_thread(move || Ok(crate::devmap::load_repo_map(&repo_path))).await
 }
 

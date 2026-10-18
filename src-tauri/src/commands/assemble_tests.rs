@@ -473,3 +473,62 @@ fn ledger_commands_resolve_a_linked_worktree_to_the_family_anchor() {
     assert_eq!(snapshots[0].repo_path, main_path.to_string_lossy());
     assert_eq!(snapshots[0].total_commits, 7);
 }
+
+/// A command's error reaches the frontend typed, with the text a person reads
+/// exactly what the engine wrote: the string it used to reject with.
+#[test]
+fn a_stale_stash_refusal_is_typed_and_its_text_is_the_engines() {
+    let repo = crate::test_support::git_repo();
+    let path = repo.path().to_string_lossy().into_owned();
+    let engine = crate::engine::stash::run_action_with(
+        &path,
+        StashAction::Drop,
+        3,
+        "abcdef12",
+        |_: &[&str]| Ok(()),
+    )
+    .expect_err("an empty stack holds no entry 3");
+
+    let error = tauri::async_runtime::block_on(cmd_stash_action(
+        path,
+        StashAction::Drop,
+        3,
+        "abcdef12".to_string(),
+    ))
+    .expect_err("the command refuses");
+    assert_eq!(error.kind, crate::ipc_error::IpcErrorKind::StaleStash);
+    assert_eq!(error.message, engine);
+    let wire = serde_json::to_value(&error).expect("serialises");
+    assert_eq!(wire["kind"], "stale_stash");
+    assert_eq!(wire["message"], engine.as_str());
+}
+
+#[test]
+fn an_unapproved_repository_is_typed_and_its_text_is_the_trust_refusal() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let status = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(dir.path())
+        .status_locked()
+        .expect("git init");
+    assert!(status.success());
+    let path = dir.path().to_string_lossy().into_owned();
+    let engine = resolve_repo(&path).expect_err("nobody approved this repository");
+
+    let error = tauri::async_runtime::block_on(cmd_resolve_repo(path)).expect_err("refused");
+    assert_eq!(
+        error.kind,
+        crate::ipc_error::IpcErrorKind::RepositoryTrustRequired
+    );
+    assert_eq!(error.message, engine);
+}
+
+#[test]
+fn a_command_error_that_says_nothing_reaches_the_frontend_unclassified() {
+    let error = tauri::async_runtime::block_on(off_thread(|| {
+        Err::<(), _>("Nothing to commit".to_string())
+    }))
+    .expect_err("the body failed");
+    assert_eq!(error.kind, crate::ipc_error::IpcErrorKind::Unclassified);
+    assert_eq!(error.message, "Nothing to commit");
+}

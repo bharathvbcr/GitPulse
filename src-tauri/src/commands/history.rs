@@ -138,7 +138,9 @@ pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, IpcErro
 
 /// Lists the stash stack. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_stash_list(repo_path: String) -> Result<crate::engine::stash::StashList, IpcError> {
+pub async fn cmd_stash_list(
+    repo_path: String,
+) -> Result<crate::engine::stash::StashList, IpcError> {
     off_thread(move || crate::engine::stash::list(&repo_path)).await
 }
 

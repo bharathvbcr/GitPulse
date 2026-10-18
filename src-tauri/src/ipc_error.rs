@@ -123,7 +123,7 @@ impl IpcError {
     /// For text a command produced from git, a program, or a repository check.
     /// Text from anywhere else is a plain `String` and stays unclassified.
     pub fn from_command_text(message: String) -> Self {
-        let kind = match RunError::classify(&message).into() {
+        let kind = match classify_runner(&message) {
             IpcErrorKind::Unclassified => classify_owned_marker(&message),
             kind => kind,
         };
@@ -135,6 +135,35 @@ impl IpcError {
     pub fn contains(&self, needle: &str) -> bool {
         self.message.contains(needle)
     }
+}
+
+/// How many `": "` boundaries are tried as the start of a runner message.
+const WRAPPED_STARTS: usize = 8;
+
+/// [`RunError::classify`] on the whole text, then on what follows each of the
+/// first few `": "` boundaries.
+///
+/// Engine code prefixes a runner failure with its own context (`Blame
+/// unavailable: git blame deferred under load after ...`), and the frontend
+/// retried those as it retried the bare message. `RunError`'s shapes are
+/// anchored at the start of the text so that a path which spells a marker is
+/// not mistaken for the runner's own message, and the same anchoring holds at
+/// every boundary here: a label with a `/` or a quote in it is not a runner
+/// label, so `Not a Git repository: /x deferred under load after 1s: y` stays
+/// unclassified.
+fn classify_runner(message: &str) -> IpcErrorKind {
+    let whole: IpcErrorKind = RunError::classify(message).into();
+    if whole != IpcErrorKind::Unclassified {
+        return whole;
+    }
+    message
+        .match_indices(": ")
+        .take(WRAPPED_STARTS)
+        .map(|(at, delimiter)| {
+            IpcErrorKind::from(RunError::classify(&message[at + delimiter.len()..]))
+        })
+        .find(|kind| *kind != IpcErrorKind::Unclassified)
+        .unwrap_or(IpcErrorKind::Unclassified)
 }
 
 /// The refusals whose phrase is defined by Rust and acted on by the UI.

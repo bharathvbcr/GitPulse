@@ -19,7 +19,10 @@ pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guar
 }
 
 #[tauri::command(async)]
-pub async fn cmd_unstage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, IpcError> {
+pub async fn cmd_unstage_file(
+    repo_path: String,
+    file_path: String,
+) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let (verdicts, _) =
             GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Unstage, |argv| {

@@ -4,6 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { get, writable } from "svelte/store";
+import { IpcError } from "../../ipc/invoke";
 import { createRepoStore, type InvokeFn } from "../repoStore";
 import type { FilterState } from "../filterStore";
 import { interfaceStore } from "../interfaceStore";
@@ -166,7 +167,7 @@ describe("a family learned after the first open", () => {
     const store = await restoredWith(
       makeInvoke({
         cmd_resolve_repo: async (cmd, args) => {
-          if (!trusted) throw new Error("REPOSITORY_TRUST_REQUIRED: not trusted");
+          if (!trusted) throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED: not trusted");
           return base(cmd, args);
         },
         cmd_repository_trust: async (_cmd, args) => {
@@ -596,7 +597,7 @@ describe("familyOf: a checkout's repository without opening it", () => {
   });
 
   it("is null, never a guess, when the checkout cannot be resolved or reports no common directory", async () => {
-    const failing = makeStore(makeInvoke({ cmd_resolve_repo: async () => { throw new Error("REPOSITORY_TRUST_REQUIRED"); } }));
+    const failing = makeStore(makeInvoke({ cmd_resolve_repo: async () => { throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED"); } }));
     expect(await failing.familyOf(wt("a"))).toBeNull();
     const silent = makeStore(makeInvoke({ cmd_resolve_repo: async (_cmd, args) => ({ path: String(args?.repoPath), name: "x", is_bare: false }) as never }));
     expect(await silent.familyOf(wt("a"))).toBeNull();

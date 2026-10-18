@@ -173,7 +173,8 @@ pub async fn cmd_write_file_content(
             Ok(Guarded { policy, output })
         })())
     })
-    .await.map_err(|e| e.message)?
+    .await
+    .map_err(|e| e.message)?
 }
 
 /// Creates an empty file that must not exist yet, for Explorer's New File and
@@ -192,7 +193,8 @@ pub async fn cmd_create_file(
             Ok(Guarded { policy, output: () })
         })())
     })
-    .await.map_err(|e| e.message)?
+    .await
+    .map_err(|e| e.message)?
 }
 
 #[tauri::command(async)]
@@ -285,7 +287,10 @@ pub async fn cmd_search_content(
 /// What resetting HEAD's branch to `target` would take off it. Read-only and
 /// ungated; the reset itself goes through the guarded [`cmd_reset`].
 #[tauri::command(async)]
-pub async fn cmd_reset_preview(repo_path: String, target: String) -> Result<ResetPreview, IpcError> {
+pub async fn cmd_reset_preview(
+    repo_path: String,
+    target: String,
+) -> Result<ResetPreview, IpcError> {
     off_thread(move || GitReader::reset_preview(&repo_path, &target)).await
 }
 

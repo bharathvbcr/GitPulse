@@ -86,7 +86,10 @@ pub async fn cmd_preview_worktree_hooks(
 /// Records consent to run the hooks file whose text is `content` — the text
 /// the person was shown. Refused if the file on disk is no longer exactly that.
 #[tauri::command(async)]
-pub async fn cmd_approve_worktree_hooks(repo_path: String, content: String) -> Result<(), IpcError> {
+pub async fn cmd_approve_worktree_hooks(
+    repo_path: String,
+    content: String,
+) -> Result<(), IpcError> {
     off_thread(move || {
         let repo = crate::engine::git_cli::validate_repo(&repo_path)?;
         crate::engine::approve_worktree_hooks(&repo, &content)
@@ -212,7 +215,8 @@ pub async fn cmd_worktree_merge_teardown(
             &|repo, argv| guard(repo, argv),
         ))
     })
-    .await.map_err(|e| e.message)?
+    .await
+    .map_err(|e| e.message)?
 }
 
 /// Body of [`cmd_worktree_merge_teardown`].

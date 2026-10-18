@@ -5,6 +5,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get, writable } from "svelte/store";
+import { IpcError } from "../../ipc/invoke";
 import { createRepoStore, type InvokeFn } from "../repoStore";
 import { memoryStorage, savePersistedWorkspace, WORKSPACE_VERSION, type StorageLike } from "../../repos/persist";
 import { MAX_OPEN_TABS } from "../../repos/tabModel";
@@ -15,7 +16,7 @@ function makeStore(trusted: Set<string>, storage: StorageLike = memoryStorage())
     const path = String(args?.repoPath ?? "");
     switch (cmd) {
       case "cmd_resolve_repo":
-        if (!trusted.has(path)) throw new Error(`REPOSITORY_TRUST_REQUIRED: ${path}`);
+        if (!trusted.has(path)) throw new IpcError("repository_trust_required", `REPOSITORY_TRUST_REQUIRED: ${path}`);
         return { path, name: path.split("/").pop(), is_bare: false, common_dir: `${path.replace(/\/\.claude\/worktrees\/.*$/, "")}/.git` } as never;
       case "cmd_repository_trust":
         return { path, scope: "none", worktrees: 1, identity: "id" } as never;

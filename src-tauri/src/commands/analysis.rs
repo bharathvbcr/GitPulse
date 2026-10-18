@@ -79,7 +79,9 @@ pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport,
 /// Kingfisher stdout is parsed in memory and dropped — never logged. A missed
 /// or truncated scan returns `ok: false` and is never implied clean.
 #[tauri::command(async)]
-pub async fn cmd_scan_secrets(repo_path: String) -> Result<crate::secrets::SecretsReport, IpcError> {
+pub async fn cmd_scan_secrets(
+    repo_path: String,
+) -> Result<crate::secrets::SecretsReport, IpcError> {
     off_thread(move || crate::secrets::scan_secrets(&repo_path)).await
 }
 
@@ -87,7 +89,9 @@ pub async fn cmd_scan_secrets(repo_path: String) -> Result<crate::secrets::Secre
 /// artifacts, large files, worktrees, stale-branch weight). The walk is
 /// budgeted and never follows symlinks; see `crate::storage`.
 #[tauri::command(async)]
-pub async fn cmd_storage_scan(repo_path: String) -> Result<crate::storage::StorageReport, IpcError> {
+pub async fn cmd_storage_scan(
+    repo_path: String,
+) -> Result<crate::storage::StorageReport, IpcError> {
     off_thread(move || crate::storage::scan_storage(&repo_path)).await
 }
 

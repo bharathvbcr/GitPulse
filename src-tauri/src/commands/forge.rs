@@ -9,7 +9,8 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
     // same degraded context a missing CLI would.
     off_thread(move || Ok::<_, String>(load_github_context(&repo_path)))
         .await
-        .map_err(|e| e.message).unwrap_or_else(|e| GitHubContext {
+        .map_err(|e| e.message)
+        .unwrap_or_else(|e| GitHubContext {
             available: false,
             cli_present: false,
             host: String::new(),
@@ -42,7 +43,8 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
 pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsReport {
     off_thread(move || Ok::<_, String>(load_workflow_runs_report(&repo_path)))
         .await
-        .map_err(|e| e.message).unwrap_or_else(|e| crate::github::GitHubRunsReport {
+        .map_err(|e| e.message)
+        .unwrap_or_else(|e| crate::github::GitHubRunsReport {
             available: false,
             checked: false,
             cli_present: false,
@@ -61,7 +63,8 @@ pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsRepo
 pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport {
     off_thread(move || Ok::<_, String>(load_dependabot_alerts(&repo_path)))
         .await
-        .map_err(|e| e.message).unwrap_or_else(DependabotReport::transport_failure)
+        .map_err(|e| e.message)
+        .unwrap_or_else(DependabotReport::transport_failure)
 }
 
 /// Open GitHub code scanning alerts for the Health view, via `gh api`. Like
@@ -71,7 +74,8 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
 pub async fn cmd_github_code_scanning_alerts(repo_path: String) -> CodeScanningReport {
     off_thread(move || Ok::<_, String>(load_code_scanning_alerts(&repo_path)))
         .await
-        .map_err(|e| e.message).unwrap_or_else(CodeScanningReport::transport_failure)
+        .map_err(|e| e.message)
+        .unwrap_or_else(CodeScanningReport::transport_failure)
 }
 
 #[tauri::command(async)]
@@ -161,7 +165,8 @@ pub async fn cmd_github_pr_action(
 pub async fn cmd_github_workflows(repo_path: String) -> crate::github::actions::WorkflowsReport {
     off_thread(move || Ok::<_, String>(crate::github::actions::load_workflows_report(&repo_path)))
         .await
-        .map_err(|e| e.message).unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
+        .map_err(|e| e.message)
+        .unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
 }
 
 /// Dispatches a workflow (`gh workflow run <selector> --ref <ref>`), after
@@ -237,7 +242,8 @@ pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::Firebase
         // A thread-pool failure is not "no Firebase config": it is a status that
         // could not be read, and it says so rather than rendering as a repository
         // that does not use Firebase.
-        .map_err(|e| e.message).unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
+        .map_err(|e| e.message)
+        .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
 }
 
 /// Lists App Hosting backends for one project.

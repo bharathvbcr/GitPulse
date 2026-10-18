@@ -22,9 +22,9 @@ pub mod hooks;
 pub mod host_platform;
 pub mod ingest;
 pub mod insights;
+pub mod ipc_error;
 pub mod lappi;
 pub mod ledger;
-pub mod ipc_error;
 pub mod limits;
 #[cfg(unix)]
 pub mod local_socket;

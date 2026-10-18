@@ -238,7 +238,7 @@ describe("source checkout trust", () => {
     tool: "manvi", ok: false, binary: null, lookup: null, version: null,
     source_used: "/source", command: "go -C /source install ./cmd/manvi", exit_code: null,
     stdout: "", stderr: "", timed_out: false, cancelled: false,
-    reason: "REPOSITORY_TRUST_REQUIRED: /source", rung: "local_checkout",
+    reason: "REPOSITORY_TRUST_REQUIRED: /source", reason_kind: "repository_trust_required", rung: "local_checkout",
   };
   const preview = { path: "/source", git_dir: "/source/.git", common_dir: "/source/.git", identity: "native-identity", scope: "none", worktrees: 1 };
   it("approves the exact native source identity before one bounded retry", async () => {
@@ -257,6 +257,15 @@ describe("source checkout trust", () => {
     const result = await installExternalTool("manvi", "local_checkout");
     expect(result.cancelled).toBe(true);
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+  it("does not ask for approval from the wording of a reason alone", async () => {
+    const { reason_kind: _kind, ...worded } = denied;
+    vi.mocked(invoke).mockResolvedValueOnce(worded);
+    const result = await installExternalTool("manvi", "local_checkout");
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("REPOSITORY_TRUST_REQUIRED: /source");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(askConfirm).not.toHaveBeenCalled();
   });
 });
 

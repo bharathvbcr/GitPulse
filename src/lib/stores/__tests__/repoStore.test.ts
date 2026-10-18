@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { get, writable } from "svelte/store";
-import { createRepoStore, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, pathsTrustedForBackground, type BranchInfo, type InvokeFn } from "../repoStore";
+import { IpcError } from "../../ipc/invoke";
+import { createRepoStore, repositoryTrustRefused, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, pathsTrustedForBackground, type BranchInfo, type InvokeFn } from "../repoStore";
 import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
 import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
 import { BACKGROUND_REFRESH_MIN_MS, WATCHER_REFRESH_DEBOUNCE_MS } from "../../repos/watcherRefresh";
@@ -207,7 +208,7 @@ describe("explicit repository trust", () => {
     const calls: string[] = [];
     const invokeFn: InvokeFn = async command => {
       calls.push(command);
-      if (command === "cmd_resolve_repo") throw new Error("REPOSITORY_TRUST_REQUIRED: explicit approval required");
+      if (command === "cmd_resolve_repo") throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED: explicit approval required");
       if (command === "cmd_repository_trust") return preview as never;
       throw new Error(`Unexpected pre-trust work: ${command}`);
     };
@@ -230,7 +231,7 @@ describe("explicit repository trust", () => {
     const invokeFn = makeInvoke({
       cmd_resolve_repo: async () => {
         order.push("resolve");
-        if (!approved) throw new Error("REPOSITORY_TRUST_REQUIRED");
+        if (!approved) throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED");
         return { path: preview.path, name: "repo", is_bare: false } as never;
       },
       cmd_repository_trust: async () => preview as never,
@@ -257,7 +258,7 @@ describe("explicit repository trust", () => {
 
   it("keeps a changed or failed grant closed even during restore", async () => {
     const { store } = makeStore(makeInvoke({
-      cmd_resolve_repo: async () => { throw new Error("REPOSITORY_TRUST_REQUIRED"); },
+      cmd_resolve_repo: async () => { throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED"); },
       cmd_repository_trust: async () => preview as never,
       cmd_grant_repository_trust: async () => { throw new Error("Repository changed while trust was being requested"); },
     }));
@@ -345,7 +346,7 @@ describe("restored untrusted tabs", () => {
         command !== "cmd_repository_trust" &&
         command !== "cmd_grant_repository_trust"
       ) {
-        throw new Error(`REPOSITORY_TRUST_REQUIRED: Open ${REFUSED} in GitPulse and trust it`);
+        throw new IpcError("repository_trust_required", `REPOSITORY_TRUST_REQUIRED: Open ${REFUSED} in GitPulse and trust it`);
       }
       return base(command, args);
     };
@@ -484,7 +485,7 @@ describe("a snapshot deferred under load", () => {
         snapshots += 1;
         if (deferrals > 0) {
           deferrals -= 1;
-          throw new Error(DEFERRAL);
+          throw new IpcError("deferred_under_load", DEFERRAL);
         }
         return snapshotFor(String(args?.repoPath)).statuses as never;
       },
@@ -515,7 +516,7 @@ describe("a snapshot deferred under load", () => {
     vi.useFakeTimers();
     const invoke = makeInvoke({
       cmd_get_status: async () => {
-        throw new Error(DEFERRAL);
+        throw new IpcError("deferred_under_load", DEFERRAL);
       },
     });
     const { store } = makeStore(withDeferralRetry(invoke as never) as InvokeFn);
@@ -531,7 +532,7 @@ describe("a snapshot deferred under load", () => {
     let defer = false;
     const invoke = makeInvoke({
       cmd_get_status: async (_cmd, args) => {
-        if (defer) throw new Error(DEFERRAL);
+        if (defer) throw new IpcError("deferred_under_load", DEFERRAL);
         return snapshotFor(String(args?.repoPath)).statuses as never;
       },
     });
@@ -2359,7 +2360,7 @@ describe("repoStore watcher coalescing", () => {
   it("hydrates anyway when the activation note fails", async () => {
     const base = makeInvoke({
       cmd_note_tab_activated: async () => {
-        throw new Error("REPOSITORY_TRUST_REQUIRED: explicit approval required");
+        throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED: explicit approval required");
       },
     });
     const { invoke, log } = recording(base);
@@ -4514,7 +4515,7 @@ describe("repoStore tab grouping", () => {
     const invoke: InvokeFn = async (command) => {
       calls.push(command);
       if (command === "cmd_resolve_repo") {
-        throw new Error("REPOSITORY_TRUST_REQUIRED: explicit approval required");
+        throw new IpcError("repository_trust_required", "REPOSITORY_TRUST_REQUIRED: explicit approval required");
       }
       throw new Error(`unexpected ${command}`);
     };
@@ -5354,5 +5355,22 @@ describe("file, worktree and branch-cleanup mutations (ft-d61584de)", () => {
       expect(outcome).toMatchObject({ ok: false, refused: true });
     }
     expect(sent).toEqual([]);
+  });
+});
+
+describe("repositoryTrustRefused reads the kind, never the wording", () => {
+  const text = "REPOSITORY_TRUST_REQUIRED: Open /r in GitPulse and trust it";
+
+  it("is true for the kind, however the message is worded or wrapped", () => {
+    expect(repositoryTrustRefused(new IpcError("repository_trust_required", text))).toBe(true);
+    expect(repositoryTrustRefused(new IpcError("repository_trust_required", `Could not open: ${text}`))).toBe(true);
+    expect(repositoryTrustRefused(new IpcError("repository_trust_required", "reworded"))).toBe(true);
+  });
+
+  it("is false for the same words without the kind", () => {
+    expect(repositoryTrustRefused(text)).toBe(false);
+    expect(repositoryTrustRefused(new Error(text))).toBe(false);
+    expect(repositoryTrustRefused(new IpcError("unclassified", text))).toBe(false);
+    expect(repositoryTrustRefused(undefined)).toBe(false);
   });
 });

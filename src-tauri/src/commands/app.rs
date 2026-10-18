@@ -19,7 +19,8 @@ use super::*;
 pub async fn cmd_check_app_update() -> crate::updates::UpdateCheck {
     off_thread(|| Ok(crate::updates::check_for_update()))
         .await
-        .map_err(|e| e.message).unwrap_or_else(crate::updates::UpdateCheck::failed)
+        .map_err(|e| e.message)
+        .unwrap_or_else(crate::updates::UpdateCheck::failed)
 }
 
 /// MCP 2.0 / Agent Plugins 1.0 installer facts: binary path, plugin manifests, tool catalog.
@@ -525,7 +526,8 @@ pub async fn cmd_provenance_freshness_batch(
 }
 
 #[tauri::command]
-pub async fn cmd_cleaner_state() -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
+pub async fn cmd_cleaner_state() -> Result<crate::storage::hygiene::global::CleanerState, IpcError>
+{
     off_thread(|| crate::storage::hygiene::global::service()?.state()).await
 }
 
@@ -537,8 +539,8 @@ pub async fn cmd_cleaner_save(
 }
 
 #[tauri::command]
-pub async fn cmd_cleaner_scan() -> Result<crate::storage::hygiene::global::CleanerInventory, IpcError>
-{
+pub async fn cmd_cleaner_scan(
+) -> Result<crate::storage::hygiene::global::CleanerInventory, IpcError> {
     off_thread(|| crate::storage::hygiene::global::service()?.inventory()).await
 }
 
@@ -557,6 +559,7 @@ pub async fn cmd_cleaner_run(
 }
 
 #[tauri::command]
-pub async fn cmd_cleaner_cancel() -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
+pub async fn cmd_cleaner_cancel() -> Result<crate::storage::hygiene::global::CleanerState, IpcError>
+{
     off_thread(|| crate::storage::hygiene::global::service()?.cancel()).await
 }

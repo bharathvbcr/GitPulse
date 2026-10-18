@@ -1061,6 +1061,17 @@ pub fn install(tool: ExternalTool) -> InstallOutcome {
     install_with_rung(tool, None)
 }
 
+/// Types `outcome.reason` once, for the desktop to read instead of its wording.
+/// Only a kind the UI acts on is set; an ordinary failure leaves it absent.
+fn with_reason_kind(mut outcome: InstallOutcome) -> InstallOutcome {
+    outcome.reason_kind = outcome
+        .reason
+        .clone()
+        .map(|reason| IpcError::from_command_text(reason).kind)
+        .filter(|kind| *kind != IpcErrorKind::Unclassified);
+    outcome
+}
+
 pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallOutcome {
     clear_cancel();
     tool_capability::invalidate(tool);
@@ -1092,12 +1103,7 @@ pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> 
         *guard = Some(tool);
     }
 
-    let mut outcome = install_inner(tool, preferred);
-    outcome.reason_kind = outcome
-        .reason
-        .clone()
-        .map(|reason| IpcError::from_command_text(reason).kind)
-        .filter(|kind| *kind != IpcErrorKind::Unclassified);
+    let outcome = with_reason_kind(install_inner(tool, preferred));
 
     *install_guard()
         .lock()
@@ -2407,6 +2413,12 @@ mod tests {
             assert!(
                 !started_before_approval,
                 "unapproved source installer started"
+            );
+            // The desktop retries after approval on this kind, not on the
+            // wording of `reason`.
+            assert_eq!(
+                with_reason_kind(denied.clone()).reason_kind,
+                Some(IpcErrorKind::RepositoryTrustRequired)
             );
             assert!(denied
                 .reason

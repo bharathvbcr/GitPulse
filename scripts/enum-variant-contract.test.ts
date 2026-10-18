@@ -1,12 +1,13 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "svelte/compiler";
 import {
-  createSourceFile, isIdentifier, isLiteralTypeNode, isParenthesizedTypeNode,
-  isPropertySignature, isStringLiteral, isTypeAliasDeclaration, isTypeLiteralNode,
-  isTypeReferenceNode, isUnionTypeNode, ScriptTarget, type TypeNode,
+  createSourceFile, isArrayLiteralExpression, isAsExpression, isIdentifier, isIndexedAccessTypeNode,
+  isLiteralTypeNode, isParenthesizedTypeNode, isPropertySignature, isStringLiteral,
+  isTypeAliasDeclaration, isTypeLiteralNode, isTypeQueryNode, isTypeReferenceNode,
+  isUnionTypeNode, isVariableStatement, ScriptTarget, SyntaxKind, type Expression, type TypeNode,
 } from "typescript";
 import { describe, expect, it } from "vitest";
 
@@ -123,9 +124,9 @@ interface RustEnum {
   tag?: string;
 }
 
-function rustEnums(): Map<string, RustEnum> {
+function rustEnums(root = RUST_ROOT): Map<string, RustEnum> {
   const found = new Map<string, RustEnum>();
-  for (const file of walk(RUST_ROOT, [".rs"])) {
+  for (const file of walk(root, [".rs"])) {
     const source = readFileSync(file, "utf8");
     for (const match of source.matchAll(/((?:#\[[^\]]*\]\s*)*)pub enum (\w+)\s*\{/g)) {
       if (!match[1].includes("Serialize")) continue;
@@ -154,6 +155,23 @@ function typeAliasLiterals(source: string, name: string, tag?: string): Set<stri
     .map((declaration) => [declaration.name.text, declaration.type]));
   const root = aliases.get(name);
   if (!root) return null;
+  // `const NAME = ["a", "b"] as const`: the const tuple a union is derived from
+  // as `(typeof NAME)[number]`, so the list is written once and the type cannot
+  // drift from it.
+  const tuples = new Map<string, string[]>();
+  const stringArray = (expression: Expression): string[] | null => {
+    const inner = isAsExpression(expression) ? expression.expression : expression;
+    if (!isArrayLiteralExpression(inner)) return null;
+    const strings = inner.elements.filter(isStringLiteral);
+    return strings.length === inner.elements.length ? strings.map((element) => element.text) : null;
+  };
+  for (const statement of parsed.statements.filter(isVariableStatement)) {
+    for (const declaration of statement.declarationList.declarations) {
+      if (!isIdentifier(declaration.name) || !declaration.initializer) continue;
+      const values = stringArray(declaration.initializer);
+      if (values) tuples.set(declaration.name.text, values);
+    }
+  }
   const literals = new Set<string>();
   const active = new Set([name]);
   let visited = 0;
@@ -164,6 +182,16 @@ function typeAliasLiterals(source: string, name: string, tag?: string): Set<stri
       node.types.forEach((child) => visit(child, tagField, depth + 1));
     } else if (isParenthesizedTypeNode(node)) {
       visit(node.type, tagField, depth + 1);
+    } else if (
+      isIndexedAccessTypeNode(node)
+      && node.indexType.kind === SyntaxKind.NumberKeyword
+      && isParenthesizedTypeNode(node.objectType)
+      && isTypeQueryNode(node.objectType.type)
+      && isIdentifier(node.objectType.type.exprName)
+    ) {
+      const tuple = tuples.get(node.objectType.type.exprName.text);
+      if (!tuple) throw new Error(`${name}: no const string tuple named ${node.objectType.type.exprName.text}`);
+      tuple.forEach((value) => literals.add(value));
     } else if (isLiteralTypeNode(node) && isStringLiteral(node.literal)) {
       literals.add(node.literal.text);
     } else if (isTypeReferenceNode(node) && isIdentifier(node.typeName) && !node.typeArguments?.length) {
@@ -299,6 +327,78 @@ describe("Svelte enum contract extraction", () => {
   });
 });
 
+/** Every way a Rust enum's unit variants and its TypeScript union disagree, as readable lines. */
+function unitDrift(enums: Map<string, RustEnum>, tsRoot: string): string[] {
+  const drift: string[] = [];
+  for (const [name, { unit, tag }] of enums) {
+    if (NO_TS_MIRROR.has(name)) continue;
+    const ts = tsUnion(name, tag, tsRoot);
+    if (!ts) {
+      drift.push(`${name}: no TypeScript union of this name, and no documented reason`);
+      continue;
+    }
+    const missing = unit.filter((v) => !ts.literals.has(v));
+    const extra = [...ts.literals].filter((v) => !unit.includes(v));
+    if (missing.length > 0) drift.push(`${name}: Rust sends ${missing.join(", ")}; TS does not accept them`);
+    if (extra.length > 0) drift.push(`${name}: TS accepts ${extra.join(", ")}; Rust never sends them`);
+  }
+  return drift;
+}
+
+describe("a const-tuple mirror is compared like any other union", () => {
+  const RUST = `#[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum IpcErrorKind {
+      Unclassified,
+      DeferredUnderLoad,
+      StaleStash,
+    }`;
+  const tuple = (kinds: string[]) => `export const IPC_ERROR_KINDS = [${kinds.map((k) => `"${k}"`).join(", ")}] as const;
+    export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];`;
+
+  function drift(rust: string, ts: string): string[] {
+    const root = mkdtempSync(path.join(tmpdir(), "gitpulse-enum-drift-"));
+    try {
+      const rustDir = path.join(root, "rust");
+      const tsDir = path.join(root, "ts");
+      mkdirSync(rustDir);
+      mkdirSync(tsDir);
+      writeFileSync(path.join(rustDir, "ipc_error.rs"), rust);
+      writeFileSync(path.join(tsDir, "invoke.ts"), ts);
+      return unitDrift(rustEnums(rustDir), tsDir);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it("agrees when the tuple lists exactly the variants Rust serialises, spelled in snake_case", () => {
+    expect(drift(RUST, tuple(["unclassified", "deferred_under_load", "stale_stash"]))).toEqual([]);
+  });
+
+  it("fails when Rust gains a kind the tuple lacks", () => {
+    const rust = RUST.replace("StaleStash,\n", "StaleStash,\n      HookCancelled,\n");
+    expect(drift(rust, tuple(["unclassified", "deferred_under_load", "stale_stash"])))
+      .toEqual(["IpcErrorKind: Rust sends hook_cancelled; TS does not accept them"]);
+  });
+
+  it("fails when the tuple lists a kind Rust never sends", () => {
+    expect(drift(RUST, tuple(["unclassified", "deferred_under_load", "stale_stash", "from_the_future"])))
+      .toEqual(["IpcErrorKind: TS accepts from_the_future; Rust never sends them"]);
+  });
+
+  it("fails when a variant is renamed on one side only", () => {
+    const renamed = drift(RUST.replace("DeferredUnderLoad", "Deferred"), tuple(["unclassified", "deferred_under_load", "stale_stash"]));
+    expect(renamed).toEqual([
+      "IpcErrorKind: Rust sends deferred; TS does not accept them",
+      "IpcErrorKind: TS accepts deferred_under_load; Rust never sends them",
+    ]);
+  });
+
+  it("refuses a union built from a tuple that is not there, rather than reading it as empty", () => {
+    expect(() => drift(RUST, `export type IpcErrorKind = (typeof MISSING)[number];`)).toThrow(/MISSING/);
+  });
+});
+
 // Every case in this block parses the whole Rust and TypeScript tree. Under
 // `--coverage` the parsing modules are instrumented as well, which measured
 // ~2x for this file (18.7 s -> 29.8 s), so vitest's 5 s default fails cases
@@ -317,20 +417,16 @@ describe("serde enum variants match their TypeScript unions", { timeout: 30_000 
   // asserts nothing about speed. The budget is explicit rather than
   // global: a slow test elsewhere should still be loud.
   it("spells every unit variant the same on both sides", () => {
-    const drift: string[] = [];
-    for (const [name, { unit, tag }] of enums) {
-      if (NO_TS_MIRROR.has(name)) continue;
-      const ts = tsUnion(name, tag);
-      if (!ts) {
-        drift.push(`${name}: no TypeScript union of this name, and no documented reason`);
-        continue;
-      }
-      const missing = unit.filter((v) => !ts.literals.has(v));
-      const extra = [...ts.literals].filter((v) => !unit.includes(v));
-      if (missing.length > 0) drift.push(`${name}: Rust sends ${missing.join(", ")}; TS does not accept them`);
-      if (extra.length > 0) drift.push(`${name}: TS accepts ${extra.join(", ")}; Rust never sends them`);
-    }
-    expect(drift).toEqual([]);
+    expect(unitDrift(enums, TS_ROOT)).toEqual([]);
+  });
+
+  it("pins the command error kinds: Rust's IpcErrorKind and invoke.ts's IPC_ERROR_KINDS", () => {
+    const rust = enums.get("IpcErrorKind");
+    expect(rust, "IpcErrorKind is a serialised Rust enum").toBeDefined();
+    expect(NO_TS_MIRROR.has("IpcErrorKind"), "the frontend branches on these").toBe(false);
+    const ts = tsUnion("IpcErrorKind");
+    expect(ts?.file).toBe("lib/ipc/invoke.ts");
+    expect([...(ts?.literals ?? [])].sort()).toEqual([...(rust?.unit ?? [])].sort());
   });
 
   it("does not let a data-carrying variant masquerade as a bare string", () => {

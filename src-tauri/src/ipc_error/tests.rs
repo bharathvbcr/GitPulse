@@ -149,6 +149,45 @@ fn the_runner_refusals_the_gate_writes_keep_their_kinds() {
     );
 }
 
+/// The lesson of a classifier that changes shape: engine code puts its own
+/// words in front of a runner failure, and the retry must still see it.
+#[test]
+fn a_runner_failure_the_engine_prefixed_keeps_its_kind() {
+    let deferred = wire_message("deferred_under_load");
+    let timed_out = wire_message("timed_out");
+    let slot = wire_message("slot_wait_timeout");
+    for (inner, kind) in [
+        (deferred, IpcErrorKind::DeferredUnderLoad),
+        (timed_out, IpcErrorKind::TimedOut),
+        (slot, IpcErrorKind::SlotWaitTimeout),
+    ] {
+        for wrapped in [
+            format!("Blame unavailable: {inner}"),
+            format!("Could not read history: Blame unavailable: {inner}"),
+            format!("[code] Blame unavailable: {inner}"),
+        ] {
+            let error = IpcError::from_command_text(wrapped.clone());
+            assert_eq!(error.kind, kind, "{wrapped}");
+            assert_eq!(error.message, wrapped, "the text is not rewritten");
+        }
+    }
+}
+
+#[test]
+fn a_path_that_spells_a_marker_is_not_a_runner_failure_however_deep() {
+    for hostile in [
+        "Not a Git repository: /tmp/a deferred under load after 1.0s: x",
+        "Cannot open: Not a Git repository: /tmp/a deferred under load after 1.0s: x",
+        "Failed to read: '/tmp/x y' deferred under load after 1.0s: x",
+    ] {
+        assert_eq!(
+            IpcError::from_command_text(hostile.to_string()).kind,
+            IpcErrorKind::Unclassified,
+            "{hostile}"
+        );
+    }
+}
+
 #[test]
 fn text_that_only_quotes_a_marker_is_not_the_kind() {
     // A path that spells the deferral phrase is not a deferral.
@@ -169,6 +208,24 @@ fn the_stale_stash_hint_types_both_refusals() {
     assert_eq!(
         IpcError::from_command_text(format!("Stash entry 2 changed. {STALE_STACK_HINT}")).kind,
         IpcErrorKind::StaleStash
+    );
+}
+
+/// The refusal the stash engine really writes, not a copy of its wording.
+#[test]
+fn the_stash_engines_own_stale_refusal_is_typed_stale_stash() {
+    use crate::engine::stash::run_action_with;
+    use crate::engine::StashAction;
+    let repo = crate::test_support::git_repo();
+    let path = repo.path().to_str().expect("fixture path");
+    let refusal = run_action_with(path, StashAction::Drop, 3, "abcdef12", |_: &[&str]| Ok(()))
+        .expect_err("an empty stack holds no entry 3");
+    assert!(refusal.contains("no longer exists"), "{refusal}");
+    let error = IpcError::from_command_text(refusal.clone());
+    assert_eq!(error.kind, IpcErrorKind::StaleStash);
+    assert_eq!(
+        error.message, refusal,
+        "the text a person reads is unchanged"
     );
 }
 
