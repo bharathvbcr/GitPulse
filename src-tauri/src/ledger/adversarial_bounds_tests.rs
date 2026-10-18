@@ -335,7 +335,7 @@ fn evidence_edge_inputs_keep_their_kind() {
     let at: String = serde_json::to_string(&vec!["a"; 5461]).unwrap();
     assert_eq!(bound_evidence_json(&at, at.len()).0, at);
     let cut = bound_evidence_json(&at, at.len() - 1).0;
-    assert!(cut.len() <= at.len() - 1);
+    assert!(cut.len() < at.len());
 }
 
 fn verdict_with(members: Value) -> LedgerEvent {

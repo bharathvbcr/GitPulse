@@ -39,7 +39,7 @@ pub mod redact;
 pub(crate) use anchor::forget as forget_identity_state;
 pub(crate) use anchor::settle as settle_identity;
 pub use cap::ValueCut;
-pub(crate) use cap::{bound_evidence_json, JsonCut, ROW_FIELD_CAP_BYTES};
+pub(crate) use cap::{bound_evidence_json, ROW_FIELD_CAP_BYTES};
 use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
 use std::collections::HashMap;
 use std::io::Read;

@@ -71,11 +71,6 @@ const KEPT_MEMBERS: [&str; 4] = [
     OBJECT_TRUNCATED_KEY,
 ];
 
-/// The `detail_json` member that records elements a page cut from a
-/// `verdict_json` array. The verdict contract admits no member the gate did not
-/// write, so the record rides in the row's open `detail_json` instead.
-const VERDICT_TRUNCATED_KEY: &str = "verdict_truncated";
-
 /// The record of a cut `object`: where it was cut, how long it was, and the
 /// FNV-1a 64 hash of the redacted full text.
 #[derive(Debug, Clone, PartialEq, Eq)]

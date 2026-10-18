@@ -4,6 +4,7 @@
 
 use super::budget::{self, TRUNCATION_KEY};
 use super::*;
+use crate::procguard::LockedSpawn;
 
 const BUDGET: usize = 64 * 1024;
 
@@ -12,7 +13,7 @@ fn git_repo() -> (tempfile::TempDir, String) {
     let repo = dir.path().to_string_lossy().into_owned();
     let init = std::process::Command::new("git")
         .args(["init", "-q", &repo])
-        .output()
+        .output_locked()
         .expect("git init");
     assert!(init.status.success(), "git init failed");
     crate::test_support::trust_repo(dir.path());
@@ -91,7 +92,7 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
     let repo = repo_dir.path().to_string_lossy().into_owned();
     let init = std::process::Command::new("git")
         .args(["init", "-q", &repo])
-        .output()
+        .output_locked()
         .expect("git init");
     assert!(init.status.success());
     crate::test_support::trust_repo(repo_dir.path());
