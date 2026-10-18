@@ -13,6 +13,7 @@
 //!   heavy row cannot make a page the transport cannot carry. Markers go
 //!   *inside* the JSON values for the same reason as above.
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::LedgerEvent;
@@ -20,7 +21,23 @@ use super::LedgerEvent;
 /// Longest `object` the ledger stores, in bytes.
 pub(super) const OBJECT_CAP_BYTES: usize = 2048;
 
-/// What a cut `object` ends with, inside the cap.
+/// Longest a path field (`repo_path`, `worktree_path`) may be, in bytes: the
+/// longest `PATH_MAX` of the platforms GitPulse runs on (Linux, 4096).
+const PATH_FIELD_CAP_BYTES: usize = 4096;
+
+/// Longest an identifier or label field (`ulid`, `ts_utc`, `actor_kind`,
+/// `actor_id`, `session_id`, `task_id`, `action`, `outcome`) may be, in bytes.
+/// A ULID is 26 bytes and a timestamp 24; the rest are short names.
+const ID_FIELD_CAP_BYTES: usize = 256;
+
+/// Longest a git ref field (`before_ref`, `after_ref`) may be, in bytes: a
+/// ref name or object id, with room for a long branch name.
+const REF_FIELD_CAP_BYTES: usize = 1024;
+
+/// What a cut text field ends with, inside its cap. One convention for every
+/// cut a stored or paged field makes without a count of its own (`object` at
+/// append, and each bounded id, path and ref); the genuine-record check below
+/// locates the `object` cut by this suffix's fixed length.
 const OBJECT_CUT_SUFFIX: &str = "… [truncated]";
 
 /// The `detail_json` key that records an `object` cut.
@@ -86,16 +103,35 @@ pub(super) fn cap_object(redacted: String) -> (String, Option<ObjectCap>) {
     if redacted.len() <= OBJECT_CAP_BYTES {
         return (redacted, None);
     }
-    let at = redacted.floor_char_boundary(OBJECT_CAP_BYTES - OBJECT_CUT_SUFFIX.len());
+    let (kept, at) = cut_with_suffix(&redacted, OBJECT_CAP_BYTES);
     let cap = ObjectCap {
         at,
         bytes: redacted.len(),
         hash: format!("fnv1a64:{:016x}", devmap_extract::content_hash(&redacted)),
     };
-    let mut kept = String::with_capacity(OBJECT_CAP_BYTES);
-    kept.push_str(&redacted[..at]);
-    kept.push_str(OBJECT_CUT_SUFFIX);
     (kept, Some(cap))
+}
+
+/// `text` cut to at most `cap` bytes at a character boundary, ending with
+/// [`OBJECT_CUT_SUFFIX`], and where the kept text ends. Text within `cap` is
+/// returned whole, with `at` its length.
+fn cut_with_suffix(text: &str, cap: usize) -> (String, usize) {
+    if text.len() <= cap {
+        return (text.to_string(), text.len());
+    }
+    let at = text.floor_char_boundary(cap.saturating_sub(OBJECT_CUT_SUFFIX.len()));
+    let mut kept = String::with_capacity(cap);
+    kept.push_str(&text[..at]);
+    kept.push_str(OBJECT_CUT_SUFFIX);
+    (kept, at)
+}
+
+fn bound_field(text: String, cap: usize) -> String {
+    if text.len() <= cap {
+        text
+    } else {
+        cut_with_suffix(&text, cap).0
+    }
 }
 
 /// Whether a stored (already redacted) `object` and its `detail_json` are a cut
@@ -214,6 +250,242 @@ pub(crate) fn bound_json_text(text: &str, cap: usize) -> String {
     Value::Object(kept).to_string()
 }
 
+/// A cut recorded beside the field it cut, for a row's JSON text field
+/// (`data_json_truncated` on evidence and gap rows): how many top-level
+/// elements (array) or members (object) were kept of how many, and the text's
+/// length before the cut. The text itself carries no marker, so it stays what
+/// its readers parse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct JsonCut {
+    pub kept: usize,
+    pub total: usize,
+    pub bytes: usize,
+}
+
+/// What a page cut from a `verdict_json`, recorded as the row's top-level
+/// `verdict_truncated`. The verdict contract admits no member the gate did not
+/// write, so the record is a sibling of the verdict, never inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValueCut {
+    /// Array elements removed, across every array.
+    pub elements_dropped: usize,
+    /// Object members removed, across every object.
+    pub members_dropped: usize,
+    /// Long strings shortened (each also ends with how much it lost).
+    pub strings_cut: usize,
+    /// The verdict's length before any cut, in bytes.
+    pub bytes: usize,
+}
+
+/// What [`shrink_to`] removed.
+#[derive(Default)]
+struct Shrunk {
+    elements: usize,
+    members: usize,
+    strings: usize,
+}
+
+/// When [`shrink_to`] shortens long strings.
+#[derive(PartialEq)]
+enum Strings {
+    /// Before anything is removed: a verdict keeps every element and member it
+    /// can, so its long strings go first.
+    First,
+    /// Only when nothing else can give: evidence keeps what it has whole.
+    LastResort,
+}
+
+fn escape_pointer(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Where [`shrink_to`] would cut, by what is left to give.
+#[derive(Default)]
+struct Plan {
+    /// The largest array with more than one element and no array inside it.
+    leaf: Option<(usize, String)>,
+    /// The largest array with more than one element that holds an array.
+    wrapper: Option<(usize, String)>,
+    /// The longest string worth shortening.
+    string: Option<(usize, String)>,
+    /// The object with the most members.
+    object: Option<(usize, String)>,
+}
+
+fn note(slot: &mut Option<(usize, String)>, size: usize, pointer: &str) {
+    if slot.as_ref().is_none_or(|(best, _)| size > *best) {
+        *slot = Some((size, pointer.to_string()));
+    }
+}
+
+/// Fills `plan` from `value`; whether `value` is or holds an array.
+fn survey(value: &Value, pointer: &str, plan: &mut Plan) -> bool {
+    match value {
+        Value::Array(items) => {
+            let mut nested = false;
+            for (n, item) in items.iter().enumerate() {
+                nested |= survey(item, &format!("{pointer}/{n}"), plan);
+            }
+            if items.len() > 1 {
+                let size = value.to_string().len();
+                note(
+                    if nested {
+                        &mut plan.wrapper
+                    } else {
+                        &mut plan.leaf
+                    },
+                    size,
+                    pointer,
+                );
+            }
+            true
+        }
+        Value::Object(members) => {
+            let mut nested = false;
+            for (key, item) in members {
+                nested |= survey(item, &format!("{pointer}/{}", escape_pointer(key)), plan);
+            }
+            if !members.is_empty() {
+                note(&mut plan.object, members.len(), pointer);
+            }
+            nested
+        }
+        Value::String(text) if text.len() > MEMBER_CAP_BYTES / 2 => {
+            note(&mut plan.string, text.len(), pointer);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn cut_strings(value: &mut Value, shrunk: &mut Shrunk) {
+    match value {
+        Value::String(text) if text.len() > MEMBER_CAP_BYTES * 2 => {
+            *text = cut_text(text, MEMBER_CAP_BYTES * 2);
+            shrunk.strings += 1;
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| cut_strings(item, shrunk)),
+        Value::Object(members) => members
+            .values_mut()
+            .for_each(|item| cut_strings(item, shrunk)),
+        _ => {}
+    }
+}
+
+/// `value` cut in place to at most `cap` serialized bytes, if it can be, without
+/// changing the kind of any value and without adding anything.
+///
+/// Each pass takes at most half of one container, so several large ones share
+/// the cut and a pass count stays logarithmic. In order of what is least lossy:
+/// the tail of the largest array that holds no array (nested arrays are cut in
+/// place, never dropped as a group), the tail of the largest array that does, a
+/// long string, then the trailing members of the object with the most. An array
+/// keeps at least its first element, so a cut never reads as "nothing".
+fn shrink_to(value: &mut Value, cap: usize, strings: Strings) -> Shrunk {
+    let mut shrunk = Shrunk::default();
+    if strings == Strings::First {
+        cut_strings(value, &mut shrunk);
+    }
+    loop {
+        let total = value.to_string().len();
+        if total <= cap {
+            break;
+        }
+        let mut excess = total - cap;
+        let mut plan = Plan::default();
+        survey(value, "", &mut plan);
+        if let Some((_, pointer)) = plan.leaf.or(plan.wrapper) {
+            let Some(Value::Array(items)) = value.pointer_mut(&pointer) else {
+                break;
+            };
+            let mut budget = (items.len() / 2).max(1).min(items.len() - 1);
+            while excess > 0 && budget > 0 {
+                budget -= 1;
+                let Some(item) = items.pop() else { break };
+                excess = excess.saturating_sub(item.to_string().len() + 1);
+                shrunk.elements += 1;
+            }
+        } else if let Some((_, pointer)) = plan.string {
+            let Some(Value::String(text)) = value.pointer_mut(&pointer) else {
+                break;
+            };
+            *text = cut_text(
+                text,
+                text.len().saturating_sub(excess).max(MEMBER_CAP_BYTES / 2),
+            );
+            shrunk.strings += 1;
+        } else if let Some((_, pointer)) = plan.object {
+            let Some(Value::Object(members)) = value.pointer_mut(&pointer) else {
+                break;
+            };
+            let mut budget = members.len().div_ceil(2);
+            while excess > 0 && budget > 0 {
+                budget -= 1;
+                let Some(key) = members.keys().next_back().cloned() else {
+                    break;
+                };
+                if let Some(item) = members.remove(&key) {
+                    excess = excess.saturating_sub(key.len() + item.to_string().len() + 4);
+                    shrunk.members += 1;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    shrunk
+}
+
+/// Evidence JSON text (`gaps[].evidence_json`, `evidence[].data_json`) cut to
+/// at most `cap` bytes without changing what kind of JSON value it is, and the
+/// record of the cut for the row's `data_json_truncated`.
+///
+/// An array keeps its leading elements and loses the rest, and nothing is added
+/// to it: no marker element, so every element still meets whatever schema its
+/// readers hold. If the first element alone is over `cap` it is shortened in
+/// place (its long strings cut, its inner arrays and members trimmed) rather
+/// than dropped. A JSON string stays a string. An object loses members past the
+/// room, named in its `gitpulse_truncated` member (see [`bound_json_text`]).
+pub(crate) fn bound_evidence_json(text: &str, cap: usize) -> (String, Option<JsonCut>) {
+    if text.len() <= cap {
+        return (text.to_string(), None);
+    }
+    let bytes = text.len();
+    let count = |value: &Value| match value {
+        Value::Array(items) => items.len(),
+        Value::Object(members) => members.len(),
+        _ => 1,
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut value @ (Value::Array(_) | Value::String(_))) => {
+            let total = count(&value);
+            shrink_to(&mut value, cap, Strings::LastResort);
+            let kept = count(&value);
+            (value.to_string(), Some(JsonCut { kept, total, bytes }))
+        }
+        Ok(value) => {
+            let total = count(&value);
+            let cut = bound_json_text(text, cap);
+            let kept = match serde_json::from_str::<Value>(&cut) {
+                Ok(Value::Object(members)) => members
+                    .keys()
+                    .filter(|key| key.as_str() != "gitpulse_truncated")
+                    .count(),
+                _ => 0,
+            };
+            (cut, Some(JsonCut { kept, total, bytes }))
+        }
+        Err(_) => (
+            bound_json_text(text, cap),
+            Some(JsonCut {
+                kept: 0,
+                total: 1,
+                bytes,
+            }),
+        ),
+    }
+}
+
 /// `argv_json` cut to about `cap` bytes, still a JSON array.
 fn bound_argv_json(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -249,32 +521,35 @@ fn bound_argv_json(text: &str, cap: usize) -> String {
     Value::Array(kept).to_string()
 }
 
-/// `verdict_json` with only its long string values cut.
+/// `verdict_json` cut to at most `cap` bytes, and the record of the cut for the
+/// row's `verdict_truncated`.
 ///
-/// The verdict contract admits no member the gate did not write, so nothing is
-/// added, removed or retyped: a long string stays a string, shorter, ending
-/// with how much was removed.
-fn bound_verdict_json(text: &str, cap: usize) -> String {
+/// Long strings are shortened first (each ends with how much it lost), then
+/// array tails are dropped, then trailing object members, by [`shrink_to`]. No
+/// member is added and no value changes kind: an array stays an array, an
+/// object an object.
+fn bound_verdict_json(text: &str, cap: usize) -> (String, Option<ValueCut>) {
     if text.len() <= cap {
-        return text.to_string();
+        return (text.to_string(), None);
     }
-    fn cut_strings(value: &mut Value) {
-        match value {
-            Value::String(text) if text.len() > MEMBER_CAP_BYTES * 2 => {
-                *text = cut_text(text, MEMBER_CAP_BYTES * 2);
-            }
-            Value::Array(items) => items.iter_mut().for_each(cut_strings),
-            Value::Object(members) => members.values_mut().for_each(cut_strings),
-            _ => {}
-        }
-    }
-    match serde_json::from_str::<Value>(text) {
-        Ok(mut value) => {
-            cut_strings(&mut value);
-            value.to_string()
-        }
-        Err(_) => cut_text(text, cap),
-    }
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        let cut = ValueCut {
+            elements_dropped: 0,
+            members_dropped: 0,
+            strings_cut: 1,
+            bytes: text.len(),
+        };
+        return (cut_text(text, cap), Some(cut));
+    };
+    let shrunk = shrink_to(&mut value, cap, Strings::First);
+    let cut = ValueCut {
+        elements_dropped: shrunk.elements,
+        members_dropped: shrunk.members,
+        strings_cut: shrunk.strings,
+        bytes: text.len(),
+    };
+    let changed = shrunk.elements + shrunk.members + shrunk.strings > 0;
+    (value.to_string(), changed.then_some(cut))
 }
 
 impl LedgerEvent {
@@ -283,21 +558,50 @@ impl LedgerEvent {
     /// A cut field stays the kind of thing its consumers parse: `detail_json`
     /// an object, `argv_json` an array, `verdict_json` the verdict with shorter
     /// strings. The row keeps its shape and its fields; only their length
-    /// changes, and each cut says so inside the value.
-    pub fn bounded(mut self) -> Self {
+    /// changes. `detail_json`, `argv_json` and `object` say so inside the value;
+    /// a `verdict_json` cut is reported by [`LedgerEvent::bounded_recorded`].
+    pub fn bounded(self) -> Self {
+        self.bounded_recorded().0
+    }
+
+    /// [`LedgerEvent::bounded`], and the record of what it cut from
+    /// `verdict_json`, for the page to carry as the row's `verdict_truncated`.
+    /// The verdict itself has no room for a marker and `detail_json` is left as
+    /// stored, so the record is the only sign.
+    pub fn bounded_recorded(mut self) -> (Self, Option<ValueCut>) {
+        self.ulid = bound_field(self.ulid, ID_FIELD_CAP_BYTES);
+        self.ts_utc = bound_field(self.ts_utc, ID_FIELD_CAP_BYTES);
+        self.repo_path = bound_field(self.repo_path, PATH_FIELD_CAP_BYTES);
+        self.worktree_path = self
+            .worktree_path
+            .map(|text| bound_field(text, PATH_FIELD_CAP_BYTES));
+        self.actor_kind = bound_field(self.actor_kind, ID_FIELD_CAP_BYTES);
+        for id in [&mut self.actor_id, &mut self.session_id, &mut self.task_id] {
+            *id = id.take().map(|text| bound_field(text, ID_FIELD_CAP_BYTES));
+        }
+        self.action = bound_field(self.action, ID_FIELD_CAP_BYTES);
+        self.outcome = bound_field(self.outcome, ID_FIELD_CAP_BYTES);
+        for reference in [&mut self.before_ref, &mut self.after_ref] {
+            *reference = reference
+                .take()
+                .map(|text| bound_field(text, REF_FIELD_CAP_BYTES));
+        }
         self.object = self
             .object
             .map(|object| cut_text(&object, ROW_OBJECT_CAP_BYTES));
-        self.detail_json = self
-            .detail_json
-            .map(|text| bound_json_text(&text, ROW_FIELD_CAP_BYTES));
         self.argv_json = self
             .argv_json
             .map(|text| bound_argv_json(&text, ROW_FIELD_CAP_BYTES));
-        self.verdict_json = self
-            .verdict_json
-            .map(|text| bound_verdict_json(&text, ROW_FIELD_CAP_BYTES));
-        self
+        let mut verdict_cut = None;
+        if let Some(text) = self.verdict_json.take() {
+            let (text, cut) = bound_verdict_json(&text, ROW_FIELD_CAP_BYTES);
+            self.verdict_json = Some(text);
+            verdict_cut = cut;
+        }
+        self.detail_json = self
+            .detail_json
+            .map(|text| bound_json_text(&text, ROW_FIELD_CAP_BYTES));
+        (self, verdict_cut)
     }
 }
 
@@ -458,6 +762,179 @@ mod tests {
         assert!(row.bounded().object.unwrap().len() <= ROW_OBJECT_CAP_BYTES);
     }
 
+    // Bounds the tests hold the page to, written out so a change to a constant
+    // is a visible change to the contract.
+    const PATH_BOUND: usize = 4096;
+    const ID_BOUND: usize = 256;
+    const REF_BOUND: usize = 1024;
+
+    fn oversized(glyph: &str, bound: usize) -> String {
+        // Starts one byte short of the bound so the glyph straddles it.
+        format!("{}{}", "a".repeat(bound - 1), glyph.repeat(bound))
+    }
+
+    #[test]
+    fn every_string_field_of_a_row_is_bounded_in_bounded() {
+        for glyph in ["a", "é", "€", "😀"] {
+            let mut row = event();
+            row.ulid = oversized(glyph, ID_BOUND * 4);
+            row.ts_utc = oversized(glyph, ID_BOUND * 4);
+            row.repo_path = oversized(glyph, PATH_BOUND * 4);
+            row.worktree_path = Some(oversized(glyph, PATH_BOUND * 4));
+            row.actor_kind = oversized(glyph, ID_BOUND * 4);
+            row.actor_id = Some(oversized(glyph, ID_BOUND * 4));
+            row.session_id = Some(oversized(glyph, ID_BOUND * 4));
+            row.task_id = Some(oversized(glyph, ID_BOUND * 4));
+            row.action = oversized(glyph, ID_BOUND * 4);
+            row.outcome = oversized(glyph, ID_BOUND * 4);
+            row.before_ref = Some(oversized(glyph, REF_BOUND * 4));
+            row.after_ref = Some(oversized(glyph, REF_BOUND * 4));
+            let cut = row.bounded();
+            for (name, text, bound) in [
+                ("ulid", &cut.ulid, ID_BOUND),
+                ("ts_utc", &cut.ts_utc, ID_BOUND),
+                ("repo_path", &cut.repo_path, PATH_BOUND),
+                (
+                    "worktree_path",
+                    cut.worktree_path.as_ref().unwrap(),
+                    PATH_BOUND,
+                ),
+                ("actor_kind", &cut.actor_kind, ID_BOUND),
+                ("actor_id", cut.actor_id.as_ref().unwrap(), ID_BOUND),
+                ("session_id", cut.session_id.as_ref().unwrap(), ID_BOUND),
+                ("task_id", cut.task_id.as_ref().unwrap(), ID_BOUND),
+                ("action", &cut.action, ID_BOUND),
+                ("outcome", &cut.outcome, ID_BOUND),
+                ("before_ref", cut.before_ref.as_ref().unwrap(), REF_BOUND),
+                ("after_ref", cut.after_ref.as_ref().unwrap(), REF_BOUND),
+            ] {
+                assert!(text.len() <= bound, "{name} {glyph}: {} bytes", text.len());
+                assert!(
+                    text.ends_with(OBJECT_CUT_SUFFIX),
+                    "{name} {glyph} was cut without the one cut suffix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_field_at_its_bound_is_not_cut() {
+        let mut row = event();
+        row.repo_path = "p".repeat(PATH_BOUND);
+        row.actor_id = Some("i".repeat(ID_BOUND));
+        row.after_ref = Some("r".repeat(REF_BOUND));
+        assert_eq!(row.clone().bounded(), row);
+    }
+
+    #[test]
+    fn a_capped_object_row_still_passes_the_genuine_record_check() {
+        let (kept, cap) = cap_object("é".repeat(5000));
+        let cap = cap.expect("cut");
+        let detail = json!({ OBJECT_TRUNCATED_KEY: cap.as_value() }).to_string();
+        let mut row = event();
+        row.object = Some(kept.clone());
+        row.detail_json = Some(detail.clone());
+        row.repo_path = oversized("é", PATH_BOUND * 2);
+        row.actor_id = Some(oversized("😀", ID_BOUND * 2));
+        let bounded = row.bounded();
+        // `bounded` leaves the capped object and its record as they were...
+        assert_eq!(bounded.object.as_deref(), Some(kept.as_str()));
+        assert!(recorded_cut_is_genuine(
+            bounded.object.as_deref().unwrap(),
+            bounded.detail_json.as_deref()
+        ));
+        // ...and the read-side cut spelling is not accepted as an append cut.
+        let read_cut = cut_text(&"é".repeat(5000), ROW_OBJECT_CAP_BYTES);
+        assert!(!recorded_cut_is_genuine(&read_cut, Some(&detail)));
+    }
+
+    #[test]
+    fn a_verdict_array_is_cut_from_the_end_and_stays_an_array_with_every_key() {
+        let verdict = json!({
+            "status": "blocked",
+            "findings": (0..4000).map(|n| json!({ "n": n, "why": "reason" })).collect::<Vec<_>>(),
+            "paths": (0..4000).map(|n| format!("src/file-{n}.rs")).collect::<Vec<_>>(),
+            "small": [1, 2],
+        });
+        let mut row = event();
+        row.verdict_json = Some(verdict.to_string());
+        let (cut, record) = row.bounded_recorded();
+        let text = cut.verdict_json.unwrap();
+        assert!(text.len() <= ROW_FIELD_CAP_BYTES, "{}", text.len());
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let keys =
+            |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
+        assert_eq!(keys(&value), keys(&verdict), "a key was added or removed");
+        for key in ["findings", "paths", "small"] {
+            assert!(value[key].is_array(), "{key} changed type");
+        }
+        assert_eq!(value["small"], json!([1, 2]));
+        // Cut from the end: what is left is a prefix, with no sentinel element.
+        let kept = value["findings"].as_array().unwrap();
+        assert!(!kept.is_empty() && kept.len() < 4000);
+        assert_eq!(
+            kept[..],
+            verdict["findings"].as_array().unwrap()[..kept.len()]
+        );
+        // The cut is recorded beside the verdict, which has no room for a marker.
+        assert!(record.expect("recorded").elements_dropped > 0);
+        assert_eq!(cut.detail_json, None);
+    }
+
+    #[test]
+    fn an_oversized_evidence_array_stays_an_array() {
+        let text = serde_json::to_string(
+            &(0..3000)
+                .map(|n| json!({ "exit": n, "stderr": "boom" }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(text.len() > ROW_FIELD_CAP_BYTES);
+        let (cut, record) = bound_evidence_json(&text, ROW_FIELD_CAP_BYTES);
+        assert!(cut.len() <= ROW_FIELD_CAP_BYTES, "{}", cut.len());
+        let value: Value = serde_json::from_str(&cut).unwrap();
+        let items = value.as_array().expect("still an array");
+        // Nothing is added: every element is one of the originals, in order.
+        assert!(items
+            .iter()
+            .enumerate()
+            .all(|(n, item)| *item == json!({ "exit": n, "stderr": "boom" })));
+        let record = record.expect("the cut is recorded");
+        assert_eq!(
+            (record.kept, record.total, record.bytes),
+            (items.len(), 3000, text.len())
+        );
+        // An array of strings is cut the same way.
+        let strings = serde_json::to_string(&vec!["x".repeat(40); 2000]).unwrap();
+        let (cut, _) = bound_evidence_json(&strings, 4096);
+        let value: Value = serde_json::from_str(&cut).unwrap();
+        assert!(value
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item == &json!("x".repeat(40))));
+        // Small arrays are returned exactly, with no record.
+        assert_eq!(
+            bound_evidence_json("[1,2]", 4096),
+            ("[1,2]".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn the_two_cut_suffixes_are_kept_because_the_append_one_is_located_by_length() {
+        // The genuine-record check finds the append cut by `at + suffix.len() ==
+        // object.len()`, so that suffix is fixed. The read-side suffix carries a
+        // removed-byte count and so has no fixed length; a read-cut text can
+        // never satisfy the check, which is what lets the two coexist.
+        let (append_cut, cap) = cap_object("x".repeat(OBJECT_CAP_BYTES + 500));
+        let detail = json!({ OBJECT_TRUNCATED_KEY: cap.unwrap().as_value() }).to_string();
+        assert!(recorded_cut_is_genuine(&append_cut, Some(&detail)));
+        assert!(append_cut.ends_with("… [truncated]"));
+        let read_cut = cut_text(&"x".repeat(OBJECT_CAP_BYTES + 500), 300);
+        assert!(read_cut.contains("…[truncated ") && read_cut.ends_with(" bytes]"));
+        assert!(!recorded_cut_is_genuine(&read_cut, Some(&detail)));
+    }
+
     #[test]
     fn the_object_cap_helper_cuts_only_past_the_cap() {
         let (kept, cap) = cap_object("a".repeat(OBJECT_CAP_BYTES));
@@ -480,3 +957,7 @@ mod tests {
         assert!(!past.is_well_formed());
     }
 }
+
+#[cfg(test)]
+#[path = "adversarial_bounds_tests.rs"]
+mod adversarial_bounds;

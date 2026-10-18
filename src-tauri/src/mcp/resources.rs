@@ -330,12 +330,27 @@ pub fn ledger_query_page(anchor: &str, query: &crate::ledger::EventQuery) -> Res
             // final page is not truncated, and a page cut for its size always
             // has more behind it.
             let truncated = page.byte_capped || page.more;
+            // Every row says whether its verdict was cut: `verdict_truncated`
+            // is null for a whole one. The verdict has no room for a marker,
+            // so the record is the row's own optional field.
+            let events: Vec<Value> = page
+                .events
+                .iter()
+                .map(|event| {
+                    let mut row = json!(event);
+                    row["verdict_truncated"] = page
+                        .verdict_cuts
+                        .get(&event.id)
+                        .map_or(Value::Null, |cut| json!(cut));
+                    row
+                })
+                .collect();
             Ok(json!({
                 "ok": true,
-                "returned": page.events.len(),
+                "returned": events.len(),
                 "truncated": truncated,
                 "next_cursor": next_cursor,
-                "events": page.events,
+                "events": events,
             }))
         }
         // No ledger is not an empty ledger, and must not read as one.
