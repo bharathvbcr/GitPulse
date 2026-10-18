@@ -224,10 +224,11 @@ export function classifierMatches(file: string, source: string): ClassifierMatch
             // A regex that is itself a sentence is a message pattern, whatever it is applied to.
             || (isRegularExpressionLiteral(unwrap(callee.receiver)) && phrase(literalText(callee.receiver))));
         // `String.prototype.includes.call(message, "...")`.
+        const through = callee.receiver === null ? null : unwrap(callee.receiver);
         const viaCall = callee.method === "call"
-          && callee.receiver !== null
-          && isPropertyAccessExpression(unwrap(callee.receiver))
-          && SEARCH.has((unwrap(callee.receiver) as { name: { text: string } }).name.text)
+          && through !== null
+          && isPropertyAccessExpression(through)
+          && SEARCH.has(through.name.text)
           && argument !== undefined
           && derives(argument);
         // `message.match(re)` and `message.search(re)` are caught by the receiver;
