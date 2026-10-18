@@ -1500,7 +1500,10 @@ mod tests {
         let stamp = stamp_aged(&clock, Duration::from_secs(10));
         let args = ["log", "adv-skew"];
         assert!(computed(&fx, &args, &stamp));
-        assert!(!computed(&fx, &args, &stamp), "stored while the clocks agree");
+        assert!(
+            !computed(&fx, &args, &stamp),
+            "stored while the clocks agree"
+        );
         let (mono, wall) = CLOCK.with(std::cell::Cell::get).unwrap();
         CLOCK.with(|cell| {
             cell.set(Some((
@@ -1526,7 +1529,10 @@ mod tests {
         );
         let fresh = ["log", "adv-skew-after"];
         assert!(computed(&fx, &fresh, &stamp));
-        assert!(!computed(&fx, &fresh, &stamp), "storing works again once the wall clock is back");
+        assert!(
+            !computed(&fx, &fresh, &stamp),
+            "storing works again once the wall clock is back"
+        );
     }
 
     /// Single-flight: the leader computes on thread A (which has a manual
@@ -1571,16 +1577,25 @@ mod tests {
             let stamp = stamp.clone();
             std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                through_stamped_coalesced(&repo, &["log", "adv-coalesce-thread"], Some(&stamp), || {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    Ok(("waiter-answer".to_string(), true))
-                })
+                through_stamped_coalesced(
+                    &repo,
+                    &["log", "adv-coalesce-thread"],
+                    Some(&stamp),
+                    || {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(("waiter-answer".to_string(), true))
+                    },
+                )
             })
         };
         let (led, _) = leader.join().unwrap();
         let waited = waiter.join().unwrap();
         assert_eq!(led.as_deref(), Ok("leader-answer"));
-        assert_eq!(waited.as_deref(), Ok("leader-answer"), "the waiter did not share the run");
+        assert_eq!(
+            waited.as_deref(),
+            Ok("leader-answer"),
+            "the waiter did not share the run"
+        );
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         // The entry A stored was stamped on A's clock (an hour ahead of the
         // real one): thread B must neither serve it nor panic on it.
