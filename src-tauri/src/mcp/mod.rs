@@ -75,6 +75,10 @@ pub const LEDGER_DEFAULT_LIMIT: u32 = 50;
 /// Ceiling on `gitpulse_ledger_events`. Without one, `limit: 4294967295`
 /// materialises the entire ledger into a single stdio write.
 pub const LEDGER_MAX_LIMIT: u32 = 1_000;
+/// Longest value accepted for a `gitpulse_ledger_events` filter. The widest
+/// column a filter compares is the object, which the ledger caps well below
+/// this, so a longer value could never match a stored row.
+pub const LEDGER_FILTER_MAX_BYTES: usize = 4_096;
 /// Ceiling on `gitpulse_active_changes`, matching what the backend enforces.
 pub const CHANGES_MAX_LIMIT: u32 = 500;
 /// Ceiling on the code-intelligence token budget.
@@ -383,7 +387,7 @@ tool_args! {
     struct LedgerEventsArgs {
         repo_path: String = repo_spec(),
         cursor: Option<i64> = Spec::int(
-            "Return events with an id greater than this. 0 (the default) starts at the beginning of history.",
+            "Where to continue. Oldest first (the default): return events with an id greater than this; 0 (the default) starts at the beginning of history. With order \"desc\": return events with an id less than this; omit it to start at the newest event.",
             0,
             i64::MAX.unsigned_abs(),
         ),
@@ -392,6 +396,21 @@ tool_args! {
             1,
             u64::from(LEDGER_MAX_LIMIT),
         ),
+        order: Option<String> = Spec::one_of(
+            "\"asc\" (the default) pages oldest first; \"desc\" returns the newest events first, so {order: \"desc\", limit: 5} is the five newest without reading older pages",
+            &["asc", "desc"],
+        ),
+        since_ts: Option<String> = Spec::bytes(
+            "Only events appended at or after this `ts_utc`, spelled as the ledger stores it: YYYY-MM-DDTHH:MM:SS.mmmZ (24 characters, UTC)",
+            1,
+            24,
+        ),
+        action: Option<String> = Spec::bytes("Only events with exactly this action, e.g. session.command", 1, LEDGER_FILTER_MAX_BYTES),
+        object: Option<String> = Spec::bytes("Only events whose object is exactly this (the stored, redacted and length-capped text). Not index-backed: stops at `limit` matches", 1, LEDGER_FILTER_MAX_BYTES),
+        worktree_path: Option<String> = Spec::bytes("Only events recorded for exactly this worktree path. Not index-backed: stops at `limit` matches", 1, LEDGER_FILTER_MAX_BYTES),
+        task_id: Option<String> = Spec::bytes("Only events attributed to this task id", 1, LEDGER_FILTER_MAX_BYTES),
+        session_id: Option<String> = Spec::bytes("Only events from this agent session id", 1, LEDGER_FILTER_MAX_BYTES),
+        after_ref: Option<String> = Spec::bytes("Only events whose after_ref is exactly this (a commit or ref value). Not index-backed: stops at `limit` matches", 1, LEDGER_FILTER_MAX_BYTES),
     }
 }
 
@@ -862,7 +881,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor`. Page by passing the last `id` you saw back as `cursor`; `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix).",
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor` by default. `order: \"desc\"` returns the newest first (`{order: \"desc\", limit: 5}` is the five newest, read by index without paging older rows); `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and `after_ref` filter by exact value and combine with AND; `since_ts`, `action`, `task_id` and `session_id` are index-backed, while `object`, `worktree_path` and `after_ref` are not: they walk the ledger newest-first or oldest-first and stop at `limit` matches, so one that matches nothing reads the whole ledger (an event time filter is not offered: event time rides in `detail_json`, not in a column). Page by passing the last `id` you saw back as `cursor` (an upper bound when `order` is `desc`); `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix).",
             LedgerEventsArgs::properties(),
             &LedgerEventsArgs::required(),
             json!({
@@ -1127,10 +1146,34 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_provenance",
             "Commit provenance",
-            "Read Git-native verification notes and confidence decay for a commit",
+            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false.",
             ProvenanceArgs::properties(),
             &ProvenanceArgs::required(),
-            json!({ "type": "object" }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "commit_sha": { "type": "string" },
+                    "distance": { "type": ["integer", "null"] },
+                    "confidence": { "type": ["number", "null"] },
+                    "is_fresh": { "type": "boolean" },
+                    "unmeasured_reason": { "type": "string" },
+                    "notes_readable": { "type": "boolean" },
+                    "verification": { "type": ["object", "null"] },
+                    "session": { "type": ["object", "null"] },
+                    "landed_on_base": { "type": ["boolean", "null"] },
+                    "on_base": { "type": ["boolean", "null"] },
+                    "base_oid": { "type": ["string", "null"] },
+                    "merge_base": { "type": ["string", "null"] },
+                    "ahead": { "type": ["integer", "null"] },
+                    "behind": { "type": ["integer", "null"] },
+                    "base_relation_reason": { "type": "string" }
+                },
+                "required": [
+                    "commit_sha", "distance", "confidence", "is_fresh", "unmeasured_reason",
+                    "notes_readable", "verification", "session", "landed_on_base", "on_base",
+                    "base_oid", "merge_base", "ahead", "behind", "base_relation_reason"
+                ]
+            }),
         ),
     ];
     tools.extend(devmap_parity::tool_definitions());
@@ -1678,10 +1721,35 @@ fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
     // history size, which reads as a complete answer over a ledger of
     // any size; `returned` says what it is, `truncated` says when more
     // follow, and `next_cursor` is what to pass to get them.
-    resources::ledger_page(
+    let descending = a.order.as_deref() == Some("desc");
+    // Newest first, the cursor is an upper bound and its absence means "from
+    // the newest"; oldest first it is the lower bound it always was.
+    let (after, before) = match (descending, a.cursor) {
+        (true, cursor) => (0, cursor),
+        (false, cursor) => (cursor.unwrap_or(0), None),
+    };
+    if let Some(since) = &a.since_ts {
+        if !crate::ledger::valid_utc_timestamp(since) {
+            return Err(format!(
+                "since_ts {since:?} is not a ledger timestamp: spell it YYYY-MM-DDTHH:MM:SS.mmmZ (UTC)"
+            ));
+        }
+    }
+    resources::ledger_query_page(
         &address.anchor,
-        a.cursor.unwrap_or(0),
-        a.limit.unwrap_or(LEDGER_DEFAULT_LIMIT),
+        &crate::ledger::EventQuery {
+            after,
+            before,
+            limit: a.limit.unwrap_or(LEDGER_DEFAULT_LIMIT),
+            descending,
+            since_ts: a.since_ts,
+            action: a.action,
+            object: a.object,
+            worktree_path: a.worktree_path,
+            task_id: a.task_id,
+            session_id: a.session_id,
+            after_ref: a.after_ref,
+        },
     )
 }
 
@@ -2839,6 +2907,75 @@ mod tests {
         assert!(tool["outputSchema"]["properties"]["total"].is_null());
     }
 
+    fn ledger_ids(result: &Value) -> Vec<i64> {
+        result["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|event| event["id"].as_i64().expect("id"))
+            .collect()
+    }
+
+    #[test]
+    fn ledger_events_newest_first_returns_the_newest_and_continues_older() {
+        let (_dir, repo) = repository_with_ledger_rows(12, 8);
+        let newest = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "order": "desc", "limit": 5 }),
+        )
+        .expect("newest");
+        assert_eq!(ledger_ids(&newest), vec![12, 11, 10, 9, 8]);
+        assert_eq!(newest["truncated"], true);
+        assert_eq!(newest["next_cursor"], 8);
+        // `cursor` is an upper bound newest first: the next page is older, with
+        // nothing repeated and nothing skipped.
+        let older = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "order": "desc", "limit": 5, "cursor": 8 }),
+        )
+        .expect("older");
+        assert_eq!(ledger_ids(&older), vec![7, 6, 5, 4, 3]);
+        // Oldest first stays the default, unchanged.
+        let oldest = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "limit": 3 }),
+        )
+        .expect("oldest");
+        assert_eq!(ledger_ids(&oldest), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ledger_events_filters_combine_and_a_bad_since_ts_is_refused() {
+        let (_dir, repo) = repository_with_ledger_rows(12, 8);
+        let one = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "object": "echo 3", "action": "session.command" }),
+        )
+        .expect("filtered");
+        assert_eq!(one["returned"], 1);
+        assert_eq!(one["events"][0]["object"], "echo 3");
+        let none = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "action": "git.push" }),
+        )
+        .expect("filtered");
+        assert_eq!(none["returned"], 0);
+        assert_eq!(
+            none["ok"], true,
+            "no match is an answer, not a missing ledger"
+        );
+        let refused = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "since_ts": "2026-01-01" }),
+        );
+        assert!(refused.is_err(), "{refused:?}");
+        let refused = validate_arguments(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "order": "sideways" }),
+        );
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
     /// A trusted repository whose ledger holds `rows` events carrying `detail`
     /// bytes each, and the anchor to read it back by.
     fn repository_with_ledger_rows(rows: usize, detail: usize) -> (tempfile::TempDir, String) {
@@ -3267,16 +3404,10 @@ mod tests {
     /// `every_advertised_tool_result_matches_its_declared_output_schema` fails
     /// both for a tool missing from this list and for one that no longer
     /// belongs on it.
-    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[
-        (
-            "gitpulse_task_view",
-            "relays Manvi's task view; the shape is Manvi's contract",
-        ),
-        (
-            "gitpulse_provenance",
-            "relays git-notes provenance records, which carry per-commit free-form fields",
-        ),
-    ];
+    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[(
+        "gitpulse_task_view",
+        "relays Manvi's task view; the shape is Manvi's contract",
+    )];
 
     fn is_object_only_exempt(name: &str) -> bool {
         OBJECT_ONLY_OUTPUT_SCHEMAS

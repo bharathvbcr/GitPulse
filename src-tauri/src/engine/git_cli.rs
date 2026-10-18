@@ -32,7 +32,7 @@ mod thread_io;
 mod shared_budget;
 
 #[cfg(test)]
-mod awaiting_adversarial;
+mod awaiting_adversarial_tests;
 
 pub(crate) mod hooks;
 pub use hooks::{

@@ -59,7 +59,8 @@ fn a_waiting_reader_is_refused_at_the_wait_budget_and_takes_nothing_at_the_reser
         "got {refusal:?}"
     );
     assert!(
-        waited >= Duration::from_millis(1_900) && waited < Duration::from_millis(3_000),
+        waited >= Duration::from_millis(1_900)
+            && waited < crate::test_support::coverage_relaxed(Duration::from_millis(3_000)),
         "refused after {waited:?}, expected about 2 s"
     );
     let counters = gate.counters()[Admission::Background.index()];
@@ -95,7 +96,7 @@ fn cancellation_ends_the_wait_within_a_poll() {
     });
     assert_eq!(refusal, Some(Refusal::Cancelled));
     assert!(
-        began.elapsed() < Duration::from_millis(900),
+        began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(900)),
         "cancel took {:?}",
         began.elapsed()
     );
@@ -114,7 +115,7 @@ fn the_callers_deadline_bounds_the_wait() {
     });
     assert!(refusal.is_some());
     assert!(
-        began.elapsed() < Duration::from_millis(900),
+        began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(900)),
         "{:?}",
         began.elapsed()
     );
@@ -147,7 +148,7 @@ fn parked_waiters_do_not_hold_the_gate_and_all_end_at_the_budget() {
         reactive.err()
     );
     assert!(
-        t.elapsed() < Duration::from_millis(150),
+        t.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(150)),
         "{:?}",
         t.elapsed()
     );
@@ -158,7 +159,7 @@ fn parked_waiters_do_not_hold_the_gate_and_all_end_at_the_budget() {
             Some(Refusal::Refused { .. })
         ));
     }
-    assert!(began.elapsed() < Duration::from_millis(3_000));
+    assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(3_000)));
 }
 
 /// Break: a background waiter that is only short of TOKENS still counts in

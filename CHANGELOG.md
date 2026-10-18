@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- `gitpulse_provenance` says where a commit sits relative to its base:
+  `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`,
+  `merge_base` and `base_oid`, each null with `base_relation_reason` when it
+  could not be measured (unresolvable base, shallow clone), never false.
+  `distance` and `is_fresh` are unchanged and now documented for what they
+  measure: how far the base moved past the commit, which is 0 for a commit
+  *ahead of* the base too. Its output schema is typed.
+- `gitpulse_ledger_events` takes `order: "desc"` (the newest first; `{order:
+  "desc", limit: 5}` no longer pages the history oldest-first) and the filters
+  `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and
+  `after_ref`. `since_ts`, `action`, `task_id` and `session_id` are
+  index-backed; `object`, `worktree_path` and `after_ref` are not, and stop at
+  `limit` matches (one that matches nothing reads the whole ledger). The ledger
+  gains two additive indexes (`ts_utc`, `action`) the next time a writer opens
+  it; nothing else in the schema changes.
+
 ### Fixed
 
 - Pulse's ownership and bus-factor report samples the highest-churn files of
@@ -173,7 +191,7 @@ reinstalling.
     much it read and how much there was.
   - A repository is caught up at most once a minute, however often you switch
     tabs.
-  - Each Claude and Codex transcript is read and parsed once for all of a
+  - Each Claude transcript is read and parsed once for all of a
     repository's worktrees, instead of once per worktree, in 1 MiB chunks.
 - **The Insights snapshot reads each worktree's status once.**
   - The worktree rows and the collision check now describe the same read.
