@@ -40,6 +40,38 @@ fn hold_lock(lock: std::path::PathBuf, hold_ms: u64) -> std::thread::JoinHandle<
     })
 }
 
+/// Real git's own index.lock failure, from every git installed here (Apple git
+/// 2.54 on PATH, Homebrew 2.56), is exactly the lock line plus git's advice:
+/// the table in `LOCK_ADVICE_LINES` matches it for `add` and `commit` alike.
+#[test]
+fn every_installed_gits_index_lock_failure_matches_the_advice_table() {
+    let dir = repo_with_commit();
+    std::fs::write(dir.path().join(".git/index.lock"), b"").unwrap();
+    std::fs::write(dir.path().join("b"), "b").unwrap();
+    let mut checked = 0;
+    for git in ["git", "/opt/homebrew/bin/git"] {
+        if git.starts_with('/') && !Path::new(git).exists() {
+            continue;
+        }
+        for args in [vec!["add", "b"], vec!["commit", "-m", "x", "--allow-empty"]] {
+            let out = std::process::Command::new(git)
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+                .args(&args)
+                .current_dir(dir.path())
+                .env("LC_ALL", "C")
+                .output_locked()
+                .unwrap();
+            let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            assert!(
+                consists_only_of_gits_index_lock_failure(&message),
+                "{git} {args:?}: {message:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 2);
+}
+
 // ---- lock-retry classifier: git's real wording -------------------------
 
 /// Every real lock failure git prints for the commands the app runs is
@@ -211,14 +243,22 @@ fn hooked_commands_retry_only_for_a_lock_in_their_own_git_dir() {
     let repo = repo_with_commit();
     let other = repo_with_commit();
     let path = repo.path();
+    let advice = "\n\nAnother git process seems to be running in this repository, or the lock file may be stale";
     let own = format!(
-        "fatal: Unable to create '{}/.git/index.lock': File exists.",
+        "fatal: Unable to create '{}/.git/index.lock': File exists.{advice}",
         path.display()
     );
     let foreign = format!(
-        "fatal: Unable to create '{}/.git/index.lock': File exists.",
+        "fatal: Unable to create '{}/.git/index.lock': File exists.{advice}",
         other.path().display()
     );
+    // The same lock line without git's advice block is not git's own failure.
+    let bare = format!(
+        "fatal: Unable to create '{}/.git/index.lock': File exists.",
+        path.display()
+    );
+    assert!(!lock_retry_wanted(Some(path), "commit", &bare));
+    assert!(lock_retry_wanted(Some(path), "add", &bare));
     for sub in ["commit", "merge", "cherry-pick", "revert", "rebase", "am"] {
         assert!(lock_retry_wanted(Some(path), sub, &own), "{sub}");
         assert!(!lock_retry_wanted(Some(path), sub, &foreign), "{sub}");

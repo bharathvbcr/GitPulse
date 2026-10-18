@@ -5032,7 +5032,70 @@ fn lock_retry_wanted(repo: Option<&Path>, sub: &str, diagnosis: &str) -> bool {
     if !is_transient_git_lock_error(diagnosis) || NETWORK_SUBCOMMANDS.contains(&sub) {
         return false;
     }
-    lock_retry_allowed(sub) || repo.is_some_and(|repo| lock_is_in_this_repository(repo, diagnosis))
+    lock_retry_allowed(sub)
+        || (consists_only_of_gits_index_lock_failure(diagnosis)
+            && repo.is_some_and(|repo| lock_is_in_this_repository(repo, diagnosis)))
+}
+
+/// The advice git prints under a lock failure, lowercased, one entry per line.
+/// Current git (2.54 and 2.56, captured from real runs) prints the first line
+/// alone; older git printed all five. Matched against a fixed table, never by
+/// substring, so anything else on the line is not git's advice.
+const LOCK_ADVICE_LINES: &[&str] = &[
+    "another git process seems to be running in this repository, or the lock file may be stale",
+    "another git process seems to be running in this repository, e.g.",
+    "an editor opened by 'git commit'. please make sure all processes",
+    "are terminated then try again. if it still fails, a git process",
+    "may have crashed in this repository earlier:",
+    "remove the file manually to continue.",
+];
+
+/// The lines git's own commands print after that advice when the index could
+/// not be taken, captured from real `merge`, `cherry-pick`, `revert` and
+/// `rebase` runs on git 2.54 and 2.56.
+const LOCK_FOLLOWUP_LINES: &[&str] = &[
+    "fatal: unable to write index.",
+    "fatal: cherry-pick failed",
+    "fatal: revert failed",
+    "error: could not detach head",
+];
+
+/// True when `diagnosis` is git's own failure to take `index.lock` and nothing
+/// else: line 1 is `fatal: Unable to create '<...>/index.lock': File exists.`,
+/// then only git's advice block, at least one line of it.
+///
+/// git takes `index.lock` before it runs any hook, so when its own attempt
+/// failed no hook ran and the whole stderr is this message. A hook that prints
+/// a lock-shaped line of its own (a nested git, a lint-staged step) is followed
+/// or preceded by other output, or lacks the advice block; either way it ran
+/// something, and the command is not replayed. Only `index.lock` qualifies: a
+/// ref lock on `commit` is taken after the hooks have run.
+fn consists_only_of_gits_index_lock_failure(diagnosis: &str) -> bool {
+    let mut lines = diagnosis.lines();
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    let is_index_lock = lock_path_named(first)
+        .and_then(|path| Path::new(path).file_name())
+        .is_some_and(|name| name == "index.lock");
+    let first_lower = first.trim_end().to_ascii_lowercase();
+    let own_prefix = first_lower.starts_with("fatal: unable to create '")
+        || first_lower.starts_with("error: unable to create '");
+    if !is_index_lock || !own_prefix || !first_lower.ends_with(".lock': file exists.") {
+        return false;
+    }
+    let mut advice = 0;
+    for line in lines.map(|line| line.trim().to_ascii_lowercase()) {
+        if line.is_empty() {
+            continue;
+        }
+        if LOCK_ADVICE_LINES.contains(&line.as_str()) {
+            advice += 1;
+        } else if !LOCK_FOLLOWUP_LINES.contains(&line.as_str()) {
+            return false;
+        }
+    }
+    advice > 0
 }
 
 /// Backoff for attempts 1..=3: 50 + 150 + 300 ms = 500 ms, plus a tiny pid jitter
@@ -6552,9 +6615,8 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
         git_text(dir.path(), &["add", "f.txt"]).unwrap();
         let counter = dir.path().join("hook-count");
-        // A nested git the hook ran against ANOTHER repository: its lock line
-        // names a path outside this git dir, so it is never replayed.
-        let other = tempfile::TempDir::new().unwrap();
+        // A hook whose nested git, against THIS repository, prints a bare lock
+        // line: git's advice block is missing, so it is not git's own failure.
         let hook = dir.path().join(".git/hooks/pre-commit");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
         std::fs::write(
@@ -6562,7 +6624,7 @@ mod tests {
             format!(
                 "#!/bin/sh\necho run >> '{}'\necho \"fatal: Unable to create '{}/.git/index.lock': File exists.\" >&2\nexit 1\n",
                 counter.display(),
-                other.path().display()
+                dir.path().display()
             ),
         )
         .unwrap();
@@ -6572,6 +6634,91 @@ mod tests {
         assert!(is_transient_git_lock_error(&error), "{error}");
         let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(runs, 1, "the hook ran {runs} times");
+    }
+
+    /// The lint-staged shape: the hook's nested git against THIS repository
+    /// fails on the lock, prints git's advice block as well, and the hook then
+    /// reports its own failure. Other output follows git's lines, so something
+    /// ran: the commit and its hook are not replayed.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_quoting_this_repos_lock_with_advice_and_other_output_runs_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        git_text(dir.path(), &["config", "user.name", "T"]).unwrap();
+        git_text(dir.path(), &["config", "user.email", "t@example.com"]).unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
+        git_text(dir.path(), &["add", "f.txt"]).unwrap();
+        let counter = dir.path().join("hook-count");
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho run >> '{c}'\necho \"fatal: Unable to create '{d}/.git/index.lock': File exists.\" >&2\necho >&2\necho 'Another git process seems to be running in this repository, or the lock file may be stale' >&2\necho 'lint-staged failed' >&2\nexit 1\n",
+                c = counter.display(),
+                d = dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        git_text(dir.path(), &["commit", "-m", "x"]).expect_err("hook rejects");
+        let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs, 1, "the hook ran {runs} times");
+    }
+
+    /// git's advice under a lock failure, as printed by real git 2.54 and 2.56
+    /// (identical), plus the five-line block older git printed. Only the lock
+    /// line and that block, nothing else, is git's own index.lock failure.
+    #[test]
+    fn only_gits_own_index_lock_failure_qualifies_for_a_hooked_retry() {
+        let line = "fatal: Unable to create '/r/.git/index.lock': File exists.";
+        let current = "Another git process seems to be running in this repository, or the lock file may be stale";
+        let legacy = "Another git process seems to be running in this repository, e.g.\nan editor opened by 'git commit'. Please make sure all processes\nare terminated then try again. If it still fails, a git process\nmay have crashed in this repository earlier:\nremove the file manually to continue.";
+        assert!(consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current}"
+        )));
+        assert!(consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current}\n"
+        )));
+        assert!(consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{legacy}"
+        )));
+        // The `error:` first line and trailing lines real merge, cherry-pick,
+        // revert and rebase print.
+        let error_line = "error: Unable to create '/r/.git/index.lock': File exists.";
+        for followup in [
+            "fatal: Unable to write index.",
+            "fatal: cherry-pick failed",
+            "fatal: revert failed",
+            "error: could not detach HEAD",
+        ] {
+            assert!(
+                consists_only_of_gits_index_lock_failure(&format!(
+                    "{error_line}\n\n{current}\n{followup}"
+                )),
+                "{followup}"
+            );
+        }
+        // A bare line, any other output, a ref lock, or a non-git first line.
+        assert!(!consists_only_of_gits_index_lock_failure(line));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current}\nlint failed"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "lint failed\n{line}\n\n{current}"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current} and more"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "error: cannot lock ref 'HEAD': Unable to create '/r/.git/HEAD.lock': File exists.\n\n{current}"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "remote: {line}\n\n{current}"
+        )));
     }
 
     /// The timeout and spawn shapes every converged classifier must tell apart,
