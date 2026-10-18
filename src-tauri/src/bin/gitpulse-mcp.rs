@@ -863,6 +863,11 @@ fn main() {
     // deferred, on every thread this process starts. First, so no thread has
     // already been given the app's default.
     gitpulse_lib::engine::git_cli::run_process_as_background();
+    // A caller (an agent) is blocked on every read this server answers, so its
+    // background spawns wait out a low budget, bounded, rather than being shed
+    // at 0.000s. Still above the reserve: see the function's doc comment for
+    // why this is not Reactive.
+    gitpulse_lib::engine::git_cli::run_process_awaiting_background_budget();
     // And from the per-user spawn budget every GitPulse process shares, before
     // any spawn builds the gate.
     gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
@@ -932,6 +937,17 @@ mod test_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deferred and retried insights read, with its wait for budget at every
+    /// spawn, still ends inside the per-call budget the watchdog enforces.
+    #[test]
+    fn a_deferred_and_retried_read_fits_the_call_budget() {
+        let worst = mcp::WORST_CASE_DEFERRED_READ;
+        assert!(
+            worst < DEFAULT_CALL_BUDGET,
+            "{worst:?} vs {DEFAULT_CALL_BUDGET:?}"
+        );
+    }
 
     /// A writer the test can read back after the wire's worker wrote to it.
     #[derive(Clone, Default)]

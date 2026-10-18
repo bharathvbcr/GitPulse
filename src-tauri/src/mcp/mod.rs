@@ -1341,14 +1341,24 @@ fn workbench_message(error: crate::workbench::WorkbenchError) -> String {
 
 /// How a read that the spawn gate deferred is asked once more.
 ///
-/// `gitpulse-mcp` runs every spawn as background work, which the gate sheds
-/// the moment the shared rate budget is low, so a deferral is routine here and
-/// usually gone a token's refill later. One retry, after a delay of one refill
-/// interval plus jitter of up to the same again, so concurrent readers shed in
-/// the same instant do not come back in the same instant. The delay is
-/// therefore under two refill intervals (125 ms each at the production
-/// 8 tokens a second): under 250 ms added to a call that is otherwise bounded
-/// in seconds, and no retry is attempted that would end past `deadline`.
+/// `gitpulse-mcp` runs every spawn as background work that waits for budget
+/// (`run_process_awaiting_background_budget`): a spawn short of budget waits
+/// up to about 2 s (`SPAWN_QUEUE_BUDGET`) for the refill and is then refused
+/// as a deferral, so a deferral here means the budget stayed at or below the
+/// background reserve for that whole wait. One retry, after a delay of one
+/// refill interval plus jitter of up to the same again (under 250 ms at the
+/// production 8 tokens a second), so concurrent readers refused in the same
+/// instant do not come back in the same instant.
+///
+/// The real bound on one call: a snapshot pass is soft-bounded at 10 s by
+/// `SNAPSHOT_DEADLINE`, plus at most one spawn already waiting (2 s) when that
+/// clock runs out. The retry is skipped unless the first pass ended, with its
+/// delay, before `DEFERRAL_RETRY_WINDOW` (5 s) after the request began
+/// (`the_retry_is_bounded_and_respects_the_deadline`). So the worst case is a
+/// first pass that ends just inside the window, the delay, and a second pass of
+/// up to 12 s: [`WORST_CASE_DEFERRED_READ`] (5 s + 2 x 12 s = 29 s as a ceiling
+/// that counts both passes at their maximum), under the 60 s
+/// `DEFAULT_CALL_BUDGET` (pinned by a test in `gitpulse-mcp`).
 /// Time, sleeping and randomness are injected so a test is exact and instant.
 pub(crate) struct DeferralRetry<'a> {
     pub sleep: &'a dyn Fn(std::time::Duration),
@@ -1364,6 +1374,15 @@ pub(crate) struct DeferralRetry<'a> {
 /// retried: a call that already spent this long has no budget for a second
 /// attempt. Well inside the transport's own per-call budget.
 const DEFERRAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A ceiling on one insights read that was deferred and retried: the retry
+/// window, plus two passes each at the snapshot's soft deadline and one spawn's
+/// wait for budget. `gitpulse-mcp` asserts it stays under its per-call budget.
+pub const WORST_CASE_DEFERRED_READ: std::time::Duration = std::time::Duration::from_secs(
+    DEFERRAL_RETRY_WINDOW.as_secs()
+        + 2 * (insights::SNAPSHOT_DEADLINE.as_secs()
+            + crate::engine::git_cli::SPAWN_QUEUE_BUDGET.as_secs()),
+);
 
 /// A value in `0..bound` that differs between processes and between calls.
 /// Not a CSPRNG and not meant to be: it only spreads retries apart.
