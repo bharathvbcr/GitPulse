@@ -1727,6 +1727,14 @@ mod batch_tests {
             .pop()
             .expect("one entry");
 
+        // The relation to the base is the one thing a badge row does not
+        // spend processes on, and says so rather than guessing.
+        assert!(!batched.relation.base_relation_reason.is_empty());
+        assert_eq!(batched.relation.landed_on_base, None);
+        let single = ProvenanceFreshness {
+            relation: batched.relation.clone(),
+            ..single
+        };
         assert_eq!(single, batched);
     }
 
@@ -2165,7 +2173,10 @@ mod batch_tests {
         );
         assert!(answer.notes_readable);
         let used = &spawned()[before..];
-        assert_eq!(used.len(), 4, "{used:?}");
+        // Four for the freshness, plus the two that say where the commit sits
+        // relative to the base: one `merge-base --is-ancestor`, one
+        // `rev-list --left-right --count`. A commit on the base needs no third.
+        assert_eq!(used.len(), 6, "{used:?}");
         assert!(
             !used.iter().any(|argv| argv.iter().any(|a| a == "show")),
             "{used:?}"
@@ -2185,7 +2196,8 @@ mod batch_tests {
         // The note the listing has, read by the blob it named.
         assert_eq!(count("show"), 0, "{used:?}");
         assert_eq!(count("--batch"), 1, "{used:?}");
-        assert_eq!(used.len(), 5, "{used:?}");
+        // Five as before, plus the two relation reads (see above).
+        assert_eq!(used.len(), 7, "{used:?}");
     }
 
     /// Answers are taken by size, so a note holding newlines, a fake header
@@ -2526,3 +2538,7 @@ mod batch_tests {
         assert!(f.verification.is_some(), "the note was not found: {f:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "provenance_landing_tests.rs"]
+mod landing_tests;

@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- `gitpulse_provenance` says where a commit sits relative to its base:
+  `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`,
+  `merge_base` and `base_oid`, each null with `base_relation_reason` when it
+  could not be measured (unresolvable base, shallow clone), never false.
+  `distance` and `is_fresh` are unchanged and now documented for what they
+  measure: how far the base moved past the commit, which is 0 for a commit
+  *ahead of* the base too. Its output schema is typed.
+- `gitpulse_landed` answers whether a commit's work reached a base and how
+  (`ff`, `merge`, `squash`, `rebase`, `tree`), with the landing commit and the
+  time from the base reflog.
+- `gitpulse_ledger_events` takes `order: "desc"` (the newest first; `{order:
+  "desc", limit: 5}` no longer pages the history oldest-first) and the filters
+  `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and
+  `after_ref`, each served by an index. The ledger gains five additive indexes
+  the next time a writer opens it; nothing else in the schema changes.
+
 ### Fixed
 
 - Pulse's ownership and bus-factor report samples the highest-churn files of

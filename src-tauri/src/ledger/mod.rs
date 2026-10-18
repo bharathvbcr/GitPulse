@@ -82,10 +82,17 @@ CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
     WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
+-- The indexes the filtered `gitpulse_ledger_events` read seeks. The three on
+-- `action`, `object` and `worktree_path` carry the predicate `id > 0` (true of
+-- every row) and that read states it, because SQLite uses a partial index only
+-- when the query contains its predicate. Without it these plain single-column
+-- indexes compete with the purpose-built ones above (`idx_events_binding`,
+-- `idx_events_reflog`, `idx_events_session`) and the planner picks them for the
+-- binding, reflog and re-anchor queries, which they serve worse.
 CREATE INDEX IF NOT EXISTS idx_events_ts       ON events(ts_utc);
-CREATE INDEX IF NOT EXISTS idx_events_action   ON events(action);
-CREATE INDEX IF NOT EXISTS idx_events_object   ON events(object) WHERE object IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_events_worktree ON events(worktree_path) WHERE worktree_path IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_action   ON events(action) WHERE id > 0;
+CREATE INDEX IF NOT EXISTS idx_events_object   ON events(object) WHERE id > 0;
+CREATE INDEX IF NOT EXISTS idx_events_worktree ON events(worktree_path) WHERE id > 0;
 CREATE INDEX IF NOT EXISTS idx_events_after_ref ON events(after_ref) WHERE after_ref IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_binding  ON events(worktree_path, ts_utc)
   WHERE action IN ('worktree.bind', 'worktree.unbind');
@@ -2170,9 +2177,33 @@ impl Default for EventQuery {
 impl EventQuery {
     /// The SELECT and its parameters. Only the filters that are set appear, so
     /// the planner is never handed an `? IS NULL OR col = ?` it cannot index.
-    fn sql(&self, limit: u32) -> (String, Vec<rusqlite::types::Value>) {
+    ///
+    /// `ts_index` says `idx_events_ts` exists (a ledger no writer has opened
+    /// since the index was added lacks it, and `INDEXED BY` a missing index is
+    /// an error). With `since_ts` as the only filter the planner prefers a
+    /// primary-key walk that tests `ts_utc` row by row, which is cheap while
+    /// recent rows match and a full scan when none do, so the index is named.
+    fn sql(&self, limit: u32, ts_index: bool) -> (String, Vec<rusqlite::types::Value>) {
         use rusqlite::types::Value;
-        let mut clauses = vec!["id > ?".to_string()];
+        let only_since = self.since_ts.is_some()
+            && [
+                &self.action,
+                &self.object,
+                &self.worktree_path,
+                &self.task_id,
+                &self.session_id,
+                &self.after_ref,
+            ]
+            .iter()
+            .all(|filter| filter.is_none());
+        let source = if ts_index && only_since {
+            "events INDEXED BY idx_events_ts"
+        } else {
+            "events"
+        };
+        // `id > 0` is the predicate of the partial indexes on action, object
+        // and worktree_path (see SCHEMA); ids start at 1, so it removes nothing.
+        let mut clauses = vec!["id > 0".to_string(), "id > ?".to_string()];
         let mut values = vec![Value::Integer(self.after)];
         if let Some(before) = self.before {
             clauses.push("id < ?".to_string());
@@ -2200,7 +2231,7 @@ impl EventQuery {
                     actor_kind, actor_id, session_id, task_id, action, object,
                     argv_json, outcome, verdict_json, before_ref, after_ref,
                     duration_ms, detail_json
-             FROM events WHERE {} ORDER BY id {order} LIMIT ?",
+             FROM {source} WHERE {} ORDER BY id {order} LIMIT ?",
             clauses.join(" AND ")
         );
         (sql, values)
@@ -2232,7 +2263,7 @@ pub fn query_readonly_page(
 /// that pins every filter to an index.
 #[cfg(test)]
 fn explain_query(conn: &Connection, query: &EventQuery) -> Vec<String> {
-    let (sql, values) = query.sql(query.limit);
+    let (sql, values) = query.sql(query.limit, true);
     let mut stmt = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .expect("prepare plan");
@@ -2260,7 +2291,17 @@ fn read_events(
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     with_access(repo_path, access, |conn| {
-        let (sql, values) = query.sql(limit + 1);
+        let ts_index = query.since_ts.is_some()
+            && conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_ts'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?
+                .is_some();
+        let (sql, values) = query.sql(limit + 1, ts_index);
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
@@ -3817,6 +3858,9 @@ mod contract_tests;
 
 #[cfg(test)]
 mod reliability_tests;
+
+#[cfg(test)]
+mod query_tests;
 
 /// Test-only helpers that need the private registry.
 #[cfg(test)]

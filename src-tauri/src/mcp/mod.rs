@@ -402,7 +402,7 @@ tool_args! {
         ),
         since_ts: Option<String> = Spec::bytes(
             "Only events appended at or after this `ts_utc`, spelled as the ledger stores it: YYYY-MM-DDTHH:MM:SS.mmmZ (24 characters, UTC)",
-            24,
+            1,
             24,
         ),
         action: Option<String> = Spec::bytes("Only events with exactly this action, e.g. session.command", 1, LEDGER_FILTER_MAX_BYTES),
@@ -2930,6 +2930,125 @@ mod tests {
         // `total` used to be the returned count wearing the name of the
         // history size. It must not come back.
         assert!(tool["outputSchema"]["properties"]["total"].is_null());
+    }
+
+    fn ledger_ids(result: &Value) -> Vec<i64> {
+        result["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|event| event["id"].as_i64().expect("id"))
+            .collect()
+    }
+
+    #[test]
+    fn ledger_events_newest_first_returns_the_newest_and_continues_older() {
+        let (_dir, repo) = repository_with_ledger_rows(12, 8);
+        let newest = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "order": "desc", "limit": 5 }),
+        )
+        .expect("newest");
+        assert_eq!(ledger_ids(&newest), vec![12, 11, 10, 9, 8]);
+        assert_eq!(newest["truncated"], true);
+        assert_eq!(newest["next_cursor"], 8);
+        // `cursor` is an upper bound newest first: the next page is older, with
+        // nothing repeated and nothing skipped.
+        let older = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "order": "desc", "limit": 5, "cursor": 8 }),
+        )
+        .expect("older");
+        assert_eq!(ledger_ids(&older), vec![7, 6, 5, 4, 3]);
+        // Oldest first stays the default, unchanged.
+        let oldest = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "limit": 3 }),
+        )
+        .expect("oldest");
+        assert_eq!(ledger_ids(&oldest), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ledger_events_filters_combine_and_a_bad_since_ts_is_refused() {
+        let (_dir, repo) = repository_with_ledger_rows(12, 8);
+        let one = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "object": "echo 3", "action": "session.command" }),
+        )
+        .expect("filtered");
+        assert_eq!(one["returned"], 1);
+        assert_eq!(one["events"][0]["object"], "echo 3");
+        let none = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "action": "git.push" }),
+        )
+        .expect("filtered");
+        assert_eq!(none["returned"], 0);
+        assert_eq!(
+            none["ok"], true,
+            "no match is an answer, not a missing ledger"
+        );
+        let refused = handle_tool_call(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "since_ts": "2026-01-01" }),
+        );
+        assert!(refused.is_err(), "{refused:?}");
+        let refused = validate_arguments(
+            "gitpulse_ledger_events",
+            &json!({ "repo_path": repo, "order": "sideways" }),
+        );
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    #[test]
+    fn gitpulse_landed_is_a_read_only_tool_that_answers_over_the_wire() {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_landed")
+            .expect("gitpulse_landed is advertised");
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        // The manifest derives its `writes` list from the annotations; a read
+        // must not appear in it.
+        let contents = resources::read("gitpulse://server/manifest").expect("manifest");
+        let manifest: Value =
+            serde_json::from_str(contents[0]["text"].as_str().expect("text")).expect("json");
+        assert!(
+            !manifest["writes"]
+                .as_array()
+                .expect("writes")
+                .iter()
+                .any(|name| name == "gitpulse_landed"),
+            "{manifest}"
+        );
+        let (_dir, repo) = repository_with_ledger_rows(0, 0);
+        let init = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output_locked()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        init(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let answer = handle_tool_call(
+            "gitpulse_landed",
+            &json!({ "repo_path": repo, "commit": "HEAD" }),
+        )
+        .expect("landed");
+        assert_eq!(answer["landed"], true, "{answer}");
+        assert_eq!(answer["via"], "ff");
+        assert!(answer["base_oid"].is_string());
     }
 
     /// A trusted repository whose ledger holds `rows` events carrying `detail`
