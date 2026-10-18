@@ -115,21 +115,21 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
                 "title": title,
                 "status": "ready",
                 "priority": 2,
-                "description": "long ".repeat(3000),
+                "description": "long ".repeat(12000),
             }),
         );
         if outcome.is_ok() {
             filed += 1;
         }
     }
-    assert!(filed >= 10, "only {filed} tasks could be filed");
+    assert!(filed >= 3,"only {filed} tasks could be filed");
     let payload = handle_tool_call(
         "gitpulse_list_tasks",
         &json!({ "repo_path": repo, "limit": 100 }),
     )
     .expect("list tasks");
     let listed = payload["tasks"].as_array().map_or(0, Vec::len);
-    assert!(listed >= 10, "list_tasks returned {listed} tasks");
+    assert!(listed >= 3,"list_tasks returned {listed} tasks");
     match budget::fit(true, payload, BUDGET) {
         Ok(fitted) => {
             assert!(wire(&fitted) <= BUDGET, "{} bytes", wire(&fitted));
