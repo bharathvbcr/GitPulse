@@ -609,7 +609,7 @@ fn a_deferred_head_read_is_asked_again_and_a_permanent_one_is_recorded() {
         head: "h1".into(),
         state: "could_not_run".into(),
         degraded: vec![
-            "the worktree's head could not be read: git rev-parse deferred under load after 2.010s"
+            "the worktree's head could not be read: git rev-parse deferred under load after 2.010s: the git spawn rate limit admitted nothing sooner"
                 .into(),
         ],
         ..Record::default()
@@ -683,7 +683,7 @@ fn a_could_not_run_caused_by_a_deferred_read_is_retried_once_the_head_can_be_rea
     let head = head_of(&repo);
     let mut rec = record(&id, "", "could_not_run", &repo, &head);
     rec["degraded"] = json!([
-        "the worktree's head could not be read: git rev-parse deferred under load after 2.010s"
+        "the worktree's head could not be read: git rev-parse deferred under load after 2.010s: the git spawn rate limit admitted nothing sooner"
     ]);
     store_record(&store, &id, &rec);
     let fake = Fake::new();
@@ -1154,6 +1154,46 @@ fn a_hex_base_that_is_also_a_branch_name_is_not_read_as_the_branch() {
         "the base asked for was {before} but the range starts at {}",
         sent[0]["base"]
     );
+}
+
+/// The prefix the driver writes is the one it strips, and only that prefix is
+/// stripped: a hostile path or a quoted refusal is still not a deferral.
+#[test]
+fn a_stored_line_is_a_deferral_only_by_the_drivers_own_prefix_and_the_anchored_shape() {
+    use crate::workbench::verification_driver::stored_question_unasked;
+    let refusal = "git rev-parse deferred under load after 2.010s: the git spawn rate limit admitted nothing sooner";
+    let target = Target {
+        worktree: "/gone".into(),
+        head: "h1".into(),
+    };
+    // What the driver writes for a permanent failure carries the prefix.
+    let Step::CouldNotRun(written) = decide(&Facts {
+        revision: 1,
+        logs: "",
+        target: &target,
+        current_head: Err("not a git repository".into()),
+        latest: Ok(None),
+        attempt: None,
+        item_id: "i",
+    }) else {
+        panic!("a permanent failure is recorded");
+    };
+    assert!(!stored_question_unasked(&written));
+    // The same prefix in front of a real refusal is read as the refusal.
+    assert!(stored_question_unasked(&format!("{written}{refusal}")));
+    assert!(stored_question_unasked(&format!(
+        "the worktree's head could not be read: {refusal}"
+    )));
+    assert!(stored_question_unasked(refusal));
+    // A path carrying a refusal, or text quoting one, is not.
+    for hostile in [
+        format!("the worktree's head could not be read: /x/{refusal}"),
+        format!("Not a Git repository: /x {refusal}"),
+        format!("some other prefix: {refusal}"),
+        "the worktree's head could not be read: ".to_owned(),
+    ] {
+        assert!(!stored_question_unasked(&hostile), "{hostile}");
+    }
 }
 
 /// `rev-parse` children started in `repo` so far.
