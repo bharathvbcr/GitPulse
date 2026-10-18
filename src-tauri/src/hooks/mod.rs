@@ -3785,6 +3785,25 @@ done
         assert!(malformed.unwrap_err().contains("malformed"));
     }
 
+    /// The app refuses to scan a repository GitPulse is not trusted in, as the
+    /// hook's own process would: the request is an error and not an empty
+    /// answer, so the hook falls back and reports "did NOT run", never a clean
+    /// pass. A peer cannot use the mailbox to read an untrusted repository.
+    #[cfg(unix)]
+    #[test]
+    fn the_app_does_not_scan_a_repository_it_is_not_trusted_in() {
+        let farm = farm(false);
+        crate::repository_trust::revoke(&farm.repo).expect("revoke trust");
+        let refused = serve_collision(&farm.repo, "seed.txt");
+        assert!(
+            refused.is_err(),
+            "an untrusted repository was scanned: {refused:?}"
+        );
+        // The fallback says what it could not do instead of staying silent.
+        let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
+        assert!(!output.is_silent(), "an unscanned edit read as a clean one");
+    }
+
     /// The Edit/Write hook used to check collisions only, so a task-bound
     /// agent's most common write — the file tool — was fenced by nothing. It
     /// is now measured against the bound task's scope, resolved by the same
