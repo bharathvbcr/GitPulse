@@ -8,6 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SCHEMAS, devmapReading, judge, rustConstant, schemasAt, summarize } from "./check-schema-parity.mjs";
 import { readCliSchema } from "./check-vendor-schema.mjs";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 const C = "EXTRACTION_SCHEMA_VERSION";
 const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94 };
@@ -157,7 +158,7 @@ if [ "$1" = "--version" ]; then ${versionBody}; fi
     await withDevmap(`sleep 60`);
     const started = Date.now();
     expect(readCliSchema()).toMatchObject({ available: true, expected: 27, extract: null });
-    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(20_000));
   }, 40_000);
 
   it("a --version that prints extract schema 94 is read", async () => {
