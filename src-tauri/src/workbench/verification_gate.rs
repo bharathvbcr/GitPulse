@@ -169,8 +169,15 @@ pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> 
 
 /// HEAD of the worktree a verification was taken in, as it is now.
 pub(crate) fn current_head(worktree: &str) -> Result<String, String> {
-    crate::engine::git_cli::git_text(
+    // The driver asks this of every held card every sweep, and the board asks
+    // it per card on every refresh. HEAD is a function of HEAD and the ref it
+    // names, which a symref may place in any namespace (`refs/remotes/...`), so
+    // the whole ref store is stamped, as for the verification base. An
+    // unchanged worktree is answered from the ref cache by file stats, with no
+    // process.
+    crate::engine::ref_cache::git_text(
         Path::new(worktree),
+        &[crate::engine::ref_cache::ALL_REFS],
         &["rev-parse", "--verify", "HEAD^{commit}"],
     )
     .map(|head| head.trim().to_owned())

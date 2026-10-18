@@ -166,9 +166,7 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
         {
             return Step::Skip
         }
-        Err(error) => {
-            return Step::CouldNotRun(format!("the worktree's head could not be read: {error}"))
-        }
+        Err(error) => return Step::CouldNotRun(format!("{HEAD_UNREADABLE}{error}")),
     };
     if *head != facts.target.head {
         return Step::Skip;
@@ -192,7 +190,7 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
             // A deferral stored by an older build is the same unasked
             // question. A sidecar that was down, or any other cause, stays
             // terminal: Verify on the card is what retries those.
-            if r.degraded.iter().any(|line| git_question_unasked(line)) {
+            if r.degraded.iter().any(|line| stored_question_unasked(line)) {
                 match facts.attempt {
                     Some((elapsed, _)) => waited(elapsed),
                     None => Step::Start,
@@ -705,6 +703,21 @@ fn git_question_unasked(err: &str) -> bool {
         || crate::engine::git_cli::is_slot_wait_timeout(err)
 }
 
+/// What the driver writes before a head read's error in a `could_not_run`
+/// record. One constant for the writer ([`decide`]) and for
+/// [`stored_question_unasked`], so the two cannot drift.
+const HEAD_UNREADABLE: &str = "the worktree's head could not be read: ";
+
+/// [`git_question_unasked`] for a `degraded` line read back from a stored
+/// record. A live read reaches [`decide`] as the raw error, so it is judged
+/// as it came; a stored line may carry the driver's own [`HEAD_UNREADABLE`]
+/// prefix, which is removed here, exactly, before the anchored matcher runs.
+/// The matcher itself is not loosened: text that merely quotes a refusal, or
+/// a path that carries one, is still not a deferral.
+pub(crate) fn stored_question_unasked(line: &str) -> bool {
+    git_question_unasked(line.strip_prefix(HEAD_UNREADABLE).unwrap_or(line))
+}
+
 const NO_PARENT: &str = "the claimed commit is on the default branch and has no parent, so there is no earlier revision to diff against";
 
 /// What a `rev-parse` of `{head}^` means for the verification base.
@@ -750,6 +763,20 @@ fn missing_parent(err: &str) -> bool {
 /// A git question that was not asked is returned as that error. It is not
 /// rewritten into "no parent" or "no default branch".
 pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, String> {
+    // The base is a function of `head`, the default branch and the other refs,
+    // all of which the ref stamp covers, so an unchanged repository is
+    // answered without the three or four reads below. The "argv" is a key
+    // for the cache, never run. Only an answer is kept: a deferral or a root
+    // commit is an `Err` and is asked again.
+    crate::engine::ref_cache::through(
+        worktree,
+        &[crate::engine::ref_cache::ALL_REFS],
+        &["verification-base", head],
+        || verification_base_uncached(worktree, head).map(|base| (base, true)),
+    )
+}
+
+fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, String> {
     let head = resolve_commit(worktree, head)?;
     let fork = default_fork(worktree, &head)?;
     if fork != head {
