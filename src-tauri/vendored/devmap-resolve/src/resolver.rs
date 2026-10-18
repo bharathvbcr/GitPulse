@@ -10,6 +10,7 @@ use devmap_extract::model::*;
 use crate::model::*;
 
 mod gotypes;
+mod jsobjects;
 
 /// A protocol method's own declaration, and the conformers' declarations of it:
 /// `(file, symbol)` pairs.
@@ -19,6 +20,7 @@ use devmap_extract::{GoModule, ProjectManifests};
 use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
 
 mod pytypes;
+use pytypes::PythonImportBind;
 
 /// The key a wildcard import (`from m import *`, `export * from 'm'`) takes in
 /// `external_imports` and `unindexed_local_imports` when its module is not
@@ -393,6 +395,26 @@ pub struct Resolver {
     /// that reads it refuses to continue through a type name two files declare,
     /// where the chain stops being identifiable.
     supertypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
+    /// `(file, subtype)` -> the bases that file's `class` statement writes, in
+    /// source order, for Python only. A dotted base (`pkg.Base`) is one entry
+    /// spelled with its dots, because it names a module's member and the last
+    /// segment alone names no class.
+    ///
+    /// [`Self::supertypes`] is flat by bare name, so two classes of one name in
+    /// two files share one entry. A Python class is identified by the file that
+    /// declares it, and its bases by the file's own imports, so this table is
+    /// the per-declaration half the `pytypes` walk reads before it falls back
+    /// to the flat one.
+    python_bases: BTreeMap<(String, String), Vec<String>>,
+    /// `file` -> local name -> everything the file's Python imports bind that
+    /// name to. A name bound to more than one thing is not a name the file
+    /// can be read as meaning one module at a class statement.
+    python_import_binds: BTreeMap<String, BTreeMap<String, BTreeSet<PythonImportBind>>>,
+    /// `(file, class name)` -> what each class of that name is written inside:
+    /// `(enclosing identity, whether it is a callable)`. Read from the symbols'
+    /// spans, because a class in a function and a class in a same-named class
+    /// share one identity.
+    python_class_enclosers: BTreeMap<(String, String), Vec<(String, bool)>>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -440,6 +462,9 @@ pub struct Resolver {
     /// built from those functions is exactly that. Only a name the literal
     /// itself spells is admitted, so the coincidence stays refused.
     module_value_members: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `file` → how each of its module-scope JS/TS const objects is built, in
+    /// source order. Read only through [`Self::object_member_target`].
+    js_objects: BTreeMap<String, jsobjects::FileObjects>,
     /// `(file, qualified name)` → the return type a callable's declaration
     /// writes, as the extractor recorded it. What types a factory-built value;
     /// read only through [`Self::factory_return_type`].
@@ -514,6 +539,13 @@ pub struct Resolver {
     /// that shields it from the dead-code pass. Answering "what declares this"
     /// is what makes the scope test possible.
     symbol_parents: BTreeMap<(String, String), String>,
+    /// `(file, parent scope, bare name)` → what that scope declares by that name.
+    ///
+    /// The inverse of `symbol_parents`, keyed so the lexical walk asks one
+    /// question per scope. Scanning every same-named symbol of the corpus per
+    /// scope made a bare read cost O(types sharing the name): 2,000 types each
+    /// declaring `id` retired 10.8x the instructions of 2,000 distinct names.
+    scope_children: BTreeMap<(String, String, String), Vec<(SymbolKind, Arc<str>)>>,
     go_modules: Vec<GoModule>,
     /// Whether `go_modules` was supplied for the snapshot currently indexed.
     ///
@@ -689,11 +721,15 @@ impl Resolver {
             poisoned_receiver_keys: BTreeSet::new(),
             type_methods: BTreeMap::new(),
             supertypes: BTreeMap::new(),
+            python_bases: BTreeMap::new(),
+            python_import_binds: BTreeMap::new(),
+            python_class_enclosers: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
             module_value_types: BTreeMap::new(),
             module_value_members: BTreeMap::new(),
+            js_objects: BTreeMap::new(),
             return_types: BTreeMap::new(),
             module_value_factories: BTreeMap::new(),
             declared_types: BTreeMap::new(),
@@ -703,6 +739,7 @@ impl Resolver {
             local_module_roots: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
             symbol_parents: BTreeMap::new(),
+            scope_children: BTreeMap::new(),
             go_modules: Vec::new(),
             go_modules_fresh: false,
             ts_projects: Vec::new(),
@@ -2313,13 +2350,113 @@ impl Resolver {
                     .get(&format!("{owner}:{owner}::{enclosing}:{name}@type"))
                     .and_then(|typed| Self::admissible_nominal_type(typed))
             })
-            .or_else(|| {
-                let shape = self
-                    .field_initializers
-                    .get(&format!("{file}:{qualified}:{name}"))?;
-                let family = self.family_of_file(file)?;
-                self.factory_return_type(family, file, None, shape)
-            })
+            .or_else(|| self.field_initializer_type(file, enclosing, name))
+    }
+
+    /// The type a field's own initializer gives it: what the factory
+    /// declares it returns, or, for Python's `self.engine = Engine()`, the
+    /// class the call names.
+    ///
+    /// The one reader of `field_initializers`, so the implicit-`self` rung
+    /// ([`Self::member_declared_type`]) and the explicit `self.field` rung
+    /// ([`Self::field_type_on`]) answer from the same fact. Keyed by the owning
+    /// class like every declared slot: class A's `self.engine = Engine()`
+    /// never types class B's `engine` in the same file.
+    fn field_initializer_type(&self, file: &str, owner: &str, field: &str) -> Option<String> {
+        if self
+            .poisoned_receiver_keys
+            .contains(&format!("field-initializer-unowned:{file}:{field}"))
+        {
+            return None;
+        }
+        let shape = self
+            .field_initializers
+            .get(&format!("{file}:{file}::{owner}:{field}"))?;
+        let family = self.family_of_file(file)?;
+        if family == LangFamily::Python && self.python_class_named(file, shape).is_some() {
+            return Some(shape.clone());
+        }
+        self.factory_return_type(family, file, None, shape)
+    }
+
+    /// Record `self.<field> = callee(..)` as `field`'s initializer on the class
+    /// that owns the method it is written in, however deeply a closure inside
+    /// that method nests it.
+    ///
+    /// A field is not one type when the file says two things about it, and the
+    /// entry is then dropped for good, because a winner picked by extraction
+    /// order is the confidently-wrong answer. That covers two different shapes
+    /// (in `__init__` and again in a reset method), a callee name the writing
+    /// function binds itself (a parameter or a rebound local is not the
+    /// imported class), and an assignment whose owning class cannot be found,
+    /// which poisons the field name for the whole file. The same shape written
+    /// twice is one fact.
+    fn record_python_field_initializer(
+        &mut self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+        field: &str,
+    ) {
+        if !matches!(
+            reference.kind,
+            ReferenceKind::Call | ReferenceKind::Constructor
+        ) {
+            return;
+        }
+        let file = ext.file_path.as_str();
+        let (Some(scope), Some(shape)) = (
+            reference.enclosing_symbol.as_deref(),
+            reference.initializer_shape(&ext.calls),
+        ) else {
+            return;
+        };
+        let Some(owner) = self.python_owning_class(file, scope) else {
+            self.poisoned_receiver_keys
+                .insert(format!("field-initializer-unowned:{file}:{field}"));
+            return;
+        };
+        let key = format!("{file}:{file}::{owner}:{field}");
+        let poison = format!("field-initializer:{key}");
+        if self.poisoned_receiver_keys.contains(&poison) {
+            return;
+        }
+        let callee_root = shape.split('.').next().unwrap_or(&shape);
+        let shadowed = self.python_name_is_rebound(file, scope, callee_root);
+        match self.field_initializers.get(&key) {
+            _ if shadowed => {
+                self.field_initializers.remove(&key);
+                self.poisoned_receiver_keys.insert(poison);
+            }
+            Some(existing) if *existing != shape => {
+                self.field_initializers.remove(&key);
+                self.poisoned_receiver_keys.insert(poison);
+            }
+            Some(_) => {}
+            None => {
+                self.field_initializers.insert(key, shape);
+            }
+        }
+    }
+
+    /// The class a Python symbol is written inside, walking out through the
+    /// functions and lambdas between: a closure in `C.__init__` writes `C`'s
+    /// `self`. `None` when no enclosing class is found.
+    fn python_owning_class(&self, file: &str, symbol: &str) -> Option<String> {
+        let mut current = symbol.to_string();
+        for _ in 0..64 {
+            let parent = self
+                .symbol_parents
+                .get(&(file.to_string(), current.clone()))
+                .filter(|parent| *parent != file)?
+                .clone();
+            // The nearest class wins: a class written inside a method owns the
+            // `self` its own methods write, and never the outer class's.
+            if let Some(class) = self.python_class_scope(file, &parent) {
+                return Some(class);
+            }
+            current = parent;
+        }
+        None
     }
 
     /// Type of `field` on `owner`, from the field Type ref indexed at build.
@@ -2349,6 +2486,10 @@ impl Resolver {
         .iter()
         .find_map(|key| self.scoped_receiver_types.get(key))
         .and_then(|t| Self::admissible_nominal_type(t))
+        // No annotation and no field Type ref: the initializer is the file's
+        // only statement of the type, the same fallback the implicit-`self`
+        // rung takes. A declaration always outranks it.
+        .or_else(|| self.field_initializer_type(file, &owner, field))
     }
 
     /// Bare-name miss: [`NoNamesake`] when the corpus has no symbol of that
@@ -2370,21 +2511,19 @@ impl Resolver {
         caller: Option<&str>,
         name: &str,
     ) -> Option<String> {
-        let hits = self.symbol_index.get(name)?;
+        // Absent everywhere: no scope can declare it.
+        self.symbol_index.get(name)?;
         let mut scope = caller.unwrap_or(file);
         for _ in 0..1024 {
-            let mut candidates = hits
-                .iter()
-                .filter(|(path, kind, _, identity)| {
-                    path == file
-                        && (!Self::family_needs_explicit_receiver(family)
-                            || *kind != SymbolKind::Method)
-                        && self
-                            .symbol_parents
-                            .get(&(file.to_string(), identity.to_string()))
-                            .is_some_and(|parent| parent == scope)
+            let mut candidates = self
+                .scope_children
+                .get(&(file.to_string(), scope.to_string(), name.to_string()))
+                .into_iter()
+                .flatten()
+                .filter(|(kind, _)| {
+                    !Self::family_needs_explicit_receiver(family) || *kind != SymbolKind::Method
                 })
-                .map(|(_, _, _, identity)| identity.as_ref());
+                .map(|(_, identity)| identity.as_ref());
             if let Some(first) = candidates.next() {
                 return candidates
                     .all(|other| other == first)
@@ -3036,11 +3175,15 @@ impl Resolver {
         self.poisoned_receiver_keys.clear();
         self.type_methods.clear();
         self.supertypes.clear();
+        self.python_bases.clear();
+        self.python_import_binds.clear();
+        self.python_class_enclosers.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
         self.module_value_types.clear();
         self.module_value_members.clear();
+        self.js_objects.clear();
         self.return_types.clear();
         self.module_value_factories.clear();
         self.declared_types.clear();
@@ -3050,6 +3193,7 @@ impl Resolver {
         self.local_module_roots.clear();
         self.qualified_names.clear();
         self.symbol_parents.clear();
+        self.scope_children.clear();
         self.go_package_by_file.clear();
         self.go_package_symbols.clear();
         self.go_package_methods.clear();
@@ -3140,14 +3284,28 @@ impl Resolver {
                         family,
                         Arc::clone(&identity),
                     ));
-                if sym.kind == SymbolKind::Method {
+                // A Swift property lives in the same per-type member index as a
+                // method, under its own key (`property_member`), so the one
+                // lookup machinery — typed receiver, implicit self, the
+                // supertype walk — serves both without a call ever meeting a
+                // property or a read ever mistaking one for the other. An enum
+                // case shares `Field` but is spelled and called like a method,
+                // so it keeps the plain key.
+                if sym.kind == SymbolKind::Method
+                    || Self::is_swift_member_property(family, sym.kind)
+                {
                     if let Some(type_name) = sym
                         .parent_symbol
                         .as_deref()
                         .and_then(|parent| parent.rsplit("::").next())
                     {
+                        let member = if sym.is_member_property() {
+                            Self::property_member(&sym.name)
+                        } else {
+                            sym.name.clone()
+                        };
                         self.type_methods
-                            .entry((family, type_name.to_string(), sym.name.clone()))
+                            .entry((family, type_name.to_string(), member))
                             .or_default()
                             .push((ext.file_path.clone(), sym.qualified_name.clone()));
                     }
@@ -3178,13 +3336,19 @@ impl Resolver {
                     })
                     .or_insert_with(|| Some(Arc::clone(&identity)));
                 // Parent links are keyed by full graph identity.
-                self.symbol_parents
+                let parent = self
+                    .symbol_parents
                     .entry((ext.file_path.clone(), sym.qualified_name.clone()))
                     .or_insert_with(|| {
                         sym.parent_symbol
                             .clone()
                             .unwrap_or_else(|| ext.file_path.clone())
-                    });
+                    })
+                    .clone();
+                self.scope_children
+                    .entry((ext.file_path.clone(), parent, sym.name.clone()))
+                    .or_default()
+                    .push((sym.kind, Arc::clone(&identity)));
                 // The markup/stylesheet namespace, kept out of the rungs above.
                 if matches!(sym.kind, SymbolKind::MarkupAnchor | SymbolKind::StyleRule) {
                     let declaring = self.selector_symbols.entry(sym.name.clone()).or_default();
@@ -4034,11 +4198,28 @@ impl Resolver {
             }
 
             let family = LangFamily::from_lang(&ext.language);
+            if family == LangFamily::Python {
+                let binds = pytypes::python_import_binds(ext);
+                if !binds.is_empty() {
+                    self.python_import_binds
+                        .insert(ext.file_path.clone(), binds);
+                }
+                for (key, encloser) in pytypes::python_class_enclosers(ext) {
+                    self.python_class_enclosers
+                        .entry(key)
+                        .or_default()
+                        .push(encloser);
+                }
+            }
             // X42. The supertype table, read from the heritage references the
             // extractor emits. `enclosing_symbol` on one of these is the
             // *declaring* type — that is what makes the `Extends` edge have two
             // endpoints — so its tail is the subtype's name and the reference's
             // own name is the supertype's.
+            // The span of the previous Python base written for a subtype: the
+            // extractor emits one reference per segment of a dotted base
+            // (`pkg.Base` is `pkg`, then `Base`) over one span.
+            let mut last_python_base: Option<(String, usize, usize)> = None;
             for reference in &ext.references {
                 if !matches!(
                     reference.kind,
@@ -4065,7 +4246,37 @@ impl Resolver {
                     .rsplit('.')
                     .next()
                     .unwrap_or(&reference.name);
-                if supertype.is_empty() || supertype == subtype {
+                if family == LangFamily::Python && !reference.name.is_empty() {
+                    let bases = self
+                        .python_bases
+                        .entry((ext.file_path.clone(), subtype.to_string()))
+                        .or_default();
+                    let span = (
+                        subtype.to_string(),
+                        reference.span.start_byte,
+                        reference.span.end_byte,
+                    );
+                    match bases.last_mut() {
+                        // The member comes first, then the qualifier segments
+                        // from the root down (`C`, `a`, `b` for `a.b.C`).
+                        Some(last) if last_python_base.as_ref() == Some(&span) => {
+                            *last = match last.rsplit_once('.') {
+                                Some((qualifier, member)) => {
+                                    format!("{qualifier}.{}.{member}", reference.name)
+                                }
+                                None => format!("{}.{last}", reference.name),
+                            };
+                        }
+                        _ => bases.push(reference.name.clone()),
+                    }
+                    last_python_base = Some(span);
+                }
+                // An opaque base names no class: it has no supertype row.
+                if supertype.is_empty()
+                    || supertype == subtype
+                    || (family == LangFamily::Python
+                        && reference.name == OPAQUE_BASE)
+                {
                     continue;
                 }
                 self.supertypes
@@ -4081,6 +4292,16 @@ impl Resolver {
                 let Some(receiver) = &reference.assigned_to else {
                     continue;
                 };
+                // `self.engine = Engine()`: the extractor spells a Python field
+                // target `self.<name>`, which is no local's name, so it never
+                // reaches the receiver maps below. It is the owning class's
+                // initializer for that field, read by `field_initializer_type`.
+                if family == LangFamily::Python {
+                    if let Some(field) = receiver.strip_prefix("self.") {
+                        self.record_python_field_initializer(ext, reference, field);
+                        continue;
+                    }
+                }
                 // A Kotlin property initialized by a factory call names no type,
                 // but the factory's declaration does. `lazy` itself is the
                 // delegate, not the value.
@@ -4168,6 +4389,7 @@ impl Resolver {
                 }
             }
             self.index_module_value_types(ext, family);
+            self.index_js_objects(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
             // are indexed just above; this pass is a second walk so a field
@@ -5564,6 +5786,60 @@ impl Resolver {
                         }
                     }
 
+                    // 2a''. A member of a module-scope JS/TS const object built
+                    // by spread, `Object.assign`, an alias or a forwarding
+                    // property (`debugLogger.warn()` for `{ ...core }`): the
+                    // member's own declaration, by JavaScript's last-write-wins
+                    // order. A receiver the call's scope rebinds is not the
+                    // module's object, and a member no step can be proven to
+                    // define falls through to the rungs below unchanged.
+                    if resolution.is_none() && family == LangFamily::JsTs {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            let first = recv.split('.').next().unwrap_or(recv);
+                            let shadowed = ext.local_binding_at(call.span.start_byte, first).is_some()
+                                || call.caller_symbol.as_deref().is_some_and(|scope| {
+                                    self.scope_declares_local(&ext.file_path, scope, first)
+                                });
+                            if !shadowed {
+                                let use_at = call
+                                    .caller_symbol
+                                    .is_none()
+                                    .then_some(call.span.start_byte);
+                                match self.object_member_target(
+                                    &ext.file_path,
+                                    recv,
+                                    &call.callee_name,
+                                    use_at,
+                                ) {
+                                    jsobjects::ObjectMember::Bound(target_file, target_symbol) => {
+                                        resolution = Some(Arc::new(if target_file == ext.file_path {
+                                            Resolution::SameFile { target_symbol, target_file }
+                                        } else {
+                                            Resolution::ImportScoped {
+                                                target_symbol,
+                                                target_file,
+                                                imported_from: recv.to_string(),
+                                            }
+                                        }));
+                                    }
+                                    // The object is known and some step that
+                                    // may define this member is not readable:
+                                    // a later rung would answer with a
+                                    // namesake the object does not have.
+                                    jsobjects::ObjectMember::Abstain => {
+                                        resolution = Some(Arc::new(Resolution::Unresolved {
+                                            reason: format!(
+                                                "the receiver is an object whose member {:?} is written by a step that cannot be read",
+                                                call.callee_name
+                                            ),
+                                        }));
+                                    }
+                                    jsobjects::ObjectMember::Absent => {}
+                                }
+                            }
+                        }
+                    }
+
                     // 2b. Import-scoped module.method (G6 — no silent global widen)
                     if resolution.is_none() {
                         let (recv, method) = if let Some(r) = &call.receiver_expr {
@@ -6291,6 +6567,14 @@ impl Resolver {
                     ) {
                         continue;
                     }
+                    // A Python base no name denotes is a fact about the MRO,
+                    // not a reference to attribute: it is neither an edge nor
+                    // a failed attribution.
+                    if reference.kind == ReferenceKind::Heritage
+                        && reference.name == OPAQUE_BASE
+                    {
+                        continue;
+                    }
                     // A DOM or stylesheet identity, answered by its own two-rung
                     // ladder and by nothing else. It never reaches the code
                     // rungs below, and a name they cannot find is not recorded
@@ -6649,6 +6933,11 @@ impl Resolver {
             ))
         });
 
+        debug_assert!(
+            self.dangling_swift_targets(&edges).is_empty(),
+            "an edge targets a spelling that is no indexed symbol: {:?}",
+            self.dangling_swift_targets(&edges)
+        );
         Ok(ResolutionResult {
             edges,
             receiver_types: self.receiver_types.clone(),
@@ -6866,11 +7155,86 @@ impl Resolver {
         // A macro is invoked as `name!(..)`, which its own reference records;
         // `name()` is a function call, so a macro is never its target.
         kind == SymbolKind::Macro
+            // A Swift property (or enum case) is a member its owner's receiver
+            // names, and `name()` never reaches one through a bare spelling: the
+            // bare-name rungs would otherwise bind any unique namesake in the
+            // module, which is the unique-global defect (ft-0e6cc90f) on the
+            // property surface. A typed or implicit `self` receiver reaches it
+            // through `type_methods`, which this does not touch.
+            || Self::is_swift_member_property(family, kind)
             || (kind == SymbolKind::Interface
                 && matches!(
                     family,
                     LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
                 ))
+    }
+
+    /// Whether a symbol of `kind` in `family` is a member the language reaches
+    /// only through a receiver: a Swift stored or computed property, or an enum
+    /// case (the two share `Field`).
+    fn is_swift_member_property(family: LangFamily, kind: SymbolKind) -> bool {
+        family == LangFamily::Swift && kind == SymbolKind::Field
+    }
+
+    /// Swift use edges whose target is not the identity of a symbol the target
+    /// file declares — `source -> x` where `x` is a bare member spelling.
+    ///
+    /// The invariant every use edge must keep: its target names a declaration.
+    /// `qualified_for` answers a bare spelling only when the file declares it
+    /// once, so a rung that passes the spelling instead of the declaration's own
+    /// identity emits a dangling edge exactly when a second type reuses the name.
+    /// Checked by `resolve_all` in debug builds and by the resolve tests through
+    /// [`Self::dangling_targets`].
+    fn dangling_swift_targets(&self, edges: &[ResolvedEdge]) -> Vec<String> {
+        edges
+            .iter()
+            .filter(|edge| {
+                matches!(
+                    edge.edge_kind,
+                    EdgeKind::Calls
+                        | EdgeKind::References
+                        | EdgeKind::Extends
+                        | EdgeKind::Implements
+                ) && edge.target_file.ends_with(".swift")
+            })
+            .filter(|edge| {
+                !self
+                    .symbol_index
+                    .get(&edge.target_symbol)
+                    .is_some_and(|hits| {
+                        hits.iter().any(|(path, _, _, identity)| {
+                            *path == edge.target_file && **identity == *edge.target_symbol
+                        })
+                    })
+            })
+            .map(|edge| format!("{} -> {}", edge.source_symbol, edge.target_symbol))
+            .collect()
+    }
+
+    /// The edges of `result` that [`Self::dangling_swift_targets`] rejects, for
+    /// tests that assert the invariant on a resolution's output.
+    pub fn dangling_targets(&self, result: &ResolutionResult) -> Vec<String> {
+        self.dangling_swift_targets(&result.edges)
+    }
+
+    /// The `type_methods` member key a property is filed under. A property and
+    /// a method of one base name (`var size` beside `func size(_:)`) are two
+    /// members of one type, and a call may reach only the method while a read
+    /// reaches the property first. `\u{1}` is no character of a Swift
+    /// identifier, so no method key can equal one.
+    fn property_member(name: &str) -> String {
+        format!("\u{1}{name}")
+    }
+
+    /// The member keys a *read* of `name` consults, in order: a Swift property
+    /// first, then a method or enum case of that name used as a value
+    /// (`map(self.helper)`). A call consults only the plain key.
+    fn read_members(family: LangFamily, name: &str) -> Vec<String> {
+        if family == LangFamily::Swift {
+            vec![Self::property_member(name), name.to_string()]
+        } else {
+            vec![name.to_string()]
+        }
     }
 
     fn parent_dir(current_file: &str) -> String {
@@ -7964,6 +8328,19 @@ impl Resolver {
         }
         let (target_file, target_symbol, receiver_type) =
             self.supertype_method(family, vec![enclosing.clone()], method)?;
+        // The breadth-first walk has no unknown or ambiguous bases and no
+        // order. For Python the class's own MRO walk can veto its answer: an
+        // opaque or ambiguous base ahead of the declaring class, or a different
+        // class first in the MRO, means the edge would be a guess. It never
+        // adds an answer (a diamond the walk refuses stays refused).
+        if family == LangFamily::Python {
+            match self.python_mro_method(file, &enclosing, method) {
+                pytypes::MroAnswer::Found(found)
+                    if found.file == target_file && found.symbol == target_symbol => {}
+                pytypes::MroAnswer::NotScoped => {}
+                _ => return None,
+            }
+        }
         Some(self.implicit_receiver_unique(
             family,
             &enclosing,
@@ -9750,28 +10127,55 @@ impl Resolver {
             ));
         }
         if let Some(class_type) = receiver_type.filter(|_| !class_is_known) {
-            if let Some(((target_file, target_symbol), receiver_type)) = self
-                .receiver_method_through_deref(
-                    ext,
-                    family,
-                    reference.enclosing_symbol.as_deref(),
-                    receiver,
-                    binding,
-                    &class_type,
-                    name,
-                )
-            {
-                return Some(self.reference_edge(
-                    ext,
-                    target_file,
-                    target_symbol,
-                    reference,
-                    Resolution::ReceiverType {
-                        target_symbol: self.qualified_for(target_file, target_symbol),
-                        target_file: target_file.clone(),
-                        receiver_type,
-                    },
-                ));
+            for member in Self::read_members(family, name) {
+                if let Some(((target_file, target_symbol), receiver_type)) = self
+                    .receiver_method_through_deref(
+                        ext,
+                        family,
+                        reference.enclosing_symbol.as_deref(),
+                        receiver,
+                        binding,
+                        &class_type,
+                        &member,
+                    )
+                {
+                    return Some(self.reference_edge(
+                        ext,
+                        target_file,
+                        target_symbol,
+                        reference,
+                        Resolution::ReceiverType {
+                            target_symbol: self.qualified_for(target_file, target_symbol),
+                            target_file: target_file.clone(),
+                            receiver_type,
+                        },
+                    ));
+                }
+                // Swift: a member the type does not write is the one a
+                // superclass supplies, as it is for a call.
+                if family == LangFamily::Swift
+                    && !self.type_methods.contains_key(&(
+                        family,
+                        class_type.clone(),
+                        member.clone(),
+                    ))
+                {
+                    if let Some((target_file, target_symbol, receiver_type)) =
+                        self.inherited_method(family, &class_type, &member)
+                    {
+                        return Some(self.reference_edge(
+                            ext,
+                            &target_file,
+                            &target_symbol,
+                            reference,
+                            Resolution::ReceiverType {
+                                target_symbol: self.qualified_for(&target_file, &target_symbol),
+                                target_file: target_file.clone(),
+                                receiver_type,
+                            },
+                        ));
+                    }
+                }
             }
         }
 
@@ -9813,23 +10217,25 @@ impl Resolver {
             && Self::is_plain_ident(receiver)
             && receiver.chars().next().is_some_and(char::is_uppercase)
         {
-            let key = (family, receiver.to_string(), name.to_string());
-            if let Some((target_file, target_symbol)) = self
-                .type_methods
-                .get(&key)
-                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
-            {
-                return Some(self.reference_edge(
-                    ext,
-                    target_file,
-                    target_symbol,
-                    reference,
-                    Resolution::ReceiverType {
-                        target_symbol: self.qualified_for(target_file, target_symbol),
-                        target_file: target_file.to_string(),
-                        receiver_type: receiver.to_string(),
-                    },
-                ));
+            for member in Self::read_members(family, name) {
+                let key = (family, receiver.to_string(), member);
+                if let Some((target_file, target_symbol)) = self
+                    .type_methods
+                    .get(&key)
+                    .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+                {
+                    return Some(self.reference_edge(
+                        ext,
+                        target_file,
+                        target_symbol,
+                        reference,
+                        Resolution::ReceiverType {
+                            target_symbol: self.qualified_for(target_file, target_symbol),
+                            target_file: target_file.to_string(),
+                            receiver_type: receiver.to_string(),
+                        },
+                    ));
+                }
             }
         }
 
@@ -9883,7 +10289,11 @@ impl Resolver {
         let implicit = Self::receiver_is_self(receiver);
         if implicit {
             let answer = reference.enclosing_symbol.as_deref().and_then(|caller| {
-                self.implicit_receiver_target(&ext.file_path, family, caller, name)
+                Self::read_members(family, name)
+                    .into_iter()
+                    .find_map(|member| {
+                        self.implicit_receiver_target(&ext.file_path, family, caller, &member)
+                    })
             })?;
             match answer {
                 ImplicitReceiverAnswer::Unique {
@@ -9891,10 +10301,14 @@ impl Resolver {
                     target_symbol,
                     receiver_type,
                 } => {
+                    // The declaration's own identity, not the bare spelling:
+                    // `qualified_for` answers a bare name only when the file
+                    // declares it once, and a second type spelling it left the
+                    // edge pointing at `x`, which is no symbol anywhere.
                     return Some(self.reference_edge(
                         ext,
                         &target_file,
-                        name,
+                        &target_symbol.clone(),
                         reference,
                         Resolution::ReceiverType {
                             target_symbol,
@@ -10198,6 +10612,39 @@ impl Resolver {
             }
         }
 
+        // Swift: a bare name inside a type is `self.name`, and the member may be
+        // one the lexical walk cannot see — a superclass's, a protocol
+        // extension's, or the type's own declared in another file. Without this
+        // such a read was dropped silently, and the property it names reported
+        // dead.
+        if family == LangFamily::Swift
+            && receiver.is_none()
+            && reference.kind == ReferenceKind::Name
+        {
+            if let Some(caller) = reference.enclosing_symbol.as_deref() {
+                for member in Self::read_members(family, name) {
+                    if let Some(ImplicitReceiverAnswer::Unique {
+                        target_file,
+                        target_symbol,
+                        receiver_type,
+                    }) = self.implicit_receiver_target(&ext.file_path, family, caller, &member)
+                    {
+                        return Some(self.reference_edge(
+                            ext,
+                            &target_file,
+                            &target_symbol,
+                            reference,
+                            Resolution::ReceiverType {
+                                target_symbol: target_symbol.clone(),
+                                target_file: target_file.clone(),
+                                receiver_type,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut bound_by_unfollowable_import = false;
         if let Some(bindings) = self
             .import_bindings
@@ -10278,7 +10725,7 @@ impl Resolver {
                 return Some(self.reference_edge(
                     ext,
                     &target_file,
-                    name,
+                    &target_symbol.clone(),
                     reference,
                     Resolution::SamePackage {
                         target_symbol,
@@ -10351,7 +10798,7 @@ impl Resolver {
                 return Some(self.reference_edge(
                     ext,
                     target_f,
-                    name,
+                    target_identity,
                     reference,
                     Resolution::UniqueGlobal {
                         target_symbol: target_identity.to_string(),

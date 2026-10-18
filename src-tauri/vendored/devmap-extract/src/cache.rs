@@ -708,7 +708,94 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// module-scope `const`/`let`/`var` name in `scope_locals` under the file's own
 /// name, so a private module-scope binding is no longer invisible. A v93 row has
 /// neither.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "94";
+///
+/// v95 stamps a Python call reference that is the whole right-hand side of
+/// `self.name = callee(..)` with `assigned_to = "self.name"`, so the resolver
+/// can type the field from its initializer. A v94 row carries `None` there.
+///
+/// v95 also changed which Python bases heritage records: only the positional
+/// entries of a class's argument list are bases (`metaclass=M` and `**kw` are
+/// not), and a subscripted base (`Base[int]`) is its value. A v94 row recorded
+/// keyword arguments as bases.
+///
+/// v96 changes Python heritage again: parentheses around
+/// a base are stripped; any other positional entry that is not a name, an
+/// attribute or a subscript of one (`*mixins`, `make_base()`, `A if c else B`)
+/// is recorded in position as the opaque marker [`crate::model::OPAQUE_BASE`],
+/// so the resolver sees an unknown class ahead of the ones after it instead of
+/// a hierarchy with the entry missing; and a dotted base's segments keep their
+/// emission order (member first, then the qualifier from the root down) instead
+/// of being sorted by name. A v95 row dropped those entries and ordered the
+/// segments alphabetically.
+///
+/// v96 also adds `Extraction::js_objects` (JS/TS, including `<script>` blocks
+/// of Vue/Svelte/Astro): how each module-scope `const` object is built — literal
+/// members, spreads, `Object.assign` sources and plain aliases, in source order
+/// — and every later write that can change its members: `Object.assign(name,
+/// …)`, `name.k = …`, `delete name.k`, `Object.defineProperty`/`Reflect.set`
+/// and friends, plus any place the object escapes (passed to a call, returned,
+/// stored in another value). Each carries whether it runs conditionally or
+/// inside a callable. The field is additive, but a v95 row has none of it, and
+/// the resolver cannot tell "no objects" from "not collected": served as
+/// current it would leave every unchanged JS/TS file without the spread,
+/// alias and member-write answers. The bump is what keeps such a row from
+/// being served at all.
+///
+/// v97 records a Swift member property as a symbol. A stored or computed
+/// `let`/`var` written directly in a `class`, `struct`, `enum`, `actor`,
+/// `extension` or `protocol` body — `static`, `class`, `lazy`, property-wrapped
+/// and observer-bearing ones included — is a [`crate::model::SymbolKind::Field`]
+/// named by its bound identifier and owned by its type's bare name, as a method
+/// is (`App.swift::Person.count`); a protocol property requirement is one too.
+/// A `let`/`var` inside a function, closure or accessor body, and one at file
+/// level, is not. Calls and references inside a property's initializer or
+/// getter keep the enclosing *type* as their caller, as before. The symbol
+/// carries a wiring exemption where a framework or the compiler is the reader
+/// (an attribute, `override`, a protocol requirement, a stored property of a
+/// type with supertypes). v97 also stops a Swift argument label (`f(count: 1)`)
+/// and a leading-dot member (`.count`) being recorded as a `Name` reference,
+/// which would now bind to a property; a leading-dot member written against a
+/// stated type (`-> Shape { .circle(1) }`, `var v: Shape = .circle(1)`) is
+/// recorded with that type as its receiver instead. A Swift property carries
+/// the `signature` `stored property`, `computed property` or `property
+/// requirement`, which is what tells it from an enum case; a key path
+/// (`\S.secret`) records its root type as the receiver; the right operand of an
+/// infix operator keeps its own receiver (`p.a + q.b` reads `q.b`, not `p.a +
+/// q`); a body written in an extension's computed property is attributed to
+/// that property; and an enum case's own name is no file-scope local. A v96 row
+/// has no property symbol and still records the old spellings, so serving it
+/// would leave every unchanged Swift file with no property for a read to bind
+/// to.
+///
+/// v97 also changes Python extractor output (Python heritage, scope-local and
+/// decorator work), which the same bump covers:
+/// (1) heritage rows read a dotted base's segments from the attribute nodes (a
+/// comment, line continuation or parenthesis between segments no longer makes
+/// the base opaque: `(a).b.C`); the self-reference skip drops only a base that
+/// is exactly the class's own bare name, so `class Model(models.Model)` records
+/// `Model`, `models` and `class b(a.b.C)` records `C`, `a`, `b`; a subscript
+/// with ONE index that is a numeric literal, slice or arithmetic (`bases[0]`)
+/// is the opaque marker, not a base named `bases`, while a parameter list
+/// (`Array[float, 3]`) is the base named by its value. (2) `scope_locals` gains,
+/// under the file's own name, each Python module-scope name bound by a
+/// `for`/`with`/`except`/`except*` target, a walrus, a `del` (parenthesised,
+/// tuple or list targets too), a `match` capture pattern, or a function's
+/// `global` declaration PLUS a binding of that name in the same function (a
+/// bare `global A` binds nothing); and, under `{file}::__all__`, the names a
+/// literal `__all__` lists. (3) A `@staticmethod`/`@classmethod` decorator is
+/// the builtin only when the bare name is not bound textually before the
+/// decorator at module scope (a `from builtins import staticmethod [as sm]` is
+/// the builtin and is no rebinding), or its attribute's object is the
+/// `builtins` module (literal, a module-scope `import builtins as X` neither
+/// rebound before the decorator, or `__import__('builtins')`); a function-scope
+/// import or binding is another scope. A `self.x = A()` field in a method the
+/// old classifier called static is now recorded. (4) The `torch.autograd.
+/// Function` / `nn.Module` dispatch exemption reads the base through the
+/// module-scope imports (`from torch import nn as N`, `from torch.autograd
+/// import Function` are now matched) and applies only when each import of the
+/// root names `torch`; a root no import binds is read as written. A v96 row has
+/// none of these.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "97";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -1,6 +1,6 @@
 [package]
 name = "devmap-analyze"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -197,4 +197,16 @@ required-features = ["parse"]
 
 [[test]]
 name = "swift_receiver_collapse_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "swift_properties_dead_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "swift_close_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "python_heritage_attack3"
 required-features = ["parse"]

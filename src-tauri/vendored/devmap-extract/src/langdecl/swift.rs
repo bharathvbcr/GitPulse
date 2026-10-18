@@ -45,8 +45,9 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
         // and `subscript` is reached through `a[i]`, which `langcalls::swift`
         // deliberately refuses to record as a call.
         "init_declaration" | "deinit_declaration" | "subscript_declaration" => None,
-        // A protocol property requirement is not emitted: a stored or computed
-        // property is no symbol anywhere in this graph.
+        // A protocol property requirement is declared by the `simple_identifier`
+        // naming it (see `property_declaration_of`), exactly as every other
+        // property is, so the declaration node itself emits nothing.
         //
         // A protocol *function* requirement is, owned by its protocol. It was
         // withheld while a receiver typed by a protocol could not be resolved at
@@ -74,7 +75,13 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
             // cannot join a reference attributed to the nested class — the
             // enclosing symbol is `Workspace.ActiveSaveRequest` — so a field
             // typed as the nested enum was confident-dead on a live save path.
-            let owner = if matches!(declared_kind, SymbolKind::Field | SymbolKind::Enum) {
+            //
+            // A property is owned by its type's bare name, as a method is: a
+            // read writes `p.count` against the type, and the resolver keys a
+            // type's members by that bare name.
+            let owner = if property_declaration_of(node).is_some() {
+                enclosing_owner(node, source, owner_identity)
+            } else if matches!(declared_kind, SymbolKind::Field | SymbolKind::Enum) {
                 super::enclosing_owner_path(node, source, declaration)
             } else {
                 enclosing_owner(node, source, owner_identity)
@@ -136,15 +143,209 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         // Emitting these closes the asymmetry SC31 named for C macros:
         // `Payload.text("z")` is already recorded as a call, and without the
         // case there is no node it could ever resolve to.
-        "simple_identifier"
-            if crate::treesitter::bounded_parent(node)
-                .is_some_and(|parent| parent.kind() == "enum_entry")
-                && is_named_child(node, "name") =>
-        {
+        "simple_identifier" if is_enum_case_name(node) => {
+            Some((SymbolKind::Field, get_node_text(node, source)))
+        }
+        // A stored or computed property of a type, of an extension or of a
+        // protocol. It reuses `Field`, the kind an enum case already carries
+        // (and the one `devmap-query` presents as `property`), rather than
+        // adding a parallel kind.
+        //
+        // Keyed on the *name node* for the enum-case reason: `var a = 1, b = 2`
+        // is one `property_declaration` with two names, and `let (x, y) = pair`
+        // binds two names from one pattern.
+        "simple_identifier" if property_declaration_of(node).is_some() => {
             Some((SymbolKind::Field, get_node_text(node, source)))
         }
         _ => None,
     }
+}
+
+/// The `property_declaration` (or protocol requirement) that `node` names, when
+/// `node` is a bound name of a **member** property.
+///
+/// A member is a property written directly in a `class_body`, `enum_class_body`
+/// or `protocol_body`. A `let`/`var` anywhere else is not a symbol: inside a
+/// function, initializer, closure or accessor body it is a local, which the
+/// scope pass binds, and at file level it is a global this graph does not model.
+/// Requiring the declaration's *direct* parent to be a type body is what keeps a
+/// `let` inside a computed property's getter from being mistaken for a member of
+/// the type that getter belongs to.
+pub(crate) fn property_declaration_of(node: Node) -> Option<Node> {
+    match name_role(node) {
+        Role::Property(raw) => {
+            // SAFETY: the same argument `parent_index::parent` makes. `raw` was
+            // taken from a live `Node` of the tree `node` belongs to (checked by
+            // the tree identity stored beside it in `ROLES`), the cache is
+            // emptied by `reset_roles` before the next file's tree exists, and
+            // no pointer is cast or fabricated.
+            Some(unsafe { Node::from_raw(raw) })
+        }
+        Role::EnumCase | Role::Other => None,
+    }
+}
+
+/// What a `simple_identifier` declares, if anything.
+#[derive(Clone, Copy)]
+enum Role {
+    /// A bound name of a member property; carries its declaration.
+    Property(tree_sitter::ffi::TSNode),
+    /// A name an `enum_entry` declares.
+    EnumCase,
+    Other,
+}
+
+thread_local! {
+    /// `(tree, role)` by node id, for the file being extracted.
+    ///
+    /// Every rule that asks "is this a property name" asks it of the same
+    /// identifier several times — the declaration, its owner, its visibility,
+    /// its exemption, its signature, the locals pass — and each answer walks
+    /// up the tree. tree-sitter's own `parent` costs time proportional to the
+    /// siblings it passes, and a type with tens of thousands of members is one
+    /// body of that many children, so the repeated walks were quadratic: 30,000
+    /// properties retired 3.2x the instructions of the same file with no
+    /// property symbols. One answer per identifier makes it a single walk.
+    static ROLES: std::cell::RefCell<std::collections::HashMap<usize, (*const tree_sitter::ffi::TSTree, Role)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Forget every cached role. Node ids are arena addresses, reused once a tree
+/// is dropped, so the cache must not outlive its file.
+pub(crate) fn reset_roles() {
+    ROLES.with(|roles| roles.borrow_mut().clear());
+}
+
+fn name_role(node: Node) -> Role {
+    if node.kind() != "simple_identifier" {
+        return Role::Other;
+    }
+    let tree = node.into_raw().tree;
+    let key = node.id();
+    if let Some(known) = ROLES.with(|roles| {
+        roles
+            .borrow()
+            .get(&key)
+            .filter(|(cached_tree, _)| *cached_tree == tree)
+            .map(|(_, role)| *role)
+    }) {
+        return known;
+    }
+    let role = compute_role(node);
+    ROLES.with(|roles| roles.borrow_mut().insert(key, (tree, role)));
+    role
+}
+
+fn compute_role(node: Node) -> Role {
+    // Called for every identifier in the file, so the cheap test comes first:
+    // the parent's own field, not a scan of its children.
+    let Some(parent) = crate::treesitter::bounded_parent(node) else {
+        return Role::Other;
+    };
+    if parent.kind() == "enum_entry" {
+        return if is_named_child(node, "name") {
+            Role::EnumCase
+        } else {
+            Role::Other
+        };
+    }
+    match member_property_declaration(node, parent) {
+        Some(declaration) => Role::Property(declaration.into_raw()),
+        None => Role::Other,
+    }
+}
+
+fn member_property_declaration<'tree>(
+    node: Node<'tree>,
+    parent: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if parent.kind() != "pattern"
+        || parent
+            .child_by_field_name("bound_identifier")
+            .is_none_or(|bound| bound.id() != node.id())
+    {
+        return None;
+    }
+    // `let (x, y) = …` nests one pattern per tuple element. A `pattern` that is
+    // a direct child of the declaration is always a bound name: the initializer
+    // is its `value` and a type annotation is its own node.
+    let mut ancestor = parent;
+    while ancestor.kind() == "pattern" {
+        ancestor = crate::treesitter::bounded_parent(ancestor)?;
+    }
+    if !matches!(
+        ancestor.kind(),
+        "property_declaration" | "protocol_property_declaration"
+    ) {
+        return None;
+    }
+    let body = crate::treesitter::bounded_parent(ancestor)?;
+    matches!(
+        body.kind(),
+        "class_body" | "enum_class_body" | "protocol_body"
+    )
+    .then_some(ancestor)
+}
+
+/// Whether `node` is a name an `enum_entry` declares (`fast` and `slow` in
+/// `case fast, slow`).
+pub(crate) fn is_enum_case_name(node: Node) -> bool {
+    matches!(name_role(node), Role::EnumCase)
+}
+
+/// The name node of the property `parent` declares, when `parent` is a
+/// `property_declaration` written in an `extension` body and `inside` lies in its
+/// value (an initializer or a computed body) rather than in its name or type.
+pub(crate) fn extension_property_symbol<'tree>(
+    parent: Node<'tree>,
+    inside: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if parent.kind() != "property_declaration" {
+        return None;
+    }
+    let body = crate::treesitter::bounded_parent(parent)?;
+    let owner = crate::treesitter::bounded_parent(body)?;
+    if body.kind() != "class_body" || owner.kind() != "class_declaration" {
+        return None;
+    }
+    let is_extension = owner
+        .child_by_field_name("declaration_kind")
+        .is_some_and(|kind| kind.kind() == "extension");
+    if !is_extension {
+        return None;
+    }
+    let value = parent
+        .child_by_field_name("computed_value")
+        .or_else(|| parent.child_by_field_name("value"))?;
+    if inside.start_byte() < value.start_byte() || inside.end_byte() > value.end_byte() {
+        return None;
+    }
+    let mut cursor = parent.walk();
+    let mut pattern = parent
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "pattern")?;
+    // `let (a, b) = …` binds several names; the first stands for the declaration.
+    while pattern.child_by_field_name("bound_identifier").is_none() {
+        let mut inner = pattern.walk();
+        let next = pattern
+            .named_children(&mut inner)
+            .find(|child| child.kind() == "pattern")?;
+        pattern = next;
+    }
+    pattern.child_by_field_name("bound_identifier")
+}
+
+/// The `signature` a member property is emitted with (see
+/// [`crate::model::SWIFT_STORED_PROPERTY`]), or `None` when `node` is not one.
+pub(crate) fn property_signature(node: Node) -> Option<&'static str> {
+    let property = property_declaration_of(node)?;
+    Some(if property.kind() == "protocol_property_declaration" {
+        crate::model::SWIFT_PROPERTY_REQUIREMENT
+    } else if property_is_computed(property) {
+        crate::model::SWIFT_COMPUTED_PROPERTY
+    } else {
+        crate::model::SWIFT_STORED_PROPERTY
+    })
 }
 
 /// Whether `node` occupies `field` on its own parent.
@@ -244,6 +445,9 @@ fn visibility_modifier(node: Node, source: &str) -> Option<String> {
 /// Only the declaration's own list is read. Reading its text instead — which is
 /// what `generic_is_exported` does — reaches into every body it contains.
 fn modifier_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    // A property's modifiers hang off its `property_declaration`, not off the
+    // name node that is the symbol.
+    let node = property_declaration_of(node).unwrap_or(node);
     let mut cursor = node.walk();
     let modifiers = node
         .named_children(&mut cursor)
@@ -336,6 +540,9 @@ pub(crate) fn exemption(
             WiringKind::StructuralExempt,
             "Swift protocol requirement — declares what a conformer must provide, so no caller of its own is expected",
         ));
+    }
+    if let Some(property) = property_declaration_of(node) {
+        return property_exemption(property, node, source);
     }
     // An enum case is reached through leading-dot inference — `let m: Mode =
     // .fast`, `case .number(let n)` — which names the case without naming its
@@ -475,6 +682,101 @@ fn enclosing_type_is_xctest(node: Node, source: &str) -> bool {
         ancestor = crate::treesitter::bounded_parent(parent);
     }
     false
+}
+
+/// Why a member property is reached without an observable read.
+///
+/// Every reason is evidence on the declaration or on the type it is written in,
+/// and the rule fails closed: a property is a dead-code candidate only when
+/// nothing but a read could reach it.
+///
+/// * A protocol requirement declares what a conformer provides.
+/// * An attribute makes the framework a reader — a property wrapper
+///   (`@Published`, `@State`, `@AppStorage`) is read through its projected
+///   value `$name`, which names no property, and `@objc`/`@IBOutlet`/`@NSManaged`
+///   publish it to the Objective-C runtime.
+/// * `override` is read by the declaring superclass.
+/// * A type that lists any supertype may satisfy a requirement with a
+///   non-private property, and its synthesized `Codable`/`Equatable`/`Hashable`
+///   conformance reads **every stored property, private ones included**. The
+///   supertype named may itself inherit `Codable` (`protocol Model: Codable`),
+///   so the conformance list is not narrowed to a known name.
+fn property_exemption(
+    property: Node,
+    name: Node,
+    source: &str,
+) -> Option<(WiringKind, &'static str)> {
+    if property.kind() == "protocol_property_declaration" {
+        return Some((
+            WiringKind::StructuralExempt,
+            "Swift protocol property requirement — declares what a conformer must provide, so no reader of its own is expected",
+        ));
+    }
+    if let Some(attribute) = attribute_names(name, source).first() {
+        return Some(match crate::wiring::swift_attribute_entry_reason(attribute) {
+            Some(reason) => (WiringKind::RuntimeEntryPoint, reason),
+            None => (
+                WiringKind::StructuralExempt,
+                "Swift attributed property (property wrapper or runtime-visible) is read by the framework through its projected value or by name",
+            ),
+        });
+    }
+    if has_member_modifier(name, source, "override") {
+        return Some((
+            WiringKind::RuntimeEntryPoint,
+            "Swift property override read by the declaring superclass or framework",
+        ));
+    }
+    let container = enclosing_type_declaration(property);
+    if container.is_some_and(|container| {
+        attribute_names(container, source)
+            .iter()
+            .any(|attribute| attribute == "objcMembers")
+    }) {
+        return Some((
+            WiringKind::RuntimeEntryPoint,
+            "published to the Objective-C runtime by the enclosing type's @objcMembers",
+        ));
+    }
+    let conforms =
+        container.is_some_and(|container| !inherited_types(container, source).is_empty());
+    if !conforms {
+        return None;
+    }
+    let private = !is_exported(name, source);
+    let stored = !property_is_computed(property);
+    if !private {
+        return Some((
+            WiringKind::StructuralExempt,
+            "Swift property of a type with supertypes — it may witness a protocol requirement or be read by a synthesized conformance",
+        ));
+    }
+    stored.then_some((
+        WiringKind::StructuralExempt,
+        "Swift private stored property of a type with supertypes — a synthesized Codable, Equatable or Hashable conformance reads every stored property",
+    ))
+}
+
+/// Whether a `property_declaration` computes its value rather than storing it.
+fn property_is_computed(property: Node) -> bool {
+    let mut cursor = property.walk();
+    let computed = property
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "computed_property");
+    computed
+}
+
+/// The `class_declaration` or `protocol_declaration` a member is written in —
+/// an extension included — or `None` outside a type.
+fn enclosing_type_declaration(node: Node) -> Option<Node> {
+    let mut ancestor = crate::treesitter::bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if matches!(parent.kind(), "class_declaration" | "protocol_declaration") {
+            return Some(parent);
+        }
+        ancestor = crate::treesitter::bounded_parent(parent);
+    }
+    None
 }
 
 /// Whether an owner path ends in the reserved `CodingKeys` segment.

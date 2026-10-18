@@ -19,7 +19,7 @@
 //! an actual parse of the language in question; the fixtures that produced them
 //! are in `tests/heritage.rs`, which fails if a grammar renames one.
 
-use crate::model::{ExtractedReference, ReferenceKind, Span};
+use crate::model::{ExtractedReference, ReferenceKind, Span, OPAQUE_BASE};
 use tree_sitter::Node;
 
 /// Whether a supertype was stated as an interface the type implements.
@@ -48,6 +48,131 @@ impl Relation {
             Relation::Implements => ReferenceKind::HeritageInterface,
         }
     }
+}
+
+/// The expression that names a Python base: parentheses and a subscript
+/// (`Base[int]`) are stripped to the value they wrap. The node itself when it
+/// is anything else.
+fn python_base_expression(base: Node) -> Node {
+    let mut current = base;
+    for _ in 0..64 {
+        let inner = match current.kind() {
+            "parenthesized_expression" => current.named_child(0),
+            "subscript" if python_subscript_is_parameterised(current) => {
+                current.child_by_field_name("value")
+            }
+            _ => None,
+        };
+        match inner {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+    current
+}
+
+/// Whether a subscript is a generic parameterisation (`Base[int]`,
+/// `Generic[T]`, `Mapping[str, list[int]]`) rather than an index into a runtime
+/// value (`bases[0]`, `bases[1:]`, `bases[-1]`). A lone index that is a numeric
+/// literal, a slice or arithmetic cannot be a type argument, so the value it
+/// subscripts is no class named by its spelling. More than one index is a
+/// parameter list (`Array[float, 3]`, `Annotated[int, 3]`): an index
+/// expression takes exactly one.
+fn python_subscript_is_parameterised(subscript: Node) -> bool {
+    let mut cursor = subscript.walk();
+    let indices: Vec<Node> = subscript
+        .children_by_field_name("subscript", &mut cursor)
+        .collect();
+    match indices.as_slice() {
+        [only] => !matches!(
+            only.kind(),
+            "integer" | "float" | "slice" | "unary_operator" | "binary_operator"
+        ),
+        _ => true,
+    }
+}
+
+/// `name`, `a.b.c` or either with parentheses around any part (`(a).b`,
+/// `((a.b)).C`), made of plain identifiers.
+fn python_is_dotted_base(node: Node) -> bool {
+    // Iterative: a base nested a thousand parentheses or attributes deep must
+    // not be able to exhaust the native stack.
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => return true,
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let mut inner = current
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "comment");
+                match (inner.next(), inner.next()) {
+                    (Some(only), None) => current = only,
+                    _ => return false,
+                }
+            }
+            "attribute" => {
+                let named = current
+                    .child_by_field_name("attribute")
+                    .is_some_and(|attribute| attribute.kind() == "identifier");
+                match current.child_by_field_name("object") {
+                    Some(object) if named => current = object,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The segments of a dotted Python name, member first and then the qualifier
+/// from the root down (`C`, `a`, `b` for `a.b.C`), read from the attribute
+/// nodes. A comment or line continuation between segments is no part of any of
+/// them, so nothing here reads a span's text. `None` unless the node is plain
+/// identifiers joined by attributes.
+fn python_dotted_segments(node: Node, source: &str) -> Option<Vec<String>> {
+    if !python_is_dotted_base(node) {
+        return None;
+    }
+    let mut outward_in = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "attribute" => {
+                outward_in
+                    .push(text(current.child_by_field_name("attribute")?, source).to_string());
+                current = current.child_by_field_name("object")?;
+            }
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let inner = current
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() != "comment")?;
+                current = inner;
+            }
+            _ => break,
+        }
+    }
+    outward_in.push(text(current, source).to_string());
+    let member = outward_in.remove(0);
+    Some(
+        std::iter::once(member)
+            .chain(outward_in.into_iter().rev())
+            .collect(),
+    )
+}
+
+/// The names a Python base records: a dotted name as one name per segment,
+/// the member first and then the qualifier from the root down (`C`, `a`, `b`
+/// for `a.b.C`), over the one span of the base. Anything that is not a dotted
+/// name of plain identifiers is the single [`OPAQUE_BASE`] marker.
+///
+/// Spelled here rather than left to `names_under`'s traversal and the sort's
+/// tie-break by name, because the order is the only thing that says which
+/// segment is the class and how the qualifier reads: `treesitter` keeps the
+/// emission order of Python heritage rows that share a span.
+fn python_base_names(clause: Node, source: &str) -> Vec<String> {
+    python_dotted_segments(clause, source).unwrap_or_else(|| vec![OPAQUE_BASE.to_string()])
 }
 
 fn text<'a>(node: Node, source: &'a str) -> &'a str {
@@ -290,7 +415,28 @@ fn heritage_clauses<'a>(
             }
             // Python states no relation: `class W(Base, Mixin)` is an
             // `argument_list` and a metaclass keyword argument lives there too.
-            ("python", "argument_list") => Relation::Extends,
+            // Only the positional entries are bases: `metaclass=M` and any
+            // other `k=v` configure the class statement and are not in its MRO.
+            // A subscripted base (`Base[int]`) is the base named by its value,
+            // and parentheses around a base are no part of it. A positional
+            // base that is none of a name, an attribute or a subscript of one
+            // (`*mixins`, `make_base()`, `A if c else B`) is still a base, in
+            // its position, whose class nothing here can name: it is pushed as
+            // it stands and `push_heritage_references` records the
+            // [`OPAQUE_BASE`] marker for it.
+            ("python", "argument_list") => {
+                let mut inner = child.walk();
+                for base in child.named_children(&mut inner) {
+                    if matches!(
+                        base.kind(),
+                        "comment" | "keyword_argument" | "dictionary_splat"
+                    ) {
+                        continue;
+                    }
+                    clauses.push((Relation::Extends, python_base_expression(base)));
+                }
+                continue;
+            }
             ("java", "superclass") => Relation::Extends,
             ("java", "super_interfaces" | "extends_interfaces") => Relation::Implements,
             ("csharp", "base_list") => Relation::Extends,
@@ -531,13 +677,21 @@ pub(crate) fn push_heritage_references(
     let enclosing = format!("{file_symbol_name}::{declarer}");
 
     for (relation, clause) in clauses {
-        let mut names = Vec::new();
-        names_under(clause, source, &mut names);
+        let names = if lang == "python" {
+            python_base_names(clause, source)
+        } else {
+            let mut names = Vec::new();
+            names_under(clause, source, &mut names);
+            names
+        };
+        // A type never extends itself, so a base that is exactly the declarer's
+        // own bare name is dropped. Python's one-segment base is the only
+        // shape that can be the bare name; a segment of a dotted base is one
+        // part of a different name (`class Model(models.Model)` extends
+        // `models.Model`) and is never dropped by comparison with the declarer.
+        let own_bare_name = lang == "python" && names.len() == 1;
         for name in names {
-            // A type never extends itself. Python's `argument_list` also
-            // carries `metaclass=…` keyword arguments, and a self-reference
-            // would make every such class its own supertype.
-            if name == declarer {
+            if (lang != "python" || own_bare_name) && name == declarer {
                 continue;
             }
             references.push(ExtractedReference {
