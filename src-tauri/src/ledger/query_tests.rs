@@ -459,3 +459,6 @@ fn bench_newest_five_on_a_45k_row_ledger() {
     );
     assert!(best_indexed <= best_paged);
 }
+
+#[path = "adversarial_tests.rs"]
+mod adversarial;

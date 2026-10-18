@@ -402,3 +402,6 @@ fn landing_changes_no_ref_or_working_file() {
     assert_eq!(refs(), refs_before);
     assert_eq!(status(), status_before);
 }
+
+#[path = "provenance_adversarial_tests.rs"]
+mod adversarial;
