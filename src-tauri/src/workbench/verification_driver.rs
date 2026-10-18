@@ -799,3 +799,7 @@ pub(crate) fn install(host: WorkbenchState) {
         log::warn!(target: "workbench", "verification driver did not start: {error}");
     }
 }
+
+#[cfg(test)]
+#[path = "verification_driver_measure.rs"]
+mod measure;
