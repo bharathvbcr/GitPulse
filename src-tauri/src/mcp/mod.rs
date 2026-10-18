@@ -27,6 +27,8 @@
 #[cfg(test)]
 mod adversarial_deferral_tests;
 #[cfg(test)]
+mod adversarial_probe_tests;
+#[cfg(test)]
 mod adversarial_tests;
 mod budget;
 pub mod complete;

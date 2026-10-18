@@ -844,3 +844,7 @@ mod tests {
         assert!(!past.is_well_formed());
     }
 }
+
+#[cfg(test)]
+#[path = "adversarial_bounds_tests.rs"]
+mod adversarial_bounds;
