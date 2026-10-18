@@ -265,4 +265,6 @@ impl From<LedgerError> for IpcError {
 }
 
 #[cfg(test)]
+mod adversarial2_tests;
+#[cfg(test)]
 mod tests;
