@@ -778,6 +778,20 @@ impl GitWriter {
         if std::fs::symlink_metadata(&to_abs).is_ok() {
             return Err(format!("destination already exists: {to}"));
         }
+        crate::engine::git_cli::refuse_nested_gitdir_below(&from_abs, from)?;
+        // Git refuses a symlinked `.gitmodules`; a rename is the one write
+        // here that can create one.
+        let source_is_link =
+            std::fs::symlink_metadata(&from_abs).is_ok_and(|meta| meta.file_type().is_symlink());
+        if source_is_link
+            && to_abs
+                .file_name()
+                .is_some_and(crate::engine::git_cli::is_gitmodules_component)
+        {
+            return Err(format!(
+                "A symlink cannot be moved to {to}: git refuses a symlinked .gitmodules"
+            ));
+        }
         let plan = if Self::tracked_count(&repo, from)? > 0 {
             MovePlan::Git {
                 argv: ["git", "mv", "--", from, to].map(String::from).to_vec(),
@@ -834,6 +848,7 @@ impl GitWriter {
         if std::fs::symlink_metadata(&abs).is_err() {
             return Err(format!("{path} does not exist"));
         }
+        crate::engine::git_cli::refuse_nested_gitdir_below(&abs, path)?;
         let spec = literal_paths(&repo, &[path.to_string()])?.remove(0);
         let tracked = Self::tracked_count(&repo, path)?;
         let untracked = Self::untracked_count(&repo, &spec)?;

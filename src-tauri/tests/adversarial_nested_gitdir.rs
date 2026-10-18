@@ -66,7 +66,6 @@ fn nested_head_commit(repo: &Path, dir: &str) -> bool {
 /// upward probe never sees it; `git clean -f -d` only spares a directory with
 /// a `.git` inside, and a bare-style gitdir has none.
 #[test]
-#[ignore = "break: delete of a parent of a nested gitdir (.modules) is not refused and wipes the object store"]
 fn deleting_the_folder_that_holds_a_nested_gitdir_is_refused() {
     let f = fixture();
     separate_gitdir(&f);
@@ -79,7 +78,6 @@ fn deleting_the_folder_that_holds_a_nested_gitdir_is_refused() {
 
 /// BREAK: moving that folder leaves `sub/.git` pointing at nothing.
 #[test]
-#[ignore = "break: move of a parent of a nested gitdir (.modules) is not refused and orphans sub/.git"]
 fn moving_the_folder_that_holds_a_nested_gitdir_is_refused() {
     let f = fixture();
     separate_gitdir(&f);
@@ -207,7 +205,6 @@ fn case_and_unicode_variants_of_a_nested_gitdir_path_are_refused() {
 /// `.git\hooks\pre-commit` is refused by `git add`/checkout, because it is
 /// `.git/hooks/pre-commit` on Windows. The explorer creates it on unix.
 #[test]
-#[ignore = "break: a single component with a backslash after .git (.git\\config) is not refused"]
 fn a_dot_git_backslash_component_is_refused_like_git_does() {
     for name in [
         ".git\\config",
@@ -218,6 +215,28 @@ fn a_dot_git_backslash_component_is_refused_like_git_does() {
     ] {
         assert!(is_git_metadata_component(OsStr::new(name)), "{name:?}");
     }
+}
+
+/// Git refuses a symlinked `.gitmodules`; a rename is the one write that can
+/// create one, so moving a link onto that name (or its NTFS/HFS spellings) is
+/// refused, while a regular file may take the name.
+#[test]
+fn a_symlink_cannot_be_moved_onto_dot_gitmodules_but_a_file_can() {
+    let f = fixture();
+    std::os::unix::fs::symlink("keep.txt", f.repo.join("lnk")).unwrap();
+    for to in [
+        ".gitmodules",
+        ".GITMODULES",
+        "GITMOD~1",
+        ".gitmodules ",
+        ".gitmod\u{200c}ules",
+    ] {
+        let result = GitWriter::move_path(&f.repo_str, "lnk", to, |_| Ok(()));
+        assert!(result.is_err(), "{to:?}: {result:?}");
+        assert!(std::fs::symlink_metadata(f.repo.join("lnk")).is_ok());
+    }
+    std::fs::write(f.repo.join("plain"), "[submodule]\n").unwrap();
+    GitWriter::move_path(&f.repo_str, "plain", ".gitmodules", |_| Ok(())).unwrap();
 }
 
 /// Over-refusal worth knowing about (not a break): `git~1` is refused on every

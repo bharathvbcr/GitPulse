@@ -221,16 +221,125 @@ fn git_metadata_message(file_path: &str) -> String {
 /// path in [`sandbox_join_write`], including a nested repository's real git
 /// directory (see [`inside_nested_git_directory`]).
 pub fn is_git_metadata_component(name: &std::ffi::OsStr) -> bool {
+    // A backslash is a directory separator on Windows, and git applies
+    // `core.protectNTFS` everywhere (`is_dir_sep`): `.git\config` is
+    // `.git/config` there (CVE-2019-1354), so every piece is tested.
+    named_like(name, |base| {
+        base.eq_ignore_ascii_case(".git") || base.eq_ignore_ascii_case("git~1")
+    })
+}
+
+/// True when any `\`-separated piece of `name`, after dropping HFS-ignorable
+/// code points, an NTFS stream suffix and trailing dots and spaces, satisfies
+/// `is_target` (the shared spelling rules of git's `is_hfs_dot*` and
+/// `is_ntfs_dot*`).
+fn named_like(name: &std::ffi::OsStr, is_target: impl Fn(&str) -> bool) -> bool {
     let name = name.to_string_lossy();
     // HFS+ drops these code points wherever they sit, so `.g\u{200c}it` is
     // `.git` there (git: `next_hfs_char` skipping `ignorable` code points).
     let name: String = name.chars().filter(|c| !is_hfs_ignorable(*c)).collect();
-    // `.git:stream` and `.git::$INDEX_ALLOCATION` open the directory on NTFS
-    // (git: `is_ntfs_dotgit` stops at `:`).
-    let base = name.split(':').next().unwrap_or("");
-    // Windows ignores trailing dots and spaces (git: `is_ntfs_dotgit`).
-    let base = base.trim_end_matches(['.', ' ']);
-    base.eq_ignore_ascii_case(".git") || base.eq_ignore_ascii_case("git~1")
+    name.split('\\').any(|piece| {
+        // `.git:stream` and `.git::$INDEX_ALLOCATION` open the directory on
+        // NTFS (git: `is_ntfs_dotgit` stops at `:`).
+        let base = piece.split(':').next().unwrap_or("");
+        // Windows ignores trailing dots and spaces (git: `is_ntfs_dotgit`).
+        is_target(base.trim_end_matches(['.', ' ']))
+    })
+}
+
+/// True when `name` is git's `.gitmodules` in any spelling `verify_path`
+/// treats as it (`is_hfs_dotgitmodules`, `is_ntfs_dotgitmodules`, whose 8.3
+/// short name is `gitmod~1`). Git refuses it as a symlink: a link there lets a
+/// later `git submodule` read a file outside the tree.
+pub fn is_gitmodules_component(name: &std::ffi::OsStr) -> bool {
+    named_like(name, |base| {
+        base.eq_ignore_ascii_case(".gitmodules") || base.eq_ignore_ascii_case("gitmod~1")
+    })
+}
+
+/// Most directory entries [`refuse_nested_gitdir_below`] examines.
+const NESTED_GITDIR_SCAN_ENTRIES: usize = 50_000;
+/// Deepest directory level [`refuse_nested_gitdir_below`] descends.
+const NESTED_GITDIR_SCAN_DEPTH: usize = 64;
+
+/// For a delete or move of the directory `abs` (the entry named `path`):
+/// refuses when any descendant is the real git directory of a nested
+/// repository. [`inside_nested_git_directory`] looks upward and cannot see
+/// this: `git clean -f -d` spares a nested repository only through the `.git`
+/// it finds inside, and a separate gitdir (`sub/.git` -> `../.modules/sub`) has
+/// none, so deleting its parent wipes the history and moving it orphans the
+/// work tree.
+///
+/// A directory named `.git` is skipped, not descended: it is a work tree's own
+/// metadata and travels with it. Symlinks are never followed ([`is_git_directory`]
+/// answers false for one, and the walk does not enter it). The walk is bounded
+/// by [`NESTED_GITDIR_SCAN_ENTRIES`] entries and [`NESTED_GITDIR_SCAN_DEPTH`]
+/// levels, and hitting either REFUSES: a walk cut short is not a clean answer.
+/// A file or symlink at `abs` has nothing below it.
+pub fn refuse_nested_gitdir_below(abs: &Path, path: &str) -> Result<(), String> {
+    refuse_nested_gitdir_below_capped(
+        abs,
+        path,
+        NESTED_GITDIR_SCAN_ENTRIES,
+        NESTED_GITDIR_SCAN_DEPTH,
+    )
+}
+
+fn refuse_nested_gitdir_below_capped(
+    abs: &Path,
+    path: &str,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<(), String> {
+    let is_plain_dir =
+        |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|meta| meta.file_type().is_dir());
+    if !is_plain_dir(abs) {
+        return Ok(());
+    }
+    let too_large = || {
+        format!(
+            "{path} is too large to check for nested git directories (more than \
+             {max_entries} entries or {max_depth} levels deep); \
+             change its contents in smaller parts"
+        )
+    };
+    let mut seen = 0usize;
+    let mut pending = vec![(abs.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = pending.pop() {
+        if is_git_directory(&dir) {
+            let inside = dir.strip_prefix(abs).unwrap_or(Path::new(""));
+            let at = Path::new(path).join(inside);
+            return Err(format!(
+                "{path} contains the git directory of a nested repository at {}",
+                at.display()
+            ));
+        }
+        let entries = std::fs::read_dir(&dir).map_err(|e| {
+            format!(
+                "Cannot check {} for nested git directories: {e}",
+                dir.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| format!("Cannot check {path} for nested git directories: {e}"))?;
+            seen += 1;
+            if seen > max_entries {
+                return Err(too_large());
+            }
+            let child = entry.path();
+            // `file_type` does not follow a symlink.
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if !is_dir || entry.file_name() == ".git" {
+                continue;
+            }
+            if depth + 1 > max_depth {
+                return Err(too_large());
+            }
+            pending.push((child, depth + 1));
+        }
+    }
+    Ok(())
 }
 
 /// The code points git's `next_hfs_char` (`is_hfs_dotgit`, utf8.c
@@ -603,10 +712,17 @@ fn save_edited_text(
     let dest = write_target(repo_path, file_path)?;
     let expect = expected_base.map_or(Expect::Any, Expect::Token);
     crate::diff::write_regular_expecting(&dest, expect, |existing| {
-        let encoded = crate::engine::text_shape::encode_edited_text(file_path, existing, content);
-        match encoded {
-            Err(_) if overwrite => Ok(content.as_bytes().to_vec()),
-            other => other,
+        use crate::engine::text_shape::{encode_edited_text_typed, EncodeRefusal};
+        match encode_edited_text_typed(file_path, existing, content) {
+            Ok(bytes) => Ok(bytes),
+            // The two refusals an Overwrite discards by intent; any other
+            // refusal added to the encoder is not bypassed by this arm.
+            Err(EncodeRefusal::InvalidUtf8 { .. } | EncodeRefusal::MixedLineEndings { .. })
+                if overwrite =>
+            {
+                Ok(content.as_bytes().to_vec())
+            }
+            Err(refusal) => Err(refusal.to_string()),
         }
     })
     .map(|disk_base| SavedFile { disk_base })
@@ -11449,6 +11565,100 @@ mod tests {
             sandbox_join_write(repo, target).unwrap_or_else(|e| panic!("{target}: {e}"));
         }
         sandbox_write(&raw, "sub/lib.txt", "y\n").unwrap();
+    }
+
+    /// A backslash is a separator to git (`is_dir_sep`, CVE-2019-1354 shape).
+    #[test]
+    fn a_backslash_separated_dotgit_piece_is_refused_in_any_position() {
+        use std::ffi::OsStr;
+        for name in [
+            ".git\\config",
+            ".git\\hooks\\pre-commit",
+            "git~1\\x",
+            ".GIT\\x",
+            ".git .\\x",
+            "a\\.git\\x",
+            "a\\b\\.git",
+            ".g\u{200c}it\\x",
+            "\\.git",
+        ] {
+            assert!(is_git_metadata_component(OsStr::new(name)), "{name:?}");
+        }
+        for name in ["a\\b", "x\\.gitignore", ".gitx\\y", "\\", "a\\git~2"] {
+            assert!(!is_git_metadata_component(OsStr::new(name)), "{name:?}");
+        }
+        assert!(is_gitmodules_component(OsStr::new(".gitmodules")));
+        assert!(is_gitmodules_component(OsStr::new("GITMOD~1")));
+        assert!(is_gitmodules_component(OsStr::new(".gitmod\u{200d}ules. ")));
+        assert!(!is_gitmodules_component(OsStr::new(".gitmodules2")));
+        assert!(!is_gitmodules_component(OsStr::new(".gitignore")));
+    }
+
+    #[test]
+    fn the_downward_walk_finds_a_nested_gitdir_and_names_where() {
+        let (_dir, raw) = nested_repo_with_separate_gitdir();
+        let repo = Path::new(&raw);
+        let err = refuse_nested_gitdir_below(&repo.join(".modules"), ".modules").unwrap_err();
+        assert!(
+            err.contains("contains the git directory of a nested repository at .modules/sub"),
+            "{err}"
+        );
+        // A work tree whose `.git` is a file has no gitdir below it; one whose
+        // `.git` is a directory carries it along and is not refused.
+        assert!(refuse_nested_gitdir_below(&repo.join("sub"), "sub").is_ok());
+        std::fs::create_dir_all(repo.join("full")).unwrap();
+        init_plain_git_repo(&repo.join("full"));
+        assert!(refuse_nested_gitdir_below(&repo.join("full"), "full").is_ok());
+        // A file has nothing below it.
+        assert!(refuse_nested_gitdir_below(&repo.join("sub/lib.txt"), "sub/lib.txt").is_ok());
+    }
+
+    #[test]
+    fn the_downward_walk_never_follows_a_symlink() {
+        let (_dir, raw) = nested_repo_with_separate_gitdir();
+        let repo = Path::new(&raw);
+        std::fs::create_dir_all(repo.join("only-links")).unwrap();
+        std::os::unix::fs::symlink(repo.join(".modules"), repo.join("only-links/l")).unwrap();
+        assert!(refuse_nested_gitdir_below(&repo.join("only-links"), "only-links").is_ok());
+        // A link to the gitdir itself is the entry, not a gitdir.
+        std::os::unix::fs::symlink(repo.join(".modules/sub"), repo.join("lnk")).unwrap();
+        assert!(refuse_nested_gitdir_below(&repo.join("lnk"), "lnk").is_ok());
+    }
+
+    /// A walk cut short by either cap refuses; it never reads as clean.
+    #[test]
+    fn the_downward_walk_refuses_when_a_cap_is_hit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for n in 0..10 {
+            std::fs::write(root.join(format!("f{n}")), "").unwrap();
+        }
+        assert!(refuse_nested_gitdir_below_capped(&root, "d", 10, 4).is_ok());
+        let err = refuse_nested_gitdir_below_capped(&root, "d", 9, 4).unwrap_err();
+        assert!(err.contains("too large to check"), "{err}");
+        let deep = root.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        let err = refuse_nested_gitdir_below_capped(&root, "d", 1000, 3).unwrap_err();
+        assert!(err.contains("too large to check"), "{err}");
+        assert!(refuse_nested_gitdir_below_capped(&root, "d", 1000, 5).is_ok());
+    }
+
+    /// Cost of the walk over a 10,000-entry folder, printed for the report
+    /// (`--nocapture`). No wall-clock assertion: the number depends on the host.
+    #[test]
+    fn the_downward_walk_over_ten_thousand_entries_completes_clean() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for d in 0..100 {
+            let sub = root.join(format!("d{d}"));
+            std::fs::create_dir(&sub).unwrap();
+            for f in 0..99 {
+                std::fs::write(sub.join(format!("f{f}")), "").unwrap();
+            }
+        }
+        let started = std::time::Instant::now();
+        refuse_nested_gitdir_below(&root, "big").expect("10k entries are within the cap");
+        eprintln!("walk of 10,000 entries: {:?}", started.elapsed());
     }
 
     #[test]

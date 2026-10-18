@@ -56,23 +56,60 @@ pub fn encode_edited_text(
     existing: Option<&[u8]>,
     content: &str,
 ) -> Result<Vec<u8>, String> {
+    encode_edited_text_typed(file_path, existing, content).map_err(|refusal| refusal.to_string())
+}
+
+/// Why [`encode_edited_text_typed`] would not encode: the disk file holds
+/// bytes the editor never showed faithfully. These are the only refusals, and
+/// the only ones an explicit Overwrite may bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeRefusal {
+    /// `bytes` of the disk file are not valid UTF-8.
+    InvalidUtf8 { file_path: String, bytes: usize },
+    /// The disk file mixes line endings.
+    MixedLineEndings { file_path: String },
+}
+
+impl std::fmt::Display for EncodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUtf8 { file_path, bytes } => write!(
+                f,
+                "Refusing to save {file_path}: {bytes} byte(s) in it are not valid UTF-8 and \
+                 were shown as U+FFFD, so saving would replace them permanently"
+            ),
+            Self::MixedLineEndings { file_path } => write!(
+                f,
+                "Refusing to save {file_path}: it mixes line endings, and the editor cannot keep \
+                 each line's ending, so saving would rewrite every one of them"
+            ),
+        }
+    }
+}
+
+/// [`encode_edited_text`] with the refusal as a value, so a caller that may
+/// override one names the variants it overrides instead of matching any error.
+pub fn encode_edited_text_typed(
+    file_path: &str,
+    existing: Option<&[u8]>,
+    content: &str,
+) -> Result<Vec<u8>, EncodeRefusal> {
     let Some(existing) = existing else {
         return Ok(content.as_bytes().to_vec());
     };
     let invalid = invalid_utf8_bytes(existing);
     if invalid > 0 {
-        return Err(format!(
-            "Refusing to save {file_path}: {invalid} byte(s) in it are not valid UTF-8 and \
-             were shown as U+FFFD, so saving would replace them permanently"
-        ));
+        return Err(EncodeRefusal::InvalidUtf8 {
+            file_path: file_path.to_string(),
+            bytes: invalid,
+        });
     }
     match line_ending(existing) {
         LineEnding::Lf => Ok(content.as_bytes().to_vec()),
         LineEnding::Crlf => Ok(to_crlf(content).into_bytes()),
-        LineEnding::Mixed => Err(format!(
-            "Refusing to save {file_path}: it mixes line endings, and the editor cannot keep \
-             each line's ending, so saving would rewrite every one of them"
-        )),
+        LineEnding::Mixed => Err(EncodeRefusal::MixedLineEndings {
+            file_path: file_path.to_string(),
+        }),
     }
 }
 
