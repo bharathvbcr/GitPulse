@@ -95,9 +95,15 @@ where
     // so a test can drive the real command under pressure.
     #[cfg(test)]
     let injected = crate::sysload::injected_governor_input();
+    // A test that holds the sidecar serial blocks on this command, so the pool
+    // thread acts for it instead of waiting on a lock its own caller holds.
+    #[cfg(test)]
+    let serial_held = crate::harness::sidecar::test_serial_held_here();
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(test)]
         let _carried = injected.map(crate::sysload::inject_governor);
+        #[cfg(test)]
+        let _lent = crate::harness::sidecar::lend_test_serial(serial_held);
         timing.start();
         // Every command starts as a deferrable read. `guard` promotes the
         // rest of a mutation's body to a user action, and this scope is what
@@ -152,5 +158,7 @@ where
 
 #[cfg(test)]
 mod assemble_tests;
+#[cfg(test)]
+mod parity_tests;
 #[cfg(test)]
 mod tests;
