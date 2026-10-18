@@ -573,8 +573,25 @@ pub(super) fn failure_detail(stdout: &str, stderr: &str, fallback: String) -> St
         .unwrap_or(fallback)
 }
 
-fn timed_out(err: &str) -> bool {
-    err.contains("timed out") || err.contains("timeout")
+/// A run error becomes a `timed_out` outcome only when the build started and
+/// ran past its deadline. A build refused at the slot wait, deferred under
+/// load, or that never spawned did not run out of time; it stays an `Err` so
+/// the caller can tell "never ran" from "hung" (see
+/// [`git_cli::RunError::classify`]).
+fn timed_out_outcome(binary: &ResolvedDevmap, err: String) -> Result<BuildOutcome, String> {
+    if !git_cli::is_run_timeout(&err) {
+        return Err(err);
+    }
+    Ok(BuildOutcome {
+        ok: false,
+        binary: binary.path.clone(),
+        lookup: binary.lookup.clone(),
+        exit_code: None,
+        stdout: String::new(),
+        stderr: err,
+        timed_out: true,
+        report: None,
+    })
 }
 
 fn build_outcome_from_run(binary: &ResolvedDevmap, run: BoundedRun) -> BuildOutcome {
@@ -743,17 +760,7 @@ impl PreparedBuild {
         }
         let outcome = match run_devmap(&binary, &repo, args, None, BUILD_DEADLINE) {
             Ok(run) => Ok(build_outcome_from_run(&binary, run)),
-            Err(e) if timed_out(&e) => Ok(BuildOutcome {
-                ok: false,
-                binary: binary.path,
-                lookup: binary.lookup,
-                exit_code: None,
-                stdout: String::new(),
-                stderr: e,
-                timed_out: true,
-                report: None,
-            }),
-            Err(e) => Err(e),
+            Err(e) => timed_out_outcome(&binary, e),
         };
         let settled = settle(outcome);
         drop(guard);
@@ -2365,6 +2372,43 @@ exit 2
         assert!(
             !log.lines().any(|line| line.starts_with("build ")),
             "a deferred probe spawned a build:\n{log}"
+        );
+    }
+
+    /// A build that ran out of time is an outcome with `timed_out`; one that
+    /// never started (slot wait refused, deferred, spawn failed, even down a
+    /// path that spells "timeout") stays an error the caller can tell apart.
+    #[test]
+    fn only_a_build_that_ran_out_of_time_is_a_timed_out_outcome() {
+        use crate::engine::git_cli::{is_slot_wait_timeout, refusal_message, Refusal};
+        let binary = ResolvedDevmap {
+            path: "/bin/devmap".into(),
+            lookup: DevmapLookup::PathSearch,
+        };
+        let ran_out = timed_out_outcome(&binary, "devmap timed out after 600s".into())
+            .expect("a build that hung is an outcome");
+        assert!(ran_out.timed_out && !ran_out.ok);
+
+        let slot = "devmap timed out after 0.5s waiting for a process slot";
+        let err = timed_out_outcome(&binary, slot.into()).expect_err("never started");
+        assert!(is_slot_wait_timeout(&err), "{err}");
+
+        let deferred = refusal_message(
+            "devmap",
+            Refusal::Refused {
+                waited: Duration::from_millis(500),
+            },
+        );
+        assert_eq!(
+            timed_out_outcome(&binary, deferred.clone()).expect_err("deferred"),
+            deferred
+        );
+
+        let spawn =
+            "Failed to spawn devmap: no such program: /Users/x/tools/timeout-wrapper/devmap";
+        assert_eq!(
+            timed_out_outcome(&binary, spawn.into()).expect_err("spawn failure"),
+            spawn
         );
     }
 

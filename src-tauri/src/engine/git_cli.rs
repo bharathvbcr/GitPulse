@@ -34,6 +34,9 @@ mod shared_budget;
 #[cfg(test)]
 mod awaiting_adversarial_tests;
 
+#[cfg(test)]
+mod run_errors_adversarial_tests;
+
 pub(crate) mod hooks;
 pub use hooks::{
     cancel as cancel_hooked_git, is_cancelled as is_hooked_git_cancelled, HOOK_TIMEOUT,
@@ -2040,6 +2043,16 @@ fn subcommand_index(args: &[&str]) -> Option<usize> {
     None
 }
 
+/// `err` without the one optional `[code] ` prefix the ledger adds. Every
+/// anchored check on a runner message goes through this, so none can be
+/// defeated by the prefix the others tolerate.
+fn strip_code_prefix(err: &str) -> &str {
+    match err.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+        Some((code, rest)) if code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => rest,
+        _ => err,
+    }
+}
+
 /// True when `err` is the gate declining to start a child under load. The
 /// command may succeed if asked again once load falls; it did not run.
 ///
@@ -2051,10 +2064,7 @@ fn subcommand_index(args: &[&str]) -> Option<usize> {
 /// the wait as `<seconds>s:`. The label ends at the FIRST marker, so a hostile
 /// path that carries a complete refusal later in the text cannot qualify.
 pub(crate) fn is_deferred_under_load(err: &str) -> bool {
-    let body = match err.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
-        Some((code, rest)) if code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => rest,
-        _ => err,
-    };
+    let body = strip_code_prefix(err);
     let Some((label, after)) = body.split_once(DEFERRED_MARKER) else {
         return false;
     };
@@ -2240,6 +2250,81 @@ pub(crate) fn is_timed_out(err: &str) -> bool {
 
 fn is_timeout_error(program: &str, err: &str) -> bool {
     err.starts_with(program) && is_timed_out(err)
+}
+
+/// What a runner failure message says happened, read once and in one place.
+///
+/// The runner still hands callers the `String` it always did (hooks, MCP and
+/// tests match on its text, so the text is unchanged); this is the typed view
+/// every classifier outside this module reads instead of matching substrings of
+/// its own. Order of precedence is the order of the variants that can overlap:
+/// a deferral and a slot-wait refusal both read like a timeout to a bare
+/// substring match, and neither one ran the child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunError {
+    /// The gate declined to start the child under load; asking again later may
+    /// succeed. See [`is_deferred_under_load`].
+    Deferred,
+    /// The child never got a concurrency slot inside its own deadline. It did
+    /// not start, so it did not run out of time. See [`is_slot_wait_timeout`].
+    SlotWaitTimeout,
+    /// The child started and ran past its own deadline.
+    Timeout,
+    /// The OS found nothing to run at the program name.
+    SpawnNotFound,
+    /// The OS refused to start the program for any other reason.
+    SpawnFailed,
+    /// Anything else: the child ran and failed, or the text is not the
+    /// runner's.
+    Other,
+}
+
+impl RunError {
+    /// Classify a runner failure message. Spawn failures are recognised before
+    /// timeouts so a program path that spells the timeout phrase cannot turn a
+    /// spawn failure into a hang.
+    pub(crate) fn classify(err: &str) -> Self {
+        let body = strip_code_prefix(err);
+        if is_deferred_under_load(err) {
+            Self::Deferred
+        } else if is_spawn_not_found(body) {
+            Self::SpawnNotFound
+        } else if body.starts_with("Failed to spawn ") {
+            Self::SpawnFailed
+        } else if is_slot_wait_timeout(err) {
+            Self::SlotWaitTimeout
+        } else if is_runner_timeout_shape(body) {
+            Self::Timeout
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// The runner's own deadline text, `<label> timed out after <n>s`, anchored at
+/// the start: a label of plain words (program and subcommand, or a program
+/// path), the marker, then the seconds. Text a child printed and a caller
+/// relayed (`... Operation timed out after 30001 milliseconds`) has a label
+/// full of punctuation and a unit that is not `s`, and is not this.
+fn is_runner_timeout_shape(body: &str) -> bool {
+    let Some((label, after)) = body.split_once(TIMEOUT_MARKER) else {
+        return false;
+    };
+    let plain_label = !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '/'));
+    let digits = after
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b'.')
+        .count();
+    plain_label && digits > 0 && after[digits..].starts_with('s')
+}
+
+/// True when `err` is a child that started and ran past its deadline: not a
+/// deferral, not a refused slot wait, not a spawn failure.
+pub(crate) fn is_run_timeout(err: &str) -> bool {
+    RunError::classify(err) == RunError::Timeout
 }
 
 /// What one pipe drain produced.
@@ -4816,14 +4901,201 @@ fn collect_drained_deadline(rx: &mpsc::Receiver<Drained>, deadline: Instant) -> 
     })
 }
 
-/// Detects transient git lock contention errors (e.g. background AI agents or terminal processes holding index.lock)
+/// Detects transient git lock contention (a background agent or terminal
+/// holding `index.lock`) from git's OWN diagnosis: the first line of the
+/// message, which is where git states a lock it could not take.
+///
+/// Only the first line is read. Anything later is output git relayed, and a
+/// pre-commit hook or a push's `remote:` lines can quote a lock error that
+/// belongs to some other process. A first line that is itself a relayed
+/// `remote:` line is not git's. The permanent ref-lock forms carry no
+/// `Unable to create ...lock` on the first line and never match:
+/// `'refs/heads/a' exists; cannot create ...` (a directory/file conflict) and
+/// `is at X but expected Y` (a lost race that retrying cannot win).
+///
+/// The first line is searched, not anchored, because a caller may prefix its
+/// own wrapper (`Index update failed for the N selected paths: fatal: ...`).
+/// Whether the command is safe to run again at all is
+/// [`lock_retry_allowed`]'s question, not this one's.
 pub fn is_transient_git_lock_error(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    (lower.contains(".lock'") && lower.contains("file exists"))
-        || lower.contains("another git process seems to be running")
-        || (lower.contains("unable to create") && lower.contains(".lock"))
-        || lower.contains("cannot lock ref")
-        || (lower.contains("index.lock") && lower.contains("file exists"))
+    // The quoted lock path is blanked before the guard phrases are looked for,
+    // so a repository path that spells `remote:` or `but expected` is still a
+    // lock, and the guards match only git's own message structure.
+    let first = err.lines().next().unwrap_or_default().to_ascii_lowercase();
+    let Some(lock) = lock_path_span(&first) else {
+        return first.contains("another git process seems to be running")
+            && !first.trim_start().starts_with("remote:");
+    };
+    let rest = format!("{}{}", &first[..lock.start], &first[lock.end..]);
+    let lost_race = rest
+        .find(" is at ")
+        .is_some_and(|at| rest[at..].contains(" but expected "));
+    if rest.trim_start().starts_with("remote:")
+        || rest.contains("exists; cannot create")
+        || lost_race
+    {
+        return false;
+    }
+    lock.directory_create || rest.contains("file exists")
+}
+
+/// The quoted `...lock` path in git's "could not take this lock" wording, by
+/// byte offsets into the lowercased first line.
+struct LockPath {
+    start: usize,
+    end: usize,
+    /// `unable to create directory for '...lock'`: a racing ref-directory
+    /// create, which says no `File exists`.
+    directory_create: bool,
+}
+
+fn lock_path_span(first_lower: &str) -> Option<LockPath> {
+    for (opener, directory_create) in [
+        ("unable to create directory for '", true),
+        ("unable to create '", false),
+    ] {
+        if let Some(at) = first_lower.find(opener) {
+            let start = at + opener.len();
+            let end = first_lower.rfind(".lock'")? + ".lock".len();
+            if end >= start {
+                return Some(LockPath {
+                    start,
+                    end,
+                    directory_create,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The lock path git names on the first line of `diagnosis`, original case.
+fn lock_path_named(diagnosis: &str) -> Option<&str> {
+    let first = diagnosis.lines().next()?;
+    let span = lock_path_span(&first.to_ascii_lowercase())?;
+    first.get(span.start..span.end)
+}
+
+/// Whether a failed hook-running command (`commit`, `merge`, `cherry-pick`, ...)
+/// failed on a lock inside THIS repository's git directory (or its common
+/// directory, where ref locks live).
+///
+/// git takes `index.lock` before it runs any hook, so git's own lock failure
+/// on this repository proves no hook started and replaying runs nothing twice.
+/// A lock line that names another path is something else's: a nested git a hook
+/// ran, or another repository. Anything that cannot be resolved is refused.
+fn lock_is_in_this_repository(repo: &Path, diagnosis: &str) -> bool {
+    let Some(named) = lock_path_named(diagnosis) else {
+        return false;
+    };
+    let Ok(dirs) = git_text(
+        repo,
+        &["rev-parse", "--absolute-git-dir", "--git-common-dir"],
+    ) else {
+        return false;
+    };
+    let named = Path::new(named);
+    // A lock file that is gone by now is compared through its directory.
+    let named = named.canonicalize().ok().or_else(|| {
+        let parent = named.parent()?.canonicalize().ok()?;
+        Some(parent.join(named.file_name()?))
+    });
+    let Some(named) = named else {
+        return false;
+    };
+    dirs.lines().any(|dir| {
+        let dir = Path::new(dir.trim());
+        let dir = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            repo.join(dir)
+        };
+        dir.canonicalize().is_ok_and(|dir| named.starts_with(dir))
+    })
+}
+
+/// Subcommands that talk to a remote. A failure that mentions a lock may be the
+/// server's, and running one again repeats the network work.
+const NETWORK_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone", "ls-remote"];
+
+/// Whether `git <sub>` may be run again after ANY lock-shaped failure: never a
+/// command that ran hooks (a hook can take minutes and has side effects) or
+/// touched the network (see [`NETWORK_SUBCOMMANDS`]). A hook-running command
+/// is replayed only on proof the hook never started: see
+/// [`lock_is_in_this_repository`].
+fn lock_retry_allowed(sub: &str) -> bool {
+    hooks::hooks_run_by(sub).is_none() && !NETWORK_SUBCOMMANDS.contains(&sub)
+}
+
+/// The full retry decision for one failed attempt of `git <sub>`.
+fn lock_retry_wanted(repo: Option<&Path>, sub: &str, diagnosis: &str) -> bool {
+    if !is_transient_git_lock_error(diagnosis) || NETWORK_SUBCOMMANDS.contains(&sub) {
+        return false;
+    }
+    lock_retry_allowed(sub)
+        || (consists_only_of_gits_index_lock_failure(diagnosis)
+            && repo.is_some_and(|repo| lock_is_in_this_repository(repo, diagnosis)))
+}
+
+/// The advice git prints under a lock failure, lowercased, one entry per line.
+/// Current git (2.54 and 2.56, captured from real runs) prints the first line
+/// alone; older git printed all five. Matched against a fixed table, never by
+/// substring, so anything else on the line is not git's advice.
+const LOCK_ADVICE_LINES: &[&str] = &[
+    "another git process seems to be running in this repository, or the lock file may be stale",
+    "another git process seems to be running in this repository, e.g.",
+    "an editor opened by 'git commit'. please make sure all processes",
+    "are terminated then try again. if it still fails, a git process",
+    "may have crashed in this repository earlier:",
+    "remove the file manually to continue.",
+];
+
+/// The lines git's own commands print after that advice when the index could
+/// not be taken, captured from real `merge`, `cherry-pick`, `revert` and
+/// `rebase` runs on git 2.54 and 2.56.
+const LOCK_FOLLOWUP_LINES: &[&str] = &[
+    "fatal: unable to write index.",
+    "fatal: cherry-pick failed",
+    "fatal: revert failed",
+    "error: could not detach head",
+];
+
+/// True when `diagnosis` is git's own failure to take `index.lock` and nothing
+/// else: line 1 is `fatal: Unable to create '<...>/index.lock': File exists.`,
+/// then only git's advice block, at least one line of it.
+///
+/// git takes `index.lock` before it runs any hook, so when its own attempt
+/// failed no hook ran and the whole stderr is this message. A hook that prints
+/// a lock-shaped line of its own (a nested git, a lint-staged step) is followed
+/// or preceded by other output, or lacks the advice block; either way it ran
+/// something, and the command is not replayed. Only `index.lock` qualifies: a
+/// ref lock on `commit` is taken after the hooks have run.
+fn consists_only_of_gits_index_lock_failure(diagnosis: &str) -> bool {
+    let mut lines = diagnosis.lines();
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    let is_index_lock = lock_path_named(first)
+        .and_then(|path| Path::new(path).file_name())
+        .is_some_and(|name| name == "index.lock");
+    let first_lower = first.trim_end().to_ascii_lowercase();
+    let own_prefix = first_lower.starts_with("fatal: unable to create '")
+        || first_lower.starts_with("error: unable to create '");
+    if !is_index_lock || !own_prefix || !first_lower.ends_with(".lock': file exists.") {
+        return false;
+    }
+    let mut advice = 0;
+    for line in lines.map(|line| line.trim().to_ascii_lowercase()) {
+        if line.is_empty() {
+            continue;
+        }
+        if LOCK_ADVICE_LINES.contains(&line.as_str()) {
+            advice += 1;
+        } else if !LOCK_FOLLOWUP_LINES.contains(&line.as_str()) {
+            return false;
+        }
+    }
+    advice > 0
 }
 
 /// Backoff for attempts 1..=3: 50 + 150 + 300 ms = 500 ms, plus a tiny pid jitter
@@ -4965,7 +5237,7 @@ fn git_run_inner(
             stderr.trim()
         };
         if !diagnosis.is_empty() {
-            if attempts < MAX_LOCK_RETRIES && is_transient_git_lock_error(diagnosis) {
+            if attempts < MAX_LOCK_RETRIES && lock_retry_wanted(repo, sub, diagnosis) {
                 attempts += 1;
                 std::thread::sleep(
                     Duration::from_millis(lock_retry_backoff_ms(attempts))
@@ -5975,7 +6247,7 @@ mod tests {
     }
     #[cfg(unix)]
     const RETRYING_ALIAS: &str =
-        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1";
+        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo \"fatal: Unable to create 'x.lock': File exists.\" >&2; exit 1";
 
     /// Where the total budget runs out between two lock retries decides which
     /// seam reports it: the top of the loop returns an error, a child killed
@@ -6253,6 +6525,250 @@ mod tests {
         assert!(lock_retry_backoff_ms(1) >= 50);
         assert!(lock_retry_backoff_ms(2) >= 150);
         assert!(lock_retry_backoff_ms(3) >= 300);
+    }
+
+    /// Every message shape the classifier is handed: raw from `git_run`, and
+    /// wrapped by `git_writer` ("Index update failed for the N selected
+    /// paths: ...") before it asks whether to halve a batch.
+    #[test]
+    fn lock_retry_classifier_reads_only_gits_own_first_line() {
+        let lock = "Unable to create '/r/.git/index.lock': File exists.";
+        let ref_lock = "cannot lock ref 'refs/heads/main': Unable to create '/r/.git/refs/heads/main.lock': File exists.";
+        // Raw, git's own: retried.
+        assert!(is_transient_git_lock_error(&format!(
+            "fatal: {lock}\n\nAnother git process seems to be running in this repository"
+        )));
+        assert!(is_transient_git_lock_error(&format!("error: {ref_lock}")));
+        // Wrapped by git_writer: still git's lock on the first line.
+        assert!(is_transient_git_lock_error(&format!(
+            "Index update failed for the 2 selected paths: fatal: {lock}\n\nAnother git process seems to be running. Refresh to review the current index."
+        )));
+        // A server's output relayed by push or fetch.
+        assert!(!is_transient_git_lock_error(
+            "remote: error: cannot lock ref 'refs/heads/main': is at A but expected B\nTo origin\n ! [remote rejected]"
+        ));
+        assert!(!is_transient_git_lock_error(&format!(
+            "remote: fatal: {lock}\nTo origin"
+        )));
+        // Hook output ahead of git's own words: the lock is not on line one.
+        assert!(!is_transient_git_lock_error(&format!(
+            "running lint...\nfatal: {lock}\nhook failed"
+        )));
+        // Permanent ref-lock forms.
+        assert!(!is_transient_git_lock_error(
+            "error: cannot lock ref 'refs/heads/a/b': 'refs/heads/a' exists; cannot create 'refs/heads/a/b'\nerror: unable to update local ref"
+        ));
+        assert!(!is_transient_git_lock_error(
+            "error: cannot lock ref 'refs/heads/main': is at A but expected B"
+        ));
+    }
+
+    #[test]
+    fn lock_retry_never_replays_hook_or_network_commands() {
+        for sub in [
+            "commit",
+            "merge",
+            "pull",
+            "rebase",
+            "push",
+            "fetch",
+            "clone",
+            "ls-remote",
+        ] {
+            assert!(!lock_retry_allowed(sub), "{sub}");
+        }
+        for sub in ["add", "update-ref", "reset", "branch", "status"] {
+            assert!(lock_retry_allowed(sub), "{sub}");
+        }
+    }
+
+    /// The real directory/file conflict is permanent: git's own wording does
+    /// not classify as a lock and the command is not run again.
+    #[test]
+    fn a_real_ref_directory_file_conflict_is_not_a_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        crate::test_support::commit_at(dir.path(), "c", 1_700_000_000, "a@example.com");
+        git_text(dir.path(), &["update-ref", "refs/heads/a", "HEAD"]).unwrap();
+        let started = Instant::now();
+        let error = git_text(dir.path(), &["update-ref", "refs/heads/a/b", "HEAD"])
+            .expect_err("a/b cannot coexist with a");
+        assert!(error.contains("exists; cannot create"), "{error}");
+        assert!(!is_transient_git_lock_error(&error), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a permanent failure is not retried with backoff"
+        );
+    }
+
+    /// A pre-commit hook that fails with a lock-shaped message ran once: the
+    /// command is not replayed. Counted by the hook itself, so a replay cannot
+    /// hide behind a fast retry.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_commit_hook_runs_exactly_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        git_text(dir.path(), &["config", "user.name", "T"]).unwrap();
+        git_text(dir.path(), &["config", "user.email", "t@example.com"]).unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
+        git_text(dir.path(), &["add", "f.txt"]).unwrap();
+        let counter = dir.path().join("hook-count");
+        // A hook whose nested git, against THIS repository, prints a bare lock
+        // line: git's advice block is missing, so it is not git's own failure.
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\necho \"fatal: Unable to create '{}/.git/index.lock': File exists.\" >&2\nexit 1\n",
+                counter.display(),
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = git_text(dir.path(), &["commit", "-m", "x"]).expect_err("hook rejects");
+        assert!(is_transient_git_lock_error(&error), "{error}");
+        let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs, 1, "the hook ran {runs} times");
+    }
+
+    /// The lint-staged shape: the hook's nested git against THIS repository
+    /// fails on the lock, prints git's advice block as well, and the hook then
+    /// reports its own failure. Other output follows git's lines, so something
+    /// ran: the commit and its hook are not replayed.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_quoting_this_repos_lock_with_advice_and_other_output_runs_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        git_text(dir.path(), &["config", "user.name", "T"]).unwrap();
+        git_text(dir.path(), &["config", "user.email", "t@example.com"]).unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
+        git_text(dir.path(), &["add", "f.txt"]).unwrap();
+        let counter = dir.path().join("hook-count");
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho run >> '{c}'\necho \"fatal: Unable to create '{d}/.git/index.lock': File exists.\" >&2\necho >&2\necho 'Another git process seems to be running in this repository, or the lock file may be stale' >&2\necho 'lint-staged failed' >&2\nexit 1\n",
+                c = counter.display(),
+                d = dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        git_text(dir.path(), &["commit", "-m", "x"]).expect_err("hook rejects");
+        let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(runs, 1, "the hook ran {runs} times");
+    }
+
+    /// git's advice under a lock failure, as printed by real git 2.54 and 2.56
+    /// (identical), plus the five-line block older git printed. Only the lock
+    /// line and that block, nothing else, is git's own index.lock failure.
+    #[test]
+    fn only_gits_own_index_lock_failure_qualifies_for_a_hooked_retry() {
+        let line = "fatal: Unable to create '/r/.git/index.lock': File exists.";
+        let current = "Another git process seems to be running in this repository, or the lock file may be stale";
+        let legacy = "Another git process seems to be running in this repository, e.g.\nan editor opened by 'git commit'. Please make sure all processes\nare terminated then try again. If it still fails, a git process\nmay have crashed in this repository earlier:\nremove the file manually to continue.";
+        assert!(consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current}"
+        )));
+        assert!(consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current}\n"
+        )));
+        assert!(consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{legacy}"
+        )));
+        // The `error:` first line and trailing lines real merge, cherry-pick,
+        // revert and rebase print.
+        let error_line = "error: Unable to create '/r/.git/index.lock': File exists.";
+        for followup in [
+            "fatal: Unable to write index.",
+            "fatal: cherry-pick failed",
+            "fatal: revert failed",
+            "error: could not detach HEAD",
+        ] {
+            assert!(
+                consists_only_of_gits_index_lock_failure(&format!(
+                    "{error_line}\n\n{current}\n{followup}"
+                )),
+                "{followup}"
+            );
+        }
+        // A bare line, any other output, a ref lock, or a non-git first line.
+        assert!(!consists_only_of_gits_index_lock_failure(line));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current}\nlint failed"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "lint failed\n{line}\n\n{current}"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "{line}\n\n{current} and more"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "error: cannot lock ref 'HEAD': Unable to create '/r/.git/HEAD.lock': File exists.\n\n{current}"
+        )));
+        assert!(!consists_only_of_gits_index_lock_failure(&format!(
+            "remote: {line}\n\n{current}"
+        )));
+    }
+
+    /// The timeout and spawn shapes every converged classifier must tell apart,
+    /// raw and wrapped the ways callers wrap them.
+    #[test]
+    fn run_error_classifies_each_runner_message_shape() {
+        let slot = format!("devmap{TIMEOUT_MARKER}0.5{SLOT_WAIT_SUFFIX}");
+        let ran_out = format!("devmap{TIMEOUT_MARKER}30s");
+        let deferred = refusal_message(
+            "devmap build",
+            Refusal::Refused {
+                waited: Duration::from_millis(500),
+            },
+        );
+        let hostile = "Failed to spawn /Users/x/timeout-wrapper/devmap: no such file";
+        let hostile_marker =
+            format!("Failed to spawn /Users/x/devmap{TIMEOUT_MARKER}1s/devmap: permission denied");
+        let not_found = spawn_error(
+            "/Users/x/timeout/devmap",
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert_eq!(RunError::classify(&ran_out), RunError::Timeout);
+        assert_eq!(
+            RunError::classify(&format!("[some_code] {ran_out}")),
+            RunError::Timeout,
+            "a coded prefix does not hide a timeout"
+        );
+        assert_eq!(
+            RunError::classify(&format!("[some_code] {slot}")),
+            RunError::SlotWaitTimeout
+        );
+        assert_eq!(RunError::classify(&slot), RunError::SlotWaitTimeout);
+        assert_eq!(RunError::classify(&deferred), RunError::Deferred);
+        assert_eq!(
+            RunError::classify(&format!("[deferred_worktree] {deferred}")),
+            RunError::Deferred
+        );
+        assert_eq!(RunError::classify(hostile), RunError::SpawnFailed);
+        assert_eq!(RunError::classify(&hostile_marker), RunError::SpawnFailed);
+        assert_eq!(RunError::classify(&not_found), RunError::SpawnNotFound);
+        assert_eq!(
+            RunError::classify("devmap exited with status 2"),
+            RunError::Other
+        );
+        assert!(is_run_timeout(&ran_out));
+        for not_timeout in [&slot, &deferred, &not_found] {
+            assert!(!is_run_timeout(not_timeout), "{not_timeout}");
+        }
+        assert!(!is_run_timeout(hostile));
+        assert!(!is_run_timeout(&hostile_marker));
     }
 
     #[test]

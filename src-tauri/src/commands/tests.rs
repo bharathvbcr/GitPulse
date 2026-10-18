@@ -594,6 +594,12 @@ fn restack_honours_a_caller_supplied_fork_point_and_refuses_a_stale_one() {
 
 #[test]
 fn unborn_head_errors_are_notices_not_faults() {
+    use crate::engine::git_reader::is_unborn_head_error;
+    // The `git log` phrases are the same classifier's: one table for both readers.
+    assert!(is_unborn_head_error(
+        "fatal: your current branch 'main' does not have any commits yet"
+    ));
+    assert!(is_unborn_head_error("fatal: bad default revision 'HEAD'"));
     assert!(is_unborn_head_error(
         "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."
     ));
