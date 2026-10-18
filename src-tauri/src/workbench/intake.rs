@@ -2262,6 +2262,10 @@ pub(crate) mod gate_tests;
 mod driver_tests;
 
 #[cfg(test)]
+#[path = "head_cache_adversarial_tests.rs"]
+mod head_cache_adversarial_tests;
+
+#[cfg(test)]
 #[path = "intake_merge_tests.rs"]
 mod merge_tests;
 
