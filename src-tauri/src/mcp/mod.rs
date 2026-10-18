@@ -1186,7 +1186,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_landed",
             "Has a commit landed",
-            "Has a commit's work reached a base, and how. `via` is `ff` or `merge` when the commit is reachable from the base, `rebase` when every patch is on the base under new ids, `squash` when one base commit carries the sum of its patch, `tree` when merging it into the base would change nothing. `merge_commit` is the base commit that brought it in (merge or squash), `landed_at` the Unix time of the first base reflog entry containing it (null with `landed_at_reason` when the reflog cannot say). `landed` is null with `error`, never false, when it could not be told: an unresolvable commit or base, a shallow clone, or a content comparison that could not run. Changes no ref, index or working-tree file; the `tree` comparison (`git merge-tree --write-tree`) may leave unreferenced tree objects in the object database.",
+            "Has a commit's work reached a base, and how. `via` is `ff` or `merge` when the commit is reachable from the base, `rebase` when every patch is on the base under new ids, `squash` when one base commit carries the sum of its patch. `landed: false` means none of those four routes was found; a landing that edited the content on the way in is not detected, because the content comparison (`git merge-tree --write-tree`) writes objects into the repository and is not used (owner decision 2). `merge_commit` is the base commit that brought it in (merge or squash), `landed_at` the Unix time of the first base reflog entry containing it (null with `landed_at_reason` when the reflog cannot say). `landed` is null with `error`, never false, when it could not be told: an unresolvable commit or base, a shallow clone, or a patch comparison that could not run. Writes nothing: no ref, index, working-tree file or object.",
             LandedArgs::properties(),
             &LandedArgs::required(),
             json!({
@@ -1197,7 +1197,7 @@ fn build_tools() -> Vec<Value> {
                     "landed": { "type": ["boolean", "null"] },
                     "via": {
                         "type": ["string", "null"],
-                        "enum": ["ff", "merge", "squash", "rebase", "tree", null]
+                        "enum": ["ff", "merge", "squash", "rebase", null]
                     },
                     "merge_commit": { "type": ["string", "null"] },
                     "landed_at": { "type": ["integer", "null"] },

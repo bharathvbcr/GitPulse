@@ -940,9 +940,6 @@ pub enum LandedVia {
     /// Not reachable, but every commit's patch is already on the base under a
     /// different id (a rebase merge or cherry-picks).
     Rebase,
-    /// Not reachable and no matching patch found, but merging it into the base
-    /// would change nothing: the content is on the base.
-    Tree,
 }
 
 /// The answer of [`landed`].
@@ -1112,15 +1109,16 @@ fn squash_commit(
 /// Reachability (`ff`, `merge`) comes from [`base_relation`]. A commit that is
 /// not reachable may still have landed under new ids: a rebase merge puts the
 /// same patches on the base (`git cherry`, all marked `-`), a squash merge puts
-/// their sum in one commit (its patch id equals the diff since the fork), and
-/// anything else whose merge into the base changes nothing is `tree`, by
-/// [`crate::engine::deadbranch::is_branch_merged_by_tree`]. A shallow clone, an
-/// unresolvable commit or base, or a comparison that cannot run answers
-/// `landed: null` with the reason, never `false`.
+/// their sum in one commit (its patch id equals the diff since the fork).
+/// `false` means none of those four routes was found; a landing that edited the
+/// content on the way in is not detectable without `git merge-tree
+/// --write-tree`, which writes objects into the repository and is not used
+/// (owner decision 2). A shallow clone, an unresolvable commit or base, or a
+/// comparison that cannot run answers `landed: null` with the reason, never
+/// `false`.
 ///
-/// Read-only for refs, index and working tree. `merge-tree --write-tree` may
-/// leave unreferenced tree objects in the object database, as the dead-branch
-/// scan does.
+/// Read-only: it runs only git commands that write nothing, the object
+/// database included.
 pub fn landed(repo_path: &str, commit: &str, base_branch: Option<&str>) -> Landed {
     let base_name = base_branch.unwrap_or(DEFAULT_BASE);
     let unknown = |base_oid: Option<String>, error: String| Landed {
@@ -1199,53 +1197,42 @@ pub fn landed(repo_path: &str, commit: &str, base_branch: Option<&str>) -> Lande
             Err(reason) => answer.error = format!("landed, but how was not determined: {reason}"),
         }
     } else {
-        let squash = relation
-            .merge_base
-            .as_deref()
-            .and_then(|fork| squash_commit(&repo, fork, &sha, &base).ok().flatten());
-        let cherry = git_complete_text(&repo, &["cherry", &base, &sha], "git cherry").ok();
-        let rebased = cherry.as_deref().is_some_and(|text| {
+        let squash = match relation.merge_base.as_deref() {
+            Some(fork) => squash_commit(&repo, fork, &sha, &base),
+            // No common history: no fork to take a patch from.
+            None => Ok(None),
+        };
+        let cherry = git_complete_text(&repo, &["cherry", &base, &sha], "git cherry");
+        let rebased = cherry.as_deref().is_ok_and(|text| {
             let mut lines = text.lines().peekable();
             lines.peek().is_some() && lines.all(|line| line.starts_with('-'))
         });
         if rebased {
             answer.landed = Some(true);
             answer.via = Some(LandedVia::Rebase);
-        } else if let Some(commit) = squash {
-            landing = commit.clone();
+        } else if let Ok(Some(commit)) = &squash {
+            landing.clone_from(commit);
             answer.landed = Some(true);
             answer.via = Some(LandedVia::Squash);
-            answer.merge_commit = Some(commit);
-        } else {
-            let tree = git_complete_text(
-                &repo,
-                &["rev-parse", &format!("{base}^{{tree}}")],
-                "git rev-parse",
+            answer.merge_commit = Some(commit.clone());
+        } else if let Some(reason) = squash.err().or(cherry.err()) {
+            // A patch comparison that could not run decides nothing. The one
+            // remaining comparison, of content (merge-tree), writes objects
+            // into the repository and is not offered (owner decision 2).
+            answer.landed = None;
+            answer.error = format!(
+                "could not tell whether the base already holds this work: {reason}; \
+                 content comparison not available (owner decision 2: merge-tree object writes)"
             );
-            let merged = tree.as_ref().ok().and_then(|tree| {
-                crate::engine::deadbranch::is_branch_merged_by_tree(&repo, tree.trim(), &base, &sha)
-            });
-            match merged {
-                Some(true) => {
-                    answer.landed = Some(true);
-                    answer.via = Some(LandedVia::Tree);
-                }
-                Some(false) => answer.landed = Some(false),
-                None => {
-                    answer.landed = None;
-                    answer.error = "could not tell whether the base already holds this \
-                         work: the content comparison (git merge-tree --write-tree) did not \
-                         produce a tree, which is also what conflicting changes look like"
-                        .to_string();
-                }
-            }
         }
+        // Otherwise both comparisons ran and found nothing: `landed` stays
+        // `false`, meaning no fast-forward, merge, squash or rebase landing.
     }
     if answer.landed == Some(true) {
         match answer.via {
-            Some(LandedVia::Rebase | LandedVia::Tree) => {
+            Some(LandedVia::Rebase) => {
                 answer.landed_at_reason =
-                    "not determined: a rebase or tree landing has no single base commit to place in the reflog"
+                    "not determined: a rebase landing has no single base commit to place in the reflog"
                         .to_string();
             }
             _ => {

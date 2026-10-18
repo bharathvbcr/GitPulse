@@ -21,7 +21,7 @@ before that tag is pushed.
   measure: how far the base moved past the commit, which is 0 for a commit
   *ahead of* the base too. Its output schema is typed.
 - `gitpulse_landed` answers whether a commit's work reached a base and how
-  (`ff`, `merge`, `squash`, `rebase`, `tree`), with the landing commit and the
+  (`ff`, `merge`, `squash`, `rebase`; null with a reason when it cannot be told), with the landing commit and the
   time from the base reflog.
 - `gitpulse_ledger_events` takes `order: "desc"` (the newest first; `{order:
   "desc", limit: 5}` no longer pages the history oldest-first) and the filters

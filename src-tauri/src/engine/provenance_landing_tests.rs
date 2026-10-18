@@ -287,6 +287,104 @@ fn an_unresolvable_commit_or_base_is_null_with_an_error() {
     assert_eq!(bad_commit.base_oid, None);
 }
 
+/// Every file under `.git/objects` (loose objects, pack files and their
+/// indexes) with its bytes, in path order: the listing, the count and the
+/// content in one value.
+fn object_store(repo: &Repo) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                out.push((name, std::fs::read(&path).expect("read")));
+            }
+        }
+    }
+    let root = repo.path().join(".git").join("objects");
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn landed_writes_nothing_to_the_object_database_on_any_landing_kind() {
+    type Scenario = fn(&Repo) -> (String, Option<LandedVia>, Option<bool>);
+    let scenarios: [(&str, Scenario); 5] = [
+        ("ff", |repo| {
+            repo.git(&["checkout", "-b", "feature"]);
+            let tip = repo.commit("feature work", "feature.txt");
+            repo.git(&["checkout", "main"]);
+            repo.git(&["merge", "--ff-only", "feature"]);
+            (tip, Some(LandedVia::Ff), Some(true))
+        }),
+        ("merge", |repo| {
+            repo.git(&["checkout", "-b", "feature"]);
+            let tip = repo.commit("feature work", "feature.txt");
+            repo.git(&["checkout", "main"]);
+            repo.commit("main work", "main.txt");
+            repo.git(&["merge", "--no-ff", "feature", "-m", "merge feature"]);
+            (tip, Some(LandedVia::Merge), Some(true))
+        }),
+        ("squash", |repo| {
+            repo.git(&["checkout", "-b", "feature"]);
+            repo.commit("first", "one.txt");
+            let tip = repo.commit("second", "two.txt");
+            repo.git(&["checkout", "main"]);
+            repo.commit("main work", "main.txt");
+            repo.git(&["merge", "--squash", "feature"]);
+            repo.git(&["commit", "-m", "squashed feature"]);
+            (tip, Some(LandedVia::Squash), Some(true))
+        }),
+        ("rebase", |repo| {
+            repo.git(&["checkout", "-b", "feature"]);
+            repo.commit("first", "one.txt");
+            let tip = repo.commit("second", "two.txt");
+            repo.git(&["checkout", "main"]);
+            repo.commit("main work", "main.txt");
+            repo.git(&["checkout", "-b", "rebased", "feature"]);
+            repo.git(&["rebase", "main"]);
+            repo.git(&["checkout", "main"]);
+            repo.git(&["merge", "--ff-only", "rebased"]);
+            (tip, Some(LandedVia::Rebase), Some(true))
+        }),
+        ("unmerged", |repo| {
+            repo.git(&["checkout", "-b", "feature"]);
+            let tip = repo.commit("feature work", "feature.txt");
+            repo.git(&["checkout", "main"]);
+            repo.commit("main work", "main.txt");
+            (tip, None, Some(false))
+        }),
+    ];
+    for (kind, build) in scenarios {
+        let repo = Repo::new();
+        let (tip, via, landed_flag) = build(&repo);
+        // Loose objects are packed so a later write would show as a new file
+        // in either place; the listing is taken after that.
+        repo.git(&["gc", "--quiet"]);
+        let before = object_store(&repo);
+        assert!(
+            !before.is_empty(),
+            "{kind}: an empty object store proves nothing"
+        );
+
+        let answer = landed(repo.as_str(), &tip, Some("main"));
+        let _ = compute_freshness(repo.as_str(), &tip, Some("main"));
+
+        assert_eq!(answer.landed, landed_flag, "{kind}: {answer:?}");
+        assert_eq!(answer.via, via, "{kind}: {answer:?}");
+        let after = object_store(&repo);
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "{kind}: object file count changed"
+        );
+        assert!(before == after, "{kind}: the object store changed");
+    }
+}
+
 #[test]
 fn landing_changes_no_ref_or_working_file() {
     let repo = Repo::new();

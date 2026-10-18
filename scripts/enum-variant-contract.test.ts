@@ -41,7 +41,7 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   [
     "LandedVia",
-    "the `gitpulse_landed` MCP tool's `via` field: serialized to MCP clients, whose schema lists the five spellings; no frontend component reads it",
+    "the `gitpulse_landed` MCP tool's `via` field: serialized to MCP clients, whose schema lists the four spellings; no frontend component reads it",
   ],
   [
     "CapabilityAnswer",

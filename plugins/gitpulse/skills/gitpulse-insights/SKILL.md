@@ -36,7 +36,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `devmap_*` (11 tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`) | The same code graph under DevMap's own tool names, for parity with the standalone `devmap mcp` server; pass `repo_path` on every call |
 | `gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_merge_tasks`, `gitpulse_delete_task` | The only write tools: they change the task board, never git (see the gitpulse-tasks skill) |
 | `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`) |
-| `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`) |
+| `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`; never writes to the repository) |
 
 ## Honesty rules this server already enforces
 
