@@ -168,7 +168,10 @@ fn display_is_bounded_and_fast_on_an_enormous_url() {
     assert!(!shown.display.contains(SECRET));
     let elapsed = started.elapsed();
     println!("LONG_URL_ELAPSED {elapsed:?}");
-    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert!(
+        elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
+        "{elapsed:?}"
+    );
 }
 
 // --- re-attach ---------------------------------------------------------
