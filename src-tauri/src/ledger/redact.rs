@@ -783,6 +783,100 @@ pub fn carries_secret(value: &str) -> bool {
     text(value) != value
 }
 
+/// A remote URL as it may be shown, and whether the original embedded a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlDisplay {
+    pub display: String,
+    pub has_credentials: bool,
+}
+
+/// The scp-like form with a password (`user:pw@host:path`,
+/// `user:pw@host:22/path`): the password is dropped and the user kept. `None`
+/// for anything that is not that shape, including a plain `git@host:path`.
+fn scp_display(url: &str) -> Option<UrlDisplay> {
+    let head_end = url.find('/').unwrap_or(url.len());
+    let at = url[..head_end].rfind('@')?;
+    let (userinfo, rest) = (&url[..at], &url[at + 1..]);
+    let (user, password) = userinfo.split_once(':')?;
+    // `host:path` after the `@` is what makes this scp-like rather than a
+    // path that happens to contain `@`; user names carry no `.` or `\`.
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    if password.is_empty()
+        || user.is_empty()
+        || user.contains('.')
+        || !rest[..host_end].contains(':')
+    {
+        return None;
+    }
+    Some(UrlDisplay {
+        display: text(&format!("{user}@{rest}")),
+        has_credentials: true,
+    })
+}
+
+/// The display form of a remote URL: the userinfo's password is dropped and
+/// the username kept, so the configured account stays visible without the
+/// token.
+///
+/// - `https://user:tok@host/p` becomes `https://user@host/p`.
+/// - A lone userinfo on a non-ssh scheme (`https://ghp_xxx@host`) is dropped
+///   when [`text`] judges it a token; a plain name (`https://alice@host`) is
+///   kept. A lone `ssh://` / `git+ssh://` userinfo is an account name, kept.
+/// - scp-like `user:pw@host:path` loses its password (`user@host:path`); a
+///   plain `git@host:path` has none and is unchanged, as are local paths and
+///   URLs without userinfo.
+///
+/// The authority is read as git does (up to the first `/`, `?` or `#`) and its
+/// userinfo ends at the last `@`, so percent-encoded userinfo and bracketed
+/// IPv6 hosts survive. The result is also passed through [`text`], so any
+/// other secret shape in the string is removed too.
+pub fn url_for_display(url: &str) -> UrlDisplay {
+    let unchanged = |url: &str| {
+        let display = text(url);
+        UrlDisplay {
+            has_credentials: display != url,
+            display,
+        }
+    };
+    let Some((scheme, after)) = url.split_once("://") else {
+        return scp_display(url).unwrap_or_else(|| unchanged(url));
+    };
+    let scheme_ok = scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+    let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..authority_end];
+    let Some(at) = authority.rfind('@').filter(|_| scheme_ok) else {
+        return unchanged(url);
+    };
+    let (userinfo, host) = (&authority[..at], &authority[at + 1..]);
+    let tail = &after[authority_end..];
+    let (user, password) = match userinfo.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (userinfo, None),
+    };
+    let is_ssh = scheme.to_ascii_lowercase().ends_with("ssh");
+    let user_is_secret = !is_ssh && {
+        let probe = format!("{scheme}://{user}@{host}");
+        text(&probe) != probe
+    };
+    let keep_user = !user.is_empty() && !user_is_secret;
+    let has_credentials = password.is_some_and(|p| !p.is_empty()) || user_is_secret;
+    let display = if keep_user {
+        format!("{scheme}://{user}@{host}{tail}")
+    } else {
+        format!("{scheme}://{host}{tail}")
+    };
+    UrlDisplay {
+        display: text(&display),
+        has_credentials,
+    }
+}
+
 /// The redactor as it was before the single-parse, gated, copy-on-write
 /// rewrite: the oracle every equivalence test compares against.
 ///

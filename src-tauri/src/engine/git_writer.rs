@@ -1841,6 +1841,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(r) = remote {
+            crate::engine::remotes::require_configured(&repo, r)?;
             validate_ref_name(r)?;
             git_text_network(&repo, &["fetch", r])
         } else {
@@ -1878,6 +1879,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         rebase: Option<bool>,
     ) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
+        if let Some(remote) = remote {
+            crate::engine::remotes::require_configured(&repo, remote)?;
+        }
         for name in remote.into_iter().chain(branch) {
             validate_ref_name(name)?;
         }
@@ -1939,6 +1943,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The first word that is not a flag is git's repository slot. It is
+        // re-checked here, under the lock, so a planned argv that was edited
+        // or went stale between plan and run cannot reach an unconfigured
+        // repository.
+        if let Some(repository) = args
+            .iter()
+            .skip(1)
+            .find(|arg| arg.as_str() != "--force-with-lease" && arg.as_str() != "-u")
+        {
+            crate::engine::remotes::require_configured(&repo, repository)?;
+        }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         git_text_network(&repo, &refs)
     }
@@ -1951,6 +1966,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::engine::remotes::require_configured(&repo, remote)?;
         validate_ref_name(remote)?;
         validate_ref_name(tag)?;
         let refspec = format!("refs/tags/{tag}");
@@ -3031,21 +3047,49 @@ fn plan_push_argv(
             }
         }
         (Some(remote), None) => {
+            crate::engine::remotes::require_configured(repo, remote)?;
             validate_ref_name(remote)?;
             args.push(remote.to_string());
         }
         (Some(remote), Some(branch)) => {
+            crate::engine::remotes::require_configured(repo, remote)?;
             validate_ref_name(remote)?;
             validate_ref_name(branch)?;
             args.push(remote.to_string());
             args.push(branch.to_string());
         }
         (None, Some(branch)) => {
+            // git reads a lone word after `push` as the repository, so a
+            // branch given without a remote must never be emitted alone: it
+            // would turn any caller-supplied word into a push target. The
+            // remote is resolved explicitly, from a configured name.
             validate_ref_name(branch)?;
+            let remote = implicit_push_remote(repo)?;
+            validate_ref_name(&remote)?;
+            args.push(remote);
             args.push(branch.to_string());
         }
     }
     Ok(args)
+}
+
+/// The configured remote a push with no named remote goes to: the current
+/// branch's own `branch.<name>.remote` when it names a configured remote,
+/// else the same choice an unpublished branch makes.
+fn implicit_push_remote(repo: &Path) -> Result<String, String> {
+    if let Ok(branch) = current_branch_name(repo) {
+        let key = format!("branch.{branch}.remote");
+        if let Ok(configured) = git_text(repo, &["config", "--get", &key]) {
+            let name = configured.trim();
+            if crate::engine::remotes::list_names(repo)?
+                .iter()
+                .any(|remote| remote == name)
+            {
+                return Ok(name.to_string());
+            }
+        }
+    }
+    unpublished_push_remote(repo)
 }
 
 /// The one validator for a branch, tag, remote or revision name that reaches a
@@ -5395,6 +5439,140 @@ mod tests {
         )
         .expect("upstream");
         assert_eq!(tracking.trim(), "origin/main");
+    }
+
+    /// A second repository that is NOT a configured remote, holding a commit so
+    /// a fetch from it would visibly succeed.
+    fn unconfigured_repo_with_commit() -> tempfile::TempDir {
+        let other = init_repo_with_commit();
+        git_in(other.path(), &["tag", "v-other"]);
+        other
+    }
+
+    #[test]
+    fn network_operations_refuse_a_path_or_unconfigured_name_before_spawning_git() {
+        let other = unconfigured_repo_with_commit();
+        let other_path = other.path().to_str().unwrap().to_string();
+        let repo = init_repo_with_commit();
+        git_in(repo.path(), &["tag", "v1"]);
+        // A relative path that passes validate_ref_name and that git would
+        // happily treat as a repository: a sibling directory of the work tree.
+        git_in(repo.path(), &["init", "-q", "--bare", "inner-remote.git"]);
+        let path = repo_path(&repo);
+        let before = refs_snapshot(repo.path());
+        let other_before = refs_snapshot(other.path());
+
+        for target in [other_path.as_str(), "inner-remote.git", "not-a-remote"] {
+            // Spawns of fetch/pull/push fail loudly here, so an Err that names
+            // the target and is not a spawn failure proves git never ran it.
+            let forced = |arg: &str, body: &dyn Fn() -> Result<String, String>| {
+                crate::engine::git_cli::with_forced_spawn_failure_of(arg, body)
+            };
+            let results: Vec<(&str, Result<String, String>)> = vec![
+                (
+                    "fetch",
+                    forced("fetch", &|| GitWriter::fetch(&path, Some(target))),
+                ),
+                (
+                    "pull",
+                    forced("pull", &|| {
+                        GitWriter::pull(&path, Some(target), Some("main"), None)
+                    }),
+                ),
+                (
+                    "push",
+                    forced("push", &|| {
+                        GitWriter::push(&path, Some(target), Some("main"), false)
+                    }),
+                ),
+                (
+                    "push remote only",
+                    forced("push", &|| {
+                        GitWriter::push(&path, Some(target), None, false)
+                    }),
+                ),
+                (
+                    "push_tag",
+                    forced("push", &|| GitWriter::push_tag(&path, target, "v1")),
+                ),
+            ];
+            for (what, result) in results {
+                let err = result.expect_err(what);
+                assert!(
+                    err.contains(target) && err.contains("not a configured remote"),
+                    "{what} {target}: {err}"
+                );
+            }
+        }
+        assert_eq!(refs_snapshot(repo.path()), before);
+        assert_eq!(refs_snapshot(other.path()), other_before);
+    }
+
+    #[test]
+    fn a_configured_remote_whose_name_contains_a_slash_still_works() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "team/fork",
+                origin.path().to_str().unwrap(),
+            ],
+        );
+        GitWriter::fetch(&repo_path(&repo), Some("team/fork")).expect("fetch from team/fork");
+        let argv = GitWriter::plan_push(&repo_path(&repo), Some("team/fork"), Some("main"), false)
+            .unwrap();
+        assert_eq!(argv, vec!["push", "team/fork", "main"]);
+        GitWriter::push(&repo_path(&repo), Some("team/fork"), Some("main"), false)
+            .expect("push to team/fork");
+        git_in(repo.path(), &["tag", "v1"]);
+        GitWriter::push_tag(&repo_path(&repo), "team/fork", "v1").expect("push tag to team/fork");
+    }
+
+    #[test]
+    fn a_branch_without_a_remote_is_planned_against_a_resolved_configured_remote() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("main"), false).unwrap();
+        assert_eq!(
+            argv,
+            vec!["push", "origin", "main"],
+            "the branch must never be the lone word git reads as the repository"
+        );
+    }
+
+    #[test]
+    fn push_planned_refuses_an_unconfigured_repository_slot_but_allows_flags_and_remotes() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let args: Vec<String> = ["push", "--force-with-lease", "-u", "elsewhere", "main"]
+            .map(String::from)
+            .to_vec();
+        let err = GitWriter::push_planned(&repo_path(&repo), &args).unwrap_err();
+        assert!(
+            err.contains("elsewhere") && err.contains("not a configured remote"),
+            "{err}"
+        );
+        let ok: Vec<String> = ["push", "origin", "main"].map(String::from).to_vec();
+        GitWriter::push_planned(&repo_path(&repo), &ok).expect("a configured remote pushes");
+    }
+
+    #[test]
+    fn push_planned_refuses_an_unconfigured_repository_slot_alone() {
+        let repo = init_repo_with_commit();
+        let err = GitWriter::push_planned(&repo_path(&repo), &["push".into(), "victim.git".into()])
+            .unwrap_err();
+        assert!(err.contains("victim.git"), "{err}");
     }
 
     #[test]

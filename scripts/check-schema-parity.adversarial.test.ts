@@ -1,13 +1,12 @@
 // Adversarial coverage for the EXTRACTION_SCHEMA_VERSION parity row
 // (ft-576fb6dc). The cases marked BREAK were `it.fails` until they were fixed.
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-// @ts-expect-error plain .mjs without types
 import { SCHEMAS, devmapReading, judge, rustConstant, schemasAt, summarize } from "./check-schema-parity.mjs";
-// @ts-expect-error plain .mjs without types
 import { readCliSchema } from "./check-vendor-schema.mjs";
 
 const C = "EXTRACTION_SCHEMA_VERSION";
@@ -103,9 +102,12 @@ describe("schemasAt on a commit that predates the constant", () => {
   it("returns the constants it can read and leaves the rest out, without throwing", () => {
     const devcouncil = "/Users/bharath/Code/devtools/DevCouncil";
     if (!existsSync(devcouncil)) return;
-    const fake = (() => ({ status: 128, stdout: "", stderr: "fatal: path does not exist", error: undefined })) as never;
-    const gate = (cmd: string, args: string[]) => (args[0] === "cat-file" ? { status: 0, stdout: "", error: undefined } : fake());
-    expect(schemasAt(devcouncil, "a".repeat(40), gate as never)).toEqual({});
+    const failed = { status: 128, stdout: "", stderr: "fatal: path does not exist", error: undefined };
+    // The double returns only the fields schemasAt reads, not a full spawnSync
+    // result, so it is cast through unknown to the injected runner's type.
+    const gate = ((_cmd: string, args: readonly string[]) =>
+      args[0] === "cat-file" ? { status: 0, stdout: "", error: undefined } : failed) as unknown as typeof spawnSync;
+    expect(schemasAt(devcouncil, "a".repeat(40), gate)).toEqual({});
   });
 });
 
