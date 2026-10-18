@@ -41,6 +41,12 @@ const DERIVED_ARGV = Object.freeze({
   cmd_change_index: "change_index_with judges every bounded chunk before the first write; native stress tests inspect exact argv and late gate denial",
   cmd_stash_save: "handler and writer both use StashSaveOptions::argv; native option tests verify staged and untracked behavior",
   cmd_checkout_branch: "GitWriter::checkout_branch_argv builds the line the gate judges; checkout_branch_judged re-derives it under the repository lock and refuses to run if it differs",
+  cmd_create_branch: "GitWriter::create_branch_argv builds the line the gate judges and create_branch runs; commands/parity_tests.rs asserts judged == spawned",
+  cmd_delete_branch: "GitWriter::delete_branch_argv builds the line the gate judges and delete_branch (and its ledger journal) runs; commands/parity_tests.rs asserts judged == spawned",
+  cmd_rename_branch: "GitWriter::rename_branch_argv builds the line the gate judges and rename_branch runs; commands/parity_tests.rs asserts judged == spawned",
+  cmd_create_tag: "GitWriter::create_tag_argv builds the line the gate judges and create_tag runs; commands/parity_tests.rs asserts judged == spawned",
+  cmd_delete_tag: "GitWriter::delete_tag_argv builds the line the gate judges and delete_tag runs; commands/parity_tests.rs asserts judged == spawned",
+  cmd_publish_release: "create_tag_argv and push_tag_argv build the two lines the gate judges, and create_tag and push_tag run them; commands/parity_tests.rs asserts judged == spawned",
   cmd_checkout_detached: "GitWriter::checkout_detached_argv builds the line the gate judges, and checkout_detached runs that same function's argv",
   cmd_hygiene_execute: "hygiene::execute owns the backend plan and gives its exact argv or file boundary to the command gate; native hygiene tests cover denial, changed plans, exact scope and single use",
   cmd_rebase_interactive: "derives the planned sequence; rebase_planned_commands_* mirror tests cover it",
@@ -157,9 +163,11 @@ describe("the command gate judges the command that actually runs", () => {
   it("compares a real share of the guarded commands", () => {
     // Vacuity guard: a parser that silently stopped matching would make every
     // comparison below pass while examining nothing.
-    // 14 since cmd_checkout_branch moved to a writer-built argv (DERIVED_ARGV).
-    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(14);
-    for (const anchor of ["cmd_push", "cmd_commit", "cmd_delete_branch", "cmd_fetch"]) {
+    // 14 since cmd_checkout_branch moved to a writer-built argv (DERIVED_ARGV),
+    // 8 since the branch, tag and release commands moved to shared builders
+    // whose judged == spawned equality commands/parity_tests.rs asserts.
+    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(8);
+    for (const anchor of ["cmd_push", "cmd_commit", "cmd_fetch"]) {
       expect(compared.map((c) => c.name), `${anchor} must be compared`).toContain(anchor);
     }
   });
